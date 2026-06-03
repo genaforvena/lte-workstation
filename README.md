@@ -103,7 +103,7 @@ Connectivity gets you in. The tools make it feel like a real workstation. This i
 
 These tools are optimized for terminal use with no mouse — which is exactly what you have on a phone. Helix in particular is worth learning: it's modal like Vim but with LSP, tree-sitter, and multi-cursor built in, so you don't need to configure plugins to get a full IDE experience.
 
-For yazi + zoxide integration (so directories you navigate to in yazi are learned by `z`), and Helix as yazi's default opener, see the config in your dotfiles repo.
+For yazi + zoxide integration (so directories you navigate to in yazi are learned by `z`), and Helix as yazi's default opener, see [genaforvena/dotfiles](https://github.com/genaforvena/dotfiles).
 
 ## Files
 
