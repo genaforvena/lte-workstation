@@ -6,6 +6,8 @@ The idea is simple: **decouple screen from compute**. Your phone is just a termi
 
 An old Android phone + a cheap Bluetooth keyboard + Termux + this setup = a full development workstation that fits in a pocket and works anywhere.
 
+What that actually means in practice: your phone is just a screen and a keyboard. Every command you run, every file you edit, every process you start — it all happens on the Linux machine. The phone contributes nothing but input and display. Switch from WiFi to LTE mid-session, go through a tunnel, lose signal for a minute — mosh holds the connection and catches up silently. You can run an AI coding assistant, a full dev stack, long-running builds — anything — and control it from your phone over whatever internet you have.
+
 ![lte-workstation: phone terminal + Telegram bot notifications](screenshot.svg)
 
 ## What you get
