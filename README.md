@@ -62,9 +62,9 @@ Phone (Termux + mosh)  ──── Tailscale WireGuard ──── Linux VM
 
 On boot:
 1. `ngrok.service` opens a TCP tunnel to port 22 and sends you a Telegram message with the SSH command and your permanent mosh address
-2. `bore-mtg.service` (if enabled) opens a bore.pub tunnel to MTG and sends a Telegram button to add the proxy
+2. `bore-mtg.service` (if enabled) sends two Telegram proxy buttons: one via your Tailscale IP (permanent, works on LTE where bore.pub may be blocked) and one via bore.pub (fallback)
 
-The bore.pub port changes on restart — that's expected. The bot always sends the fresh link.
+The bore.pub port changes on restart — that's expected. The bot always sends the fresh link. **Use the Tailscale link on LTE.**
 
 ## Phone setup (Termux)
 
