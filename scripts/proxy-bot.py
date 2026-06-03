@@ -19,6 +19,7 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
 )
+from telegram.request import HTTPXRequest
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -185,12 +186,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("Not authorized.")
         return
 
+    await query.answer()  # ack immediately so Telegram stops showing spinner
+
     action, uid = query.data.split(":", 1)
     users = load_users()
 
     if uid not in users:
         await query.edit_message_text("User not found (may have been removed).")
-        await query.answer()
         return
 
     info = users[uid]
@@ -224,8 +226,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_users(users)
         await query.edit_message_text(f"Denied {label}.")
 
-    await query.answer()
-
 
 def main():
     if not BOT_TOKEN:
@@ -236,6 +236,7 @@ def main():
     app = (
         Application.builder()
         .token(BOT_TOKEN)
+        .request(HTTPXRequest(connect_timeout=15, read_timeout=30, write_timeout=30))
         .build()
     )
     app.add_handler(CommandHandler("start", cmd_start))
