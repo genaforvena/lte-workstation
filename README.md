@@ -6,6 +6,8 @@ The idea is simple: **decouple screen from compute**. Your phone is just a termi
 
 An old Android phone + a cheap Bluetooth keyboard + Termux + this setup = a full development workstation that fits in a pocket and works anywhere.
 
+![lte-workstation: phone terminal + Telegram bot notifications](screenshot.svg)
+
 ## What you get
 
 - **Permanent mosh connection** via Tailscale — stable IP, survives switching networks mid-session
