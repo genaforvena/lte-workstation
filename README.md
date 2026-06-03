@@ -90,7 +90,26 @@ If Telegram is blocked on your LTE network, the optional proxy routes your Teleg
 - Iran: pick any unblocked local domain
 - Other: `google.com`, `apple.com`, or any HTTPS site that isn't blocked
 
-The proxy secret is embedded in the Telegram "Add Proxy" button the bot sends you. Share that button with anyone who needs it.
+The proxy secret is embedded in the Telegram "Add Proxy" button the bot sends you.
+
+### Sharing with others
+
+`proxy-bot.service` runs an access-control bot on the same Telegram bot token. To share your proxy:
+
+1. Send friends your bot link: `https://t.me/yourbotname`
+2. They tap `/start` — you receive a notification with their Telegram handle and **Approve / Deny** buttons
+3. Tap **Approve** — the bot sends them the proxy link automatically
+
+**Owner commands** (send these to your bot):
+
+| Command | What it does |
+|---------|-------------|
+| `/list` | Show all users and their status (approved / pending / denied) |
+| `/revoke @username` | Cut off someone's access |
+
+When the bore.pub port changes (service restart), all approved users are automatically sent the updated link — no manual re-sharing needed.
+
+> **Note:** the bot needs `python3` and `python-telegram-bot==20.*` installed in `~/.local/venv/proxy-bot/`. The setup script handles this. Approved users receive the bore.pub link (publicly accessible); your personal Tailscale link is sent only to you.
 
 ## Terminal stack
 
@@ -114,9 +133,11 @@ For yazi + zoxide integration (so directories you navigate to in yazi are learne
 ```
 scripts/
   ngrok-notify.sh      # sends Telegram message with SSH/mosh commands on ngrok start
-  bore-mtg.sh          # runs bore tunnel, sends proxy button when port is assigned
+  bore-mtg.sh          # bore tunnel + proxy notifications + notifies approved users on port change
+  proxy-bot.py         # access-control bot: approve/deny proxy requests from Telegram
   ngrok.service        # systemd user service
   bore-mtg.service     # systemd user service
+  proxy-bot.service    # systemd user service
 setup.sh               # one-time interactive setup
 ```
 
@@ -134,6 +155,6 @@ systemctl --user restart bore-mtg.service
 
 **Check service status:**
 ```bash
-systemctl --user status ngrok.service bore-mtg.service
-journalctl --user -u ngrok.service -f
+systemctl --user status ngrok.service bore-mtg.service proxy-bot.service
+journalctl --user -u proxy-bot.service -f
 ```
