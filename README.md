@@ -1,24 +1,65 @@
-# lte-workstation
+# The Window and the Agent
 
-Turn any Linux machine into a remote workstation you can reach from your phone anywhere on LTE.
+*On building a workstation that doesn't exist*
 
-The idea is simple: **decouple screen from compute**. Your phone is just a terminal — it has a screen, a keyboard (Bluetooth, ~$20), and mobile internet. The Linux machine does the actual work. You connect them with [mosh](https://mosh.org) over [Tailscale](https://tailscale.com), which gives you a connection that survives network switches, high latency, and bad LTE signal.
+Last night I built a working development machine out of things I already owned: a 2011 laptop running an OS three versions out of support, a phone about seven years old, an even older iPhone SE, a Bluetooth keyboard, and a display salvaged from a 2013 Mac. None of these objects is, by current standards, a computer you would choose to work on. Each one, alone, is the kind of thing you are quietly encouraged to replace.
 
-An old Android phone + a cheap Bluetooth keyboard + Termux + this setup = a full development workstation that fits in a pocket and works anywhere.
+Assembled, they behave like a portable laptop that has never been manufactured. The heavy lifting happens elsewhere — on a VM, and, more importantly, inside a coding agent running on that VM. What I hold in my hands is no longer being asked to compute. It is being asked to show me a screen and take my keystrokes. And at that, a fourteen-year-old laptop is exactly as good as a new one.
 
-What that actually means in practice: your phone is just a screen and a keyboard. Every command you run, every file you edit, every process you start — it all happens on the Linux machine. The phone contributes nothing but input and display. Switch from WiFi to LTE mid-session, go through a tunnel, lose signal for a minute — mosh holds the connection and catches up silently. You can run an AI coding assistant, a full dev stack, long-running builds — anything — and control it from your phone over whatever internet you have.
+I want to argue that this is not a clever hack. It is a small example of a position that two existing communities have each half-discovered, and that neither has yet stated whole.
+
+## Two camps, each half-right
+
+The first camp is permacomputing. Its instinct is ethical and ecological: hardware should last, e-waste is a moral problem, and software ought to respect the machines that already exist rather than conscripting everyone into an upgrade cycle. This is correct and good. But permacomputing's reflex is *local* self-sufficiency. Its ideal is software so lean it runs on the old machine directly, and its suspicion of the cloud runs deep — dependency on a datacenter reads as fragility, as a loss of autonomy. So it sets itself a hard task: heroically optimize software downward until it fits inside weak, old silicon.
+
+The second camp is remote-first computing — thin clients, homelabs, "treat the home server as the computer and the device in your hand as a screen with manners." Its instinct is architectural: put the weight on a capable host, let the endpoint be light. This is also correct. But its motivation is usually convenience, centralization, or raw power. The thin client, in this story, is cheap. It is not *dignified*. Nobody in this camp is moved by the fact that the endpoint was rescued from a drawer. The old phone is incidental; any cheap screen would do.
+
+Each camp holds one of the two pieces. Permacomputing holds the ethics of old hardware. Remote-first holds the architecture that frees it. But put bluntly: permacomputing wants old hardware to stay self-sufficient and pays for it in endless software optimization; remote-first is happy to offload the work but doesn't care whether the endpoint lived a previous life or rolled off a line last week.
+
+## The variable nobody priced in
+
+What changes the equation is the agent.
+
+For decades, "thin client to a powerful machine" meant a remote desktop. You still did the work; the remote box merely lent you its CPU. The endpoint had to render a full graphical environment — windows, compositing, the whole weight of a modern desktop — even though the computation was elsewhere. The screen was thin, but the *interface* was still thick.
+
+A coding agent collapses that. When the thing on the other end is not just horsepower but an *executor*, the endpoint no longer has to present a heavy GUI at all. It has to present a conversation. Text in, text out, a diff, a log, a confirmation. The old phone is not straining to mirror a desktop; it is displaying a dialogue with something that does the work on your behalf.
+
+This is the move neither camp made. Permacomputing said: *software must respect old hardware.* But the deeper implication, once an agent exists, is stronger and stranger: old hardware does not need to carry the software at all. The agent carries it. The hardware becomes a window. And the moment that happens, permacomputing's central burden — the heroic downward optimization — simply dissolves. You no longer need to shrink the software to fit the machine, because the software has left the machine entirely. What stays behind is the lightest possible task, the one task old hardware has always been able to do forever: show text, accept input, hold a network connection.
+
+## Old hardware stops aging
+
+Here is the consequence I find genuinely beautiful.
+
+A display from 2013 does not need to get faster. It renders text exactly as well as a display sold today. A keyboard does not receive updates. A seven-year-old phone can draw a terminal indefinitely; there is no version of "drawing a terminal" that it will fall behind on. The reason old hardware feels obsolete is that we keep asking it to do the one category of thing it cannot keep up with — to *locally* run software that grows heavier every year. Remove that demand, and the obsolescence evaporates. The hardware was never slow at being a window. It was only slow at being a computer, and we have stopped asking it to be one.
+
+So the synthesis is this: old hardware, plus a remote agent, equals a new kind of self-sufficiency — not the local self-sufficiency permacomputing wanted, but something that achieves the same end (long-lived devices, no forced upgrades, dignity for the machine you already have) by an opposite route. Not "make the software small enough to stay home," but "let the work leave, and let the home device be the calm, permanent thing it is good at being."
+
+## A way of seeing
+
+There is a Japanese word, *mitate*, that means something like seeing an ordinary thing as utterly new — not transforming it, but perceiving the form that was already there. The pile of old hardware was always a workstation. Termux, SSH, tmux, an agent — none of it is new. The network was always reliable enough. What was missing was the angle from which the pile resolves into a machine.
+
+This is not a product. It is barely even a configuration. It is a stance: that the device in your hand does not need to be powerful, only present; that power belongs on a host you do not carry; and that the work itself can increasingly be handed to something that does it while you watch. The screen you carry can be any screen you like — including the one you already own and were about to throw away.
+
+The good computer doesn't have to travel with you. Increasingly, it doesn't even have to be operated by you. It only has to be reachable. And almost anything, it turns out, is enough to reach it.
+
+---
+
+## How to build it
+
+What follows is how the setup described above actually works — the practical infrastructure behind the idea.
 
 ![lte-workstation: phone terminal + Telegram bot notifications](screenshot.svg)
 
-## What you get
+### What you get
 
 - **Permanent mosh connection** via Tailscale — stable IP, survives switching networks mid-session
 - **SSH fallback** via ngrok — dynamic public URL, auto-notified via Telegram bot
 - **Auto-notifications** — Telegram message with connection commands whenever your machine comes online
 - **Auto-start on reboot** — everything comes back up without manual action
 - **Optional: MTProto Telegram proxy** — for regions where Telegram is blocked (Russia, Iran, etc.)
+- **Phone as a sensor node** — SSH from the VM back into the phone; access mic, camera, location, battery via termux-api
 
-## Prerequisites
+### Prerequisites
 
 You need these installed on your Linux machine before running setup:
 
@@ -35,7 +76,7 @@ You also need:
 - Your **Telegram chat ID** — message [@userinfobot](https://t.me/userinfobot)
 - An **ngrok account** (free) — get your auth token at [dashboard.ngrok.com](https://dashboard.ngrok.com/get-started/your-authtoken)
 
-## Setup
+### Setup
 
 ```bash
 git clone https://github.com/genaforvena/lte-workstation
@@ -47,7 +88,7 @@ The script checks prerequisites, asks for your tokens, generates config, install
 
 Your credentials are saved to `~/.config/remote-access/env` (chmod 600, never committed to git).
 
-## How it works
+### How it works
 
 ```
 Phone (Termux + mosh)  ──── Tailscale WireGuard ──── Linux VM
@@ -66,13 +107,13 @@ On boot:
 
 The bore.pub port changes on restart — that's expected. The bot always sends the fresh link. **Use the Tailscale link on LTE.**
 
-## Phone setup (Termux)
+### Phone setup (Termux)
 
 ```bash
-pkg update && pkg install termux-services mosh openssh
+pkg update && pkg install termux-services mosh openssh termux-api
 ```
 
-Connect:
+Connect to the VM:
 
 ```bash
 mosh your-user@your-tailscale-ip
@@ -82,7 +123,63 @@ Get your Tailscale IP from the Telegram notification or by running `tailscale ip
 
 > **Tip:** pair a Bluetooth keyboard with your phone. A $15–20 keyboard transforms the experience — you get proper modifier keys, Tab, arrow keys, and no on-screen keyboard eating half your screen.
 
-## MTProto proxy (censored regions)
+Start the SSH server so the VM can reach back into the phone:
+
+```bash
+sshd
+```
+
+To prevent Android from killing the Termux process during long sessions:
+
+```bash
+termux-wake-lock   # run this in Termux before long operations
+```
+
+Also disable battery optimization: **Settings → Apps → Termux → Battery → Unrestricted**. On Xiaomi/Redmi, also enable **Autostart** for Termux in Settings → Apps.
+
+### Phone as a sensor node
+
+Once `sshd` is running on the phone and both devices are on Tailscale, the VM can SSH *into* the phone. This turns the phone into a sensor node — the VM can access the phone's hardware remotely.
+
+```bash
+# From the VM
+ssh -p 8022 u0_a386@<phone-tailscale-ip>
+```
+
+With [termux-api](https://wiki.termux.com/wiki/Termux:API) installed (`pkg install termux-api`), and the **Termux:API companion app** from F-Droid:
+
+```bash
+# Check battery
+ssh -p 8022 u0_a386@<phone-ip> "termux-battery-status"
+
+# Get location
+ssh -p 8022 u0_a386@<phone-ip> "termux-location -p network"
+
+# Record audio (grant Microphone permission first; run termux-setup-storage for storage access)
+ssh -p 8022 u0_a386@<phone-ip> "termux-wake-lock; termux-microphone-record -l 10"
+# wait for isRecording: false before copying
+ssh -p 8022 u0_a386@<phone-ip> "termux-microphone-record -i"
+scp -P 8022 u0_a386@<phone-ip>:storage/shared/TermuxAudioRecording_*.m4a ./
+```
+
+> **Permissions required:** Microphone → Settings → Apps → Termux → Permissions → Microphone. Storage → run `termux-setup-storage` in Termux and approve the dialog.
+
+> **Camera capture** (`termux-camera-photo`) requires the Termux:API companion app from F-Droid. Camera info and battery status work without it.
+
+For scripted access without interactive password prompts, use `SSH_ASKPASS`:
+
+```bash
+cat > /tmp/askpass.sh << 'EOF'
+#!/bin/bash
+printf 'your-termux-password'
+EOF
+chmod +x /tmp/askpass.sh
+SSH_ASKPASS=/tmp/askpass.sh SSH_ASKPASS_REQUIRE=force \
+  ssh -p 8022 -o PasswordAuthentication=yes -o PreferredAuthentications=password \
+  u0_a386@<phone-ip> "termux-battery-status"
+```
+
+### MTProto proxy (censored regions)
 
 If Telegram is blocked on your LTE network, the optional proxy routes your Telegram traffic through this machine and out via your network's exit point. Setup prompts you for an SNI domain (fake-TLS camouflage) — pick a domain that's commonly accessed on your network:
 
@@ -92,7 +189,7 @@ If Telegram is blocked on your LTE network, the optional proxy routes your Teleg
 
 The proxy secret is embedded in the Telegram "Add Proxy" button the bot sends you.
 
-### Sharing with others
+#### Sharing with others
 
 `proxy-bot.service` runs an access-control bot on the same Telegram bot token. To share your proxy:
 
@@ -111,7 +208,7 @@ When the bore.pub port changes (service restart), all approved users are automat
 
 > **Note:** the bot needs `python3` and `python-telegram-bot==20.*` installed in `~/.local/venv/proxy-bot/`. The setup script handles this. Approved users receive the bore.pub link (publicly accessible); your personal Tailscale link is sent only to you.
 
-## Terminal stack
+### Terminal stack
 
 Connectivity gets you in. The tools make it feel like a real workstation. This is what works well over mosh on a phone screen:
 
