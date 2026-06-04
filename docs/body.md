@@ -1,0 +1,169 @@
+# Phone as a body
+
+The VM has compute but no senses. The phone has senses — camera, microphone, GPS, accelerometer — but a hostile runtime for agents (glibc binaries don't run in Bionic). SSH between them and the agent on the VM can borrow the phone's hardware.
+
+This document covers the second capability in this repo: an agent or script running on the VM reaching into the phone over SSH and driving its sensors via `termux-api`.
+
+## Verification principle
+
+Every capability must produce a real artifact before you consider it working. An agent reporting "done" is not proof; the file is. A 0-byte file is not a photo. An m4a that won't play is not a recording. Each section below describes what a successful artifact looks like and what common failure modes produce instead.
+
+## Prerequisites
+
+On the phone:
+
+1. **Termux** — from F-Droid (not Google Play; the Play version is frozen and missing features)
+2. **Termux:API companion app** — also from F-Droid. This is a separate APK, not just the `termux-api` package. Camera capture requires it; battery status and camera info do not.
+3. In Termux: `pkg install openssh termux-api`
+4. Start the SSH server: `sshd` (port 8022 by default)
+
+Both devices must be on Tailscale. Get the phone's Tailscale IP:
+```bash
+# on the phone
+tailscale ip -4
+```
+
+## Key-based auth (recommended)
+
+Add the VM's public key to the phone's authorized_keys so the agent isn't blocked on password prompts:
+
+```bash
+# on the VM
+cat ~/.ssh/id_ed25519.pub
+```
+
+On the phone, in Termux:
+```bash
+mkdir -p ~/.ssh && chmod 700 ~/.ssh
+echo "ssh-ed25519 AAAA...your-vm-key..." >> ~/.ssh/authorized_keys
+chmod 600 ~/.ssh/authorized_keys
+```
+
+Test:
+```bash
+# from the VM
+ssh -p 8022 u0_a386@<phone-tailscale-ip> "echo ok"
+```
+
+If you need password-based auth in scripts (e.g. key setup not done yet), use `SSH_ASKPASS`:
+```bash
+cat > /tmp/askpass.sh << 'EOF'
+#!/bin/bash
+printf 'your-termux-password'
+EOF
+chmod +x /tmp/askpass.sh
+SSH_ASKPASS=/tmp/askpass.sh SSH_ASKPASS_REQUIRE=force \
+  ssh -p 8022 -o PasswordAuthentication=yes -o PreferredAuthentications=password \
+  u0_a386@<phone-ip> "termux-battery-status"
+```
+
+## Keeping the connection alive
+
+Android will kill Termux background processes under memory pressure. Before any long operation:
+
+```bash
+# on the phone (in Termux)
+termux-wake-lock
+```
+
+Also disable battery optimization: **Settings → Apps → Termux → Battery → Unrestricted**. On Xiaomi/Redmi, also enable **Autostart** for Termux.
+
+Do not swipe Termux from the recent apps list — that sends SIGKILL immediately.
+
+For a persistent reverse tunnel from phone to VM (so the VM can always reach the phone even without knowing its current IP), run on the phone:
+```bash
+ssh -N -R 2222:localhost:8022 user@vm-tailscale-ip
+```
+This makes `localhost:2222` on the VM forward to the phone's sshd. Use `autossh` to keep it alive across disconnects.
+
+## Android permissions
+
+Some termux-api commands require Android permissions that can only be granted by a human tapping a dialog on the phone. The agent cannot approve these itself.
+
+| Command | Permission required | Where to grant |
+|---------|--------------------|----|
+| `termux-camera-photo` | Camera | Settings → Apps → Termux:API → Permissions → Camera |
+| `termux-microphone-record` | Microphone | Settings → Apps → Termux → Permissions → Microphone |
+| `termux-location` | Location | Settings → Apps → Termux → Permissions → Location |
+| `termux-battery-status` | (none) | Works without any grant |
+| `termux-camera-info` | (none) | Works without any grant |
+
+Storage access (for microphone recordings, which write to `/storage/emulated/0/`):
+```bash
+# run once in Termux; approve the dialog that appears on screen
+termux-setup-storage
+```
+
+## Microphone recording
+
+```bash
+# from the VM — start a 10-second recording
+ssh -p 8022 u0_a386@<phone-ip> "termux-wake-lock; termux-microphone-record -l 10"
+```
+
+The command returns immediately after printing "Recording started". The recording runs in the background in the Termux:API process. Poll until done:
+
+```bash
+until ssh -p 8022 u0_a386@<phone-ip> "termux-microphone-record -i" | grep -q '"isRecording": false'; do
+  sleep 3
+done
+```
+
+Then copy:
+```bash
+scp -P 8022 u0_a386@<phone-ip>:storage/shared/TermuxAudioRecording_*.m4a ./recording.m4a
+```
+
+**Successful artifact:** a non-empty `.m4a` file that plays. Check structure:
+```bash
+python3 -c "
+data = open('recording.m4a','rb').read()
+print('moov:', data.find(b'moov'))  # must be >= 0
+print('size:', len(data), 'bytes')
+"
+```
+
+**Common failure: "moov atom not found"** — the file was copied before the recording finished finalizing. The moov atom is written last, when the recorder closes the file. Fix: always wait for `isRecording: false` before running `scp`. Never interrupt the recording with `-q` and immediately copy.
+
+**Common failure: `EPERM` on `/storage/emulated/0/`** — storage permission not granted. Run `termux-setup-storage` on the phone.
+
+**Common failure: `RECORD_AUDIO` permission error** — grant microphone permission to Termux (not Termux:API) in Android settings.
+
+Note: `-l` sets a duration limit in seconds. The `-f` flag sets the audio format (not the filename); the output path is always `/storage/emulated/0/TermuxAudioRecording_DATE.m4a`.
+
+## Camera
+
+Camera capture requires the Termux:API companion app from F-Droid and Camera permission granted to Termux:API.
+
+```bash
+ssh -p 8022 u0_a386@<phone-ip> "termux-camera-photo -c 0 ~/photo.jpg"
+scp -P 8022 u0_a386@<phone-ip>:photo.jpg ./
+```
+
+`-c 0` = back camera, `-c 1` = front camera.
+
+**Successful artifact:** a non-empty JPEG file.
+
+**Common failure: 0-byte file** — Termux:API companion app not installed (install from F-Droid, not Google Play), or Camera permission not granted to Termux:API.
+
+Camera metadata (which cameras exist, resolutions, focal lengths) works without the companion app:
+```bash
+ssh -p 8022 u0_a386@<phone-ip> "termux-camera-info"
+```
+
+## Location
+
+```bash
+ssh -p 8022 u0_a386@<phone-ip> "termux-location -p network"
+```
+
+Requires Location permission granted to Termux. Returns JSON with `latitude`, `longitude`, `accuracy`.
+
+## Battery status
+
+Works without any permission grant:
+```bash
+ssh -p 8022 u0_a386@<phone-ip> "termux-battery-status"
+```
+
+Returns JSON: percentage, temperature, health, plugged status, current.
