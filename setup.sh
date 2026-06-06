@@ -126,9 +126,9 @@ EOF
     info "Starting MTG Docker container"
     docker rm -f mtg 2>/dev/null || true
     docker run -d --name mtg --restart unless-stopped \
-        -v "$HOME/.config/mtg/config.toml:/etc/mtg.toml:ro" \
-        -p 443:443 \
-        ghcr.io/9seconds/mtg:2 run /etc/mtg.toml
+        --network host \
+        -v "$HOME/.config/mtg/config.toml:/config.toml:ro" \
+        ghcr.io/9seconds/mtg:2 run /config.toml
     info "MTG container started"
 fi
 
