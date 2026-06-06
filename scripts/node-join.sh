@@ -81,11 +81,48 @@ else
     info "Tag advertised. Approve in Tailscale admin console if prompted."
 fi
 
+# ── VPN mesh ─────────────────────────────────────────────────────────────────
+section "VPN mesh"
+
+HUB_IP="100.125.157.75:9999"
+TAILSCALE_IP=$(tailscale ip -4 2>/dev/null || echo "unknown")
+HOSTNAME=$(hostname)
+
+if command -v wg &>/dev/null && command -v wg-quick &>/dev/null; then
+    info "WireGuard: OK"
+else
+    info "Installing WireGuard..."
+    if command -v apt-get &>/dev/null; then
+        sudo apt-get install -y -qq wireguard 2>/dev/null || warn "apt install failed, run manually: sudo apt install wireguard"
+    elif command -v dnf &>/dev/null; then
+        sudo dnf install -y wireguard-tools 2>/dev/null
+    elif command -v pacman &>/dev/null; then
+        sudo pacman -S --noconfirm wireguard-tools 2>/dev/null
+    else
+        warn "Unknown package manager. Install wireguard-tools manually."
+    fi
+fi
+
+info "Requesting VPN config from hub ($HUB_IP) for $HOSTNAME..."
+WG_CONF=$(curl -s --connect-timeout 5 "http://$HUB_IP/$HOSTNAME" 2>/dev/null || true)
+
+if [ -n "$WG_CONF" ] && echo "$WG_CONF" | grep -q "Interface"; then
+    echo "$WG_CONF" | sudo tee /etc/wireguard/wg-mesh.conf > /dev/null
+    sudo chmod 600 /etc/wireguard/wg-mesh.conf
+
+    WG_EXISTING=$(sudo wg show wg-mesh 2>/dev/null || true)
+    if [ -n "$WG_EXISTING" ]; then
+        sudo wg-quick down wg-mesh 2>/dev/null || true
+    fi
+    sudo wg-quick up wg-mesh
+    info "VPN mesh connected"
+else
+    warn "Cannot reach VPN hub at $HUB_IP — running Tailscale-only (no VPN mesh)"
+fi
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 section "Node registered"
 
-TAILSCALE_IP=$(tailscale ip -4 2>/dev/null || echo "unknown")
-HOSTNAME=$(hostname)
 USER=$(whoami)
 
 echo ""

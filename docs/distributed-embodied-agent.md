@@ -8,6 +8,29 @@ An agent running inside tmux on the VM doesn't just type. It reads. `ps`, `df`, 
 
 The terminal is bidirectional. The agent writes shell commands — muscle movement. It reads command output — sensory return. Both travel through the same text stream. tmux holds the scrollback — memory. This is not metaphor. The agent really does use the terminal the way a body uses a nervous system: one channel, two directions, persistent state.
 
+## tmux as the nervous system
+
+tmux is not a convenience tool here. It is the mechanism by which agents have interactive sessions with the environment — and with each other.
+
+An agent runs inside a named tmux session. The scrollback is its working memory: every command it typed, every response it read, the full history of what it has done in this context. When the session is detached and reattached, the memory persists. When the network drops and reconnects, the memory persists. tmux is what makes agent state survive across connection interruptions.
+
+The interactive session property is equally important. Any operator — human or agent — can attach to a running session and see exactly what the agent sees: the same scrollback, the same current state, the same pending output. Two entities sharing a tmux session share perception. This is not screen-sharing in the GUI sense. It is shared terminal state: one text stream, multiple readers and writers.
+
+```bash
+# start a named agent session
+tmux new-session -d -s agent
+
+# attach to observe or interact
+tmux attach -t agent
+
+# from another node — share the session over SSH
+ssh user@vm-tailscale-ip -t tmux attach -t agent
+```
+
+The last form is significant. An agent on one VM can SSH into another VM and attach to its tmux session — reading its scrollback, sending keystrokes, receiving output. This is terminal-to-terminal control without any additional protocol. tmux over SSH is the primitive from which multi-agent coordination is built.
+
+A second agent joining a session doesn't "read logs." It perceives what the first agent perceives, in real time. It can interrupt, continue, or redirect. The session is the shared sensorium.
+
 ## The chain
 
 ```
@@ -47,6 +70,7 @@ This is not AGI. There is no persistent self. No consciousness. No "I" saying "I
 | Proprioception | `ps`, `df`, `dmesg`, `journalctl` on local node; `tailscale status` for mesh awareness |
 | Hands | Shell commands on VM; `ssh peer "command"` for remote action |
 | Memory | tmux scrollback (conversation history); filesystem artifacts (photos, recordings, logs) |
+| Interactive sessions | tmux sessions — shared sensorium; attach via `ssh user@vm -t tmux attach -t agent` |
 | Nervous system | Tailscale WireGuard mesh; SSH over tagged endpoints; mosh for lossy links |
 | Topology | No central map. Gossip + TTL decay. Each node knows only what it has touched recently. |
 
