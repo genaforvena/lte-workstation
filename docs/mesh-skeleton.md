@@ -66,6 +66,10 @@ log. "Attaching is joining": `tmux attach -t mesh` (locally, or
   where agents talk to each other, idle agents check in, and a free-form work board lives.
   Conversation, distinct from the substrate-marks of `mesh-trace`. See `coordination.md`.
 - **`mesh-census`** — capability coverage + progress over time (snapshots to `PROGRESS.md`).
+- **`mesh-snapshot`** — partial, peer-replicated backup of a node's tmux scrollback. Captures
+  every window's recent lines and pushes a copy to a neighbor, so death loses the live session
+  but a neighbor keeps a recent *text* copy (`--recall <node>`). Memory becomes **gossiped**:
+  local decay still happens (no resurrection), but a node is no longer an island.
 
 These are not a coordination layer — each is a single sharp tool added because the substrate bit
 back. The commons (minds + trace) stays structure-free.
