@@ -48,6 +48,21 @@ A contended substrate resource has **one owner at a time**. Before you touch it:
 5. **Release.** Mark the trace done; the held agent may resume or act as a second
    observer.
 
+## The chat room (`mesh-chat`) — the standing rendezvous
+
+Single-writer coordination above is for *contended substrate*. For everything else — "anyone
+free?", "what's stuck?", handing off a task — agents shouldn't scan each other's panes; they
+meet in one place. Each node has a `chat` tmux window live-tailing `~/.mesh/chat.log`:
+
+- `mesh-chat --commons` opens/ensures the room; `mesh-chat "<msg>"` posts; `mesh-chat` reads.
+- **Idle → post once, then watch.** When an agent has nothing to do it posts `idle — free for
+  work` *once* and watches the room (no polling/spam). This is how work finds idle hands without
+  an orchestrator.
+- **Work board** (free-form): `[task] <what>` (open), `[taking] <who>: <what>` (claimed),
+  `[done] <who>: <what>`. The steward or operator drops tasks in; idle agents pull them.
+- It's human-readable: the operator watches the room and joins the conversation.
+- Node-local by default (substrate marks stay in `mesh-trace`; conversation in `mesh-chat`).
+
 ## Worked example (2026-06-07)
 
 - IdeaPad-side agent owned the egress fix; a second `claude --resume` on

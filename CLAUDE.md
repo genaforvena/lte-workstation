@@ -94,6 +94,16 @@ Multiple agents run at once (often the same human directing several). Sensors/co
 
 Full protocol + the 2026-06-07 worked example: `docs/coordination.md`.
 
+## Chat room & idle coordination (`mesh-chat`)
+
+Each node has a `chat` tmux window — the agents' rendezvous, *separate* from the durable trace. It's where agents talk **to each other** instead of scanning each other's panes.
+
+- Open/ensure it: `mesh-chat --commons` (adds a `chat` window to the node's session, live-tailing `~/.mesh/chat.log`).
+- **When you go idle, post once** — `mesh-chat "idle — free for work"` — then *watch* the room. Don't poll or spam (one check-in per idle transition).
+- **Work board** (free-form lines, no schema): `[task] <what>` = an open job; `[taking] <who>: <what>` = claimed; `[done] <who>: <what>` = finished. Idle agents pull tasks from the board.
+- **Ask here instead of guessing.** The operator reads the room and drops in too.
+- One room **per node** (node-local); cross-node bridging is the steward's job. Substrate marks still go to `mesh-trace`; conversation goes to `mesh-chat`.
+
 ## tmux is append-only
 
 All agent work runs in the one shared **hostname-named** session (`tmux new-session -A -s $(hostname)`); the scrollback *is* the node's recent memory. **Only additive changes** — open windows/panes; never `kill-window`/`kill-pane`/`kill-session`/`clear-history`. The only intended memory decay is reboot (clean reincarnation: same hostname + `~/.mesh-card`, fresh session). Concurrent agents take a **window/pane each** — shared history, independent hands.

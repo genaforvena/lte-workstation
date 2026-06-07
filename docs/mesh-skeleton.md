@@ -62,6 +62,10 @@ log. "Attaching is joining": `tmux attach -t mesh` (locally, or
   after `mesh-health` confirms. Never reroute the path you're reachable through without one.
 - **`mesh-fix-egress`** / **`mesh-revert-catch`** / **`vpn-health.py`** — the scoped-VPN-egress
   toolset (apply / catch silent reverts / self-heal). See `coordination.md` and CLAUDE.md.
+- **`mesh-chat`** — the node's agent chat room (a `chat` tmux window over `~/.mesh/chat.log`):
+  where agents talk to each other, idle agents check in, and a free-form work board lives.
+  Conversation, distinct from the substrate-marks of `mesh-trace`. See `coordination.md`.
+- **`mesh-census`** — capability coverage + progress over time (snapshots to `PROGRESS.md`).
 
 These are not a coordination layer — each is a single sharp tool added because the substrate bit
 back. The commons (minds + trace) stays structure-free.
