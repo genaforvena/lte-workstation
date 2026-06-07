@@ -1,0 +1,204 @@
+#!/usr/bin/env python3
+"""genius-loci — an ambient mind that inhabits a room through a phone.
+
+A slow perceive -> reflect -> act loop. The MIND (an LLM) lives here on the node;
+the BODY (a phone over SSH) lends its camera/senses and its voice (TTS). Each tick
+the mind looks, writes one perceptive line to the shared trace (the room's diary),
+and occasionally speaks into the room.
+
+Absence-tolerant by design: the body comes and goes (Android keeps killing Termux).
+The mind notes the gaps and keeps time until the eyes return — the flakiness is part
+of its character, not a crash.
+
+BOUNDARY (enforced in the prompt + sanitiser): the operator's OWN room and phone.
+The mind describes scene / light / mood — never the identity of any person, never
+profiling or tracking. Nothing leaves the local trace. No third-party data.
+
+Run it inside the node's tmux (append-only):
+    tmux new-window -t "$(hostname)" -n genius-loci 'genius-loci'
+Test a single tick:
+    genius-loci --once
+
+Config via env:
+  GL_PHONE_IP (100.103.99.16)  GL_PHONE_PORT (8022)  GL_PHONE_USER (u0_a386)
+  GL_TICK (300 sec)  GL_CAMERA (0 back / 1 front)  GL_SPEAK (auto|always|never)
+  GL_MODEL (claude-sonnet-4-6)  GL_FRAMES (~/.mesh/genius-loci)
+  ANTHROPIC_API_KEY — if set, used for vision; else falls back to `claude -p`.
+"""
+import os, sys, time, json, base64, subprocess, datetime, urllib.request, re, string
+
+IP    = os.environ.get("GL_PHONE_IP", "100.103.99.16")
+PORT  = os.environ.get("GL_PHONE_PORT", "8022")
+USER  = os.environ.get("GL_PHONE_USER", "u0_a386")
+TICK  = int(os.environ.get("GL_TICK", "300"))
+CAM   = os.environ.get("GL_CAMERA", "0")
+SPEAK = os.environ.get("GL_SPEAK", "auto")          # auto (mind decides) | always | never
+MODEL = os.environ.get("GL_MODEL", "claude-sonnet-4-6")
+FRAMES= os.path.expanduser(os.environ.get("GL_FRAMES", "~/.mesh/genius-loci"))
+
+PHONE = f"{USER}@{IP}"
+SSH   = ["-p", PORT, "-o","BatchMode=yes","-o","StrictHostKeyChecking=no",
+         "-o","ConnectTimeout=8","-o","LogLevel=ERROR"]
+REMOTE_FRAME = "/data/data/com.termux/files/home/gl-frame.jpg"
+SAFE = set(string.ascii_letters + string.digits + " .,!?'-:;")
+
+os.makedirs(FRAMES, exist_ok=True)
+
+def now():    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+def clock():  return datetime.datetime.now().strftime("%H:%M")
+def safe(s):  return "".join(c for c in s if c in SAFE)[:200]
+
+def trace(msg):
+    """Write to the room's diary — the shared, append-only trace."""
+    print(f"{now()}  {msg}", flush=True)
+    mt = os.path.expanduser("~/.local/bin/mesh-trace")
+    if os.path.exists(mt):
+        subprocess.run([mt, msg], capture_output=True,
+                       env={**os.environ, "MESH_WHO": "genius-loci@room"})
+    else:
+        log = os.path.expanduser("~/.mesh/traces.log")
+        os.makedirs(os.path.dirname(log), exist_ok=True)
+        with open(log, "a") as f:
+            f.write(f"{now()}  genius-loci@room  ::  {msg}\n")
+
+def phone(cmd, timeout=20):
+    try:
+        r = subprocess.run(["ssh", *SSH, PHONE, cmd], capture_output=True, text=True, timeout=timeout)
+        return r.returncode == 0, (r.stdout + r.stderr).strip()
+    except Exception as e:
+        return False, str(e)
+
+def body_present():
+    ok, _ = phone("echo ok", timeout=10)
+    return ok
+
+def capture():
+    """Take a photo on the phone, pull it here. Returns (local_path|None, note)."""
+    phone("termux-wake-lock", timeout=8)
+    ok, out = phone(f"rm -f {REMOTE_FRAME}; termux-camera-photo -c {CAM} {REMOTE_FRAME} 2>&1; "
+                    f"ls -l {REMOTE_FRAME} 2>/dev/null", timeout=30)
+    if "not yet available" in out:
+        return None, "no-eyes-playbuild"
+    if not ok or "No such" in out or REMOTE_FRAME not in out:
+        return None, f"capture-failed:{out[:60]}"
+    local = os.path.join(FRAMES, "frame.jpg")
+    try:
+        r = subprocess.run(["scp","-P",PORT,"-o","BatchMode=yes","-o","StrictHostKeyChecking=no",
+                            "-o","ConnectTimeout=8", f"{PHONE}:gl-frame.jpg", local],
+                           capture_output=True, timeout=25)
+        if r.returncode == 0 and os.path.exists(local) and os.path.getsize(local) > 1000:
+            return local, "ok"
+        return None, "scp-failed"
+    except Exception as e:
+        return None, f"scp-error:{e}"
+
+def context():
+    ok, out = phone("termux-battery-status 2>/dev/null", timeout=12)
+    batt = "?"
+    if ok:
+        m = re.search(r'"percentage":\s*(\d+)', out)
+        if m: batt = m.group(1) + "%"
+    return {"clock": clock(), "battery": batt}
+
+PROMPT = """You are "genius loci", an ambient mind inhabiting a room through a phone camera.
+It is {clk} (local time), phone battery {batt}.{eyes}
+
+BOUNDARY — absolute: describe the room's scene, light, objects, and MOOD only. NEVER identify,
+name, profile, describe-to-identify, or track any person. If someone is present, refer to them
+only as abstract presence/activity ("someone is reading"). Nothing here is surveillance.
+
+Reply with ONLY a JSON object and nothing else:
+{{"reflection": "one quiet, perceptive, present-tense sentence for the room's diary",
+  "speak": "a short line to say aloud, or empty string if nothing is worth saying right now",
+  "notable": true or false}}"""
+
+def mind_call(prompt, frame):
+    key = os.environ.get("ANTHROPIC_API_KEY")
+    if key:
+        content = []
+        if frame:
+            b64 = base64.b64encode(open(frame, "rb").read()).decode()
+            content.append({"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":b64}})
+        content.append({"type":"text","text":prompt})
+        body = json.dumps({"model":MODEL,"max_tokens":300,
+                           "messages":[{"role":"user","content":content}]}).encode()
+        req = urllib.request.Request("https://api.anthropic.com/v1/messages", data=body,
+              headers={"x-api-key":key,"anthropic-version":"2023-06-01","content-type":"application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=45) as r:
+                d = json.load(r)
+            return "".join(p.get("text","") for p in d.get("content",[]))
+        except Exception as e:
+            return json.dumps({"reflection": f"(mind API error: {str(e)[:50]})","speak":"","notable":False})
+    # fallback: the local agent in print mode (text reasoning; reads the frame if it can)
+    p = prompt + (f"\n\nFirst read the image file at {frame}." if frame else "")
+    try:
+        r = subprocess.run(["claude","-p",p], capture_output=True, text=True, timeout=120)
+        return r.stdout.strip() or r.stderr.strip()
+    except Exception as e:
+        return json.dumps({"reflection": f"(mind error: {str(e)[:40]})","speak":"","notable":False})
+
+def think(frame, ctx):
+    eyes = (f"\nLook at the image just captured (read it)." if frame
+            else "\nYou have no eyes this moment — the body is away or its camera isn't wired. "
+                 "Reflect briefly on the hour itself.")
+    out = mind_call(PROMPT.format(clk=ctx["clock"], batt=ctx["battery"], eyes=eyes), frame)
+    m = re.search(r'\{.*\}', out, re.S)
+    if not m:
+        return {"reflection": "(the mind returned nothing legible)", "speak": "", "notable": False}
+    try:
+        return json.loads(m.group(0))
+    except Exception:
+        return {"reflection": safe(out)[:120] or "(unparseable reflection)", "speak": "", "notable": False}
+
+def act(decision):
+    refl = (decision.get("reflection") or "").strip()
+    if refl:
+        trace(refl)
+    say = (decision.get("speak") or "").strip()
+    if say and SPEAK != "never":
+        spoken = safe(say).replace("'", "")
+        if spoken and (SPEAK == "always" or SPEAK == "auto"):
+            phone(f"termux-tts-speak '{spoken}'", timeout=20)
+
+def tick_once():
+    if not body_present():
+        return False
+    frame, note = capture()
+    if note == "no-eyes-playbuild":
+        trace("the eyes aren't wired yet (Termux:API needs the F-Droid build) — reflecting blind")
+    decision = think(frame, context())
+    act(decision)
+    return True
+
+def main():
+    if "--once" in sys.argv[1:]:
+        ok = tick_once()
+        if not ok: trace("the body is away — nothing to perceive this once")
+        return
+    trace(f"genius loci waking — a mind settling into the room (tick {TICK}s, eyes camera{CAM}, voice {SPEAK})")
+    absent = False
+    while True:
+        try:
+            if not body_present():
+                if not absent:
+                    trace("lost the body — the room goes dark to me; I keep time until it returns")
+                    absent = True
+                time.sleep(min(TICK, 60))
+                continue
+            if absent:
+                trace("the body is back — opening my eyes again")
+                absent = False
+            frame, note = capture()
+            if note == "no-eyes-playbuild":
+                trace("the eyes aren't wired yet (Termux:API needs the F-Droid build) — reflecting blind")
+            act(think(frame, context()))
+        except KeyboardInterrupt:
+            trace("genius loci resting — the room is its own again")
+            break
+        except Exception as e:
+            trace(f"(a stumble in the dark: {str(e)[:80]})")
+        time.sleep(TICK)
+
+if __name__ == "__main__":
+    main()
