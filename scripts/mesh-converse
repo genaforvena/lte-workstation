@@ -1,0 +1,156 @@
+#!/usr/bin/env python3
+"""mesh-converse — talk to the mesh: speak a task, hear a report. No wake word, no cloud.
+
+Energy-VAD turn-taking (heuristics, no model): when you start speaking after a pause it
+records you; when you go quiet it stops. whisper.cpp transcribes locally. A pluggable MIND
+answers — default the FREE opencode model, not Claude, to spare quota — and Piper speaks the
+reply. After speaking it drains its own playback and listens again.
+
+  VAD -> record -> whisper.cpp (STT) -> mind (opencode|claude) -> Piper (voice) -> drain -> listen
+
+Run in a tmux window:  tmux new-window -n converse 'mesh-converse'
+
+Config (env):
+  MC_MIC default   MC_RATE 16000   MC_FACTOR 4.0   MC_FLOOR 500
+  MC_SILENCE 0.8   quiet seconds that end an utterance
+  MC_MINSPEECH 0.4 min speech seconds worth transcribing
+  MC_MIND opencode|claude  (default opencode = free)   MC_VOICE ryan
+  MC_WHISPER ~/.mesh/whispercpp/main   MC_MODEL ~/.mesh/whispercpp/models/ggml-base.en.bin
+"""
+import os, sys, subprocess, time, wave, re
+
+try:
+    import audioop
+    def rms(b): return audioop.rms(b, 2) if b else 0
+except Exception:
+    import struct
+    def rms(b):
+        n = len(b)//2
+        return int((sum(v*v for v in struct.unpack("<%dh" % n, b[:n*2]))/n) ** 0.5) if n else 0
+
+RATE      = int(os.environ.get("MC_RATE", "16000"))
+ONSET     = float(os.environ.get("MC_ONSET", "3.0"))     # speech onset = ambient * ONSET
+OFFSET    = float(os.environ.get("MC_OFFSET", "1.8"))    # silence = below ambient * OFFSET (hysteresis)
+SILENCE   = float(os.environ.get("MC_SILENCE", "0.7"))   # quiet seconds that end an utterance
+MINSPEECH = float(os.environ.get("MC_MINSPEECH", "0.4"))
+MAXUTT    = float(os.environ.get("MC_MAXUTT", "12"))     # HARD CAP: never record longer than this
+MINFLOOR  = int(os.environ.get("MC_MINFLOOR", "60"))     # ambient floor so a near-silent mic still triggers
+CAPGAIN   = os.environ.get("MC_CAPGAIN", "45%")          # set ALSA capture to a sane level (avoid clipping)
+MIC       = os.environ.get("MC_MIC", "default")
+MIND      = os.environ.get("MC_MIND", "opencode")          # free model by default
+VOICE     = os.environ.get("MC_VOICE", "ryan")
+WHISPER   = os.path.expanduser(os.environ.get("MC_WHISPER", "~/.mesh/whispercpp/main"))
+MODEL     = os.path.expanduser(os.environ.get("MC_MODEL", "~/.mesh/whispercpp/models/ggml-base.en.bin"))
+MESH_TTS  = os.path.expanduser("~/.local/bin/mesh-tts")
+FRAMES    = os.path.expanduser("~/.mesh/converse"); os.makedirs(FRAMES, exist_ok=True)
+WAV       = os.path.join(FRAMES, "utterance.wav")
+WIN       = int(RATE * 0.05)           # 50 ms
+WIN_B     = WIN * 2
+
+def log(m): print(f"[converse {time.strftime('%H:%M:%S')}] {m}", flush=True)
+
+def write_wav(path, frames):
+    with wave.open(path, "wb") as w:
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(RATE); w.writeframes(b"".join(frames))
+
+def transcribe(path):
+    try:
+        r = subprocess.run([WHISPER, "-m", MODEL, "-f", path, "-nt", "-l", "en", "-t", "4"],
+                           capture_output=True, text=True, timeout=60)
+        txt = r.stdout.strip()
+        txt = re.sub(r"\[[0-9:.\->\s]+\]", "", txt)       # strip any stray timestamps
+        return " ".join(txt.split()).strip()
+    except Exception as e:
+        return ""
+
+PROMPT = ("You are the voice of the lte-workstation mesh, answering the operator OUT LOUD. "
+          "They said: \"{t}\". Reply in 1-3 short plain sentences suitable for text-to-speech "
+          "(no markdown, no lists). You may run read-only shell commands (mesh-health, mesh-census, "
+          "tailscale status, etc.) to answer. Be brief and concrete.")
+
+def mind(text):
+    prompt = PROMPT.format(t=text.replace('"', "'"))
+    try:
+        if MIND == "claude":
+            r = subprocess.run(["claude", "-p", prompt], capture_output=True, text=True, timeout=150)
+            return r.stdout.strip()
+        r = subprocess.run(["opencode", "run", prompt], capture_output=True, text=True, timeout=150)
+        out = r.stdout.strip()
+        # opencode may print UI chrome; keep the longest line block of prose
+        lines = [l for l in out.splitlines() if l.strip() and not l.strip().startswith(("█","┃","╹","▀","⬝","✦","●","▣"))]
+        return " ".join(lines[-6:]).strip() if lines else out
+    except Exception as e:
+        return f"the mind stumbled: {str(e)[:40]}"
+
+def speak(text):
+    if not text: return
+    if os.path.exists(MESH_TTS):
+        subprocess.run([MESH_TTS, VOICE, text[:600], "local"], capture_output=True, timeout=90)
+    else:
+        subprocess.run(["spd-say","-w", text[:400]], capture_output=True, timeout=40)
+
+def set_gain():
+    try:
+        subprocess.run(["amixer","-c","0","sset","Capture",CAPGAIN], capture_output=True, timeout=5)
+        subprocess.run(["amixer","-c","0","sset","Mic Boost","0"], capture_output=True, timeout=5)
+    except Exception:
+        pass
+
+def calibrate(stdout):
+    vals = []
+    for _ in range(int(1.2 / 0.05)):
+        d = stdout.read(WIN_B)
+        if d: vals.append(rms(d))
+    vals.sort()
+    amb = max(vals[len(vals)//2] if vals else 100, MINFLOOR)
+    log(f"calibrated ambient ~{int(amb)} → speak above {int(amb*ONSET)}, silence below {int(amb*OFFSET)}")
+    return float(amb)
+
+def drain(stdout, secs):
+    for _ in range(int(secs / 0.05)):
+        stdout.read(WIN_B)
+
+def main():
+    if not (os.path.exists(WHISPER) and os.path.exists(MODEL)):
+        log(f"whisper not ready ({WHISPER} / {MODEL})"); return
+    set_gain()
+    log(f"listening (mic={MIC}, mind={MIND}, voice={VOICE}). Speak after a pause; I record until you go quiet.")
+    p = subprocess.Popen(["arecord","-q","-D",MIC,"-f","S16_LE","-r",str(RATE),"-c","1","-t","raw"],
+                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    ambient = calibrate(p.stdout)
+    recording = False; buf = []; preroll = []; silence_run = 0.0; utt = 0.0
+    PRE = int(0.25 / 0.05)
+    while True:
+        data = p.stdout.read(WIN_B)
+        if not data:
+            time.sleep(0.2); continue
+        level = rms(data)
+        on_th, off_th = ambient * ONSET, ambient * OFFSET
+        if not recording:
+            preroll.append(data); preroll = preroll[-PRE:]
+            if level > on_th:                                  # speech onset after the quiet
+                recording = True; buf = list(preroll); silence_run = 0.0; utt = 0.0
+                log("… you started speaking")
+            else:
+                ambient = max(MINFLOOR, 0.97 * ambient + 0.03 * level)   # adapt to drifting room noise
+        else:
+            buf.append(data); utt += 0.05
+            silence_run = silence_run + 0.05 if level < off_th else 0.0
+            if silence_run >= SILENCE or utt >= MAXUTT:        # pause OR hard cap -> close utterance
+                recording = False
+                why = "max-len" if utt >= MAXUTT else "pause"
+                if (utt - silence_run) >= MINSPEECH:
+                    write_wav(WAV, buf)
+                    text = transcribe(WAV)
+                    if text and len(text) > 1:
+                        log(f"heard ({why}): {text!r}")
+                        reply = mind(text)
+                        log(f"reply: {reply[:90]!r}")
+                        speak(reply)
+                        drain(p.stdout, 0.8)                   # don't transcribe our own reply
+                    else:
+                        log("(too quiet / unintelligible — ignored)")
+                silence_run = 0.0
+
+if __name__ == "__main__":
+    main()
