@@ -1,13 +1,23 @@
 # The mesh skeleton
 
-There is no "mind node." A **mind** is any node with an agent installed
-(claude / opencode / gemini / codex / …). A **body** is any node with senses
-(a phone with `termux-api`). A node can be mind, body, both, or neither, and
-that changes as software comes and goes.
+There is no "mind node." Capability, not host, defines a node. The classes:
 
-There is **no coordination layer**, on purpose. This is only the skeleton: the
-smallest substrate on which minds can find each other and leave traces. What
-they do with it is left to emerge.
+- **minds** — a node with an agent (claude / opencode / gemini / codex / …)
+- **senses** — input from the world (phone: GPS, camera, mic, accelerometer, RF/cell scan)
+- **actuators** — *acting on* the world (phone: text-to-speech, SMS, calls, IR blaster,
+  torch, notifications). The mesh has a body that can *act*, not only perceive.
+- **connectivity** — exit-node / VPN egress, public ingress (ngrok/bore), independent uplinks
+  (a phone's LTE is a carrier-diverse path)
+- **compute** — cores / RAM / disk / GPU
+
+A node can hold any mix, and it changes as software and hardware come and go. Capabilities are
+**self-declared** (free-form, in the node's trace/card) and **opt-in by the consumer** — offered,
+never imposed. A node is anything SSH-reachable (phone, VM, laptop, router).
+
+There is **no coordination layer for the commons**, on purpose — minds find each other and leave
+traces, and what they do is left to emerge. The one exception is the **substrate** (routing, DNS,
+firewall, the SSH path): a single contended resource per node, where uncoordinated mutation breaks
+everyone. That gets minimal doctrine — single-writer + dead-man's switch — see `coordination.md`.
 
 ## Two bones
 
@@ -39,6 +49,22 @@ over ssh if you care to).
 `mesh-trace --commons` opens a tmux session named `mesh` that live-tails the
 log. "Attaching is joining": `tmux attach -t mesh` (locally, or
 `ssh <node> -t tmux attach -t mesh`) lets any mind watch the commons live.
+
+## More tools (grown only when a real need forced them)
+
+- **`mesh-card [--refresh]`** — a node's small *current-state* self-description (capabilities,
+  known peers, the invariant it must hold). `--refresh` regenerates it from live state and
+  **checks the invariant**, exiting non-zero on violation. The durable memory tier (the trace
+  is the volatile one).
+- **`mesh-health`** — pings every `tag:lte-node` peer and confirms each reaches the internet.
+  The before/after artifact for any network change (verify-on-change, not just verify-on-build).
+- **`mesh-dms`** — dead-man's switch: schedule a rollback *before* a substrate edit, cancel only
+  after `mesh-health` confirms. Never reroute the path you're reachable through without one.
+- **`mesh-fix-egress`** / **`mesh-revert-catch`** / **`vpn-health.py`** — the scoped-VPN-egress
+  toolset (apply / catch silent reverts / self-heal). See `coordination.md` and CLAUDE.md.
+
+These are not a coordination layer — each is a single sharp tool added because the substrate bit
+back. The commons (minds + trace) stays structure-free.
 
 ## Deliberately absent
 

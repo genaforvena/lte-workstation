@@ -1,6 +1,6 @@
 # lte-workstation — Node Operator Context
 
-This machine (`imozerov-Default-string`, Tailscale IP: `100.125.157.75`) is the **mind** node of the lte-workstation mesh. Claude Code runs here as the node operator.
+This file documents the `imozerov-Default-string` operator context. There is **no fixed mind** — a mind is any node running an agent (`docs/mesh-skeleton.md`); run `hostname` to know which body you're in. The sections below describe default-string's services and capabilities specifically.
 
 ## Your role
 
@@ -22,10 +22,12 @@ for k,p in d.get('Peer',{}).items():
 "
 ```
 
-Known nodes as of 2026-06-06:
-- `Redmi 10` — 100.103.99.16 (android, tag:lte-node) — phone body
-- `ilya` — 100.107.198.111 (linux, tag:lte-node)
-- `imozerov-IdeaPad-3-15IIL05` — 100.73.170.56 (linux, tag:lte-node, offline)
+Known nodes as of 2026-06-07:
+- `imozerov-Default-string` — 100.125.157.75 (linux) — mind; **VPN exit-node** (scoped egress), public ingress (ngrok/bore/proxy-bot), LAN-gateway-adjacent. 4c/15Gi.
+- `imozerov-IdeaPad-3-15IIL05` — 100.73.170.56 (linux) — mind; exit-node *consumer* (egress via default-string's VPN). 8c/7.3Gi/210G.
+- `Redmi 10` — 100.103.99.16 (android, SSH port 8022, user `u0_a386`) — **body**: senses (GPS/cam/mic/sensors/RF) **and actuators** (TTS/SMS/calls/IR/torch/notify); independent MegaFon LTE uplink. 8c.
+- `ilya` — 100.107.198.111 (linux) — offline (different location; needs physical power-on).
+- router `192.168.8.1` (GL-MT3000 OpenWRT) — **not a node yet**: LAN gateway, SSH open, but not on Tailscale and not onboarded.
 
 ## Phone access (body node: Redmi 10)
 
@@ -47,7 +49,7 @@ See `docs/body.md` for full verification protocol (always check artifact size/va
 ## Services managed on this node
 
 ```bash
-systemctl --user status ngrok.service bore-mtg.service proxy-bot.service vpn-hub.service
+systemctl --user status ngrok.service bore-mtg.service proxy-bot.service
 ```
 
 | Service | Purpose | Status |
@@ -100,16 +102,37 @@ All agent work runs in the one shared **hostname-named** session (`tmux new-sess
 
 Each node keeps a small current-state card (`mesh-card --refresh` regenerates it from live state and checks the substrate invariant). It is the durable memory tier; the trace (`~/.mesh/traces.log`) is the volatile history tier.
 
-## WireGuard mesh
+## VPN egress (scoped — the operator's feature, not the mesh's)
 
-- Hub IP: `100.125.157.75` (this machine)
-- Subnet: `10.9.0.0/24`
-- Node DB: `~/.wg-mesh-nodes.json`
-- Hub API: `http://100.125.157.75:9999/<hostname>` → returns WireGuard config
+The central WireGuard overlay (`vpn-hub`, `10.9.0.0/24`, `~/.wg-mesh-nodes.json`) is
+**retired** (2026-06-07). Topology is now flat Tailscale reachability + node-local/gossiped
+trace — no central registry.
+
+default-string offers VPN egress as an **opt-in, scoped** capability (Gtcld → upstream VPN):
+- The **host control plane stays on the clean route** (`Table=off`); only forwarded exit-node
+  client traffic is marked (`MESH_VPN` chain, LAN+CGNAT excluded) → table 200 → Gtcld → MASQUERADE.
+- Only consenting nodes set `--exit-node=default-string` (currently just the IdeaPad).
+- `vpn-health.py` (root daemon) self-heals the *scoped* tunnel; `mesh-fix-egress` re-applies it.
+- **Invariant:** a node offering a route never carries its own reachability on it. `mesh-card
+  --refresh` flags violations. See `docs/coordination.md`.
+
+## Mesh tooling (`~/.local/bin/`)
+
+`mesh-minds` (live capability probe) · `mesh-trace` (shared append-only trace, `~/.mesh/traces.log`) ·
+`mesh-card [--refresh]` (node self-description + invariant check) · `mesh-health` (per-node internet,
+before/after artifact) · `mesh-dms` (dead-man's switch for substrate edits) · `mesh-fix-egress`
+(restore scoped egress) · `mesh-revert-catch` (catch silent full-tunnel reverts).
+
+## Capabilities (self-declared, opt-in by consumers)
+
+Classes: **minds** (agents) · **senses** (sensors) · **actuators** (act on the world — phone TTS/SMS/
+calls/IR) · **connectivity** (exit-node, public ingress, independent uplinks) · **compute**. A node
+declares what it offers; consumers read the trace/card and opt in. Nothing is imposed.
 
 ## Key paths
 
-- Config: `~/.config/remote-access/env`
-- Scripts: `~/.local/bin/` (ngrok-notify.sh, bore-mtg.sh, proxy-bot.py, vpn-hub.py)
+- Config: `~/.config/remote-access/env`  (BOT_TOKEN, CHAT_ID, MTG_SECRET)
+- Mesh tools: `~/.local/bin/mesh-*`  ·  trace: `~/.mesh/traces.log`  ·  card: `~/.mesh-card`
+- Userland scripts: `~/.local/bin/` (ngrok-notify.sh, bore-mtg.sh, proxy-bot.py)
 - Services: `~/.config/systemd/user/`
-- WireGuard DB: `~/.wg-mesh-nodes.json`
+- Scoped VPN config: `/etc/wireguard/Gtcld.conf` (Table=off) · watchdog: `~/.mesh/vpn-health.py`
