@@ -1,0 +1,193 @@
+#!/usr/bin/env python3
+"""mesh-census — measure the mesh's capability coverage, and its progress over time.
+
+Extends mesh-minds: probes every tag:lte-node for the FULL capability surface across
+classes (minds / senses / actuators / connectivity / compute), marks verified vs merely
+detected, checks health + the per-node invariant, and appends a snapshot to PROGRESS.md
+so the trajectory is legible. Progress = the delta between censuses.
+
+BOUNDARY (enforced here): actuators are DETECTED (the verb exists), never FIRED. This
+census never sends an SMS, places a call, blasts IR, or triggers mic/camera. Verification
+is limited to no-side-effect probes (battery read, compute, connectivity).
+
+Usage:
+  mesh-census            # human report + append snapshot to PROGRESS.md
+  mesh-census --json     # machine-readable
+  mesh-census --no-log   # don't append to PROGRESS.md
+"""
+import json, os, subprocess, sys, concurrent.futures, datetime
+
+AGENTS = ["claude", "opencode", "gemini", "codex", "aider", "llm", "ollama"]
+
+# termux verbs (prefix 'termux-' stripped) -> capability class
+SENSE = {"battery-status","camera-info","camera-photo","microphone-record","location","sensor",
+         "telephony-cellinfo","telephony-deviceinfo","wifi-connectioninfo","wifi-scaninfo",
+         "audio-info","nfc","fingerprint","speech-to-text","clipboard-get","contact-list",
+         "sms-inbox","sms-list","call-log","infrared-frequencies","usb"}
+ACTUATOR = {"tts-speak","sms-send","telephony-call","infrared-transmit","torch","vibrate",
+            "notification","media-player","toast","volume","brightness","wifi-enable",
+            "clipboard-set","share","open-url","wallpaper","download","dialog"}
+
+SSH = ["-o","BatchMode=yes","-o","ConnectTimeout=8","-o","StrictHostKeyChecking=no","-o","LogLevel=ERROR"]
+REPO_PROGRESS = os.path.expanduser("~/lte-workstation/PROGRESS.md")
+
+LINUX_PROBE = (r'''
+m=""
+for a in ''' + " ".join(AGENTS) + r'''; do command -v "$a" >/dev/null 2>&1 && m="$m $a"; done
+echo "MINDS:$m"
+echo "COMPUTE:cores=$(nproc 2>/dev/null) mem=$(free -h 2>/dev/null|awk '/Mem/{print $2}') disk=$(df -h / 2>/dev/null|awk 'NR==2{print $4}')"
+ing=""
+for s in ngrok bore-mtg proxy-bot; do systemctl --user is-active "$s" >/dev/null 2>&1 && ing="$ing $s"; done
+dev=$(ip route get 1.1.1.1 2>/dev/null|grep -oP 'dev \K\S+'|head -1)
+ex=$(tailscale debug prefs 2>/dev/null | tr -d ' ' | grep -c '"0.0.0.0/0"')
+echo "CONN:default-dev=$dev ingress=$ing exit-advertise=$ex"
+inet=$(ping -c1 -W3 1.1.1.1 >/dev/null 2>&1 && echo ok || echo fail); echo "INET:$inet"
+''')
+
+ANDROID_PROBE = (r'''
+verbs=$(ls "$PREFIX/bin" 2>/dev/null | grep '^termux-' | sed 's/^termux-//' | paste -sd' ' -)
+echo "TERMUX:$verbs"
+echo "COMPUTE:cores=$(nproc 2>/dev/null) mem=$(free -h 2>/dev/null|awk '/Mem/{print $2}')"
+echo "CONN:uplink=$(getprop gsm.operator.alpha 2>/dev/null | tr -d ' ' | head -c 24)"
+bat=$(termux-battery-status 2>/dev/null | grep -c percentage); echo "VERIFY-BATTERY:$bat"
+m=""
+for a in ''' + " ".join(AGENTS) + r'''; do command -v "$a" >/dev/null 2>&1 && m="$m $a"; done
+echo "MINDS:$m"
+inet=$(ping -c1 -W3 1.1.1.1 >/dev/null 2>&1 && echo ok || echo fail); echo "INET:$inet"
+''')
+
+
+def nodes():
+    out = subprocess.run(["tailscale","status","--json"], capture_output=True, text=True).stdout
+    d = json.loads(out)
+    res = []
+    me = d.get("Self", {})
+    res.append({"host": me.get("HostName"), "ip": (me.get("TailscaleIPs") or ["?"])[0],
+                "online": True, "os": me.get("OS"), "self": True})
+    for p in d.get("Peer", {}).values():
+        if "tag:lte-node" in (p.get("Tags") or []):
+            res.append({"host": p.get("HostName"), "ip": p["TailscaleIPs"][0],
+                        "online": p.get("Online"), "os": p.get("OS"), "self": False})
+    return res
+
+
+def probe(node):
+    n = dict(node, minds=[], senses=[], actuators=[], connectivity=[], compute="",
+             inet="?", invariant="?", reached=False)
+    # Probe by REACHABILITY, not the (often-stale) Tailscale Online flag — a node can be
+    # reachable over a direct path while the coordination server still lists it offline.
+    android = node["os"] == "android"
+    body = ANDROID_PROBE if android else LINUX_PROBE
+    try:
+        if node["self"]:
+            cmd = ["bash","-ls"]
+        elif android:
+            cmd = ["ssh","-p","8022",*SSH,f"u0_a386@{node['ip']}","bash -ls"]
+        else:
+            cmd = ["ssh",*SSH,f"{os.environ.get('USER','')}@{node['ip']}","bash -ls"]
+        r = subprocess.run(cmd, input=body, capture_output=True, text=True, timeout=30)
+        for line in r.stdout.splitlines():
+            if line.startswith("MINDS:"):
+                n["minds"] = line[6:].split(); n["reached"] = True
+            elif line.startswith("TERMUX:"):
+                for v in line[7:].split():
+                    if v in SENSE: n["senses"].append(v)
+                    elif v in ACTUATOR: n["actuators"].append(v)
+            elif line.startswith("COMPUTE:"):
+                n["compute"] = line[8:].strip()
+            elif line.startswith("CONN:"):
+                c = line[5:]
+                if "exit-advertise=1" in c or "exit-advertise=2" in c: n["connectivity"].append("exit-node")
+                if "ingress=" in c and c.split("ingress=")[1].split("exit")[0].strip(): n["connectivity"].append("public-ingress")
+                if "uplink=" in c:
+                    up = c.split("uplink=")[1].strip()
+                    if up and up != "": n["connectivity"].append(f"uplink:{up}")
+                # invariant: own default egress must NOT be a wireguard tunnel
+                dev = ""
+                if "default-dev=" in c: dev = c.split("default-dev=")[1].split()[0] if c.split("default-dev=")[1].split() else ""
+                if dev:
+                    n["invariant"] = "VIOLATED" if (dev == "Gtcld" or dev.startswith("wg")) else "OK"
+                    if n["invariant"] == "OK" and "exit-node" not in n["connectivity"]:
+                        pass
+            elif line.startswith("INET:"):
+                n["inet"] = line[5:].strip()
+            elif line.startswith("VERIFY-BATTERY:"):
+                n["battery_verified"] = line[15:].strip() == "1"
+    except Exception as e:
+        n["error"] = str(e)
+    return n
+
+
+def census():
+    ns = nodes()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        res = list(ex.map(probe, ns))
+    up = [r for r in res if r.get("reached")]
+    # aggregate surface
+    surf = {"minds": 0, "senses": 0, "actuators": 0, "connectivity": 0, "compute": 0}
+    for r in res:
+        surf["minds"] += len(r["minds"])
+        surf["senses"] += len(r["senses"])
+        surf["actuators"] += len(r["actuators"])
+        surf["connectivity"] += len(r["connectivity"])
+        surf["compute"] += 1 if r["compute"] else 0
+    health_ok = sum(1 for r in up if r.get("inet") == "ok")
+    inv = [f"{r['host']}={r['invariant']}" for r in res if r["invariant"] in ("OK","VIOLATED")]
+    return res, surf, up, health_ok, inv
+
+
+def fmt_report(res, surf, up, health_ok, inv, ts):
+    L = []
+    L.append(f"=== MESH CENSUS {ts} ===")
+    L.append(f"NODES: {len(up)}/{len(res)} up")
+    L.append("")
+    L.append(f"{'NODE':<28} {'M':>2} {'S':>2} {'A':>2}  CONNECTIVITY            COMPUTE")
+    for r in res:
+        if not r.get("reached"):
+            tag = "offline" if not r["online"] else "unreachable"
+            L.append(f"{(r['host'] or '?'):<28} {'—':>2} {'—':>2} {'—':>2}  {tag}"); continue
+        conn = ",".join(r["connectivity"]) or "-"
+        L.append(f"{(r['host'] or '?'):<28} {len(r['minds']):>2} {len(r['senses']):>2} {len(r['actuators']):>2}  {conn:<22} {r['compute']}")
+    L.append("")
+    L.append("CAPABILITY SURFACE (across mesh):")
+    L.append(f"  minds={surf['minds']}  senses={surf['senses']}  actuators={surf['actuators']}  connectivity={surf['connectivity']}  compute-nodes={surf['compute']}")
+    L.append("  actuators are DETECTED, not fired (boundary). senses verified only by no-side-effect reads.")
+    L.append("")
+    L.append("HEALTH / INVARIANTS:")
+    L.append(f"  internet: {health_ok}/{len(up)} online nodes reach 1.1.1.1")
+    L.append(f"  invariant-check: {', '.join(inv) or 'n/a'}")
+    return "\n".join(L)
+
+
+def append_progress(surf, up, res, health_ok, inv, ts):
+    line = (f"\n## Census {ts}\n"
+            f"- Nodes up: {len(up)}/{len(res)}\n"
+            f"- Surface: minds={surf['minds']} senses={surf['senses']} actuators={surf['actuators']} "
+            f"connectivity={surf['connectivity']} compute-nodes={surf['compute']}\n"
+            f"- Health: {health_ok}/{len(up)} reach internet; invariants: {', '.join(inv) or 'n/a'}\n")
+    try:
+        new = not os.path.exists(REPO_PROGRESS)
+        with open(REPO_PROGRESS, "a") as f:
+            if new:
+                f.write("# Mesh progress log\n\nAppend-only census snapshots (newest at bottom). "
+                        "Generated by `mesh-census`. Progress = the delta between snapshots.\n")
+            f.write(line)
+        return REPO_PROGRESS
+    except Exception as e:
+        return f"(could not write progress log: {e})"
+
+
+def main():
+    ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    res, surf, up, health_ok, inv = census()
+    if "--json" in sys.argv[1:]:
+        print(json.dumps({"ts": ts, "surface": surf, "nodes": res,
+                          "health_ok": health_ok, "invariants": inv}, indent=2)); return
+    print(fmt_report(res, surf, up, health_ok, inv, ts))
+    if "--no-log" not in sys.argv[1:]:
+        where = append_progress(surf, up, res, health_ok, inv, ts)
+        print(f"\nsnapshot appended -> {where}")
+
+
+if __name__ == "__main__":
+    main()
