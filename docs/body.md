@@ -1,8 +1,27 @@
 # Phone as a body
 
-The VM has compute but no senses. The phone has senses — camera, microphone, GPS, accelerometer — but a hostile runtime for agents (glibc binaries don't run in Bionic). SSH between them and the agent on the VM can borrow the phone's hardware.
+The VM has compute but no senses. The phone has both **senses and actuators** — but a hostile
+runtime for agents (glibc binaries don't run in Bionic). SSH between them and the agent on the VM
+can borrow the phone's hardware. This document covers an agent on the VM reaching into the phone
+over SSH and driving it via `termux-api`.
 
-This document covers the second capability in this repo: an agent or script running on the VM reaching into the phone over SSH and driving its sensors via `termux-api`.
+## The phone's full surface (`termux-api`, ~40 verbs)
+
+It is not just camera/mic/GPS. Enumerate with `ls $PREFIX/bin | grep '^termux-'`. The classes:
+
+- **Senses (input):** `termux-location` (GPS), `termux-camera-photo`, `termux-microphone-record`,
+  `termux-sensor` (accel/gyro/light/…), `termux-battery-status`, `termux-telephony-cellinfo`,
+  `termux-wifi-scaninfo` (RF/localization), `termux-nfc`, `termux-fingerprint`, `termux-speech-to-text`.
+- **Actuators (act on the world):** `termux-tts-speak` (voice out), `termux-sms-send`,
+  `termux-telephony-call`, `termux-infrared-transmit` (control TVs/appliances), `termux-torch`,
+  `termux-vibrate`, `termux-notification`, `termux-media-player`, `termux-toast`, `termux-volume`,
+  `termux-brightness`, `termux-wifi-enable`, `termux-clipboard-set`, `termux-share`, `termux-open-url`.
+- **Personal data:** `termux-sms-inbox`, `termux-call-log`, `termux-contact-list`.
+- **Connectivity:** an independent LTE uplink (carrier-diverse from the VM's path) — a natural
+  out-of-band/backup ingress.
+
+The Verification Principle below applies to actuators too: "it spoke" is not proof; a heard
+utterance, a delivered SMS, a TV that changed channel — the *effect* is the artifact.
 
 ## Verification principle
 

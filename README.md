@@ -6,7 +6,7 @@ Three things live in this repo.
 
 **The phone as a body:** An agent running on the VM reaches back into the phone over SSH and drives its hardware — camera, microphone, GPS — via `termux-api`. The VM has compute but no senses; the phone has senses but a hostile runtime for agents. SSH between them and you get a machine that can both think and perceive.
 
-**The mesh:** Multiple machines — VMs, laptops, phones — all tagged `tag:lte-node` on Tailscale and joined to a WireGuard overlay. Each node is an entry point. No central authority. The agent on the mind-VM can SSH to any node in the mesh and borrow its sensors, run computations, or chain commands. The topology propagates through Tailscale; the mesh knows itself only locally.
+**The mesh:** Multiple machines — VMs, laptops, phones, (eventually) the router — all tagged `tag:lte-node` on Tailscale. Each node is an entry point; no central authority, no fixed mind. Any node running an agent can SSH to any other and borrow its self-declared capabilities — **minds, senses, actuators, connectivity, compute** — which consumers opt into. Topology is flat Tailscale reachability plus node-local, gossiped knowledge; the mesh knows itself only locally. (An earlier central WireGuard overlay + config hub was retired in favour of this.)
 
 ## Why
 
@@ -42,7 +42,7 @@ mosh your-user@your-tailscale-ip   # connect to the VM
                          ▼
 ┌───────────────────────────────────────────────────────────────────────┐
 │  Linux VM (the mind)                                         tag:lte-node │
-│  tmux · Claude Code · ngrok · bore · MTG proxy · vpn-hub             │
+│  tmux · Claude Code · ngrok · bore · MTG proxy · scoped VPN egress   │
 └──────┬────────────────────┬──────────────────────────────────────────┘
        │ ssh -p 8022        │ ssh (Tailscale)         │ ngrok TCP tunnel
        │ (Tailscale)        ▼                         │ → public SSH URL
@@ -63,9 +63,9 @@ The phone plays both roles simultaneously: window (you type through it) and body
 - **SSH fallback** via ngrok — dynamic public URL, auto-notified via Telegram bot
 - **Auto-notifications** — Telegram message with connection commands on boot
 - **Auto-start on reboot** — everything comes back up without manual action
-- **Phone sensor access** — VM agent captures audio, queries location, reads battery via termux-api
-- **Distributed mesh** — any Tailscale-tagged node can join via `node-join.sh`; nodes are discoverable and SSH-able from each other
-- **WireGuard overlay** — `vpn-hub.py` assigns each joining node a stable IP on `10.9.0.0/24`
+- **Phone as body** — VM agent drives the phone's senses *and actuators* (camera, mic, GPS, plus TTS/SMS/calls/IR) via termux-api
+- **Distributed mesh** — any Tailscale-tagged node can join via `node-join.sh`; nodes are discoverable and SSH-able from each other; capabilities are self-declared and opt-in
+- **Scoped VPN egress** — a node can opt into another's VPN as an exit-node; the offering node's own control plane stays on the clean route (only the consumer's traffic is tunnelled). See `docs/coordination.md`
 - **Optional: MTProto Telegram proxy** — for regions where Telegram is blocked; runs in Docker with host networking for stability; auto-restarted by watchdog if Telegram DCs become unreachable
 
 ## tmux as the nervous system
@@ -73,14 +73,13 @@ The phone plays both roles simultaneously: window (you type through it) and body
 The agent runs inside a named tmux session. Any operator — human or agent — can attach:
 
 ```bash
-tmux new-session -d -s operator
-tmux attach -t operator
+tmux new-session -A -s "$(hostname)"          # attach-or-create, named by hostname (convention)
 
 # from another node over SSH
-ssh user@vm-tailscale-ip -t tmux attach -t operator
+ssh user@node-tailscale-ip -t 'tmux new-session -A -s "$(hostname)"'
 ```
 
-The scrollback is the agent's working memory. Attaching is joining the same sensorium. See `docs/distributed-embodied-agent.md`.
+The scrollback is the agent's working memory. Attaching is joining the same sensorium. The session is **append-only** — open new windows/panes; never kill/clear (the only intended decay is reboot). Concurrent agents take a window/pane each. See `docs/distributed-embodied-agent.md`.
 
 ## Prerequisites
 
@@ -106,7 +105,7 @@ Any Linux machine with Tailscale can join:
 ./scripts/node-join.sh
 ```
 
-The script enables Tailscale SSH, advertises `tag:lte-node`, fetches a WireGuard config from the hub, and brings up `wg-mesh`. Your Tailscale ACL needs:
+The script enables Tailscale SSH and advertises `tag:lte-node`. (There is no central WireGuard hub anymore — flat Tailscale reachability replaces the old `10.9.0.0/24` overlay.) Your Tailscale ACL needs:
 
 ```json
 "tagOwners": { "tag:lte-node": ["autogroup:member"] },
@@ -129,8 +128,9 @@ tailscale status --json | jq -r '.Peer[] | select(.Tags // [] | index("tag:lte-n
 
 1. `ngrok.service` opens a TCP tunnel to port 22 and sends a Telegram message with the SSH command and permanent mosh address
 2. `bore-mtg.service` (if enabled) sends two proxy buttons: Tailscale IP (permanent) and bore.pub (fallback)
-3. `vpn-hub.service` listens on port 9999 and serves WireGuard configs to joining nodes
-4. `mtg-watchdog.timer` checks every 5 minutes and restarts MTG if Telegram DC connections are failing
+3. `mtg-watchdog.timer` checks every 5 minutes and restarts MTG if Telegram DC connections are failing
+
+(`vpn-hub.service` — the old WireGuard config server on port 9999 — is retired.)
 
 The bore.pub port changes on restart — the bot always sends the fresh link. **Use the Tailscale link on LTE.**
 
@@ -184,22 +184,26 @@ When the bore.pub port changes, all approved users are automatically sent the up
 
 ```
 docs/
-  body.md                       # phone-as-body: termux-api, sensor access, verification
+  mesh-skeleton.md              # the minimal kernel: capability classes + the mesh tools
+  coordination.md               # substrate changes + multi-agent single-writer protocol
+  body.md                       # phone-as-body: termux-api senses + actuators, verification
   distributed-embodied-agent.md # mesh theory, tmux perception, Guattari appendix
 scripts/
+  mesh-minds                    # live capability probe (registry-free)
+  mesh-trace                    # shared append-only trace surface (~/.mesh/traces.log)
+  mesh-card                     # node self-description + --refresh invariant check
+  mesh-health                   # per-node internet reachability (before/after artifact)
+  mesh-dms                      # dead-man's switch wrapper for substrate edits
+  mesh-fix-egress               # restore scoped VPN egress (host clean, client tunnelled)
+  mesh-revert-catch             # catch silent full-tunnel reverts (identifies the culprit)
+  vpn-health.py                 # self-healing watchdog for the scoped VPN tunnel
   ngrok-notify.sh               # Telegram notification: SSH addr + mosh cmd
   bore-mtg.sh                   # bore tunnel loop + proxy notification + user auto-notify
   proxy-bot.py                  # access-control bot: approve/deny proxy requests
-  vpn-hub.py                    # WireGuard mesh config server (runs on hub node)
-  node-join.sh                  # register any Linux node into the mesh
-  node-join-android.sh          # register an Android phone as a node (run from hub)
-  mtg-watchdog.sh               # restart MTG if Telegram connections are failing
-  ngrok.service                 # systemd user service
-  bore-mtg.service              # systemd user service
-  proxy-bot.service             # systemd user service
-  vpn-hub.service               # systemd user service
-  mtg-watchdog.service          # oneshot service called by the timer
-  mtg-watchdog.timer            # runs watchdog every 5 minutes
+  node-join.sh / node-join-android.sh   # register a node (vpn-hub fetch step is retired)
+  mtg-watchdog.{sh,service,timer}        # restart MTG if Telegram connections fail
+  ngrok.service / bore-mtg.service / proxy-bot.service   # systemd user services
+  vpn-hub.py / vpn-hub.service   # RETIRED — central WireGuard registry, no longer used
 setup.sh                        # one-time interactive setup
 CLAUDE.md                       # node operator context for Claude Code
 ```
@@ -218,7 +222,7 @@ systemctl --user restart bore-mtg.service
 
 **Check service status:**
 ```bash
-systemctl --user status ngrok.service bore-mtg.service proxy-bot.service vpn-hub.service
+systemctl --user status ngrok.service bore-mtg.service proxy-bot.service
 systemctl --user list-timers mtg-watchdog.timer
 docker logs mtg --since 10m
 ```
@@ -226,7 +230,8 @@ docker logs mtg --since 10m
 **Check mesh nodes:**
 ```bash
 tailscale status --json | jq -r '.Peer[] | select(.Tags // [] | index("tag:lte-node")) | "\(.HostName) \(.TailscaleIPs[0]) online:\(.Online)"'
-curl -s http://localhost:9999/nodes   # WireGuard mesh assignments
+mesh-minds            # live capability table (minds/senses per node)
+mesh-health           # per-node internet reachability
 ```
 
 ## Limits
