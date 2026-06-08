@@ -26,7 +26,9 @@ SUDO=""; [ "$(id -u)" -ne 0 ] && have sudo && SUDO="sudo"
 
 # ---- package manager abstraction (works across geos/distros) ------------
 PM=""; SSHD_PKG="openssh-server"
-if   have apt-get; then PM="apt"
+if   [ "$(uname)" = "Darwin" ] && have brew; then PM="brew"; SSHD_PKG=""   # macOS: sshd is built-in
+elif [ "$(uname)" = "Darwin" ]; then PM="brew-missing"; SSHD_PKG=""; echo "  ! macOS without Homebrew — install it first: /bin/bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\""
+elif have apt-get; then PM="apt"
 elif have dnf;     then PM="dnf"
 elif have yum;     then PM="yum"
 elif have pacman;  then PM="pacman"; SSHD_PKG="openssh"
@@ -35,6 +37,8 @@ elif have zypper;  then PM="zypper"; SSHD_PKG="openssh"
 fi
 pkg(){ # pkg <names...>
   case "$PM" in
+    brew)   brew install "$@" 2>/dev/null ;;
+    brew-missing) echo "  ! install Homebrew, then re-run: $*"; return 1 ;;
     apt)    $SUDO apt-get update -qq 2>/dev/null; $SUDO apt-get install -y -qq "$@" ;;
     dnf)    $SUDO dnf install -y -q "$@" ;;
     yum)    $SUDO yum install -y -q "$@" ;;
@@ -54,7 +58,10 @@ have sshd || have /usr/sbin/sshd || pkg "$SSHD_PKG" 2>/dev/null || true
 
 # ---- BEACHHEAD: sshd + tmux up before anything that can fail ------------
 log "beachhead (sshd + tmux '$NODE') — the recovery channel"
-if have systemctl; then
+if [ "$(uname)" = "Darwin" ]; then
+  $SUDO systemsetup -setremotelogin on >/dev/null 2>&1 && echo "  Remote Login (sshd) on" \
+    || echo "  ! enable Remote Login by hand: System Settings → General → Sharing → Remote Login"
+elif have systemctl; then
   $SUDO systemctl enable --now ssh 2>/dev/null || $SUDO systemctl enable --now sshd 2>/dev/null || true
 elif have rc-service; then $SUDO rc-service sshd start 2>/dev/null || true; fi
 if have tmux; then
@@ -77,11 +84,21 @@ if [ -d "$REPO_DIR/scripts" ]; then
     install -m755 "$f" ~/.local/bin/ 2>/dev/null && echo "  $b"
   done
 fi
-case ":$PATH:" in *":$HOME/.local/bin:"*) :;; *) echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc; export PATH="$HOME/.local/bin:$PATH";; esac
+case ":$PATH:" in *":$HOME/.local/bin:"*) :;; *)
+  echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+  [ "$(uname)" = "Darwin" ] && echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc   # macOS default shell is zsh
+  export PATH="$HOME/.local/bin:$PATH";; esac
 
 # ---- join the mesh (auth, NO secrets in the link) -----------------------
 log "tailscale (join flat + tagged; routing untouched)"
-have tailscale || { echo "  installing tailscale…"; curl -fsSL https://tailscale.com/install.sh | $SUDO sh 2>/dev/null || echo "  ! install tailscale by hand"; }
+have tailscale || {
+  if [ "$(uname)" = "Darwin" ] && have brew; then
+    echo "  installing tailscale via brew…"; brew install tailscale 2>/dev/null
+    $SUDO tailscaled install-system-daemon 2>/dev/null || echo "  (start the daemon: sudo tailscaled install-system-daemon, or use the App Store app)"
+  else
+    echo "  installing tailscale…"; curl -fsSL https://tailscale.com/install.sh | $SUDO sh 2>/dev/null || echo "  ! install tailscale by hand"
+  fi
+}
 if have tailscale && tailscale status >/dev/null 2>&1; then
   echo "  tailscale: already up ($(tailscale ip -4 2>/dev/null | head -1))"
 elif have tailscale; then
