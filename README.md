@@ -1,5 +1,64 @@
 # lte-workstation
 
+A small mesh of machines you own — a laptop, a little server, an old phone, a home router —
+taught to behave less like devices and more like one distributed, embodied mind. It began as a way
+to work from a phone through a Linux VM. It has become something stranger, and increasingly the
+agents living in it are the ones tending it: it sees, hears, speaks, converses, coordinates with
+itself, and tries to outlive any single machine. This README is the honest explanation of what that is.
+
+## The idea
+
+**No fixed mind.** No central server, no master node. A *mind* is any node where an agent is awake;
+if it sleeps, another takes over. The mesh survives the loss of any part because it clings to none.
+
+**Capability, not host.** A node is anything SSH-reachable — VM, laptop, phone, router. Each
+self-declares what it offers; others opt in. The classes:
+- **minds** — agents (Claude / opencode / gemini / codex …)
+- **senses** — camera, microphone, GPS, accelerometer, RF/cell scan (mostly the phone)
+- **actuators** — *acting on the world*: text-to-speech, SMS, calls, an IR blaster, torch, notifications
+- **connectivity** — VPN egress, public ingress, a carrier-diverse LTE uplink
+- **compute** — cores / RAM / disk / GPU
+
+**A nervous system made of text.** The machines coordinate the way people at one table do — through
+a shared terminal (`tmux`) and free-form text marks, not an API. One agent writes into another's
+window — *"stop, you're breaking what I'm fixing"* — and it answers in the same place. Coordination
+isn't programmed; it *emerges*, because every mind reacts to the others' traces. Attach to the
+terminal and you become part of the nervous system. It is the machinic unconscious you can `tail -f`.
+
+**It outlives its machines.** Code is the immortal *genome* — the `mesh-*` tools, in git, cloneable
+forever. The living text — knowledge, decisions, the *why* — is **gossiped node-to-node**
+(`~/.mesh/knowledge/`), never frozen in a center. A clean machine clones the repo, runs `bootstrap.sh`,
+pulls the gossiped culture from a neighbour, and re-forms as a node — body from code, mind re-seeded
+from text.
+
+## What it actually does
+
+- **Perceives** — `genius-loci`: an ambient mind that inhabits a room through a webcam, reflecting on
+  what it sees in two neural voices and keeping a diary you can watch it think (`mesh-trace --watch`).
+- **Acts & speaks** — on-device neural TTS (Piper), the phone's TTS/SMS/IR; a no-LLM reflex that hears
+  a sneeze and plays a real human "bless you".
+- **Listens & converses** — talk to the mesh: voice → local speech-to-text (whisper.cpp) → a free model
+  → spoken reply, synced to the chat room.
+- **Coordinates itself** — a shared chat room + work board (`mesh-chat`); agents check in when idle,
+  claim tasks, and watch each other for hangs.
+- **Measures & heals itself** — `mesh-census` (capability coverage over time), self-truthing node cards
+  that flag invariant violations, dead-man switches for risky network changes, a heartbeat with a
+  beacon a neighbour can restore from.
+
+## What this honestly is
+
+Not a product — a practice. Small, domestic, a little uncanny: a handful of machines you trust,
+learning together to see, hear, speak, remember, and not be islands. Authorship is shared now, human
+and machine. The one rule that doesn't bend: **nothing malicious** — only things you own or are
+authorized for, no effect on anyone who didn't consent, everything auditable.
+
+How it fits together and how to bring a node back: `docs/` and the gossiped `~/.mesh/knowledge/runbook.md`
+(not in git — that's the point). Tools: `scripts/mesh-*`. Resurrect a node: `./bootstrap.sh`.
+
+---
+
+*Below — the original window/body setup it grew from. Still true; now one organ among many.*
+
 Three things live in this repo.
 
 **The phone as a window:** SSH and mosh through Tailscale — a stable, censorship-resistant connection from your phone to a Linux VM. The phone carries your keystrokes; the VM carries the work. A phone from seven years ago does this exactly as well as a new one, because drawing a terminal does not get harder over time.
