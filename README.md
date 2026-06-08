@@ -55,6 +55,26 @@ authorized for, no effect on anyone who didn't consent, everything auditable.
 How it fits together and how to bring a node back: `docs/` and the gossiped `~/.mesh/knowledge/runbook.md`
 (not in git — that's the point). Tools: `scripts/mesh-*`. Resurrect a node: `./bootstrap.sh`.
 
+## Plant your own mesh
+
+Anyone can grow one — it's just your machines and a few conventions:
+
+1. **Start with one Linux box** (VM, laptop, an old PC) running an agent (Claude Code, opencode, …):
+   `git clone https://github.com/genaforvena/lte-workstation && cd lte-workstation && ./bootstrap.sh`
+2. **Join your machines on Tailscale:** `tailscale up --advertise-tags=tag:lte-node --ssh` on each.
+   Flat, private reachability — no central server.
+3. **Add nodes.** A node is anything SSH-reachable: another laptop, a phone (Termux + `sshd` +
+   `termux-api`), a home router (Tailscale SSH). Each runs `bootstrap.sh` or just gets the `mesh-*` tools.
+4. **Let them coordinate:** `mesh-chat --commons` opens the shared room; agents check in, claim tasks,
+   watch each other. `mesh-snapshot` gossips memory to a neighbour so nothing is an island.
+5. **Make it embodied (optional):** a webcam → `genius-loci`; a mic → `mesh-voice`; the phone's
+   senses/actuators reached over SSH.
+
+The only rule: **your own things** — owned or authorized hardware, networks, accounts; nothing reaching
+into anyone who didn't consent. A private practice, not a tool against others.
+
+**License: [CC0 1.0](LICENSE)** — dedicated to the public domain. Take it, fork it, grow your own.
+
 ---
 
 *Below — the original window/body setup it grew from. Still true; now one organ among many.*
