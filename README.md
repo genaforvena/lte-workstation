@@ -169,7 +169,7 @@ The scrollback is the agent's working memory. Attaching is joining the same sens
 | [bore](https://github.com/ekzhang/bore) | TCP tunnel for proxy relay | `cargo install bore-cli` |
 | [mosh](https://mosh.org) | Resilient SSH alternative | `sudo apt install mosh` |
 | [Tailscale](https://tailscale.com/download) | Permanent private IP + mesh | package + `sudo tailscale up` |
-| [WireGuard](https://www.wireguard.com/install/) | Overlay VPN for the mesh | `sudo apt install wireguard` |
+| [WireGuard](https://www.wireguard.com/install/) | Scoped VPN egress only (optional) | `sudo apt install wireguard` |
 
 You also need:
 - A **Telegram bot token** — create one via [@BotFather](https://t.me/BotFather) → `/newbot`
