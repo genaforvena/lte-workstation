@@ -105,6 +105,8 @@ have mesh-chat && mesh-chat --commons 2>/dev/null || true
 cat <<EOF
 
   Node '$NODE' has a body and a beachhead.
+  TRUST GATE: if the tailnet has device-approval ON, this node is now PENDING — it has NO
+  mesh access until an admin approves it. The mesh can always say no. (That is the point.)
   RECOVERY CHANNEL (use if the network flaps before it's fully ready):
       ssh in, then:  tmux attach -t $NODE
   BECOME THE MIND — read, in order:
