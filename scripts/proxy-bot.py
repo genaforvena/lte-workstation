@@ -18,6 +18,8 @@ from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    MessageHandler,
+    filters,
 )
 from telegram.request import HTTPXRequest
 
@@ -27,6 +29,7 @@ log = logging.getLogger(__name__)
 ENV_FILE = Path.home() / ".config/remote-access/env"
 USERS_FILE = Path.home() / ".config/proxy-bot/users.json"
 STATE_FILE = Path.home() / ".config/proxy-bot/state.json"
+MESH_CHAT = Path.home() / ".mesh/chat.log"
 
 
 def load_env():
@@ -225,6 +228,26 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         users[uid]["denied_at"] = now_iso()
         save_users(users)
         await query.edit_message_text(f"Denied {label}.")
+
+
+async def mirror_from_owner(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Bridge: mirror the OWNER's plain-text messages into mesh-chat (the tmux nervous
+    system of text), so the openclam bot is a comms channel synced with the mesh. Owner-only
+    by design — random users' /start requests are NOT mirrored. Commands are handled elsewhere."""
+    msg = update.message
+    if not msg or not msg.text:
+        return
+    if update.effective_user.id != OWNER_ID:
+        return
+    ts = datetime.now(timezone.utc).strftime("%H:%M:%SZ")
+    line = f"{ts}  tg:operator  ::  {msg.text}\n"
+    try:
+        MESH_CHAT.parent.mkdir(parents=True, exist_ok=True)
+        with MESH_CHAT.open("a") as f:
+            f.write(line)
+        await msg.reply_text("↦ mesh-chat (видно в tmux)")
+    except Exception as e:
+        log.warning("mirror_from_owner failed: %s", e)
 
 
 def main():
