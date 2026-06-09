@@ -113,12 +113,14 @@ elif have tailscale; then
 fi
 
 # ---- receive the living culture (gossip, NOT git) -----------------------
-if [ -n "$PEER" ] && have mesh-restore; then
+if [ -z "$PEER" ]; then
+  log "no peer — this is the FIRST node (the seed); it grows from itself"
+elif have mesh-restore; then
   log "pull living knowledge from a neighbour ($PEER)"
   mesh-restore --pull "$PEER" 2>/dev/null && echo "  pulled ~/.mesh/knowledge" \
     || echo "  ! couldn't reach $PEER — pull ~/.mesh/knowledge from any living node by hand"
 else
-  log "no peer — this is the FIRST node (the seed); it grows from itself"
+  echo "  ! mesh-restore missing — pull ~/.mesh/knowledge from $PEER by hand once tools are installed"
 fi
 have mesh-chat && mesh-chat --commons 2>/dev/null || true
 
