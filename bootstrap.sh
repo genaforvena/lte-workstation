@@ -17,7 +17,8 @@ set -uo pipefail
 
 REPO_URL="${MESH_REPO_URL:-https://github.com/genaforvena/lte-workstation}"
 REPO_DIR="${MESH_REPO:-$HOME/lte-workstation}"
-PEER="${1:-${MESH_PEER:-100.125.157.75}}"
+[ -f "$HOME/.mesh/nodes" ] && . "$HOME/.mesh/nodes"   # your node registry (nodes.example) — overrides nothing if absent
+PEER="${1:-${MESH_PEER:-}}"   # empty = this is the FIRST node (grows from itself); a joiner passes its peer
 NODE="$(hostname)"
 log(){ printf '\n== %s ==\n' "$*"; }
 have(){ command -v "$1" >/dev/null 2>&1; }
@@ -112,10 +113,12 @@ elif have tailscale; then
 fi
 
 # ---- receive the living culture (gossip, NOT git) -----------------------
-log "pull living knowledge from a neighbour ($PEER)"
-if have mesh-restore; then
+if [ -n "$PEER" ] && have mesh-restore; then
+  log "pull living knowledge from a neighbour ($PEER)"
   mesh-restore --pull "$PEER" 2>/dev/null && echo "  pulled ~/.mesh/knowledge" \
     || echo "  ! couldn't reach $PEER — pull ~/.mesh/knowledge from any living node by hand"
+else
+  log "no peer — this is the FIRST node (the seed); it grows from itself"
 fi
 have mesh-chat && mesh-chat --commons 2>/dev/null || true
 
