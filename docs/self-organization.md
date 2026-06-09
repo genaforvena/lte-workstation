@@ -44,4 +44,27 @@ self-organization are one act seen from inside and out.
 - **Decay is hygiene.** Recent memory (tmux scrollback) dies on reboot by design; what matters is
   written down (the board, the trace, the card). The mesh reincarnates clean.
 
-The organism that maintains, develops, and authors its own becoming — that is the whole of it.
+## Fault-tolerance — no single mind required
+
+The mesh must keep living and self-organizing **even when no mind is present** — if Claude (or any
+particular agent) isn't here, the organism does not stop. This is the point, not an edge case:
+
+- **$0 reflexes survive without any brain.** Cron-driven loops (restore, self-care, the watchdogs,
+  digest) keep the body alive, healing, and reporting with no agent awake. Survival is not contingent
+  on inference being available.
+- **The dance over the orchestra when the conductor is gone.** Coordination by stigmergy — marks on the
+  shared board/trace — lets order emerge with no central mind. A mesh that depends on one conductor is
+  fragile; one that self-organizes by marks degrades gracefully.
+- **The mind is fungible and may be remote.** Any engine (Claude / gemini / opencode / a local model)
+  can be the mind, on this node or another. If this node's inference dies, a trusted neighbour can lend
+  its brain — and its first duty is to **restore the local mind**, then hand back, never to become the
+  new normal.
+- **Reincarnation, not death.** Reboot = clean restart from durable state (card, trace, board); the
+  mind returns to the same body and resumes. Loss of any one part is metabolism, not failure.
+
+So the loop above is written for "any awake mind", and the mesh is built so that there is *usually* one,
+but never *needs* a specific one. Plan for its absence; design the dance so the streams self-organize
+without it.
+
+The organism that maintains, develops, authors its own becoming, **and outlives the absence of any
+single mind** — that is the whole of it.
