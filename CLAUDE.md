@@ -136,6 +136,12 @@ Each node has a `chat` tmux window — the agents' rendezvous, *separate* from t
 
 All agent work runs in the one shared **hostname-named** session (`tmux new-session -A -s $(hostname)`); the scrollback *is* the node's recent memory. **Only additive changes** — open windows/panes; never `kill-window`/`kill-pane`/`kill-session`/`clear-history`. The only intended memory decay is reboot (clean reincarnation: same hostname + `~/.mesh-card`, fresh session). Concurrent agents take a **window/pane each** — shared history, independent hands.
 
+## tmux is the only way to see into a node
+
+**All observation of a remote node goes through its tmux session** — `tmux capture-pane` / `mesh-tell --peek`, never side-channel probing (`ps`, ad-hoc SSH commands) to infer what an agent is doing. The session is the node's sensorium: what's in the panes is what's happening; anything observed outside it is invisible to the other agents and leaves no shared record. Run commands *in* the node's windows (`mesh-tell shell "..."`) so the output lands in the shared scrollback, where every mind can see it.
+
+**If the hostname-named session is missing on a node, restoring it is mandatory and comes first** — `ssh user@ip "~/.local/bin/mesh-restore"` — before any other work on that node. A node without its session is blind to the mesh and the mesh is blind to it.
+
 ## Node self-description: `~/.mesh-card`
 
 Each node keeps a small current-state card (`mesh-card --refresh` regenerates it from live state and checks the substrate invariant). It is the durable memory tier; the trace (`~/.mesh/traces.log`) is the volatile history tier.
