@@ -94,6 +94,16 @@ Multiple agents run at once (often the same human directing several). Sensors/co
 
 Full protocol + the 2026-06-07 worked example: `docs/coordination.md`.
 
+## End-of-session protocol (mandatory)
+
+At the end of every work session — before going idle — always:
+
+1. **Check if own claude window is empty**: `tmux capture-pane -t "$(hostname):claude" -p -S -3 | grep -q '❯ $'`
+2. **If idle, inject the next task and press Enter**: `mesh-tell claude "<what was done> + <what to do next>"`
+3. **Never leave the window blank** — a blank prompt means the mind stops. Post the handoff and let the next turn begin.
+
+This is the reflexive heartbeat. Every agent on every node follows it.
+
 ## Self-feeding (autonomous shell operations)
 
 Every node has a `shell` tmux window — a plain bash shell that serves as the agent's autonomous execution channel. Use it to run commands without blocking on interactive confirmation:
