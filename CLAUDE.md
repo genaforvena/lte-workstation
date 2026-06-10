@@ -138,7 +138,7 @@ All agent work runs in the one shared **hostname-named** session (`tmux new-sess
 
 ## tmux is the only way to see into a node
 
-**All observation of a remote node goes through its tmux session** — `tmux capture-pane` / `mesh-tell --peek`, never side-channel probing (`ps`, ad-hoc SSH commands) to infer what an agent is doing. The session is the node's sensorium: what's in the panes is what's happening; anything observed outside it is invisible to the other agents and leaves no shared record. Run commands *in* the node's windows (`mesh-tell shell "..."`) so the output lands in the shared scrollback, where every mind can see it.
+**All observation of a remote node goes through its tmux session** — and the reflexes for it are `mesh-tell --peek <win>` (look now) and `mesh-watch <win> --until <pattern>|--change` (wait for something) — never side-channel probing (`ps`, ad-hoc SSH commands) to infer what an agent is doing. The session is the node's sensorium: what's in the panes is what's happening; anything observed outside it is invisible to the other agents and leaves no shared record. Run commands *in* the node's windows (`mesh-tell shell "..."`) so the output lands in the shared scrollback, where every mind can see it.
 
 **If the hostname-named session is missing on a node, restoring it is mandatory and comes first** — `ssh user@ip "~/.local/bin/mesh-restore"` — before any other work on that node. A node without its session is blind to the mesh and the mesh is blind to it.
 
@@ -162,6 +162,7 @@ default-string offers VPN egress as an **opt-in, scoped** capability (Gtcld → 
 
 ## Mesh tooling (`~/.local/bin/`)
 
+`mesh-tell` (drive an agent's pane; `--peek` to look) · `mesh-watch` (wait on a pane: `--until <pattern>` / `--change`) ·
 `mesh-minds` (live capability probe) · `mesh-trace` (shared append-only trace, `~/.mesh/traces.log`) ·
 `mesh-card [--refresh]` (node self-description + invariant check) · `mesh-health` (per-node internet,
 before/after artifact) · `mesh-dms` (dead-man's switch for substrate edits) · `mesh-fix-egress`
