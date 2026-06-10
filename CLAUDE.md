@@ -26,8 +26,8 @@ Known nodes as of 2026-06-07:
 - `imozerov-Default-string` — 100.125.157.75 (linux) — mind; **VPN exit-node** (scoped egress), public ingress (ngrok/bore/proxy-bot), LAN-gateway-adjacent. 4c/15Gi.
 - `imozerov-IdeaPad-3-15IIL05` — 100.73.170.56 (linux) — mind; exit-node *consumer* (egress via default-string's VPN). 8c/7.3Gi/210G.
 - `Redmi 10` — 100.103.99.16 (android, SSH port 8022, user `u0_a386`) — **body**: senses (GPS/cam/mic/sensors/RF) **and actuators** (TTS/SMS/calls/IR/torch/notify); independent MegaFon LTE uplink. 8c.
-- `ilya` — 100.107.198.111 (linux) — offline (different location; needs physical power-on).
-- router `192.168.8.1` (GL-MT3000 OpenWRT) — **not a node yet**: LAN gateway, SSH open, but not on Tailscale and not onboarded.
+- `ilya` — `ssh ilya@100.107.198.111` (linux) — mind (Claude installed, clean NL egress via default-string); was offline, now up. sudo needs password.
+- `GL-MT3000` router — **NODE** (onboarded 2026-06-07): `ssh root@100.92.205.67` (**Tailscale SSH, no password**); LAN gateway `192.168.8.1` (OpenWrt 21.02, GL.iNet, **plain WG only — no amneziawg**). See `~/.mesh/knowledge/how-nodes-breathe.md`.
 
 ## Phone access (body node: Redmi 10)
 
