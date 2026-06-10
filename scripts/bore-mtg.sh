@@ -2,7 +2,7 @@
 . "$HOME/.config/remote-access/env"
 
 BORE_BIN="${HOME}/.cargo/bin/bore"
-TAILSCALE_IP="$(tailscale ip -4 2>/dev/null || echo '100.125.157.75')"
+TAILSCALE_IP="$(tailscale ip -4 2>/dev/null )"
 STATE_FILE="$HOME/.config/proxy-bot/state.json"
 USERS_FILE="$HOME/.config/proxy-bot/users.json"
 
