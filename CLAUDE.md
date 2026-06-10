@@ -190,12 +190,27 @@ A node *may* offer VPN egress as an **opt-in, scoped** capability:
 
 ## Mesh tooling (`~/.local/bin/`)
 
-`mesh-tell` (drive an agent's pane; `--peek` to look) · `mesh-watch` (wait on a pane:
-`--until <pattern>` / `--change`) · `mesh-minds` (live capability probe) · `mesh-trace`
-(shared append-only trace, `~/.mesh/traces.log`) · `mesh-card [--refresh]` (node
-self-description + invariant check) · `mesh-health` (per-node internet, before/after
-artifact) · `mesh-dms` (dead-man's switch for substrate edits) · `mesh-fix-egress`
-(restore scoped egress) · `mesh-revert-catch` (catch silent full-tunnel reverts).
+**Coordinate / drive:** `mesh-tell` (drive an agent's pane; `--peek` to look) · `mesh-watch`
+(wait on a pane: `--until` / `--change`) · `mesh-chat` (the board/room) · `mesh-minds` (live
+capability probe) · `mesh-trace` (shared append-only trace) · `mesh-textin` (operator drives any
+mind by TEXT over any channel: `@<win> cmd`; wakes the steward on plain msgs).
+
+**Perceive (sensorium):** `mesh-presence` (BLE proximity scan → rssi|mac|name) · `mesh-presence-fuse`
+(cross-node: which node a device is nearest) · `mesh-presence-trends` (residents/arrivals/departures
+over the log) · `mesh-find <device>` (locate any BLE thing) · `mesh-say` (speak aloud) ·
+`mesh-voice-rx`/`mesh-voice-tx` (operator Telegram in/out, text+voice+photo). Perception is
+re-observed live, never stored (no DB — a live `presence` tmux window, decays on reboot).
+
+**Liveness / self-tend:** `mesh-card [--refresh]` (node card + invariant check) · `mesh-health` ·
+`mesh-egress-health` (egress quality, not just up) · `mesh-supervise` (OTP-style child supervisor;
+restarts dead/WEDGED loops; detects blocked minds) · `mesh-verify` (reboot-survival check) ·
+`mesh-tick`/`mesh-heartbeat`/`mesh-beacon-watch`/`mesh-selfcare` (breath, mutual keep-alive).
+
+**Genome / substrate:** `mesh-sync-tools` (detect/heal genome↔local tool drift) · `mesh-genome-sync`
+(mirror the genome off-GitHub) · `mesh-restore` (revive a node's session) · `mesh-dms` (dead-man's
+switch for substrate edits) · `mesh-fix-egress` · `mesh-revert-catch`.
+
+Source of truth is the genome (`scripts/`), deployed to `~/.local/bin/`; `mesh-sync-tools` flags drift.
 
 ## Capabilities (self-declared, opt-in by consumers)
 
