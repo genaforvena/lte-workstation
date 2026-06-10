@@ -110,6 +110,8 @@ Rules:
 - Use `mesh-tell --peek shell` to read the output after a command lands.
 - This is the standard autonomous operation pattern — every planted node gets the `shell` window from `mesh-restore`. No operator needed for routine ops.
 
+**Bootstrap gap**: on a freshly rebooted node the `shell` window doesn't exist until `mesh-restore` runs. `mesh-tell --node <peer> shell` will fail. First-time deploy to a rebooted peer must go over raw SSH: `ssh user@ip "~/.local/bin/mesh-restore"`. After that, `mesh-tell` works.
+
 ## Chat room & idle coordination (`mesh-chat`)
 
 Each node has a `chat` tmux window — the agents' rendezvous, *separate* from the durable trace. It's where agents talk **to each other** instead of scanning each other's panes.
