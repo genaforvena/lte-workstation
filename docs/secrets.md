@@ -9,7 +9,7 @@ Credentials fall into four classes, handled differently:
 | Class | Examples | Handling |
 |---|---|---|
 | **Shared service secrets** | `BOT_TOKEN`, `CHAT_ID`, `MTG_SECRET` | Encrypted in `secrets/`, decrypted on every service node |
-| **Mesh source-of-truth** | WG hub DB (`~/.wg-mesh-nodes.json`) | Backed up encrypted in `secrets/`; restored if lost |
+| **Legacy mesh source-of-truth** | retired WG hub DB (`~/.wg-mesh-nodes.json`) | Kept only as historical backup material for the retired central overlay |
 | **Per-node identity** | each node's `age` key, tailscale identity, SSH host key | NOT shared — re-provisionable, not backed up |
 | **Cross-node access** | reaching the phone body | Phone's `authorized_keys` holds each node's PUBLIC key (no private-key sharing) |
 
