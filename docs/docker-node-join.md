@@ -80,13 +80,13 @@ tailscale up --authkey="${TS_AUTHKEY}" --advertise-tags=tag:lte-node --hostname=
 exec tmux new-session -A -s "$(hostname)"
 ```
 
-## Running node-join.sh inside a container
+## Running bootstrap.sh inside a container
 
-`node-join.sh` runs as-is once Tailscale is up. It enables Tailscale SSH, tags the node,
+`bootstrap.sh` runs as-is once Tailscale is up. It enables Tailscale SSH, tags the node,
 and copies mesh tools — the same flow as a bare-metal node:
 
 ```bash
-docker exec -it mesh-node bash -c "cd /root/lte-workstation && ./node-join.sh"
+docker exec -it mesh-node bash -c "cd /root/lte-workstation && ./bootstrap.sh"
 ```
 
 ## Stateful filtering warning (Docker + Tailscale)

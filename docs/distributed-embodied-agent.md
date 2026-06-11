@@ -47,7 +47,7 @@ The phone has senses but a hostile runtime for agents (Bionic libc, no glibc bin
 
 ## Multiple bodies
 
-A single phone gives the agent one set of sensors. Multiple phones — multiple people's phones — give it distributed perception. Each node joins voluntarily by running `node-join.sh` from `scripts/`. Once tagged `tag:lte-node`, the node becomes discoverable via Tailscale.
+A single phone gives the agent one set of sensors. Multiple phones — multiple people's phones — give it distributed perception. Each node joins voluntarily by running `bootstrap.sh` from the repo root. Once tagged `tag:lte-node`, the node becomes discoverable via Tailscale.
 
 ```
 tailscale status --json | jq '.Peer[] | select(.Tags // [] | index("tag:lte-node"))'
