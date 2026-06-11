@@ -3,9 +3,10 @@
 # Runs mesh-card --refresh; on non-zero exit (invariant violation), writes a loud
 # line to mesh-trace and sends a Telegram notification via mesh-tg.
 #
-# Intended to be triggered by mesh-card-watchdog.timer (systemd), following the same
-# pattern as mtg-watchdog. Runs as the current user (user-level systemd unit).
+# Usage:
+#   mesh-card-watchdog.sh
 set -uo pipefail
+[ "${1:-}" = --test ] && { command -v mesh-card >/dev/null 2>&1 || { echo "smoke-test: FAIL (no mesh-card)"; exit 1; }; echo "smoke-test: ok"; exit 0; }
 
 CARD="${MESH_CARD:-$HOME/.mesh-card}"
 MESH_DIR="${HOME}/.mesh"
