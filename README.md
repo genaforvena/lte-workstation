@@ -89,6 +89,10 @@ Anyone can grow one — it's just your machines and a few conventions:
    watch each other. `mesh-snapshot` gossips memory to a neighbour so nothing is an island.
 5. **Make it embodied (optional):** a webcam → `genius-loci`; a mic → `mesh-voice`; the phone's
    senses/actuators reached over SSH.
+6. **Verify your plant:** `mesh-doctor` reports whether anything is up-but-broken (egress, organs,
+   reflexes, hardcoded-IP leaks). `test-mesh-plant` checks a fresh plant is clean — tools install,
+   the node registry seeds, and nothing carries another mesh's addresses. The genome hardcodes no
+   IPs: your topology lives in `~/.mesh/nodes` (seeded from `nodes.example`), never in the code.
 
 The only rule: **your own things** — owned or authorized hardware, networks, accounts; nothing reaching
 into anyone who didn't consent. A private practice, not a tool against others.
@@ -163,7 +167,7 @@ The phone plays both roles simultaneously: window (you type through it) and body
 - **Auto-notifications** — Telegram message with connection commands on boot
 - **Auto-start on reboot** — everything comes back up without manual action
 - **Phone as body** — VM agent drives the phone's senses *and actuators* (camera, mic, GPS, plus TTS/SMS/calls/IR) via termux-api
-- **Distributed mesh** — any Tailscale-tagged node can join via `node-join.sh`; nodes are discoverable and SSH-able from each other; capabilities are self-declared and opt-in
+- **Distributed mesh** — any Tailscale-tagged node can join via `bootstrap.sh`; nodes are discoverable and SSH-able from each other; capabilities are self-declared and opt-in
 - **Scoped VPN egress** — a node can opt into another's VPN as an exit-node; the offering node's own control plane stays on the clean route (only the consumer's traffic is tunnelled). See `docs/coordination.md`
 - **Optional: MTProto Telegram proxy** — for regions where Telegram is blocked; runs in Docker with host networking for stability; auto-restarted by watchdog if Telegram DCs become unreachable
 
@@ -201,7 +205,7 @@ You also need:
 Any Linux machine with Tailscale can join:
 
 ```bash
-./scripts/node-join.sh
+./bootstrap.sh
 ```
 
 The script enables Tailscale SSH and advertises `tag:lte-node`. (There is no central WireGuard hub anymore — flat Tailscale reachability replaces the old `10.9.0.0/24` overlay.) Your Tailscale ACL needs:
@@ -299,10 +303,11 @@ scripts/
   ngrok-notify.sh               # Telegram notification: SSH addr + mosh cmd
   bore-mtg.sh                   # bore tunnel loop + proxy notification + user auto-notify
   proxy-bot.py                  # access-control bot: approve/deny proxy requests
-  node-join.sh / node-join-android.sh   # register a node (vpn-hub fetch step is retired)
+  bootstrap.sh                  # adopt a fresh machine into the mesh (one command)
+  node-join-android.sh          # register an Android/Termux phone as a node
   mtg-watchdog.{sh,service,timer}        # restart MTG if Telegram connections fail
   ngrok.service / bore-mtg.service / proxy-bot.service   # systemd user services
-  vpn-hub.py / vpn-hub.service   # RETIRED — central WireGuard registry, no longer used
+  (vpn-hub.py / vpn-hub.service — RETIRED central WireGuard registry, removed from the genome)
 setup.sh                        # one-time interactive setup
 CLAUDE.md                       # node operator context for Claude Code
 ```
