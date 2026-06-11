@@ -214,18 +214,20 @@ Source of truth is the genome (`scripts/`), deployed to `~/.local/bin/`; `mesh-s
 
 **On-demand canon** (genome-lean audit 2026-06-11 — unwired by design, each earns its place;
 anything in `scripts/` that is neither wired (cron/systemd/mesh-restore/called-by-tool/supervise
-registry) nor listed here is decay-eligible): `mesh-browse` (browser organ) · `mesh-exit`
+registry) nor listed here is decay-eligible): `mesh-browse` (browser organ) · `mesh-breath` (read-only breathing probe: verifies access paths and liveness) · `mesh-exit`
 (consumer-side exit-node flip, DMS-gated) · `mesh-eye` (consent-gated ambient sense) ·
-`mesh-local-mind` (local-inference primitive) · `mesh-neighbour-watch` (peer SSH liveness +
+`mesh-guardian` (survival reflex: reachability + tmux + Telegram organ recovery) ·
+`mesh-local-mind` (local-inference primitive) · `mesh-load` (read-only agent load/quota reporter for `mesh-chat`) · `mesh-neighbour-watch` (peer SSH liveness +
 restore) · `mesh-review` (multi-engine blind review) · `mesh-since` (on-return brief) ·
-`mesh-transcribe` (consent-gated continuous transcription) · `mesh-hear` (consent-gated per-node
+`mesh-study` (field-mining / study brief helper) · `mesh-transcribe` (consent-gated continuous transcription) · `mesh-hear` (consent-gated per-node
 mic capture → WAV) · `mesh-transcribe-organ` (source-agnostic WAV → filtered text) ·
-`mesh-chaos-doctor`/`mesh-chaos-verify`
+`mesh-usage` (usage aggregator backing `mesh-load`) · `mesh-chaos-doctor`/`mesh-chaos-verify`
 (induced-failure drills) · `mesh-fleet-health` (fleet table) · `mesh-steward-deadman` (router
 dead-man, deploy gated) · `mesh-card-watchdog.{sh,service,timer}` (card freshness) ·
 `node-join-android.sh` (phone onboarding) · `test-*` (verification artifacts). Decayed
 2026-06-11: `mesh-health-watch` (→ mesh-session-watchdog), `mesh-tg-recv` (→ voice-rx+textin),
-`mesh-zone` (→ presence-fuse/trends), `vpn-hub.py` (retired overlay). Git history is the attic.
+`mesh-zone` (→ presence-fuse/trends), `vpn-hub.py` (retired overlay), `mesh-onboard` (attic:
+junk-posted onboarding wrapper; keep out of canon). Git history is the attic.
 
 ## Capabilities (self-declared, opt-in by consumers)
 
