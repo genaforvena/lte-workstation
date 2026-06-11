@@ -212,6 +212,19 @@ switch for substrate edits) · `mesh-fix-egress` · `mesh-revert-catch`.
 
 Source of truth is the genome (`scripts/`), deployed to `~/.local/bin/`; `mesh-sync-tools` flags drift.
 
+**On-demand canon** (genome-lean audit 2026-06-11 — unwired by design, each earns its place;
+anything in `scripts/` that is neither wired (cron/systemd/mesh-restore/called-by-tool/supervise
+registry) nor listed here is decay-eligible): `mesh-browse` (browser organ) · `mesh-exit`
+(consumer-side exit-node flip, DMS-gated) · `mesh-eye` (consent-gated ambient sense) ·
+`mesh-local-mind` (local-inference primitive) · `mesh-neighbour-watch` (peer SSH liveness +
+restore) · `mesh-review` (multi-engine blind review) · `mesh-since` (on-return brief) ·
+`mesh-transcribe` (consent-gated transcription) · `mesh-chaos-doctor`/`mesh-chaos-verify`
+(induced-failure drills) · `mesh-fleet-health` (fleet table) · `mesh-steward-deadman` (router
+dead-man, deploy gated) · `mesh-card-watchdog.{sh,service,timer}` (card freshness) ·
+`node-join-android.sh` (phone onboarding) · `test-*` (verification artifacts). Decayed
+2026-06-11: `mesh-health-watch` (→ mesh-session-watchdog), `mesh-tg-recv` (→ voice-rx+textin),
+`mesh-zone` (→ presence-fuse/trends), `vpn-hub.py` (retired overlay). Git history is the attic.
+
 ## Capabilities (self-declared, opt-in by consumers)
 
 Classes: **minds** (agents) · **senses** (sensors) · **actuators** (act on the world —
