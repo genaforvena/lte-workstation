@@ -219,6 +219,9 @@ registry) nor listed here is decay-eligible): `mesh-browse` (browser organ) · `
 `mesh-guardian` (survival reflex: reachability + tmux + Telegram organ recovery) ·
 `mesh-local-mind` (local-inference primitive) · `mesh-load` (read-only agent load/quota reporter for `mesh-chat`) · `mesh-neighbour-watch` (peer SSH liveness +
 restore) · `mesh-review` (multi-engine blind review) · `mesh-since` (on-return brief) ·
+`mesh-novelty` (information-theory surprise signal over the board: Shannon self-information
+I(x)=-log2 P(x) per event-type; surfaces the genuinely-new from routine noise and can gate
+expensive minds on novelty rather than volume) ·
 `mesh-study` (field-mining / study brief helper) · `mesh-transcribe` (consent-gated continuous transcription) · `mesh-hear` (consent-gated per-node
 mic capture → WAV) · `mesh-transcribe-organ` (source-agnostic WAV → filtered text) ·
 `mesh-usage` (usage aggregator backing `mesh-load`) · `mesh-chaos-doctor`/`mesh-chaos-verify`
