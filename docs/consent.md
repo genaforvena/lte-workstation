@@ -76,3 +76,5 @@ Scripts must enforce the boundary at the code level (not only in comments):
 | `mesh-ear` | ✅ `mic` / `mic_always` (built-in) | ✅ | ✅ torch | ✅ start/stop/heartbeat |
 | `mesh-converse` | ✅ `mic` gate | ✅ | ✅ torch | ✅ start/stop |
 | `genius-loci` | ✅ `camera` + `mic` gate | ✅ | ✅ torch | ✅ start/stop/heartbeat |
+| `mesh-hear` | ✅ `mic_always` gate | ✅ | ✅ torch for phone | ✅ start/stop |
+| `mesh-transcribe-organ` | n/a (processes caller-provided WAV) | n/a | n/a | n/a |

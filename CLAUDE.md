@@ -218,7 +218,9 @@ registry) nor listed here is decay-eligible): `mesh-browse` (browser organ) · `
 (consumer-side exit-node flip, DMS-gated) · `mesh-eye` (consent-gated ambient sense) ·
 `mesh-local-mind` (local-inference primitive) · `mesh-neighbour-watch` (peer SSH liveness +
 restore) · `mesh-review` (multi-engine blind review) · `mesh-since` (on-return brief) ·
-`mesh-transcribe` (consent-gated transcription) · `mesh-chaos-doctor`/`mesh-chaos-verify`
+`mesh-transcribe` (consent-gated continuous transcription) · `mesh-hear` (consent-gated per-node
+mic capture → WAV) · `mesh-transcribe-organ` (source-agnostic WAV → filtered text) ·
+`mesh-chaos-doctor`/`mesh-chaos-verify`
 (induced-failure drills) · `mesh-fleet-health` (fleet table) · `mesh-steward-deadman` (router
 dead-man, deploy gated) · `mesh-card-watchdog.{sh,service,timer}` (card freshness) ·
 `node-join-android.sh` (phone onboarding) · `test-*` (verification artifacts). Decayed
