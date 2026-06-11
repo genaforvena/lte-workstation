@@ -149,7 +149,7 @@ The lte mesh is an assemblage in four precise senses:
 
 **1. Components are heterogeneous and autonomous.** The VM (Debian, x86_64, glibc) and the phone (Android, ARM64, Bionic) are different architectures running different kernels, different libc, different binary formats. They are not designed to work together. The assemblage couples them anyway, and each component retains its autonomy — the phone can be used for calls even while its camera is the agent's eye.
 
-**2. The connections are contingent and reversible.** A node joins by running `node-join.sh` — a voluntary act. A node disconnects when its battery dies. The mesh doesn't mourn nodes that leave. It reconfigures around the remaining connections. This is what Guattari calls **deterritorialization** (a component exits the assemblage) and **reterritorialization** (a new component enters, or the same one reconnects with a different IP, a different state).
+**2. The connections are contingent and reversible.** A node joins by running `bootstrap.sh` — a voluntary act. A node disconnects when its battery dies. The mesh doesn't mourn nodes that leave. It reconfigures around the remaining connections. This is what Guattari calls **deterritorialization** (a component exits the assemblage) and **reterritorialization** (a new component enters, or the same one reconnects with a different IP, a different state).
 
 **3. The assemblage has effects that no component has.** No individual node "sees through two cameras at once." But when the agent on the VM queries two phones' camera APIs and composits the JPEGs into a single scrollback entry, the assemblage is producing an integrated sensory field from distributed sensors. The integration is temporary and fragile — it exists only as long as both SSH sessions are alive — but it is real, and it produces real artifacts (the composited JPEG).
 
@@ -213,7 +213,7 @@ This is also why the agent doesn't need "understanding" in the cognitive-science
 Guattari's spatial vocabulary — territory, deterritorialization, reterritorialization — describes the metabolism of assemblages: how they form, dissolve, and reform.
 
 **Territorialization** is the process that stabilizes an assemblage. In the mesh, territorialization happens when:
-- A node runs `node-join.sh` and advertises `tag:lte-node`
+- A node runs `bootstrap.sh` and advertises `tag:lte-node`
 - The Tailscale ACL accepts the tag and enables SSH
 - Other nodes discover it and cache its IP
 - SSH keys are exchanged and tested
