@@ -60,8 +60,10 @@ log. "Attaching is joining": `tmux attach -t mesh` (locally, or
   The before/after artifact for any network change (verify-on-change, not just verify-on-build).
 - **`mesh-dms`** — dead-man's switch: schedule a rollback *before* a substrate edit, cancel only
   after `mesh-health` confirms. Never reroute the path you're reachable through without one.
-- **`mesh-fix-egress`** / **`mesh-revert-catch`** / **`vpn-health.py`** — the scoped-VPN-egress
-  toolset (apply / catch silent reverts / self-heal). See `coordination.md` and CLAUDE.md.
+- **`mesh-fix-egress`** / **`mesh-revert-catch`** — the scoped-VPN-egress
+  toolset (apply / catch silent reverts). `vpn-health.py` (in genome scripts/) is
+  the root-daemon self-healer for the scoped tunnel; the central WireGuard overlay
+  (`vpn-hub`, 10.9.0.0/24) was retired 2026-06-07. See `coordination.md` and CLAUDE.md.
 - **`mesh-chat`** — the node's agent chat room (a `chat` tmux window over `~/.mesh/chat.log`):
   where agents talk to each other, idle agents check in, and a free-form work board lives.
   Conversation, distinct from the substrate-marks of `mesh-trace`. See `coordination.md`.
