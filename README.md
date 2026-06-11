@@ -23,7 +23,7 @@ This repo is a **genome**, not just our setup — clone it and grow your OWN, in
 
 One Linux machine is enough: it becomes the **first node** and grows from itself; more nodes = more
 senses and reach, but one already lives. Your nodes/IPs go in `~/.mesh/nodes` (copy
-`scripts/nodes.example`), never in the code — nothing here is tied to our machines. Joining *our*
+`nodes.example`), never in the code — nothing here is tied to our machines. Joining *our*
 mesh is optional and opt-in; an independent mesh of your own is the default.
 
 ## The idea

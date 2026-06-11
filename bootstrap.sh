@@ -85,6 +85,12 @@ if [ -d "$REPO_DIR/scripts" ]; then
     install -m755 "$f" ~/.local/bin/ 2>/dev/null && echo "  $b"
   done
 fi
+# seed the node registry from the template so topology-driven tools have a file to read + you a
+# file to fill (the genome hardcodes NO IPs — your topology lives here). Empty = single-node, fine.
+if [ ! -f ~/.mesh/nodes ] && [ -f "$REPO_DIR/nodes.example" ]; then
+  cp "$REPO_DIR/nodes.example" ~/.mesh/nodes && chmod 600 ~/.mesh/nodes
+  echo "  seeded ~/.mesh/nodes (edit it to add peers: MESH_NODES=\"label:user@ip ...\")"
+fi
 case ":$PATH:" in *":$HOME/.local/bin:"*) :;; *)
   echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
   [ "$(uname)" = "Darwin" ] && echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc   # macOS default shell is zsh
