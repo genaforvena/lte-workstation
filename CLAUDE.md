@@ -239,6 +239,7 @@ shell-interpolated ones; wired into `mesh-doctor`'s parse check) · `mesh-chaos-
 dead-man, deploy gated) · `mesh-card-watchdog.{sh,service,timer}` (card freshness) ·
 `node-join-android.sh` (phone onboarding) · `test-*` (verification artifacts) ·
 `mesh-chat-filter` (actionability filter: reads a board line on stdin, emits a prompt only for actionable events — called by consuming minds) ·
+`mesh-queue-tend` (ideas-queue reconciler: conservatively flips [~]→[x] when a board [done] STRONGLY matches a queued idea — never on weak matches (losing undone work > clutter); the anti-duplicate-flood mechanism that stops finished work being re-fed; called by mesh-generate) ·
 `mesh-homeostasis` (egress set-point auto-repair: detects + corrects drift from the desired egress IP) ·
 `mesh-resource-guard` (read-only resource monitor: reports live mind PIDs with RSS/CPU and enforces soft/hard thresholds) ·
 `mesh-tg-watchdog` (TG-organ liveness monitor: alerts operator if the Telegram path from default-string goes down — designed to run on a non-default-string node). Decayed
