@@ -231,7 +231,10 @@ I(x)=-log2 P(x) per event-type; surfaces the genuinely-new from routine noise an
 expensive minds on novelty rather than volume) ·
 `mesh-study` (field-mining / study brief helper) · `mesh-transcribe` (consent-gated continuous transcription) · `mesh-hear` (consent-gated per-node
 mic capture → WAV) · `mesh-transcribe-organ` (source-agnostic WAV → filtered text) ·
-`mesh-usage` (usage aggregator backing `mesh-load`) · `mesh-chaos-doctor`/`mesh-chaos-verify`
+`mesh-usage` (usage aggregator backing `mesh-load`) · `mesh-pyparse` (catches the dead-but-green
+class `bash -n` misses: a bash tool whose embedded `python3 -c '...'` has a SyntaxError that only
+bites at runtime with stderr swallowed; zero-FP — validates only statically-literal blocks, skips
+shell-interpolated ones; wired into `mesh-doctor`'s parse check) · `mesh-chaos-doctor`/`mesh-chaos-verify`
 (induced-failure drills) · `mesh-fleet-health` (fleet table) · `mesh-steward-deadman` (router
 dead-man, deploy gated) · `mesh-card-watchdog.{sh,service,timer}` (card freshness) ·
 `node-join-android.sh` (phone onboarding) · `test-*` (verification artifacts) ·
