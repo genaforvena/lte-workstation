@@ -204,7 +204,7 @@ re-observed live, never stored (no DB — a live `presence` tmux window, decays 
 **Liveness / self-tend:** `mesh-card [--refresh]` (node card + invariant check) · `mesh-health` ·
 `mesh-egress-health` (egress quality, not just up) · `mesh-supervise` (OTP-style child supervisor;
 restarts dead/WEDGED loops; detects blocked minds) · `mesh-verify` (reboot-survival check) ·
-`mesh-tick`/`mesh-heartbeat`/`mesh-beacon-watch`/`mesh-selfcare` (breath, mutual keep-alive) · `mesh-router-watch` (thermal watchdog for the fanless router gateway — edge-triggered [router-hot]/[router-cool]) · `mesh-reflex-health` (catches a reflex that is cron-SCHEDULED + smoke-passing but DEAD at runtime — its per-run artifact gone stale; edge-triggered [reflex-stale]/[reflex-ok]; the blind spot mesh-reflexes (drops) and mesh-reflex-decay (autophagy) miss).
+`mesh-tick`/`mesh-heartbeat`/`mesh-beacon-watch`/`mesh-selfcare` (breath, mutual keep-alive) · `mesh-router-watch` (thermal watchdog for the fanless router gateway — edge-triggered [router-hot]/[router-cool]) · `mesh-body-power` (watch the phone BODY's battery → edge-triggered [body-power-low]/[body-power-ok] so the revived body doesn't silently die on a dead battery) · `mesh-reflex-health` (catches a reflex that is cron-SCHEDULED + smoke-passing but DEAD at runtime — its per-run artifact gone stale; edge-triggered [reflex-stale]/[reflex-ok]; the blind spot mesh-reflexes (drops) and mesh-reflex-decay (autophagy) miss).
 
 **Genome / substrate:** `mesh-sync-tools` (detect/heal genome↔local tool drift) · `mesh-genome-sync`
 (mirror the genome off-GitHub) · `mesh-restore` (revive a node's session) · `mesh-dms` (dead-man's
