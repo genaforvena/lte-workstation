@@ -110,9 +110,34 @@ Tailscale control-plane traffic on that route. Same invariant as a bare-metal no
 ## Quick-start (userspace, no caps, mind node)
 
 ```bash
+# Create entrypoint.sh from the example in the "Minimal Dockerfile — mind node" section
+cat > entrypoint.sh << 'ENTRYPOINT'
+#!/usr/bin/env bash
+set -e
+tailscaled --tun=userspace-networking &
+sleep 2
+tailscale up --authkey="${TS_AUTHKEY}" --advertise-tags=tag:lte-node --hostname="${HOSTNAME}"
+~/.local/bin/mesh-restore 2>/dev/null || /root/lte-workstation/scripts/mesh-restore
+exec tmux new-session -A -s "$(hostname)"
+ENTRYPOINT
+chmod +x entrypoint.sh
+
+# Create a Dockerfile from the "Minimal Dockerfile — mind node" section above
+cat > Dockerfile.mind << 'DOCKERFILE'
+FROM ubuntu:22.04
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y curl tmux git openssh-server nodejs npm sudo
+RUN curl -fsSL https://tailscale.com/install.sh | sh
+RUN npm install -g @anthropic-ai/claude-code
+RUN git clone https://github.com/genaforvena/lte-workstation /root/lte-workstation
+RUN cp /root/lte-workstation/scripts/mesh-* /usr/local/bin/ && chmod +x /usr/local/bin/mesh-*
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+ENTRYPOINT ["/entrypoint.sh"]
+DOCKERFILE
+
 # Build
-git clone https://github.com/genaforvena/lte-workstation && cd lte-workstation
-docker build -f docker/Dockerfile.mind -t mesh-mind .
+docker build -f Dockerfile.mind -t mesh-mind .
 
 # Run (get a fresh one-time key from https://login.tailscale.com/admin/settings/keys)
 docker run -d --name my-mesh-mind \

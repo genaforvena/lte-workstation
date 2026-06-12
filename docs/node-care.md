@@ -63,7 +63,8 @@ loginctl enable-linger "$(whoami)"
 ```
 
 What happens on power-on: `cron` fires `@reboot` → `mesh-restore` → a fresh hostname-named tmux
-session + the standard loops (`chat`, `snapshot`, **`self-care`**). The `*/5` line is a safety net:
+session + the standard loops (`chat`, `snapshot`, **`selfcare`**, and `verifier` where the mission
+file exists). The `*/5` line is a safety net:
 if any loop dies mid-life, it comes back within five minutes. Tailscale is a system service, so the
 node rejoins the mesh on its own.
 
@@ -98,7 +99,7 @@ reflexes. Everything else is theirs to grow.
 ## 5. A node can live alone (standalone colony)
 
 A node does not need this mesh to be alive. Plant it somewhere with no connection to the others and
-it will still: keep its session, run its self-care, survive reboots, and host an agent. Later, two
+it will still: keep its session, run `mesh-selfcare`, survive reboots, and host an agent. Later, two
 independent meshes can be **merged** — a node added through a neighbour inherits that neighbour's
 view and pulls more as needed. Growth is meant to be *more perception and capability*, not merely
 more machines; a new sense on an old node counts as much as a new node.

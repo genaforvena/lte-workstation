@@ -7,7 +7,7 @@ edits**; our specifics live in a node-local config, never in the genome.
 
 ## Findings (tracked files)
 - **~38 hardcoded IPs** (our Tailscale `100.x` + LAN `192.168.8.x`) across `*.sh`, `*.md`, `scripts/*`.
-- **Our hostnames / usernames** (`imozerov-*`, `Default-string`, `Redmi`, `imozerov@`, `u0_a386`) in:
+- **Our hostnames / usernames** (`imozerov-*`, `Default-string`, `Redmi`, `imozerov@`, `u0_a380` live; `u0_a386` legacy) in:
   CLAUDE.md, README.md, PROGRESS.md, docs/*, and scripts: mesh-conn, mesh-morning, mesh-fix-egress,
   mesh-health, mesh-minds, mesh-census, mesh-converse, mesh-ear, mesh-blessyou, genius-loci, …
 - **bootstrap.sh**: parameterized (`PEER=${1:-${MESH_PEER:-100.125.157.75}}`) but the *default* is our IP.

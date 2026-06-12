@@ -5,9 +5,10 @@ runtime for agents (glibc binaries don't run in Bionic). SSH between them and th
 can borrow the phone's hardware. This document covers an agent on the VM reaching into the phone
 over SSH and driving it via `termux-api`.
 
-## The phone's full surface (`termux-api`, ~40 verbs)
+## The phone's full surface (`termux-api`, ~80 verbs)
 
-It is not just camera/mic/GPS. Enumerate with `ls $PREFIX/bin | grep '^termux-'`. The classes:
+It is not just camera/mic/GPS. Enumerate with `ls $PREFIX/bin | grep '^termux-'`. (Live count
+on the Redmi 10, 2026-06-12 after the F-Droid reinstall: termux-api 0.59.1, 83 commands.) The classes:
 
 - **Senses (input):** `termux-location` (GPS), `termux-camera-photo`, `termux-microphone-record`,
   `termux-sensor` (accel/gyro/light/…), `termux-battery-status`, `termux-telephony-cellinfo`,
@@ -61,7 +62,7 @@ chmod 600 ~/.ssh/authorized_keys
 Test:
 ```bash
 # from the VM
-ssh -p 8022 u0_a386@<phone-tailscale-ip> "echo ok"
+ssh -p 8022 u0_a380@<phone-tailscale-ip> "echo ok"
 ```
 
 If you need password-based auth in scripts (e.g. key setup not done yet), use `SSH_ASKPASS`:
@@ -73,7 +74,7 @@ EOF
 chmod +x /tmp/askpass.sh
 SSH_ASKPASS=/tmp/askpass.sh SSH_ASKPASS_REQUIRE=force \
   ssh -p 8022 -o PasswordAuthentication=yes -o PreferredAuthentications=password \
-  u0_a386@<phone-ip> "termux-battery-status"
+  u0_a380@<phone-ip> "termux-battery-status"
 ```
 
 ## Keeping the connection alive
@@ -117,20 +118,20 @@ termux-setup-storage
 
 ```bash
 # from the VM — start a 10-second recording
-ssh -p 8022 u0_a386@<phone-ip> "termux-wake-lock; termux-microphone-record -l 10"
+ssh -p 8022 u0_a380@<phone-ip> "termux-wake-lock; termux-microphone-record -l 10"
 ```
 
 The command returns immediately after printing "Recording started". The recording runs in the background in the Termux:API process. Poll until done:
 
 ```bash
-until ssh -p 8022 u0_a386@<phone-ip> "termux-microphone-record -i" | grep -q '"isRecording": false'; do
+until ssh -p 8022 u0_a380@<phone-ip> "termux-microphone-record -i" | grep -q '"isRecording": false'; do
   sleep 3
 done
 ```
 
 Then copy:
 ```bash
-scp -P 8022 u0_a386@<phone-ip>:storage/shared/TermuxAudioRecording_*.m4a ./recording.m4a
+scp -P 8022 u0_a380@<phone-ip>:storage/shared/TermuxAudioRecording_*.m4a ./recording.m4a
 ```
 
 **Successful artifact:** a non-empty `.m4a` file that plays. Check structure:
@@ -155,8 +156,8 @@ Note: `-l` sets a duration limit in seconds. The `-f` flag sets the audio format
 Camera capture requires the Termux:API companion app from F-Droid and Camera permission granted to Termux:API.
 
 ```bash
-ssh -p 8022 u0_a386@<phone-ip> "termux-camera-photo -c 0 ~/photo.jpg"
-scp -P 8022 u0_a386@<phone-ip>:photo.jpg ./
+ssh -p 8022 u0_a380@<phone-ip> "termux-camera-photo -c 0 ~/photo.jpg"
+scp -P 8022 u0_a380@<phone-ip>:photo.jpg ./
 ```
 
 `-c 0` = back camera, `-c 1` = front camera.
@@ -167,13 +168,13 @@ scp -P 8022 u0_a386@<phone-ip>:photo.jpg ./
 
 Camera metadata (which cameras exist, resolutions, focal lengths) works without the companion app:
 ```bash
-ssh -p 8022 u0_a386@<phone-ip> "termux-camera-info"
+ssh -p 8022 u0_a380@<phone-ip> "termux-camera-info"
 ```
 
 ## Location
 
 ```bash
-ssh -p 8022 u0_a386@<phone-ip> "termux-location -p network"
+ssh -p 8022 u0_a380@<phone-ip> "termux-location -p network"
 ```
 
 Requires Location permission granted to Termux. Returns JSON with `latitude`, `longitude`, `accuracy`.
@@ -182,7 +183,7 @@ Requires Location permission granted to Termux. Returns JSON with `latitude`, `l
 
 Works without any permission grant:
 ```bash
-ssh -p 8022 u0_a386@<phone-ip> "termux-battery-status"
+ssh -p 8022 u0_a380@<phone-ip> "termux-battery-status"
 ```
 
 Returns JSON: percentage, temperature, health, plugged status, current.

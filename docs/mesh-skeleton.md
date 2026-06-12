@@ -46,9 +46,10 @@ The log lives at `~/.mesh/traces.log`, local per node. It does not auto-sync —
 crossing nodes is itself emergent (find peers with `mesh-minds`, read theirs
 over ssh if you care to).
 
-`mesh-trace --commons` opens a tmux session named `mesh` that live-tails the
-log. "Attaching is joining": `tmux attach -t mesh` (locally, or
-`ssh <node> -t tmux attach -t mesh`) lets any mind watch the commons live.
+`mesh-trace --commons` opens a tmux session named after the node's hostname
+that live-tails the log. "Attaching is joining": `tmux attach -t "$(hostname)"`
+(locally, or `ssh <node> -t 'tmux attach -t "$(hostname)"'`) lets any mind watch
+the commons live.
 
 ## More tools (grown only when a real need forced them)
 

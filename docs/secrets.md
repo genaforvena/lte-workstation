@@ -25,22 +25,24 @@ Credentials fall into four classes, handled differently:
 2. git history — survives accidental deletion/corruption;
 3. offline recovery key — survives *total* mesh loss (kept off-mesh, never committed).
 
-## Daily use
+## Current reality
 
-```bash
-scripts/mesh-secrets.sh hydrate   # decrypt repo store -> live config (runs at boot via systemd)
-scripts/mesh-secrets.sh backup    # re-encrypt live source-of-truth -> repo store, then commit
-scripts/mesh-secrets.sh check     # verify this node can decrypt everything
-```
+The encrypted-store design (`.sops.yaml` + per-node `age` identities) is still the intended model,
+but the helper entrypoints documented here are **not** present in the current genome tree:
 
-Boot-time hydration: `scripts/mesh-secrets.service` (systemd user unit).
+- `scripts/mesh-secrets.sh`
+- `scripts/mesh-secrets.service`
+
+So treat this document as the storage doctrine, not as a claim that those automation helpers exist
+right now in-repo. Current nodes rely on the underlying `age`/`sops` material and local operator
+handling, not a checked-in `mesh-secrets` wrapper.
 
 ## Enroll a new node
 
 1. Install `age` + `sops` (static binaries in `~/.local/bin`).
 2. `age-keygen -o ~/.config/sops/age/keys.txt && chmod 600 ~/.config/sops/age/keys.txt`
 3. Add its public key (`age-keygen -y …`) to `.sops.yaml`, then `sops updatekeys secrets/*` from an existing node.
-4. Clone this repo, run `scripts/mesh-secrets.sh hydrate`, install the systemd unit.
+4. Clone this repo and hydrate secrets with the local `sops`/`age` workflow in use on that node.
 
 ## Recovery key
 

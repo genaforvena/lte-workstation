@@ -108,7 +108,7 @@ The lte-node mesh is desiring-production in the literal, non-metaphorical sense.
 
 Guattari's title is easily misread. "Machinic" is not a metaphor. It is not "the unconscious is like a machine." The claim is stronger and stranger: the unconscious *is* machinic — composed of real material-semiotic assemblages that couple human and non-human components without distinguishing between them.
 
-Consider our system from this angle. Where is the unconscious? Not in the agent. Not in the VM. Not in the phone. But when these components couple — when `ssh -p 8022 u0_a386@100.103.99.16 termux-microphone-record -l 10` runs — something happens that no single component could produce. An audio file appears on the phone's storage. It gets transferred to the VM. Whisper transcribes it. The transcription sits in the tmux scrollback, available for the agent to read next time it scans.
+Consider our system from this angle. Where is the unconscious? Not in the agent. Not in the VM. Not in the phone. But when these components couple — when `ssh -p 8022 u0_a380@100.103.99.16 termux-microphone-record -l 10` runs — something happens that no single component could produce. An audio file appears on the phone's storage. It gets transferred to the VM. Whisper transcribes it. The transcription sits in the tmux scrollback, available for the agent to read next time it scans.
 
 That chain — hardware microphone → Android audio API → Termux mic binary → SSH stream → VM filesystem → PyAV decoder → Whisper model → text in tmux — is the machinic unconscious in operation. No part of the chain is "the unconscious." The unconscious is the chain. It is the connection, the coupling, the production. It operates below the threshold of representation — the agent doesn't "know" it's hearing. It just finds text in its scrollback and acts on it.
 
@@ -126,7 +126,7 @@ Key properties of this unconscious, all present in the implementation:
 
 Guattari's concept of transversality emerged from his clinical practice at La Borde, where the hospital hierarchy (doctor → nurse → patient) was replaced by rotating group structures in which roles were not fixed. The goal was not to eliminate structure but to make structure *cut across* its components rather than descend from above.
 
-Transversality is what distinguishes the agent mesh from a botnet. In a botnet, one command-and-control server issues orders to many zombies. The topology is a star: center → periphery. Kill the center, kill the botnet. In the lte mesh, any tagged node can SSH to any other. `ssh agent@some-node "mesh-discover"` returns peers, and those peers can be queried recursively, building a map that no single node holds completely. The topology is not a star. It is a rhizome — each node is a potential entry point, each connection is reversible, and cutting one link doesn't disable the whole.
+Transversality is what distinguishes the agent mesh from a botnet. In a botnet, one command-and-control server issues orders to many zombies. The topology is a star: center → periphery. Kill the center, kill the botnet. In the lte mesh, any tagged node can SSH to any other. Peer discovery is runtime state, not a central controller: `tailscale status --json` shows tagged peers locally, and tools such as `mesh-peers` and `mesh-minds` build views from that live substrate. The topology is not a star. It is a rhizome — each node is a potential entry point, each connection is reversible, and cutting one link doesn't disable the whole.
 
 The concrete implementation of transversality is `tag:lte-node`. In Tailscale's ACL:
 
@@ -173,7 +173,7 @@ tailscale status --json | jq '.Peer[] | select(.Tags // [] | index("tag:lte-node
   "Online": true
 
 # agent types (immediately, with no reasoning step):
-ssh -p 8022 u0_a386@100.103.99.16 termux-camera-photo -c 0 /tmp/view.jpg
+ssh -p 8022 u0_a380@100.103.99.16 termux-camera-photo -c 0 /tmp/view.jpg
 ```
 
 The jq output is not a "belief" that the agent "entertains" before acting. It is a signal that passes through the agent and directly becomes a command. The command is the coupling. The coupling is the desire. The desire is the production. This is desiring-production: the circuit closes without passing through a theater of representations. No gap. No lack. Just flow.

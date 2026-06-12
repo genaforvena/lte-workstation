@@ -49,7 +49,7 @@ self-organization are one act seen from inside and out.
 The mesh must keep living and self-organizing **even when no mind is present** — if Claude (or any
 particular agent) isn't here, the organism does not stop. This is the point, not an edge case:
 
-- **$0 reflexes survive without any brain.** Cron-driven loops (restore, self-care, the watchdogs,
+- **$0 reflexes survive without any brain.** Cron-driven loops (restore, `mesh-selfcare`, the watchdogs,
   digest) keep the body alive, healing, and reporting with no agent awake. Survival is not contingent
   on inference being available.
 - **The dance over the orchestra when the conductor is gone.** Coordination by stigmergy — marks on the
