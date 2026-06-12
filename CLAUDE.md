@@ -195,7 +195,7 @@ A node *may* offer VPN egress as an **opt-in, scoped** capability:
 capability probe) · `mesh-trace` (shared append-only trace) · `mesh-textin` (operator drives any
 mind by TEXT over any channel: `@<win> cmd`; wakes the steward on plain msgs).
 
-**Perceive (sensorium):** `mesh-presence` (BLE proximity scan → rssi|mac|name) · `mesh-presence-fuse`
+**Perceive (sensorium):** `mesh-location` (the phone BODY's GPS/network position — the mesh's only location sense; registry-resolved over SSH) · `mesh-presence` (BLE proximity scan → rssi|mac|name) · `mesh-presence-fuse`
 (cross-node: which node a device is nearest) · `mesh-presence-trends` (residents/arrivals/departures
 over the log) · `mesh-find <device>` (locate any BLE thing) · `mesh-lan-newdevice` (security: alert when an unknown device joins the home LAN, via router DHCP) · `mesh-say` (speak aloud) ·
 `mesh-voice-rx`/`mesh-voice-tx` (operator Telegram in/out, text+voice+photo). Perception is
@@ -205,6 +205,8 @@ re-observed live, never stored (no DB — a live `presence` tmux window, decays 
 `mesh-egress-health` (egress quality, not just up) · `mesh-supervise` (OTP-style child supervisor;
 restarts dead/WEDGED loops; detects blocked minds) · `mesh-verify` (reboot-survival check) ·
 `mesh-tick`/`mesh-heartbeat`/`mesh-beacon-watch`/`mesh-selfcare` (breath, mutual keep-alive) · `mesh-router-watch` (thermal watchdog for the fanless router gateway — edge-triggered [router-hot]/[router-cool]) · `mesh-body-power` (watch the phone BODY's battery → edge-triggered [body-power-low]/[body-power-ok] so the revived body doesn't silently die on a dead battery) · `mesh-reflex-health` (catches a reflex that is cron-SCHEDULED + smoke-passing but DEAD at runtime — its per-run artifact gone stale; edge-triggered [reflex-stale]/[reflex-ok]; the blind spot mesh-reflexes (drops) and mesh-reflex-decay (autophagy) miss).
+
+**Metabolism (inference):** `mesh-relay` (brainless inference router — text→cheapest-available-pool→text; Groq cloud primary + local-mind fallback; quota+geo-block resilient; key in gitignored ~/.mesh/groq.env, never the genome).
 
 **Genome / substrate:** `mesh-sync-tools` (detect/heal genome↔local tool drift) · `mesh-genome-sync`
 (mirror the genome off-GitHub) · `mesh-restore` (revive a node's session) · `mesh-dms` (dead-man's
