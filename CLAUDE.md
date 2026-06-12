@@ -197,7 +197,7 @@ mind by TEXT over any channel: `@<win> cmd`; wakes the steward on plain msgs).
 
 **Perceive (sensorium):** `mesh-presence` (BLE proximity scan → rssi|mac|name) · `mesh-presence-fuse`
 (cross-node: which node a device is nearest) · `mesh-presence-trends` (residents/arrivals/departures
-over the log) · `mesh-find <device>` (locate any BLE thing) · `mesh-say` (speak aloud) ·
+over the log) · `mesh-find <device>` (locate any BLE thing) · `mesh-lan-newdevice` (security: alert when an unknown device joins the home LAN, via router DHCP) · `mesh-say` (speak aloud) ·
 `mesh-voice-rx`/`mesh-voice-tx` (operator Telegram in/out, text+voice+photo). Perception is
 re-observed live, never stored (no DB — a live `presence` tmux window, decays on reboot).
 
