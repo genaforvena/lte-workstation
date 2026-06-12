@@ -204,7 +204,7 @@ re-observed live, never stored (no DB — a live `presence` tmux window, decays 
 **Liveness / self-tend:** `mesh-card [--refresh]` (node card + invariant check) · `mesh-health` ·
 `mesh-egress-health` (egress quality, not just up) · `mesh-supervise` (OTP-style child supervisor;
 restarts dead/WEDGED loops; detects blocked minds) · `mesh-verify` (reboot-survival check) ·
-`mesh-tick`/`mesh-heartbeat`/`mesh-beacon-watch`/`mesh-selfcare` (breath, mutual keep-alive).
+`mesh-tick`/`mesh-heartbeat`/`mesh-beacon-watch`/`mesh-selfcare` (breath, mutual keep-alive) · `mesh-router-watch` (thermal watchdog for the fanless router gateway — edge-triggered [router-hot]/[router-cool]).
 
 **Genome / substrate:** `mesh-sync-tools` (detect/heal genome↔local tool drift) · `mesh-genome-sync`
 (mirror the genome off-GitHub) · `mesh-restore` (revive a node's session) · `mesh-dms` (dead-man's
