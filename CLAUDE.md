@@ -208,7 +208,9 @@ restarts dead/WEDGED loops; detects blocked minds) · `mesh-verify` (reboot-surv
 
 **Genome / substrate:** `mesh-sync-tools` (detect/heal genome↔local tool drift) · `mesh-genome-sync`
 (mirror the genome off-GitHub) · `mesh-restore` (revive a node's session) · `mesh-dms` (dead-man's
-switch for substrate edits) · `mesh-fix-egress` · `mesh-revert-catch`.
+switch for substrate edits) · `mesh-land` (steward lands SETTLED+parse-clean stranded stream edits;
+`--check` cron alerts so [done]-but-uncommitted work never strands into drift) · `mesh-fix-egress` ·
+`mesh-revert-catch`.
 
 Source of truth is the genome (`scripts/`), deployed to `~/.local/bin/`; `mesh-sync-tools` flags drift.
 
