@@ -6,7 +6,25 @@
 # Usage:
 #   mesh-card-watchdog.sh
 set -uo pipefail
-[ "${1:-}" = --test ] && { command -v mesh-card >/dev/null 2>&1 || { echo "smoke-test: FAIL (no mesh-card)"; exit 1; }; echo "smoke-test: ok"; exit 0; }
+if [ "${1:-}" = --test ]; then
+  command -v mesh-card >/dev/null 2>&1 || { echo "smoke-test: FAIL (no mesh-card)"; exit 1; }
+  command -v mktemp >/dev/null 2>&1 || { echo "smoke-test: FAIL (no mktemp)"; exit 1; }
+  command -v grep   >/dev/null 2>&1 || { echo "smoke-test: FAIL (no grep)"; exit 1; }
+  tmp="$(mktemp -d)" || { echo "smoke-test: FAIL (mktemp failed)"; exit 1; }
+  trap 'rm -rf "$tmp"' EXIT
+  touch "$tmp/traces.log" || { echo "smoke-test: FAIL (cannot create temp log)"; exit 1; }
+  out="$(MESH_CARD="$tmp/card" HOME="$HOME" mesh-card --refresh 2>&1)" || {
+    echo "smoke-test: FAIL (mesh-card --refresh failed: $out)"; exit 1;
+  }
+  printf '%s\n' "$out" | grep -q '^hostname:' || {
+    echo "smoke-test: FAIL (mesh-card refresh did not emit card content)"; exit 1;
+  }
+  printf '%s\n' "$out" | grep -q 'invariant-check:' || {
+    echo "smoke-test: FAIL (mesh-card refresh missing invariant-check)"; exit 1;
+  }
+  [ -s "$tmp/card" ] || { echo "smoke-test: FAIL (temp card file not written)"; exit 1; }
+  echo "smoke-test: ok"; exit 0
+fi
 
 CARD="${MESH_CARD:-$HOME/.mesh-card}"
 MESH_DIR="${HOME}/.mesh"
