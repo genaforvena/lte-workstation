@@ -210,7 +210,9 @@ restarts dead/WEDGED loops; detects blocked minds) · `mesh-verify` (reboot-surv
 (mirror the genome off-GitHub) · `mesh-restore` (revive a node's session) · `mesh-dms` (dead-man's
 switch for substrate edits) · `mesh-land` (steward lands SETTLED+parse-clean stranded stream edits;
 `--check` cron alerts so [done]-but-uncommitted work never strands into drift) · `mesh-fix-egress` ·
-`mesh-revert-catch`.
+`mesh-revert-catch` · `mesh-harden-ssh` (close the `:22` password-auth lateral-movement surface —
+disables password/kbd-interactive auth, key-auth only, UNDER mesh-dms with a verified-key-login
+auto-revert; refuses without an authorized_keys; `--check` is read-only).
 
 Source of truth is the genome (`scripts/`), deployed to `~/.local/bin/`; `mesh-sync-tools` flags drift.
 
