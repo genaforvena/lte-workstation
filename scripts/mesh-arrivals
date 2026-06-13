@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+# mesh-arrivals — the "who's around" life-event sense: emit [arrived]/[left] ONLY for a KNOWN/NAMED
+# device (a person's phone, Bose, Quest, the TV), suppressing the randomized-MAC BLE churn that makes
+# raw presence useless as a life-signal. The MEANINGFUL edge that mesh-presence-delta isn't.
+#
+# Two refinements over mesh-presence-delta (which fires on ANY mac|name change):
+#   1. NAME identity, not MAC — a named device's MAC rotates (privacy randomization) but its NAME is
+#      stable, so tracking by name means "Bose rotated its address" does NOT read as leave+arrive.
+#   2. DEBOUNCE (hysteresis) — BLE RSSI flickers: a present device drops out of a single scan then
+#      returns (seen live: Bose present 17:31, gone 17:33, back 17:34). A device is only declared
+#      LEFT after MESH_ARRIVAL_MISSES consecutive absent scans (default 3) — killing the flap that
+#      would otherwise spam "left/arrived" every other cycle.
+#
+# Honest-fusion (memory fusion-tools-distinguish-empty-from-failed): a FAILED/empty/unreachable scan
+# never increments misses — an absent vantage is NOT "everyone left". First run seeds silently (the
+# whole room is not "arrivals"). Multi-vantage: a device seen at ANY reachable vantage counts present
+# (union); an unreachable peer is skipped + noted, never an absence.
+#
+#   mesh-arrivals                    scan local BLE → emit named arrive/leave edges (debounced)
+#   mesh-arrivals --vantages "local default-string"   union across BLE vantages (best-effort)
+#   mesh-arrivals --status           current known-present named devices + miss counts
+#   mesh-arrivals --forget           reset state (re-seed next run)
+#   mesh-arrivals --test             smoke test
+#   (also reads a presence scan on STDIN — composes as a mesh-stream filter)
+#
+# Read-only sense. Edge is in the TEXT (feed a mind); exit 0 normally, 2 = could not sample any vantage.
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+[ -f "$HOME/.mesh/nodes" ] && . "$HOME/.mesh/nodes"
+
+STATE="$HOME/.mesh/arrivals.state"        # lines: <name>\t<miss_count>   (present known devices)
+MISSES="${MESH_ARRIVAL_MISSES:-3}"        # consecutive absent scans before a device is "left"
+WIN="${MESH_ARRIVAL_WIN:-8}"              # BLE scan window seconds
+mkdir -p "$HOME/.mesh"
+
+# A real, trackable name: not empty, not the unknown '?', not a randomized device-name token
+# (SC-<hex> = Samsung-accessory rotating names). Everything else (Bose / [TV] … / Quest 3 / a phone
+# model / even a default "Bluetooth") is a stable identity worth a life-event.
+is_named(){ local n="$1"; case "$n" in ""|"?") return 1;; SC-[0-9A-Fa-f]*) return 1;; *) return 0;; esac; }
+
+# extract the set of NAMED device names from a presence scan (rssi|mac|name lines; name may contain
+# spaces and ()[]; rejoin fields >=3 in case a name held a literal '|'). One name per line, unique.
+named_from_scan(){
+  grep -E '^[+-]?[0-9]+\|' 2>/dev/null | awk -F'|' 'NF>=3{n=$3; for(i=4;i<=NF;i++) n=n"|"$i; if(n!="" && n!="?") print n}' \
+    | while IFS= read -r n; do is_named "$n" && printf '%s\n' "$n"; done | sort -u
+}
+
+if [ "${1:-}" = --test ]; then
+  for c in mesh-presence awk grep sort comm; do command -v "$c" >/dev/null 2>&1 || { echo "smoke-test: FAIL (no $c)"; exit 1; }; done
+  # named filter must keep real names + drop ?/SC-noise; debounce must hold a 1-scan flicker
+  scan=$'=== mesh-presence x ===\n-66|28:11:A5:B8:9E:A2|LE-Bose Revolve SoundLink\n-74|66:FA:CC:99:91:BE|?\n-93|E8:5C:5F:7C:D0:90|SC-3115020001FC5A\n-85|5C:49:7D:92:1E:58|[TV] Samsung 5 Series (40)'
+  got="$(printf '%s\n' "$scan" | named_from_scan)"
+  printf '%s\n' "$got" | grep -qx 'LE-Bose Revolve SoundLink' || { echo "smoke-test: FAIL (dropped a real name: [$got])"; exit 1; }
+  printf '%s\n' "$got" | grep -qx '\[TV\] Samsung 5 Series (40)' || { echo "smoke-test: FAIL (dropped a real name: [$got])"; exit 1; }
+  printf '%s\n' "$got" | grep -q 'SC-' && { echo "smoke-test: FAIL (kept SC- randomized name)"; exit 1; }
+  [ "$(printf '%s\n' "$got" | grep -c .)" = 2 ] || { echo "smoke-test: FAIL (expected 2 named, got [$got])"; exit 1; }
+  echo "smoke-test: ok"; exit 0
+fi
+
+ARG="${1:-}"; vantages="local"
+case "$ARG" in
+  --forget) rm -f "$STATE"; echo "arrivals state forgotten — next run re-seeds"; exit 0;;
+  --status)
+    echo "known-present named devices (name | misses):"
+    [ -s "$STATE" ] && awk -F'\t' '{printf "  %-32s %s\n", $1, $2}' "$STATE" || echo "  (none tracked yet)"
+    exit 0;;
+  --vantages) vantages="${2:-local}";;
+esac
+
+# ---- gather current named set across vantages (union; unreachable vantage skipped, not an absence) -
+tmp_seen="$(mktemp)"; trap 'rm -f "$tmp_seen"' EXIT
+any_vantage=0; skipped=""
+# STDIN scan (stream mode) feeds the LOCAL vantage if present
+stdin_scan=""
+if [ ! -t 0 ]; then stdin_scan="$(cat)"; fi
+
+for v in $vantages; do
+  scan=""; ok=0
+  if [ "$v" = "local" ] || [ "$v" = "$(hostname)" ]; then
+    if [ -n "$stdin_scan" ]; then scan="$stdin_scan"; ok=1
+    else scan="$(timeout $((WIN+40)) mesh-presence "$WIN" 2>/dev/null)" && [ -n "$scan" ] && ok=1; fi
+  else
+    addr="$(mesh-peer-addr "$v" 2>/dev/null || true)"
+    if [ -n "$addr" ]; then
+      # resolve ssh user from the MESH_NODES registry (label:user@ip), else a sane default
+      vuser="$(for n in ${MESH_NODES:-}; do [ "${n%%:*}" = "$v" ] && { e="${n#*:}"; echo "${e%%@*}"; break; }; done)"
+      [ -n "$vuser" ] || vuser="${MESH_ARRIVAL_USER:-$(whoami)}"
+      scan="$(timeout $((WIN+45)) ssh -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new "$vuser@$addr" "\$HOME/.local/bin/mesh-presence $WIN" </dev/null 2>/dev/null)" \
+        && [ -n "$scan" ] && ok=1
+    fi
+  fi
+  if [ "$ok" = 1 ]; then any_vantage=1; printf '%s\n' "$scan" | named_from_scan >> "$tmp_seen"
+  else skipped="$skipped $v"; fi
+done
+
+if [ "$any_vantage" = 0 ]; then
+  echo "mesh-arrivals: no BLE vantage reachable (${vantages// /, }) — cannot sample, NOT declaring anyone left" >&2
+  exit 2
+fi
+cur="$(sort -u "$tmp_seen")"
+
+# ---- first run: seed silently (whole room ≠ arrivals) --------------------------------------------
+if [ ! -f "$STATE" ]; then
+  while IFS= read -r n; do [ -n "$n" ] && printf '%s\t0\n' "$n"; done <<<"$cur" > "$STATE"
+  echo "mesh-arrivals: seeded $(grep -c . "$STATE" 2>/dev/null || echo 0) known device(s) (silent first run)" >&2
+  exit 0
+fi
+
+# ---- diff with debounce --------------------------------------------------------------------------
+declare -A PREVMISS=()
+while IFS=$'\t' read -r name miss; do [ -n "$name" ] && PREVMISS["$name"]="${miss:-0}"; done < "$STATE"
+declare -A CURSET=()
+while IFS= read -r n; do [ -n "$n" ] && CURSET["$n"]=1; done <<<"$cur"
+
+arrived=""; left=""
+: > "$STATE.new"
+# devices seen now: present (miss=0); ARRIVED if they weren't tracked before
+for n in "${!CURSET[@]}"; do
+  if [ -z "${PREVMISS[$n]+x}" ]; then arrived="$arrived$n"$'\n'; fi
+  printf '%s\t0\n' "$n" >> "$STATE.new"
+done
+# tracked devices NOT seen now: bump miss; LEFT at threshold, else keep (debounce)
+for n in "${!PREVMISS[@]}"; do
+  [ -n "${CURSET[$n]+x}" ] && continue
+  m=$(( ${PREVMISS[$n]} + 1 ))
+  if [ "$m" -ge "$MISSES" ]; then left="$left$n"$'\n'; else printf '%s\t%s\n' "$n" "$m" >> "$STATE.new"; fi
+done
+mv -f "$STATE.new" "$STATE"
+
+[ -n "$skipped" ] && echo "(vantages skipped — unreachable, not counted as absence:$skipped)" >&2
+if [ -z "${arrived}${left}" ]; then exit 0; fi   # no meaningful edge → say nothing
+
+# ---- emit the life-event (the text a mind reacts to) ---------------------------------------------
+echo "who's-around change near $(hostname) — a KNOWN device arrived/left (react if it matters, else acknowledge):"
+[ -n "$arrived" ] && printf '%s' "$arrived" | sed '/^$/d; s/^/  [arrived] /'
+[ -n "$left"    ] && printf '%s' "$left"    | sed '/^$/d; s/^/  [left]    /'
+exit 0
