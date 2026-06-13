@@ -195,7 +195,7 @@ A node *may* offer VPN egress as an **opt-in, scoped** capability:
 capability probe) · `mesh-trace` (shared append-only trace) · `mesh-textin` (operator drives any
 mind by TEXT over any channel: `@<win> cmd`; wakes the steward on plain msgs).
 
-**Perceive (sensorium):** `mesh-location` (the phone BODY's GPS/network position — the mesh's only location sense; registry-resolved over SSH) · `mesh-presence` (BLE proximity scan → rssi|mac|name) · `mesh-presence-fuse`
+**Perceive (sensorium):** `mesh-location` (the phone BODY's GPS/network position — the mesh's only location sense; registry-resolved over SSH) · `mesh-body-motion` (the phone BODY's ACTIVITY sense — fuses accel/orientation/step-counter/lux in ONE SSH read → classifies STILL/CARRIED/HANDLED/COVERED; the gap mesh-location (where) + mesh-presence (who) leave: whether the body is moving/held; `--edge` for streams, exit 2 = phone unreachable) · `mesh-presence` (BLE proximity scan → rssi|mac|name) · `mesh-presence-fuse`
 (cross-node: which node a device is nearest) · `mesh-presence-fuse-stream` (cron-wired reflex on top of
 it: feeds a mind when a tracked device changes zone — [zone] edge) · `mesh-presence-trends` (residents/arrivals/departures
 over the log) · `mesh-find <device>` (locate any BLE thing) · `mesh-lan-newdevice` (security: alert when an unknown device joins the home LAN, via router DHCP) · `mesh-say` (speak aloud) ·

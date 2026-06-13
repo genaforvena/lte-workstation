@@ -13,6 +13,13 @@ on the Redmi 10, 2026-06-12 after the F-Droid reinstall: termux-api 0.59.1, 83 c
 - **Senses (input):** `termux-location` (GPS), `termux-camera-photo`, `termux-microphone-record`,
   `termux-sensor` (accel/gyro/light/…), `termux-battery-status`, `termux-telephony-cellinfo`,
   `termux-wifi-scaninfo` (RF/localization), `termux-nfc`, `termux-fingerprint`, `termux-speech-to-text`.
+  - **Wired sense organ** `mesh-body-motion` — fuses `bma420`+`ORIENTATION`+`STEP_COUNTER`+`LINEARACCEL`+`tmd2755_l`
+    in one SSH read and classifies the body's **activity**: `STILL` / `CARRIED` (step delta) /
+    `HANDLED` (linear-accel) / `COVERED` (face-down or upright + dark). The mesh's only body-activity
+    sense — `mesh-location` knows *where*, `mesh-presence` knows *who's near*, neither knows if the body
+    is moving or held. A parked body reading `CARRIED`/`HANDLED` = tamper/interaction. `--edge` emits only
+    on a state change (stream-feedable); `--raw` is the fused-sensor artifact; `--test` exit 2 = phone n/a.
+    (Full sensor matrix: `knowledge/phone-sensor-inventory-2026-06-13.md`.)
 - **Actuators (act on the world):** `termux-tts-speak` (voice out), `termux-sms-send`,
   `termux-telephony-call`, `termux-infrared-transmit` (control TVs/appliances), `termux-torch`,
   `termux-vibrate`, `termux-notification`, `termux-media-player`, `termux-toast`, `termux-volume`,
