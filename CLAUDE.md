@@ -202,7 +202,11 @@ over the log) · `mesh-find <device>` (locate any BLE thing) · `mesh-lan-newdev
 `mesh-voice-rx`/`mesh-voice-tx` (operator Telegram in/out, text+voice+photo) · `mesh-tg-update`
 (proactive operator-notification REFLEX: cron-polled "what changed" → concise Telegram push —
 landed commits + completed tasks + genuine problem-signals; marker-deduped, SILENT on no-change;
-a reflex NOT a mind, so it never goes stale on a rate-limited/blocked chat mind; */15). Perception is
+a reflex NOT a mind, so it never goes stale on a rate-limited/blocked chat mind; */15) · `mesh-watchtower`
+(the mesh's eye on the OUTSIDE — runs against the public-IP node phaedra: senses inbound KNOCKS on the
+public `:22` [who's scanning the mesh], external REACH from a clean datacenter vantage [reaches Anthropic
+where RU-egress home nodes 403 — a geo-bypass canary], and self-EXPOSURE [what the internet can reach];
+the inverse of the phone's eye-on-the-room; `--edge` on reach-flip/scan-spike, exit 2 = node unreachable). Perception is
 re-observed live, never stored (no DB — a live `presence` tmux window, decays on reboot).
 
 **Liveness / self-tend:** `mesh-card [--refresh]` (node card + invariant check) · `mesh-health` ·
