@@ -243,10 +243,11 @@ dead-man, deploy gated) · `mesh-card-watchdog.{sh,service,timer}` (card freshne
 `mesh-homeostasis` (egress set-point auto-repair: detects + corrects drift from the desired egress IP) ·
 `mesh-resource-guard` (read-only resource monitor: reports live mind PIDs with RSS/CPU and enforces soft/hard thresholds) ·
 `mesh-tg-watchdog` (TG-organ liveness monitor: alerts operator if the Telegram path from default-string goes down — designed to run on a non-default-string node) ·
-`mesh-attach` (mesh-wide tmux: list all nodes' hostname-named sessions + attach any from one command; self-detects own node to avoid SSH round-trip to self). Decayed
+`mesh-attach` (mesh-wide tmux: list all nodes' hostname-named sessions + attach any from one command; self-detects own node to avoid SSH round-trip to self) ·
+`mesh-digest` (brainless daily summary of what changed on this node: git log + trace tail + health snapshot — operator orient/verify tool). Decayed
 2026-06-11: `mesh-health-watch` (→ mesh-session-watchdog), `mesh-tg-recv` (→ voice-rx+textin),
 `mesh-zone` (→ presence-fuse/trends), `vpn-hub.py` (retired overlay), `mesh-onboard` (attic:
-junk-posted onboarding wrapper; keep out of canon). Git history is the attic.
+junk-posted onboarding wrapper; keep out of canon). Decayed 2026-06-13: `mesh-board-timerepair` (one-shot 2026-06-11 board date-repair, no longer needed). Git history is the attic.
 
 ## Capabilities (self-declared, opt-in by consumers)
 
