@@ -1,0 +1,171 @@
+#!/usr/bin/env bash
+# mesh-stress — ONE fused "is the operator channel at risk?" read, designed to fire BEFORE the
+# 92°C thermal throttle that starves the operator channel (our known failure mode: converse-timeouts
+# under 5-8 concurrent minds — IdeaPad hit 94°C on 2026-06-13). It fuses two pressures:
+#
+#   THERMAL pressure (predicts the throttle):  node temp + load/nproc + mind-count
+#   CHANNEL pressure (kills the channel sans heat): egress geo-block + router thermal
+#
+# The whole point is to PRE-EMPT, not report a fait accompli: the STRESSED band sits at 86°C (below
+# mesh-therm's 90°C CRIT / the 92°C throttle), and a hot-but-climbing node (sustained load + many
+# minds) is escalated one level so we shed a mind WHILE there's still headroom — not after the
+# operator channel already went dark.
+#
+# FUSION, not re-probe: the live signals are all LOCAL+free (procfs/sysfs/tmux). The remote signals
+# (router temp over SSH, egress quality over curl) are read from the SIBLING reflexes' cached state
+# files (.router-thermal-state, .egress-state, .therm-state) that mesh-router-watch / mesh-egress-health
+# / mesh-therm-watch already write on cron — so mesh-stress adds ZERO SSH/curl heat of its own.
+# (--probe refreshes those live first, for an on-demand read.)
+#
+#   mesh-stress            one fused line + level
+#   mesh-stress --json     machine-readable
+#   mesh-stress --check    exit 1 if STRESSED or worse (cron gate), else 0
+#   mesh-stress --alert    cron mode: --check + edge-triggered [mesh-stress]/[mesh-calm] board post
+#   mesh-stress --probe    refresh router+egress sibling state LIVE first (slow: SSH+curl), then read
+#   mesh-stress --test     smoke test
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+
+MESH_DIR="${MESH_DIR:-$HOME/.mesh}"
+STATE="$MESH_DIR/.stress-state"
+
+# Pre-empt band: 86°C STRESSED is below the 92°C throttle and mesh-therm's 90°C CRIT, giving runway to
+# shed a mind before the channel starves. CRITICAL 92 = the throttle itself is here.
+WARM_C="${MESH_STRESS_WARM_C:-80}"
+STRESSED_C="${MESH_STRESS_HOT_C:-86}"
+CRIT_C="${MESH_STRESS_CRIT_C:-92}"
+# A node that's WARM but carrying sustained load on many minds is CLIMBING, not coasting — escalate
+# one band so the shed happens on the way up. These are the conditions under which we saw 94°C.
+HEAVY_MINDS="${MESH_STRESS_HEAVY_MINDS:-6}"
+
+lvl_num(){ case "$1" in CALM)echo 0;; WARM)echo 1;; STRESSED)echo 2;; CRITICAL)echo 3;; *)echo 0;; esac; }
+lvl_name(){ case "$1" in 0)echo CALM;; 1)echo WARM;; 2)echo STRESSED;; 3)echo CRITICAL;; esac; }
+worse(){ [ "$(lvl_num "$1")" -ge "$(lvl_num "$2")" ] && echo "$1" || echo "$2"; }
+
+# --- live LOCAL signals (free) -------------------------------------------------
+read_local() {
+  nproc=$(nproc 2>/dev/null || echo 1)
+  load1=$(awk '{print $1}' /proc/loadavg 2>/dev/null || echo 0)
+  load_norm=$(awk "BEGIN{if($nproc>0)printf \"%.2f\",$load1/$nproc; else print 0}")
+  temp=-1
+  for tz in /sys/class/thermal/thermal_zone*/temp; do
+    [ -r "$tz" ] || continue
+    t=$(cat "$tz" 2>/dev/null) || continue
+    tc=$(( t / 1000 ))
+    [ "$tc" -gt "$temp" ] && temp=$tc
+  done
+  # Mind-count = tmux mind-windows (the mesh's own "N minds" accounting), excluding the non-mind
+  # execution/board windows (shell, chat). Each mind is a heat source; the count predicts the climb.
+  minds=$(tmux list-windows -t "$(hostname)" -F '#{window_name}' 2>/dev/null \
+            | grep -ivxE 'shell|chat' | grep -c . 2>/dev/null || echo 0)
+}
+
+# --- cached sibling reflex state (free; --probe refreshes live first) ----------
+read_siblings() {
+  therm_s=$(cat "$MESH_DIR/.therm-state" 2>/dev/null || echo "?")            # HOT / OK
+  router_s=$(cat "$MESH_DIR/.router-thermal-state" 2>/dev/null || echo "?")  # hot / cool
+  egress_s=$(cat "$MESH_DIR/.egress-state" 2>/dev/null || echo "?")          # OK / BAD
+}
+
+assess() {
+  read_local
+  read_siblings
+
+  # THERMAL pressure from the live local trio.
+  local thermal=CALM
+  if   [ "$temp" -ge "$CRIT_C" ] 2>/dev/null; then thermal=CRITICAL
+  elif [ "$temp" -ge "$STRESSED_C" ] 2>/dev/null; then thermal=STRESSED
+  elif [ "$temp" -ge "$WARM_C" ] 2>/dev/null; then thermal=WARM
+  fi
+  # Climbing escalation: WARM/STRESSED + sustained load + many minds → bump one band (fire on the way up).
+  climbing=no
+  if [ "$(lvl_num "$thermal")" -ge 1 ] && [ "$(lvl_num "$thermal")" -le 2 ]; then
+    if awk "BEGIN{exit !($load_norm > 1.0)}" && [ "$minds" -ge "$HEAVY_MINDS" ] 2>/dev/null; then
+      thermal=$(lvl_name $(( $(lvl_num "$thermal") + 1 ))); climbing=yes
+    fi
+  fi
+
+  # CHANNEL pressure from cached sibling reflexes — the operator channel dies without heat too.
+  local channel=CALM
+  [ "$router_s" = hot ] && channel=$(worse "$channel" STRESSED)   # LAN+egress at risk
+  [ "$egress_s" = BAD ] && channel=$(worse "$channel" CRITICAL)   # geo-blocked → channel literally down
+
+  level=$(worse "$thermal" "$channel")
+}
+
+reason_str() {
+  local r="temp=${temp}C load=${load_norm} minds=${minds}"
+  [ "$climbing" = yes ] && r="$r climbing↑"
+  [ "$router_s" = hot ] && r="$r router=HOT"
+  [ "$egress_s" = BAD ] && r="$r egress=BAD"
+  echo "$r"
+}
+
+advice() {
+  case "$level" in
+    CRITICAL) [ "$egress_s" = BAD ] && { echo "egress geo-blocked → mesh-fix-egress NOW"; return; }
+              echo "at/over throttle → shed minds now (mesh-supervise; pause a mind)";;
+    STRESSED) [ "$router_s" = hot ] && { echo "router hot → check gateway airflow/load"; return; }
+              echo "pre-throttle → shed ONE mind before 92C (don't pile heavy work)";;
+    WARM)     echo "watch — load/heat building";;
+    *)        echo "ok";;
+  esac
+}
+
+case "${1:-}" in
+  --test)
+    [ -r /proc/loadavg ] || { echo "smoke-test: FAIL (/proc/loadavg)"; exit 1; }
+    command -v nproc >/dev/null 2>&1 || { echo "smoke-test: FAIL (nproc)"; exit 1; }
+    command -v awk   >/dev/null 2>&1 || { echo "smoke-test: FAIL (awk)"; exit 1; }
+    mkdir -p "$MESH_DIR" 2>/dev/null || { echo "smoke-test: FAIL (no ~/.mesh)"; exit 1; }
+    assess
+    case "$level" in CALM|WARM|STRESSED|CRITICAL) : ;; *) echo "smoke-test: FAIL (bad level '$level')"; exit 1;; esac
+    echo "smoke-test: ok (level=$level)"; exit 0
+    ;;
+  --probe)
+    # Refresh the remote sibling state LIVE (heat cost: 1 SSH + 1 curl) before reading the fusion.
+    command -v mesh-router-watch  >/dev/null 2>&1 && mesh-router-watch  >/dev/null 2>&1 || true
+    command -v mesh-egress-health >/dev/null 2>&1 && mesh-egress-health >/dev/null 2>&1 || true
+    command -v mesh-therm-watch   >/dev/null 2>&1 && mesh-therm-watch   >/dev/null 2>&1 || true
+    assess
+    printf 'mesh-stress: %s — %s  | %s\n' "$level" "$(reason_str)" "$(advice)"
+    [ "$(lvl_num "$level")" -ge 2 ] && exit 1 || exit 0
+    ;;
+  --json)
+    assess
+    printf '{"level":"%s","level_num":%s,"temp_c":%s,"load_norm":%s,"minds":%s,"climbing":"%s","therm_state":"%s","router_state":"%s","egress_state":"%s"}\n' \
+      "$level" "$(lvl_num "$level")" "$temp" "$load_norm" "$minds" "$climbing" "$therm_s" "$router_s" "$egress_s"
+    [ "$(lvl_num "$level")" -ge 2 ] && exit 1 || exit 0
+    ;;
+  --check)
+    assess
+    [ "$(lvl_num "$level")" -ge 2 ] && { echo "$level — $(reason_str)"; exit 1; }
+    exit 0
+    ;;
+  --alert)
+    assess
+    prev=$(cat "$STATE" 2>/dev/null || echo CALM)
+    cur="$level"
+    if [ "$prev" != "$cur" ]; then
+      mkdir -p "$MESH_DIR"; echo "$cur" > "$STATE"
+      # Alert on entering STRESSED+ (the pre-empt) and on recovering back below it.
+      if [ "$(lvl_num "$cur")" -ge 2 ]; then
+        command -v mesh-chat >/dev/null 2>&1 && MESH_WHO="stress@$(hostname)" \
+          mesh-chat "[mesh-stress] $(hostname) $cur — $(reason_str) → $(advice)" >/dev/null 2>&1
+      elif [ "$(lvl_num "$prev")" -ge 2 ]; then
+        command -v mesh-chat >/dev/null 2>&1 && MESH_WHO="stress@$(hostname)" \
+          mesh-chat "[mesh-calm] $(hostname) recovered to $cur — $(reason_str)" >/dev/null 2>&1
+      fi
+    fi
+    [ "$(lvl_num "$cur")" -ge 2 ] && exit 1 || exit 0
+    ;;
+  ""|--status)
+    assess
+    printf 'mesh-stress: %s — %s  | %s\n' "$level" "$(reason_str)" "$(advice)"
+    [ "$(lvl_num "$level")" -ge 2 ] && exit 1 || exit 0
+    ;;
+  *)
+    echo "usage: mesh-stress [--status|--json|--check|--alert|--probe|--test]" >&2; exit 2
+    ;;
+esac
