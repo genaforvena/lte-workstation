@@ -246,6 +246,7 @@ shell-interpolated ones; wired into `mesh-doctor`'s parse check) · `mesh-chaos-
 dead-man, deploy gated) · `mesh-card-watchdog.{sh,service,timer}` (card freshness) ·
 `mesh-tools` (navigable tool INDEX — answers "160 scripts, hard to reason about": categories parsed from THIS tooling section, one-line descriptions from each script's header; `mesh-tools` grouped / `<category>` / `--search <term>` / `--counts` / `--uncategorized`. A living index, nothing hand-maintained) ·
 `mtg-watchdog.{sh,service,timer}` (Docker-MTG proxy watchdog — node-specific, deploy on Docker-MTG nodes) ·
+`bore-mtg.{sh,service}` (bore.pub MTProto proxy tunnel + Telegram link notification — node-specific, deploy on proxy nodes) ·
 `node-join-android.sh` (phone onboarding) · `test-*` (verification artifacts) ·
 `mesh-chat-filter` (actionability filter: reads a board line on stdin, emits a prompt only for actionable events — called by consuming minds) ·
 `mesh-queue-tend` (ideas-queue reconciler: conservatively flips [~]→[x] when a board [done] STRONGLY matches a queued idea — never on weak matches (losing undone work > clutter); the anti-duplicate-flood mechanism that stops finished work being re-fed; called by mesh-generate) ·
