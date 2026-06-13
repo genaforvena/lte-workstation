@@ -27,6 +27,13 @@ on the Redmi 10, 2026-06-12 after the F-Droid reinstall: termux-api 0.59.1, 83 c
   `termux-telephony-call`, `termux-infrared-transmit` (control TVs/appliances), `termux-torch`,
   `termux-vibrate`, `termux-notification`, `termux-media-player`, `termux-toast`, `termux-volume`,
   `termux-brightness`, `termux-wifi-enable`, `termux-clipboard-set`, `termux-share`, `termux-open-url`.
+  - **Wired actuator organ** `mesh-act <vibrate|torch|notify|ir> [args]` — the mesh's first
+    physical-world actuators beyond audio (the *hand* to the senses). `vibrate [ms]` / `torch
+    [on|off|N]` / `notify <msg>` were proven by felt/seen effect (operator-consented 2026-06-13,
+    memory `actuator-consent-2026-06-13`); `ir <freqHz> <pattern>` is gated behind its own
+    subcommand (it drives real devices — needs a target appliance + IR codes; transmit path built,
+    real-device effect unproven). `--test` is the reachability gate (exit 2 = unreachable, NO fire);
+    honest-organ — an unreachable phone is never a successful actuation.
 - **Personal data:** `termux-sms-inbox`, `termux-call-log`, `termux-contact-list`.
 - **Connectivity:** an independent LTE uplink (carrier-diverse from the VM's path) — a natural
   out-of-band/backup ingress.
