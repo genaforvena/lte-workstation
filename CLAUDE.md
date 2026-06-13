@@ -255,6 +255,7 @@ dead-man, deploy gated) · `mesh-card-watchdog.{sh,service,timer}` (card freshne
 `mesh-attach` (mesh-wide tmux: list all nodes' hostname-named sessions + attach any from one command; self-detects own node to avoid SSH round-trip to self) ·
 `mesh-organ` (the CAPABILITY ROUTER — run an organ by NAME wherever it physically lives: `mesh-organ camera` resolves a node that HAS a camera (mesh-organs --json), runs it there over SSH, returns the artifact; `--list`/`--where`/`--node`/`--manifest`. Location transparency layer B — "it shouldn't matter WHERE the organs are"; see knowledge/location-transparency-design-2026-06-13) ·
 `mesh-digest` (brainless daily summary of what changed on this node: git log + trace tail + health snapshot — operator orient/verify tool) ·
+`mesh-sensorium` (one-shot WHOLE-NODE perception dump: runs every sense tool best-effort → one timestamped report of what THIS node perceives now (health/therm/presence/wifiscan/audio/card); `--compact` one-line-per-sensor. The per-node breadth peer to mesh-body-context's body-only fusion + mesh-organ's single-organ run; distinct from mesh-snapshot's tmux-memory backup) ·
 `mesh-stream` (universal primitive: pipe any data stream into a mind's tmux session as a keystroke prompt — the SOURCE→FILTER→FEED pattern) ·
 `mesh-fleet-feed` (cross-node data feed: each node posts its own slice to peers, liveness falls out of replication staleness) ·
 `mesh-presence-delta` (presence stream filter: diffs consecutive scans, emits a mind-prompt only on device changes — used in presence pipelines) ·
