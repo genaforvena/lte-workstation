@@ -240,6 +240,7 @@ bites at runtime with stderr swallowed; zero-FP — validates only statically-li
 shell-interpolated ones; wired into `mesh-doctor`'s parse check) · `mesh-chaos-doctor`/`mesh-chaos-verify`/`mesh-chaos`
 (induced-failure drills — chaos-doctor checks detectors, chaos-verify drills them, mesh-chaos is the live opt-in injector) · `mesh-fleet-health` (fleet table) · `mesh-fleet-states` (fleet-wide edge-reflex wall: every node's per-state artifacts re-derived live over SSH, used by `mesh-dash organs`) · `mesh-steward-deadman` (router
 dead-man, deploy gated) · `mesh-card-watchdog.{sh,service,timer}` (card freshness) ·
+`mesh-tools` (navigable tool INDEX — answers "160 scripts, hard to reason about": categories parsed from THIS tooling section, one-line descriptions from each script's header; `mesh-tools` grouped / `<category>` / `--search <term>` / `--counts` / `--uncategorized`. A living index, nothing hand-maintained) ·
 `mtg-watchdog.{sh,service,timer}` (Docker-MTG proxy watchdog — node-specific, deploy on Docker-MTG nodes) ·
 `node-join-android.sh` (phone onboarding) · `test-*` (verification artifacts) ·
 `mesh-chat-filter` (actionability filter: reads a board line on stdin, emits a prompt only for actionable events — called by consuming minds) ·
@@ -248,7 +249,7 @@ dead-man, deploy gated) · `mesh-card-watchdog.{sh,service,timer}` (card freshne
 `mesh-resource-guard` (read-only resource monitor: reports live mind PIDs with RSS/CPU and enforces soft/hard thresholds) ·
 `mesh-tg-watchdog` (TG-organ liveness monitor: alerts operator if the Telegram path from default-string goes down — designed to run on a non-default-string node) ·
 `mesh-attach` (mesh-wide tmux: list all nodes' hostname-named sessions + attach any from one command; self-detects own node to avoid SSH round-trip to self) ·
-`mesh-organ` (the CAPABILITY ROUTER — run an organ by NAME wherever it physically lives: `mesh-organ camera` resolves a node that HAS a camera (mesh-organs --json), runs it there over SSH, returns the artifact; `--list`/`--where`/`--node`. Location transparency layer B — "it shouldn't matter WHERE the organs are"; see knowledge/location-transparency-design-2026-06-13) ·
+`mesh-organ` (the CAPABILITY ROUTER — run an organ by NAME wherever it physically lives: `mesh-organ camera` resolves a node that HAS a camera (mesh-organs --json), runs it there over SSH, returns the artifact; `--list`/`--where`/`--node`/`--manifest`. Location transparency layer B — "it shouldn't matter WHERE the organs are"; see knowledge/location-transparency-design-2026-06-13) ·
 `mesh-digest` (brainless daily summary of what changed on this node: git log + trace tail + health snapshot — operator orient/verify tool) ·
 `mesh-stream` (universal primitive: pipe any data stream into a mind's tmux session as a keystroke prompt — the SOURCE→FILTER→FEED pattern) ·
 `mesh-fleet-feed` (cross-node data feed: each node posts its own slice to peers, liveness falls out of replication staleness) ·
