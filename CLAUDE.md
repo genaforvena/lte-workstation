@@ -234,19 +234,26 @@ mic capture → WAV) · `mesh-transcribe-organ` (source-agnostic WAV → filtere
 `mesh-usage` (usage aggregator backing `mesh-load`) · `mesh-pyparse` (catches the dead-but-green
 class `bash -n` misses: a bash tool whose embedded `python3 -c '...'` has a SyntaxError that only
 bites at runtime with stderr swallowed; zero-FP — validates only statically-literal blocks, skips
-shell-interpolated ones; wired into `mesh-doctor`'s parse check) · `mesh-chaos-doctor`/`mesh-chaos-verify`
-(induced-failure drills) · `mesh-fleet-health` (fleet table) · `mesh-steward-deadman` (router
+shell-interpolated ones; wired into `mesh-doctor`'s parse check) · `mesh-chaos-doctor`/`mesh-chaos-verify`/`mesh-chaos`
+(induced-failure drills — chaos-doctor checks detectors, chaos-verify drills them, mesh-chaos is the live opt-in injector) · `mesh-fleet-health` (fleet table) · `mesh-steward-deadman` (router
 dead-man, deploy gated) · `mesh-card-watchdog.{sh,service,timer}` (card freshness) ·
+`mtg-watchdog.{sh,service,timer}` (Docker-MTG proxy watchdog — node-specific, deploy on Docker-MTG nodes) ·
 `node-join-android.sh` (phone onboarding) · `test-*` (verification artifacts) ·
 `mesh-chat-filter` (actionability filter: reads a board line on stdin, emits a prompt only for actionable events — called by consuming minds) ·
 `mesh-queue-tend` (ideas-queue reconciler: conservatively flips [~]→[x] when a board [done] STRONGLY matches a queued idea — never on weak matches (losing undone work > clutter); the anti-duplicate-flood mechanism that stops finished work being re-fed; called by mesh-generate) ·
 `mesh-homeostasis` (egress set-point auto-repair: detects + corrects drift from the desired egress IP) ·
 `mesh-resource-guard` (read-only resource monitor: reports live mind PIDs with RSS/CPU and enforces soft/hard thresholds) ·
 `mesh-tg-watchdog` (TG-organ liveness monitor: alerts operator if the Telegram path from default-string goes down — designed to run on a non-default-string node) ·
-`mesh-attach` (mesh-wide tmux: list all nodes' hostname-named sessions + attach any from one command; self-detects own node to avoid SSH round-trip to self). Decayed
+`mesh-attach` (mesh-wide tmux: list all nodes' hostname-named sessions + attach any from one command; self-detects own node to avoid SSH round-trip to self) ·
+`mesh-digest` (brainless daily summary of what changed on this node: git log + trace tail + health snapshot — operator orient/verify tool) ·
+`mesh-stream` (universal primitive: pipe any data stream into a mind's tmux session as a keystroke prompt — the SOURCE→FILTER→FEED pattern) ·
+`mesh-fleet-feed` (cross-node data feed: each node posts its own slice to peers, liveness falls out of replication staleness) ·
+`mesh-presence-delta` (presence stream filter: diffs consecutive scans, emits a mind-prompt only on device changes — used in presence pipelines) ·
+`mesh-channel-tg` (TG voice-in channel combinator: wraps mesh-channel+mesh-tg-filter→claude for Telegram voice input) ·
+`mesh-chat-agent` (conversational chat-room agent: watches chat.log, answers operator in their language via opencode, speaks reply — on-demand conversation mode). Decayed
 2026-06-11: `mesh-health-watch` (→ mesh-session-watchdog), `mesh-tg-recv` (→ voice-rx+textin),
 `mesh-zone` (→ presence-fuse/trends), `vpn-hub.py` (retired overlay), `mesh-onboard` (attic:
-junk-posted onboarding wrapper; keep out of canon). Git history is the attic.
+junk-posted onboarding wrapper; keep out of canon). Decayed 2026-06-13: `mesh-board-timerepair` (one-shot 2026-06-11 board date-repair, no longer needed). Git history is the attic.
 
 ## Capabilities (self-declared, opt-in by consumers)
 
