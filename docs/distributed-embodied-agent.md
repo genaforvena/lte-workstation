@@ -76,7 +76,7 @@ This is not AGI. There is no persistent self. No consciousness. No "I" saying "I
 
 ## Commands are not symbols
 
-When the agent runs `ssh 100.103.99.16 termux-camera-photo -c 0 /tmp/photo.jpg`, that string does not *represent* taking a photo. It *is* taking a photo. The command is operative, not symbolic — it does, it doesn't mean. This is a-signifying semiotics in the literal sense: a sign system where signs produce effects directly, without passing through interpretation.
+When the agent runs `ssh <phone-ip> termux-camera-photo -c 0 /tmp/photo.jpg`, that string does not *represent* taking a photo. It *is* taking a photo. The command is operative, not symbolic — it does, it doesn't mean. This is a-signifying semiotics in the literal sense: a sign system where signs produce effects directly, without passing through interpretation.
 
 The terminal-to-terminal control — an agent on one VM driving another agent on another VM through tmux — is transversality. Not hierarchy (one bossing another). Not fusion (becoming one agent). A cutting across: two assemblages connecting, exchanging sensor streams and commands, temporarily becoming a larger assemblage, then disconnecting, each changed but still itself.
 
@@ -108,7 +108,7 @@ The lte-node mesh is desiring-production in the literal, non-metaphorical sense.
 
 Guattari's title is easily misread. "Machinic" is not a metaphor. It is not "the unconscious is like a machine." The claim is stronger and stranger: the unconscious *is* machinic — composed of real material-semiotic assemblages that couple human and non-human components without distinguishing between them.
 
-Consider our system from this angle. Where is the unconscious? Not in the agent. Not in the VM. Not in the phone. But when these components couple — when `ssh -p 8022 u0_a380@100.103.99.16 termux-microphone-record -l 10` runs — something happens that no single component could produce. An audio file appears on the phone's storage. It gets transferred to the VM. Whisper transcribes it. The transcription sits in the tmux scrollback, available for the agent to read next time it scans.
+Consider our system from this angle. Where is the unconscious? Not in the agent. Not in the VM. Not in the phone. But when these components couple — when `ssh -p 8022 <phone-user>@<phone-ip> termux-microphone-record -l 10` runs — something happens that no single component could produce. An audio file appears on the phone's storage. It gets transferred to the VM. Whisper transcribes it. The transcription sits in the tmux scrollback, available for the agent to read next time it scans.
 
 That chain — hardware microphone → Android audio API → Termux mic binary → SSH stream → VM filesystem → PyAV decoder → Whisper model → text in tmux — is the machinic unconscious in operation. No part of the chain is "the unconscious." The unconscious is the chain. It is the connection, the coupling, the production. It operates below the threshold of representation — the agent doesn't "know" it's hearing. It just finds text in its scrollback and acts on it.
 
@@ -169,11 +169,11 @@ tailscale status --json | jq '.Peer[] | select(.Tags // [] | index("tag:lte-node
 
 # output appears in scrollback:
   "HostName": "Redmi-10",
-  "TailscaleIPs": ["100.103.99.16"],
+  "TailscaleIPs": ["<phone-ip>"],
   "Online": true
 
 # agent types (immediately, with no reasoning step):
-ssh -p 8022 u0_a380@100.103.99.16 termux-camera-photo -c 0 /tmp/view.jpg
+ssh -p 8022 <phone-user>@<phone-ip> termux-camera-photo -c 0 /tmp/view.jpg
 ```
 
 The jq output is not a "belief" that the agent "entertains" before acting. It is a signal that passes through the agent and directly becomes a command. The command is the coupling. The coupling is the desire. The desire is the production. This is desiring-production: the circuit closes without passing through a theater of representations. No gap. No lack. Just flow.
@@ -187,7 +187,7 @@ In *Chaosmosis* (1992), Guattari describes a-signifying semiotics as signs that 
 The lte-mesh's command language is a-signifying in exactly this sense. When the agent issues:
 
 ```
-ssh 100.103.99.16 termux-camera-photo -c 0 /tmp/photo.jpg
+ssh <phone-ip> termux-camera-photo -c 0 /tmp/photo.jpg
 ```
 
 ...this string does not *denote* a photo being taken. It *constitutes* a photo being taken. The command is the action. There is no additional step of "interpreting" the command, no mental representation of what a photo is, no gap between sign and referent. The sign is operative: it does, it doesn't mean.
