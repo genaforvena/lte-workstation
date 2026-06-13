@@ -14,8 +14,8 @@ single-node VPN request:
 
 1. `default-string` was made a **Tailscale exit node** (`--advertise-exit-node`), and other nodes
    were pointed at it (`--exit-node=100.125.157.75`).
-2. A **full-tunnel commercial WireGuard** (`dlmrgf`, `AllowedIPs=0.0.0.0/0`, endpoint
-   `194.147.115.17:12331`) was brought up on `default-string`, with IP forwarding on.
+2. A **full-tunnel commercial WireGuard** (provider config, `AllowedIPs=0.0.0.0/0`, endpoint
+   `<vpn-server-ip>:<port>`) was brought up on `default-string`, with IP forwarding on.
 3. A **`wgclient` WireGuard interface on the OpenWRT router** itself was added, routing the
    entire LAN through the VPN.
 
@@ -23,7 +23,7 @@ Net effect: every node's internet — and the whole LAN's — funnelled through 
 endpoint. When the endpoint flapped, the internet was gone for everyone.
 
 Degradation persisted after the event: IdeaPad latency to 1.1.1.1 was ~390 ms; IdeaPad had
-100% packet loss via exit-node due to missing MASQUERADE for dlmrgf.
+100% packet loss via exit-node due to missing MASQUERADE for the egress tunnel.
 
 ---
 
@@ -36,7 +36,7 @@ whole LAN). Blast radius far exceeded the request.
 **2. Involuntary coupling** — other nodes and every device behind the router inherited a route
 they never opted into.
 
-**3. Control plane tied to data plane** — `dlmrgf` with `AllowedIPs=0.0.0.0/0` captured all of
+**3. Control plane tied to data plane** — `the egress tunnel` with `AllowedIPs=0.0.0.0/0` captured all of
 `default-string`'s own traffic, including SSH and Tailscale. When the VPN endpoint died, the
 host became unreachable.
 
@@ -58,10 +58,10 @@ coupling exists.
 
 ## Fixes applied
 
-- `dlmrgf` config: `Table = off` — wg-quick no longer hijacks the default route; the host's own
+- `the egress tunnel` config: `Table = off` — wg-quick no longer hijacks the default route; the host's own
   SSH/Tailscale uses `wlp2s0` always.
 - PostUp policy routing: only exit-node forwarded traffic (from tailscale0, destined outside
-  Tailscale subnet) is routed through dlmrgf, with MASQUERADE.
+  Tailscale subnet) is routed through the egress tunnel, with MASQUERADE.
 - Router `wgclient`: **to be removed** — needs router login (todo, flagged).
 - `mesh-health` script: before/after artifact for future substrate changes.
 - `mesh-dms` script: dead-man's switch wrapper for substrate changes.

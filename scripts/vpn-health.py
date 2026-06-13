@@ -3,17 +3,26 @@
 
 The host egresses CLEAN by design; only forwarded exit-node clients use the VPN.
 So "VPN healthy" is tested ON THE TUNNEL (fresh handshake + traffic forwards through
-Gtcld), NOT via the host's public IP. On failure it re-applies the SCOPED config
+the VPN iface), NOT via the host's public IP. On failure it re-applies the SCOPED config
 (Table=off + MESH_VPN chain), which keeps the host control plane on the clean route.
 
 Run as root so its wg-quick/wg calls work without a tty:
     sudo nohup python3 ~/.mesh/vpn-health.py >> ~/.mesh/vpn-health.log 2>&1 &
 """
-import subprocess, time, os
+import subprocess, time, os, glob
 
-CONFIG = "/etc/wireguard/Gtcld.conf"   # scoped (Table=off + MESH_VPN chain)
-IFACE = "Gtcld"
-LOG = "/home/imozerov/.mesh/vpn-health.log"
+# Interface/config are node-local — never hardcoded in the genome. Resolve from the
+# environment (VPN_EGRESS_IFACE), else from the single scoped config in /etc/wireguard.
+def _resolve_iface():
+    env = os.environ.get("VPN_EGRESS_IFACE")
+    if env:
+        return env
+    confs = glob.glob("/etc/wireguard/*.conf")
+    return os.path.splitext(os.path.basename(confs[0]))[0] if len(confs) == 1 else ""
+
+IFACE = _resolve_iface()
+CONFIG = os.environ.get("VPN_EGRESS_CONF") or (f"/etc/wireguard/{IFACE}.conf" if IFACE else "")
+LOG = os.environ.get("VPN_HEALTH_LOG") or "/home/imozerov/.mesh/vpn-health.log"
 CHECK_INTERVAL = 60
 FAIL_THRESHOLD = 3
 HANDSHAKE_MAX_AGE = 180   # seconds; healthy tunnel handshakes ~every 2 min
@@ -64,7 +73,10 @@ def bring_up():
 
 def main():
     os.makedirs(os.path.dirname(LOG), exist_ok=True)
-    log("Starting VPN health watchdog (scoped model, tunnel-direct check)")
+    if not IFACE or not CONFIG:
+        log("not an egress-offering node (no VPN_EGRESS_IFACE / single /etc/wireguard conf) — exiting")
+        return
+    log(f"Starting VPN health watchdog (scoped model, tunnel-direct check) iface={IFACE}")
     fails = 0
     while True:
         ok, info = check_vpn()
