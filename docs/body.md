@@ -20,6 +20,9 @@ on the Redmi 10, 2026-06-12 after the F-Droid reinstall: termux-api 0.59.1, 83 c
     is moving or held. A parked body reading `CARRIED`/`HANDLED` = tamper/interaction. `--edge` emits only
     on a state change (stream-feedable); `--raw` is the fused-sensor artifact; `--test` exit 2 = phone n/a.
     (Full sensor matrix: `knowledge/phone-sensor-inventory-2026-06-13.md`.)
+  - **Wired sense organ** `mesh-light` — reads `tmd2755_l` once and classifies the room as `DARK` / `LIT`
+    (edge-triggered with `--edge`; `--status` prints the current lux level). This is the mesh's ambient-light
+    sense: room brightness, day/night in the room, coarse occupancy proxy. `--test` is the reachability gate.
 - **Actuators (act on the world):** `termux-tts-speak` (voice out), `termux-sms-send`,
   `termux-telephony-call`, `termux-infrared-transmit` (control TVs/appliances), `termux-torch`,
   `termux-vibrate`, `termux-notification`, `termux-media-player`, `termux-toast`, `termux-volume`,

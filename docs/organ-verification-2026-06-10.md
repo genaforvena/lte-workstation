@@ -13,7 +13,7 @@
 | Camera /dev/video0 | ✅ | mesh-camera → /tmp/cam-*.jpg, real 640×480 JPEG (19.8KB, fswebcam backend), re-verified 2026-06-12T20:42Z | WORKS — per-user ACL `user:imozerov:rw-` grants access WITHOUT video group; fswebcam installed (no ffmpeg/v4l2-ctl needed) |
 | Camera /dev/video1 | ✅ | same Integrated Camera, second interface; mesh-camera --test ok | WORKS via mesh-camera (see video0) |
 | Mic (ALC236 card 0) | ✅ | /tmp/mic-test-ideapad.wav 345K, WAV PCM 44.1kHz stereo, peak=32768 (live signal, steward-verified) | WORKS |
-| Speaker (ALC236 card 0) | ✅ | blessyou played bless-lessac.wav @ local 2026-06-10 01:16Z (prior artifact) | WORKS |
+| Speaker (ALC236 card 0) | ✅ | mesh-blessyou played bless-lessac.wav @ local 2026-06-10 01:16Z (prior artifact) | WORKS |
 | Speaker (HDMI 0-3 card 0) | ⚠️ | aplay -l lists 4 HDMI devices | presence only, playback not tested |
 | Bluetooth adapter | ✅ | bluetoothctl show: Powered=yes, Name=imozerov-IdeaPad | WORKS |
 | BLE scan | ✅ | 5s scan: Bose LE, Samsung TV, 3 unknown devices | WORKS |
