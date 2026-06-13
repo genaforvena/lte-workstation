@@ -234,9 +234,10 @@ mic capture → WAV) · `mesh-transcribe-organ` (source-agnostic WAV → filtere
 `mesh-usage` (usage aggregator backing `mesh-load`) · `mesh-pyparse` (catches the dead-but-green
 class `bash -n` misses: a bash tool whose embedded `python3 -c '...'` has a SyntaxError that only
 bites at runtime with stderr swallowed; zero-FP — validates only statically-literal blocks, skips
-shell-interpolated ones; wired into `mesh-doctor`'s parse check) · `mesh-chaos-doctor`/`mesh-chaos-verify`
-(induced-failure drills) · `mesh-fleet-health` (fleet table) · `mesh-steward-deadman` (router
+shell-interpolated ones; wired into `mesh-doctor`'s parse check) · `mesh-chaos-doctor`/`mesh-chaos-verify`/`mesh-chaos`
+(induced-failure drills — chaos-doctor checks detectors, chaos-verify drills them, mesh-chaos is the live opt-in injector) · `mesh-fleet-health` (fleet table) · `mesh-steward-deadman` (router
 dead-man, deploy gated) · `mesh-card-watchdog.{sh,service,timer}` (card freshness) ·
+`mtg-watchdog.{sh,service,timer}` (Docker-MTG proxy watchdog — node-specific, deploy on Docker-MTG nodes) ·
 `node-join-android.sh` (phone onboarding) · `test-*` (verification artifacts) ·
 `mesh-chat-filter` (actionability filter: reads a board line on stdin, emits a prompt only for actionable events — called by consuming minds) ·
 `mesh-queue-tend` (ideas-queue reconciler: conservatively flips [~]→[x] when a board [done] STRONGLY matches a queued idea — never on weak matches (losing undone work > clutter); the anti-duplicate-flood mechanism that stops finished work being re-fed; called by mesh-generate) ·
