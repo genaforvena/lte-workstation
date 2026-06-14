@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+# mesh-wifi-motion — WiFi passive radar: detect room motion from RSSI delta vs last scan.
+#
+# Android's WiFi scan cache means rapid re-scans return identical data. The correct pattern:
+# call this tool on a cron interval (2-5 min) and compare the current scan to the PREVIOUS
+# one stored in state. People moving in a room shift multipath RSSI by ±3-8 dBm per scan
+# interval. Empty room: consecutive scans agree within ±2 dBm on stable APs.
+#
+# Research basis: WiDet (IEEE 2014), "Device-free Passive Localization via WiFi".
+# This is the lightweight RSSI-delta approach (no kernel-CSI needed, works with stock termux).
+#
+#   mesh-wifi-motion           one scan → compare vs last → STILL / MOTION / UNCERTAIN / FIRST-RUN
+#   mesh-wifi-motion --edge    emit ONLY on state change vs last classification
+#   mesh-wifi-motion --test    smoke-test (exit 2 = phone unreachable = n/a)
+#
+# Thresholds (max RSSI delta across stable BSSIDs):
+#   ≤ 2 dBm  → STILL    (quiet room, no one moved)
+#   ≥ 5 dBm  → MOTION   (someone moved between last and current scan)
+#   else      → UNCERTAIN
+#
+# "Stable BSSID" = present in both current and previous scan.
+# On first run (no previous scan): stores current, exits FIRST-RUN.
+#
+# Honest-organ: phone unreachable → exit 2; stale (same timestamps) → UNCERTAIN (cached data).
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+[ -f "$HOME/.mesh/nodes" ] && . "$HOME/.mesh/nodes"
+STATEFILE="$HOME/.mesh/.wifi-motion-prev"   # stores: prev scan JSON
+CLASSFILE="$HOME/.mesh/.wifi-motion-state"  # stores: STILL/MOTION/UNCERTAIN
+
+if [ "${1:-}" = --test ]; then
+  command -v ssh >/dev/null 2>&1 || { echo "smoke-test: FAIL (no ssh)"; exit 1; }
+  command -v python3 >/dev/null 2>&1 || { echo "smoke-test: FAIL (no python3)"; exit 1; }
+  command -v mesh-peer-addr >/dev/null 2>&1 || { echo "smoke-test: FAIL (no mesh-peer-addr)"; exit 1; }
+  mkdir -p "$HOME/.mesh" 2>/dev/null || { echo "smoke-test: FAIL (no ~/.mesh)"; exit 1; }
+  pip="${PHONE_IP:-$(mesh-peer-addr Redmi 2>/dev/null || mesh-peer-addr redmi 2>/dev/null || true)}"
+  [ -n "$pip" ] || { echo "smoke-test: FAIL (no phone in nodes/registry)"; exit 1; }
+  _out="$(timeout 12 ssh -p "${PHONE_SSH_PORT:-8022}" -o BatchMode=yes -o ConnectTimeout=6 \
+    -o StrictHostKeyChecking=accept-new "${PHONE_USER:-u0_a380}@$pip" \
+    "termux-wifi-scaninfo 2>/dev/null; true" </dev/null 2>/dev/null)"
+  printf '%s' "$_out" | python3 -c "import json,sys; aps=json.load(sys.stdin); assert len(aps)>0" \
+    2>/dev/null || { echo "smoke-test: FAIL (phone unreachable, no WiFi scan, or WiFi permission not granted)"; exit 2; }
+  echo "smoke-test: ok"
+  exit 0
+fi
+
+EDGE=0; [ "${1:-}" = --edge ] && EDGE=1
+
+pip="${PHONE_IP:-$(mesh-peer-addr Redmi 2>/dev/null || mesh-peer-addr redmi 2>/dev/null || true)}"
+[ -n "$pip" ] || { echo "[wifi-motion] no phone in registry" >&2; exit 2; }
+
+# Fetch current scan
+curr="$(timeout 12 ssh -p "${PHONE_SSH_PORT:-8022}" \
+  -o BatchMode=yes -o ConnectTimeout=6 -o StrictHostKeyChecking=accept-new \
+  "${PHONE_USER:-u0_a380}@$pip" "termux-wifi-scaninfo 2>/dev/null; true" \
+  </dev/null 2>/dev/null)" || true
+
+[ -n "$curr" ] && printf '%s' "$curr" | python3 -c "import json,sys; json.load(sys.stdin)" >/dev/null 2>&1 \
+  || { echo "[wifi-motion] phone unreachable or no WiFi scan" >&2; exit 2; }
+
+# First run: just store and exit
+if [ ! -f "$STATEFILE" ]; then
+  printf '%s' "$curr" > "$STATEFILE"
+  echo "[wifi-motion] FIRST-RUN (baseline stored)"
+  exit 0
+fi
+prev="$(cat "$STATEFILE")"
+
+# Compare current vs previous — write both to temp files for clean parse
+_TMPDIR="$(mktemp -d /tmp/.wifi-motion.XXXXXX)"
+trap 'rm -rf "$_TMPDIR"' EXIT
+printf '%s' "$curr" > "$_TMPDIR/curr.json"
+printf '%s' "$prev" > "$_TMPDIR/prev.json"
+
+verdict="$(python3 - "$_TMPDIR/curr.json" "$_TMPDIR/prev.json" <<'PYEOF'
+import sys, json
+
+try:
+    curr_aps = {a['bssid']: a for a in json.load(open(sys.argv[1])) if 'bssid' in a}
+    prev_aps = {a['bssid']: a for a in json.load(open(sys.argv[2])) if 'bssid' in a}
+except Exception as e:
+    print(f'UNCERTAIN (JSON parse error: {e})')
+    sys.exit(0)
+
+# Check for stale data (same timestamps on key APs)
+stable_bssids = set(curr_aps.keys()) & set(prev_aps.keys())
+if not stable_bssids:
+    print('UNCERTAIN (no stable BSSIDs in both scans)')
+    sys.exit(0)
+
+stale = all(
+    curr_aps[b].get('timestamp') == prev_aps[b].get('timestamp')
+    for b in stable_bssids
+)
+if stale:
+    print(f'UNCERTAIN (cached — all {len(stable_bssids)} timestamps identical, Android scan not refreshed)')
+    sys.exit(0)
+
+# Compute max RSSI delta per stable BSSID
+max_delta = 0
+worst = ''
+for bssid in stable_bssids:
+    delta = abs(curr_aps[bssid].get('rssi', 0) - prev_aps[bssid].get('rssi', 0))
+    if delta > max_delta:
+        max_delta = delta
+        worst = bssid
+
+if max_delta <= 2:
+    print(f'STILL (max_delta={max_delta}dBm, n_stable={len(stable_bssids)})')
+elif max_delta >= 5:
+    print(f'MOTION (max_delta={max_delta}dBm, bssid={worst})')
+else:
+    print(f'UNCERTAIN (max_delta={max_delta}dBm, borderline)')
+PYEOF
+)"
+rm -rf "$_TMPDIR"; trap - EXIT
+
+label="${verdict%% *}"  # STILL / MOTION / UNCERTAIN
+output="[wifi-motion] $verdict"
+
+# Update stored scan (always refresh for next comparison)
+printf '%s' "$curr" > "$STATEFILE"
+
+if [ "$EDGE" = 1 ]; then
+  prev_class="$(cat "$CLASSFILE" 2>/dev/null || true)"
+  printf '%s' "$label" > "$CLASSFILE"
+  [ "$label" = "$prev_class" ] && exit 0
+fi
+
+echo "$output"
