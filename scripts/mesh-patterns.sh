@@ -50,13 +50,19 @@ export MESH_RL_RE MESH_AUTH_RE MESH_GATE_RE
 #                      Unknown-but-named devices (DV8235, guest phones) ARE tracked: a stranger's
 #                      device appearing IS a life event. MESH_PERSON_RE = confidence weighting only.
 #   mesh-ambient-clock: INCLUSION-based — harvests MESH_FIXED_RE matches.
-#   Unknown C04-/C05-/WSH86-: random-MAC churn, suppressed by mesh-arrivals debounce (not FIXED).
+#   Unknown C04-/C05-/WSH86-: rotating serial-name churn — rejected by MESH_NOISE_RE (2026-06-15).
 # Pattern agreement: genome controls this; both tools source mesh-patterns.sh.
 
 MESH_PERSON_RE='Bose|JBL|AirPods|Galaxy Buds|Quest|Pixel|iPhone|Redmi|Armor|EDIFIER|Mobicar'
 MESH_FIXED_RE='\[TV\]|MiTV-|Mi Box|Bluedroid TV|GR-AC_|MI SCALE|LYWSD|Vega BLE|GEELY_BT|CAR-BT'
+# MESH_NOISE_RE — rotating serial-number names: devices that embed their serial/ID into the BLE
+# advertisement name and rotate it with the MAC. Looks like a "real name" (not a bare MAC, not SC-)
+# but is per-device-instance noise that produces the same false [arrived]/[left] churn as random MACs.
+# Observed: WSH86<serial> (wearable/scale, e.g. WSH866897059279853AM5886 — no hyphen), C04-<serial>, C05-<serial>.
+# Was: "suppressed by debounce (not FIXED)" in this file — now properly rejected by is_named().
+MESH_NOISE_RE='^(WSH86|C04-|C05-)[0-9A-Za-z]'
 
-export MESH_PERSON_RE MESH_FIXED_RE
+export MESH_PERSON_RE MESH_FIXED_RE MESH_NOISE_RE
 
 # Guard: run the test block ONLY when this file is EXECUTED directly — never when SOURCED.
 # (A sourced lib inherits the caller's $1, so without this guard `consumer --test` would trip the
