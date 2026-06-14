@@ -24,7 +24,7 @@
 # suppresses quoted-in-output false positives.
 
 # quota / rate-limit / credits wall → mind is UP for liveness but DEAD for work
-MESH_RL_RE='hit your (usage|session) limit|usage limit reached|rate.?limit|429|too many requests|quota.*(exhaust|exceed)|out of credits|purchase more credits|upgrade to (pro|team)|try again (at|later|in)|resets? (at )?[0-9]|overloaded'
+MESH_RL_RE='hit your (usage|session) limit|usage limit reached|rate.?limit(ed|[ _.-]?(reach|exceed|error|hit|wall|block))|429|too many requests|quota.*(exhaust|exceed)|out of credits|purchase more credits|upgrade to (pro|team)|try again (at|later|in)|resets? (at )?[0-9]|overloaded'
 
 # auth / context wall → a real steward action (not just route-elsewhere)
 MESH_AUTH_RE='login.*required|oauth.*required|please (log|sign) ?in|authentication required|100% context (used|left)|context (full|exhausted)|/login'
@@ -81,11 +81,14 @@ if [ "${1:-}" = --test ] && [ "${BASH_SOURCE[0]}" = "${0}" ]; then
   ck "$MESH_RL_RE" match "You're out of credits"            "out-of-credits"
   ck "$MESH_RL_RE" match "Purchase more credits to continue" "purchase-credits"
   ck "$MESH_RL_RE" match "Upgrade to Pro"                    "upgrade-pro (case-insensitive)"
-  ck "$MESH_RL_RE" match "rate limit reached"                "rate-limit"
+  ck "$MESH_RL_RE" match "rate limit reached"                "rate-limit-reached"
+  ck "$MESH_RL_RE" match "the mind is rate-limited"          "rate-limited-ed"
+  ck "$MESH_RL_RE" match "rate_limit_error from the API"     "rate_limit_error"
   ck "$MESH_RL_RE" match "Overloaded"                        "overloaded"
   echo "MESH_RL_RE — must NOT match benign output:"
   ck "$MESH_RL_RE" no "✻ Crunched for 4m"                    "past-tense-crunched"
   ck "$MESH_RL_RE" no "editing rate_card.py"                 "rate_card-filename"
+  ck "$MESH_RL_RE" no "spam fixed by rate-limit patch (1329d22)" "rate-limit-patch-prose"
   ck "$MESH_RL_RE" no "all systems nominal"                  "nominal"
   echo "MESH_AUTH_RE — login/context, distinct from quota:"
   ck "$MESH_AUTH_RE" match "Please login to continue"        "login-required"
