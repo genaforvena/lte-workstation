@@ -1,0 +1,231 @@
+#!/usr/bin/env bash
+# mesh-home-state — the CAUSE LAYER: fuse sensor traces → home situation inference
+#
+# Single sensor = FACT. Correlated sensors over time = CAUSE.
+# This tool reads the sensor stream (sensors.log + presence + transcription) and
+# infers WHAT IS HAPPENING in the home — not just what individual meters report.
+#
+# Output: one-line home state + confidence signals + contributing evidence
+#
+#   mesh-home-state              infer current home state, print + post to board
+#   mesh-home-state --json       machine-readable output
+#   mesh-home-state --watch      re-infer every 5 min, edge-triggered board post
+#   mesh-home-state --test       smoke test
+#
+# State classes: QUIET_NIGHT | ASLEEP | WAKING | ACTIVE | ACTIVE_SOCIAL | AWAY
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+
+LOG="${MESH_SENSOR_LOG:-$HOME/.mesh/sensors.log}"
+TRANSCRIPT="$HOME/.mesh/transcript.log"
+STATE_FILE="$HOME/.mesh/.home-state"
+MESH="$HOME/.mesh"
+
+if [ "${1:-}" = --test ]; then
+  [ -f "$LOG" ] || { echo "smoke-test: WARN (no sensors.log yet)"; exit 2; }
+  command -v python3 >/dev/null 2>&1 || { echo "smoke-test: FAIL (no python3)"; exit 1; }
+  echo "smoke-test: ok"; exit 0
+fi
+
+# ── Inference engine ─────────────────────────────────────────────────────────
+python3 - "$LOG" "$TRANSCRIPT" "${1:-}" << 'PYEOF'
+import sys, os, re, json
+from datetime import datetime, timezone, timedelta
+from collections import defaultdict
+
+log_path   = sys.argv[1]
+trans_path = sys.argv[2]
+mode       = sys.argv[3] if len(sys.argv) > 3 else ""
+
+NOW = datetime.now(timezone.utc)
+WINDOW = timedelta(minutes=15)   # look at last 15 min of sensor data
+
+# ── Parse sensor log: last WINDOW minutes ──────────────────────────────────
+snaps = defaultdict(lambda: defaultdict(list))   # ts → sensor_type → [val,...]
+try:
+    with open(log_path) as f:
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) < 4: continue
+            try:
+                ts = datetime.fromisoformat(parts[0].replace('Z','+00:00'))
+            except ValueError:
+                continue
+            if NOW - ts > WINDOW: continue
+            stype = parts[2]
+            val   = " ".join(parts[3:])
+            snaps[ts][stype].append(val)
+except FileNotFoundError:
+    snaps = {}
+
+# Flatten to most-recent value per sensor type
+recent = {}
+for ts in sorted(snaps):
+    for stype, vals in snaps[ts].items():
+        recent[stype] = vals[-1]
+
+# ── Parse transcript: word count in last 15 min ─────────────────────────────
+speech_words = 0
+try:
+    with open(trans_path) as f:
+        for line in f:
+            parts = line.strip().split(None, 1)
+            if len(parts) < 2: continue
+            try:
+                ts = datetime.fromisoformat(parts[0].replace('Z','+00:00'))
+                if NOW - ts <= WINDOW:
+                    speech_words += len(parts[1].split())
+            except (ValueError, IndexError):
+                pass
+except FileNotFoundError:
+    pass
+
+# ── Signal extraction ────────────────────────────────────────────────────────
+hour_utc = NOW.hour  # 0-23; adjust for local if needed (assume UTC+3)
+hour_loc = (hour_utc + 3) % 24
+
+ble_count   = int(recent.get('ble_count', 0) or 0)
+ble_named   = int(recent.get('ble_named', 0) or 0)
+ble_top     = recent.get('ble_top', '')          # "RSSI|DeviceName"
+room_sense  = recent.get('room_sense', 'UNCERTAIN')
+light       = recent.get('phone_light', '')
+bat_pct_s   = recent.get('phone_battery', '')    # "PCT status"
+bat_temp    = recent.get('phone_battery_temp', '')
+cpu_temp    = recent.get('therm_x86_pkg_temp', recent.get('cpu_temp', ''))
+cpu_load    = recent.get('cpu_load1', '')
+
+# WiFi RSSI variance → motion proxy (higher variance = more movement)
+wifi_vals = [snaps[ts].get('wifi_rssi', []) for ts in sorted(snaps)]
+rssi_series = []
+for ts in sorted(snaps):
+    for v in snaps[ts].get('wifi_rssi', []):
+        try:
+            rssi_series.append(int(v.split()[-1]))
+        except (ValueError, IndexError):
+            pass
+wifi_variance = max(rssi_series) - min(rssi_series) if len(rssi_series) > 1 else 0
+
+# Named-device roster (from ble_top and known devices in presence log)
+known_devices = {'LE-Bose': 'audio', 'Quest 3': 'vr', 'Nintendo': 'gaming',
+                 'PlayStation': 'gaming', 'TV': 'media', 'SoundLink': 'audio'}
+active_devices = []
+for kw, role in known_devices.items():
+    if kw.lower() in ble_top.lower():
+        active_devices.append(role)
+
+# ── Inference rules (combine signals → state) ──────────────────────────────
+signals = []
+score   = {}   # state → evidence count
+
+def sig(label):
+    signals.append(label)
+
+# Night hours
+if 23 <= hour_loc or hour_loc < 6:
+    score['QUIET_NIGHT'] = score.get('QUIET_NIGHT', 0) + 2
+    sig(f"hour={hour_loc}h (night)")
+elif 6 <= hour_loc < 9:
+    score['WAKING'] = score.get('WAKING', 0) + 1
+    sig(f"hour={hour_loc}h (morning)")
+
+# Presence / BLE
+if room_sense == 'EMPTY' and ble_named <= 1:
+    score['AWAY'] = score.get('AWAY', 0) + 3
+    sig("room=EMPTY, BLE sparse → likely away")
+elif ble_named >= 4:
+    score['ACTIVE_SOCIAL'] = score.get('ACTIVE_SOCIAL', 0) + 2
+    sig(f"ble_named={ble_named} → several devices active")
+elif ble_named >= 2:
+    score['ACTIVE'] = score.get('ACTIVE', 0) + 1
+    sig(f"ble_named={ble_named} devices present")
+
+if ble_count >= 8:
+    score['ACTIVE'] = score.get('ACTIVE', 0) + 1
+    sig(f"ble_count={ble_count} (rich environment)")
+
+# Speech activity
+if speech_words >= 50:
+    score['ACTIVE'] = score.get('ACTIVE', 0) + 2
+    sig(f"speech={speech_words} words in 15min → active conversation")
+elif speech_words >= 15:
+    score['WAKING'] = score.get('WAKING', 0) + 1
+    sig(f"speech={speech_words} words (low, ambient)")
+elif speech_words == 0:
+    score['QUIET_NIGHT'] = score.get('QUIET_NIGHT', 0) + 1
+    score['ASLEEP']      = score.get('ASLEEP', 0) + 1
+    sig("speech=0 (silent)")
+
+# Light proxy (lux)
+if light:
+    try:
+        lux = float(light)
+        if lux < 5:
+            score['ASLEEP']     = score.get('ASLEEP', 0) + 2
+            score['QUIET_NIGHT']= score.get('QUIET_NIGHT', 0) + 1
+            sig(f"light={lux:.0f}lux (dark)")
+        elif lux > 100:
+            score['ACTIVE'] = score.get('ACTIVE', 0) + 1
+            sig(f"light={lux:.0f}lux (lit)")
+    except ValueError:
+        pass
+
+# WiFi motion proxy
+if wifi_variance >= 10:
+    score['ACTIVE'] = score.get('ACTIVE', 0) + 1
+    sig(f"wifi_variance={wifi_variance}dBm (motion)")
+elif wifi_variance <= 3 and len(rssi_series) > 3:
+    score['ASLEEP']     = score.get('ASLEEP', 0) + 1
+    score['QUIET_NIGHT']= score.get('QUIET_NIGHT', 0) + 1
+    sig(f"wifi_variance={wifi_variance}dBm (stable, no motion)")
+
+# Audio device active → entertainment
+if 'audio' in active_devices:
+    score['ACTIVE'] = score.get('ACTIVE', 0) + 1
+    sig("Bose active → audio playing or social")
+if 'vr' in active_devices:
+    score['ACTIVE_SOCIAL'] = score.get('ACTIVE_SOCIAL', 0) + 2
+    sig("Quest 3 active → VR/gaming session")
+
+# Battery temp → ambient
+if bat_temp:
+    try:
+        bt = float(bat_temp)
+        sig(f"ambient≈{bt:.0f}°C (phone battery temp)")
+    except ValueError:
+        pass
+
+# ── Pick best state ──────────────────────────────────────────────────────────
+fallback = 'UNCERTAIN'
+if not score:
+    state = fallback
+else:
+    state = max(score, key=lambda s: (score[s], ['AWAY','QUIET_NIGHT','ASLEEP','WAKING','ACTIVE','ACTIVE_SOCIAL','UNCERTAIN'].index(s) if s in ['AWAY','QUIET_NIGHT','ASLEEP','WAKING','ACTIVE','ACTIVE_SOCIAL','UNCERTAIN'] else 0))
+    if score[state] == 0:
+        state = fallback
+
+# ── Human-readable summary ───────────────────────────────────────────────────
+desc = {
+    'AWAY':         'nobody home',
+    'QUIET_NIGHT':  'home quiet (night)',
+    'ASLEEP':       'someone home, likely asleep',
+    'WAKING':       'waking up or winding down',
+    'ACTIVE':       'home active',
+    'ACTIVE_SOCIAL':'home lively (multiple devices/people)',
+    'UNCERTAIN':    'state unclear',
+}
+
+# Key evidence (top 3 signals)
+evidence = " · ".join(signals[:4]) if signals else "no signals"
+summary = f"[home-state] {state}: {desc.get(state,'?')} | {evidence}"
+
+if mode == "--json":
+    out = {"state": state, "desc": desc.get(state,"?"),
+           "signals": signals, "score": score,
+           "ble_count": ble_count, "ble_named": ble_named,
+           "speech_words": speech_words, "wifi_variance": wifi_variance,
+           "hour_local": hour_loc}
+    print(json.dumps(out))
+else:
+    print(summary)
+PYEOF
