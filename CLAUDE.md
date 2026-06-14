@@ -230,7 +230,7 @@ Source of truth is the genome (`scripts/`), deployed to `~/.local/bin/`; `mesh-s
 anything in `scripts/` that is neither wired (cron/systemd/mesh-restore/called-by-tool/supervise
 registry) nor listed here is decay-eligible): `mesh-browse` (browser organ) · `mesh-breath` (read-only breathing probe: verifies access paths and liveness) · `mesh-exit`
 (consumer-side exit-node flip, DMS-gated) · `mesh-eye` (consent-gated ambient sense) ·
-`mesh-guardian` (survival reflex: reachability + tmux + Telegram organ recovery) ·
+`mesh-gate-watch` (operator-approval router: polls every multi-pane tmux channel for a permission gate, notifies via Telegram so a HUMAN approves — never auto-approves; run periodically when autonomous minds are active) · `mesh-guardian` (survival reflex: reachability + tmux + Telegram organ recovery) ·
 `mesh-local-mind` (local-inference primitive) · `mesh-load` (read-only agent load/quota reporter for `mesh-chat`) · `mesh-neighbour-watch` (peer SSH liveness +
 restore) · `mesh-review` (multi-engine blind review) · `mesh-since` (on-return brief) ·
 `mesh-novelty` (information-theory surprise signal over the board: Shannon self-information
@@ -249,7 +249,7 @@ dead-man, deploy gated) · `mesh-card-watchdog.{sh,service,timer}` (card freshne
 `bore-mtg.{sh,service}` (bore.pub MTProto proxy tunnel + Telegram link notification — node-specific, deploy on proxy nodes) ·
 `node-join-android.sh` (phone onboarding) · `test-*` (verification artifacts) ·
 `mesh-chat-filter` (actionability filter: reads a board line on stdin, emits a prompt only for actionable events — called by consuming minds) ·
-`mesh-queue-tend` (ideas-queue reconciler: conservatively flips [~]→[x] when a board [done] STRONGLY matches a queued idea — never on weak matches (losing undone work > clutter); the anti-duplicate-flood mechanism that stops finished work being re-fed; called by mesh-generate) ·
+`mesh-knowledge-sync` (anti-entropy gossip for the knowledge tier: reconciles `~/.mesh/knowledge` with all reachable peers bidirectionally, newest-wins, no deletes — fixes cultural drift on nodes that are skipped by the snapshot star topology; run periodically or after genome-sync) · `mesh-queue-tend` (ideas-queue reconciler: conservatively flips [~]→[x] when a board [done] STRONGLY matches a queued idea — never on weak matches (losing undone work > clutter); the anti-duplicate-flood mechanism that stops finished work being re-fed; called by mesh-generate) ·
 `mesh-homeostasis` (egress set-point auto-repair: detects + corrects drift from the desired egress IP) ·
 `mesh-resource-guard` (read-only resource monitor: reports live mind PIDs with RSS/CPU and enforces soft/hard thresholds) ·
 `mesh-tg-watchdog` (TG-organ liveness monitor: alerts operator if the Telegram path from default-string goes down — designed to run on a non-default-string node) ·
