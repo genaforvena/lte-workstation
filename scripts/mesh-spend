@@ -1,94 +1,207 @@
 #!/usr/bin/env bash
-# mesh-spend — quota-burn visibility: ticks-per-mind in the rolling 5h window.
-# Proxy: 1 Claude turn ≈ 1 "fired" tick (no per-token data from Anthropic API).
-# Source: ~/.mesh/tick.log  (written by mesh-tick; one line per cron fire)
+# mesh-spend — where the mesh's mind-compute goes: per MIND, per MODEL, per PROVIDER (paid vs free).
+# (operator 2026-06-15: "keep track spent on different minds, with different models etc.")
 #
-#   mesh-spend           fired ticks per mind in the last 5h
-#   mesh-spend --all     include minds with zero 5h fires
-#   mesh-spend --test    smoke test (exit 2 = no log yet, not a FAIL)
+# Two honest proxies — there is NO per-token billing feed from the providers, so this counts WORK UNITS:
+#   • turns  (spend.log) — a rising edge into WORKING per window, sampled by `--sample` (cron). Catches
+#                          EVERY mind incl. the non-ticked workers (sense/discover) + dispatched work,
+#                          and records the OBSERVED model/provider at the time. The complete signal.
+#   • ticks  (tick.log)  — fired self-feed nudges, written by mesh-tick. Legacy proxy; only covers
+#                          windows that have a tick cron (plan/work/dev/health/verify). Shown for trail.
+# A turn/tick ≈ one provider round-trip ≈ one unit of quota/credit. Use the PAID-vs-FREE split to see
+# whether work can be shifted onto the free pools (mesh-relay / opencode-free) — the squeeze the
+# mind-allocation reflex (mesh-dispatch) exists to enable.
 #
-# Status vocabulary in tick.log:
-#   "idle … nudge" → mind got a prompt (QUOTA CONSUMED, "fired")
-#   "skip"         → mind pane busy, tick skipped (no quota used)
-#   "no-pane"      → pane missing, skip (no quota used)
+#   mesh-spend                  per-mind turns + ticks, last 5h
+#   mesh-spend --by-provider    roll up by provider + PAID/FREE split (the squeeze view)
+#   mesh-spend --by-model       roll up by observed model
+#   mesh-spend --all            include zero-activity minds
+#   mesh-spend --sample         ONE sampling pass (the cron reflex — records turns; prints nothing)
+#   mesh-spend --test           smoke
+#
+# Map: window→engine→provider→tier, from ~/.mesh/minds.map if present else the built-in default.
+#      Model is OBSERVED live at sample time (footer scrape), falling back to the engine default.
+# Env: MESH_SPEND_WINDOW (hours, default 5)
 set -uo pipefail
 export PATH="$HOME/.local/bin:$PATH"
 [ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
-TICK_LOG="${MESH_TICK_LOG:-$HOME/.mesh/tick.log}"
+MESH="$HOME/.mesh"; SESS="$(hostname)"
+SPEND_LOG="${MESH_SPEND_LOG:-$MESH/spend.log}"
+TICK_LOG="${MESH_TICK_LOG:-$MESH/tick.log}"
+PREV="$MESH/.spend-prev"
+MAPFILE="$MESH/minds.map"
 WINDOW_H="${MESH_SPEND_WINDOW:-5}"
 
+# window engine provider tier  — built-in default (operator-maintainable via ~/.mesh/minds.map)
+default_map(){
+  cat <<'EOF'
+plan     claude   anthropic  paid
+tg       claude   anthropic  paid
+dev      claude   anthropic  paid
+discover claude   anthropic  paid
+sense    claude   anthropic  paid
+health   opencode opencode   free
+verify   opencode opencode   free
+tg-roz   opencode opencode   free
+work     codex    openai     paid
+EOF
+}
+themap(){ [ -f "$MAPFILE" ] && grep -vE '^\s*#|^\s*$' "$MAPFILE" || default_map; }
+
+# best-effort observed model from a window's footer (else engine default)
+model_of(){
+  local win="$1" eng="$2" cap m
+  cap="$(tmux capture-pane -t "$SESS:$win" -p -S -8 2>/dev/null || true)"
+  m="$(printf '%s\n' "$cap" | grep -oiE 'gpt-[0-9][0-9.]*-?[a-z]*|claude-[a-z0-9.-]+|opus|sonnet|haiku|mimo[^·|]*|deepseek[-a-z0-9.]*|gemini[-a-z0-9.]*|qwen[-a-z0-9.:]*' | head -1 | tr -d ' ' | cut -c1-22)"
+  if [ -n "$m" ]; then printf '%s' "$m"; return; fi
+  case "$eng" in
+    claude) printf 'claude-?';; codex) printf 'gpt-?';; opencode) printf 'opencode-free';; *) printf '?';; esac
+}
+
 if [ "${1:-}" = --test ]; then
-  [ -f "$TICK_LOG" ] || { echo "smoke-test: n/a (no tick.log yet)"; exit 2; }
   command -v python3 >/dev/null 2>&1 || { echo "smoke-test: FAIL (no python3)"; exit 1; }
-  python3 - "$TICK_LOG" "$WINDOW_H" >/dev/null 2>&1 <<'PYEOF'
-import sys, re
-from datetime import datetime, timezone
-with open(sys.argv[1]) as f:
-    for line in f:
-        m = re.match(r'^(\d{2}):(\d{2})Z\s+tick\[local:(\w+)\]', line)
-        if m:
-            sys.exit(0)
-sys.exit(0)
-PYEOF
+  command -v mesh-mind-state >/dev/null 2>&1 || { echo "smoke-test: FAIL (no mesh-mind-state)"; exit 1; }
+  default_map | grep -q '^plan ' || { echo "smoke-test: FAIL (map)"; exit 1; }
   echo "smoke-test: ok"; exit 0
 fi
 
-[ -f "$TICK_LOG" ] || { echo "mesh-spend: no tick.log (no ticks recorded yet)"; exit 0; }
+# ---------- SAMPLER: record a turn on each rising edge into WORKING ----------
+if [ "${1:-}" = --sample ]; then
+  mkdir -p "$MESH"; touch "$PREV" "$SPEND_LOG"
+  now="$(date -u +%FT%RZ)"
+  newprev="$(mktemp)"; trap 'rm -f "$newprev"' EXIT
+  while read -r win eng prov tier; do
+    [ -n "$win" ] || continue
+    st="$(mesh-mind-state "$win" 2>/dev/null | head -1 | cut -f1)"; st="${st:-ABSENT}"
+    prevst="$(grep -m1 "^$win=" "$PREV" 2>/dev/null | cut -d= -f2)"; prevst="${prevst:-NONE}"
+    if [ "$st" = WORKING ] && [ "$prevst" != WORKING ]; then
+      model="$(model_of "$win" "$eng")"
+      printf '%s turn %s %s %s %s %s\n' "$now" "$win" "$eng" "$prov" "$tier" "$model" >>"$SPEND_LOG"
+    fi
+    printf '%s=%s\n' "$win" "$st" >>"$newprev"
+  done <<EOF
+$(themap)
+EOF
+  mv -f "$newprev" "$PREV"; trap - EXIT
+  exit 0
+fi
 
-python3 - "$TICK_LOG" "$WINDOW_H" "${1:-}" <<'PYEOF'
+# ---------- REPORTER ----------
+VIEW="${1:-default}"
+MAPF="$(mktemp)"; trap 'rm -f "$MAPF"' EXIT; themap >"$MAPF"
+python3 - "$SPEND_LOG" "$TICK_LOG" "$WINDOW_H" "$VIEW" "$MAPF" <<'PYEOF'
 import sys, re
 from datetime import datetime, timezone, timedelta
+spend_log, tick_log, win_h_s, view, mapf = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
+win_h = float(win_h_s)
+# window -> (engine, provider, tier) from the map (attributes tick-only minds too)
+MAP = {}
+for ln in open(mapf):
+    p = ln.split()
+    if len(p) >= 4: MAP[p[0]] = (p[1], p[2], p[3])
+now = datetime.now(timezone.utc); cut = now - timedelta(hours=win_h)
 
-tick_log, window_h_s, flag = sys.argv[1], sys.argv[2], (sys.argv[3] if len(sys.argv) > 3 else "")
-window_h = float(window_h_s)
+def parse_ts(s):
+    try: return datetime.strptime(s, '%Y-%m-%dT%H:%M').replace(tzinfo=timezone.utc)
+    except ValueError: return None
 
-now = datetime.now(timezone.utc)
-window_cutoff = now - timedelta(hours=window_h)
+# turns from spend.log: ts turn window engine provider tier model
+turns = []
+try:
+    for ln in open(spend_log):
+        p = ln.split()
+        if len(p) < 7 or p[1] != 'turn': continue
+        dt = parse_ts(p[0].rstrip('Z'))
+        if not dt or dt < cut: continue
+        turns.append(dict(win=p[2], eng=p[3], prov=p[4], tier=p[5], model=p[6]))
+except FileNotFoundError:
+    pass
 
-# mind -> [fired_win, skip_win, fired_all, skip_all]
-counts = {}
-for line in open(tick_log):
-    line = line.strip()
-    if not line:
-        continue
-    m = re.match(r'^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2})Z\s+tick\[local:(\w+)\]:\s*(.*)', line)
-    if not m:
-        continue
-    ts_str, mind, status = m.group(1), m.group(2), m.group(3)
-    try:
-        entry_dt = datetime.strptime(ts_str, '%Y-%m-%dT%H:%M').replace(tzinfo=timezone.utc)
-    except ValueError:
-        continue
-    # quota consumed = "nudge" fired; skip/no-pane = no quota
-    fired = "nudge" in status or ("idle" in status and "skip" not in status)
-    in_window = entry_dt >= window_cutoff
-    if mind not in counts:
-        counts[mind] = [0, 0, 0, 0]
-    if fired:
-        counts[mind][2] += 1
-        if in_window:
-            counts[mind][0] += 1
+# legacy fired-ticks per mind from tick.log
+ticks = {}
+try:
+    for ln in open(tick_log):
+        m = re.match(r'^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2})Z\s+tick\[local:(\w+)\]:\s*(.*)', ln)
+        if not m: continue
+        dt = parse_ts(m.group(1))
+        if not dt or dt < cut: continue
+        if 'nudge' in m.group(3):
+            ticks[m.group(2)] = ticks.get(m.group(2), 0) + 1
+except FileNotFoundError:
+    pass
+
+hdr = f"mesh-spend — work units, last {win_h:.0f}h (as of {now.strftime('%H:%MZ')}) · turn/tick ≈ 1 round-trip"
+
+def bar(n, mx, w=18):
+    return '#'*int(round(w*n/mx)) if mx else ''
+
+def model_default(eng):
+    return {'claude':'claude-?','codex':'gpt-?','opencode':'opencode-free'}.get(eng,'?')
+
+# UNIFIED work-units = sampled turns (observed model) + fired ticks (map-attributed). A ticked mind's
+# nudge and the turn it triggers are correlated, so this mildly double-counts ticked minds — it is an
+# APPROXIMATE distribution ("where does compute go"), not an exact bill. Non-ticked minds (sense/
+# discover/dispatched) appear only via turns; that's the whole reason turns exist.
+units = []
+for t in turns:
+    units.append((t['prov'], t['tier'], t['model']))
+for w, n in ticks.items():
+    eng, prov, tier = MAP.get(w, ('?','?','?'))
+    units += [(prov, tier, model_default(eng))] * n
+
+if view == '--by-provider':
+    agg = {}
+    for prov,tier,_ in units: agg[(prov,tier)] = agg.get((prov,tier),0)+1
+    print(hdr); print("  proxy: turns(sampled)+ticks(nudges) — approximate, not a token bill")
+    print(f"  {'provider':<14} {'tier':<5} {'units':>6}")
+    print("  "+"-"*32)
+    mx = max(agg.values(), default=0)
+    paid=free=0
+    for (prov,tier),n in sorted(agg.items(), key=lambda x:-x[1]):
+        if tier=='paid': paid+=n
+        else: free+=n
+        print(f"  {prov:<14} {tier:<5} {n:>6}  {bar(n,mx)}")
+    print("  "+"-"*32)
+    tot=paid+free
+    if tot:
+        print(f"  PAID  {paid:>4}  ({100*paid//tot}%)   FREE  {free:>4}  ({100*free//tot}%)")
+        print(f"  -> {free} of {tot} units on free pools" + ("" if not paid else f"; {paid} paid units are shift candidates"))
     else:
-        counts[mind][3] += 1
-        if in_window:
-            counts[mind][1] += 1
+        print("  (no activity in window yet)")
 
-total_fw = sum(v[0] for v in counts.values())
-total_sw = sum(v[1] for v in counts.values())
+elif view == '--by-model':
+    agg={}
+    for prov,tier,model in units:
+        agg[(model,prov)] = agg.get((model,prov),0)+1
+    print(hdr); print("  proxy: turns(sampled)+ticks(nudges) — approximate")
+    print(f"  {'model':<22} {'provider':<11} {'units':>6}")
+    print("  "+"-"*44)
+    mx=max(agg.values(), default=0)
+    for (model,prov),n in sorted(agg.items(), key=lambda x:-x[1]):
+        print(f"  {model:<22} {prov:<11} {n:>6}  {bar(n,mx)}")
+    if not agg: print("  (no activity in window yet)")
 
-print(f"mesh-spend — quota ticks, last {window_h:.0f}h (as of {now.strftime('%H:%MZ')})")
-print(f"  {'mind':<11}  {'fired':>6}  {'skip':>5}  {'all-time':>9}")
-print("  " + "-" * 37)
-active = {k: v for k, v in counts.items() if v[0] > 0 or v[1] > 0}
-inactive = {k: v for k, v in counts.items() if v[0] == 0 and v[1] == 0}
-for mind, v in sorted(active.items(), key=lambda x: -x[1][0]):
-    print(f"  {'▶ ' + mind:<12}  {v[0]:>6}  {v[1]:>5}  {v[2]+v[3]:>9}")
-if flag == "--all":
-    for mind, v in sorted(inactive.items()):
-        print(f"    {mind:<10}  {v[0]:>6}  {v[1]:>5}  {v[2]+v[3]:>9}")
-print("  " + "-" * 37)
-print(f"  {'TOTAL':<12}  {total_fw:>6}  {total_sw:>5}")
-if total_fw > 0 and window_h > 0:
-    rate = total_fw / window_h
-    print(f"  burn rate: {rate:.1f} fired-ticks/h")
+else:  # default: per-mind turns + ticks
+    allmind=set(t['win'] for t in turns)|set(ticks)
+    meta=dict(MAP)  # map first (covers tick-only minds), observed turns refine
+    for t in turns: meta[t['win']]=(t['eng'],t['prov'],t['tier'])
+    tcount={}
+    for t in turns: tcount[t['win']]=tcount.get(t['win'],0)+1
+    print(hdr); print(f"  {'mind':<10} {'engine':<8} {'tier':<5} {'turns':>5} {'ticks':>5}")
+    print("  "+"-"*40)
+    rows=[]
+    show_all = view=='--all'
+    for w in allmind:
+        eng,prov,tier = meta.get(w,('?','?','?'))
+        rows.append((w,eng,tier,tcount.get(w,0),ticks.get(w,0)))
+    rows.sort(key=lambda r:-(r[3]+r[4]))
+    for w,eng,tier,tu,tk in rows:
+        if not show_all and tu==0 and tk==0: continue
+        print(f"  {w:<10} {eng:<8} {tier:<5} {tu:>5} {tk:>5}")
+    tt=sum(r[3] for r in rows); tkk=sum(r[4] for r in rows)
+    print("  "+"-"*40)
+    print(f"  {'TOTAL':<25} {tt:>5} {tkk:>5}")
+    if not turns:
+        print("  (turns not sampled yet — `mesh-spend --sample` runs via cron */5; views fill over time)")
+    print("  views: --by-provider (paid/free squeeze) · --by-model · --all")
 PYEOF
