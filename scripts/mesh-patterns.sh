@@ -34,6 +34,30 @@ MESH_GATE_RE='Do you want to (proceed|make this edit|create|delete|allow|run)|�
 
 export MESH_RL_RE MESH_AUTH_RE MESH_GATE_RE
 
+# ---- BLE device classification (shared by mesh-arrivals + mesh-ambient-clock) ----
+#
+# MESH_PERSON_RE  — KNOWN person-carried devices (operator + known items). Used for WEIGHTING
+#                   and confidence (e.g. room-sense PRESENT_STRONG, operator-state NEARBY).
+#                   NOT a gate for mesh-arrivals — use MESH_FIXED_RE exclusion there.
+#   Mobicar = operator's car (arrival = operator coming home).
+#
+# MESH_FIXED_RE   — fixed APPLIANCE devices: BLE cycling = ambient social clock / weather proxy,
+#                   definitionally NOT person-movement signals. EXCLUDED from mesh-arrivals,
+#                   HARVESTED by mesh-ambient-clock. Includes TVs, ACs, smart scales, sensors.
+#
+# Consumer contract (agreed 2026-06-15):
+#   mesh-arrivals:     EXCLUSION-based — tracks any real name NOT matching MESH_FIXED_RE.
+#                      Unknown-but-named devices (DV8235, guest phones) ARE tracked: a stranger's
+#                      device appearing IS a life event. MESH_PERSON_RE = confidence weighting only.
+#   mesh-ambient-clock: INCLUSION-based — harvests MESH_FIXED_RE matches.
+#   Unknown C04-/C05-/WSH86-: random-MAC churn, suppressed by mesh-arrivals debounce (not FIXED).
+# Pattern agreement: genome controls this; both tools source mesh-patterns.sh.
+
+MESH_PERSON_RE='Bose|JBL|AirPods|Galaxy Buds|Quest|Pixel|iPhone|Redmi|Armor|EDIFIER|Mobicar'
+MESH_FIXED_RE='\[TV\]|MiTV-|Mi Box|Bluedroid TV|GR-AC_|MI SCALE|LYWSD|Vega BLE|GEELY_BT|CAR-BT'
+
+export MESH_PERSON_RE MESH_FIXED_RE
+
 # Guard: run the test block ONLY when this file is EXECUTED directly — never when SOURCED.
 # (A sourced lib inherits the caller's $1, so without this guard `consumer --test` would trip the
 # lib's own test+exit and hijack the consumer's self-check.)
