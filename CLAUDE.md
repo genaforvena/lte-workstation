@@ -238,7 +238,7 @@ I(x)=-log2 P(x) per event-type; surfaces the genuinely-new from routine noise an
 expensive minds on novelty rather than volume) ·
 `mesh-study` (field-mining / study brief helper) · `mesh-transcribe` (consent-gated continuous transcription) · `mesh-hear` (consent-gated per-node
 mic capture → WAV) · `mesh-ear` (consent-gated always-on wake-word ear: layer-1 energy reflex always running ~free; layer-2 local whisper triggers only on speech; layer-3 cheapest mind fires ONLY on wake word; zero idle cost — mic_always=yes consent required) · `mesh-transcribe-organ` (source-agnostic WAV → filtered text) ·
-`mesh-usage` (usage aggregator backing `mesh-load`) · `mesh-pyparse` (catches the dead-but-green
+`mesh-usage` (usage aggregator backing `mesh-load`) · `mesh-spend` (quota-burn visibility: ticks-per-mind in the rolling 5h window — proxy for Claude turns consumed; `--all` includes zero-fire minds; reads tick.log, no network) · `mesh-pyparse` (catches the dead-but-green
 class `bash -n` misses: a bash tool whose embedded `python3 -c '...'` has a SyntaxError that only
 bites at runtime with stderr swallowed; zero-FP — validates only statically-literal blocks, skips
 shell-interpolated ones; wired into `mesh-doctor`'s parse check) · `mesh-chaos-doctor`/`mesh-chaos-verify`/`mesh-chaos`
