@@ -168,6 +168,19 @@ the shared scrollback, where every mind can see it.
 first** — `ssh user@ip "~/.local/bin/mesh-restore"` — before any other work on that node. A
 node without its session is blind to the mesh and the mesh is blind to it.
 
+## A window's data pane carries what the window is FOR
+
+Each channel is a 2-pane window: **top = DATA (live, refreshing text), bottom = MIND**. The
+window is named after its *role*, and its data pane must hold **everything important for that
+role** — so the mind can act from the pane alone, never re-fetching the same context each turn.
+The test: if your mind keeps running the same probe every turn, that signal belongs **on top**.
+Each channel owns its dash — extend `mesh-dash <role>` (or the role's live `--watch` surface),
+throttling any expensive read so the refresh loop stays cheap. Examples: `minds` → allocation
+(idle hands / open `[task]`) + spend (paid vs free); `plan` → situation + PLAN-next +
+blocked-minds; `health` → fleet health; `sense` → fused perception. To hot-reload a live data
+pane after editing its dash, `tmux respawn-pane -k -t <sess>:<win>.0` — it replaces the process
+in place (no reindex, mind pane untouched); never C-c it (that closes+reindexes the pane).
+
 ## Node self-description: `~/.mesh-card`
 
 Each node keeps a small current-state card (`mesh-card --refresh` regenerates it from live
