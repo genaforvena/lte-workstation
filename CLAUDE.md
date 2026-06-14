@@ -273,6 +273,7 @@ dead-man, deploy gated) · `mesh-card-watchdog.{sh,service,timer}` (card freshne
 `mesh-phone-sensors` (phone-body sensor demo: exercises battery/location/light/accel/wifi/camera → real artifacts; `--probe` = reachability check, `--notify` = TG alert) ·
 `mesh-phone-convo` (phone voice conversation: phone mic (opus)→WAV→whisper.cpp→mesh-relay→termux-tts-speak; `--loop` for continuous; exit 2 = phone offline; consent: mic_always=yes required) ·
 `mesh-sms` (SMS via phone body: termux-sms-send over SSH; TG-independent alert channel; config: MESH_SMS_NUMBER env or ~/.mesh/sms.conf; exit 2 = phone unreachable) ·
+`mesh-room-sense` (ROOM OCCUPANCY fusion — folds BLE presence (IdeaPad-local, named device RSSI) + WiFi RSSI motion (phone) + ambient light (phone) → PRESENT/EMPTY/UNCERTAIN; honest-degraded when phone offline (BLE-only path); `--edge` for cron wiring, `--json` for machines; wired */5 edge reflex posting to board on state change; the "is someone home?" sensor) ·
 `mesh-sms-send` (phone-side SMS helper: runs on the phone body; called by mesh-sms over SSH). Decayed
 2026-06-11: `mesh-health-watch` (→ mesh-session-watchdog), `mesh-tg-recv` (→ voice-rx+textin),
 `mesh-zone` (→ presence-fuse/trends), `vpn-hub.py` (retired overlay), `mesh-onboard` (attic:
