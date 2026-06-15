@@ -79,4 +79,5 @@ Scripts must enforce the boundary at the code level (not only in comments):
 | `mesh-converse` | ✅ `mic` gate | ✅ | ✅ torch | ✅ start/stop |
 | `genius-loci` | ✅ `camera` + `mic` gate | ✅ | ✅ torch | ✅ start/stop/heartbeat |
 | `mesh-hear` | ✅ `mic_always` gate | ✅ | ✅ torch for phone | ✅ start/stop |
+| `mesh-eye` | ✅ `camera`/`mic` gate — STRUCTURAL, refuses `rc=3` (sandbox-tested in `--test`) | ✖ no `mesh-say` | abstract signals only, **no raw frame kept** | → `~/.mesh/eye.log` (not `mesh-trace`) |
 | `mesh-transcribe-organ` | n/a (processes caller-provided WAV) | n/a | n/a | n/a |
