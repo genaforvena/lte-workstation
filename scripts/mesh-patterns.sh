@@ -49,6 +49,14 @@ export MESH_STRONG_RL_RE MESH_RL_BANNER_MAXLEN
 # length; broad RL tokens only on a line <= MESH_RL_BANNER_MAXLEN bytes.
 rl_is_walled(){
   local txt; txt="$(cat)"
+  # STRIP BOARD-ECHO lines FIRST. A mesh-chat board line (TIMESTAMP␠␠who@node␠␠::␠␠body, double-space
+  # separators) shown in a mind's pane is the mesh's OWN chatter — NEVER a real TUI quota banner. A
+  # free-pool mind doing board-reading work (e.g. opencode 'verify') echoes [mind-paused]/[mind-limited]
+  # lines like "monthly usage limit reached, reset in 18-20 hours" that otherwise match MESH_RL_RE → it
+  # is FALSELY shed off the mesh's own quota-chatter. (phaedra verify — free opencode pool, no real wall —
+  # was shed ~hourly all afternoon 2026-06-15, then an 18h banner-reset MISPARSE of an echoed monthly
+  # line pinned it dead 17h.) Real banners carry no timestamped who@node prefix, so this is always safe.
+  txt="$(printf '%s\n' "$txt" | grep -vE '^[[:space:]]*[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:Z]+  [^ ]+  ::  ')"
   # STATE = MOST-RECENT signal. A live ready-footer or working spinner at the very bottom means any
   # quota banner ABOVE it is STALE — the mind recovered / moved on — so it is NOT currently walled.
   # (operator FP 2026-06-15: discover/sense recovered after their 2:20pm reset but the old "hit your
