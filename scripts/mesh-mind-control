@@ -9,9 +9,16 @@
 #   mesh-mind-control                  print the mind table once
 #   mesh-mind-control --watch          live dashboard (refresh loop) — for a dedicated tmux window
 #   mesh-mind-control --dispatch "..." route the task to the best AVAILABLE claude worker (mesh-tell)
-#   mesh-mind-control --test           smoke
+#   mesh-mind-control --allocate "..." SMART route: classify text-vs-agentic, then send text→cheapest
+#                                      pool (mesh-relay), agentic→idle claude worker else free-agentic
+#                                      fallback (codex) when claude is WALLED. The "squeeze every
+#                                      subscription" router — agentic work no longer stalls on a walled
+#                                      claude. Prints the routing decision + result/handle.
+#   mesh-mind-control --classify "..." print just the text|agentic verdict + why (for testing/inspection)
+#   mesh-mind-control --test           smoke (incl. classifier assertions)
 #
-# Env: MESH_MIND_WORKERS (dispatch pool, default "dev discover sense") · MESH_MIND_REFRESH (watch secs)
+# Env: MESH_MIND_WORKERS (claude dispatch pool, default "dev discover sense") · MESH_AGENTIC_FALLBACK
+#      (free-agentic minds tried when claude is walled, default "work" = codex) · MESH_MIND_REFRESH (watch secs)
 set -uo pipefail
 export PATH="$HOME/.local/bin:$PATH"
 [ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
@@ -25,8 +32,29 @@ minds_manifest() {
     "work codex" "dev claude" "discover claude" "sense claude" "tg-roz opencode"
 }
 WORKERS="${MESH_MIND_WORKERS:-dev discover sense}"   # claude general-work pool (operator: rely on claude)
+# Free-agentic fallback pool: real tool-using minds on FREE/cheap engines, tried ONLY when claude is
+# walled (rate-limited / all workers busy/blocked). Default = codex 'work' window. health/verify are
+# opencode but carry their own stream ROLE (check/verify) so they're NOT general-work targets; tg/tg-roz
+# are operator-facing. Operator 2026-06-14 "rely on claude minds" = claude is PRIMARY; this is the
+# resilience fallback so agentic work doesn't stall when the subscription is rate-limited.
+AGENTIC_FALLBACK="${MESH_AGENTIC_FALLBACK:-work}"
 
 state_of() { mesh-mind-state "$1" 2>/dev/null | head -1 || printf 'ABSENT\t(no classify)\n'; }
+# engine_of <win> — detect the LIVE engine from the mind pane's footer chrome, NOT a hardcoded manifest
+# (the windows drift: a 'claude' window gets restarted as opencode, etc. — verified 2026-06-15 dev was
+# OpenCode while the manifest said claude). An honest allocator + an honest minds pane must read reality.
+engine_of() {
+  local win="$1" pidx pane foot
+  pidx="$(tmux list-panes -t "$SESS:$win" -F '#{pane_top} #{pane_index}' 2>/dev/null | sort -n | tail -1 | awk '{print $2}')"
+  [ -n "$pidx" ] || { echo "absent"; return; }
+  foot="$(tmux capture-pane -t "$SESS:$win.$pidx" -p 2>/dev/null | grep -vE '^[[:space:]]*$' | tail -6)"
+  case "$foot" in
+    *OpenCode*|*"opencode"*)                 echo "opencode";;
+    *Codex*|*codex*|*"OpenAI"*)              echo "codex";;
+    *"auto mode on"*|*"shift+tab to cycle"*|*"for agents"*|*"to manage"*|*"bypass permissions"*) echo "claude";;
+    *) echo "unknown";;
+  esac
+}
 # backlog + spend footer — this surface is FOR orchestration, so its data shows where work waits and
 # where compute goes. Both THROTTLED to a 60s cache so the --watch loop stays cheap regardless of refresh.
 backlog_line() { local td; td="$(date -u +%F)"; local c="$HOME/.mesh/chat.log"
@@ -48,12 +76,13 @@ icon() { case "$1" in
 render() {
   echo "=== mesh minds · $SESS · $(date -u +%H:%M:%SZ) ==="
   printf '  %-9s %-9s  %-13s %s\n' WINDOW ENGINE STATE EVIDENCE
-  local avail="" line st ev win eng
+  local avail="" line st ev win eng leng
   while read -r win eng; do
     [ -n "$win" ] || continue
     line="$(state_of "$win")"; st="${line%%	*}"; ev="${line#*	}"
     [ "$st" = "$line" ] && ev=""
-    printf '  %-9s %-9s  %s %-11s %s\n' "$win" "$eng" "$(icon "$st")" "$st" "$(printf '%s' "$ev" | cut -c1-58)"
+    leng="$(engine_of "$win")"; [ "$leng" = unknown ] && leng="$eng?"   # LIVE engine (manifest is only a hint)
+    printf '  %-9s %-9s  %s %-11s %s\n' "$win" "$leng" "$(icon "$st")" "$st" "$(printf '%s' "$ev" | cut -c1-58)"
     case " $WORKERS " in *" $win "*) [ "$st" = IDLE ] && avail="$avail $win";; esac
   done <<EOF
 $(minds_manifest)
@@ -88,8 +117,98 @@ dispatch() {
   fi
 }
 
+# classify_task <task> -> prints "agentic <reason>" or "text <reason>" on stdout.
+# HONEST heuristic, zero-cost + deterministic (so it's testable + has no inference dependency):
+#  - AGENTIC = needs tools / side-effects / multi-step (edit a file, run a command, verify against
+#    reality, git/ssh/tmux, a path or filename). Routing this to a text pool returns a USELESS non-answer
+#    (it describes what it WOULD do, doesn't do it) — so AGENTIC is also the conservative default on a tie.
+#  - TEXT = a pure transform with no side-effect (summarize / translate / explain / classify / draft).
+classify_task() {
+  local t; t="$(printf '%s' "$1" | tr 'A-Z' 'a-z')"
+  # 1. a file path / filename / code-ish token → agentic even with "summarize": a text pool has no
+  #    filesystem, so "summarize scripts/mesh-tick" needs a tool to READ the file first.
+  if printf '%s' "$t" | grep -qE '(^|[[:space:]])/[a-z]|\.(sh|py|md|json|conf|service|timer|ya?ml)([[:space:]]|$)|scripts/|~/\.mesh|\.local/bin'; then
+    echo "agentic file/path token"; return; fi
+  # 2. LEADING pure-transform verb → text, even if an agentic NOUN appears later in the subject
+  #    ("draft a tg update about the pane FIX" = write text, not perform a fix). The lead verb wins.
+  if printf '%s' "$t" | grep -qE '^[[:space:]]*(please[[:space:]]+|can you[[:space:]]+|could you[[:space:]]+)?(summari[sz]e|translate|explain|describe|answer|draft|rephrase|reword|compose|paraphrase|define|tell me|what is|who is)\b'; then
+    echo "text leading transform verb"; return; fi
+  # 3. action verbs implying tools / mutation / execution / reality-checking
+  if printf '%s' "$t" | grep -qwE 'edit|write|create|add|append|fix|repair|build|implement|code|refactor|rename|move|delete|remove|chmod|patch|chang(e|ing)|run|execute|exec|commit|push|deploy|install|wire|configure|set\s?up|restart|verify|reality-check|investigate|debug|diagnose|reproduce|test|smoke|probe|scan|measure|capture|record|ssh|git|tmux|cron|provision'; then
+    echo "agentic action verb"; return; fi
+  # 4. pure-transform verb anywhere (no agentic signal above) = text
+  if printf '%s' "$t" | grep -qwE 'summari[sz]e|translate|explain|describe|classify|answer|draft|rephrase|reword|rewrite|compose|tldr|summary|paraphrase|define|what is|who is|list (the )?(pros|cons)'; then
+    echo "text pure-transform verb"; return; fi
+  echo "agentic default (ambiguous → safe side: a misrouted agentic-as-text gives a non-answer)"
+}
+
+# allocate <task> — the smart router. text→cheapest inference pool; agentic→best available agentic mind.
+allocate() {
+  local task="$1"; [ -n "$task" ] || { echo "usage: mesh-mind-control --allocate \"<task>\""; return 1; }
+  local verdict reason; verdict="$(classify_task "$task")"; reason="${verdict#* }"; verdict="${verdict%% *}"
+  if [ "$verdict" = text ]; then
+    echo "route: TEXT ($reason) → mesh-relay (cheapest available pool)"
+    if command -v mesh-relay >/dev/null 2>&1; then
+      MESH_WHO="mind-control@$SESS" mesh-chat "[allocate] TEXT→relay: $(printf '%s' "$task" | cut -c1-80)" >/dev/null 2>&1 || true
+      mesh-relay "$task"; return $?
+    fi
+    echo "mesh-relay unavailable — cannot serve text task"; return 2
+  fi
+  # AGENTIC: scan the dispatch pool by LIVE engine + state. Prefer an idle CLAUDE worker (operator:
+  # rely on claude for quality); else an idle FREE-engine worker (opencode/codex — squeeze the free
+  # subscriptions when claude is walled); else queue to a busy claude. Honest about which tier it used.
+  local claude_ok; claude_ok="$(mesh-claude-check --quiet 2>/dev/null || echo '?')"
+  local idle_claude="" idle_free="" free_eng="" busyc="" win st eng
+  for win in $WORKERS $AGENTIC_FALLBACK; do
+    st="$(state_of "$win")"; st="${st%%	*}"; eng="$(engine_of "$win")"
+    if [ "$st" = IDLE ]; then
+      case "$eng" in
+        claude)          [ -z "$idle_claude" ] && idle_claude="$win";;
+        opencode|codex)  [ -z "$idle_free" ] && { idle_free="$win"; free_eng="$eng"; };;
+        *)               [ -z "$idle_free" ] && { idle_free="$win"; free_eng="$eng"; };;
+      esac
+    elif [ "$st" = WORKING ] && [ "$eng" = claude ] && [ -z "$busyc" ]; then busyc="$win"; fi
+  done
+  if [ -n "$idle_claude" ]; then
+    echo "route: AGENTIC ($reason) → claude worker '$idle_claude' (idle, preferred)"; _send_agentic "$idle_claude" "$task" claude; return $?
+  fi
+  if [ -n "$idle_free" ]; then
+    echo "route: AGENTIC ($reason) → FREE-agentic '$idle_free' ($free_eng, idle — claude workers busy/walled: claude-access=$claude_ok)"
+    _send_agentic "$idle_free" "$task" "free:$free_eng"; return $?
+  fi
+  if [ -n "$busyc" ]; then
+    echo "route: AGENTIC ($reason) → queued to busy claude worker '$busyc' (no idle claude or free worker)"
+    _send_agentic "$busyc" "$task" claude-queued; return $?
+  fi
+  echo "route: AGENTIC ($reason) → NO available agentic capacity (all workers busy/blocked) — NOT dispatched"
+  MESH_WHO="mind-control@$SESS" mesh-chat "[allocate] BLOCKED — no agentic capacity for: $(printf '%s' "$task" | cut -c1-80)" >/dev/null 2>&1 || true
+  return 2
+}
+_send_agentic() { # <win> <task> <tier-label>
+  if mesh-tell "$1" "$2" >/dev/null 2>&1; then
+    echo "  dispatched → $1"
+    MESH_WHO="mind-control@$SESS" mesh-chat "[allocate] AGENTIC→$1 ($3): $(printf '%s' "$2" | cut -c1-80)" >/dev/null 2>&1 || true
+  else echo "  dispatch FAILED (mesh-tell $1 — pane gone?)"; return 1; fi
+}
+
 case "${1:-}" in
-  --test)     echo "smoke-test: ok"; exit 0;;
+  --test)     # smoke + classifier assertions (a router that misroutes is worse than none)
+              fails=0
+              assert(){ local got; got="$(classify_task "$1")"; got="${got%% *}"
+                [ "$got" = "$2" ] || { echo "  classify FAIL: '$1' → $got (want $2)"; fails=$((fails+1)); }; }
+              assert "fix the syntax error in scripts/mesh-tick" agentic
+              assert "summarize the last 10 board posts" text
+              assert "translate this message to english" text
+              assert "verify mesh-act fires the phone vibrate" agentic
+              assert "run mesh-doctor and report FAILs" agentic
+              assert "explain what a reflex is" text
+              assert "commit and push the change" agentic
+              assert "draft a telegram update about the pane fix" text
+              assert "summarize scripts/mesh-tick" agentic
+              [ "$fails" = 0 ] && echo "smoke-test: ok (classifier 9 assertions pass)" || { echo "smoke-test: FAIL ($fails classifier miss)"; exit 1; }
+              exit 0;;
+  --classify) shift; v="$(classify_task "$*")"; echo "${v%% *}: ${v#* }"; exit 0;;
+  --allocate) shift; allocate "$*";;
   --watch)    # self-reexec on code update so a long-lived pane never renders stale layout (see mesh-dash)
               _S="$(command -v "$0" 2>/dev/null || echo "$0")"; _SM="$(stat -c %Y "$_S" 2>/dev/null || echo 0)"
               while true; do
