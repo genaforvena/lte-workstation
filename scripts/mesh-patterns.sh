@@ -60,12 +60,19 @@ MESH_FIXED_RE='\[TV\]|MiTV-|Mi Box|Bluedroid TV|GR-AC_|MI SCALE|LYWSD|Vega BLE|G
 # DRG[0-9] = Sercomm Digital Residential Gateway (e.g. DRG70-5AC65F) — a neighbor's home router,
 # confirmed STABLE fixed appliance: 2 sightings, same real-OUI MAC 4C:E1:74:5A:C6:5F (2026-06-15).
 # MESH_NOISE_RE — rotating serial-number names: devices that embed their serial/ID into the BLE
-# advertisement name and rotate it with the MAC. Looks like a "real name" (not a bare MAC, not SC-)
-# but is per-device-instance noise that produces the same false [arrived]/[left] churn as random MACs.
-# Observed: WSH86<serial> (wearable/scale), C04-<serial>, C05-<serial>, SBB01W12AL028100, ...
-# Generic heuristic: 12+ chars, all uppercase+digits, no spaces/hyphens — serial/UUID-in-name
-# regardless of prefix. Prefix list kept for backwards compat / C0x- with hyphens.
-MESH_NOISE_RE='^(WSH86|C04-|C05-)[0-9A-Za-z]|^[A-Z][A-Z0-9]{11,}$'
+# advertisement name and rotate it with the MAC. Looks like a "real name" (not a bare MAC) but is
+# per-device-instance noise producing false [arrived]/[left] churn.
+# Observed: WSH86<serial> (wearable/scale), C04-/C05-<serial>, SBB01W12AL028100,
+#   SC-<14-hex> (smart-sensor series, 180-345 sightings each, 2026-06-15),
+#   J65172082 (9-char uppercase+digit serial, 2026-06-15).
+# Three sub-patterns (consumers apply -i, so [A-Z] matches lowercase too — be precise):
+#   (1) Known prefix+hyphen: WSH86/C04-/C05-/SC-<12-hex> — hyphens break the generic threshold
+#   (2) Letter + 7+ digits only: ^[A-Z][0-9]{7,}$ — catches J65172082 (J+8 digits); safe: -i
+#       can't false-positive on "Bluetooth" (has letter chars, not all digits after initial)
+#   (3) Generic 12+ chars all-uppercase+digit: ^[A-Z][A-Z0-9]{11,}$ — catches SBB01W12AL028100
+#       (16c); threshold kept at 12 because -i makes [A-Z0-9] match lowercase too (9c would
+#       catch "Bluetooth" = B+luetooth at 9c)
+MESH_NOISE_RE='^(WSH86|C04-|C05-)[0-9A-Za-z]|^SC-[0-9A-F]{12,}$|^[A-Z][0-9]{7,}$|^[A-Z][A-Z0-9]{11,}$'
 
 export MESH_PERSON_RE MESH_FIXED_RE MESH_NOISE_RE
 
@@ -112,8 +119,13 @@ if [ "${1:-}" = --test ] && [ "${BASH_SOURCE[0]}" = "${0}" ]; then
   ck "$MESH_FIXED_RE" no    "Quest 3"                     "person-headset-NOT-fixed"
   echo "MESH_NOISE_RE — rotating serial-name churn (ignored):"
   ck "$MESH_NOISE_RE" match "WSH86ABC123"                  "WSH86-noise"
-  ck "$MESH_NOISE_RE" match "ABCDEFGHIJKLM"                "12-char-allcaps-serial"
-  ck "$MESH_NOISE_RE" no    "DRG70-5AC65F"                "DRG-not-noise (has hyphen)"
+  ck "$MESH_NOISE_RE" match "ABCDEFGHIJKLM"                "13-char-allcaps-serial"
+  ck "$MESH_NOISE_RE" match "J65172082"                    "9-char-serial (2026-06-15)"
+  ck "$MESH_NOISE_RE" match "SC-31142100007F1F"            "SC-hex-sensor (2026-06-15)"
+  ck "$MESH_NOISE_RE" match "SC-31150200034BED"            "SC-hex-sensor-variant"
+  ck "$MESH_NOISE_RE" no    "DRG70-5AC65F"                "DRG-not-noise (in FIXED_RE)"
+  ck "$MESH_NOISE_RE" no    "Bluetooth"                   "Bluetooth-not-noise (lowercase)"
   ck "$MESH_NOISE_RE" no    "Samsung 5 Series (40)"       "TV-not-noise"
+  ck "$MESH_NOISE_RE" no    "DV8235"                      "6-char-model-not-noise (too short)"
   [ "$fail" = 0 ] && { echo "smoke-test: ok"; exit 0; } || { echo "smoke-test: FAIL"; exit 1; }
 fi
