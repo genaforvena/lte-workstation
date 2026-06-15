@@ -58,9 +58,10 @@ MESH_FIXED_RE='\[TV\]|MiTV-|Mi Box|Bluedroid TV|GR-AC_|MI SCALE|LYWSD|Vega BLE|G
 # MESH_NOISE_RE — rotating serial-number names: devices that embed their serial/ID into the BLE
 # advertisement name and rotate it with the MAC. Looks like a "real name" (not a bare MAC, not SC-)
 # but is per-device-instance noise that produces the same false [arrived]/[left] churn as random MACs.
-# Observed: WSH86<serial> (wearable/scale, e.g. WSH866897059279853AM5886 — no hyphen), C04-<serial>, C05-<serial>.
-# Was: "suppressed by debounce (not FIXED)" in this file — now properly rejected by is_named().
-MESH_NOISE_RE='^(WSH86|C04-|C05-)[0-9A-Za-z]'
+# Observed: WSH86<serial> (wearable/scale), C04-<serial>, C05-<serial>, SBB01W12AL028100, ...
+# Generic heuristic: 12+ chars, all uppercase+digits, no spaces/hyphens — serial/UUID-in-name
+# regardless of prefix. Prefix list kept for backwards compat / C0x- with hyphens.
+MESH_NOISE_RE='^(WSH86|C04-|C05-)[0-9A-Za-z]|^[A-Z][A-Z0-9]{11,}$'
 
 export MESH_PERSON_RE MESH_FIXED_RE MESH_NOISE_RE
 
