@@ -49,6 +49,12 @@ export MESH_STRONG_RL_RE MESH_RL_BANNER_MAXLEN
 # length; broad RL tokens only on a line <= MESH_RL_BANNER_MAXLEN bytes.
 rl_is_walled(){
   local txt; txt="$(cat)"
+  # STATE = MOST-RECENT signal. A live ready-footer or working spinner at the very bottom means any
+  # quota banner ABOVE it is STALE — the mind recovered / moved on — so it is NOT currently walled.
+  # (operator FP 2026-06-15: discover/sense recovered after their 2:20pm reset but the old "hit your
+  # session limit" banner sat in scrollback above the live idle footer → falsely RATE-LIMITED + shed.)
+  printf '%s\n' "$txt" | grep -vE '^[[:space:]]*$' | tail -4 \
+    | grep -qE '⏵⏵ auto mode on|\? for shortcuts[^$]*agents|Use /skills to list|Ask anything|ctrl\+p commands|esc to interrupt|…[[:space:]]*\([0-9]|ing\.\.\.[[:space:]]*\([0-9]' && return 1
   printf '%s\n' "$txt" | grep -vE '^[[:space:]]*[❯›]' | grep -qiE "$MESH_STRONG_RL_RE" && return 0
   printf '%s\n' "$txt" | grep -vE '^[[:space:]]*[❯›]' \
     | awk -v m="$MESH_RL_BANNER_MAXLEN" 'length($0)<=m' | grep -qiE "$MESH_RL_RE" && return 0
@@ -77,9 +83,13 @@ rl_is_walled(){
 MESH_PERSON_RE='JBL|AirPods|Galaxy Buds|Galaxy S|Galaxy A|Galaxy Note|Quest|Pixel|iPhone|Redmi|Armor|EDIFIER|Mobicar|Car Remote|Huawei|HUAWEI|Xiaomi Band|Mi Band'
 # Bose Revolve SoundLink is a desk speaker broadcasting BLE 24/7 in standby — fixed appliance, not person-movement.
 # Generic Bose removed from PERSON_RE; Bose headphones (QC, Earbuds) not yet observed, add if seen.
-MESH_FIXED_RE='\[TV\]|MiTV-|Mi Box|Bluedroid TV|GR-AC_|MI SCALE|LYWSD|Vega BLE|GEELY_BT|CAR-BT|Bose Revolve|Bose SoundLink|DRG[0-9]'
+MESH_FIXED_RE='\[TV\]|MiTV-|Mi Box|Bluedroid TV|GR-AC_|MI SCALE|LYWSD|Vega BLE|GEELY_BT|CAR-BT|Bose Revolve|Bose SoundLink|DRG[0-9]| [Тт][Вв]$'
 # DRG[0-9] = Sercomm Digital Residential Gateway (e.g. DRG70-5AC65F) — a neighbor's home router,
 # confirmed STABLE fixed appliance: 2 sightings, same real-OUI MAC 4C:E1:74:5A:C6:5F (2026-06-15).
+# " [Тт][Вв]$" = a Cyrillic "<name> тв/ТВ" TV (e.g. "ваня тв") — a neighbor's TV, the bracketed-[TV]
+# pattern misses these. STABLE fixed appliance: 2 sightings, same real-OUI MAC F0:A3:B2:DF:EB:83
+# (2026-06-15). Anchored to a trailing " тв" word so it never matches mid-name; no person device is
+# named "<x> тв".
 # MESH_NOISE_RE — rotating serial-number names: devices that embed their serial/ID into the BLE
 # advertisement name and rotate it with the MAC. Looks like a "real name" (not a bare MAC) but is
 # per-device-instance noise producing false [arrived]/[left] churn.
@@ -136,8 +146,11 @@ if [ "${1:-}" = --test ] && [ "${BASH_SOURCE[0]}" = "${0}" ]; then
   ck "$MESH_FIXED_RE" match "MiTV-MZTU1"                  "MiTV"
   ck "$MESH_FIXED_RE" match "Bose Revolve SoundLink"       "Bose-desk-speaker"
   ck "$MESH_FIXED_RE" match "DRG70-5AC65F"                "Sercomm-DRG-gateway"
+  ck "$MESH_FIXED_RE" match "ваня тв"                     "cyrillic-TV-suffix"
+  ck "$MESH_FIXED_RE" match "Гостиная ТВ"                 "cyrillic-TV-uppercase"
   ck "$MESH_FIXED_RE" no    "iPhone 13"                   "person-phone-NOT-fixed"
   ck "$MESH_FIXED_RE" no    "Quest 3"                     "person-headset-NOT-fixed"
+  ck "$MESH_FIXED_RE" no    "Светлана"                    "cyrillic-name-NOT-fixed (no тв suffix)"
   echo "MESH_NOISE_RE — rotating serial-name churn (ignored):"
   ck "$MESH_NOISE_RE" match "WSH86ABC123"                  "WSH86-noise"
   ck "$MESH_NOISE_RE" match "ABCDEFGHIJKLM"                "13-char-allcaps-serial"
@@ -157,5 +170,7 @@ if [ "${1:-}" = --test ] && [ "${BASH_SOURCE[0]}" = "${0}" ]; then
   ckw clear  "summary-prose quota"    "Noted but no action: rate-limit walls cascading (09:56-10:05) are designed thermal/quota backpressure via channel-keepalive, not a fault — just fewer hands during cooldown."
   ckw clear  "task-text about RL"     "on a rate-limited claude worker auto-re-routes to an idle FREE-engine worker. Propose the trigger (mind-state RATE-LIMITED → re-dispatch its open task) plus de-dup."
   ckw clear  "input-box quota draft"  "❯ should we retry after we hit the usage limit?"
+  ckw clear  "STALE banner + idle footer" "$(printf '⎿  You'"'"'ve hit your session limit · resets 2:20pm (Europe/Moscow)\n   /upgrade to increase your usage limit.\n✻ Worked for 1s\n❯ \n  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents')"
+  ckw clear  "STALE banner + spinner"     "$(printf '⎿  You'"'"'ve hit your session limit · resets 2:20pm\n✻ Cogitating… (12s · esc to interrupt)')"
   [ "$fail" = 0 ] && { echo "smoke-test: ok"; exit 0; } || { echo "smoke-test: FAIL"; exit 1; }
 fi
