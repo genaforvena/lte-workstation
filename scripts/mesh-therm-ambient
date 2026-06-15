@@ -1,0 +1,197 @@
+#!/usr/bin/env bash
+# mesh-therm-ambient — AMBIENT temperature + humidity from a LYWSD03MMC BLE sensor via bleak.
+# Two read paths (auto-detected by which service UUID the sensor broadcasts):
+#   • PVVX/ATC custom firmware: passive advertisement decode (UUID 0x181A, no connection needed)
+#   • Stock Xiaomi firmware: GATT connect → read characteristic EBE0CCC1... (needs RSSI ≥ RSSI_MIN)
+# At -102 dBm (typical range for a sensor in another room), stock GATT is marginal; flash PVVX
+# for robust passive reading from any distance: https://github.com/pvvx/ATC_MiThermometer
+#
+# Requires: python3 + bleak (pip3 install bleak --break-system-packages)
+#   PYTHONPATH auto-set to ~/.local/lib/pythonX.Y/site-packages if bleak not on default path.
+#
+#   mesh-therm-ambient           one-shot: print temp+humidity to stdout, post to board
+#   mesh-therm-ambient --status  print last cached result (no BLE scan)
+#   mesh-therm-ambient --edge    edge-triggered: post [ambient-temp] board event on ≥0.5°C change
+#   mesh-therm-ambient --test    smoke test (does not scan — just checks prerequisites)
+#
+# State: ~/.mesh/.ambient-temp.state   Edge: [ambient-temp] T=X.X°C H=XX%
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+
+SENSOR_MAC="${MESH_LYWSD_MAC:-A4:C1:38:A0:9C:E4}"
+SCAN_SECS="${MESH_AMBIENT_SCAN:-60}"
+RSSI_MIN="${MESH_AMBIENT_RSSI_MIN:--97}"    # dBm threshold for GATT attempt
+STATE="$HOME/.mesh/.ambient-temp.state"
+MESH="$HOME/.mesh"
+
+# Resolve bleak PYTHONPATH (it may be user-installed)
+_py_path() {
+  local ver; ver="$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null)"
+  local p="$HOME/.local/lib/python${ver}/site-packages"
+  [ -d "$p" ] && printf '%s' "$p" || true
+}
+export PYTHONPATH="${PYTHONPATH:-$(_py_path)}"
+
+# Check prerequisites (no scan)
+_check() {
+  command -v python3 >/dev/null 2>&1 || { echo "FAIL: no python3"; return 1; }
+  python3 -c "import bleak" 2>/dev/null || { echo "FAIL: bleak not installed (pip3 install bleak --break-system-packages)"; return 1; }
+  python3 -c "import asyncio" 2>/dev/null || { echo "FAIL: no asyncio"; return 1; }
+  echo "ok (python3+bleak present, PYTHONPATH=$PYTHONPATH)"
+}
+
+if [ "${1:-}" = "--test" ]; then
+  result="$(_check 2>&1)"
+  if printf '%s' "$result" | grep -q '^ok'; then
+    echo "smoke-test: ok ($result)"
+    exit 0
+  else
+    echo "smoke-test: FAIL ($result)"
+    exit 1
+  fi
+fi
+
+if [ "${1:-}" = "--status" ]; then
+  if [ -f "$STATE" ]; then
+    cat "$STATE"
+  else
+    echo "no cached reading"
+    exit 1
+  fi
+  exit 0
+fi
+
+# Run the BLE scan + read
+result="$(python3 - <<PYEOF
+import asyncio, struct, sys, re, os
+
+ADDR     = '${SENSOR_MAC}'
+TIMEOUT  = ${SCAN_SECS}
+RSSI_MIN = ${RSSI_MIN}
+GATT_UUID = "EBE0CCC1-7A0A-4B0C-8A1A-6FF2997DA3A6"
+PVVX_UUID = "0000181a-0000-1000-8000-00805f9b34fb"   # Environmental Sensing (PVVX firmware)
+
+def decode_pvvx(mac, data):
+    # PVVX format: MAC_rev(6) + temp_x100(int16) + hum_x100(uint16) + bat_mv(uint16) + bat_pct(uint8) + flags(uint8)
+    if len(data) < 13: return None
+    temp  = struct.unpack_from('<h', data, 6)[0] / 100.0
+    hum   = struct.unpack_from('<H', data, 8)[0] / 100.0
+    bat_mv = struct.unpack_from('<H', data, 10)[0]
+    bat_pct = data[12] if len(data) > 12 else 0
+    return (temp, hum, bat_mv, bat_pct)
+
+async def main():
+    try:
+        from bleak import BleakScanner, BleakClient
+    except ImportError:
+        print("BLOCKED:bleak-not-installed")
+        return
+
+    best = {}
+
+    def cb(dev, adv):
+        if dev.address.upper() == ADDR.upper():
+            best.setdefault('rssi', adv.rssi)
+            if adv.rssi > best.get('rssi', -999):
+                best['rssi'] = adv.rssi
+                best['adv']  = adv
+            # Attempt PVVX decode on the fly
+            sd = adv.service_data or {}
+            for uuid, data in sd.items():
+                if '181a' in uuid.lower():
+                    r = decode_pvvx(ADDR, data)
+                    if r:
+                        best['pvvx'] = r
+
+    scanner = BleakScanner(detection_callback=cb)
+    await scanner.start()
+    await asyncio.sleep(TIMEOUT)
+    await scanner.stop()
+
+    if not best:
+        print("NOT-SEEN")
+        return
+
+    rssi = best.get('rssi', -999)
+
+    # If PVVX firmware detected, use that (no connection needed)
+    if 'pvvx' in best:
+        t, h, bat_mv, bat_pct = best['pvvx']
+        print(f"T={t:.1f}:H={h:.0f}:rssi={rssi}:bat={bat_pct}%:src=pvvx-adv")
+        return
+
+    # Stock firmware: try GATT if signal is adequate
+    if rssi < RSSI_MIN:
+        print(f"WEAK:rssi={rssi}:PVVX-needed")
+        return
+
+    try:
+        async with BleakClient(ADDR, timeout=20.0) as client:
+            data = await client.read_gatt_char(GATT_UUID)
+            if len(data) >= 3:
+                temp  = struct.unpack_from('<h', data, 0)[0] / 100.0
+                hum   = data[2]
+                bat_v = struct.unpack_from('<H', data, 3)[0] / 1000.0 if len(data) >= 5 else 0
+                print(f"T={temp:.1f}:H={hum}:rssi={rssi}:bat={bat_v:.2f}V:src=gatt")
+            else:
+                print(f"GATT-SHORT:rssi={rssi}")
+    except Exception as e:
+        print(f"GATT-FAIL:rssi={rssi}:{str(e)[:60]}")
+
+asyncio.run(main())
+PYEOF
+)"
+
+ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+host="$(hostname)"
+
+case "$result" in
+  T=*)
+    # Parse result: T=22.1:H=45:rssi=-99:...
+    temp="$(printf '%s' "$result" | grep -oE 'T=[0-9.-]+' | cut -d= -f2)"
+    hum="$(printf '%s' "$result" | grep -oE 'H=[0-9.]+' | cut -d= -f2)"
+    rssi="$(printf '%s' "$result" | grep -oE 'rssi=-?[0-9]+' | cut -d= -f2)"
+    src="$(printf '%s' "$result" | grep -oE 'src=[^ ]+' | cut -d= -f2)"
+    summary="${temp}°C ${hum}% RH (rssi=${rssi} src=${src})"
+    echo "$summary"
+
+    if [ "${1:-}" = "--edge" ]; then
+      prev_temp="$(cat "$STATE" 2>/dev/null | grep -oE 'T=[0-9.-]+' | cut -d= -f2 || echo '')"
+      printf 'T=%s:H=%s:rssi=%s:src=%s:ts=%s\n' "$temp" "$hum" "$rssi" "$src" "$ts" > "$STATE"
+      # Post edge event if temp changed ≥ 0.5°C
+      if [ -n "$prev_temp" ]; then
+        delta="$(python3 -c "d=abs(${temp}-${prev_temp}); print('big' if d>=0.5 else 'small')" 2>/dev/null)"
+        [ "${delta:-}" = "big" ] || exit 0
+      fi
+      printf '%s  ambient@%s  ::  [ambient-temp] %s\n' "$ts" "$host" "$summary" \
+        | tee -a "$MESH/traces.log" | MESH_WHO="ambient@${host}" mesh-chat 2>/dev/null || true
+    else
+      printf 'T=%s:H=%s:rssi=%s:src=%s:ts=%s\n' "$temp" "$hum" "$rssi" "$src" "$ts" > "$STATE"
+    fi
+    ;;
+  WEAK:*)
+    rssi="$(printf '%s' "$result" | grep -oE 'rssi=-?[0-9]+' | cut -d= -f2)"
+    msg="LYWSD03MMC detected (rssi=${rssi} dBm) — too far for GATT; flash PVVX firmware for passive read"
+    echo "$msg"
+    [ "${1:-}" = "--edge" ] && exit 0  # not a state change worth posting
+    ;;
+  NOT-SEEN)
+    echo "LYWSD03MMC not seen in ${SCAN_SECS}s scan (MAC=${SENSOR_MAC})"
+    exit 1
+    ;;
+  BLOCKED:*)
+    echo "BLOCKED: ${result#BLOCKED:}"
+    exit 2
+    ;;
+  GATT-FAIL:*)
+    rssi="$(printf '%s' "$result" | grep -oE 'rssi=-?[0-9]+' | cut -d= -f2)"
+    err="${result#GATT-FAIL:rssi=${rssi}:}"
+    echo "LYWSD03MMC rssi=${rssi} GATT failed: ${err}"
+    exit 1
+    ;;
+  *)
+    echo "unexpected: $result"
+    exit 1
+    ;;
+esac
