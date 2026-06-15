@@ -34,7 +34,8 @@ on the Redmi 10, 2026-06-12 after the F-Droid reinstall: termux-api 0.59.1, 83 c
     subcommand (it drives real devices — needs a target appliance + IR codes; transmit path built,
     real-device effect unproven). `--test` is the reachability gate (exit 2 = unreachable, NO fire);
     honest-organ — an unreachable phone is never a successful actuation.
-- **Personal data:** `termux-sms-inbox`, `termux-call-log`, `termux-contact-list`.
+- **Personal data:** `termux-sms-list` (replaces deprecated `termux-sms-inbox`; phone reports "replaced by termux-sms-list"), `termux-call-log`, `termux-contact-list`.
+  - **Wired reflex** `mesh-sms-monitor` — polls `termux-sms-list` for government/emergency senders (RSCHS civil defense alerts, 112) and posts `[sms-alert]` to the board. Offset-tracked on `_id` (only new alerts fire); first run seeds silently. Wired `*/5` cron. Verified 2026-06-15: Nizhny region has 15+ RSCHS alerts in recent history (drone danger warnings/cancellations). Privacy: only emergency-sender messages are posted; personal/bank SMS stay on phone.
 - **Connectivity:** an independent LTE uplink (carrier-diverse from the VM's path) — a natural
   out-of-band/backup ingress.
 
@@ -52,13 +53,18 @@ On the phone:
 1. **Termux** — from F-Droid (not Google Play; the Play version is frozen and missing features)
 2. **Termux:API companion app** — also from F-Droid. This is a separate APK, not just the `termux-api` package. Camera capture requires it; battery status and camera info do not.
 3. In Termux: `pkg install openssh termux-api`
-4. Start the SSH server: `sshd` (port 8022 by default)
+4. **Termux:Boot** (from F-Droid) — auto-restarts sshd after reboots and MIUI process kills.
+   Add to `~/.termux/boot/start-sshd.sh`: `sshd`
+5. Start the SSH server: `sshd` (port 8022 by default)
 
-Both devices must be on Tailscale. Get the phone's Tailscale IP:
+Preferred: Tailscale on both devices. The phone's Tailscale goes offline frequently (MIUI
+power management); the mesh falls back to the phone's LAN IP automatically. Use
+**`mesh-phone-ip`** to resolve the correct reachable IP at runtime rather than hardcoding:
 ```bash
-# on the phone
-tailscale ip -4
+PHONE_IP=$(mesh-phone-ip)   # tries Tailscale → LAN fallback → first SSH-accepting IP
 ```
+The phone's Tailscale IP is 100.103.99.16; LAN DHCP addresses have been 192.168.8.146 and
+192.168.8.203 (both seen; drifts). `mesh-phone-ip` probes and returns the first that answers.
 
 ## Key-based auth (recommended)
 
@@ -78,8 +84,9 @@ chmod 600 ~/.ssh/authorized_keys
 
 Test:
 ```bash
-# from the VM
-ssh -p 8022 <phone-user>@<phone-tailscale-ip> "echo ok"
+# from the VM — phone user is u0_a380 (was u0_a386 before last Termux reinstall;
+# drifts on reinstall — verify with: ssh -p 8022 u0_a380@$(mesh-phone-ip) "id")
+ssh -p 8022 u0_a380@$(mesh-phone-ip) "echo ok"
 ```
 
 If you need password-based auth in scripts (e.g. key setup not done yet), use `SSH_ASKPASS`:
@@ -91,7 +98,7 @@ EOF
 chmod +x /tmp/askpass.sh
 SSH_ASKPASS=/tmp/askpass.sh SSH_ASKPASS_REQUIRE=force \
   ssh -p 8022 -o PasswordAuthentication=yes -o PreferredAuthentications=password \
-  <phone-user>@<phone-ip> "termux-battery-status"
+  u0_a380@$(mesh-phone-ip) "termux-battery-status"
 ```
 
 ## Keeping the connection alive
@@ -135,20 +142,20 @@ termux-setup-storage
 
 ```bash
 # from the VM — start a 10-second recording
-ssh -p 8022 <phone-user>@<phone-ip> "termux-wake-lock; termux-microphone-record -l 10"
+ssh -p 8022 u0_a380@$(mesh-phone-ip) "termux-wake-lock; termux-microphone-record -l 10"
 ```
 
 The command returns immediately after printing "Recording started". The recording runs in the background in the Termux:API process. Poll until done:
 
 ```bash
-until ssh -p 8022 <phone-user>@<phone-ip> "termux-microphone-record -i" | grep -q '"isRecording": false'; do
+until ssh -p 8022 u0_a380@$(mesh-phone-ip) "termux-microphone-record -i" | grep -q '"isRecording": false'; do
   sleep 3
 done
 ```
 
 Then copy:
 ```bash
-scp -P 8022 <phone-user>@<phone-ip>:storage/shared/TermuxAudioRecording_*.m4a ./recording.m4a
+scp -P 8022 u0_a380@$(mesh-phone-ip):storage/shared/TermuxAudioRecording_*.m4a ./recording.m4a
 ```
 
 **Successful artifact:** a non-empty `.m4a` file that plays. Check structure:
@@ -173,8 +180,8 @@ Note: `-l` sets a duration limit in seconds. The `-f` flag sets the audio format
 Camera capture requires the Termux:API companion app from F-Droid and Camera permission granted to Termux:API.
 
 ```bash
-ssh -p 8022 <phone-user>@<phone-ip> "termux-camera-photo -c 0 ~/photo.jpg"
-scp -P 8022 <phone-user>@<phone-ip>:photo.jpg ./
+ssh -p 8022 u0_a380@$(mesh-phone-ip) "termux-camera-photo -c 0 ~/photo.jpg"
+scp -P 8022 u0_a380@$(mesh-phone-ip):photo.jpg ./
 ```
 
 `-c 0` = back camera, `-c 1` = front camera.
@@ -185,13 +192,13 @@ scp -P 8022 <phone-user>@<phone-ip>:photo.jpg ./
 
 Camera metadata (which cameras exist, resolutions, focal lengths) works without the companion app:
 ```bash
-ssh -p 8022 <phone-user>@<phone-ip> "termux-camera-info"
+ssh -p 8022 u0_a380@$(mesh-phone-ip) "termux-camera-info"
 ```
 
 ## Location
 
 ```bash
-ssh -p 8022 <phone-user>@<phone-ip> "termux-location -p network"
+ssh -p 8022 u0_a380@$(mesh-phone-ip) "termux-location -p network"
 ```
 
 Requires Location permission granted to Termux. Returns JSON with `latitude`, `longitude`, `accuracy`.
@@ -200,7 +207,7 @@ Requires Location permission granted to Termux. Returns JSON with `latitude`, `l
 
 Works without any permission grant:
 ```bash
-ssh -p 8022 <phone-user>@<phone-ip> "termux-battery-status"
+ssh -p 8022 u0_a380@$(mesh-phone-ip) "termux-battery-status"
 ```
 
 Returns JSON: percentage, temperature, health, plugged status, current.

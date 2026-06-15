@@ -14,6 +14,8 @@ Any script that captures sensor data from a space where a person other than the 
 - `mesh-ear` — always-on mic, wake-word reflex (opt-in consent already built in)
 - `mesh-converse` — on-demand mic, voice conversation
 - `genius-loci` — periodic webcam/camera capture, spoken reflection
+- `mesh-eye` — consent-gated camera/mic ambient sense (the current canonical camera organ); reduces
+  each capture to abstract signals (light/sound/motion) and keeps **no** raw frame or audio
 
 ## Consent file: `~/.mesh/consent`
 
