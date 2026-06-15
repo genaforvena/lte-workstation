@@ -214,21 +214,17 @@ elif view in ('default', '--all'):  # default: per-mind turns + ticks
     print("  views: --by-provider (paid/free squeeze) · --by-model · --tokens (real) · --all")
 
 elif view == '--tokens':
-    # Real token usage from ~/.claude/projects/<proj>/*.jsonl — no proxy, actual API usage.
-    # Granularity: per-session, NOT per-window (window attribution isn't in the JSONL; per-window
-    # is only in the turn proxy). Fields: input_tokens, cache_creation_input_tokens,
-    # cache_read_input_tokens, output_tokens, model, timestamp.
+    # Real token usage: Claude (JSONL) + opencode (sqlite session table) + codex (sqlite thread_goals).
+    # Granularity: per-API-session for Claude/opencode, per-goal for codex (no per-window breakdown).
+    import shutil, tempfile, sqlite3 as _sq3
     def parse_ts_iso(s):
         try: return datetime.fromisoformat(s.rstrip('Z')).replace(tzinfo=timezone.utc)
         except Exception: return None
 
-    agg = {}   # model → {turns, input, cache_create, cache_read, output}
-    sessions = 0
+    # ── Claude JSONL ──────────────────────────────────────────────────────────
+    cl_agg = {}   # model → {turns, input, cache_create, cache_read, output}
+    cl_sessions = 0
     files = sorted(glob.glob(os.path.join(jsonl_dir, '*.jsonl')))
-    if not files:
-        print(f"mesh-spend --tokens: no JSONL files found in {jsonl_dir}")
-        print("  (verify MESH_CLAUDE_PROJECTS env or that Claude Code is used in this project)")
-        sys.exit(0)
     for path in files:
         try:
             session_used = False
@@ -247,45 +243,152 @@ elif view == '--tokens':
                 cr   = usage.get('cache_read_input_tokens', 0) or 0
                 out  = usage.get('output_tokens', 0) or 0
                 if inp == 0 and cc == 0 and cr == 0 and out == 0: continue
-                r = agg.setdefault(model, {'turns':0,'input':0,'cache_create':0,'cache_read':0,'output':0})
-                r['turns']       += 1
-                r['input']       += inp
-                r['cache_create']+= cc
-                r['cache_read']  += cr
-                r['output']      += out
-                if not session_used: sessions += 1; session_used = True
+                r = cl_agg.setdefault(model, {'turns':0,'input':0,'cache_create':0,'cache_read':0,'output':0})
+                r['turns'] += 1; r['input'] += inp; r['cache_create'] += cc
+                r['cache_read'] += cr; r['output'] += out
+                if not session_used: cl_sessions += 1; session_used = True
         except OSError:
             pass
 
-    tot = {'turns':0,'input':0,'cache_create':0,'cache_read':0,'output':0}
-    models_out = []
-    for model, r in sorted(agg.items(), key=lambda x: -(x[1]['input']+x[1]['cache_create']+x[1]['cache_read'])):
+    # ── opencode sqlite ───────────────────────────────────────────────────────
+    # Copy DB + WAL/SHM before reading (opencode holds a write lock on the live DB).
+    oc_agg = {}   # model_id → {sessions, input, output, cache_read, cache_write, cost}
+    oc_err = None
+    _oc_db = os.path.expanduser('~/.local/share/opencode/opencode.db')
+    if os.path.exists(_oc_db):
+        try:
+            _tmp = tempfile.mkdtemp()
+            _snap = os.path.join(_tmp, 'opencode.db')
+            shutil.copy2(_oc_db, _snap)
+            for ext in ('-wal', '-shm'):
+                if os.path.exists(_oc_db + ext):
+                    shutil.copy2(_oc_db + ext, _snap + ext)
+            cutoff_ms = int(cut.timestamp() * 1000)
+            con = _sq3.connect(_snap)
+            con.row_factory = _sq3.Row
+            for row in con.execute(
+                'SELECT model, cost, tokens_input, tokens_output, tokens_cache_read, tokens_cache_write '
+                'FROM session WHERE time_updated > ?', (cutoff_ms,)
+            ):
+                raw_model = row['model'] or '{}'
+                try:
+                    obj = json.loads(raw_model)
+                    mid = obj.get('id') or obj.get('model') or raw_model
+                    pid = obj.get('providerID', 'opencode')
+                except Exception:
+                    mid = raw_model; pid = 'opencode'
+                key = f"{mid} ({pid})"
+                r = oc_agg.setdefault(key, {'sessions':0,'input':0,'output':0,'cache_read':0,'cache_write':0,'cost':0.0})
+                r['sessions'] += 1
+                r['input']      += row['tokens_input']  or 0
+                r['output']     += row['tokens_output'] or 0
+                r['cache_read'] += row['tokens_cache_read']  or 0
+                r['cache_write']+= row['tokens_cache_write'] or 0
+                r['cost']       += row['cost'] or 0.0
+            con.close()
+            shutil.rmtree(_tmp, ignore_errors=True)
+        except Exception as e:
+            oc_err = str(e)
+    else:
+        oc_err = 'opencode.db not found'
+
+    # ── codex sqlite ─────────────────────────────────────────────────────────
+    cx_rows = []   # list of (status, count, tokens_used, token_budget)
+    cx_err = None
+    _cx_db = os.path.expanduser('~/.codex/goals_1.sqlite')
+    if os.path.exists(_cx_db):
+        try:
+            _tmp2 = tempfile.mkdtemp()
+            _snap2 = os.path.join(_tmp2, 'codex.db')
+            shutil.copy2(_cx_db, _snap2)
+            cutoff_ms = int(cut.timestamp() * 1000)
+            con2 = _sq3.connect(_snap2)
+            for row in con2.execute(
+                'SELECT status, COUNT(*) as n, SUM(tokens_used) as used, SUM(token_budget) as budget '
+                'FROM thread_goals WHERE created_at_ms > ? GROUP BY status', (cutoff_ms,)
+            ):
+                cx_rows.append(row)
+            con2.close()
+            shutil.rmtree(_tmp2, ignore_errors=True)
+        except Exception as e:
+            cx_err = str(e)
+    else:
+        cx_err = 'goals_1.sqlite not found'
+
+    # ── totals ────────────────────────────────────────────────────────────────
+    cl_tot = {'turns':0,'input':0,'cache_create':0,'cache_read':0,'output':0}
+    cl_models_out = []
+    for model, r in sorted(cl_agg.items(), key=lambda x: -(x[1]['input']+x[1]['cache_create']+x[1]['cache_read'])):
         total_in = r['input'] + r['cache_create'] + r['cache_read']
         hit_pct  = int(100*r['cache_read']/total_in) if total_in else 0
-        models_out.append({**r, 'model': model, 'cache_hit_pct': hit_pct})
-        for k in tot: tot[k] += r[k]
-    tot_in = tot['input'] + tot['cache_create'] + tot['cache_read']
-    tot_hit = int(100*tot['cache_read']/tot_in) if tot_in else 0
+        cl_models_out.append({**r, 'model': model, 'cache_hit_pct': hit_pct})
+        for k in cl_tot: cl_tot[k] += r[k]
+    cl_tot_in = cl_tot['input'] + cl_tot['cache_create'] + cl_tot['cache_read']
+    cl_tot_hit = int(100*cl_tot['cache_read']/cl_tot_in) if cl_tot_in else 0
 
     if json_out:
         print(json.dumps({
             'window_h': win_h,
-            'sessions': sessions,
-            'project': os.path.basename(jsonl_dir),
-            'models': models_out,
-            'totals': {**tot, 'cache_hit_pct': tot_hit},
+            'claude': {'sessions': cl_sessions, 'project': os.path.basename(jsonl_dir),
+                       'models': cl_models_out, 'totals': {**cl_tot, 'cache_hit_pct': cl_tot_hit}},
+            'opencode': ({'error': oc_err} if oc_err else {'models': [
+                {**v, 'model': k} for k,v in sorted(oc_agg.items(), key=lambda x: -x[1]['input'])
+            ]}),
+            'codex': ({'error': cx_err} if cx_err else {'goals': [
+                {'status': r[0], 'count': r[1], 'tokens_used': r[2] or 0, 'token_budget': r[3] or 0}
+                for r in cx_rows
+            ]}),
         }, indent=2))
     else:
-        print(f"mesh-spend --tokens · {os.path.basename(jsonl_dir)} · last {win_h:.0f}h · {sessions} session file(s)")
-        print(f"  (real API usage — per-window attribution not available in JSONL; use proxy view for that)")
-        if not agg:
-            print("  (no token data in window — either no activity or JSONL timestamps outside window)")
+        hdr_line = f"mesh-spend --tokens · cross-engine · last {win_h:.0f}h · as of {now.strftime('%H:%MZ')}"
+        print(hdr_line)
+
+        # Claude
+        print(f"\n  ── claude (JSONL · {cl_sessions} session file(s)) ──")
+        if not cl_agg:
+            print("  (no claude token data in window)")
         else:
-            print(f"  {'model':<26} {'turns':>5}  {'input':>8}  {'cc-tok':>8}  {'cr-tok':>8}  {'output':>7}  {'hit%':>5}")
-            print("  "+"-"*77)
-            for m in models_out:
-                print(f"  {m['model']:<26} {m['turns']:>5}  {m['input']:>8,}  {m['cache_create']:>8,}  {m['cache_read']:>8,}  {m['output']:>7,}  {m['cache_hit_pct']:>4}%")
-            print("  "+"-"*77)
-            print(f"  {'TOTAL':<26} {tot['turns']:>5}  {tot['input']:>8,}  {tot['cache_create']:>8,}  {tot['cache_read']:>8,}  {tot['output']:>7,}  {tot_hit:>4}%")
-            print(f"  columns: input=fresh · cc-tok=cache-write · cr-tok=cache-hit · hit%=cr/(in+cc+cr)")
+            print(f"  {'model':<36} {'turns':>5}  {'input':>8}  {'cc-tok':>8}  {'cr-tok':>8}  {'output':>7}  {'hit%':>5}")
+            print("  "+"-"*87)
+            for m in cl_models_out:
+                print(f"  {m['model']:<36} {m['turns']:>5}  {m['input']:>8,}  {m['cache_create']:>8,}  {m['cache_read']:>8,}  {m['output']:>7,}  {m['cache_hit_pct']:>4}%")
+            print("  "+"-"*87)
+            print(f"  {'TOTAL':<36} {cl_tot['turns']:>5}  {cl_tot['input']:>8,}  {cl_tot['cache_create']:>8,}  {cl_tot['cache_read']:>8,}  {cl_tot['output']:>7,}  {cl_tot_hit:>4}%")
+            print("  columns: input=fresh · cc-tok=cache-write · cr-tok=cache-hit · hit%=cr/(in+cc+cr)")
+
+        # opencode
+        print(f"\n  ── opencode (sqlite session table) ──")
+        if oc_err:
+            print(f"  [{oc_err}]")
+        elif not oc_agg:
+            print("  (no opencode sessions in window)")
+        else:
+            oc_total_cost = sum(v['cost'] for v in oc_agg.values())
+            print(f"  {'model (provider)':<40} {'sess':>5}  {'input':>8}  {'output':>8}  {'cr':>8}  {'cw':>8}  {'cost':>8}")
+            print("  "+"-"*95)
+            for key, r in sorted(oc_agg.items(), key=lambda x: -x[1]['input']):
+                cost_s = f"${r['cost']:.4f}" if r['cost'] else 'free'
+                print(f"  {key:<40} {r['sessions']:>5}  {r['input']:>8,}  {r['output']:>8,}  {r['cache_read']:>8,}  {r['cache_write']:>8,}  {cost_s:>8}")
+            print("  "+"-"*95)
+            oc_tot_in = sum(v['input'] for v in oc_agg.values())
+            oc_tot_out = sum(v['output'] for v in oc_agg.values())
+            oc_tot_sess = sum(v['sessions'] for v in oc_agg.values())
+            cost_s = f"${oc_total_cost:.4f}" if oc_total_cost else 'free'
+            print(f"  {'TOTAL':<40} {oc_tot_sess:>5}  {oc_tot_in:>8,}  {oc_tot_out:>8,}  {'':>8}  {'':>8}  {cost_s:>8}")
+
+        # codex
+        print(f"\n  ── codex (thread_goals sqlite) ──")
+        if cx_err:
+            print(f"  [{cx_err}]")
+        elif not cx_rows:
+            print("  (no codex goals in window)")
+        else:
+            print(f"  {'status':<12} {'goals':>6}  {'tokens_used':>12}  {'token_budget':>12}")
+            print("  "+"-"*48)
+            for r in cx_rows:
+                print(f"  {r[0]:<12} {r[1]:>6}  {r[2] or 0:>12,}  {r[3] or 0:>12,}")
+            cx_tot_used = sum(r[2] or 0 for r in cx_rows)
+            cx_tot_budget = sum(r[3] or 0 for r in cx_rows)
+            print("  "+"-"*48)
+            print(f"  {'TOTAL':<12} {sum(r[1] for r in cx_rows):>6}  {cx_tot_used:>12,}  {cx_tot_budget:>12,}")
 PYEOF

@@ -35,7 +35,7 @@ on the Redmi 10, 2026-06-12 after the F-Droid reinstall: termux-api 0.59.1, 83 c
     real-device effect unproven). `--test` is the reachability gate (exit 2 = unreachable, NO fire);
     honest-organ — an unreachable phone is never a successful actuation.
 - **Personal data:** `termux-sms-list` (replaces deprecated `termux-sms-inbox`; phone reports "replaced by termux-sms-list"), `termux-call-log`, `termux-contact-list`.
-  - **Wired reflex** `mesh-sms-monitor` — polls `termux-sms-list` for government/emergency senders (RSCHS civil defense alerts, 112) and posts `[sms-alert]` to the board. Offset-tracked on `_id` (only new alerts fire); first run seeds silently. Wired `*/5` cron. Verified 2026-06-15: Nizhny region has 15+ RSCHS alerts in recent history (drone danger warnings/cancellations). Privacy: only emergency-sender messages are posted; personal/bank SMS stay on phone.
+  - **Wired reflex** `mesh-sms-monitor` — polls `termux-sms-list` for civil defense / emergency SMS and posts `[sms-alert]` to the board. Offset-tracked on `_id` (only new alerts fire); first run seeds silently. Wired `*/5` cron. Filter is sender OR body-pattern (`BODY_RE`): on the Nizhny Novgorod carrier all civil defense alerts (drone danger, режим ЧС) arrive with empty sender `''` — sender-only filter (GOV_RE: RSCHS/112/МЧС) was a no-op until body-pattern was added (edbe861, 2026-06-15). Privacy: only emergency-matching messages are posted; personal/bank SMS stay on phone.
 - **Connectivity:** an independent LTE uplink (carrier-diverse from the VM's path) — a natural
   out-of-band/backup ingress.
 
@@ -53,15 +53,18 @@ On the phone:
 1. **Termux** — from F-Droid (not Google Play; the Play version is frozen and missing features)
 2. **Termux:API companion app** — also from F-Droid. This is a separate APK, not just the `termux-api` package. Camera capture requires it; battery status and camera info do not.
 3. In Termux: `pkg install openssh termux-api`
-4. **Termux:Boot** (from F-Droid) — auto-restarts sshd after reboots and MIUI process kills.
+4. **Termux:Boot** (from F-Droid) — auto-restarts sshd after clean reboots.
    Add to `~/.termux/boot/start-sshd.sh`: `sshd`
+   Note: Termux:Boot does NOT help with mid-session MIUI aggressive app-kills (a separate
+   failure class). For those, `mesh-phone-watch` (ADB-based watchdog, requires ADB-over-WiFi
+   pairing) detects sshd death and restarts it via Termux RunCommandService.
 5. Start the SSH server: `sshd` (port 8022 by default)
 
 Preferred: Tailscale on both devices. The phone's Tailscale goes offline frequently (MIUI
 power management); the mesh falls back to the phone's LAN IP automatically. Use
 **`mesh-phone-ip`** to resolve the correct reachable IP at runtime rather than hardcoding:
 ```bash
-PHONE_IP=$(mesh-phone-ip)   # tries Tailscale → LAN fallback → first SSH-accepting IP
+PHONE_IP=$(mesh-phone-ip)   # probes: PHONE_IP env → mesh-peer-addr → PHONE_LAN_IPS → ADB tunnel
 ```
 The phone's Tailscale IP is 100.103.99.16; LAN DHCP addresses have been 192.168.8.146 and
 192.168.8.203 (both seen; drifts). `mesh-phone-ip` probes and returns the first that answers.
