@@ -29,14 +29,16 @@ A contended substrate resource has **one owner at a time**. Before you touch it:
    durable "I changed X at T, here's how to undo it" the postmortem said was always
    missing.
 3. **Coordinate through tmux.** All agents run in the one hostname-named session, so
-   you can reach any other agent's pane directly and ask it to hold:
+   you can reach any other agent's pane directly and ask it to hold. Use `mesh-tell`
+   (the canonical pane-driver) rather than raw `tmux send-keys`:
    ```bash
-   # map agents -> panes
+   # find which window each agent is in
    tmux list-panes -s -t <hostname> -F '#{window_name}.#{pane_index} pane=#{pane_id} tty=#{pane_tty} cmd=#{pane_current_command}'
    ps -o pid,tty,args -p <agent_pids>
-   # send a hold/handoff request into the other agent's pane
-   tmux send-keys -t <hostname>:<win>.<pane> -l "<coordination message>"
-   tmux send-keys -t <hostname>:<win>.<pane> Enter
+   # send a hold request into the other agent's window (preferred over raw send-keys)
+   mesh-tell <win> "HOLD — I am taking substrate ownership of <resource>; ack + list outstanding changes"
+   # read back the ack
+   mesh-tell --peek <win>
    ```
    The other agent **acknowledges in the same channel** and states what it has left
    outstanding (its un-rolled-back changes). Now there is a single writer.
