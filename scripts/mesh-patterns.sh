@@ -83,13 +83,15 @@ rl_is_walled(){
 MESH_PERSON_RE='JBL|AirPods|Galaxy Buds|Galaxy S|Galaxy A|Galaxy Note|Quest|Pixel|iPhone|Redmi|Armor|EDIFIER|Mobicar|Car Remote|Huawei|HUAWEI|Xiaomi Band|Mi Band'
 # Bose Revolve SoundLink is a desk speaker broadcasting BLE 24/7 in standby — fixed appliance, not person-movement.
 # Generic Bose removed from PERSON_RE; Bose headphones (QC, Earbuds) not yet observed, add if seen.
-MESH_FIXED_RE='\[TV\]|MiTV-|Mi Box|Bluedroid TV|GR-AC_|MI SCALE|LYWSD|Vega BLE|GEELY_BT|CAR-BT|Bose Revolve|Bose SoundLink|DRG[0-9]| [Тт][Вв]$'
+MESH_FIXED_RE='\[TV\]|MiTV-|Mi Box|Bluedroid TV|GR-AC_|MI SCALE|LYWSD|Vega BLE|GEELY_BT|CAR-BT|Bose Revolve|Bose SoundLink|DRG[0-9]| [Тт][Вв]$|LED_BLE_'
 # DRG[0-9] = Sercomm Digital Residential Gateway (e.g. DRG70-5AC65F) — a neighbor's home router,
 # confirmed STABLE fixed appliance: 2 sightings, same real-OUI MAC 4C:E1:74:5A:C6:5F (2026-06-15).
 # " [Тт][Вв]$" = a Cyrillic "<name> тв/ТВ" TV (e.g. "ваня тв") — a neighbor's TV, the bracketed-[TV]
 # pattern misses these. STABLE fixed appliance: 2 sightings, same real-OUI MAC F0:A3:B2:DF:EB:83
 # (2026-06-15). Anchored to a trailing " тв" word so it never matches mid-name; no person device is
 # named "<x> тв".
+# "LED_BLE_" = cheap RGB LED strip controller (e.g. LED_BLE_72284E6F) — fixed appliance, always
+# powered, BLE broadcasts 24/7. First seen 2026-06-15.
 # MESH_NOISE_RE — rotating serial-number names: devices that embed their serial/ID into the BLE
 # advertisement name and rotate it with the MAC. Looks like a "real name" (not a bare MAC) but is
 # per-device-instance noise producing false [arrived]/[left] churn.
@@ -148,6 +150,7 @@ if [ "${1:-}" = --test ] && [ "${BASH_SOURCE[0]}" = "${0}" ]; then
   ck "$MESH_FIXED_RE" match "DRG70-5AC65F"                "Sercomm-DRG-gateway"
   ck "$MESH_FIXED_RE" match "ваня тв"                     "cyrillic-TV-suffix"
   ck "$MESH_FIXED_RE" match "Гостиная ТВ"                 "cyrillic-TV-uppercase"
+  ck "$MESH_FIXED_RE" match "LED_BLE_72284E6F"             "LED-strip-controller-fixed"
   ck "$MESH_FIXED_RE" no    "iPhone 13"                   "person-phone-NOT-fixed"
   ck "$MESH_FIXED_RE" no    "Quest 3"                     "person-headset-NOT-fixed"
   ck "$MESH_FIXED_RE" no    "Светлана"                    "cyrillic-name-NOT-fixed (no тв suffix)"
