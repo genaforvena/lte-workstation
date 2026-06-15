@@ -53,7 +53,7 @@ export MESH_RL_RE MESH_AUTH_RE MESH_GATE_RE
 #   Unknown C04-/C05-/WSH86-: rotating serial-name churn — rejected by MESH_NOISE_RE (2026-06-15).
 # Pattern agreement: genome controls this; both tools source mesh-patterns.sh.
 
-MESH_PERSON_RE='Bose|JBL|AirPods|Galaxy Buds|Galaxy S|Galaxy A|Galaxy Note|Quest|Pixel|iPhone|Redmi|Armor|EDIFIER|Mobicar|Car Remote'
+MESH_PERSON_RE='Bose|JBL|AirPods|Galaxy Buds|Galaxy S|Galaxy A|Galaxy Note|Quest|Pixel|iPhone|Redmi|Armor|EDIFIER|Mobicar|Car Remote|Huawei|HUAWEI'
 MESH_FIXED_RE='\[TV\]|MiTV-|Mi Box|Bluedroid TV|GR-AC_|MI SCALE|LYWSD|Vega BLE|GEELY_BT|CAR-BT'
 # MESH_NOISE_RE — rotating serial-number names: devices that embed their serial/ID into the BLE
 # advertisement name and rotate it with the MAC. Looks like a "real name" (not a bare MAC, not SC-)
