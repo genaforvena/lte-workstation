@@ -22,7 +22,7 @@ def _resolve_iface():
 
 IFACE = _resolve_iface()
 CONFIG = os.environ.get("VPN_EGRESS_CONF") or (f"/etc/wireguard/{IFACE}.conf" if IFACE else "")
-LOG = os.environ.get("VPN_HEALTH_LOG") or "/home/imozerov/.mesh/vpn-health.log"
+LOG = os.environ.get("VPN_HEALTH_LOG") or os.path.expanduser("~/.mesh/vpn-health.log")
 CHECK_INTERVAL = 60
 FAIL_THRESHOLD = 3
 HANDSHAKE_MAX_AGE = 180   # seconds; healthy tunnel handshakes ~every 2 min
