@@ -314,6 +314,20 @@ phone TTS/SMS/calls/IR) · **connectivity** (exit-node, public ingress, independ
 **compute**. A node declares what it offers; consumers read the trace/card and opt in. Nothing
 is imposed.
 
+**The card capability is AUTHORITATIVE — a node that does not declare `minds:` is HANDS-OFF
+(operator rule 2026-06-15).** If a node's `~/.mesh-card` `minds:` line does not list an engine,
+the mesh must **not touch that node's minds at all** — never relaunch, shed, kill, feed, nudge,
+or dispatch to them. A node can run mind binaries (claude/opencode/codex) for its *operator's own
+use* without the mesh treating them as mesh minds; blanking the card's `minds:` line is the clean
+"minds off the mesh" switch. Every mind-touching tool gates on the card: `mesh-restore` (launch),
+`mesh-mind-keepalive` + `mesh-channel-keepalive` (relaunch/**shed**) all skip when the card declares
+no minds — so the early-return means a decommissioned node's panes are never even read, let alone
+killed. **Never blanket-`pkill` a mind engine by user** (`pkill -u <user> claude`) — it kills the
+operator's *own* sessions too; scope kills to the specific mesh-session pane via the card-gated tool,
+never a process sweep. To decommission a node's minds: blank the card `minds:` line + set
+`MESH_ROLES=<node>:compute` (steward stops feeding board/knowledge) + pause its mind-driving reflexes
+(`mesh-tick`/`chat-sync`/`channel-keepalive`/`supervise`/`mind-keepalive` in `reflexes.cron`).
+
 ## Key paths
 
 - Node config: `~/.mesh/nodes` (gitignored, runtime) · `nodes.example` (committed, template)
