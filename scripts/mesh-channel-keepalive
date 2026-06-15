@@ -102,8 +102,48 @@ mind_present(){ local bin="${1%% *}"
 # spinning mind so its pane drops to a shell, mark a cooldown, and skip relaunch until cooldown — so a
 # rate-limited mind spins ~one keepalive cycle per cooldown instead of continuously (~97% CPU cut).
 RL_COOLDOWN="${MESH_RL_COOLDOWN:-1800}"   # re-check a paused mind every 30min (it may regain quota)
-ratelimited(){ # $1=pane → 0 if a HARD rate-limit/usage wall is showing in the live pane
-  tmux capture-pane -t "$1" -p -S -10 2>/dev/null | grep -qiE "$MESH_RL_RE"
+ratelimited(){ # $1=pane → 0 if a GENUINE rate-limit/usage wall BANNER is showing (banner-shape, not
+  # prose). Uses the shared rl_is_walled (mesh-patterns.sh) so a mind writing ABOUT quotas in its own
+  # summary/task text is never shed off that prose (operator FP 2026-06-15). Inline fallback if the
+  # shared lib isn't deployed: terse-line guard only (drops the worst long-prose false positives).
+  if command -v rl_is_walled >/dev/null 2>&1; then
+    tmux capture-pane -t "$1" -p -S -10 2>/dev/null | rl_is_walled
+  else
+    tmux capture-pane -t "$1" -p -S -10 2>/dev/null | grep -vE '^[[:space:]]*[❯›]' \
+      | awk 'length($0)<=100' | grep -qiE "$MESH_RL_RE"
+  fi
+}
+# rl_cooldown_secs — read the REAL reset time the banner states ("resets 2:20pm", "try again at
+# 6:03 PM", "try again in 2h", "resets at 15:00") and return seconds-to-reset, clamped [120, 6h].
+# A blind fixed 30min wait either thrashes (relaunch into the same wall before the 5h limit resets)
+# or over-waits (idle long after quota came back) — the banner tells us exactly when. Stdin = pane
+# text. No reset parseable → no output (caller falls back to RL_COOLDOWN). Reset already PAST (stale
+# banner / quota restored) → MIN, so we resume promptly. (operator 2026-06-15: discover sat paused
+# 30min after its 2:20pm reset had already passed.)
+rl_cooldown_secs(){
+  command -v python3 >/dev/null 2>&1 || return 0
+  python3 <(cat <<'PYEOF'
+import sys,re,datetime
+MIN,MAX=120,6*3600
+txt=sys.stdin.read().lower()
+def out(s): print(max(MIN,min(int(s),MAX))); sys.exit(0)
+now=datetime.datetime.now()
+# relative: "try again in 2h" / "in 45 min"
+m=re.search(r'\bin\s+(\d+)\s*(h|hr|hrs|hour|hours|m|min|mins|minute|minutes)\b',txt)
+if m:
+    n=int(m.group(1)); out(n*3600+30 if m.group(2).startswith('h') else n*60+30)
+# absolute clock: "resets 2:20pm" / "reset at 3:00 pm" / "try again at 6:03 pm" / "resets at 15:00"
+m=re.search(r'(?:reset[s]?|try again)\s*(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?',txt)
+if m:
+    hh=int(m.group(1)); mm=int(m.group(2) or 0); ap=m.group(3)
+    if ap=='pm' and hh<12: hh+=12
+    if ap=='am' and hh==12: hh=0
+    if hh<=23 and mm<=59:
+        tgt=now.replace(hour=hh,minute=mm,second=0,microsecond=0)
+        out(0 if tgt<=now else int((tgt-now).total_seconds())+30)  # past → MIN (quota likely back)
+sys.exit(0)
+PYEOF
+)
 }
 shed_mind(){ # $1=pane → kill the mind process under the pane shell (wrapper then drops to bash); keep the pane
   local pp; pp=$(tmux display -p -t "$1" '#{pane_pid}' 2>/dev/null) || return 1
@@ -119,15 +159,20 @@ keep(){ # $1=window $2=launch-cmd
   [ "${n:-0}" -ge 2 ] || return 0   # not a 2-pane channel → skip (mesh-restore rebuilds structure)
   mp=$(tmux list-panes -t "$S:$1" -F '#{pane_top} #{pane_index}' 2>/dev/null | sort -n | tail -1 | awk '{print $2}')
   rlmark="$HOME/.mesh/.rl-cooldown-$1"
-  # PAUSED: a fresh rate-limit cooldown → leave the channel idle (don't relaunch into the same wall)
-  if [ -f "$rlmark" ] && [ "$(( $(date +%s) - $(stat -c %Y "$rlmark" 2>/dev/null||echo 0) ))" -lt "$RL_COOLDOWN" ]; then
+  # PAUSED until the cooldown EXPIRY epoch stored in the mark (reset-aware, see rl_cooldown_secs).
+  # Old marks stored shed-time (< now) → read as expiry they're already past → not paused → the mind
+  # is re-evaluated and re-shed with a proper expiry. Self-healing on upgrade.
+  if [ -f "$rlmark" ] && [ "$(date +%s)" -lt "$(cat "$rlmark" 2>/dev/null || echo 0)" ]; then
     [ "${VERBOSE:-}" = 1 ] && echo "  $1: rate-limited — paused (cooldown active), skip"; return 0
   fi
   if mind_alive "$S:$1.$mp"; then
     if ratelimited "$S:$1.$mp"; then
-      shed_mind "$S:$1.$mp"; date +%s > "$rlmark"
-      echo "$(ts) SHED $1: rate-limit wall + spinning mind → killed, paused ${RL_COOLDOWN}s (save heat/power)" >> "$LOG"
-      command -v mesh-chat >/dev/null 2>&1 && MESH_WHO="channel-keepalive@$S" mesh-chat "[mind-paused] $S:$1 hit a rate-limit wall (was busy-waiting CPU) — shed + paused ${RL_COOLDOWN}s to save heat; auto-retries after cooldown" >/dev/null 2>&1
+      local secs src
+      secs="$(tmux capture-pane -t "$S:$1.$mp" -p -S -15 2>/dev/null | rl_cooldown_secs)"
+      if [ -n "$secs" ]; then src="banner-reset"; else secs="$RL_COOLDOWN"; src="default"; fi
+      shed_mind "$S:$1.$mp"; echo "$(( $(date +%s) + secs ))" > "$rlmark"
+      echo "$(ts) SHED $1: rate-limit wall + spinning mind → killed, paused ${secs}s ($src), resumes $(date -d "@$(( $(date +%s) + secs ))" '+%H:%M' 2>/dev/null) (save heat/power)" >> "$LOG"
+      command -v mesh-chat >/dev/null 2>&1 && MESH_WHO="channel-keepalive@$S" mesh-chat "[mind-paused] $S:$1 hit a rate-limit wall — shed + paused ${secs}s ($src), auto-resumes ~$(date -d "@$(( $(date +%s) + secs ))" '+%H:%M' 2>/dev/null)" >/dev/null 2>&1
       return 0
     fi
     rm -f "$rlmark" 2>/dev/null   # alive + working → clear any stale cooldown

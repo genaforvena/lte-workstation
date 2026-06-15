@@ -34,6 +34,27 @@ MESH_GATE_RE='Do you want to (proceed|make this edit|create|delete|allow|run)|�
 
 export MESH_RL_RE MESH_AUTH_RE MESH_GATE_RE
 
+# STRONG quota phrases — an engine STOP banner uses these but a mind's natural-language prose almost
+# never does → safe to match at ANY length. The rest of MESH_RL_RE (rate-limited/wall/overloaded/
+# try-again/resets) ALSO appears when a mind writes ABOUT quotas in its own summary/task text, so
+# those count only on a TERSE banner line. (operator FP 2026-06-15: a mind read RATE-LIMITED — and
+# was SHED — off its own 150-char summary "rate-limit walls cascading" / a design doc literally
+# containing "RATE-LIMITED".) Banner-SHAPE decides state, not keyword presence.
+MESH_STRONG_RL_RE='hit your (usage|session) limit|usage limit reached|too many requests|429|out of credits|purchase more credits|upgrade to (pro|team)'
+MESH_RL_BANNER_MAXLEN=100   # an engine banner is terse; a mind's prose is long-form
+export MESH_STRONG_RL_RE MESH_RL_BANNER_MAXLEN
+# rl_is_walled — stdin: the bottom pane lines. Returns 0 iff a GENUINE quota wall banner is present.
+# Every shedder/classifier SHOULD use this (not a raw `grep MESH_RL_RE`) so a mind is never shed or
+# mislabelled off its own prose. Drops input-box (prompt-glyph) lines; STRONG phrases match any
+# length; broad RL tokens only on a line <= MESH_RL_BANNER_MAXLEN bytes.
+rl_is_walled(){
+  local txt; txt="$(cat)"
+  printf '%s\n' "$txt" | grep -vE '^[[:space:]]*[❯›]' | grep -qiE "$MESH_STRONG_RL_RE" && return 0
+  printf '%s\n' "$txt" | grep -vE '^[[:space:]]*[❯›]' \
+    | awk -v m="$MESH_RL_BANNER_MAXLEN" 'length($0)<=m' | grep -qiE "$MESH_RL_RE" && return 0
+  return 1
+}
+
 # ---- BLE device classification (shared by mesh-arrivals + mesh-ambient-clock) ----
 #
 # MESH_PERSON_RE  — KNOWN person-carried devices (operator + known items). Used for WEIGHTING
@@ -127,5 +148,14 @@ if [ "${1:-}" = --test ] && [ "${BASH_SOURCE[0]}" = "${0}" ]; then
   ck "$MESH_NOISE_RE" no    "Bluetooth"                   "Bluetooth-not-noise (lowercase)"
   ck "$MESH_NOISE_RE" no    "Samsung 5 Series (40)"       "TV-not-noise"
   ck "$MESH_NOISE_RE" no    "DV8235"                      "6-char-model-not-noise (too short)"
+  echo "rl_is_walled — banner-shape gate (a mind is never shed off its own prose):"
+  ckw(){ local want="$1" label="$2" txt="$3"; if printf '%s\n' "$txt" | rl_is_walled; then got=walled; else got=clear; fi
+         if [ "$got" = "$want" ]; then echo "  ok: $label ($got)"; else echo "  FAIL: $label want=$want got=$got"; fail=1; fi; }
+  ckw walled "session-limit banner"   "⎿  You've hit your session limit · resets 2:20pm (Europe/Moscow)"
+  ckw walled "usage-limit banner"     "■ You've hit your usage limit. Upgrade to Pro to continue."
+  ckw walled "terse rate-limit"       "API request failed: rate limit exceeded"
+  ckw clear  "summary-prose quota"    "Noted but no action: rate-limit walls cascading (09:56-10:05) are designed thermal/quota backpressure via channel-keepalive, not a fault — just fewer hands during cooldown."
+  ckw clear  "task-text about RL"     "on a rate-limited claude worker auto-re-routes to an idle FREE-engine worker. Propose the trigger (mind-state RATE-LIMITED → re-dispatch its open task) plus de-dup."
+  ckw clear  "input-box quota draft"  "❯ should we retry after we hit the usage limit?"
   [ "$fail" = 0 ] && { echo "smoke-test: ok"; exit 0; } || { echo "smoke-test: FAIL"; exit 1; }
 fi
