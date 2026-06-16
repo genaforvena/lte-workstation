@@ -1,0 +1,197 @@
+#!/usr/bin/env bash
+# mesh-immune-watcher — immune-system reflex: when a new device appears on LAN (called from
+# mesh-lan-newdevice or standalone), also checks for unapproved SSH keys and new Tailscale nodes.
+# Posts to Telegram for operator approval ("allow <name>"), scans voice-in.log for replies.
+#
+#   mesh-immune-watcher           check + process pending approvals
+#   mesh-immune-watcher --check   check only (no voice-in reply scan)
+#   mesh-immune-watcher --approve <type> <name>  approve explicitly (for mesh-tell / board)
+#   mesh-immune-watcher --test    smoke test
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+
+APPROVED_SSH="$HOME/.mesh/.immune-approved-ssh"
+APPROVED_TS="$HOME/.mesh/.immune-approved-ts"
+PENDING_SSH="$HOME/.mesh/.immune-pending-ssh"
+PENDING_TS="$HOME/.mesh/.immune-pending-ts"
+VOICE_IN="$HOME/.mesh/voice-in.log"
+OFFSET_FILE="$HOME/.mesh/.immune-offset"
+mkdir -p "$HOME/.mesh"
+
+if [ "${1:-}" = "--test" ]; then
+  for x in ssh-keygen tailscale awk sort uniq; do
+    command -v "$x" >/dev/null 2>&1 || { echo "smoke-test: FAIL (no $x)"; exit 1; }
+  done
+  [ -f "$APPROVED_SSH" ] || { echo "smoke-test: FAIL (no approved SSH list)"; exit 1; }
+  [ -f "$APPROVED_TS" ] || { echo "smoke-test: FAIL (no approved TS list)"; exit 1; }
+  [ -f "$HOME/.ssh/authorized_keys" ] || { echo "smoke-test: FAIL (no authorized_keys)"; exit 1; }
+  command -v ssh-keygen >/dev/null 2>&1 && ssh-keygen -lf "$HOME/.ssh/authorized_keys" >/dev/null 2>&1 || { echo "smoke-test: FAIL (authorized_keys unreadable)"; exit 1; }
+  echo "smoke-test: ok"; exit 0
+fi
+
+# --- Extract comment from a ssh-keygen -lf line ---
+get_comment() {
+  local line="$1"
+  awk '{for(i=3;i<NF;i++){if(i>3)printf " ";printf "%s",$i};print ""}' <<< "$line"
+}
+
+# --- Check 1: unapproved SSH keys ---
+check_ssh() {
+  local count=0 fp comment
+  while read -r line; do
+    [ -z "$line" ] && continue
+    fp=$(awk '{print $2}' <<< "$line")
+    [ -z "$fp" ] && continue
+    grep -qixF "$fp" "$APPROVED_SSH" 2>/dev/null && continue
+    comment=$(get_comment "$line")
+    [ -z "$comment" ] && comment="$fp"
+    echo "$fp|$comment" >> "$PENDING_SSH"
+    count=$((count + 1))
+  done < <(ssh-keygen -lf "$HOME/.ssh/authorized_keys" 2>/dev/null)
+  [ -f "$PENDING_SSH" ] && sort -u "$PENDING_SSH" > "${PENDING_SSH}.sorted" && mv "${PENDING_SSH}.sorted" "$PENDING_SSH"
+  return "$count"
+}
+
+# --- Check 2: new Tailscale tag:lte-node nodes ---
+check_ts() {
+  local count=0 self_name hostname
+  local ts_data
+  ts_data=$(tailscale status --json 2>/dev/null)
+  [ -z "$ts_data" ] && return 0
+  self_name=$(hostname)
+  while read -r hostname; do
+    [ -z "$hostname" ] && continue
+    [ "$hostname" = "$self_name" ] && continue
+    grep -qixF "$hostname" "$APPROVED_TS" 2>/dev/null && continue
+    echo "$hostname" >> "$PENDING_TS"
+    count=$((count + 1))
+  done < <(printf '%s' "$ts_data" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+for k,p in d.get('Peer',{}).items():
+    if 'tag:lte-node' in (p.get('Tags') or []):
+        print(p['HostName'])
+")
+  [ -f "$PENDING_TS" ] && sort -u "$PENDING_TS" > "${PENDING_TS}.sorted" && mv "${PENDING_TS}.sorted" "$PENDING_TS"
+  return "$count"
+}
+
+# --- Alert: post pending items to Telegram (once per item) ---
+alert_pending() {
+  local alerted=0 fp comment
+  while IFS='|' read -r fp comment; do
+    [ -z "$fp" ] && continue
+    [ -z "$comment" ] && comment="${fp:0:16}"
+    command -v mesh-tg >/dev/null 2>&1 && mesh-tg "🔐 Immune: SSH key \"$comment\" wants in ($fp) — approve? [allow $comment]" >/dev/null 2>&1
+    alerted=$((alerted + 1))
+  done < <(grep -v '^ALERTED|' "$PENDING_SSH" 2>/dev/null)
+  while read -r hostname; do
+    [ -z "$hostname" ] && continue
+    command -v mesh-tg >/dev/null 2>&1 && mesh-tg "🔐 Immune: Tailscale node \"$hostname\" wants in — approve? [allow $hostname]" >/dev/null 2>&1
+    alerted=$((alerted + 1))
+  done < <(grep -v '^ALERTED|' "$PENDING_TS" 2>/dev/null)
+  # mark as alerted
+  [ -f "$PENDING_SSH" ] && sed -i 's/^/ALERTED|/' "$PENDING_SSH" 2>/dev/null
+  [ -f "$PENDING_TS" ] && sed -i 's/^/ALERTED|/' "$PENDING_TS" 2>/dev/null
+  return "$alerted"
+}
+
+# --- Process operator's "allow <name>" from voice-in.log ---
+process_approvals() {
+  [ -f "$VOICE_IN" ] || return 0
+  local offset=0 file_size
+  [ -f "$OFFSET_FILE" ] && offset=$(cat "$OFFSET_FILE" 2>/dev/null || echo 0)
+  file_size=$(stat -c%s "$VOICE_IN" 2>/dev/null || echo 0)
+  [ "$file_size" -le "$offset" ] && return 0
+  local new_text approved=0
+  new_text=$(tail -c +$((offset + 1)) "$VOICE_IN" 2>/dev/null)
+  echo "$file_size" > "$OFFSET_FILE"
+  while IFS= read -r line; do
+    # skip empty, VOICE, or non-"allow" lines
+    line=$(printf '%s' "$line" | sed -nE 's/^[0-9:.Z]+\s+\S+\s+//p')
+    [ -z "$line" ] && continue
+    local name
+    name=$(printf '%s' "$line" | sed -nE 's/^allow[[:space:]]+//p')
+    [ -z "$name" ] && continue
+    # strip trailing punctuation/whitespace
+    name=$(printf '%s' "$name" | sed 's/[[:space:]]*$//')
+    # check if it matches a pending SSH key (by comment)
+    local matched
+    matched=$(grep -E "\\|${name}$" "$PENDING_SSH" 2>/dev/null | head -1)
+    # strip ALERTED| prefix if present
+    matched=$(printf '%s' "$matched" | sed 's/^ALERTED|//')
+    if [ -n "$matched" ]; then
+      local fp
+      fp=$(printf '%s' "$matched" | cut -d'|' -f1)
+      echo "$fp" >> "$APPROVED_SSH"
+      sort -u "$APPROVED_SSH" > "${APPROVED_SSH}.tmp" && mv "${APPROVED_SSH}.tmp" "$APPROVED_SSH"
+      sed -i "/|${name}$/d" "$PENDING_SSH" 2>/dev/null
+      approved=$((approved + 1))
+      command -v mesh-chat >/dev/null 2>&1 && mesh-chat "[immune] SSH key \"$name\" approved (operator via TG)" >/dev/null 2>&1
+      continue
+    fi
+    # check if it matches a pending TS node
+    matched=$(grep -E "\\|${name}$|^${name}$" "$PENDING_TS" 2>/dev/null | head -1)
+    matched=$(printf '%s' "$matched" | sed 's/^ALERTED|//')
+    if [ -n "$matched" ]; then
+      echo "$name" >> "$APPROVED_TS"
+      sort -u "$APPROVED_TS" > "${APPROVED_TS}.tmp" && mv "${APPROVED_TS}.tmp" "$APPROVED_TS"
+      sed -i "/^ALERTED|${name}$/d" "$PENDING_TS" 2>/dev/null
+      sed -i "/^${name}$/d" "$PENDING_TS" 2>/dev/null
+      approved=$((approved + 1))
+      command -v mesh-chat >/dev/null 2>&1 && mesh-chat "[immune] Tailscale node \"$name\" approved (operator via TG)" >/dev/null 2>&1
+      continue
+    fi
+  done <<< "$new_text"
+  return "$approved"
+}
+
+# --- Explicit approve (for --approve <type> <name>) ---
+explicit_approve() {
+  local type="$1" name="$2"
+  if [ "$type" = "ssh" ]; then
+    local matched
+    matched=$(grep -E "\\|${name}$" "$PENDING_SSH" 2>/dev/null | head -1)
+    matched=$(printf '%s' "$matched" | sed 's/^ALERTED|//')
+    if [ -z "$matched" ]; then
+      echo "immune-approve: SSH key \"$name\" not in pending list" >&2
+      return 1
+    fi
+    local fp
+    fp=$(printf '%s' "$matched" | cut -d'|' -f1)
+    echo "$fp" >> "$APPROVED_SSH"
+    sort -u "$APPROVED_SSH" > "${APPROVED_SSH}.tmp" && mv "${APPROVED_SSH}.tmp" "$APPROVED_SSH"
+    sed -i "/|${name}$/d" "$PENDING_SSH" 2>/dev/null
+    command -v mesh-chat >/dev/null 2>&1 && mesh-chat "[immune] SSH key \"$name\" approved ($type cmd)" >/dev/null 2>&1
+    echo "approved SSH key: $name"
+  elif [ "$type" = "ts" ]; then
+    echo "$name" >> "$APPROVED_TS"
+    sort -u "$APPROVED_TS" > "${APPROVED_TS}.tmp" && mv "${APPROVED_TS}.tmp" "$APPROVED_TS"
+    sed -i "/^ALERTED|${name}$/d" "$PENDING_TS" 2>/dev/null
+    sed -i "/^${name}$/d" "$PENDING_TS" 2>/dev/null
+    command -v mesh-chat >/dev/null 2>&1 && mesh-chat "[immune] Tailscale node \"$name\" approved ($type cmd)" >/dev/null 2>&1
+    echo "approved TS node: $name"
+  else
+    echo "immune-approve: unknown type \"$type\" (use ssh or ts)" >&2; return 1
+  fi
+}
+
+# --- Main ---
+case "${1:-}" in
+  --check)
+    check_ssh; ssh_count=$?
+    check_ts; ts_count=$?
+    [ "$ssh_count" -gt 0 ] || [ "$ts_count" -gt 0 ] && alert_pending
+    ;;
+  --approve)
+    [ $# -lt 3 ] && { echo "usage: mesh-immune-watcher --approve <ssh|ts> <name>" >&2; exit 1; }
+    explicit_approve "$2" "$3"
+    ;;
+  ""|--*)
+    check_ssh; ssh_count=$?
+    check_ts; ts_count=$?
+    [ "$ssh_count" -gt 0 ] || [ "$ts_count" -gt 0 ] && alert_pending
+    process_approvals
+    ;;
+esac
+exit 0
