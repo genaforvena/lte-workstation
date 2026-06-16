@@ -9,7 +9,7 @@ the VPN iface), NOT via the host's public IP. On failure it re-applies the SCOPE
 Run as root so its wg-quick/wg calls work without a tty:
     sudo nohup python3 ~/.mesh/vpn-health.py >> ~/.mesh/vpn-health.log 2>&1 &
 """
-import subprocess, time, os, glob
+import subprocess, time, os, glob, sys, shutil
 
 # Interface/config are node-local — never hardcoded in the genome. Resolve from the
 # environment (VPN_EGRESS_IFACE), else from the single scoped config in /etc/wireguard.
@@ -19,6 +19,33 @@ def _resolve_iface():
         return env
     confs = glob.glob("/etc/wireguard/*.conf")
     return os.path.splitext(os.path.basename(confs[0]))[0] if len(confs) == 1 else ""
+
+if len(sys.argv) > 1 and sys.argv[1] == '--test':
+    if not shutil.which('wg'):
+        print("smoke-test: FAIL (wg not found)"); sys.exit(1)
+    iface = _resolve_iface()
+    config = os.environ.get("VPN_EGRESS_CONF") or (f"/etc/wireguard/{iface}.conf" if iface else "")
+    if not iface or not config:
+        print("smoke-test: n/a (no VPN configured on this node)"); sys.exit(2)
+    if not os.path.isfile(config):
+        print(f"smoke-test: FAIL (config missing: {config})"); sys.exit(1)
+    try:
+        hs = subprocess.run(["wg", "show", iface, "latest-handshakes"],
+                            capture_output=True, text=True, timeout=5)
+        if hs.returncode != 0:
+            print("smoke-test: ok (interface inactive)"); sys.exit(0)
+        if not hs.stdout.strip():
+            print("smoke-test: ok (tunnel idle)"); sys.exit(0)
+        epochs = [int(p.split()[-1]) for p in hs.stdout.strip().splitlines() if p.split()]
+        last = max(epochs) if epochs else 0
+        age = int(time.time()) - last
+        if last == 0 or age > 180:
+            print(f"smoke-test: FAIL (stale handshake — {age}s)"); sys.exit(1)
+        print("smoke-test: ok"); sys.exit(0)
+    except FileNotFoundError:
+        print("smoke-test: FAIL (wg not found)"); sys.exit(1)
+    except Exception as e:
+        print(f"smoke-test: FAIL (check error: {e})"); sys.exit(1)
 
 IFACE = _resolve_iface()
 CONFIG = os.environ.get("VPN_EGRESS_CONF") or (f"/etc/wireguard/{IFACE}.conf" if IFACE else "")
