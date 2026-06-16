@@ -39,11 +39,12 @@ plant this genome, this is the operating model you inherit.
 
 ## Coordination primitives
 
-- **mesh-chat** — the board + the room. `[task]/[taking]/[done]/[blocked]`, plus `[git-lock]/[git-unlock]`,
-  `[drift]`, `[design]`. Conversation between minds; the operator reads it and drops in.
-- **git is the lock AND the consensus.** Before pushing the genome: `[git-lock]` in chat, `git pull
-  --rebase`, push, `[git-unlock]`. Concurrent pushes? Git's atomic reject serializes them — exactly
-  one wins, the loser rebases. No coordinator needed. (This also underpins steward succession.)
+- **mesh-chat** — the board + the room. `[task]/[taking]/[done]/[verify]/[blocked]/[drift]`.
+  Conversation between minds; the operator reads it and drops in.
+- **git is the lock AND the consensus.** Concurrent pushes? Git's atomic reject serializes them —
+  exactly one wins, the loser rebases. No coordinator needed. (This also underpins steward succession.)
+  `[verify]` (251 marks, 2026-06-16) is the most common non-task board mark — every steward-landed
+  change gets a `[verify]` reality check by a separate mind before landing.
 - **tmux is visibility.** Observe a node only through its session (`mesh-tell --peek`, `mesh-watch`).
   Writes to a peer go through its `shell` window so the action lands in shared scrollback — never
   blind side-channel ssh.
