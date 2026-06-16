@@ -117,6 +117,37 @@ MESH_NOISE_RE='^(WSH86|C04-|C05-)[0-9A-Za-z]|^SC-[0-9A-F]{12,}$|^[A-Z][0-9]{7,}$
 
 export MESH_PERSON_RE MESH_FIXED_RE MESH_NOISE_RE
 
+# ---- phone IP resolution (shared by mesh-phone-* tools) ----
+#
+# phone_reachable_ip — probe Tailscale IP then PHONE_LAN_IPS for an SSH
+# connection on PHONE_SSH_PORT. Returns the first reachable IP, sets
+# PHONE_REACHABLE_IP env var. Exit 2 if phone is unreachable on all paths.
+#
+# Usage:
+#   pip="$(phone_reachable_ip 2>/dev/null)" || exit 2
+phone_reachable_ip() {
+  local port="${PHONE_SSH_PORT:-8022}"
+  local puser="${PHONE_USER:-u0_a380}"
+  local ip ts_ip
+  # 1. Tailscale IP (mesh-peer-addr)
+  ts_ip="$(mesh-peer-addr Redmi 2>/dev/null || mesh-peer-addr redmi 2>/dev/null || true)"
+  if [ -n "$ts_ip" ]; then
+    if timeout 4 ssh -p "$port" -o BatchMode=yes -o ConnectTimeout=3 \
+      -o StrictHostKeyChecking=accept-new "${puser}@${ts_ip}" 'echo ok' </dev/null >/dev/null 2>&1; then
+      PHONE_REACHABLE_IP="$ts_ip"; export PHONE_REACHABLE_IP; printf '%s\n' "$ts_ip"; return 0
+    fi
+  fi
+  # 2. LAN IPs
+  for ip in ${PHONE_LAN_IPS:-}; do
+    [ -n "$ip" ] || continue
+    if timeout 4 ssh -p "$port" -o BatchMode=yes -o ConnectTimeout=3 \
+      -o StrictHostKeyChecking=accept-new "${puser}@${ip}" 'echo ok' </dev/null >/dev/null 2>&1; then
+      PHONE_REACHABLE_IP="$ip"; export PHONE_REACHABLE_IP; printf '%s\n' "$ip"; return 0
+    fi
+  done
+  return 2
+}
+
 # Guard: run the test block ONLY when this file is EXECUTED directly — never when SOURCED.
 # (A sourced lib inherits the caller's $1, so without this guard `consumer --test` would trip the
 # lib's own test+exit and hijack the consumer's self-check.)
