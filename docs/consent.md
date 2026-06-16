@@ -13,7 +13,6 @@ Any script that captures sensor data from a space where a person other than the 
 - `mesh-blessyou` — always-on mic, energy-detection loop
 - `mesh-ear` — always-on mic, wake-word reflex (opt-in consent already built in)
 - `mesh-converse` — on-demand mic, voice conversation
-- `genius-loci` — periodic webcam/camera capture, spoken reflection
 - `mesh-eye` — consent-gated camera/mic ambient sense (the current canonical camera organ); reduces
   each capture to abstract signals (light/sound/motion) and keeps **no** raw frame or audio
 
@@ -74,10 +73,9 @@ Scripts must enforce the boundary at the code level (not only in comments):
 
 | Script | Consent | Announce | Indicator | Trace |
 |--------|---------|----------|-----------|-------|
-| `mesh-blessyou` | ✅ `mic_always` gate | ✅ | ✅ torch | ✅ start/stop/heartbeat |
+| `mesh-blessyou` | ✅ `mic_always` gate (genome; not cron-wired) | ✅ | ✅ torch | ✅ start/stop/heartbeat |
 | `mesh-ear` | ✅ `mic` / `mic_always` (built-in) | ✅ | ✅ torch | ✅ start/stop/heartbeat |
 | `mesh-converse` | ✅ `mic` gate | ✅ | ✅ torch | ✅ start/stop |
-| `genius-loci` | ✅ `camera` + `mic` gate | ✅ | ✅ torch | ✅ start/stop/heartbeat |
 | `mesh-hear` | ✅ `mic_always` gate | ✅ | ✅ torch for phone | ✅ start/stop |
 | `mesh-eye` | ✅ `camera`/`mic` gate — STRUCTURAL, refuses `rc=3` (sandbox-tested in `--test`) | ✖ no `mesh-say` | abstract signals only, **no raw frame kept** | → `~/.mesh/eye.log` (not `mesh-trace`) |
 | `mesh-transcribe-organ` | n/a (processes caller-provided WAV) | n/a | n/a | n/a |
