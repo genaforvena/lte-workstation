@@ -13,12 +13,14 @@ on the Redmi 10, 2026-06-12 after the F-Droid reinstall: termux-api 0.59.1, 83 c
 - **Senses (input):** `termux-location` (GPS), `termux-camera-photo`, `termux-microphone-record`,
   `termux-sensor` (accel/gyro/light/…), `termux-battery-status`, `termux-telephony-cellinfo`,
   `termux-wifi-scaninfo` (RF/localization), `termux-nfc`, `termux-fingerprint`, `termux-speech-to-text`.
-  - **Wired sense organ** `mesh-body-motion` — fuses `bma420`+`ORIENTATION`+`STEP_COUNTER`+`LINEARACCEL`+`tmd2755_l`
-    in one SSH read and classifies the body's **activity**: `STILL` / `CARRIED` (step delta) /
-    `HANDLED` (linear-accel) / `COVERED` (face-down or upright + dark). The mesh's only body-activity
-    sense — `mesh-location` knows *where*, `mesh-presence` knows *who's near*, neither knows if the body
-    is moving or held. A parked body reading `CARRIED`/`HANDLED` = tamper/interaction. `--edge` emits only
-    on a state change (stream-feedable); `--raw` is the fused-sensor artifact; `--test` exit 2 = phone n/a.
+   - **Wired sense organ** `mesh-body-motion` — fuses `bma420`+`ORIENTATION`+`STEP_COUNTER`+`LINEARACCEL`+`tmd2755_l`+`tmd2755_p`
+     in one SSH read and classifies the body's **activity**: `STILL` / `CARRIED` (step delta) /
+     `HANDLED` (linear-accel) / `COVERED` (proximity=near, face-down+dark, or upright+dark). Proximity
+     sensor (`tmd2755_p`, 0=near/covered, 5=far) is the primary COVERED signal, checked before the
+     orientation+light heuristics. The mesh's only body-activity sense — `mesh-location` knows *where*,
+     `mesh-presence` knows *who's near*, neither knows if the body is moving or held. A parked body
+     reading `CARRIED`/`HANDLED` = tamper/interaction. `--edge` emits only on a state change
+     (stream-feedable); `--raw` is the fused-sensor artifact; `--test` exit 2 = phone n/a.
     (Full sensor matrix: `knowledge/phone-sensor-inventory-2026-06-13.md`.)
   - **Wired sense organ** `mesh-light` — reads `tmd2755_l` once and classifies the room as `DARK` / `LIT`
     (edge-triggered with `--edge`; `--status` prints the current lux level). This is the mesh's ambient-light
