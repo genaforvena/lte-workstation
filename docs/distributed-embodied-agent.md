@@ -66,12 +66,12 @@ This is not AGI. There is no persistent self. No consciousness. No "I" saying "I
 | Property | How |
 |----------|-----|
 | Eyes | `termux-camera-photo -c 0` via SSH, JPEG returned to VM |
-| Ears | `termux-microphone-record`, `.m4a` extracted via SCP, transcribed with `faster-whisper` |
+| Ears | `termux-microphone-record`, `.m4a` extracted via SCP, transcribed with `whisper.cpp` |
 | Proprioception | `ps`, `df`, `dmesg`, `journalctl` on local node; `tailscale status` for mesh awareness |
 | Hands | Shell commands on VM; `ssh peer "command"` for remote action |
 | Memory | tmux scrollback (conversation history); filesystem artifacts (photos, recordings, logs) |
 | Interactive sessions | tmux sessions — shared sensorium; attach via `ssh user@vm -t tmux attach -t agent` |
-| Nervous system | Tailscale WireGuard mesh; SSH over tagged endpoints; mosh for lossy links |
+| Nervous system | Tailscale WireGuard mesh; SSH over tagged endpoints |
 | Topology | No central map. Gossip + TTL decay. Each node knows only what it has touched recently. |
 
 ## Commands are not symbols

@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+# reflex-cadence: 3-59/10 * * * *
+# mesh-psi — the node's RESOURCE-CONTENTION sense (Pressure Stall Information). Reads the kernel's
+# /proc/pressure/{cpu,io,memory} — the % of wallclock time tasks were STALLED waiting on each
+# resource — and folds it into one CALM/BUSY/STALLED level naming the DOMINANT resource.
+#
+# Why this is a new sense, not a dup of mesh-stress: mesh-stress reads /proc/loadavg, which CONFLATES
+# cause — a load of 5 could be cpu-bound, io-bound, or memory-thrashing, and load counts uninterruptible
+# io-wait the same as runnable cpu demand. PSI is what tasks ACTUALLY experience: `some` = ≥1 task
+# stalled, `full` = EVERY non-idle task stalled (nothing progresses). It tells you not just "busy" but
+# "busy ON WHAT" — the diagnostic mesh-stress is blind to (e.g. this node idles cpu-cool yet sits
+# io-stalled ~half the time, which load average hides inside a normal-looking number).
+#
+#   mesh-psi            one line: level + dominant resource + the three readings
+#   mesh-psi --json     machine-readable
+#   mesh-psi --edge     emit only on level change (2-consecutive debounce) — board reflex
+#   mesh-psi --test     smoke test (pure, no /proc read before the gate)
+#
+# Levels (per resource, worst wins; tunable via env):
+#   CALM    = no meaningful stall
+#   BUSY    = some-pressure ≥ MESH_PSI_SOME_BUSY (25) or any full pressure — contention, work still flows
+#   STALLED = full ≥ MESH_PSI_FULL_STALL (10) or some ≥ MESH_PSI_SOME_STALL (60) — real stalling
+# Memory `full` pressure is treated as extra-serious (thrashing): any mem full ≥5 → STALLED.
+#
+# Honest-degraded: a kernel built without CONFIG_PSI has no /proc/pressure → UNAVAILABLE + exit 2,
+# never a faked CALM. (VMs/older kernels may lack it; that is reported, not hidden.)
+set -uo pipefail
+
+STATE="${HOME:-/root}/.mesh/.psi.state"
+SOME_BUSY="${MESH_PSI_SOME_BUSY:-25}"
+SOME_STALL="${MESH_PSI_SOME_STALL:-60}"
+FULL_STALL="${MESH_PSI_FULL_STALL:-10}"
+MEM_FULL_STALL="${MESH_PSI_MEM_FULL_STALL:-5}"
+
+# Pure classifier — no I/O, no /proc read. args: cpu_some cpu_full io_some io_full mem_some mem_full
+# echoes "LEVEL|dominant"
+classify() {
+  awk -v cs="$1" -v cf="$2" -v ios="$3" -v iof="$4" -v ms="$5" -v mf="$6" \
+      -v sb="$SOME_BUSY" -v ss="$SOME_STALL" -v fs="$FULL_STALL" -v mfs="$MEM_FULL_STALL" '
+    function lvl(some, full) {
+      if (full >= fs || some >= ss) return 3;   # STALLED
+      if (full >= 1  || some >= sb) return 2;    # BUSY
+      return 1;                                  # CALM
+    }
+    BEGIN {
+      cl = lvl(cs, cf); il = lvl(ios, iof); ml = lvl(ms, mf);
+      if (mf >= mfs && ml < 3) ml = 3;           # memory full pressure = thrashing, extra-serious
+      worst = cl; dom = "cpu"; domsome = cs + 0;
+      if (il > worst || (il == worst && (ios + 0) > domsome)) { worst = il; dom = "io"; domsome = ios + 0 }
+      if (ml > worst || (ml == worst && (ms + 0) > domsome)) { worst = ml; dom = "memory"; domsome = ms + 0 }
+      name = (worst == 3 ? "STALLED" : worst == 2 ? "BUSY" : "CALM");
+      printf "%s|%s", name, dom;
+    }'
+}
+
+if [ "${1:-}" = --test ]; then
+  command -v awk >/dev/null 2>&1 || { echo "smoke-test: FAIL (no awk)"; exit 1; }
+  fail() { echo "smoke-test: FAIL ($1)"; exit 1; }
+  # Pure classify() assertions — falsifiable, no real sensor read.
+  [ "$(classify 0 0 0 0 0 0)"     = "CALM|cpu" ]    || fail "all-zero should be CALM"
+  [ "$(classify 5 0 65 59 0 0)"   = "STALLED|io" ]  || fail "live io-stall (some65/full59) should be STALLED on io"
+  [ "$(classify 30 0 0 0 0 0)"    = "BUSY|cpu" ]    || fail "cpu some=30 should be BUSY on cpu"
+  [ "$(classify 70 15 0 0 0 0)"   = "STALLED|cpu" ] || fail "cpu full=15 should be STALLED on cpu"
+  [ "$(classify 0 0 0 0 10 8)"    = "STALLED|memory" ] || fail "mem full=8 (thrash) should be STALLED on memory"
+  [ "$(classify 60 10 90 50 0 0)" = "STALLED|io" ]  || fail "two stalled, higher some=io should dominate"
+  [ "$(classify 24 0 0 0 0 0)"    = "CALM|cpu" ]    || fail "some=24 below BUSY threshold should be CALM"
+  [ "$(classify 25 0 0 0 0 0)"    = "BUSY|cpu" ]    || fail "some=25 at BUSY threshold should be BUSY"
+  [ "$(classify 0 0 0 0 0 3)"     = "BUSY|memory" ] || fail "mem full=3 (<5) should be BUSY not STALLED"
+  # State machine: the real-path read is gated below, never before these pure asserts.
+  if [ -r /proc/pressure/cpu ]; then
+    out="$("$0" --json 2>&1)" || fail "json probe failed: $out"
+    printf '%s\n' "$out" | grep -q '"level":"' || fail "json missing level: $out"
+    printf '%s\n' "$out" | grep -q '"dominant":"' || fail "json missing dominant: $out"
+    echo "smoke-test: ok"
+  else
+    echo "smoke-test: ok (no /proc/pressure — kernel without CONFIG_PSI, sense reports UNAVAILABLE)"
+  fi
+  exit 0
+fi
+
+MODE=text; [ "${1:-}" = --json ] && MODE=json
+EDGE=0;   [ "${1:-}" = --edge ] && EDGE=1
+TS=$(date -u +%H:%M:%SZ)
+
+# --- Honest-degraded: no PSI support → UNAVAILABLE, never fake CALM ---
+if [ ! -r /proc/pressure/cpu ]; then
+  if [ "$MODE" = json ]; then
+    printf '{"level":"UNAVAILABLE","dominant":"-","reason":"kernel has no PSI (CONFIG_PSI off)","ts":"%s"}\n' "$TS"
+  else
+    echo "[psi] UNAVAILABLE — kernel has no PSI (/proc/pressure absent; CONFIG_PSI off)"
+  fi
+  exit 2
+fi
+
+# read avg10 (most recent 10s window) for a resource's some+full lines
+read_psi() {  # $1 = cpu|io|memory ; echoes "some full"
+  local f="/proc/pressure/$1"
+  awk '
+    /^some/ { for (i=1;i<=NF;i++) if ($i ~ /^avg10=/) { sub("avg10=","",$i); s=$i } }
+    /^full/ { for (i=1;i<=NF;i++) if ($i ~ /^avg10=/) { sub("avg10=","",$i); f=$i } }
+    END { printf "%s %s", (s==""?0:s), (f==""?0:f) }
+  ' "$f" 2>/dev/null
+}
+
+read cpu_some cpu_full <<<"$(read_psi cpu)"
+read io_some io_full   <<<"$(read_psi io)"
+read mem_some mem_full <<<"$(read_psi memory)"
+
+res="$(classify "$cpu_some" "$cpu_full" "$io_some" "$io_full" "$mem_some" "$mem_full")"
+level="${res%%|*}"; dom="${res#*|}"
+
+signals="cpu=${cpu_some}/${cpu_full} io=${io_some}/${io_full} mem=${mem_some}/${mem_full} (some/full %)"
+if [ "$level" = CALM ]; then
+  reason="all resources calm"
+else
+  case "$dom" in
+    cpu)    d_some="$cpu_some"; d_full="$cpu_full";;
+    io)     d_some="$io_some";  d_full="$io_full";;
+    memory) d_some="$mem_some"; d_full="$mem_full";;
+  esac
+  reason="$dom some=${d_some}% full=${d_full}%"
+fi
+
+if [ "$MODE" = json ]; then
+  printf '{"level":"%s","dominant":"%s","reason":"%s","cpu_some":%s,"cpu_full":%s,"io_some":%s,"io_full":%s,"mem_some":%s,"mem_full":%s,"ts":"%s"}\n' \
+    "$level" "$dom" "$reason" "$cpu_some" "$cpu_full" "$io_some" "$io_full" "$mem_some" "$mem_full" "$TS"
+  exit 0
+fi
+
+if [ "$EDGE" = 1 ]; then
+  PENDING="${STATE%.state}.pending"
+  confirmed="$(cat "$STATE" 2>/dev/null || true)"
+  pending_line="$(cat "$PENDING" 2>/dev/null || true)"
+  pending="${pending_line%%:*}"; pcount="${pending_line##*:}"; pcount="${pcount:-0}"
+  if [ -z "$confirmed" ]; then
+    printf '%s\n' "$level" > "$STATE"; rm -f "$PENDING"
+  elif [ "$level" = "$confirmed" ]; then
+    rm -f "$PENDING"
+  elif [ "$level" = "$pending" ]; then
+    pcount=$((pcount + 1))
+    if [ "$pcount" -ge 2 ]; then
+      printf '%s\n' "$level" > "$STATE"; rm -f "$PENDING"
+      printf '[psi-%s] %s — %s | %s\n' "$(printf '%s' "$level" | tr '[:upper:]' '[:lower:]')" "$level" "$reason" "$signals"
+    else
+      printf '%s:%d\n' "$level" "$pcount" > "$PENDING"
+    fi
+  else
+    printf '%s:1\n' "$level" > "$PENDING"
+  fi
+  exit 0
+fi
+
+printf '[psi] %s — %s | %s\n' "$level" "$reason" "$signals"

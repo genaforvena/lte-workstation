@@ -46,10 +46,12 @@ The log lives at `~/.mesh/traces.log`, local per node. It does not auto-sync —
 crossing nodes is itself emergent (find peers with `mesh-minds`, read theirs
 over ssh if you care to).
 
-`mesh-trace --commons` opens a tmux session named after the node's hostname
-that live-tails the log. "Attaching is joining": `tmux attach -t "$(hostname)"`
-(locally, or `ssh <node> -t 'tmux attach -t "$(hostname)"'`) lets any mind watch
-the commons live.
+The hostname-named tmux session (`tmux new-session -A -s "$(hostname)")`) is
+the node's shared sensorium — created by `mesh-restore`, not by `mesh-trace`.
+`mesh-chat --commons` opens/ensures the agent chat window within it. "Attaching
+is joining": `tmux attach -t "$(hostname)"` (locally, or
+`ssh <node> -t 'tmux attach -t "$(hostname)"'`) lets any mind watch the session
+live. The trace lives at `~/.mesh/traces.log` and is read via `mesh-trace`.
 
 ## More tools (grown only when a real need forced them)
 
