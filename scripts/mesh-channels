@@ -25,10 +25,11 @@ if [ "${1:-}" = --test ]; then
     command -v "$x" >/dev/null 2>&1 || { echo "smoke-test: FAIL (no $x)"; exit 1; }
   done
   tmp="$(mktemp)" || { echo "smoke-test: FAIL (mktemp)"; exit 1; }; trap 'rm -f "$tmp"' EXIT
-  printf '# a comment\n\nx | echo hi | plan\ny | echo yo | dev | grep -qE "a|b" && echo fire\n' > "$tmp"
+  printf '# a comment\n\nx | echo hi | plan\ny | echo yo | dev | grep -qE "a|b" && echo fire\n@hb minds plan\n' > "$tmp"
   n=$(MESH_STREAMS_CONF="$tmp" "$0" --list 2>/dev/null | grep -cE '^[xy] ') || true
-  [ "$n" = 2 ] || { echo "smoke-test: FAIL (parse: expected 2 channels, got $n)"; exit 1; }
+  [ "$n" = 2 ] || { echo "smoke-test: FAIL (parse: expected 2 edge channels, got $n)"; exit 1; }
   MESH_STREAMS_CONF="$tmp" "$0" --list 2>/dev/null | grep -q 'mind:plan' || { echo "smoke-test: FAIL (mind not parsed)"; exit 1; }
+  MESH_STREAMS_CONF="$tmp" "$0" --list 2>/dev/null | grep -q '@hb minds' || { echo "smoke-test: FAIL (@hb heartbeat line not parsed / leaked into edge channels)"; exit 1; }
   # 3-field line x → filter defaults to mesh-delta; 4-field line y → bespoke filter with a LITERAL pipe honored (greedy)
   MESH_STREAMS_CONF="$tmp" "$0" --list 2>/dev/null | grep -q 'filter: mesh-delta x' || { echo "smoke-test: FAIL (default filter not applied)"; exit 1; }
   MESH_STREAMS_CONF="$tmp" "$0" --list 2>/dev/null | grep -q 'filter: grep -qE "a|b" && echo fire' || { echo "smoke-test: FAIL (greedy piped filter truncated/not parsed)"; exit 1; }
@@ -41,10 +42,13 @@ fi
 # filter defaults to `mesh-delta <name>` when absent/empty (backward-compatible). filter is the GREEDY
 # last field — it keeps any literal `|` (real filters pipe + use `|` in regexes, e.g. grep "a|b") instead
 # of the delimiter truncating them. So: name | pull | mind | filter-may-contain | pipes-freely.
+# parse EDGE config → tab-separated  name<TAB>pull<TAB>mind<TAB>filter  (skip blank, #comment, and @hb
+# heartbeat lines — those are handled separately). filter defaults to `mesh-delta <name>` when absent;
+# filter is the GREEDY last field — keeps literal `|` (real filters pipe + use `|` in regexes).
 parse() {
   while IFS='|' read -r name pull mind filter; do
     name="$(echo "$name" | xargs 2>/dev/null)"; [ -z "$name" ] && continue
-    case "$name" in \#*) continue;; esac
+    case "$name" in \#*|@hb|@hb\ *) continue;; esac
     pull="$(echo "$pull" | sed 's/^ *//;s/ *$//')"
     mind="$(echo "$mind" | xargs 2>/dev/null)"; [ -z "$mind" ] && mind=plan
     filter="$(echo "$filter" | sed 's/^ *//;s/ *$//')"; [ -z "$filter" ] && filter="mesh-delta $name"
@@ -52,34 +56,67 @@ parse() {
   done < "$CONF"
 }
 
+# parse HEARTBEAT lines:  @hb <window> <role> [min]  (space-separated, no pipes) → window<TAB>role<TAB>min.
+# A heartbeat is a self-continuation TICK — delegated to mesh-tick-adapt (idle-gates + P-controller cadence,
+# and crucially RE-feeds each cycle, which mesh-stream's edge-dedup cannot do). This is what gives an idle
+# mind whose source never changes a reason to keep going — the "where's my tick" guarantee, per channel.
+parse_hb() {
+  while read -r tag win role _min _rest; do
+    [ "$tag" = "@hb" ] && [ -n "${win:-}" ] && printf '%s\t%s\n' "$win" "${role:-}"
+  done < "$CONF"
+}
+
 if [ "${1:-}" = --list ]; then
   parse | while IFS=$'\t' read -r name pull mind filter; do
     printf '%s  ->  mind:%s   [pull: %s | filter: %s]\n' "$name" "$mind" "$pull" "$filter"
   done
+  parse_hb | while IFS=$'\t' read -r win role; do
+    printf '@hb %s  ->  heartbeat tick (role:%s)\n' "$win" "${role:-default}"
+  done
   exit 0
 fi
 
-# Rate-limit fallback routing: when a channel's target mind is RATE-LIMITED,
-# route to the first idle worker in MESH_RATE_FALLBACK (colon-sep window names).
-# Allows alerts to reach a live mind even when the primary planner is cooling down.
-MESH_RATE_FALLBACK="${MESH_RATE_FALLBACK:-dev:discover:sense}"
-_target_mind() { # $1=desired mind → stdout=routed mind (fallback if rate-limited)
-  local want="$1" state
-  state="$(mesh-mind-state "$want" 2>/dev/null | grep -oE 'WORKING|IDLE|RATE-LIMITED|DEAD' | head -1)"
+# state of a mind window (field 1 of mesh-mind-state): WORKING|NEEDS-INPUT|RATE-LIMITED|IDLE|DEAD
+_mind_state() { mesh-mind-state "$1" 2>/dev/null | grep -oE 'WORKING|NEEDS-INPUT|RATE-LIMITED|IDLE|DEAD' | head -1; }
+
+# Rate-limit fallback routing: when a channel's target mind is RATE-LIMITED, route the edge feed to the
+# first IDLE worker in MESH_RATE_FALLBACK so an alert still reaches a live mind while the primary cools.
+MESH_RATE_FALLBACK="${MESH_RATE_FALLBACK:-genome:senses:health}"
+_target_mind() {
+  local want="$1" state; state="$(_mind_state "$want")"
   if [ "$state" = "RATE-LIMITED" ]; then
     local fb; IFS=':' read -ra _FBs <<< "$MESH_RATE_FALLBACK"
     for fb in "${_FBs[@]}"; do
       [ "$fb" = "$want" ] && continue
-      local fb_state; fb_state="$(mesh-mind-state "$fb" 2>/dev/null | grep -oE 'WORKING|IDLE|RATE-LIMITED|DEAD' | head -1)"
-      if [ "$fb_state" = "IDLE" ]; then printf '%s' "$fb"; return; fi
+      [ "$(_mind_state "$fb")" = "IDLE" ] && { printf '%s' "$fb"; return; }
     done
   fi
   printf '%s' "$want"
 }
 
-# tick every channel: state-fn -> filter -> mind  (display suppressed; data already lives in the pane)
+# SINGLE-WRITER guard: this driver SERIALIZES many slow mesh-mind-state pane-samples, so a tick can run
+# tens of seconds. A non-blocking lock makes an overlapping cron run SKIP rather than pile up (the
+# mesh-doctor --quiet pile-up lesson). --test/--list above run lock-free.
+exec 9>"$HOME/.mesh/.channels.lock" 2>/dev/null || true
+flock -n 9 2>/dev/null || { echo "mesh-channels: another tick in progress — skip"; exit 0; }
+
+# 1) HEARTBEAT channels first — self-continuation tick (tick-adapt idle-gates + paces itself, logs to tick.log).
+# DETACH each: mesh-tick FOREGROUND-sleeps on its empty/fast-tick backoff (up to MESH_TICK_SLOW_SLEEP=300s),
+# which would block this serial driver AND hold the single-writer lock for 5 minutes. Run backgrounded with
+# the lock fd (9) CLOSED so the sleep holds neither; and set SLOW_SLEEP=0 since the cron cadence already paces.
+parse_hb | while IFS=$'\t' read -r win role; do
+  ( exec 9>&-; MESH_TICK_SLOW_SLEEP=0 mesh-tick-adapt local "$win" "${role:-}" >> "$HOME/.mesh/tick.log" 2>&1 ) &
+  echo "[@hb $win] tick-adapt(role=${role:-default}) [detached]"
+done
+
+# 2) EDGE channels — feed the mind on a significant source change. IDLE-GATE centrally: NEVER inject into a
+# WORKING mind (corrupts its turn) or a NEEDS-INPUT mind (a permission gate → leave it to gate-watch/operator).
+# The edge is simply caught on the next idle tick — mesh-delta only advances its seen-state when we run it.
 parse | while IFS=$'\t' read -r name pull mind filter; do
+  st="$(_mind_state "$mind")"
+  case "$st" in WORKING|NEEDS-INPUT) echo "[$name] skip — $mind is $st (don't interrupt)"; continue;; esac
   target="$(_target_mind "$mind")"
-  [ "$target" != "$mind" ] && printf '[%s] routing to %s (plan is rate-limited)\n' "$name" "$target"
+  [ "$target" != "$mind" ] && printf '[%s] routing to %s (%s rate-limited)\n' "$name" "$target" "$mind"
+  rst="$(_mind_state "$target")"; case "$rst" in WORKING|NEEDS-INPUT) echo "[$name] skip — routed $target is $rst"; continue;; esac
   MESH_STREAM_NODISPLAY=1 mesh-stream "$name" "$pull" "$filter" "$target" 2>&1 | sed "s/^/[$name] /" || true
 done
