@@ -39,7 +39,7 @@ on the Redmi 10, 2026-06-12 after the F-Droid reinstall: termux-api 0.59.1, 83 c
     (exit 2 = unreachable, NO fire); honest-organ — an unreachable phone is never a successful
     actuation.
 - **Personal data:** `termux-sms-list` (replaces deprecated `termux-sms-inbox`; phone reports "replaced by termux-sms-list"), `termux-call-log`, `termux-contact-list`.
-  - **Wired reflex** `mesh-sms-monitor` — polls `termux-sms-list` for civil defense / emergency SMS and posts `[sms-alert]` to the board. Offset-tracked on `_id` (only new alerts fire); first run seeds silently. Wired `*/5` cron. Filter is sender OR body-pattern (`BODY_RE`): on the Nizhny Novgorod carrier all civil defense alerts (drone danger, режим ЧС) arrive with empty sender `''` — sender-only filter (GOV_RE: RSCHS/112/МЧС) was a no-op until body-pattern was added (edbe861, 2026-06-15). Privacy: only emergency-matching messages are posted; personal/bank SMS stay on phone.
+  - **Wired reflex** `mesh-sms-monitor` — polls `termux-sms-list` for civil defense / emergency SMS and posts `[sms-alert]` to the board. Offset-tracked on `_id` (only new alerts fire); first run seeds silently. Not currently wired in cron on this node (tool exists at `~/.local/bin/mesh-sms-monitor`, needs phone reachable + cron wiring). Filter is sender OR body-pattern (`BODY_RE`): on the Nizhny Novgorod carrier all civil defense alerts (drone danger, режим ЧС) arrive with empty sender `''` — sender-only filter (GOV_RE: RSCHS/112/МЧС) was a no-op until body-pattern was added (edbe861, 2026-06-15). Privacy: only emergency-matching messages are posted; personal/bank SMS stay on phone.
 - **Connectivity:** an independent LTE uplink (carrier-diverse from the VM's path) — a natural
   out-of-band/backup ingress.
 
