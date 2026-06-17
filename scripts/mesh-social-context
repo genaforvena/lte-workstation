@@ -1,0 +1,254 @@
+#!/usr/bin/env bash
+# reflex-cadence: 2-59/5 * * * *
+# reflex-args: --edge
+# mesh-social-context — SOCIAL FUSION: who's in the room and what's happening?
+# Combines audio-energy + body-motion + ambient-light + BLE-presence into a single
+# social context label. No single sensor answers "is the operator alone or with others?"
+# — audio says "loud/quiet", body says "moving/still", light says "dark/lit",
+# BLE says "N devices visible". Fused they distinguish SOLO from SOCIAL from EMPTY.
+#
+# Signals (all best-effort — a missing signal degrades visibly, never fakes a clear):
+#   Audio energy (phone):   SILENT/QUIET/MODERATE/LOUd (mesh-audio-energy)
+#   Body motion (phone):    STILL/CARRIED/HANDLED/COVERED (mesh-body-motion)
+#   Ambient light (phone):  DARK/LIT (mesh-light)
+#   BLE presence (local):   named person-device count + identities (mesh-presence)
+#
+# Fusion:
+#   SOLO-WORK    = 1 person device + audio quiet + body still + lit room
+#   SOLO-LEISURE = 1 person device + (audio moderate OR body handled)
+#   SOCIAL-SMALL = 2 person devices + lit room
+#   SOCIAL-GROUP = 3+ person devices
+#   ACTIVE       = loud audio or body carried/handled (from room-activity logic)
+#   QUIET        = still + quiet + lit
+#   DARK         = still + quiet + dark
+#   EMPTY        = no person devices + still + quiet
+#   DEGRADED     = phone unreachable (inputs missing — never silently ALL-CLEAR)
+#
+# Exit codes (honest-exit contract):
+#   0 = verdict assessed (may be DEGRADED if signals conflict)
+#   2 = cannot assess at all (phone unreachable AND BLE scan failed)
+#
+#   mesh-social-context           one-shot verdict to stdout
+#   mesh-social-context --edge    emit only on state change (2-consecutive debounce)
+#   mesh-social-context --json    machine-readable JSON
+#   mesh-social-context --test    smoke test (no scan)
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+[ -f "$HOME/.mesh/nodes" ] && . "$HOME/.mesh/nodes"
+
+STATE="$HOME/.mesh/.social-context.state"
+OFFLINEFILE="$HOME/.mesh/.social-context-offline"
+
+if [ "${1:-}" = --test ]; then
+  command -v mesh-audio-energy >/dev/null 2>&1 || { echo "smoke-test: FAIL (no mesh-audio-energy)"; exit 1; }
+  command -v mesh-body-motion >/dev/null 2>&1 || { echo "smoke-test: FAIL (no mesh-body-motion)"; exit 1; }
+  command -v mesh-light >/dev/null 2>&1 || { echo "smoke-test: FAIL (no mesh-light)"; exit 1; }
+  command -v mesh-presence >/dev/null 2>&1 || { echo "smoke-test: FAIL (no mesh-presence)"; exit 1; }
+  [ -d "$HOME/.mesh" ] || { echo "smoke-test: FAIL (no $HOME/.mesh)"; exit 1; }
+  echo "smoke-test: ok"; exit 0
+fi
+
+MODE=text; [ "${1:-}" = --json ] && MODE=json
+EDGE=0
+if [ "${1:-}" = --edge ]; then EDGE=1; MODE=edge; fi
+TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+# Source canonical BLE patterns for person vs appliance classification
+if [ -f "$HOME/.local/bin/mesh-patterns.sh" ]; then
+  . "$HOME/.local/bin/mesh-patterns.sh" 2>/dev/null || true
+elif [ -f "$HOME/.local/bin/mesh-patterns" ]; then
+  . "$HOME/.local/bin/mesh-patterns" 2>/dev/null || true
+fi
+PERSON_RE="${MESH_PERSON_RE:-JBL|AirPods|Galaxy Buds|Pixel|iPhone|Redmi}"
+FIXED_RE="${MESH_FIXED_RE:-\\[TV\\]|MiTV|Bose}"
+NOISE_RE="${MESH_NOISE_RE:-}"
+
+# --- Audio energy (phone, ~4s) ---
+ae_j="$(timeout 15 mesh-audio-energy --json 2>/dev/null)" || ae_j=""
+if [ -n "$ae_j" ]; then
+  audio_state="$(printf '%s' "$ae_j" | grep -oE '"state":"[^"]*"' | cut -d'"' -f4)"
+  audio_rms="$(printf '%s' "$ae_j" | grep -oE '"rms":[0-9.]+' | cut -d: -f2)"
+else
+  audio_state="UNKNOWN"; audio_rms=""
+fi
+
+# --- Body motion (phone) ---
+phone_ok=0
+bm_out="$(timeout 12 mesh-body-motion 2>/dev/null)"; bm_rc=$?
+if [ "$bm_rc" = 2 ]; then
+  bm_state="UNKNOWN"
+else
+  phone_ok=1
+  bm_tag="$(printf '%s' "$bm_out" | grep -oE '\[body-[a-z]+\]' | tr -d '[]')"
+  case "${bm_tag##*-}" in
+    still)   bm_state="STILL";;
+    carried) bm_state="CARRIED";;
+    handled) bm_state="HANDLED";;
+    covered) bm_state="COVERED";;
+    *)       bm_state="UNKNOWN";;
+  esac
+fi
+
+# --- Ambient light (phone) ---
+light_state="UNKNOWN"
+if [ "$phone_ok" = 1 ]; then
+  light_out="$(timeout 10 mesh-light 2>/dev/null || true)"
+  if printf '%s' "$light_out" | grep -q 'LIT'; then
+    light_state="LIT"
+  elif printf '%s' "$light_out" | grep -q 'DARK'; then
+    light_state="DARK"
+  fi
+fi
+
+# --- BLE presence (local, no phone needed) ---
+# Count person devices vs fixed appliances. Noise devices (rotating serial names) excluded.
+ble_person_count=0
+ble_person_names=""
+ble_fixed_count=0
+ble_any=0
+
+ble_raw="$(mesh-presence 10 2>/dev/null)" || true
+if [ -n "$ble_raw" ]; then
+  ble_any=1
+  while IFS='|' read -r rssi mac name; do
+    [ -z "$name" ] || [ "$name" = '?' ] && continue
+    [[ "$name" =~ ^[0-9A-Fa-f:]{17}$ ]] && continue  # bare MAC = unnamed
+    # Skip noise devices (rotating serial names)
+    if [ -n "$NOISE_RE" ] && printf '%s' "$name" | grep -qiE "$NOISE_RE"; then
+      continue
+    fi
+    if printf '%s' "$name" | grep -qiE "$PERSON_RE"; then
+      ble_person_count=$((ble_person_count + 1))
+      ble_person_names="${ble_person_names:+$ble_person_names,}$name"
+    elif printf '%s' "$name" | grep -qiE "$FIXED_RE"; then
+      ble_fixed_count=$((ble_fixed_count + 1))
+    fi
+  done < <(printf '%s\n' "$ble_raw" | grep -E '^-?[0-9]+\|')
+fi
+
+# --- Honest-degraded: phone unreachable ---
+# If phone is down, we lose audio + body + light. BLE alone can't assess social context.
+# EXIT 2 — cannot assess, NOT "empty".
+if [ "$phone_ok" = 0 ] && [ "$ble_any" = 0 ]; then
+  if [ ! -f "$OFFLINEFILE" ]; then
+    echo "mesh-social-context: phone unreachable AND BLE scan failed — cannot assess" >&2
+    touch "$OFFLINEFILE"
+  fi
+  exit 2
+fi
+
+# --- Fusion ---
+verdict="UNCERTAIN"
+reason=""
+signals="audio=${audio_state}(rms=${audio_rms:-?}) body=${bm_state} light=${light_state} ble_person=${ble_person_count} ble_fixed=${ble_fixed_count}"
+
+# DEGRADED: phone unreachable but BLE works — we see devices but can't hear/feel the room
+if [ "$phone_ok" = 0 ]; then
+  if [ "$ble_person_count" -ge 1 ]; then
+    verdict="DEGRADED"
+    reason="phone offline — ${ble_person_count} person device(s) visible [${ble_person_names}], but audio/body/light unavailable"
+  else
+    verdict="DEGRADED"
+    reason="phone offline — no person devices, cannot confirm empty without audio/body"
+  fi
+# DEGRADED: audio unavailable but other signals work
+elif [ "$audio_state" = "UNKNOWN" ]; then
+  if [ "$ble_person_count" -ge 3 ]; then
+    verdict="SOCIAL-GROUP"
+    reason="audio unavailable but ${ble_person_count} person devices visible [${ble_person_names}]"
+  elif [ "$ble_person_count" -ge 2 ]; then
+    verdict="SOCIAL-SMALL"
+    reason="audio unavailable but 2 person devices visible [${ble_person_names}]"
+  elif [ "$ble_person_count" -ge 1 ]; then
+    verdict="SOLO-LEISURE"
+    reason="audio unavailable, 1 person device [${ble_person_names}], body=${bm_state}"
+  elif [ "$bm_state" = "CARRIED" ] || [ "$bm_state" = "HANDLED" ]; then
+    verdict="ACTIVE"
+    reason="audio unavailable, no person devices, body=${bm_state}"
+  else
+    verdict="DEGRADED"
+    reason="audio unavailable, no person devices, body=${bm_state}"
+  fi
+# All signals available — full fusion
+else
+  # Group detection: 3+ person devices = SOCIAL-GROUP regardless of audio
+  if [ "$ble_person_count" -ge 3 ]; then
+    verdict="SOCIAL-GROUP"
+    reason="${ble_person_count} person devices [${ble_person_names}]"
+    [ "$audio_state" != "SILENT" ] && [ "$audio_state" != "QUIET" ] && reason="$reason + ${audio_state,,} audio"
+  # Small social: 2 person devices
+  elif [ "$ble_person_count" -ge 2 ]; then
+    verdict="SOCIAL-SMALL"
+    reason="2 person devices [${ble_person_names}]"
+    [ "$audio_state" != "SILENT" ] && [ "$audio_state" != "QUIET" ] && reason="$reason + ${audio_state,,} audio"
+  # Solo: 1 person device
+  elif [ "$ble_person_count" -ge 1 ]; then
+    if [ "$audio_state" = "LOUD" ] || [ "$bm_state" = "CARRIED" ] || [ "$bm_state" = "HANDLED" ]; then
+      verdict="SOLO-LEISURE"
+      reason="1 person device [${ble_person_names}], ${audio_state,,} audio, body=${bm_state}"
+    elif [ "$audio_state" = "SILENT" ] || [ "$audio_state" = "QUIET" ]; then
+      if [ "$light_state" = "DARK" ]; then
+        verdict="DARK"
+        reason="1 person device [${ble_person_names}], quiet + dark + still"
+      else
+        verdict="SOLO-WORK"
+        reason="1 person device [${ble_person_names}], quiet audio, body=${bm_state}, lit room"
+      fi
+    else
+      verdict="SOLO-LEISURE"
+      reason="1 person device [${ble_person_names}], ${audio_state,,} audio"
+    fi
+  # No person devices
+  else
+    if [ "$bm_state" = "CARRIED" ] || [ "$bm_state" = "HANDLED" ]; then
+      verdict="ACTIVE"
+      reason="no person devices but body=${bm_state}, ${audio_state,,} audio"
+    elif [ "$audio_state" = "LOUD" ]; then
+      verdict="ACTIVE"
+      reason="no person devices but loud audio"
+    elif [ "$light_state" = "DARK" ] && [ "$bm_state" = "STILL" ]; then
+      verdict="DARK"
+      reason="no person devices, dark + still + quiet"
+    elif [ "$audio_state" = "SILENT" ] || [ "$audio_state" = "QUIET" ]; then
+      verdict="EMPTY"
+      reason="no person devices, quiet + still"
+    else
+      verdict="EMPTY"
+      reason="no person devices, no significant activity"
+    fi
+  fi
+fi
+
+case "$MODE" in
+  json)
+    printf '{"verdict":"%s","signals":"%s","reason":"%s","ts":"%s","phone_ok":%s,"ble_any":%s,"person_count":%d,"person_names":"%s","fixed_count":%d}\n' \
+      "$verdict" "$signals" "$reason" "$TS" "$phone_ok" "$ble_any" "$ble_person_count" "$ble_person_names" "$ble_fixed_count"
+    ;;
+  edge)
+    PENDING="${STATE%.state}.pending"
+    confirmed="$(cat "$STATE" 2>/dev/null || true)"
+    pending_line="$(cat "$PENDING" 2>/dev/null || true)"
+    pending="${pending_line%%:*}"; pcount="${pending_line##*:}"; pcount="${pcount:-0}"
+
+    if [ -z "$confirmed" ]; then
+      printf '%s\n' "$verdict" > "$STATE"; rm -f "$PENDING"
+    elif [ "$verdict" = "$confirmed" ]; then
+      rm -f "$PENDING"
+    elif [ "$verdict" = "$pending" ]; then
+      pcount=$((pcount + 1))
+      if [ "$pcount" -ge 2 ]; then
+        printf '%s\n' "$verdict" > "$STATE"; rm -f "$PENDING"
+        printf '[social-context] %s — %s (%s)\n' "$verdict" "$reason" "$signals"
+      else
+        printf '%s:%d\n' "$verdict" "$pcount" > "$PENDING"
+      fi
+    else
+      printf '%s:1\n' "$verdict" > "$PENDING"
+    fi
+    [ -e "$STATE" ] && touch "$STATE" 2>/dev/null || printf '%s\n' "$verdict" > "$STATE"
+    ;;
+  *)
+    printf '[social-context] %s — %s [%s]\n' "$verdict" "$reason" "$signals"
+    ;;
+esac
