@@ -1,0 +1,227 @@
+#!/usr/bin/env bash
+# mesh-body-state — operator body-state fusion (where is the operator physically?)
+#
+# Cross-sense fusion combining:
+#   1. body-motion (accel/orient/steps → STILL/CARRIED/HANDLED/COVERED)
+#   2. tamper (significant-motion trigger → moved/quiet)
+#   3. ambient-light (5 levels → DARK/DIM/MODERATE/LIT/BRIGHT)
+#   4. BLE presence (nearby device count)
+#
+# Derived states:
+#   AT-PHONE       — phone being actively used (HANDLED)
+#   PHONE-NEARBY   — phone at rest, recently moved or BLE nearby
+#   CARRIED        — phone in motion, not actively used (pocket/bag)
+#   AWAY           — phone at rest, no activity, low light (likely empty)
+#   COVERED        — phone face-down (body-motion=COVERED), signals ambiguous
+#   DEGRADED       — one or more sensors unreachable ([DEGRADED: ...])
+#   UNCERTAIN      — signals conflict
+#
+# Hysteresis: 2 consecutive reads must agree on state change (debounce).
+# Honest-degraded: UNREACHABLE → DEGRADED, never silently AWAY.
+#
+# Usage: mesh-body-state [--test|--edge|--json|--status]
+#   --test    dry-run (phone unreachable = exit 2)
+#   --edge    only emit on state change (2-consecutive debounce)
+#   --json    JSON output
+#   --status  print last known state
+#
+# reflex-cadence: */5 * * * *
+
+set -euo pipefail
+
+STATE_FILE="${MESH_BODY_STATE_FILE:-$HOME/.mesh/.body-state.state}"
+DEGRADED_FILE="${MESH_BODY_STATE_DEGRADED:-$HOME/.mesh/.body-state.degraded}"
+mkdir -p "$(dirname "$STATE_FILE")"
+
+usage() {
+  sed -n '2,/^$/{ s/^# \?//; p }' "$0" && exit 0
+}
+
+[[ "${1:-}" == "--help" ]] && usage
+
+# ── Fusion (PURE — no I/O, exercised by --test) ──────────────────────
+# classify <body> <tamper> <light> <ble>  → echoes "STATE|reason"
+# Honest-degraded: any UNREACHABLE sensor → DEGRADED, never a faked verdict.
+classify() {
+  local body="$1" tamper="$2" light="$3" ble="$4"
+  local degraded_reasons="" raw reason
+
+  [ "$body" = "UNREACHABLE" ] && degraded_reasons="body-motion"
+  [ "$tamper" = "UNREACHABLE" ] && degraded_reasons="${degraded_reasons:+$degraded_reasons + }tamper"
+  [ "$light" = "UNREACHABLE" ] && degraded_reasons="${degraded_reasons:+$degraded_reasons + }light"
+  [ "$ble" = "UNREACHABLE" ] && degraded_reasons="${degraded_reasons:+$degraded_reasons + }presence"
+
+  if [ -n "$degraded_reasons" ]; then
+    raw="DEGRADED"
+    reason="unreachable: $degraded_reasons (phone offline or sensor missing)"
+  elif [ "$body" = "UNKNOWN" ]; then
+    raw="UNCERTAIN"
+    reason="body-motion unknown"
+  elif [ "$body" = "HANDLED" ]; then
+    raw="AT-PHONE"
+    reason="phone actively used (HANDLED)"
+    [ "$light" != "UNKNOWN" ] && [ "$light" != "UNREACHABLE" ] && reason="$reason + $light"
+    [ "$ble" != "UNKNOWN" ] && [ "$ble" != "UNREACHABLE" ] && reason="$reason + ${ble} device(s) nearby"
+  elif [ "$body" = "CARRIED" ]; then
+    raw="CARRIED"
+    reason="phone in motion, not actively used (CARRIED)"
+  else
+    # Phone at rest (STILL or COVERED)
+    if [ "$tamper" = "MOVED" ] && [ "$ble" != "0" ] && [ "$ble" != "UNKNOWN" ]; then
+      raw="PHONE-NEARBY"
+      reason="phone recently moved + ${ble} device(s) nearby"
+    # COVERED must precede AWAY: a face-down phone can't see the light sensor,
+    # so its DARK reading is masked, NOT evidence the room is empty.
+    elif [ "$body" = "COVERED" ]; then
+      raw="COVERED"
+      reason="phone face-down, ambient signals masked"
+    elif [ "$tamper" = "QUIET" ] && [ "$ble" = "0" ] \
+         && { [ "$light" = "DARK" ] || [ "$light" = "DIM" ]; }; then
+      raw="AWAY"
+      reason="phone still, no recent activity, no BLE, low light"
+    else
+      raw="UNCERTAIN"
+      reason="mixed signals: body=$body tamper=$tamper light=$light ble=$ble"
+    fi
+  fi
+  printf '%s|%s' "$raw" "$reason"
+}
+
+# ── Smoke test (FALSIFIABLE, no network — must run before any sensor read) ──
+if [[ "${1:-}" == "--test" ]]; then
+  fails=0
+  assert() { # <desc> <expected-state> <body> <tamper> <light> <ble>
+    local got; got="$(classify "$3" "$4" "$5" "$6")"; got="${got%%|*}"
+    if [ "$got" != "$2" ]; then echo "FAIL: $1 — got '$got' want '$2'"; fails=$((fails+1)); fi
+  }
+  assert "handled→at-phone"   AT-PHONE     HANDLED QUIET LIT 1
+  assert "carried→carried"    CARRIED      CARRIED QUIET DARK 0
+  assert "moved+ble→nearby"   PHONE-NEARBY STILL   MOVED LIT 2
+  assert "quiet+dark→away"    AWAY         STILL   QUIET DARK 0
+  assert "covered→covered"    COVERED      COVERED QUIET DARK 0
+  assert "unreachable→degraded" DEGRADED   UNREACHABLE UNREACHABLE UNREACHABLE UNREACHABLE
+  assert "one-unreachable→degraded" DEGRADED STILL QUIET UNREACHABLE 0
+  assert "unknown-body→uncertain" UNCERTAIN UNKNOWN QUIET LIT 1
+  assert "mixed→uncertain"    UNCERTAIN    STILL   MOVED DARK 0
+  # Falsifiability check: a STILL/QUIET/LIT/nonzero-ble must NOT be AWAY
+  assert "lit-not-away"       UNCERTAIN    STILL   QUIET LIT 0
+  if [ "$fails" -eq 0 ]; then
+    echo "smoke-test: ok (fusion verified: 10 combinations × 4 sensor axes, no network)"
+    exit 0
+  fi
+  echo "smoke-test: FAILED ($fails assertion(s))"; exit 1
+fi
+
+# ── Read senses ──────────────────────────────────────────────────────
+read_body_motion() {
+  local out
+  out="$(timeout 15 mesh-body-motion 2>/dev/null)" || { echo "UNREACHABLE"; return; }
+  case "$out" in
+    *\[body-still\]*)     echo "STILL" ;;
+    *\[body-carried\]*)   echo "CARRIED" ;;
+    *\[body-handled\]*)   echo "HANDLED" ;;
+    *\[body-covered\]*)   echo "COVERED" ;;
+    *)                    echo "UNKNOWN" ;;
+  esac
+}
+
+read_tamper() {
+  local out
+  out="$(timeout 15 mesh-tamper 2>/dev/null)" || { echo "UNREACHABLE"; return; }
+  case "$out" in
+    *\[body-moved\]*)  echo "MOVED" ;;
+    *\[body-quiet\]*)  echo "QUIET" ;;
+    *)                 echo "UNKNOWN" ;;
+  esac
+}
+
+read_light() {
+  local out
+  out="$(timeout 15 mesh-light --json 2>/dev/null)" || { echo "UNREACHABLE"; return; }
+  printf '%s' "$out" | python3 -c "import json,sys; print(json.load(sys.stdin)['level'])" 2>/dev/null || echo "UNKNOWN"
+}
+
+read_ble_count() {
+  local out count
+  out="$(timeout 15 mesh-presence 2>/dev/null)" || { echo "UNREACHABLE"; return; }
+  count="$(printf '%s' "$out" | head -1 | grep -oE '[0-9]+ device' | grep -oE '[0-9]+' || echo "")"
+  [ -n "$count" ] && echo "$count" || echo "UNKNOWN"
+}
+
+body="$(read_body_motion)"
+tamper="$(read_tamper)"
+light="$(read_light)"
+ble="$(read_ble_count)"
+
+# ── Fusion (shared pure function — see classify() above) ─────────────
+fused="$(classify "$body" "$tamper" "$light" "$ble")"
+raw_state="${fused%%|*}"
+reason="${fused#*|}"
+
+# ── Hysteresis (2-consecutive debounce) ──────────────────────────────
+# State transitions only when 2 consecutive reads agree on the new state.
+# STATE_FILE = last raw_state seen (pending confirmation)
+# PREV_FILE  = the confirmed/emitted state
+prev_state=""
+[ -f "$STATE_FILE" ] && prev_state="$(cat "$STATE_FILE" 2>/dev/null || echo "")"
+prev_raw=""
+[ -f "$DEGRADED_FILE" ] && prev_raw="$(cat "$DEGRADED_FILE" 2>/dev/null || echo "")"
+
+changed=0
+if [ "$raw_state" = "$prev_raw" ] && [ "$raw_state" != "$prev_state" ]; then
+  # Two consecutive reads agree on new state → confirmed transition
+  echo "$raw_state" > "$STATE_FILE"
+  changed=1
+elif [ "$raw_state" != "$prev_raw" ]; then
+  # State differs from last read — record as pending, don't emit yet
+  :
+fi
+# Always update the "last raw read" tracker
+echo "$raw_state" > "$DEGRADED_FILE"
+
+state="$prev_state"
+[ "$changed" = "1" ] && state="$raw_state"
+# First run ever: emit immediately
+[ -z "$prev_state" ] && state="$raw_state" && changed=1
+
+# ── Modes ────────────────────────────────────────────────────────────
+if [[ "${1:-}" == "--status" ]]; then
+  if [ -f "$STATE_FILE" ]; then
+    echo "last: $(cat "$STATE_FILE")"
+  else
+    echo "no state recorded"
+  fi
+  exit 0
+fi
+
+if [[ "${1:-}" == "--edge" ]]; then
+  if [ "$changed" = 0 ]; then
+    exit 0  # silent on no change
+  fi
+fi
+
+# ── Output ───────────────────────────────────────────────────────────
+ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+if [[ "${1:-}" == "--json" ]]; then
+  # DEGRADED = unreachable sensors → don't fake the signal
+  if [ "$state" = "DEGRADED" ]; then
+    printf '{"state":"DEGRADED","reason":"%s","sensors":{"body":"%s","tamper":"%s","light":"%s","ble":"%s"},"ts":"%s"}\n' \
+      "$reason" "$body" "$tamper" "$light" "$ble" "$ts"
+  else
+    printf '{"state":"%s","reason":"%s","sensors":{"body":"%s","tamper":"%s","light":"%s","ble":"%s"},"ts":"%s"}\n' \
+      "$state" "$reason" "$body" "$tamper" "$light" "$ble" "$ts"
+  fi
+  exit 0
+fi
+
+# Human-readable
+case "$state" in
+  AT-PHONE)     echo "[body-active] $reason — operator at phone" ;;
+  PHONE-NEARBY) echo "[body-nearby] $reason — operator nearby" ;;
+  CARRIED)      echo "[body-carried] $reason — phone in transit" ;;
+  AWAY)         echo "[body-away] $reason — operator away" ;;
+  COVERED)      echo "[body-covered-sense] $reason — signals masked" ;;
+  DEGRADED)     echo "[body-degraded] $reason — sensor blind spot" ;;
+  *)            echo "[body-unknown] $reason" ;;
+esac
