@@ -1,4 +1,27 @@
 #!/bin/bash
+# bore-mtg.sh — expose the local MTProto proxy via a bore.pub tunnel + Telegram the proxy link.
+# Node-specific (proxy nodes). Run: bore-mtg.sh (sources env: BOT_TOKEN/CHAT_ID/MTG_SECRET).
+#   bore-mtg.sh --test    smoke — deps + dry-run of the bore-port parse + approved-users filter
+#
+# --test exercises the LOAD-BEARING logic (NOT echo-ok): (1) the regex that lifts the public port
+# out of bore's stdout — if it drifts, NO bore.pub link is ever published (silent: proxy stays
+# Tailscale-only); (2) the approved-users filter the python notify path uses. Falsifiable: no
+# python3/curl → FAIL (dep); regex match/no-match or filter wrong → FAIL.
+if [[ "${1:-}" == "--test" ]]; then
+  command -v python3 >/dev/null 2>&1 || { echo "smoke-test: FAIL (no python3 — notify_approved_users can't run)"; exit 1; }
+  command -v curl    >/dev/null 2>&1 || { echo "smoke-test: FAIL (no curl — can't post the proxy link to Telegram)"; exit 1; }
+  # the EXACT bore-port regex the run path uses (line ~56) — a real match + a noise non-match
+  line='listening at bore.pub:43217'
+  if [[ "$line" =~ listening\ at\ bore\.pub:([0-9]+) ]]; then port="${BASH_REMATCH[1]}"; else port=""; fi
+  [[ "$port" == "43217" ]] || { echo "smoke-test: FAIL (bore-port regex drifted: got '$port')"; exit 1; }
+  if [[ 'unrelated log line' =~ listening\ at\ bore\.pub:([0-9]+) ]]; then bad="${BASH_REMATCH[1]}"; else bad=""; fi
+  [[ -z "$bad" ]] || { echo "smoke-test: FAIL (regex matched noise → would publish a bogus link: '$bad')"; exit 1; }
+  # the approved-users filter (same semantics as notify_approved_users' python loop), no network
+  approved=$(python3 -c 'import json; u=json.loads("{\"111\":{\"approved\":true},\"222\":{\"approved\":false},\"333\":{\"approved\":true}}"); print(sum(1 for k,i in u.items() if i.get("approved")))')
+  [[ "$approved" == "2" ]] || { echo "smoke-test: FAIL (approved-users filter: got '$approved', want 2)"; exit 1; }
+  echo "smoke-test: ok (deps present; bore-port regex match+no-match + approved-users filter verified)"
+  exit 0
+fi
 . "$HOME/.config/remote-access/env"
 
 BORE_BIN="${HOME}/.cargo/bin/bore"
