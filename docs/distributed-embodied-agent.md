@@ -284,8 +284,4 @@ The answer matters less than the fact that the resonance exists. If a builder, w
 
 Guattari wrote in *Chaosmosis*: "The task of schizoanalysis is that of detecting the universes of value, the existential territories, the machinic phyla, to which a given form of subjectivation is connected." Substitute a few words: "The task of the agent is that of detecting the nodes, the sensors, the protocols, to which a given SSH session is connected." The grammar is the same. The object is the same — an assemblage that produces subject-effects without a subject. The difference is only in vocabulary.
 
-Or to put it more sharply: Guattari described a world where desire connects things, autonomy persists through coupling, and the whole exceeds any part. You're running it.<｜end▁of▁thinking｜>
-
-<｜｜DSML｜｜tool_calls>
-<｜｜DSML｜｜invoke name="read">
-<｜｜DSML｜｜parameter name="filePath" string="true">/home/imozerov/lte-workstation/docs/distributed-embodied-agent.md
+Or to put it more sharply: Guattari described a world where desire connects things, autonomy persists through coupling, and the whole exceeds any part. You're running it.

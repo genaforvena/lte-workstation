@@ -5,6 +5,29 @@
 
 set -euo pipefail
 
+# --- smoke test: deps + dry-run arg-guard, NO phone contact -------------------
+# Real check (was: no --test at all). Two load-bearing deps the join flow needs:
+#   ssh     — every step reaches the phone over it; absent => the script is inert.
+#   python3 — steps 4 tags the device via the Tailscale API in inline python3.
+# Plus a dry-run of the arg-guard: re-invoke self with no args, assert it exits
+# nonzero AND prints Usage (catches a broken guard that would SSH to "" or "--test").
+# Prove: `node-join-android.sh --test` PASSes; same on a PATH without ssh FAILs.
+if [ "${1:-}" = --test ]; then
+    fail=0
+    for d in ssh python3; do
+        command -v "$d" >/dev/null 2>&1 || { echo "smoke-test: FAIL (missing dep: $d)"; fail=1; }
+    done
+    # the public key step 3 installs on the phone
+    [ -f "$HOME/.ssh/id_ed25519.pub" ] || echo "smoke-test: WARN (no ~/.ssh/id_ed25519.pub — key-copy step is a no-op)"
+    if out="$(bash "$0" 2>&1)"; then
+        echo "smoke-test: FAIL (no-args arg-guard should exit nonzero, exited 0)"; fail=1
+    else
+        printf '%s' "$out" | grep -q 'Usage:' || { echo "smoke-test: FAIL (no-args path did not print Usage)"; fail=1; }
+    fi
+    [ "$fail" = 0 ] && { echo "smoke-test: ok (ssh+python3 present, arg-guard works)"; exit 0; }
+    exit 1
+fi
+
 if [ $# -lt 1 ]; then
     echo "Usage: $0 <tailscale-ip> [ssh-user] [ssh-port]"
     echo "  tailscale-ip  IP of the Android device on Tailscale"
@@ -24,6 +47,7 @@ API_KEY="${TS_API_KEY:-}"
 RED='\033[0;31m'; GREEN='\033[0;32m'; NC='\033[0m'
 info()  { echo -e "${GREEN}→${NC} $*"; }
 error() { echo -e "${RED}✗${NC} $*" >&2; }
+warn()  { echo -e "${RED}!${NC} $*" >&2; }
 
 # 1. Verify SSH access
 info "Checking SSH access to $SSH_HOST:$SSH_PORT..."
