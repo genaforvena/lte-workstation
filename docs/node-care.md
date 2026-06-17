@@ -63,7 +63,7 @@ loginctl enable-linger "$(whoami)"
 ```
 
 What happens on power-on: `cron` fires `@reboot` → `mesh-restore` → a fresh hostname-named tmux
-session + the standard loops (`chat`, `snapshot`, **`selfcare`**, and `verifier` where the mission
+session + the standard loops (`chat`, `snapshot`, and **`selfcare`**) where the mission
 file exists). The `*/5` line is a safety net:
 if any loop dies mid-life, it comes back within five minutes. Tailscale is a system service, so the
 node rejoins the mesh on its own.

@@ -46,12 +46,10 @@ Two further gaps between doctrine and the tree as of 2026-06-15 (reality-checked
   credentials actually in use today live as gitignored **runtime** files, not sops ciphertext:
   `~/.mesh/secrets/` (e.g. `tailscale.env`), `~/.config/remote-access/env` (`BOT_TOKEN`),
   `~/.mesh/groq.env`. Populating `secrets/*` with `sops` is the intended next step, not done.
-- **The repo is not currently published.** The "every node clones the public repo and decrypts"
-  path is design intent: the genome is propagated **node-to-node** (the git remote is a peer, e.g.
-  `ilya`, not the public GitHub origin) and pushing to the public origin is deliberately paused for
-  topology-exposure reasons (170+ commits unpushed). "SOPS+age ciphertext is safe to publish" stays
-  true as a *property of the encryption*, but it describes why publishing *would be* safe, not a
-  claim that the repo is being published right now.
+- **The repo IS now published.** Since 2026-06-15 the commits were pushed to the public GitHub
+  origin (`origin/main` == `main`, 0 unpushed). The genome propagation path now includes the
+  public origin alongside node-to-peer remotes. "SOPS+age ciphertext is safe to publish" remains
+  true, and the published state confirms it — no secrets have leaked.
 
 ## Enroll a new node
 
