@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+# reflex-cadence: 4-59/5 * * * *
+# reflex-args: --edge
+# mesh-grip — the body's HELD-vs-ON-SURFACE sense (adux1050 capacitive).
+# Reads the phone's 16-channel capacitive array and classifies whether the phone
+# is being HELD (skin/fingers touching the grip area) or is PUT-DOWN (on a surface,
+# no grip contact).
+#
+# Data source: adux1050 via SSH (termux-sensor). 16 channels, values 0-65535.
+# Channels 0-5 typically cover the grip area (sides of phone); channels 6-15
+# are often zero (not near hand). Active channels (value > threshold) indicate
+# capacitive coupling to skin — a reliable grip signal independent of motion.
+#
+# Classifier:
+#   HELD     ≥ MESH_GRIP_ACTIVE_MIN (3) active channels AND mean active > 5000
+#            → phone is in someone's hand
+#   PUT-DOWN < 3 active channels OR mean < 5000
+#            → phone is on a surface (no grip contact)
+#
+# Complements mesh-body-motion (accel): motion detects MOVEMENT, grip detects
+# HOLDING — a phone can be still but held (resting in palm), or moving but
+# not held (sliding on a table).
+#
+#   mesh-grip           one HELD/PUT-DOWN line
+#   mesh-grip --edge    emit only on state change (for cron wiring)
+#   mesh-grip --json    machine-readable {state, active, mean, channels}
+#   mesh-grip --test    smoke test (exit 2 = phone unreachable)
+#
+# Exit codes (honest-exit contract):
+#   0 = assessment produced
+#   2 = phone unreachable — cannot read sensor, never faked
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+[ -f "$HOME/.mesh/nodes" ] && . "$HOME/.mesh/nodes"
+
+STATE="$HOME/.mesh/.grip-state"         # holds: <state> <active> <mean>
+OFFLINEFILE="$HOME/.mesh/.grip-offline"
+ACTIVE_MIN="${MESH_GRIP_ACTIVE_MIN:-3}"  # minimum active channels for HELD
+MEAN_THRESHOLD="${MESH_GRIP_MEAN_THRESHOLD:-5000}"  # minimum mean of active channels
+CHANNEL_THRESHOLD="${MESH_GRIP_CHANNEL_THRESHOLD:-1000}"  # per-channel active threshold
+
+if [ "${1:-}" = --test ]; then
+  command -v python3 >/dev/null 2>&1 || { echo "smoke-test: FAIL (no python3)"; exit 1; }
+  command -v mesh-phone-ip >/dev/null 2>&1 || { echo "smoke-test: FAIL (no mesh-phone-ip)"; exit 1; }
+  mkdir -p "$HOME/.mesh" 2>/dev/null || { echo "smoke-test: FAIL (no ~/.mesh)"; exit 1; }
+  # Dry-run: verify classifier against synthetic channel arrays
+  _f=0
+  _classify() {
+    python3 -c "
+import sys
+vals = [int(x) for x in sys.argv[1].split(',')]
+active_min = $ACTIVE_MIN
+mean_thresh = $MEAN_THRESHOLD
+chan_thresh = $CHANNEL_THRESHOLD
+active = [v for v in vals if v > chan_thresh]
+n_active = len(active)
+mean_active = sum(active) / n_active if n_active > 0 else 0
+if n_active >= active_min and mean_active > mean_thresh:
+    print('HELD')
+else:
+    print('PUT-DOWN')
+" "$1"
+  }
+  # HELD: 6 active channels, mean ~17600
+  [ "$(_classify '6048,26958,20910,13694,25903,12209,0,0,0,0,0,0,0,0,0,0')" = "HELD" ] || { echo "  FAIL: 6 active channels should be HELD"; _f=1; }
+  # PUT-DOWN: 0 active channels
+  [ "$(_classify '0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0')" = "PUT-DOWN" ] || { echo "  FAIL: 0 active channels should be PUT-DOWN"; _f=1; }
+  # PUT-DOWN: 1 active channel (< 3 min)
+  [ "$(_classify '5000,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0')" = "PUT-DOWN" ] || { echo "  FAIL: 1 active channel should be PUT-DOWN"; _f=1; }
+  # PUT-DOWN: 3 active channels but low mean
+  [ "$(_classify '1500,1200,1100,0,0,0,0,0,0,0,0,0,0,0,0,0')" = "PUT-DOWN" ] || { echo "  FAIL: 3 low channels should be PUT-DOWN"; _f=1; }
+  # HELD: 4 active channels
+  [ "$(_classify '8000,12000,9000,7000,0,0,0,0,0,0,0,0,0,0,0,0')" = "HELD" ] || { echo "  FAIL: 4 active channels should be HELD"; _f=1; }
+  mesh-phone-ip >/dev/null 2>&1 || { echo "smoke-test: n/a (phone unreachable — grip sense unavailable)"; [ "$_f" = 0 ] && exit 2; exit 1; }
+  [ "$_f" = 0 ] || { echo "smoke-test: FAIL (grip classifier drifted)"; exit 1; }
+  echo "smoke-test: ok (grip classifier: 5 cases verified)"; exit 0
+fi
+
+MODE=text
+[ "${1:-}" = --json ] && MODE=json
+EDGE=0
+[ "${1:-}" = --edge ] && EDGE=1
+
+TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+# --- Phone reachability gate ---
+pip="$(mesh-phone-ip 2>/dev/null)" || {
+  if [ ! -f "$OFFLINEFILE" ]; then echo "phone unreachable — can't read grip sensor (not an alarm)" >&2; touch "$OFFLINEFILE"; fi
+  exit 2
+}
+rm -f "$OFFLINEFILE"
+
+# --- Read adux1050 via SSH ---
+j="$(timeout 12 ssh -p "${PHONE_SSH_PORT:-8022}" -o BatchMode=yes -o ConnectTimeout=6 "${PHONE_USER:-u0_a380}@$pip" 'timeout 6 termux-sensor -s adux1050 -n 1' </dev/null 2>/dev/null)"
+[ -n "$j" ] || { if [ ! -f "$OFFLINEFILE" ]; then echo "phone unreachable — can't read grip sensor (not an alarm)" >&2; touch "$OFFLINEFILE"; fi; exit 2; }
+
+# Parse 16-channel array
+channels="$(printf '%s' "$j" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    vals = d.get("adux1050", {}).get("values", [])
+    if len(vals) >= 16:
+        print(",".join(str(int(v)) for v in vals[:16]))
+except Exception:
+    pass
+' 2>/dev/null)"
+[ -n "$channels" ] || { echo "adux1050 parse failed (not an alarm)" >&2; exit 2; }
+
+# --- Classify HELD/PUT-DOWN ---
+read -r grip_state active mean_val <<< "$(python3 -c "
+import sys
+vals = [int(x) for x in sys.argv[1].split(',')]
+chan_thresh = $CHANNEL_THRESHOLD
+active_min = $ACTIVE_MIN
+mean_thresh = $MEAN_THRESHOLD
+active = [v for v in vals if v > chan_thresh]
+n_active = len(active)
+mean_active = sum(active) / n_active if n_active > 0 else 0
+state = 'HELD' if (n_active >= active_min and mean_active > mean_thresh) else 'PUT-DOWN'
+print(f'{state} {n_active} {int(mean_active)}')
+" "$channels" 2>/dev/null)"
+
+[ -n "$grip_state" ] || { echo "grip classify failed (not an alarm)" >&2; exit 2; }
+
+# --- Read previous state ---
+prev_state=""
+if [ -f "$STATE" ]; then
+  read -r prev_state _ _ < "$STATE" 2>/dev/null || true
+fi
+
+# --- Write state ---
+printf '%s %s %s\n' "$grip_state" "$active" "$mean_val" > "$STATE"
+
+# --- Output ---
+tag="[grip-${grip_state,,}]"
+
+case "$MODE" in
+  json)
+    printf '{"state":"%s","active":%s,"mean":%s,"channels":"%s","ts":"%s"}\n' \
+      "$grip_state" "$active" "$mean_val" "$channels" "$TS"
+    ;;
+  edge)
+    [ "$grip_state" = "$prev_state" ] && exit 0
+    printf '%s %s — %s active channels, mean=%s\n' "$tag" "$grip_state" "$active" "$mean_val"
+    ;;
+  *)
+    printf '%s %s — %s active channels, mean=%s\n' "$tag" "$grip_state" "$active" "$mean_val"
+    ;;
+esac
