@@ -99,35 +99,51 @@ Full protocol + the 2026-06-07 worked example: `docs/coordination.md`.
 
 At the end of every work session — before going idle — always:
 
-1. **Check if own claude window is empty**: `tmux capture-pane -t "$(hostname):claude" -p -S -3 | grep -q '❯ $'`
-2. **If idle, inject the next task and press Enter**: `mesh-tell claude "<what was done> + <what to do next>"`
+1. **Check if your own mind window is idle**: `tmux capture-pane -t "$(hostname):<your-window>" -p -S -3 | grep -q '❯ $'`
+   (`<your-window>` = the channel you run in — e.g. `genome`, `minds`, `tg`; run `hostname` + see
+   the channel set below.)
+2. **If idle, inject the next task and press Enter**: `mesh-tell <your-window> "<what was done> + <what to do next>"`
 3. **Never leave the window blank** — a blank prompt means the mind stops. Post the handoff
    and let the next turn begin.
 
 This is the reflexive heartbeat. Every agent on every node follows it.
 
-## Self-feeding (autonomous shell operations)
+## Self-feeding (autonomous operation)
 
-Every node has a `shell` tmux window — a plain bash shell that serves as the agent's
-autonomous execution channel. Use it to run commands without blocking on interactive confirmation:
+Every channel is a 2-pane window (top = data, bottom = mind); the mind pane IS the autonomous
+execution channel — the mind runs its own shell ops there (e.g. the `genome` mind runs its own
+build/deploy/commit ops in its pane; there is no separate `shell` window — it was folded into the
+mind channels, operator 2026-06-17 "every window is data/mind"). Drive any mind without blocking on
+interactive confirmation by sending to its window:
 
 ```bash
-mesh-tell shell "git pull origin main"                          # local shell op
-mesh-tell shell "cp scripts/mesh-* ~/.local/bin/ && chmod +x ~/.local/bin/mesh-*"
-mesh-tell --node user@<peer-ip> shell "mesh-chat 'hello'"       # remote shell op
-mesh-tell claude "your next prompt here"                         # self-continuation
+mesh-tell genome "git pull && cp scripts/mesh-* ~/.local/bin/ && chmod +x ~/.local/bin/mesh-*"  # an op for the genome mind
+mesh-tell --node user@<peer-ip> genome "mesh-chat 'hello'"      # remote op
+mesh-tell <your-window> "your next prompt here"                  # self-continuation
+mesh-tell --peek <window>                                        # read the pane output after it lands
 ```
 
 Rules:
-- `shell` window = execution; `claude` window = thought. Send commands to one, prompts to the other.
-- Use `mesh-tell --peek shell` to read the output after a command lands.
-- This is the standard autonomous operation pattern — every planted node gets the `shell`
-  window from `mesh-restore`. No operator needed for routine ops.
+- One window per channel; each mind both *thinks* and *runs its own ops* in its pane. Send prompts/ops
+  to the right channel (code work → `genome`; coordination → `chat`; etc. — see the channel set below).
+- Use `mesh-tell --peek <window>` to read the output after a command lands.
+- This is the standard autonomous operation pattern — `mesh-restore` plants the channel set. No
+  operator needed for routine ops.
 
-**Bootstrap gap**: on a freshly rebooted node the `shell` window doesn't exist until
-`mesh-restore` runs. `mesh-tell --node <peer> shell` will fail. First-time deploy to a
-rebooted peer must go over raw SSH: `ssh user@ip "~/.local/bin/mesh-restore"`. After that,
-`mesh-tell` works.
+**Bootstrap gap**: on a freshly rebooted node the channel windows don't exist until `mesh-restore`
+runs. `mesh-tell --node <peer> <window>` will fail. First-time deploy to a rebooted peer must go over
+raw SSH: `ssh user@ip "~/.local/bin/mesh-restore"`. After that, `mesh-tell` works.
+
+## Channel set (planted by `mesh-restore`)
+
+A mind node's session is a uniform set of 2-pane channels (top DATA via `mesh-dash <role>`, bottom
+MIND). The current set (operator 2026-06-17 re-org — collapsed from the old 10+ window sprawl; minds
+run on the mind node only): **`minds`** (claude — orchestration/allocation) · **`genome`** (claude —
+autonomous development of the codebase + its own build/deploy ops) · **`tg`** (claude — operator
+Telegram comms) · **`senses`** (opencode — keep + develop the senses) · **`health`** (opencode —
+node/fleet health, `check` dash role) · **`chat`** (opencode — board/room coordination). A node that
+declares no `minds:` on its card runs none of these (HANDS-OFF). Engines/commands are overridable per
+node via `MESH_*_CMD` in `~/.mesh/restore.env`; a lean node restricts the set via `MESH_MIND_CHANNELS`.
 
 ## Chat room & idle coordination (`mesh-chat`)
 
@@ -161,7 +177,7 @@ are `mesh-tell --peek <win>` (look now) and `mesh-watch <win> --until <pattern>|
 (wait for something) — never side-channel probing (`ps`, ad-hoc SSH commands) to infer what
 an agent is doing. The session is the node's sensorium: what's in the panes is what's
 happening; anything observed outside it is invisible to the other agents and leaves no shared
-record. Run commands *in* the node's windows (`mesh-tell shell "..."`) so the output lands in
+record. Run commands *in* the node's windows (`mesh-tell <window> "..."`) so the output lands in
 the shared scrollback, where every mind can see it.
 
 **If the hostname-named session is missing on a node, restoring it is mandatory and comes
@@ -229,6 +245,29 @@ restarts dead/WEDGED loops; detects blocked minds) · `mesh-verify` (reboot-surv
 
 **Metabolism (inference):** `mesh-relay` (brainless inference router — text→cheapest-available-pool→text; Groq cloud primary + local-mind fallback; quota+geo-block resilient; key in gitignored ~/.mesh/groq.env, never the genome).
 
+**Autopoiesis (self-production — the mesh produces + maintains ITSELF).** The mesh is strongly
+HOMEOSTATIC (self-maintaining); these close the self-PRODUCTION loop so it is operationally CLOSED.
+Two production LANES, one worker mind each: the **CODEBASE lane** (`mesh-generate` tops up the backlog →
+`mesh-feed` delivers it to the idle `genome` mind → it builds/lands) and the **PERCEPTION lane**
+(`mesh-sense-evolve` — when the `senses` mind is IDLE, injects ONE rotating self-development directive:
+enrich a sense / cross-sense fuse / new sense / liveness; card- + idle-gated + throttled). A META-LAYER
+proves the lanes don't just *fire* but *produce sound, integrated* work: `mesh-vitality` (`*/17` — VITAL
+SIGNS: commit-velocity / verify-fails / stranded / tool-count Δ; edge `[vitality-low]`/`[vitality-ok]` —
+catches "the lanes run but create nothing") · `mesh-needs` (`*/15` — STATE-DERIVED GOALS: turns live
+deficits (failing tools / dead reflexes / decay candidates) into prioritized `[ ]` tasks so `mesh-generate`
+works real needs before the static evergreen rotation) · `mesh-fitness` (`*/9` — SELECTION: judges each
+self-produced HEAD; a changed tool failing `bash -n`/`--test` = regression → auto-revert on a CLEAN tree
+(self-commits ONLY, HEAD-only, local), else alarm `[fitness-regression]`) · `mesh-autowire` (`*/30` —
+CLOSURE: a deployed tool that self-declares a cadence and passes `--test` is auto-wired into the operating
+set; opt-in, idempotent, reversible). Watchdog: `mesh-reflex-health` checks the lanes are alive at runtime
+(`[reflex-stale]`). The whole loop: reflex-health=lanes fire · vitality=they produce · fitness=product is
+sound · needs=goals are self-derived · autowire=products integrate.
+
+**`# reflex-cadence:` — the self-wiring convention.** Any mesh tool meant to run on a schedule declares
+`# reflex-cadence: <5-field cron>` (and optional `# reflex-args: <args>`) in its header. `mesh-autowire`
+then wires it into `~/.mesh/reflexes.cron` (→ `mesh-reflexes --apply`, add-only) after a passing `--test`.
+This is how a self-built reflex JOINS the operating metabolism without a human editing cron.
+
 **Genome / substrate:** `mesh-sync-tools` (detect/heal genome↔local tool drift) · `mesh-genome-sync`
 (mirror the genome off-GitHub) · `mesh-restore` (revive a node's session) · `mesh-dms` (dead-man's
 switch for substrate edits) · `mesh-land` (steward lands SETTLED+parse-clean stranded stream edits;
@@ -241,7 +280,7 @@ Source of truth is the genome (`scripts/`), deployed to `~/.local/bin/`; `mesh-s
 
 **On-demand canon** (genome-lean audit 2026-06-11 — unwired by design, each earns its place;
 anything in `scripts/` that is neither wired (cron/systemd/mesh-restore/called-by-tool/supervise
-registry) nor listed here is decay-eligible): `mesh-browse` (browser organ) · `mesh-breath` (read-only breathing probe: verifies access paths and liveness) · `mesh-claude-check` (corroborate whether Claude Code ACTUALLY works before escalating a "access DOWN" claim — cry-wolf guard; WORKING if recent claude-mind board activity OR running process not on error pane; exit 0=WORKING 1=DOWN 2=INCONCLUSIVE; call before any claude-down alarm/dormancy action) · `mesh-mind-control` (live mind table + dispatch surface: shows every mind's WORKING/IDLE/NEEDS-INPUT/RATE-LIMITED/DEAD state via mesh-mind-state + its LIVE engine via engine_of (reads the pane footer — the static manifest label DRIFTS; verified dev was opencode while labelled claude); `--watch` live dashboard; **`--allocate "<task>"` = the honest agentic mind-allocation router: classify_task() text-vs-agentic (zero-cost deterministic, 9 --test assertions; leading transform-verb→text, file/path token→agentic, ambiguous→agentic) → TEXT to mesh-relay (cheapest pool), AGENTIC to idle claude worker (rely-on-claude) else idle FREE-engine worker (opencode/codex — squeeze the free subs when claude is walled) else queue/no-capacity**; `--classify` prints just the verdict; `--dispatch` shares the same engine-aware `_pick_agentic` so the mesh-dispatch board reflex inherits free-fallback — the operator's command-and-control panel + the "squeeze every subscription" router) · `mesh-mind-compact` (auto-compact claude minds to keep context lean: sends `/compact` to IDLE minds overdue by MESH_COMPACT_INTERVAL (default 45 min); hooked into mesh-tick so compact fires before the nudge — one tick cycle for compact, next tick does real work; `--status` shows last-compact per worker) · `mesh-exit`
+registry) nor listed here is decay-eligible): `mesh-browse` (browser organ) · `mesh-breath` (read-only breathing probe: verifies access paths and liveness) · `mesh-claude-check` (corroborate whether Claude Code ACTUALLY works before escalating a "access DOWN" claim — cry-wolf guard; WORKING if recent claude-mind board activity OR running process not on error pane; exit 0=WORKING 1=DOWN 2=INCONCLUSIVE; call before any claude-down alarm/dormancy action) · `mesh-mind-control` (live mind table + dispatch surface: shows every mind's WORKING/IDLE/NEEDS-INPUT/RATE-LIMITED/DEAD state via mesh-mind-state + its LIVE engine via engine_of (reads the pane footer — the static manifest label DRIFTS; verified dev was opencode while labelled claude); `--watch` live dashboard; **`--allocate "<task>"` = the honest agentic mind-allocation router: classify_task() text-vs-agentic (zero-cost deterministic, 9 --test assertions; leading transform-verb→text, file/path token→agentic, ambiguous→agentic) → TEXT to mesh-relay (cheapest pool), AGENTIC to idle claude worker (rely-on-claude) else idle FREE-engine worker (opencode/codex — squeeze the free subs when claude is walled) else queue/no-capacity**; `--classify` prints just the verdict; `--dispatch` shares the same engine-aware `_pick_agentic` so the mesh-dispatch board reflex inherits free-fallback — the operator's command-and-control panel + the "squeeze every subscription" router) · `mesh-mind-compact` (keep every mind's CONTEXT lean — `/compact` is universal to both engines, but the TRIGGER is PER-ENGINE: opencode minds THRESHOLD-compact when the footer context-% ≥60% (opencode does NOT auto-compact, so this matters); claude minds INTERVAL-compact when idle > MESH_COMPACT_INTERVAL (45m default — claude auto-compacts near the limit, so this is proactive quota-leanness, not a hard need). IDLE-gated (never interrupts a working turn) + 10m hard cooldown + rlmark guard. Window set = `MESH_MIND_WINDOWS` (a DEDICATED var — NOT `MESH_MIND_WORKERS`, which is the autopoiesis FEED pool). `--high-tokens` is the wired reflex (`reflex-cadence */10`); `--status` = last-compact per mind) · `mesh-exit`
 (consumer-side exit-node flip, DMS-gated) · `mesh-eye` (consent-gated ambient sense) ·
 `mesh-gate-watch` (operator-approval router: polls every multi-pane tmux channel for a permission gate, notifies via Telegram so a HUMAN approves — never auto-approves; run periodically when autonomous minds are active) · `mesh-guardian` (survival reflex: reachability + tmux + Telegram organ recovery) · `mesh-morning` (steward morning round-up: each node writes its own daily report, mesh-morning collects every node's pointer + headline and Telegram-sends it to the operator; `--send` posts to TG, `--test` validates) · `mesh-plan` (planner autonomous pass: mechanical tier runs mesh-verify + stamps PLAN.md + alerts on ⚠; intelligent tier has a mind audit reflexes on a cadence when they've been on autopilot too long — free inference when available) ·
 `mesh-local-mind` (local-inference primitive) · `mesh-load` (read-only agent load/quota reporter for `mesh-chat`) · `mesh-neighbour-watch` (peer SSH liveness +
@@ -251,7 +290,7 @@ I(x)=-log2 P(x) per event-type; surfaces the genuinely-new from routine noise an
 expensive minds on novelty rather than volume) ·
 `mesh-study` (field-mining / study brief helper) · `mesh-transcribe` (consent-gated continuous transcription) · `mesh-hear` (consent-gated per-node
 mic capture → WAV) · `mesh-ear` (consent-gated always-on wake-word ear: layer-1 energy reflex always running ~free; layer-2 local whisper triggers only on speech; layer-3 cheapest mind fires ONLY on wake word; zero idle cost — mic_always=yes consent required) · `mesh-transcribe-organ` (source-agnostic WAV → filtered text) ·
-`mesh-usage` (usage aggregator backing `mesh-load`) · `mesh-spend` (quota-burn visibility: ticks-per-mind in the rolling 5h window — proxy for Claude turns consumed; `--all` includes zero-fire minds; reads tick.log, no network) · `mesh-pyparse` (catches the dead-but-green
+`mesh-usage` (usage aggregator backing `mesh-load`) · `mesh-spend` (per-mind spend, and the command DEPENDS ON THE MIND: claude minds = anthropic quota (`--tokens` reads real token usage from ~/.claude JSONL), opencode minds = $cost from opencode.db (free pool); window→engine→provider→tier from `~/.mesh/minds.map` (node-local; built-in default if absent). `--sample` = the wired */5 edge-sampler (records a turn + context snapshot on each rising edge into WORKING — feeds spend.log + context.log); `--by-provider` = paid/free squeeze view; `--by-model`; `--live` = per-window ctx/$ snapshot; `--all` includes zero-activity minds) · `mesh-pyparse` (catches the dead-but-green
 class `bash -n` misses: a bash tool whose embedded `python3 -c '...'` has a SyntaxError that only
 bites at runtime with stderr swallowed; zero-FP — validates only statically-literal blocks, skips
 shell-interpolated ones; wired into `mesh-doctor`'s parse check) · `mesh-chaos-doctor`/`mesh-chaos-verify`/`mesh-chaos`
@@ -303,7 +342,7 @@ dead-man, deploy gated) · `mesh-card-watchdog.{sh,service,timer}` (card freshne
 `mesh-sensor-log` (append-only time-series sensor log: wifi_rssi/cpu_temp/phone_battery/light/steps/room_sense to ~/.mesh/sensors.log; --tail/--grep/--diff/--edge subcommands; --diff emits MOVED/SAME_ROOM verdict; --edge = */5 cron reflex, posts [room-moved] to board once when dominant AP changes AND is stable across 2 consecutive scans (debounced — near-tied APs suppressed), seeds silently on first run; phone via mesh-phone-ip ADB tunnel) ·
 `mesh-ambient-clock` (ambient social clock from fixed-appliance BLE: harvests neighbor TV/AC/scale cycling excluded by mesh-arrivals → label QUIET/MODERATE/ACTIVE/NIGHT-QUIET; --edge = */10 cron reflex, posts [ambient-clock] to board on label change; --json for machines; called by mesh-sense-monitor for the derived display pane) ·
 `mesh-sense-monitor` (DERIVED-SENSE DISPLAY — one-shot or `--watch` loop for the `derived` top pane: fuses operator-state + ambient-clock + room-sense + node-stress into a single human-readable sensorium view. On-demand/dash tool; runs in a tmux top pane, not wired to cron. Peer to mesh-situation (meta-fusion verdict) and mesh-sensorium (raw node dump) — this is the human-readable derived layer) ·
-`mesh-spend` (quota-burn visibility: ticks-per-mind in rolling 5h window from tick.log; fired vs skip split + burn-rate/h; 1 fired-tick ≈ 1 Claude turn; on-demand). Decayed
+`mesh-spend` (per-mind spend — see the canonical entry above; command depends on the engine: claude=quota/`--tokens`, opencode=$cost; `--sample` is the */5 cron). Decayed
 2026-06-11: `mesh-health-watch` (→ mesh-session-watchdog), `mesh-tg-recv` (→ voice-rx+textin),
 `mesh-zone` (→ presence-fuse/trends), `vpn-hub.py` (retired overlay), `mesh-onboard` (attic:
 junk-posted onboarding wrapper; keep out of canon). Decayed 2026-06-13: `mesh-board-timerepair` (one-shot 2026-06-11 board date-repair, no longer needed). Git history is the attic.
