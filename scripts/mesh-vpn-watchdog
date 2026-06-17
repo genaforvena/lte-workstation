@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# reflex-cadence: */2 * * * *
+# mesh-vpn-watchdog — keep a friend-facing WireGuard SERVER's peer set ALWAYS LIVE.
+#
+# The failure this exists for (phaedra, 2026-06-16): a wg0.conf edit silently DROPPED 4 of 6
+# [Peer] blocks, so 4 client configs existed on disk but were not loaded peers → "VPN down for
+# all clients", and nothing noticed for ~a day. This reconciles the GROUND TRUTH (each
+# /etc/wireguard/clients-*.conf) against the live interface AND the on-disk wg0.conf, re-adding any
+# client that has gone missing, and brings the interface up if it is down. Non-client peers already
+# present (e.g. a home/relay peer with no clients-*.conf) are PRESERVED — reconcile is ADD-only.
+#
+# Self-heals with `wg syncconf` (no interface teardown → live sessions keep their handshake).
+# Edge-quiet: logs + alerts ONLY when it actually repairs something.
+#
+# No-op (exit 0) on any node that is not a VPN server (no clients-*.conf) — safe to ship in the
+# genome and wire everywhere; only a server node does work.
+#
+#   mesh-vpn-watchdog          reconcile + heal (cron mode)
+#   mesh-vpn-watchdog --check  report drift, change NOTHING (exit 1 if drift)
+#   mesh-vpn-watchdog --test   smoke test (no system change, no alert)
+#
+# Exit: 0 = healthy or healed · 1 = drift found (--check) · 2 = cannot operate (no wg / not root)
+set -uo pipefail
+export PATH="/usr/sbin:/usr/bin:/sbin:/bin:$HOME/.local/bin:$PATH"
+WG_IF="${MESH_WG_IF:-wg0}"
+WG_DIR="${MESH_WG_DIR:-/etc/wireguard}"
+CONF="$WG_DIR/$WG_IF.conf"
+LOG="$HOME/.mesh/vpn-watchdog.log"
+MODE="${1:-cron}"
+
+log(){ mkdir -p "$HOME/.mesh" 2>/dev/null; printf '%s %s\n' "$(date -u +%FT%TZ)" "$1" | tee -a "$LOG" >&2; }
+
+# --- smoke test: exercises the pubkey-derivation + peer-block builder with NO system change ---
+if [ "$MODE" = --test ]; then
+  command -v wg >/dev/null 2>&1 || { echo "smoke-test: FAIL (no wg binary)"; exit 1; }
+  # a throwaway keypair → derive pub → build a peer block → assert it round-trips
+  k=$(wg genkey 2>/dev/null) || { echo "smoke-test: FAIL (wg genkey)"; exit 1; }
+  p=$(printf '%s' "$k" | wg pubkey 2>/dev/null) || { echo "smoke-test: FAIL (wg pubkey)"; exit 1; }
+  case "$p" in *=) :;; *) echo "smoke-test: FAIL (pubkey not base64: $p)"; exit 1;; esac
+  blk=$(printf '[Peer]\nPublicKey = %s\nAllowedIPs = 10.66.66.99/32\n' "$p")
+  printf '%s' "$blk" | grep -qxF "PublicKey = $p" || { echo "smoke-test: FAIL (peer block malformed)"; exit 1; }
+  echo "smoke-test: ok (no-op on non-server: $( [ -n "$(ls "$WG_DIR"/clients-*.conf 2>/dev/null)" ] && echo 'this IS a server' || echo 'this is NOT a server')); pubkey derivation + block builder verified"
+  exit 0
+fi
+
+# --- not a VPN server? clean no-op. ---
+set -- "$WG_DIR"/clients-*.conf
+[ -e "$1" ] || { exit 0; }
+CLIENTS=("$@")
+
+# --- need root + wg to operate ---
+[ "$(id -u)" = 0 ] || { log "[vpn-watchdog] cannot operate: not root"; exit 2; }
+command -v wg >/dev/null 2>&1 || { log "[vpn-watchdog] cannot operate: no wg binary"; exit 2; }
+
+CHECK=0; [ "$MODE" = --check ] && CHECK=1
+repaired=""; drift=""
+
+# --- 1. interface up? ---
+iface_up=1
+if ! wg show "$WG_IF" >/dev/null 2>&1; then
+  iface_up=0; drift="iface-down"
+  if [ "$CHECK" = 0 ]; then
+    if wg-quick up "$WG_IF" >/dev/null 2>&1; then repaired="iface-up"; log "[vpn-watchdog] $WG_IF was DOWN → wg-quick up OK";
+    else log "[vpn-watchdog] $WG_IF DOWN and wg-quick up FAILED"; exit 2; fi
+  fi
+fi
+
+# --- 2. reconcile every client config into the on-disk conf + live interface (ADD-only) ---
+running="$(wg show "$WG_IF" peers 2>/dev/null || true)"
+conf_changed=0
+for c in "${CLIENTS[@]}"; do
+  name=$(basename "$c" .conf)
+  pub=$(sed -n 's/^[[:space:]]*PrivateKey[[:space:]]*=[[:space:]]*//p' "$c" | head -1 | wg pubkey 2>/dev/null)
+  aip=$(sed -n 's/^[[:space:]]*Address[[:space:]]*=[[:space:]]*//p' "$c" | head -1 | sed 's#/[0-9]*##; s/,.*//')
+  [ -z "$pub" ] && { log "[vpn-watchdog] WARN $name: could not derive pubkey — skipping"; continue; }
+  [ -z "$aip" ] && { log "[vpn-watchdog] WARN $name: no Address — skipping"; continue; }
+
+  # missing from the persistent conf?
+  if ! grep -qF "$pub" "$CONF" 2>/dev/null; then
+    drift="${drift:+$drift }conf-missing:$name"
+    if [ "$CHECK" = 0 ]; then
+      if [ "$conf_changed" = 0 ]; then cp -a "$CONF" "$CONF.pre-watchdog.$(date -u +%Y%m%dT%H%M%SZ)" 2>/dev/null; fi
+      printf '\n[Peer]\n# %s (re-added by mesh-vpn-watchdog)\nPublicKey = %s\nAllowedIPs = %s/32\n' "$name" "$pub" "$aip" >> "$CONF"
+      conf_changed=1; repaired="${repaired:+$repaired }conf:$name"
+      log "[vpn-watchdog] $name MISSING from $CONF → re-added [Peer] ($aip)"
+    fi
+  fi
+  # present in conf but not on the live interface?
+  if ! printf '%s\n' "$running" | grep -qxF "$pub"; then
+    drift="${drift:+$drift }live-missing:$name"
+    [ "$CHECK" = 0 ] && repaired="${repaired:+$repaired }live:$name"
+  fi
+done
+
+# --- 3. apply to the live interface without teardown (preserves existing handshakes) ---
+if [ "$CHECK" = 0 ] && { [ "$conf_changed" = 1 ] || printf '%s' "$repaired" | grep -q 'live:'; }; then
+  if wg syncconf "$WG_IF" <(wg-quick strip "$WG_IF") 2>/dev/null; then
+    log "[vpn-watchdog] syncconf applied — live peers now: $(wg show "$WG_IF" peers | wc -l)"
+  else
+    log "[vpn-watchdog] syncconf FAILED"; exit 2
+  fi
+fi
+
+# --- 4. report / alert (edge-only: only when something was actually repaired) ---
+if [ "$CHECK" = 1 ]; then
+  [ -n "$drift" ] && { echo "vpn-watchdog: DRIFT — $drift"; exit 1; }
+  echo "vpn-watchdog: ok ($(wg show "$WG_IF" peers | wc -l) live peers, ${#CLIENTS[@]} client configs)"; exit 0
+fi
+
+if [ -n "$repaired" ]; then
+  msg="[vpn-watchdog] $(hostname): RESTORED friend-VPN peers — $repaired (was a silent drop; now $(wg show "$WG_IF" peers | wc -l) live peers)"
+  command -v mesh-chat >/dev/null 2>&1 && mesh-chat "$msg" >/dev/null 2>&1 || true
+  command -v mesh-tg   >/dev/null 2>&1 && mesh-tg "🔧 $msg" >/dev/null 2>&1 || true
+  log "$msg"
+fi
+exit 0
