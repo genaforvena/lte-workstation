@@ -32,9 +32,10 @@ on the Redmi 10, 2026-06-12 after the F-Droid reinstall: termux-api 0.59.1, 83 c
   - **Wired actuator organ** `mesh-act <vibrate|torch|notify|ir|led> [args]` — the mesh's
     physical-world actuators beyond audio (the *hand* to the senses). `vibrate [ms]` / `torch
     [on|off|N]` / `notify <msg>` were proven by felt/seen effect (operator-consented 2026-06-13,
-    memory `actuator-consent-2026-06-13`); `ir <freqHz> <pattern>` is gated behind its own
-    subcommand (it drives real devices — needs a target appliance + IR codes; transmit path built,
-    real-device effect unproven); `led <color> <action>` controls the router's blue/white LEDs
+    memory `actuator-consent-2026-06-13`); `ir <device> <command>` looks the pulse pattern up from
+    `~/.mesh/ir-codes.conf` (legacy `ir <freqHz> <pattern>` still accepted) and is gated behind its
+    own subcommand (it drives real devices — needs a target appliance + IR codes; transmit path
+    built, real-device effect unproven); `led <color> <action>` controls the router's blue/white LEDs
     (on/off/flash) via sysfs — a visible in-room signal. `--test` is the reachability gate
     (exit 2 = unreachable, NO fire); honest-organ — an unreachable phone is never a successful
     actuation.
