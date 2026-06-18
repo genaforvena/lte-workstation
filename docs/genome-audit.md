@@ -17,8 +17,8 @@ All findings below are **historical** — resolved via the refactor that followe
   node-specific topology lives in `CLAUDE.local.md` (gitignored). PROGRESS.md changelog entries
   retain hostnames (historical record — acceptable).
 - ~~**bootstrap.sh**: default `PEER` defaults to our IP.~~
-  → **RESOLVED: `bootstrap.sh` no longer contains a hardcoded default.** Parameterized via
-  `MESH_PEER` env / explicit argument.
+   → **RESOLVED: `bootstrap.sh` (repo root) no longer contains a hardcoded default.** Parameterized via
+   `MESH_PEER` env / explicit argument.
 
 ## The split (generic SKELETON vs node-local CONFIG — implemented)
 1. **Node registry → config, not code.** `~/.mesh/nodes` (gitignored) + `nodes.example` exist.
@@ -41,3 +41,12 @@ Re-run `rg -c '100\.(7[0-9]|[89][0-9]|1[01][0-9]|12[0-5])\.[0-9]{1,3}\.[0-9]{1,3
 
 Status: AUDIT findings resolved. Verified zero hardcoded IPs/usernames in scripts (2026-06-16).
 Re-check if new scripts are added.
+
+## Post-audit drift (2026-06-18 re-check)
+
+- **`scripts/mesh-say`**: `MAC_HOST` and `MAC_CHAIN` had hardcoded IPs (`192.168.8.214`, `100.73.170.56`).
+  → **FIXED**: resolved via `mesh-peer-addr mac` + `tailscale status --self` dynamically.
+- **`scripts/mesh-breath`**: `--test` fixture used our real IPs as test data (`100.73.170.56`,
+  `38.49.216.141`, `192.168.8.146`).
+  → **FIXED**: replaced with RFC 5735 documentation IPs (`203.0.113.0/24`, `198.51.100.0/24`).
+  Test assertions updated accordingly.
