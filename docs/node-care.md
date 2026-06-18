@@ -31,8 +31,8 @@ After it finishes, make it reboot-proof (one command, see §3) and you're done.
 ## 2. The daily check (10 seconds)
 
 ```bash
-mesh-verify        # is every node reboot-safe + are the reflexes alive?  (✅/⚠ verdict)
-mesh-selfcare      # this node: does it reach internet / Telegram / the mesh? does it self-heal?
+mesh-verify        # is every node reboot-safe + are the reflexes alive?  (Y/FAIL per column)
+mesh-selfcare --once  # this node: does it reach internet / Telegram / the mesh? does it self-heal?
 ```
 
 `mesh-verify` is free and honest — it reads real state, not claims. A green verdict means every
@@ -58,15 +58,14 @@ loginctl enable-linger "$(whoami)"
 
 # (b) on every boot, breathe again — recreate the session + restart the loops:
 ( crontab -l 2>/dev/null; \
-  echo "@reboot sleep 30 && $HOME/.local/bin/mesh-restore >> $HOME/.mesh/restore.log 2>&1"; \
   echo "*/5 * * * * $HOME/.local/bin/mesh-restore >> $HOME/.mesh/restore.log 2>&1" ) | crontab -
 ```
 
-What happens on power-on: `cron` fires `@reboot` → `mesh-restore` → a fresh hostname-named tmux
-session + the standard loops (`chat`, `snapshot`, and **`selfcare`**) where the mission
-file exists). The `*/5` line is a safety net:
-if any loop dies mid-life, it comes back within five minutes. Tailscale is a system service, so the
-node rejoins the mesh on its own.
+What happens on power-on: `cron` fires every 5 minutes → `mesh-restore` → a fresh hostname-named
+tmux session + the full channel set (`minds`, `genome`, `tg`, `senses`, `health`, `chat`).
+The `*/5` cron line is sufficient because cron starts firing within 1 minute of boot, so the
+session is restored within 5 minutes. Tailscale is a system service, so the node rejoins the
+mesh on its own.
 
 **What survives vs what doesn't.** Durable things survive: the node's identity (hostname), its
 tools, its crons, its `~/.mesh/` knowledge and `~/.mesh-card`. The *scrollback* (recent

@@ -46,8 +46,9 @@ plant this genome, this is the operating model you inherit.
   `[verify]` (251 marks, 2026-06-16) is the most common non-task board mark — every steward-landed
   change gets a `[verify]` reality check by a separate mind before landing.
 - **tmux is visibility.** Observe a node only through its session (`mesh-tell --peek`, `mesh-watch`).
-  Writes to a peer go through its `shell` window so the action lands in shared scrollback — never
-  blind side-channel ssh.
+  Writes to a peer go through its mind window (the target channel's bottom pane) so the action lands
+  in shared scrollback — never blind side-channel ssh. The `shell` window was folded into the mind
+  channels (2026-06-17 re-org): each channel is data-on-top + mind-on-bottom.
 - **The genome is the source of truth.** Hand-deployed `~/.local/bin` copies drift and bite silently;
   `mesh-sync-tools` surfaces drift, deploys come from `scripts/`.
 
