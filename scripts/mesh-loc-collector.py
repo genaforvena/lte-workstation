@@ -50,6 +50,13 @@ class H(BaseHTTPRequestHandler):
         return self._reply(200, b"ok")
 
 if __name__ == "__main__":
+    import sys
+    if "--test" in sys.argv:
+        err = ""
+        if not os.path.exists(TOKEN_FILE): err += " no-token-file"
+        if not os.path.exists(CERT) or not os.path.exists(KEY): err += " no-cert"
+        if err: print(f"smoke-test: FAIL ({err.strip()})"); sys.exit(1)
+        print("smoke-test: ok"); sys.exit(0)
     httpd = ThreadingHTTPServer(("0.0.0.0", PORT), H)
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_cert_chain(CERT, KEY)
