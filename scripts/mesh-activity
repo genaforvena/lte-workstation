@@ -1,0 +1,209 @@
+#!/usr/bin/env bash
+# mesh-activity — local 3-sense fusion: ambient-level (mic) + room-sense + BLE presence
+# Answers: is this space actively being used right now?
+# Combines sound level + occupancy detection + device proximity into a 5-level activity gradient.
+#
+# Usage:
+#   mesh-activity              one-shot verdict to stdout
+#   mesh-activity --edge       only emit when verdict changes (for cron wiring)
+#   mesh-activity --json       machine-readable JSON
+#   mesh-activity --test       smoke test
+#
+# Signals (all best-effort, degrade gracefully):
+#   ambient-level (IdeaPad mic, LOCAL):  SILENCE/QUIET/MODERATE/LOUD
+#   room-sense (local+phone):            PRESENT/EMPTY/UNCERTAIN
+#   BLE presence (IdeaPad-local):        named devices at rssi > -82 → count
+#
+# Fusion — 5-level activity gradient:
+#   IDLE      = quiet/silent + room empty + no nearby devices
+#   AMBIENT   = quiet/silent + room present OR devices nearby (TV/AC on, nobody active)
+#   MODERATE  = sound detected + room present (someone here, low activity)
+#   ACTIVE    = loud sound + room present (someone here, active)
+#   UNCERTAIN = signals conflict or critical input unreachable
+#
+# Why this matters: mesh-room-sense says PRESENT/EMPTY (binary), mesh-situation
+# says NOMINAL/ALERT (security posture). This says HOW the space is being used.
+# UNREACHABLE ≠ IDLE: a missing signal renders UNCERTAIN, never silent all-clear.
+#
+# Exit codes:
+#   0 = verdict assessed (may be UNCERTAIN)
+#   2 = cannot assess at all (all signals unreachable)
+
+set -euo pipefail
+
+STATE_DIR="${MESH_STATE_DIR:-$HOME/.mesh}"
+STATE="$STATE_DIR/.activity.state"
+PENDING="$STATE_DIR/.activity.pending"
+MODE="oneshot"
+EDGE_WINDOW=2
+
+for arg in "$@"; do
+  case "$arg" in
+    --edge) MODE=edge ;;
+    --json) MODE=json ;;
+    --test) MODE=test ;;
+  esac
+done
+
+mkdir -p "$STATE_DIR"
+
+# --- Fusion engine ---
+_fuse() {
+  local am="$1" rm="$2" bc="$3"
+
+  # All unreachable → cannot assess
+  if [ "$am" = "UNKNOWN" ] && [ "$rm" = "UNKNOWN" ] && [ "$bc" = "0" ]; then
+    verdict="UNCERTAIN"; reason="all signals unreachable"; return 2
+  fi
+
+  # IDLE: quiet/silent + empty + no devices
+  if { [ "$am" = "SILENCE" ] || [ "$am" = "QUIET" ] || [ "$am" = "UNKNOWN" ]; } && \
+     { [ "$rm" = "EMPTY" ] || [ "$rm" = "UNKNOWN" ]; } && \
+     [ "$bc" = "0" ]; then
+    verdict="IDLE"; reason="quiet + empty + no devices"
+    return 0
+  fi
+
+  # AMBIENT: quiet/silent + (room present OR devices nearby)
+  if { [ "$am" = "SILENCE" ] || [ "$am" = "QUIET" ] || [ "$am" = "UNKNOWN" ]; } && \
+     { [ "$rm" = "PRESENT" ] || [ "$bc" -gt 0 ]; }; then
+    verdict="AMBIENT"; reason="quiet"
+    [ "$rm" = "PRESENT" ] && reason="$reason + room present"
+    [ "$bc" -gt 0 ] && reason="$reason + ${bc} devices"
+    return 0
+  fi
+
+  # MODERATE: sound detected + room present
+  if [ "$am" = "MODERATE" ] && [ "$rm" = "PRESENT" ]; then
+    verdict="MODERATE"; reason="ambient MODERATE + room present"
+    return 0
+  fi
+
+  # ACTIVE: loud sound + room present
+  if [ "$am" = "LOUD" ] && [ "$rm" = "PRESENT" ]; then
+    verdict="ACTIVE"; reason="ambient LOUD + room present"
+    return 0
+  fi
+
+  # MODERATE: sound detected + devices nearby (phone may be offline)
+  if [ "$am" = "MODERATE" ] && [ "$bc" -gt 0 ]; then
+    verdict="MODERATE"; reason="ambient MODERATE + ${bc} devices"
+    return 0
+  fi
+
+  # ACTIVE: loud sound + devices nearby
+  if [ "$am" = "LOUD" ] && [ "$bc" -gt 0 ]; then
+    verdict="ACTIVE"; reason="ambient LOUD + ${bc} devices"
+    return 0
+  fi
+
+  # UNCERTAIN: mixed or partial signals
+  verdict="UNCERTAIN"; reason="mixed: ambient=$am room=$rm devices=$bc"
+  return 0
+}
+
+# --- Test mode: run fusion assertions only, no scans ---
+if [ "$MODE" = "test" ]; then
+  # 8 fusion verdict assertions
+  _fuse 'SILENCE' 'EMPTY' 0
+  [ "$verdict" = "IDLE" ] || { echo "  FAIL: silence+empty should give IDLE (got $verdict)"; exit 1; }
+  _fuse 'QUIET' 'PRESENT' 0
+  [ "$verdict" = "AMBIENT" ] || { echo "  FAIL: quiet+present should give AMBIENT (got $verdict)"; exit 1; }
+  _fuse 'QUIET' 'EMPTY' 2
+  [ "$verdict" = "AMBIENT" ] || { echo "  FAIL: quiet+devices should give AMBIENT (got $verdict)"; exit 1; }
+  _fuse 'MODERATE' 'PRESENT' 0
+  [ "$verdict" = "MODERATE" ] || { echo "  FAIL: moderate+present should give MODERATE (got $verdict)"; exit 1; }
+  _fuse 'LOUD' 'PRESENT' 0
+  [ "$verdict" = "ACTIVE" ] || { echo "  FAIL: loud+present should give ACTIVE (got $verdict)"; exit 1; }
+  _fuse 'UNKNOWN' 'UNKNOWN' 0 && rc=$? || rc=$?
+  [ "$verdict" = "UNCERTAIN" ] || { echo "  FAIL: all-unknown should give UNCERTAIN (got $verdict)"; exit 1; }
+  [ "$rc" = "2" ] || { echo "  FAIL: all-unknown should exit 2 (got $rc)"; exit 1; }
+  _fuse 'MODERATE' 'EMPTY' 3
+  [ "$verdict" = "MODERATE" ] || { echo "  FAIL: moderate+devices should give MODERATE (got $verdict)"; exit 1; }
+  _fuse 'LOUD' 'EMPTY' 2
+  [ "$verdict" = "ACTIVE" ] || { echo "  FAIL: loud+devices should give ACTIVE (got $verdict)"; exit 1; }
+  echo "smoke-test: ok (8 fusion assertions: idle→IDLE, quiet+present→AMBIENT, quiet+devices→AMBIENT, moderate+present→MODERATE, loud+present→ACTIVE, all-unknown→UNCERTAIN/exit2, moderate+devices→MODERATE, loud+devices→ACTIVE)"; exit 0
+fi
+
+TS=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+NOW=$(date +%s)
+
+_read_state() {
+  local f="$STATE_DIR/$1"
+  [ -f "$f" ] && head -1 "$f" || echo "UNKNOWN"
+}
+
+# --- Signals ---
+
+# 1. Ambient level (IdeaPad mic, local — no phone needed)
+ambient="UNKNOWN"
+if command -v mesh-ambient-level >/dev/null 2>&1; then
+  al_out="$(timeout 5 mesh-ambient-level 2>/dev/null)" || true
+  if printf '%s' "$al_out" | grep -q 'LOUD'; then
+    ambient="LOUD"
+  elif printf '%s' "$al_out" | grep -q 'MODERATE'; then
+    ambient="MODERATE"
+  elif printf '%s' "$al_out" | grep -q 'QUIET'; then
+    ambient="QUIET"
+  elif printf '%s' "$al_out" | grep -q 'SILENCE'; then
+    ambient="SILENCE"
+  fi
+fi
+
+# 2. Room sense (read state file — no subprocess, instant)
+room="$(_read_state .room-sense.state)"
+# Strip any prefix (edge state files may include timestamp)
+case "$room" in
+  PRESENT|EMPTY|UNCERTAIN) ;;
+  *) room="UNKNOWN" ;;
+esac
+
+# 3. BLE presence (IdeaPad-local scan)
+ble_count=0
+ble_names=""
+if command -v mesh-presence >/dev/null 2>&1; then
+  ble_out="$(timeout 20 mesh-presence 2>/dev/null)" || true
+  # Count named devices (skip MAC-only lines)
+  ble_names="$(printf '%s\n' "$ble_out" | grep -vE '^[0-9a-f:]{17}$' | \
+    grep -vE '^[[:space:]]*$' | head -5 | tr '\n' ', ' | sed 's/,$//')"
+  ble_count="$(printf '%s\n' "$ble_out" | grep -cE '[a-zA-Z]{2,}' || echo 0)"
+fi
+
+_fuse "$ambient" "$room" "$ble_count" && ec=$? || ec=$?
+
+# --- Edge mode ---
+if [ "$MODE" = "edge" ]; then
+  confirmed="UNKNOWN"
+  [ -f "$STATE" ] && confirmed="$(head -1 "$STATE")"
+  pending=""
+  pcount=0
+  [ -f "$PENDING" ] && { pending="$(head -1 "$PENDING" | cut -d: -f1)"; pcount="$(head -1 "$PENDING" | cut -d: -f2)"; }
+
+  if [ "$verdict" = "$confirmed" ]; then
+    : # stable — no board post
+  elif [ "$verdict" = "$pending" ]; then
+    pcount=$((pcount + 1))
+    echo "${pending}:${pcount}" > "$PENDING"
+    if [ "$pcount" -ge "$EDGE_WINDOW" ]; then
+      echo "$verdict" > "$STATE"
+      rm -f "$PENDING"
+      echo "[activity] $verdict — $reason"
+    fi
+  else
+    echo "${verdict}:1" > "$PENDING"
+  fi
+fi
+
+# --- Output ---
+case "$MODE" in
+  oneshot|edge)
+    printf 'activity: %s — %s [ambient=%s room=%s devices=%s]\n' \
+      "$verdict" "$reason" "$ambient" "$room" "$ble_count"
+    ;;
+  json)
+    printf '{"verdict":"%s","reason":"%s","ambient":"%s","room":"%s","devices":%d,"ts":"%s"}\n' \
+      "$verdict" "$reason" "$ambient" "$room" "$ble_count" "$TS"
+    ;;
+esac
+
+exit ${ec:-0}

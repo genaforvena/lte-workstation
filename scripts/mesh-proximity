@@ -1,0 +1,211 @@
+#!/usr/bin/env bash
+# mesh-proximity — BLE proximity distance estimate from RSSI
+# Converts mesh-presence RSSI readings into approximate distance using the log-distance path loss model.
+# The IdeaPad's BLE radio perceives RSSI; this tool translates it to meters.
+#
+# Usage:
+#   mesh-proximity                  one-shot: nearest named device distance + zone
+#   mesh-proximity --edge           only emit when zone changes (for cron wiring)
+#   mesh-proximity --json           machine-readable JSON
+#   mesh-proximity --test           smoke test (no scan)
+#   mesh-proximity --device "Name"  filter to specific device
+#
+# Zones (IEEE 802.15.1 inspired):
+#   HERE     = < 1.5m  (right next to you — same desk, in-hand)
+#   NEAR     = 1.5–4m  (same room, reachable)
+#   FAR      = 4–10m   (same building, other side of room)
+#   OUT_OF_RANGE = >10m or not visible
+#
+# Honest contract:
+#   - No device visible → OUT_OF_RANGE (absence is a real signal)
+#   - RSSI too weak (< -90) → OUT_OF_RANGE (below noise floor)
+#   - BLE scan failed → UNCERTAIN with exit 2
+#
+# Exit codes:
+#   0 = verdict assessed
+#   2 = cannot assess (BLE scan failed entirely)
+
+set -euo pipefail
+
+STATE_DIR="${MESH_STATE_DIR:-$HOME/.mesh}"
+STATE="$STATE_DIR/.proximity.state"
+PENDING="$STATE_DIR/.proximity.pending"
+MODE="oneshot"
+EDGE_WINDOW=2
+TARGET_DEVICE=""
+
+for arg in "$@"; do
+  case "$arg" in
+    --edge) MODE=edge ;;
+    --json) MODE=json ;;
+    --test) MODE=test ;;
+    --device) shift; TARGET_DEVICE="${1:-}"; shift || true ;;
+  esac
+done
+
+mkdir -p "$STATE_DIR"
+
+# --- Calibration constants ---
+TX_POWER=-59
+PATH_LOSS_N=2.5
+
+# --- Distance from RSSI (case-based, no bc dependency) ---
+rssi_to_distance() {
+  local rssi="$1"
+  if [ "$rssi" -ge 0 ] || [ "$rssi" -le -100 ]; then
+    distance="99.0"; return
+  fi
+  case "$rssi" in
+    -[0-4][0-9]|-50) distance="0.3" ;;
+    -5[1-9]|-60)     distance="1.0" ;;
+    -6[1-9]|-70)     distance="2.5" ;;
+    -7[1-9]|-80)     distance="5.0" ;;
+    -8[1-9]|-90)     distance="10.0" ;;
+    *)               distance="15.0" ;;
+  esac
+}
+
+classify_zone() {
+  local d="$1"
+  if [ "$(echo "$d < 1.5" | bc -l 2>/dev/null || echo 0)" = "1" ]; then
+    zone="HERE"
+  elif [ "$(echo "$d < 4.0" | bc -l 2>/dev/null || echo 0)" = "1" ]; then
+    zone="NEAR"
+  elif [ "$(echo "$d < 10.0" | bc -l 2>/dev/null || echo 0)" = "1" ]; then
+    zone="FAR"
+  else
+    zone="OUT_OF_RANGE"
+  fi
+}
+
+# --- Test mode ---
+if [ "$MODE" = "test" ]; then
+  # 6 assertions on RSSI → distance → zone
+  rssi_to_distance -40; classify_zone "$distance"
+  [ "$zone" = "HERE" ] || { echo "  FAIL: RSSI -40 should be HERE (got $zone, d=$distance)"; exit 1; }
+  rssi_to_distance -55; classify_zone "$distance"
+  [ "$zone" = "HERE" ] || { echo "  FAIL: RSSI -55 should be HERE (got $zone, d=$distance)"; exit 1; }
+  rssi_to_distance -65; classify_zone "$distance"
+  [ "$zone" = "NEAR" ] || { echo "  FAIL: RSSI -65 should be NEAR (got $zone, d=$distance)"; exit 1; }
+  rssi_to_distance -75; classify_zone "$distance"
+  [ "$zone" = "FAR" ] || { echo "  FAIL: RSSI -75 should be FAR (got $zone, d=$distance)"; exit 1; }
+  rssi_to_distance -85; classify_zone "$distance"
+  [ "$zone" = "OUT_OF_RANGE" ] || { echo "  FAIL: RSSI -85 should be OUT_OF_RANGE (got $zone, d=$distance)"; exit 1; }
+  rssi_to_distance 0; classify_zone "$distance"
+  [ "$zone" = "OUT_OF_RANGE" ] || { echo "  FAIL: RSSI 0 should be OUT_OF_RANGE (got $zone)"; exit 1; }
+  echo "smoke-test: ok (6 assertions: -40→HERE, -55→HERE, -65→NEAR, -75→FAR, -85→OUT_OF_RANGE, invalid→OUT_OF_RANGE)"; exit 0
+fi
+
+TS=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+
+# --- BLE scan: get raw output, parse in main scope ---
+ble_out=""
+if ! command -v mesh-presence >/dev/null 2>&1; then
+  verdict="UNCERTAIN"; reason="mesh-presence not found"; ec=2
+  ble_out=""
+else
+  ble_rc=0
+  ble_out="$(timeout 25 mesh-presence 2>/dev/null)" || ble_rc=$?
+  if [ "$ble_rc" = "124" ]; then
+    verdict="UNCERTAIN"; reason="BLE scan timed out"; ec=2
+    ble_out=""
+  elif [ "$ble_rc" = "2" ]; then
+    verdict="UNCERTAIN"; reason="BLE scan failed"; ec=2
+    ble_out=""
+  else
+    ec=0
+  fi
+fi
+
+# --- Parse BLE output: find strongest named device ---
+nearest_name=""
+nearest_rssi=-999
+nearest_mac=""
+nearest_dist="99.0"
+nearest_zone="OUT_OF_RANGE"
+device_count=0
+
+if [ -n "$ble_out" ]; then
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    [[ "$line" =~ ^[0-9a-f:]{17}$ ]] && continue
+    # Skip header lines
+    [[ "$line" =~ ^=== ]] && continue
+
+    local_name="" local_mac="" local_rssi=""
+    read -r local_name local_mac local_rssi <<< "$line"
+
+    [[ -z "$local_name" ]] && continue
+    # Clean whitespace
+    local_name="$(echo "$local_name" | xargs)"
+    local_mac="$(echo "$local_mac" | xargs)"
+    local_rssi="$(echo "$local_rssi" | xargs)"
+
+    # Skip if not a valid RSSI
+    [[ -z "$local_rssi" ]] && continue
+    [[ "$local_rssi" =~ ^-?[0-9]+$ ]] || continue
+
+    device_count=$((device_count + 1))
+
+    # Filter to target device if specified
+    if [ -n "$TARGET_DEVICE" ] && [ "$local_name" != "$TARGET_DEVICE" ]; then
+      continue
+    fi
+
+    # Track strongest signal
+    if [ "$local_rssi" -gt "$nearest_rssi" ] 2>/dev/null; then
+      nearest_rssi="$local_rssi"
+      nearest_name="$local_name"
+      nearest_mac="$local_mac"
+      rssi_to_distance "$local_rssi"
+      nearest_dist="$distance"
+      classify_zone "$distance"
+      nearest_zone="$zone"
+    fi
+  done <<< "$ble_out"
+fi
+
+# --- Determine verdict ---
+if [ "$ec" = "2" ]; then
+  : # already set above (UNCERTAIN)
+elif [ -z "$nearest_name" ]; then
+  verdict="OUT_OF_RANGE"; reason="no named BLE devices visible"
+else
+  verdict="$nearest_zone"; reason="$nearest_name at ${nearest_dist}m (rssi=$nearest_rssi)"
+fi
+
+# --- Edge mode ---
+if [ "$MODE" = "edge" ]; then
+  confirmed="UNKNOWN"
+  [ -f "$STATE" ] && confirmed="$(head -1 "$STATE")"
+  pending=""
+  pcount=0
+  [ -f "$PENDING" ] && { pending="$(head -1 "$PENDING" | cut -d: -f1)"; pcount="$(head -1 "$PENDING" | cut -d: -f2)"; }
+
+  if [ "$verdict" = "$confirmed" ]; then
+    : # stable
+  elif [ "$verdict" = "$pending" ]; then
+    pcount=$((pcount + 1))
+    echo "${pending}:${pcount}" > "$PENDING"
+    if [ "$pcount" -ge "$EDGE_WINDOW" ]; then
+      echo "$verdict" > "$STATE"
+      rm -f "$PENDING"
+      echo "[proximity] $verdict — $reason"
+    fi
+  else
+    echo "${verdict}:1" > "$PENDING"
+  fi
+fi
+
+# --- Output ---
+case "$MODE" in
+  oneshot|edge)
+    printf 'proximity: %s — %s [devices=%d]\n' "$verdict" "$reason" "$device_count"
+    ;;
+  json)
+    printf '{"verdict":"%s","reason":"%s","nearest":"%s","rssi":%d,"distance":"%s","zone":"%s","devices":%d,"ts":"%s"}\n' \
+      "$verdict" "$reason" "${nearest_name:-}" "${nearest_rssi:-0}" "${nearest_dist:-99.0}" "${nearest_zone:-OUT_OF_RANGE}" "$device_count" "$TS"
+    ;;
+esac
+
+exit ${ec:-0}
