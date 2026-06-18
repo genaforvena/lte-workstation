@@ -75,7 +75,9 @@ tailscaled --tun=userspace-networking &
 sleep 2
 tailscale up --authkey="${TS_AUTHKEY}" --advertise-tags=tag:lte-node --hostname="${HOSTNAME}"
 # Restore mesh session (tmux + chat + snapshot loop)
-~/.local/bin/mesh-restore 2>/dev/null || /root/lte-workstation/scripts/mesh-restore
+# PATH-resolved: the Dockerfile installs tools to /usr/local/bin (on PATH);
+# fall back to the repo copy if tools were installed elsewhere.
+mesh-restore 2>/dev/null || /root/lte-workstation/scripts/mesh-restore
 # Keep container alive via tmux session
 exec tmux new-session -A -s "$(hostname)"
 ```
@@ -117,7 +119,7 @@ set -e
 tailscaled --tun=userspace-networking &
 sleep 2
 tailscale up --authkey="${TS_AUTHKEY}" --advertise-tags=tag:lte-node --hostname="${HOSTNAME}"
-~/.local/bin/mesh-restore 2>/dev/null || /root/lte-workstation/scripts/mesh-restore
+mesh-restore 2>/dev/null || /root/lte-workstation/scripts/mesh-restore
 exec tmux new-session -A -s "$(hostname)"
 ENTRYPOINT
 chmod +x entrypoint.sh
