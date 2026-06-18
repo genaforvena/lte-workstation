@@ -1,0 +1,164 @@
+#!/usr/bin/env bash
+# mesh-mic-crossvalidate — play a test tone → verify every mic hears it.
+#
+# Operator 2026-06-18: "вы же можете красавалидировать, например, если у вас голос и
+# микрофон есть, то можно одно другим проверять" — cross-validate mics by playing a
+# known sound and checking that every mic detects it. End-to-end mic path confidence.
+#
+# Two-phase: quiet baseline (what each mic hears at rest) → tone (play 440Hz burst
+# through speaker → capture simultaneously). If a mic's mean_volume rises significantly
+# above its quiet floor, it hears the test tone → PASS.
+#
+# Usage:
+#   mesh-mic-crossvalidate [--nodes "IdeaPad phone mac"] [--json] [--test]
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+
+NODES="${MESH_MIC_NODES:-IdeaPad phone mac}"
+JSON=0
+TMP="${TMPDIR:-/tmp}"
+PLAY_DEV="${MESH_CV_PLAY_DEV:-plughw:1,0}"   # Bose Revolve SoundLink USB
+RISE_DB="${MESH_CV_RISE_DB:-3}"              # dB rise over floor = hears the tone (3dB = 2× energy)
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --nodes) NODES="$2"; shift 2;;
+    --json) JSON=1; shift;;
+    --test) MODE_TEST=1; shift;;
+    -h|--help) echo "usage: mesh-mic-crossvalidate [--nodes \"...\"] [--json]"; exit 0;;
+    *) echo "unknown arg: $1" >&2; exit 2;;
+  esac
+done
+
+energy(){
+  command -v ffmpeg >/dev/null 2>&1 || return 1
+  ffmpeg -hide_banner -nostdin -i "$1" -af volumedetect -f null /dev/null 2>&1 \
+    | awk -F': ' '/mean_volume/{m=$2} /max_volume/{x=$2}
+                  END{ if(m!=""){gsub(/ dB/,"",m); gsub(/ dB/,"",x); print m" "x} }'
+}
+
+if [ "${MODE_TEST:-0}" = 1 ]; then
+  fail=0
+  for d in ffmpeg awk aplay; do
+    command -v $d >/dev/null 2>&1 && echo "  ok: $d present" \
+      || { echo "  FAIL: $d missing"; fail=1; }
+  done
+  command -v mesh-hear >/dev/null 2>&1 && echo "  ok: mesh-hear present" \
+    || { echo "  FAIL: mesh-hear missing"; fail=1; }
+  # synth a tone, verify energy() returns a numeric level
+  f="$TMP/.mesh-cv-test.wav"
+  ffmpeg -hide_banner -f lavfi -i "sine=frequency=440:duration=0.5" -ac 1 -ar 44100 "$f" -y >/dev/null 2>&1
+  e=$(energy "$f")
+  l="${e%% *}"
+  awk -v l="$l" 'BEGIN{exit (l+0==l)}' 2>/dev/null && \
+    { echo "  FAIL: energy() returned non-numeric: $e"; fail=1; } || \
+    echo "  ok: energy() returns numeric levels (${l}dB)"
+  rm -f "$f"
+  [ "$fail" = 0 ] && { echo "smoke-test: ok"; exit 0; } || { echo "smoke-test: FAIL"; exit 1; }
+fi
+
+for d in ffmpeg aplay mesh-hear; do
+  command -v $d >/dev/null 2>&1 || { echo "mesh-mic-crossvalidate: $d not found" >&2; exit 1; }
+done
+
+ts="$(date -u +%H%M%S)"
+TONE="$TMP/.mesh-cv-tone-${ts}.wav"
+declare -A QUIET_MEAN QUIET_MAX TONE_MEAN TONE_MAX
+
+# Generate test tone: 3 seconds of 440Hz, loud (3s so captures have time to overlap)
+ffmpeg -hide_banner -f lavfi -i "sine=frequency=440:duration=3,volume=15dB" -ac 1 -ar 44100 "$TONE" -y >/dev/null 2>&1
+[ -s "$TONE" ] || { echo "mesh-mic-crossvalidate: failed to generate test tone" >&2; exit 1; }
+
+# Phase 1: quiet floor (what does each mic hear at rest?)
+has_ideapad=0
+for n in $NODES; do [ "$n" = "IdeaPad" ] && has_ideapad=1; done
+
+for n in $NODES; do
+  f="$TMP/.mesh-cv-q-${n}-${ts}.wav"
+  rm -f "$f"
+done
+# Run sequentially for reliable capture
+for n in $NODES; do
+  f="$TMP/.mesh-cv-q-${n}-${ts}.wav"
+  mesh-hear "$n" -d 2 -o "$f" >/dev/null 2>&1 || true
+  if [ -s "$f" ] && e=$(energy "$f") && [ -n "$e" ]; then
+    QUIET_MEAN[$n]="${e%% *}"; QUIET_MAX[$n]="${e##* }"
+  else
+    QUIET_MEAN[$n]=""; QUIET_MAX[$n]=""
+  fi
+  rm -f "$f"
+done
+
+# Phase 2: play tone through speaker, capture all mics simultaneously
+for n in $NODES; do
+  f="$TMP/.mesh-cv-t-${n}-${ts}.wav"
+  rm -f "$f"
+done
+# Start all captures in background simultaneously
+for n in $NODES; do
+  f="$TMP/.mesh-cv-t-${n}-${ts}.wav"
+  mesh-hear "$n" -d 3 -o "$f" >/dev/null 2>&1 &
+done
+sleep 0.5
+aplay -q -D "$PLAY_DEV" "$TONE" 2>/dev/null || aplay -q "$TONE" 2>/dev/null || true
+wait
+
+for n in $NODES; do
+  f="$TMP/.mesh-cv-t-${n}-${ts}.wav"
+  if [ -s "$f" ] && e=$(energy "$f") && [ -n "$e" ]; then
+    TONE_MEAN[$n]="${e%% *}"; TONE_MAX[$n]="${e##* }"
+  else
+    TONE_MEAN[$n]=""; TONE_MAX[$n]=""
+  fi
+  rm -f "$f"
+done
+rm -f "$TONE"
+
+# Phase 3: verdict per mic
+pass=0; fail=0; unreach=0
+declare -A VERDICT DETAIL
+for n in $NODES; do
+  q="${QUIET_MEAN[$n]:-}"
+  t="${TONE_MEAN[$n]:-}"
+  tx="${TONE_MAX[$n]:-}"
+  if [ -z "$t" ]; then
+    VERDICT[$n]="UNREACHABLE"; DETAIL[$n]="no capture (offline)"; unreach=$((unreach+1))
+  else
+    # PASS if: (a) absolute tone level ≥ -40dB (same room) OR (b) ≥ RISE_DB over quiet floor
+    abs_ok=$(awk "BEGIN{print ($t >= -40) ? 1 : 0}")
+    if [ -n "$q" ]; then
+      rise=$(awk "BEGIN{printf \"%.1f\", $t - $q}")
+      rise_ok=$(awk "BEGIN{print ($t - $q >= $RISE_DB) ? 1 : 0}")
+    else
+      rise="N/A"; rise_ok=0
+    fi
+    if [ "$abs_ok" = 1 ] || [ "$rise_ok" = 1 ]; then
+      detail_str="tone ${t}dB"
+      [ -n "$q" ] && detail_str="${detail_str}, rose ${rise}dB over quiet ${q}dB"
+      VERDICT[$n]="PASS"; DETAIL[$n]="$detail_str"
+      pass=$((pass+1))
+    else
+      VERDICT[$n]="FAIL"
+      if [ -n "$q" ]; then DETAIL[$n]="only ${rise}dB rise (needs ≥${RISE_DB}dB)"
+      else DETAIL[$n]="tone ${t}dB below -40dB (no quiet floor)"; fi
+      fail=$((fail+1))
+    fi
+  fi
+done
+
+if [ "$JSON" = 1 ]; then
+  printf '{"pass":%d,"fail":%d,"unreachable":%d,"mics":{' "$pass" "$fail" "$unreach"
+  first=1
+  for n in $NODES; do
+    [ "$first" = 1 ] || printf ","; first=0
+    printf '"%s":{"verdict":"%s","detail":"%s"}' "$n" "${VERDICT[$n]}" "${DETAIL[$n]}"
+  done
+  printf '}}\n'
+else
+  echo "mesh-mic-crossvalidate :: ${pass} pass / ${fail} fail / ${unreach} unreachable"
+  for n in $NODES; do
+    printf "  %-14s %s  %s\n" "$n" "${VERDICT[$n]}" "${DETAIL[$n]}"
+  done
+fi
+
+[ "$fail" -gt 0 ] && exit 1 || exit 0
