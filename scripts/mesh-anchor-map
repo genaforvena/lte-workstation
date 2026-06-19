@@ -1,0 +1,298 @@
+#!/usr/bin/env bash
+# mesh-anchor-map — turn flat 1-D radio scalars into a 2-D spatial map of the mesh's own devices.
+#
+# THE IDEA (operator 2026-06-19, "how does a flat signal become 3-D vision?"): a single RSSI is a
+# noisy 1-D shadow — it only says "near/far". Spatial structure emerges from THREE things together:
+#   (1) several vantage points (each node is an instrument),
+#   (2) a forward model (log-distance path-loss maps RSSI → metres),
+#   (3) cross-correlation of what the instruments share.
+# Here the shared thing is the WiFi ENVIRONMENT: every node hears the same set of access points (the
+# home router + neighbours' APs, which sit in DIFFERENT physical directions). A node's vector of
+# RSSIs to all those APs is its "fingerprint". Two nodes that are physically close have similar
+# fingerprints; far-apart nodes have different ones. The RMS difference between two fingerprints is a
+# real, measurable pairwise distance → fill the NxN matrix → classical MDS (multidimensional scaling)
+# turns that distance matrix into 2-D coordinates. That is the literal "distances → map" algorithm.
+#
+# TWO honest layers in the output:
+#   • METRIC radial layer — each node's distance from the home router in metres (path-loss model).
+#     This is the trustworthy absolute number (one known anchor = the router).
+#   • RELATIVE constellation — the MDS embedding in fingerprint-space. Shows who-is-near-whom
+#     topology. Units are signal-space (dB-RMS), not metres, and at intra-room scale (1-3 m) RSSI
+#     noise (±3 dB, body absorption, multipath) makes it COARSE — zone-level, not survey-grade. The
+#     channel that resolves a true metric room triangle is acoustic time-of-flight; that's the v2.
+#
+#   mesh-anchor-map           gather live fingerprints from all nodes → matrix → MDS → map
+#   mesh-anchor-map --json    same, machine-readable
+#   mesh-anchor-map --test    smoke: MDS recovers a known synthetic geometry (no devices touched)
+#
+# Nodes are the three co-located instruments by default; override with ANCHOR_NODES (see below).
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+[ -f "$HOME/.mesh/nodes" ] && . "$HOME/.mesh/nodes" 2>/dev/null || true
+
+# Path-loss model params (nominal indoor; override in env if you calibrate). d = 10^((TxRef-RSSI)/(10*n))
+ANCHOR_TXREF="${ANCHOR_TXREF:--40}"   # RSSI (dBm) expected at 1 m
+ANCHOR_PLE="${ANCHOR_PLE:-2.5}"       # path-loss exponent (2=free space, 3-4=cluttered indoor)
+ROUTER_SSID_PREFIX="${ROUTER_SSID_PREFIX:-GL-MT3000}"   # the known anchor AP (home router)
+
+# ---- pure-python MDS + rendering (no numpy: Jacobi eigensolver inline) -----------------------------
+run_python() {
+local _prog; _prog="$(mktemp /tmp/anchor-mds-XXXXXX.py)"
+cat > "$_prog" <<'PYEOF'
+import sys, json, math, os
+
+# --- classical (Torgerson) MDS via Jacobi eigen-decomposition, pure python ---
+def jacobi_eig(A, iters=100, tol=1e-12):
+    n=len(A); A=[row[:] for row in A]; V=[[1.0 if i==j else 0.0 for j in range(n)] for i in range(n)]
+    for _ in range(iters):
+        # largest off-diagonal
+        p,q,mx=0,1,0.0
+        for i in range(n):
+            for j in range(i+1,n):
+                if abs(A[i][j])>mx: mx=abs(A[i][j]); p,q=i,j
+        if mx<tol: break
+        app,aqq,apq=A[p][p],A[q][q],A[p][q]
+        phi=0.5*math.atan2(2*apq, aqq-app) if (aqq-app)!=0 else math.pi/4
+        c,s=math.cos(phi),math.sin(phi)
+        for k in range(n):
+            akp,akq=A[k][p],A[k][q]
+            A[k][p]=c*akp - s*akq; A[k][q]=s*akp + c*akq
+        for k in range(n):
+            apk,aqk=A[p][k],A[q][k]
+            A[p][k]=c*apk - s*aqk; A[q][k]=s*apk + c*aqk
+        for k in range(n):
+            vkp,vkq=V[k][p],V[k][q]
+            V[k][p]=c*vkp - s*vkq; V[k][q]=s*vkp + c*vkq
+    eig=[A[i][i] for i in range(n)]
+    vecs=[[V[r][c] for r in range(n)] for c in range(n)]  # vecs[c] = c-th eigenvector
+    return eig, vecs
+
+def mds(D, dim=2):
+    n=len(D)
+    if n==0: return []
+    if n==1: return [[0.0]*dim]
+    D2=[[D[i][j]**2 for j in range(n)] for i in range(n)]
+    J=[[(1.0 if i==j else 0.0)-1.0/n for j in range(n)] for i in range(n)]
+    # B = -1/2 J D2 J
+    JD=[[sum(J[i][k]*D2[k][j] for k in range(n)) for j in range(n)] for i in range(n)]
+    B=[[-0.5*sum(JD[i][k]*J[k][j] for k in range(n)) for j in range(n)] for i in range(n)]
+    eig,vecs=jacobi_eig(B)
+    order=sorted(range(n), key=lambda i:eig[i], reverse=True)
+    coords=[]
+    for r in range(n):
+        pt=[]
+        for d in range(dim):
+            idx=order[d] if d<len(order) else 0
+            lam=max(eig[idx],0.0)
+            pt.append(vecs[idx][r]*math.sqrt(lam))
+        coords.append(pt)
+    return coords
+
+def ascii_map(names, coords, ranges, w=44, h=15):
+    if not coords: return "(no points)"
+    xs=[c[0] for c in coords]; ys=[c[1] for c in coords]
+    minx,maxx=min(xs),max(xs); miny,maxy=min(ys),max(ys)
+    spanx=(maxx-minx) or 1.0; spany=(maxy-miny) or 1.0
+    grid=[[' ']*w for _ in range(h)]
+    for i,(x,y) in enumerate(coords):
+        cx=int((x-minx)/spanx*(w-3))+1; cy=int((y-miny)/spany*(h-2))
+        cy=h-1-cy
+        cx=max(0,min(w-1,cx)); cy=max(0,min(h-1,cy))
+        ch=str(i+1)
+        grid[cy][cx]=ch
+    out=[''.join(r) for r in grid]
+    legend=[]
+    for i,nm in enumerate(names):
+        rg=ranges.get(nm)
+        legend.append(f"  {i+1} = {nm}" + (f"  (~{rg:.1f} m from router)" if rg is not None else "  (router range n/a)"))
+    return "\n".join(out)+"\n"+"\n".join(legend)
+
+mode=sys.argv[1] if len(sys.argv)>1 else "run"
+data=json.load(sys.stdin)         # {node: {bssid: rssi_dbm, ...}, ...}  + optional "_router": {node: rssi}
+fps={k:v for k,v in data.items() if not k.startswith("_")}
+router_rssi=data.get("_router",{})
+names=list(fps.keys())
+n=len(names)
+
+# pairwise fingerprint distance = RMS of dBm differences over APs the PAIR both hear (min overlap 2)
+def pair_dist(a,b):
+    common=set(fps[a])&set(fps[b])
+    if len(common)<2: return None,0
+    diffs=[fps[a][k]-fps[b][k] for k in common]
+    rms=math.sqrt(sum(d*d for d in diffs)/len(diffs))
+    return rms,len(common)
+
+D=[[0.0]*n for _ in range(n)]; overlap=[[0]*n for _ in range(n)]; missing=[]
+for i in range(n):
+    for j in range(i+1,n):
+        d,ov=pair_dist(names[i],names[j])
+        overlap[i][j]=overlap[j][i]=ov
+        if d is None: missing.append((names[i],names[j])); d=0.0
+        D[i][j]=D[j][i]=d
+
+coords=mds(D,2) if n>=2 else [[0.0,0.0]]
+
+txref=float(os.environ.get("ANCHOR_TXREF","-40")); ple=float(os.environ.get("ANCHOR_PLE","2.5"))
+ranges={}
+for nm in names:
+    r=router_rssi.get(nm)
+    if r is not None:
+        ranges[nm]=10**((txref-float(r))/(10*ple))
+
+if mode=="--json":
+    print(json.dumps({"nodes":names,"dist_matrix":D,"overlap":overlap,"coords":coords,
+                      "router_rssi":router_rssi,"router_range_m":ranges,"missing_edges":missing},indent=2))
+    sys.exit(0)
+
+print("=== mesh-anchor-map — spatial map from WiFi fingerprints ===")
+print(f"instruments: {n} nodes — {', '.join(names)}")
+print()
+print("PAIRWISE FINGERPRINT DISTANCE (dB-RMS over shared APs; smaller = physically closer):")
+hdr="            "+ "".join(f"{nm[:9]:>11}" for nm in names); print(hdr)
+for i in range(n):
+    row=f"  {names[i][:9]:>9} "
+    for j in range(n):
+        row+= f"{D[i][j]:>11.1f}" if i!=j else f"{'·':>11}"
+    print(row)
+print()
+print("METRIC radial layer — distance from home router (path-loss model, ±~50% noisy):")
+for nm in names:
+    r=router_rssi.get(nm)
+    if r is not None: print(f"  {nm:>22}: router RSSI {r:>4} dBm  →  ~{ranges[nm]:.1f} m")
+    else:             print(f"  {nm:>22}: router RSSI  n/a  →  range n/a")
+print()
+print("RELATIVE CONSTELLATION (MDS of the fingerprint matrix — who-is-near-whom; signal-space units):")
+print(ascii_map(names,coords,ranges))
+if missing:
+    print()
+    print("  ⚠ edges with <2 shared APs (could not range): "+", ".join(f"{a}~{b}" for a,b in missing))
+print()
+print("  honest note: fingerprint distance is a noisy proxy. At 1-3 m intra-room spacing RSSI cannot")
+print("  resolve a precise triangle (±3 dB ≈ metres of slop). This gives zone-level topology + the")
+print("  router-range metric. A true metric room triangle needs acoustic time-of-flight (v2).")
+PYEOF
+  python3 "$_prog" "$@"
+  local rc=$?
+  rm -f "$_prog"
+  return $rc
+}
+
+# ---- smoke test: MDS must recover a known geometry --------------------------------------------------
+if [ "${1:-}" = --test ]; then
+  command -v python3 >/dev/null 2>&1 || { echo "smoke-test: FAIL (no python3)"; exit 1; }
+  out="$(printf '%s' '{
+    "A":{"ap1":-40,"ap2":-80,"ap3":-70,"ap4":-60},
+    "B":{"ap1":-80,"ap2":-40,"ap3":-60,"ap4":-70},
+    "C":{"ap1":-70,"ap2":-60,"ap3":-40,"ap4":-80},
+    "D":{"ap1":-60,"ap2":-70,"ap3":-80,"ap4":-40}
+  }' | run_python --json 2>/dev/null)" || { echo "smoke-test: FAIL (python errored)"; exit 1; }
+  # The 4 fingerprints above are a symmetric design: MDS must place them as 4 distinct points whose
+  # recovered pairwise distances reproduce the input matrix. Verify with python (falsifiable).
+  export MOCK_OUT="$out"
+  python3 - <<'CHK'
+import json,sys,math,os
+d=json.loads(os.environ["MOCK_OUT"])
+co=d["coords"]; D=d["dist_matrix"]; n=len(co)
+if n!=4: print("smoke-test: FAIL (expected 4 points, got %d)"%n); sys.exit(1)
+# recovered distances vs input
+err=0.0; cnt=0
+for i in range(n):
+    for j in range(i+1,n):
+        rd=math.dist(co[i],co[j]); cnt+=1
+        if D[i][j]>0: err+=abs(rd-D[i][j])/D[i][j]
+err/=cnt
+# all 4 points distinct
+mind=min(math.dist(co[i],co[j]) for i in range(n) for j in range(i+1,n))
+if err<0.05 and mind>1e-6:
+    print("smoke-test: ok (MDS recovered 4-point geometry; mean rel-err %.3f)"%err)
+    sys.exit(0)
+print("smoke-test: FAIL (MDS distortion %.3f or degenerate)"%err); sys.exit(1)
+CHK
+  exit $?
+fi
+
+# ---- live gather: each node's WiFi RSSI fingerprint (dBm) ------------------------------------------
+# Node spec: "name:method:target". Methods: local(nmcli/iw) · mac(ssh airport) · adb(phone).
+# Default = the three co-located instruments on THIS mesh; override via ANCHOR_NODES (space-sep specs).
+MAC_NODE="${ANCHOR_MAC_NODE:-ilya@192.168.8.214}"
+AIRPORT="/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport"
+ADB_BIN="${ADB_BIN:-/tmp/platform-tools/adb}"
+
+gather_local() {   # IdeaPad — prefer dBm via root iw scan; fall back to nmcli quality→dBm approx
+  local ifc; ifc="$(iw dev 2>/dev/null | awk '/Interface/{print $2; exit}')"
+  if [ -n "$ifc" ] && sudo -n iw dev "$ifc" scan >/dev/null 2>&1; then
+    sudo -n iw dev "$ifc" scan 2>/dev/null | awk '
+      /^BSS /{mac=$2; sub(/\(.*/,"",mac)}
+      /signal:/{print mac"\t"$2}'
+  else
+    # nmcli SIGNAL is 0-100 quality; approximate dBm = pct/2 - 100 (documented, ±several dB)
+    nmcli -t -f BSSID,SIGNAL dev wifi 2>/dev/null | sed 's/\\//g' | awk -F: '
+      {mac=$1":"$2":"$3":"$4":"$5":"$6; q=$7; if(mac!~/^$/ && q!="") printf "%s\t%d\n", mac, (q/2)-100}'
+  fi
+}
+gather_mac() {     # iMac — airport -s gives dBm directly
+  timeout 18 ssh -o BatchMode=yes -o ConnectTimeout=8 "$MAC_NODE" "$AIRPORT -s 2>/dev/null" 2>/dev/null \
+    | awk 'NR>1 && match($0,/([0-9a-f]{2}:){5}[0-9a-f]{2}/){mac=substr($0,RSTART,17);
+           rest=substr($0,RSTART+17); n=split(rest,a," "); print mac"\t"a[1]}'
+}
+gather_adb() {     # phone — adb cmd wifi list-scan-results gives dBm
+  local tid; tid="$("$ADB_BIN" devices -l 2>/dev/null | awk '/_adb-tls-connect._tcp[[:space:]]+device/{for(i=1;i<=NF;i++)if($i~/transport_id/){split($i,a,":");print a[2];exit}}')"
+  [ -n "$tid" ] || return 1
+  "$ADB_BIN" -t "$tid" shell cmd wifi start-scan >/dev/null 2>&1; sleep 3
+  "$ADB_BIN" -t "$tid" shell cmd wifi list-scan-results 2>/dev/null | awk '
+    match($0,/([0-9a-f]{2}:){5}[0-9a-f]{2}/){mac=substr($0,RSTART,17);
+      r=$0; if(match(r,/-[0-9]+/)){rssi=substr(r,RSTART,RLENGTH); print mac"\t"rssi}}'
+}
+
+# Build the JSON of fingerprints. fp_to_json <name> reads name\tTAB-lines on stdin.
+emit_node_json() {  # <name> ; reads "mac<TAB>rssi" lines; prints  "name":{...}  + router rssi to stderr-var
+  local name="$1" first=1; printf '"%s":{' "$name"
+  while IFS=$'\t' read -r mac rssi; do
+    [ -n "$mac" ] && [ -n "$rssi" ] || continue
+    rssi="${rssi%%[!0-9-]*}"
+    [ "$first" = 1 ] || printf ','; first=0
+    printf '"%s":%s' "$(printf '%s' "$mac" | tr 'A-F' 'a-f')" "$rssi"
+  done
+  printf '}'
+}
+
+TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+gather_local > "$TMP/ideapad" 2>/dev/null &
+gather_mac   > "$TMP/mac"     2>/dev/null &
+gather_adb   > "$TMP/phone"   2>/dev/null &
+wait
+
+# router RSSI per node = strongest BSSID whose SSID starts with ROUTER_SSID_PREFIX. We only have BSSIDs
+# in the fp files, so match the known GL-MT3000 BSSIDs (5G 1a:14:eb:40:48:93, 2.4G 4a:53:fa:dd:fc:97).
+router_bssids="1a:14:eb:40:48:93 4a:53:fa:dd:fc:97"
+router_for() { local f="$1" best=""; for b in $router_bssids; do
+    local r; r="$(grep -i "$b" "$f" 2>/dev/null | awk -F'\t' '{print $2}' | head -1)"
+    [ -n "$r" ] && { [ -z "$best" ] && best="$r" || { [ "$r" -gt "$best" ] 2>/dev/null && best="$r"; }; }
+  done; printf '%s' "$best"; }
+
+{
+  printf '{'
+  sep=""
+  for nm in ideapad mac phone; do
+    [ -s "$TMP/$nm" ] || continue
+    printf '%s' "$sep"; emit_node_json "$nm" < "$TMP/$nm"; sep=","
+  done
+  # router rssi block
+  printf '%s"_router":{' "$sep"; rsep=""
+  for nm in ideapad mac phone; do
+    [ -s "$TMP/$nm" ] || continue
+    rr="$(router_for "$TMP/$nm")"; [ -n "$rr" ] || continue
+    printf '%s"%s":%s' "$rsep" "$nm" "$rr"; rsep=","
+  done
+  printf '}}'
+} > "$TMP/fp.json"
+
+# guard: need ≥2 nodes with fingerprints
+nodecount="$(grep -oE '"(ideapad|mac|phone)":\{' "$TMP/fp.json" | wc -l)"
+if [ "$nodecount" -lt 2 ]; then
+  echo "mesh-anchor-map: only $nodecount node fingerprint(s) gathered — need ≥2 for a map." >&2
+  echo "  (nodes reachable? IdeaPad=local, Mac=$MAC_NODE, phone=adb $ADB_BIN)" >&2
+  exit 2
+fi
+
+run_python "${1:-run}" < "$TMP/fp.json"
