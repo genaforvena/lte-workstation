@@ -1,0 +1,180 @@
+#!/usr/bin/env bash
+# mesh-vpn-health — READ-ONLY liveness of the mesh's client-facing VPN server (default: phaedra).
+#
+# Verifies every client path is UP + serving, WITHOUT ever touching/restarting/rotating them.
+# Operator hard rule 2026-06-19: a VPN that works is FROZEN — never edit/rotate/restart it (see
+# memory never-touch-working-vpn; the 6/18 Dasha cut-off). This tool ONLY observes.
+#
+# Client paths checked:
+#   - Shadowsocks  :443  (TCP+UDP) — friend Dasha's shared VPN + operator anti-DPI path
+#   - trojan       :8443 (TCP/TLS) — operator's LTE bypass (LE cert via sslip.io)
+#   - WireGuard    :51820 (UDP)    — friend/phone peers
+#
+# Probes (all non-invasive):
+#   * process alive + listener bound        (SSH read-only: ss/pgrep/wg show)
+#   * trojan TLS cert valid + days-to-expiry (external TLS handshake, like any client)
+#   * SS :443 reachable from the outside     (external TCP connect)
+#   * egress IP == expected                  (clients MASQUERADE through this; wrong IP = broken path)
+#   * WG per-peer handshake freshness        (info: which client paths are live now)
+#
+# Honest-degraded: VPN node unreachable -> exit 2 (NEVER fakes an all-clear).
+# Verdict: OK (0) / DEGRADED (0, soft) / DOWN (1) / UNREACHABLE (2).
+#
+# Config (node-local, genome stays IP-free — set in ~/.mesh/nodes):
+#   MESH_VPN_NODE      label in MESH_NODES of the VPN server   (default: phaedra)
+#   MESH_VPN_PUBIP     public IP for external probes + expected egress (REQUIRED for full check)
+#   MESH_VPN_SS_PORT   shadowsocks port   (default 443)
+#   MESH_VPN_TROJAN_PORT trojan port      (default 8443)
+#   MESH_VPN_WG_PORT   wireguard port     (default 51820)
+#   MESH_VPN_CERT_WARN_DAYS  warn if cert expires within N days (default 14)
+#
+# Usage: mesh-vpn-health [--edge] [--json] [--test]
+# reflex-cadence: */10 * * * *
+# reflex-args: --edge
+
+set -uo pipefail
+[ -f "$HOME/.mesh/nodes" ] && . "$HOME/.mesh/nodes"
+
+VPN_NODE="${MESH_VPN_NODE:-phaedra}"
+SS_PORT="${MESH_VPN_SS_PORT:-443}"
+TROJAN_PORT="${MESH_VPN_TROJAN_PORT:-8443}"
+WG_PORT="${MESH_VPN_WG_PORT:-51820}"
+CERT_WARN_DAYS="${MESH_VPN_CERT_WARN_DAYS:-14}"
+STATE="$HOME/.mesh/.vpn-health.state"
+LOG="$HOME/.mesh/vpn-health.log"
+SSH_OPTS=(-o StrictHostKeyChecking=no -o ConnectTimeout=8 -o BatchMode=yes -o LogLevel=ERROR)
+
+# resolve user@ip for the VPN node from MESH_NODES ("label:user@ip ...")
+resolve_node(){
+    local want="$1" entry
+    for entry in ${MESH_NODES:-}; do
+        [ "${entry%%:*}" = "$want" ] && { printf '%s\n' "${entry#*:}"; return 0; }
+    done
+    return 1
+}
+
+if [ "${1:-}" = --test ]; then
+    fail=0
+    for c in ssh ss openssl timeout; do command -v "$c" >/dev/null 2>&1 || { echo "  FAIL: no $c"; fail=1; }; done
+    # resolve_node parse
+    MESH_NODES="phaedra:root@100.0.0.9 ilya:x@1.2.3.4" t="$(resolve_node phaedra)"
+    [ "$t" = "root@100.0.0.9" ] && echo "  ok: resolve_node parse" || { echo "  FAIL: resolve_node ($t)"; fail=1; }
+    # cert-expiry day-math (no real network): notAfter in the past -> negative days
+    _na="Jan 1 00:00:00 2020 GMT"
+    _d=$(( ( $(date -d "$_na" +%s 2>/dev/null || echo 0) - $(date +%s) ) / 86400 ))
+    [ "$_d" -lt 0 ] && echo "  ok: cert day-math (expired -> $_d)" || { echo "  FAIL: cert day-math ($_d)"; fail=1; }
+    # verdict precedence: DOWN beats DEGRADED beats OK
+    v=OK; v=DEGRADED; [ "$v" = DEGRADED ] && v=DOWN; [ "$v" = DOWN ] && echo "  ok: verdict precedence" || { echo "  FAIL: precedence"; fail=1; }
+    command -v tailscale >/dev/null 2>&1 && echo "  ok: tailscale present" || echo "  note: no tailscale (ok, not required)"
+    [ "$fail" = 0 ] && echo "smoke-test: ok" && exit 0 || { echo "smoke-test: FAIL"; exit 1; }
+fi
+
+EDGE=0; JSON=0
+for a in "$@"; do
+    case "$a" in
+        --edge) EDGE=1 ;;
+        --json) JSON=1 ;;
+    esac
+done
+
+target="$(resolve_node "$VPN_NODE" || true)"
+[ -n "$target" ] || { echo "vpn-health: cannot resolve '$VPN_NODE' in MESH_NODES" >&2; exit 2; }
+
+# --- single read-only SSH gather (one round-trip) ---
+remote="$(ssh "${SSH_OPTS[@]}" "$target" '
+  echo "SS=$(pgrep -x ss-server >/dev/null && echo up || echo down)"
+  echo "TROJAN=$(pgrep -x trojan >/dev/null && echo up || echo down)"
+  echo "WG=$(ip link show wg0 >/dev/null 2>&1 && echo up || echo down)"
+  echo "L443T=$(ss -tlnp 2>/dev/null | grep -cE ":443\b")"
+  echo "L443U=$(ss -ulnp 2>/dev/null | grep -cE ":443\b")"
+  echo "L8443=$(ss -tlnp 2>/dev/null | grep -cE ":8443\b")"
+  echo "L51820=$(ss -ulnp 2>/dev/null | grep -cE ":51820\b")"
+  echo "EGRESS=$(curl -s -m 8 https://api.ipify.org 2>/dev/null || echo unknown)"
+  echo "WGPEERS=$(wg show wg0 peers 2>/dev/null | wc -l)"
+  # newest handshake age in seconds across all peers (-1 if none ever)
+  now=$(date +%s); best=-1
+  while read -r _pk hs; do [ -n "$hs" ] && [ "$hs" -gt 0 ] && { age=$((now-hs)); [ "$best" -lt 0 ] || [ "$age" -lt "$best" ] && best=$age; }; done < <(wg show wg0 latest-handshakes 2>/dev/null)
+  echo "WGFRESH=$best"
+' 2>/dev/null)" || remote=""
+
+[ -n "$remote" ] || {
+    # UNREACHABLE: honest, never an all-clear
+    [ "$JSON" = 1 ] && echo '{"verdict":"UNREACHABLE","node":"'"$VPN_NODE"'"}' || echo "vpn-health: $VPN_NODE UNREACHABLE (read-only SSH failed) — BLIND, not clear"
+    exit 2
+}
+eval "$(printf '%s\n' "$remote" | grep -E '^[A-Z0-9]+=' | sed -E 's/^([A-Z0-9]+)=(.*)$/R_\1="\2"/')"
+
+issues=(); notes=(); verdict=OK
+down(){ verdict=DOWN; issues+=("$1"); }
+degr(){ [ "$verdict" = DOWN ] || verdict=DEGRADED; issues+=("$1"); }
+
+# process + listener checks
+[ "${R_SS:-down}" = up ]   || down "shadowsocks process DOWN"
+[ "${R_TROJAN:-down}" = up ] || down "trojan process DOWN"
+[ "${R_WG:-down}" = up ]   || down "wireguard wg0 DOWN"
+[ "${R_L443T:-0}" -ge 1 ] || down "SS :$SS_PORT TCP not bound"
+[ "${R_L8443:-0}" -ge 1 ] || down "trojan :$TROJAN_PORT not bound"
+[ "${R_L51820:-0}" -ge 1 ] || down "WG :$WG_PORT not bound"
+
+# external reachability + cert (needs MESH_VPN_PUBIP)
+PUBIP="${MESH_VPN_PUBIP:-}"
+if [ -n "$PUBIP" ]; then
+    # egress correctness — clients present as this; wrong = broken egress path
+    if [ "${R_EGRESS:-unknown}" != unknown ] && [ "${R_EGRESS}" != "$PUBIP" ]; then
+        degr "egress IP drifted: ${R_EGRESS} != expected $PUBIP"
+    fi
+    # SS :443 reachable from outside
+    if ! timeout 6 bash -c "echo >/dev/tcp/$PUBIP/$SS_PORT" 2>/dev/null; then
+        down "SS :$SS_PORT unreachable externally"
+    fi
+    # trojan TLS cert validity + expiry
+    cert_end="$(echo | timeout 10 openssl s_client -connect "$PUBIP:$TROJAN_PORT" -servername "$(echo "$PUBIP"|tr . -).sslip.io" 2>/dev/null | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2)"
+    if [ -z "$cert_end" ]; then
+        degr "trojan :$TROJAN_PORT TLS handshake failed (cert unreadable)"
+    else
+        days=$(( ( $(date -d "$cert_end" +%s 2>/dev/null || echo 0) - $(date +%s) ) / 86400 ))
+        if [ "$days" -lt 0 ]; then down "trojan cert EXPIRED ($cert_end)"
+        elif [ "$days" -lt "$CERT_WARN_DAYS" ]; then degr "trojan cert expires in ${days}d ($cert_end)"
+        else notes+=("trojan cert ok (${days}d left)"); fi
+    fi
+else
+    notes+=("set MESH_VPN_PUBIP for external cert/reach/egress checks")
+fi
+
+# WG client freshness (info, not a failure — clients connect intermittently)
+wgfresh="${R_WGFRESH:--1}"
+if [ "$wgfresh" -ge 0 ]; then
+    notes+=("WG ${R_WGPEERS:-?} peers, newest handshake ${wgfresh}s ago")
+    [ "$wgfresh" -gt 86400 ] && degr "no WG client handshake in >24h (all peers idle?)"
+else
+    notes+=("WG ${R_WGPEERS:-?} peers, no handshakes yet")
+fi
+
+summary="$VPN_NODE VPN $verdict — SS:$([ "${R_SS:-}" = up ]&&echo up||echo DOWN) trojan:$([ "${R_TROJAN:-}" = up ]&&echo up||echo DOWN) wg:$([ "${R_WG:-}" = up ]&&echo up||echo DOWN)"
+[ ${#issues[@]} -gt 0 ] && summary="$summary | $(IFS='; '; echo "${issues[*]}")"
+[ ${#notes[@]}  -gt 0 ] && summary="$summary | $(IFS='; '; echo "${notes[*]}")"
+
+if [ "$JSON" = 1 ]; then
+    printf '{"verdict":"%s","node":"%s","ss":"%s","trojan":"%s","wg":"%s","egress":"%s","wg_fresh_s":%s,"issues":%d}\n' \
+        "$verdict" "$VPN_NODE" "${R_SS:-?}" "${R_TROJAN:-?}" "${R_WG:-?}" "${R_EGRESS:-?}" "${wgfresh}" "${#issues[@]}"
+else
+    echo "=== mesh-vpn-health $(date -u +%Y-%m-%dT%H:%M:%SZ) ==="
+    echo "$summary"
+fi
+
+printf '%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$summary" >> "$LOG" 2>/dev/null || true
+
+# --edge: post to board only on verdict change
+if [ "$EDGE" = 1 ]; then
+    prev="$(cat "$STATE" 2>/dev/null || echo '')"
+    if [ "$verdict" != "$prev" ]; then
+        echo "$verdict" > "$STATE" 2>/dev/null || true
+        case "$verdict" in
+            DOWN)     command -v mesh-chat >/dev/null && mesh-chat "[vpn-down] $summary — CLIENTS CUT OFF. DIAGNOSE READ-ONLY; do NOT restart/rotate a working VPN without operator (memory never-touch-working-vpn)." >/dev/null 2>&1 ;;
+            DEGRADED) command -v mesh-chat >/dev/null && mesh-chat "[vpn-degraded] $summary" >/dev/null 2>&1 ;;
+            OK)       [ -n "$prev" ] && command -v mesh-chat >/dev/null && mesh-chat "[vpn-ok] $summary — all client paths serving again" >/dev/null 2>&1 ;;
+        esac
+    fi
+fi
+
+case "$verdict" in DOWN) exit 1 ;; *) exit 0 ;; esac
