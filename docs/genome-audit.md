@@ -37,7 +37,10 @@ PR; steward reviews + commits — agents don't commit.)
 
 ## Periodic drift check
 Re-run `rg -c '100\.(7[0-9]|[89][0-9]|1[01][0-9]|12[0-5])\.[0-9]{1,3}\.[0-9]{1,3}' scripts/` and
-`rg -c 'imozerov|Default-string|Redmi' scripts/` to detect back-sliding. Zero hits = clean.
+`rg -c 'imozerov|Default-string|Redmi' scripts/` to detect back-sliding. **The clean test is NOT
+"zero hits" anymore** (superseded — see the 2026-06-19 re-check below): the operator's 2026-06-15
+genome-push policy accepts CGNAT (`100.64/10`) + RFC1918 IPs and structural device-name/label refs;
+only **secret VALUES** and genuinely new personalization are drift. Triage each hit, don't gate on the raw count.
 
 Status: AUDIT findings resolved. Verified zero hardcoded IPs/usernames in scripts (2026-06-16).
 Re-check if new scripts are added.
@@ -50,3 +53,23 @@ Re-check if new scripts are added.
   `38.49.216.141`, `192.168.8.146`).
   → **FIXED**: replaced with RFC 5735 documentation IPs (`203.0.113.0/24`, `198.51.100.0/24`).
   Test assertions updated accordingly.
+
+## 2026-06-19 re-check (the "zero hits" claim has drifted — found + reconciled)
+Ran the two drift-check commands above against current `scripts/`. **Both return non-zero** — the
+absolute "zero hits / zero occurrences" claims (lines above, written 2026-06-16) are no longer
+literally true. Triaged:
+- **Hardcoded CGNAT IPs — 4 files, all post-audit scripts**: `mesh-travels` (`PHAEDRA = "root@100.94.116.17"`,
+  no env fallback), `mesh-node-care` + `mesh-phone-collect` + `mesh-tg-watchdog` (CGNAT IPs as
+  `${ENV:-default}` fallbacks). These DID re-introduce our specifics — line 43's "re-check if new
+  scripts are added" warning was prescient. **Accepted, not a defect**: they are CGNAT (`100.64/10`),
+  which the operator's 2026-06-15 push policy explicitly permits, and all but `mesh-travels` are
+  env-overridable. (Optional hardening: give `mesh-travels` an `${MESH_*:-}` env override too.)
+- **`imozerov|Default-string|Redmi` — ~40 files**: mostly **legitimate structural refs**, NOT
+  re-personalization: `mesh-peer-addr Redmi` device-name lookups (the registry key, resolved at
+  runtime), hostname→friendly-label maps (`mesh-fleet-health`: `imozerov-IdeaPad-…) echo "IdeaPad"`),
+  and `PHONE_USER:-u0_a380` defaults. A stranger cloning still gets a working mesh (these resolve via
+  their own `~/.mesh/nodes`); the device-NAME constants are the registry contract, not our IPs.
+
+Verdict: the genome de-personalization HOLDS for its real goal (zero secret values; a stranger plants
+cleanly). The doc's *historical* findings are accurate; only its "zero hits = clean" drift-test was
+stale and is corrected above. No code change made under this doc-drift task.
