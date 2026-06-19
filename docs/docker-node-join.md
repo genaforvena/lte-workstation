@@ -40,8 +40,8 @@ docker run -d --name mesh-node \
 ```
 
 Use a **one-time** Tailscale auth key from the admin console (never reuse keys from logs).
-Tag it `tag:lte-node` in the key settings or with `tailscale set --advertise-tags=tag:lte-node`
-inside the container after auth.
+Tag it `tag:lte-node` in the key settings or with
+`tailscale up --advertise-tags=tag:lte-node` inside the container after auth.
 
 ## Minimal Dockerfile — mind node
 
