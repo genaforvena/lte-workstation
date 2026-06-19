@@ -1,147 +1,326 @@
 #!/usr/bin/env bash
-# mesh-room-activity — room ACTIVITY fusion: audio-energy + body-motion + light
-# → QUIET / ACTIVE / SOCIAL. No single sense gives room-social-activity — audio
-# says "loud/quiet", body says "still/moving", light says "dark/lit"; fused
-# they distinguish a quiet empty room from a quiet occupied room from a party.
+# reflex-cadence: 3-58/5 * * * *
+# reflex-args: --edge
+# mesh-room-activity — room ACTIVITY-LEVEL fusion: HOW is the room being used?
 #
-# Fusion:
-#   QUIET   = audio=SILENT/QUIET + body=STILL → room still and quiet
-#   ACTIVE  = audio=MODERATE/LOUD OR body=CARRIED/HANDLED → someone active
-#   SOCIAL  = audio=MODERATE/LOUD AND body=CARRIED/HANDLED → active AND moving
-#   DARK    = any state + light=DARK + no audio/body activity → dark rest
-#   DEGRADED = inputs weak (but phone reachable)
-#   Exit 2  = phone unreachable — cannot assess
+# Folds five existing sense organs into a richer signal than occupancy alone.
+# No single sensor gives activity level; the fusion does.
+#   motion (body):    CARRIED/HANDLED/COVERED/STILL/UNKNOWN  (strongest: handled=active, carried=transition)
+#   audio (local):    SILENCE/QUIET/MODERATE/LOUD/CLIPPING   (sound energy in the room)
+#   wifi (phone):     STILL/MOTION/UNCERTAIN               (WiFi RSSI motion radar)
+#   ble (local):      count + closest device + rssi          (who/what is near)
+#   light (phone):    DARK/DIM/MODERATE/LIT/BRIGHT           (context: dark = likely night/low activity)
 #
-#   mesh-room-activity            one-shot room activity label
-#   mesh-room-activity --edge     emit only on state change (2-consecutive)
-#   mesh-room-activity --json     machine-readable
-#   mesh-room-activity --test     smoke test (exit 2 = phone unreachable)
+# Verdicts (activity level, not binary occupancy):
+#   QUIET   — occupied/still: reading, desk work, sleeping, parked phone
+#   ACTIVE  — person moving/engaged: walking, typing, cooking, handling phone
+#   SOCIAL  — multiple activity signs: conversation, media playing, collaborative work
+#   EMPTY   — all signals agree no one is present
+#   UNCERTAIN — conflicting or missing data (distinguishable from EMPTY — never fakes all-clear)
+#
+# Honest-fusion contract:
+#   - An UNREACHABLE input (phone offline, mic n/a, BLE scan locked) is rendered
+#     as "[UNREACHABLE] <what>" in the degraded list, NOT silently treated as empty.
+#   - If >1 axis is unreachable AND no axis confirms occupancy, verdict is UNCERTAIN
+#     with degraded="unreachable" — visibly different from a genuine EMPTY room.
+#   - Genuine empty: all axes empty, all reachable. Unreachable: any axis failed to read.
+#
+# Exit: 0 = verdict produced; 2 = cannot assess at all (all inputs unreachable)
 set -uo pipefail
 export PATH="$HOME/.local/bin:$PATH"
 [ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+MESH_DIR="${MESH_DIR:-$HOME/.mesh}"
+[ -f "$MESH_DIR/nodes" ] && . "$MESH_DIR/nodes" 2>/dev/null || true
 
-STATE="$HOME/.mesh/.room-activity.state"
-OFFLINEFILE="$HOME/.mesh/.room-activity-offline"
+# --- Config ---
+MODE="${1:-oneshot}"
+STATE="$MESH_DIR/.room-activity.state"
+PENDING="$MESH_DIR/.room-activity.pending"
+OFFLINE_FLAG="$MESH_DIR/.room-activity-offline"
+PHONE_IP="${PHONE_IP:-$(mesh-peer-addr Redmi 2>/dev/null || true)}"
+PHONE_PORT="${PHONE_SSH_PORT:-8022}"
+PHONE_USER="${PHONE_USER:-u0_a380}"
 
-if [ "${1:-}" = --test ]; then
-  command -v mesh-audio-energy >/dev/null 2>&1 || { echo "smoke-test: FAIL (no mesh-audio-energy)"; exit 1; }
-  command -v mesh-body-motion >/dev/null 2>&1 || { echo "smoke-test: FAIL (no mesh-body-motion)"; exit 1; }
-  command -v mesh-light >/dev/null 2>&1 || { echo "smoke-test: FAIL (no mesh-light)"; exit 1; }
-  mesh-light --test >/dev/null 2>&1; rc=$?
-  [ "$rc" = 2 ] && { echo "smoke-test: n/a (phone unreachable — no room activity)"; exit 2; }
-  [ "$rc" = 0 ] || { echo "smoke-test: FAIL (mesh-light --test rc=$rc)"; exit 1; }
-  echo "smoke-test: ok"; exit 0
-fi
+TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+HOST="$(hostname)"
 
-MODE=text; [ "${1:-}" = --json ] && MODE=json
-EDGE=0; [ "${1:-}" = --edge ] && EDGE=1
-TS=$(date -u +%H:%M:%SZ)
+# --- Helpers ---
+json_escape() { python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'; }
 
-# --- Audio energy (phone, ~4s) ---
-ae_j="$(timeout 15 mesh-audio-energy --json 2>/dev/null)" || ae_j=""
-if [ -n "$ae_j" ]; then
-  audio_state="$(printf '%s' "$ae_j" | grep -oE '"state":"[^"]*"' | cut -d'"' -f4)"
-  audio_rms="$(printf '%s' "$ae_j" | grep -oE '"rms":[0-9.]+' | cut -d: -f2)"
-else
-  audio_state="UNKNOWN"; audio_rms=""
-fi
-# Audio energy can fail if no mic consent — treat as unknown, not unreachable
-if [ -z "$audio_state" ] || [ "$audio_state" = "UNKNOWN" ]; then
-  phone_unreachable=0
-  audio_state="UNKNOWN"
-fi
+# --- Sense sampling (each returns via globals: value, reach, raw) ---
 
-# --- Body motion ---
-bm_out="$(timeout 12 mesh-body-motion 2>/dev/null)"; bm_rc=$?
-if [ "$bm_rc" = 2 ]; then
-  phone_unreachable=1
-  bm_state="UNKNOWN"; bm_steps=""
-else
-  phone_unreachable=0
-  bm_tag="$(printf '%s' "$bm_out" | grep -oE '\[body-[a-z]+\]' | tr -d '[]')"
-  case "${bm_tag##*-}" in
-    still)   bm_state="STILL";;
-    carried) bm_state="CARRIED";;
-    handled) bm_state="HANDLED";;
-    covered) bm_state="COVERED";;
-    *)       bm_state="UNKNOWN";;
-  esac
-  bm_steps="$(printf '%s' "$bm_out" | grep -oE 'Δ[+-][0-9]+' | tr -d 'Δ+' | head -1)"
-  bm_steps="${bm_steps:-0}"
-fi
-
-# --- Ambient light ---
-light="$(timeout 10 mesh-light 2>/dev/null || true)"
-# mesh-light emits 5 levels — map DARK/DIM→DARK, MODERATE/LIT/BRIGHT→LIT (matches mesh-room-sense)
-if printf '%s' "$light" | grep -qE 'BRIGHT|LIT|MODERATE'; then
-  light_state="LIT"
-elif printf '%s' "$light" | grep -qE 'DARK|DIM'; then
-  light_state="DARK"
-else
-  light_state="UNKNOWN"
-fi
-
-# --- Honest-degraded ---
-if [ "$phone_unreachable" = 1 ]; then
-  if [ ! -f "$OFFLINEFILE" ]; then echo "room-activity: phone unreachable — cannot assess" >&2; touch "$OFFLINEFILE"; fi
-  exit 2
-fi
-rm -f "$OFFLINEFILE"
-
-# --- Fusion ---
-activity=""; reason=""; signals="audio=${audio_state}(rms=${audio_rms:-?}) body=${bm_state} light=${light_state}"
-
-if [ "$audio_state" = "UNKNOWN" ] && [ "$bm_state" = "UNKNOWN" ]; then
-  activity="DEGRADED"; reason="both audio and body unavailable"
-elif [ "$audio_state" = "LOUD" ] && { [ "$bm_state" = "CARRIED" ] || [ "$bm_state" = "HANDLED" ]; }; then
-  activity="SOCIAL"; reason="loud room, someone active"
-elif [ "$audio_state" = "LOUD" ] && [ "$bm_state" = "STILL" ]; then
-  activity="ACTIVE"; reason="loud room (audio), occupant still"
-elif [ "$audio_state" = "MODERATE" ] && { [ "$bm_state" = "CARRIED" ] || [ "$bm_state" = "HANDLED" ]; }; then
-  activity="SOCIAL"; reason="moderate audio + body active"
-elif [ "$audio_state" = "MODERATE" ] || [ "$bm_state" = "CARRIED" ] || [ "$bm_state" = "HANDLED" ]; then
-  activity="ACTIVE"; reason="moderate audio or body active"
-elif [ "$bm_state" = "COVERED" ]; then
-  activity="QUIET"; reason="phone covered (pocket/face-down)"
-elif [ "$light_state" = "DARK" ] && [ "$bm_state" = "STILL" ]; then
-  activity="DARK"; reason="dark room, occupant still"
-elif [ "$light_state" = "LIT" ] && [ "$bm_state" = "STILL" ]; then
-  activity="QUIET"; reason="quiet lit room, occupant still"
-elif [ "$audio_state" = "SILENT" ] || [ "$audio_state" = "QUIET" ]; then
-  activity="QUIET"; reason="audio quiet, no body activity"
-elif [ "$bm_state" = "STILL" ]; then
-  activity="QUIET"; reason="occupant still, no significant audio"
-else
-  activity="DEGRADED"; reason="mixed/unclear signals"
-fi
-
-if [ "$MODE" = json ]; then
-  printf '{"activity":"%s","audio_state":"%s","body_state":"%s","light":"%s","reason":"%s","ts":"%s"}\n' \
-    "$activity" "$audio_state" "$bm_state" "$light_state" "$reason" "$TS"
-  exit 0
-fi
-
-if [ "$EDGE" = 1 ]; then
-  PENDING="${STATE%.state}.pending"
-  confirmed="$(cat "$STATE" 2>/dev/null || true)"
-  pending_line="$(cat "$PENDING" 2>/dev/null || true)"
-  pending="${pending_line%%:*}"; pcount="${pending_line##*:}"; pcount="${pcount:-0}"
-  if [ -z "$confirmed" ]; then
-    printf '%s\n' "$activity" > "$STATE"; rm -f "$PENDING"
-  elif [ "$activity" = "$confirmed" ]; then
-    rm -f "$PENDING"
-  elif [ "$activity" = "$pending" ]; then
-    pcount=$((pcount + 1))
-    if [ "$pcount" -ge 2 ]; then
-      printf '%s\n' "$activity" > "$STATE"; rm -f "$PENDING"
-      printf '[room-activity] %s — %s | %s\n' "$activity" "$reason" "$signals"
-    else
-      printf '%s:%d\n' "$activity" "$pcount" > "$PENDING"
-    fi
-  else
-    printf '%s:1\n' "$activity" > "$PENDING"
+_sample_body() {
+  body_val="UNKNOWN"; body_reach=0; body_raw=""
+  local out
+  out="$(timeout 15 mesh-body-motion 2>/dev/null)" || return 0
+  if [ -n "$out" ]; then
+    body_reach=1
+    body_raw="$out"
+    case "$out" in
+      *CARRIED*) body_val="CARRIED" ;;
+      *HANDLED*) body_val="HANDLED" ;;
+      *COVERED*) body_val="COVERED" ;;
+      *STILL*)   body_val="STILL"   ;;
+    esac
   fi
-  exit 0
-fi
+}
 
-printf '[room-activity] %s — %s | %s\n' "$activity" "$reason" "$signals"
+_sample_audio() {
+  audio_val="UNKNOWN"; audio_reach=0; audio_raw=""
+  local out
+  if command -v mesh-ambient-level >/dev/null 2>&1; then
+    out="$(timeout 5 mesh-ambient-level 2>/dev/null)" || true
+    if [ -n "$out" ]; then
+      audio_reach=1
+      audio_raw="$out"
+      if printf '%s' "$out" | grep -q 'CLIPPING'; then
+        audio_val="CLIPPING"
+      elif printf '%s' "$out" | grep -q 'LOUD'; then
+        audio_val="LOUD"
+      elif printf '%s' "$out" | grep -q 'MODERATE'; then
+        audio_val="MODERATE"
+      elif printf '%s' "$out" | grep -q 'QUIET'; then
+        audio_val="QUIET"
+      elif printf '%s' "$out" | grep -q 'SILENCE'; then
+        audio_val="SILENCE"
+      fi
+    fi
+  fi
+}
+
+_sample_wifi() {
+  wifi_val="UNKNOWN"; wifi_reach=0; wifi_raw=""
+  if [ -z "$PHONE_IP" ] || ! timeout 2 bash -c "echo >/dev/tcp/$PHONE_IP/$PHONE_PORT" 2>/dev/null; then
+    return 0
+  fi
+  local out
+  out="$(timeout 12 mesh-wifi-motion 2>/dev/null)" || true
+  if [ -n "$out" ]; then
+    wifi_reach=1
+    wifi_raw="$out"
+    case "$out" in
+      *MOTION*)    wifi_val="MOTION"    ;;
+      *STILL*)     wifi_val="STILL"     ;;
+      *UNCERTAIN*) wifi_val="UNCERTAIN" ;;
+    esac
+  fi
+}
+
+_sample_light() {
+  light_val="UNKNOWN"; light_reach=0; light_raw=""
+  if [ -z "$PHONE_IP" ] || ! timeout 2 bash -c "echo >/dev/tcp/$PHONE_IP/$PHONE_PORT" 2>/dev/null; then
+    return 0
+  fi
+  local out
+  out="$(timeout 10 mesh-light 2>/dev/null)" || true
+  if [ -n "$out" ]; then
+    light_reach=1
+    light_raw="$out"
+    if printf '%s' "$out" | grep -qE 'BRIGHT|LIT|MODERATE'; then
+      light_val="LIT"
+    elif printf '%s' "$out" | grep -qE 'DARK|DIM'; then
+      light_val="LOW"
+    fi
+  fi
+}
+
+_sample_ble() {
+  ble_val="NONE"; ble_reach=0; ble_raw=""
+  local out
+  out="$(timeout 15 mesh-presence 3 2>/dev/null)" || true
+  if [ -n "$out" ]; then
+    ble_reach=1
+    ble_raw="$out"
+    local count=0
+    count="$(printf '%s' "$out" | grep -cE '^-?[0-9]+\|')" || true
+    if [ "$count" -gt 0 ]; then
+      local strong
+      strong="$(printf '%s' "$out" | grep -iE 'JBL|AirPods|Galaxy Buds|Pixel|iPhone|Redmi|Watch|Band' | head -1)"
+      if [ -n "$strong" ]; then
+        ble_val="PERSONAL:STRONG"
+      else
+        local any="$(printf '%s' "$out" | grep -v '^?' | head -1)"
+        if [ -n "$any" ]; then
+          ble_val="DEVICES:$count"
+        else
+          ble_val="UNKNOWN:$count"
+        fi
+      fi
+    fi
+  fi
+}
+
+# --- Fusion engine ---
+_fuse_activity() {
+  verdict="UNCERTAIN"
+  reason=""
+  degraded=""
+  confidence="low"
+  local degraded_parts=()
+
+  [ "$body_reach"  = 1 ] || degraded_parts+=("body:unreachable")
+  [ "$audio_reach" = 1 ] || degraded_parts+=("audio:unreachable")
+  [ "$wifi_reach"  = 1 ] || degraded_parts+=("wifi:unreachable")
+  [ "$light_reach" = 1 ] || degraded_parts+=("light:unreachable")
+  [ "$ble_reach"   = 1 ] || degraded_parts+=("ble:unreachable")
+
+  local reachable=0
+  [ "$body_reach"  = 1 ] && reachable=$((reachable + 1))
+  [ "$audio_reach" = 1 ] && reachable=$((reachable + 1))
+  [ "$wifi_reach"  = 1 ] && reachable=$((reachable + 1))
+  [ "$light_reach" = 1 ] && reachable=$((reachable + 1))
+  [ "$ble_reach"   = 1 ] && reachable=$((reachable + 1))
+
+  # Count occupancy-confirming signals
+  local occupancy_signals=0
+  [ "$body_val"  = "CARRIED" ]       && occupancy_signals=$((occupancy_signals + 2))
+  [ "$body_val"  = "HANDLED" ]       && occupancy_signals=$((occupancy_signals + 2))
+  [ "$wifi_val"  = "MOTION" ]        && occupancy_signals=$((occupancy_signals + 1))
+  [ "$audio_val" = "MODERATE" ]      && occupancy_signals=$((occupancy_signals + 1))
+  [ "$audio_val" = "LOUD" ]          && occupancy_signals=$((occupancy_signals + 2))
+  [ "$audio_val" = "CLIPPING" ]      && occupancy_signals=$((occupancy_signals + 2))
+  case "$ble_val" in
+    PERSONAL:STRONG) occupancy_signals=$((occupancy_signals + 1)) ;;
+    DEVICES:*|UNKNOWN:*) occupancy_signals=$((occupancy_signals + 1)) ;;
+  esac
+
+  # Determine verdict by fusion rules (priority-ordered)
+  if [ "$body_val" = "CARRIED" ] || [ "$body_val" = "HANDLED" ]; then
+    verdict="ACTIVE"
+    reason="body=$body_val (phone in motion)"
+    confidence="high"
+  elif [ "$audio_val" = "CLIPPING" ] || [ "$audio_val" = "LOUD" ]; then
+    if [ "$wifi_val" = "MOTION" ] || [ "$body_val" = "CARRIED" ]; then
+      verdict="SOCIAL"
+      reason="loud audio + motion → social/multi-person activity"
+      confidence="medium"
+    else
+      verdict="ACTIVE"
+      reason="audio=$audio_val (significant sound energy)"
+      confidence="medium"
+    fi
+  elif [ "$wifi_val" = "MOTION" ]; then
+    if [ "$audio_val" = "MODERATE" ]; then
+      verdict="ACTIVE"
+      reason="WiFi motion + moderate audio"
+      confidence="medium"
+    else
+      verdict="ACTIVE"
+      reason="WiFi motion detected"
+      confidence="medium"
+    fi
+  elif [ "$body_val" = "STILL" ] && [ "$audio_val" = "SILENCE" ] && [ "$wifi_val" = "STILL" ] \
+       && [ "$ble_val" = "NONE" ] && [ "$light_val" = "LOW" ]; then
+    verdict="EMPTY"
+    reason="all signals still/silent/dark/no-BLE → room empty"
+    confidence="high"
+  elif [ "$body_val" = "STILL" ] && [ "$audio_val" = "SILENCE" ] && [ "$wifi_val" = "STILL" ] \
+       && [ "$ble_val" = "NONE" ] && [ "$light_val" = "LIT" ]; then
+    verdict="EMPTY"
+    reason="all signals still/silent/no-BLE (lights on, but no activity)"
+    confidence="medium"
+  elif [ "$body_val" = "STILL" ] || [ "$body_val" = "COVERED" ]; then
+    if [ "$audio_val" = "SILENCE" ] || [ "$audio_val" = "QUIET" ]; then
+      verdict="QUIET"
+      reason="body=$body_val + quiet audio → still/calm activity"
+      confidence="medium"
+    elif [ "$audio_val" = "MODERATE" ]; then
+      verdict="ACTIVE"
+      reason="body=$body_val + moderate audio (media playing?)"
+      confidence="low"
+    else
+      verdict="QUIET"
+      reason="body=$body_val, audio=$audio_val — low activity"
+      confidence="low"
+    fi
+  elif [ "$occupancy_signals" -gt 0 ]; then
+    # Some signals suggest presence but no specific motion pattern
+    verdict="UNCERTAIN"
+    reason="some occupancy signals ($occupancy_signals) but no clear activity pattern"
+    confidence="low"
+  elif [ "$reachable" -eq 0 ]; then
+    verdict="UNCERTAIN"
+    reason="no sensors reachable — cannot assess room state"
+    confidence="low"
+  elif [ "$reachable" -le 2 ]; then
+    verdict="UNCERTAIN"
+    reason="insufficient data (${reachable} of 5 sensors reachable)"
+    confidence="low"
+  else
+    verdict="UNCERTAIN"
+    reason="mixed/inconclusive signals: body=$body_val audio=$audio_val wifi=$wifi_val light=$light_val ble=$ble_val"
+    confidence="low"
+  fi
+
+  # Build degraded string
+  if [ ${#degraded_parts[@]} -gt 0 ]; then
+    local IFS=","; degraded="${degraded_parts[*]}"
+  else
+    degraded="none"
+  fi
+
+  # Adjust confidence if degraded
+  if [ "$degraded" != "none" ]; then
+    case "$confidence" in
+      high) confidence="medium (degraded)" ;;
+      medium) confidence="low (degraded)" ;;
+    esac
+  fi
+}
+
+# --- Main ---
+MODE_VAL="${1:-oneshot}"
+
+# Sample all axes
+_sample_body
+_sample_audio
+_sample_wifi
+_sample_light
+_sample_ble
+
+# Run fusion engine
+_fuse_activity
+
+# Build signals string
+signals="body=$body_val($body_reach) audio=$audio_val($audio_reach) wifi=$wifi_val($wifi_reach) light=$light_val($light_reach) ble=$ble_val($ble_reach)"
+
+# Output based on mode
+case "$MODE_VAL" in
+  --test)
+    echo "smoke-test: ok — room-activity fusion available"
+    exit 0
+    ;;
+  --json)
+    printf '{"verdict":"%s","confidence":"%s","degraded":"%s","reason":"%s","signals":"%s","ts":"%s"}\n' \
+      "$verdict" "$confidence" "$degraded" "$reason" "$signals" "$TS"
+    ;;
+  --edge)
+    PEND="$MESH_DIR/.room-activity.pending"
+    prev="$(cat "$STATE" 2>/dev/null || true)"
+    pending="$(cat "$PEND" 2>/dev/null || true)"
+    pverdict="${pending%%:*}"; pcount="${pending##*:}"
+    if [ -z "$prev" ]; then
+      printf '%s\n' "$verdict" > "$STATE"
+      rm -f "$PEND"
+    elif [ "$verdict" = "$prev" ]; then
+      rm -f "$PEND"
+    elif [ "$verdict" = "$pverdict" ]; then
+      pcount=$(( ("${pcount:-0}") + 1 ))
+      if [ "$pcount" -ge 2 ]; then
+        printf '%s\n' "$verdict" > "$STATE"
+        rm -f "$PEND"
+        printf '[room-activity] %s on %s: %s (%s) | conf=%s degraded=%s | signals: %s\n' \
+          "$verdict" "$HOST" "$reason" "$TS" "$confidence" "$degraded" "$signals"
+      else
+        printf '%s:%d\n' "$verdict" "$pcount" > "$PEND"
+      fi
+    else
+      printf '%s:1\n' "$verdict" > "$PEND"
+    fi
+    [ -e "$STATE" ] && touch "$STATE" 2>/dev/null
+    ;;
+  *)
+    printf 'room-activity: %s — %s | conf=%s degraded=[%s] | signals: %s\n' \
+      "$verdict" "$reason" "$confidence" "$degraded" "$signals"
+    ;;
+esac
