@@ -74,8 +74,8 @@ power management); the mesh falls back to the phone's LAN IP automatically. Use
 ```bash
 PHONE_IP=$(mesh-phone-ip)   # probes: PHONE_IP env → mesh-peer-addr → PHONE_LAN_IPS → ADB tunnel
 ```
-The phone's Tailscale IP is 100.103.99.16; LAN DHCP addresses have been 192.168.8.146 and
-192.168.8.203 (both seen; drifts). `mesh-phone-ip` probes and returns the first that answers.
+The phone's IPs drift with the current network path; do not hardcode them. `mesh-phone-ip`
+probes and returns the first address that answers.
 
 ## Key-based auth (recommended)
 
