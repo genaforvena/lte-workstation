@@ -108,7 +108,7 @@ more machines; a new sense on an old node counts as much as a new node.
 ## 6. The mind is not the machine (and not even the engine)
 
 The "mind" of a node is the **context in its tmux session** — the running text — not any particular
-AI. The inference engine (Claude, Gemini, opencode, …) is just a *source of thought* you point at
+AI. The inference engine (Claude, opencode, Gemini, Codex, …) is just a *source of thought* you point at
 that context. You can swap one for another, and the engine doesn't even have to run on the same
 machine: a node on a tiny box can be driven by an agent thinking elsewhere. Care for the **context**
 (the session, the trace, the plan); the engine is replaceable.
