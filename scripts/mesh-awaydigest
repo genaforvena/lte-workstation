@@ -1,0 +1,304 @@
+#!/usr/bin/env python3
+# mesh-awaydigest — the "while you were away" report, in TWO halves (operator 2026-06-19).
+#
+# The operator wants the mesh to KNOW when he leaves home and when he comes back, and on
+# return to tell him what it caught while he was out — from BOTH sides:
+#   🏠 HOME  — what happened in the apartment while empty (we never stop watching): presence,
+#              movement (wifi-radar / room-sense), who arrived/left, household mode, sound.
+#   🌍 AROUND — what the mesh perceived OUTSIDE via its sensors: neighbour BLE "social clock",
+#              new LAN devices, the public-vantage net watch, overall situation.
+#   🤖 MESH  — what the minds themselves produced meanwhile: commits, completed tasks, incidents.
+#
+# Presence is decided by mesh-operator-home (phone-on-LAN + operator BLE + tailscale). This tool
+# tracks the HOME<->AWAY transition itself (own state file, so it is independent of operator-home's
+# debounce bookkeeping) and, on RETURN, builds the digest and sends it by VOICE (mesh-voice-tx —
+# the operator's preferred format), duplicated as text.
+#
+# Honest by construction: every section says "(тихо — ничего)" when empty, never fakes signal;
+# a too-short step-out (< MIN_AWAY_MIN) is skipped (no spam on a quick flap).
+#
+# Usage:
+#   mesh-awaydigest            # --edge: the reflex (track presence, send digest on return)
+#   mesh-awaydigest --edge     # same, explicit
+#   mesh-awaydigest --show [since]   # print the digest, no send (default since last-away or 3h ago)
+#   mesh-awaydigest --send [since]   # build + send NOW (manual "what did I miss")
+#   mesh-awaydigest --test     # smoke test (no side effects)
+#
+# reflex-cadence: 2-59/5 * * * *
+# reflex-args: --edge
+import calendar, json, os, re, subprocess, sys, time
+
+HOME = os.path.expanduser("~")
+MESH = os.path.join(HOME, ".mesh")
+CHAT = os.path.join(MESH, "chat.log")
+HOMESTATE = os.path.join(MESH, "home-state.log")
+REPO = os.environ.get("MESH_REPO", os.path.join(HOME, "lte-workstation"))
+STATE = os.path.join(MESH, ".awaydigest.state")       # last definite presence we saw: HOME / AWAY
+AWAY_SINCE = os.path.join(MESH, ".awaydigest.away-since")  # epoch when AWAY began
+MIN_AWAY_MIN = int(os.environ.get("MESH_AWAY_MIN_MIN", "20"))  # skip step-outs shorter than this
+
+TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})Z")
+
+# tag -> bucket. HOME = inside the apartment; AROUND = the world outside.
+HOME_TAGS = {
+    "arrived": "🏠", "left": "🏠", "room-moved": "🏠", "presence": "🏠",
+    "household-active": "🏠", "household-asleep": "🏠", "household-away": "🏠",
+    "body-walking": "🏠", "body-still": "🏠", "op-home": "🏠", "op-away": "🏠",
+}
+AROUND_TAGS = {
+    "ambient-clock": "🌍", "lan-newdevice": "🌍", "lan-up": "🌍", "lan-down": "🌍",
+    "scan-spike": "🌍", "reach-down": "🌍", "reach-up": "🌍", "perimeter-alert": "🌍",
+    "perimeter-notice": "🌍", "situation-watch": "🌍", "situation-alert": "🌍",
+}
+TAG_RE = re.compile(r"\[([a-z0-9-]+)\]")
+
+
+def _op_status():
+    """Current presence verdict from the canonical oracle. UNCERTAIN if it can't be read."""
+    try:
+        out = subprocess.run(["mesh-operator-home", "--json"], capture_output=True,
+                             text=True, timeout=30).stdout
+        return (json.loads(out) or {}).get("status", "UNCERTAIN")
+    except Exception:
+        return "UNCERTAIN"
+
+
+def _read(p):
+    try:
+        return open(p, encoding="utf-8", errors="replace").read().splitlines()
+    except OSError:
+        return []
+
+
+def _chat_since(since):
+    """Yield (epoch, who, msg) for chat lines at/after `since`. Lines: 'ISOZ  who  ::  msg'."""
+    for ln in _read(CHAT):
+        m = TS_RE.match(ln)
+        if not m:
+            continue
+        ep = _iso_epoch(m.group(1))
+        if ep is None or ep < since:
+            continue
+        rest = ln[m.end():].lstrip()
+        who, _, msg = rest.partition("::")
+        yield ep, who.strip(), msg.strip()
+
+
+def _iso_epoch(s):
+    """Parse an ISO 'YYYY-MM-DDTHH:MM:SS' (UTC, no offset) to epoch via timegm (tz-safe)."""
+    try:
+        return calendar.timegm(time.strptime(s, "%Y-%m-%dT%H:%M:%S"))
+    except Exception:
+        return None
+
+
+def _git_commits(since):
+    try:
+        out = subprocess.run(
+            ["git", "-C", REPO, "log", "--since", "@%d" % since,
+             "--format=%h %ad %s", "--date=short"],
+            capture_output=True, text=True, timeout=20).stdout
+        return [l for l in out.splitlines() if l.strip()]
+    except Exception:
+        return []
+
+
+def _fmt_dur(sec):
+    h, m = sec // 3600, (sec % 3600) // 60
+    if h and m:
+        return f"{h}ч {m}м"
+    if h:
+        return f"{h}ч"
+    return f"{m}м"
+
+
+def build_digest(since, now):
+    """Return the Russian digest text for the window [since, now]. Deterministic, log-derived."""
+    home_ev, around_ev = [], []
+    arrivals, departures = [], []
+    household, ambient = [], []
+    for ep, who, msg in _chat_since(since):
+        tags = TAG_RE.findall(msg)
+        if not tags:
+            continue
+        tag = tags[0]
+        body = msg.split("::", 1)[-1].strip() if "::" in msg else msg
+        short = re.sub(r"\s+", " ", body)[:140]
+        if tag == "arrived":
+            arrivals.append(short)
+        elif tag == "left":
+            departures.append(short)
+        elif tag.startswith("household-"):
+            household.append(short)
+        elif tag == "ambient-clock":
+            ambient.append(short)
+        elif tag in ("op-home", "op-away") or tag.startswith("body-"):
+            continue            # presence axis itself / the phone WITH him — not a "home" event
+        elif tag in HOME_TAGS:
+            home_ev.append(short)
+        elif tag in AROUND_TAGS:
+            around_ev.append(short)
+
+    # home movement: home-state.log has no leading timestamp, so read it by recency (last N lines)
+    recent_hs = _read(HOMESTATE)[-40:]
+    active_seen = any("ACTIVE" in l or "WAKING" in l or "SOCIAL" in l for l in recent_hs)
+    quiet_seen = any("ASLEEP" in l or "QUIET" in l for l in recent_hs)
+
+    commits = _git_commits(since)
+    done = [m for _, _, m in _chat_since(since) if re.match(r"\[done\]", m.split("::")[-1].strip())]
+    incidents = [m for _, _, m in _chat_since(since)
+                 if re.match(r"\[(health-fail|organ-down|reflex-stale|fitness-regression)\]",
+                             m.split("::")[-1].strip())]
+
+    L = []
+    L.append(f"🏠 Пока тебя не было ({_fmt_dur(now - since)}):")
+    L.append("")
+    # --- HOME half ---
+    L.append("🏠 ДОМА:")
+    home_lines = []
+    if arrivals or departures:
+        if arrivals:
+            home_lines.append(f"  приходили: {arrivals[-1]}")
+        if departures:
+            home_lines.append(f"  уходили: {departures[-1]}")
+    if active_seen and not quiet_seen:
+        home_lines.append("  в квартире фиксировалось движение/активность")
+    elif quiet_seen and not active_seen:
+        home_lines.append("  дома было тихо (без движения)")
+    elif active_seen and quiet_seen:
+        home_lines.append("  чередовались активность и тишина")
+    if household:
+        home_lines.append(f"  режим дома: {household[-1]}")
+    for e in home_ev[-2:]:
+        home_lines.append(f"  {e}")
+    L += home_lines or ["  (тихо — заметных событий дома не было)"]
+    L.append("")
+    # --- AROUND half ---
+    L.append("🌍 ВОКРУГ (сенсоры наружу):")
+    around_lines = []
+    if ambient:
+        around_lines.append(f"  соседский фон: {ambient[-1]}")
+    for e in around_ev[-3:]:
+        around_lines.append(f"  {e}")
+    L += around_lines or ["  (вокруг спокойно — ничего необычного сенсоры не поймали)"]
+    L.append("")
+    # --- MESH half ---
+    L.append("🤖 МЕШ наработал:")
+    mesh_lines = []
+    if commits:
+        mesh_lines.append(f"  коммитов: {len(commits)}")
+        for c in commits[:3]:
+            parts = c.split(" ", 2)
+            mesh_lines.append(f"   • {parts[2] if len(parts) > 2 else c}")
+    if done:
+        mesh_lines.append(f"  выполнено задач: {len(done)}")
+    if incidents:
+        mesh_lines.append(f"  инцидентов: {len(incidents)} (меш сам разрулил)")
+    L += mesh_lines or ["  (спокойно — без заметных изменений)"]
+    return "\n".join(L)
+
+
+def _send(text):
+    for cmd in (["mesh-voice-tx", text], ["mesh-tg", text]):
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+            if r.returncode == 0:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _read_state():
+    try:
+        return open(STATE).read().strip()
+    except OSError:
+        return ""
+
+
+def _write(p, v):
+    try:
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        tmp = p + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(str(v))
+        os.replace(tmp, p)
+    except Exception:
+        pass
+
+
+def edge(now):
+    """The reflex: detect HOME<->AWAY transitions; send the digest on RETURN."""
+    cur = _op_status()
+    if cur == "UNCERTAIN":
+        return                      # don't flip on an unreadable verdict — wait for a definite one
+    prev = _read_state()
+    if not prev:                    # first run — seed silently
+        _write(STATE, cur)
+        return
+    if cur == prev:
+        return
+    if cur == "AWAY":               # left home — stamp the departure, stay silent
+        _write(AWAY_SINCE, now)
+        _write(STATE, cur)
+        return
+    if cur == "HOME":               # came back — build + send the "while you were away" digest
+        since = None
+        try:
+            since = int(open(AWAY_SINCE).read().strip())
+        except Exception:
+            since = None
+        _write(STATE, cur)
+        try:
+            os.remove(AWAY_SINCE)
+        except OSError:
+            pass
+        if since is None:
+            return
+        away_min = (now - since) // 60
+        if away_min < MIN_AWAY_MIN:
+            return                  # quick step-out — not worth a digest
+        digest = "С возвращением! 👋\n\n" + build_digest(since, now)
+        _send(digest)
+
+
+def main():
+    args = sys.argv[1:]
+    now = int(time.time())
+
+    if "--test" in args:
+        # parser + bucket logic, no side effects
+        assert _iso_epoch("2026-06-19T12:00:00") is not None, "iso parse"
+        assert _iso_epoch("garbage") is None, "iso reject"
+        d = build_digest(now - 3600, now)
+        assert "ДОМА" in d and "ВОКРУГ" in d and "МЕШ" in d, "three halves present"
+        assert _fmt_dur(3660) == "1ч 1м" and _fmt_dur(120) == "2м", "dur fmt"
+        # honest-empty: a window with no events still renders the empty markers, never blank
+        empty = build_digest(now + 10, now + 20)
+        assert "тихо" in empty or "спокойно" in empty, "empty section is explicit"
+        print("smoke-test: ok")
+        return
+
+    if "--show" in args or "--send" in args:
+        rest = [a for a in args if not a.startswith("--")]
+        if rest:
+            ep = subprocess.run(["date", "-u", "-d", rest[0], "+%s"],
+                                capture_output=True, text=True).stdout.strip()
+            since = int(ep) if ep.isdigit() else now - 3 * 3600
+        else:
+            try:
+                since = int(open(AWAY_SINCE).read().strip())
+            except Exception:
+                since = now - 3 * 3600
+        digest = "С возвращением! 👋\n\n" + build_digest(since, now)
+        if "--send" in args:
+            print("[sent]" if _send(digest) else "[send failed]")
+        else:
+            print(digest)
+        return
+
+    edge(now)      # default = the reflex
+
+
+if __name__ == "__main__":
+    main()
