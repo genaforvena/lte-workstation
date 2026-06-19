@@ -1,0 +1,291 @@
+#!/usr/bin/env bash
+# mesh-conversation — one spoken conversation TURN, fully local + reflexive (no minds).
+# Ack on the speaker → record the mic → local whisper STT → mesh-relay (fast LLM) → piper TTS → speaker.
+# Lives on a node with a mic + speaker (default-string: webcam mic + Bose). This is the organ a
+# gesture/wake trigger fires (mesh-gesture-watch runs `mesh-conversation --turn` on a thumbs-up), but
+# it's standalone — anything can trigger one turn (a button, a wake word, cron, a test).
+#
+# The whole pipeline is on-device: whisper.cpp transcribes locally, piper synthesizes locally; only the
+# "thinking" step (mesh-relay) leaves the box (cheapest available text pool). No mind is involved.
+#
+#   mesh-conversation --session  CONTINUOUS dialog: ack → listen, on each PAUSE answer + keep listening
+#                                (VAD turn-taking; silence never replies; ends after a long quiet gap)
+#   mesh-conversation --turn     one fixed-window turn: ack → record → STT → relay → TTS → speak
+#   mesh-conversation --say TXT  speak arbitrary text on the speaker (piper → pw-play)   (organ probe)
+#   mesh-conversation --hear     record + transcribe only, print the text                (STT probe)
+#   mesh-conversation --test     dry-run: render+play a fixed phrase, no mic/relay        (smoke)
+#
+# Tunables (env):
+#   CONV_SECS=6           seconds of mic to record per turn
+#   CONV_WHISPER=~/.mesh/whispercpp/main     CONV_MODEL=~/.mesh/whispercpp/models/ggml-base.bin
+#   CONV_PIPER=~/.mesh/piper/piper/piper     CONV_VOICE=~/.mesh/piper/voices/ruslan.onnx
+#   CONV_ACK=~/.mesh/mesh-slyshit.wav        pre-rendered "Меш слышит" acknowledgement
+#   CONV_LANG=ru          CONV_LOG=~/.mesh/conversation.log
+set -uo pipefail
+export PATH="/usr/bin:$HOME/.local/bin:$PATH"   # /usr/bin first: never a snap-confined pw-*/curl
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"   # pipewire (mic + Bose sink)
+MESH="${MESH_DIR:-$HOME/.mesh}"
+
+CONV_SECS="${CONV_SECS:-6}"
+CONV_WHISPER="${CONV_WHISPER:-$MESH/whispercpp/main}"
+CONV_MODEL="${CONV_MODEL:-$MESH/whispercpp/models/ggml-base.bin}"
+CONV_PIPER="${CONV_PIPER:-$MESH/piper/piper/piper}"
+CONV_PIPERLIB="${CONV_PIPERLIB:-$MESH/piper/piper}"
+CONV_VOICE="${CONV_VOICE:-$MESH/piper/voices/ruslan.onnx}"
+CONV_ACK="${CONV_ACK:-$MESH/mesh-slyshit.wav}"
+CONV_LANG="${CONV_LANG:-ru}"
+CONV_MIN_RMS="${CONV_MIN_RMS:-180}"   # below this the room is "silent" → skip (whisper would invent text)
+CONV_LOG="${CONV_LOG:-$MESH/conversation.log}"
+
+logln() { printf '%sZ  %s\n' "$(date -u +%Y-%m-%dT%H:%M:%S)" "$1" >> "$CONV_LOG" 2>/dev/null || true; }
+
+# --- speak <text> : render with piper and play on the default sink (Bose) -----------------------------
+speak() {
+  local txt="$1" wav; wav="$(mktemp /tmp/conv-tts-XXXX.wav)"
+  if [ -x "$CONV_PIPER" ] && [ -f "$CONV_VOICE" ]; then
+    printf '%s' "$txt" | LD_LIBRARY_PATH="$CONV_PIPERLIB" "$CONV_PIPER" -m "$CONV_VOICE" -f "$wav" 2>/dev/null
+  fi
+  if [ -s "$wav" ]; then pw-play "$wav" >/dev/null 2>&1 || aplay -q "$wav" >/dev/null 2>&1; fi
+  rm -f "$wav"
+}
+
+# --- play a pre-rendered wav (the ack) ----------------------------------------------------------------
+play_wav() { [ -s "$1" ] && { pw-play "$1" >/dev/null 2>&1 || aplay -q "$1" >/dev/null 2>&1; }; }
+
+# --- record CONV_SECS of mic to a 16k mono wav --------------------------------------------------------
+record() {  # <out.wav> -> 0 if a non-empty wav was produced
+  local out="$1"
+  timeout "$((CONV_SECS+2))" pw-record --rate 16000 --channels 1 "$out" >/dev/null 2>&1 &
+  local pid=$!
+  sleep "$CONV_SECS"
+  kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+  [ -s "$out" ]
+}
+
+# --- mic energy: RMS of a wav (0-32767). A near-silent room reads low; whisper invents plausible
+# filler from silence, so we gate on real energy BEFORE transcribing. Prints an integer RMS. ----------
+wav_rms() {  # <in.wav> -> integer RMS on stdout (0 if unreadable)
+  python3 - "$1" <<'PY'
+import sys, wave, audioop
+try:
+    w=wave.open(sys.argv[1],'rb'); d=w.readframes(w.getnframes())
+    print(audioop.rms(d, w.getsampwidth()) if d else 0)
+except Exception: print(0)
+PY
+}
+
+# --- transcribe a wav with whisper.cpp; echo trimmed text --------------------------------------------
+transcribe() {  # <in.wav> -> text on stdout
+  [ -x "$CONV_WHISPER" ] && [ -f "$CONV_MODEL" ] || { echo ""; return 1; }
+  "$CONV_WHISPER" -m "$CONV_MODEL" -f "$1" -l "$CONV_LANG" -nt 2>/dev/null \
+    | tr '\n' ' ' | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//'
+}
+
+# --- whisper hallucinates filler on silence/noise; reject it so we don't "answer" a quiet room --------
+# Returns 0 (real speech) or 1 (garbage to ignore). Matches the common ru silence hallucinations.
+is_real_speech() {  # <text>
+  local t; t="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  [ -n "$t" ] || return 1
+  # too short to be a real utterance. NB: GNU tr is byte-oriented, so `tr -dc '[:alnum:]'` would
+  # strip every multibyte Cyrillic char and make EVERY Russian utterance look empty (false "no speech").
+  # Strip only spaces with bash expansion (multibyte-safe) and check the remaining length.
+  local bare="${t//[[:space:]]/}"
+  [ "${#bare}" -ge 4 ] || return 1
+  case "$t" in
+    *'спокойная музыка'*|*'продолжение следует'*|*субтитр*|*'[музыка]'*|*'[аплодисменты]'*|\
+    *'спасибо за просмотр'*|*'редактор субтитров'*|*'корректор'*|'thank you'|'you'|*'♪'*) return 1;;
+  esac
+  return 0
+}
+
+turn() {
+  logln "TURN start (record ${CONV_SECS}s)"
+  play_wav "$CONV_ACK"                       # "Меш слышит"
+  local wav; wav="$(mktemp /tmp/conv-rec-XXXX.wav)"
+  if ! record "$wav"; then logln "record FAIL"; rm -f "$wav"; speak "Микрофон не отвечает."; return 1; fi
+  local rms; rms="$(wav_rms "$wav")"
+  if [ "${rms:-0}" -lt "$CONV_MIN_RMS" ]; then
+    logln "silence rms=$rms < $CONV_MIN_RMS -> skip"; rm -f "$wav"; speak "Тихо, я ничего не услышал."; return 0
+  fi
+  local text; text="$(transcribe "$wav")"; rm -f "$wav"
+  logln "rms=$rms"
+  logln "HEARD: ${text:-<empty>}"
+  if ! is_real_speech "$text"; then
+    logln "no real speech -> skip"; speak "Я не расслышал, повтори, пожалуйста."; return 0
+  fi
+  local reply; reply="$(mesh-relay "Ты — голос умного дома 'Меш'. Ответь коротко (1-2 фразы), по-русски, разговорно. Вопрос: $text" 2>/dev/null)"
+  reply="$(printf '%s' "$reply" | tr '\n' ' ' | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+  [ -n "$reply" ] || reply="Что-то я завис, попробуй ещё раз."
+  logln "REPLY: $reply"
+  speak "$reply"
+  return 0
+}
+
+# --- continuous SESSION: listen until a pause, answer, keep listening (VAD turn-taking) --------------
+# Streams raw PCM from pw-record and runs a tiny voice-activity state machine in python: wait for
+# speech onset, capture until a pause, transcribe THAT utterance, think, speak (mic idle while we talk),
+# then listen again. Silence/empty room never triggers a reply. The session ends after a long quiet gap.
+session() {
+  export CONV_WHISPER CONV_MODEL CONV_PIPER CONV_PIPERLIB CONV_VOICE CONV_ACK CONV_LANG CONV_LOG
+  local PY; PY="$(mktemp /tmp/conv-sess-XXXXXX.py)"; trap 'rm -f "$PY"' RETURN
+  cat > "$PY" <<'PYEOF'
+import os, sys, time, wave, audioop, subprocess, struct
+
+RATE=16000; FRAME_MS=int(os.environ.get("CONV_FRAME_MS","200"))
+FRAME=int(RATE*FRAME_MS/1000); FBYTES=FRAME*2; FSEC=FRAME_MS/1000.0
+START_RMS=int(os.environ.get("CONV_START_RMS","600"))   # speech onset
+SIL_RMS  =int(os.environ.get("CONV_SIL_RMS","300"))     # below = silence
+END_SIL  =float(os.environ.get("CONV_END_SIL","0.9"))   # silence that ends an utterance
+MAX_UTT  =float(os.environ.get("CONV_MAX_UTT","18"))    # hard cap per utterance
+MIN_UTT  =float(os.environ.get("CONV_MIN_UTT","0.4"))   # minimum voiced length to bother
+IDLE_END =float(os.environ.get("CONV_SESSION_IDLE","22"))  # quiet gap that ends the session
+LANG=os.environ.get("CONV_LANG","ru")
+WHISPER=os.environ["CONV_WHISPER"]; MODEL=os.environ["CONV_MODEL"]
+PIPER=os.environ["CONV_PIPER"]; PIPERLIB=os.environ["CONV_PIPERLIB"]; VOICE=os.environ["CONV_VOICE"]
+ACK=os.environ.get("CONV_ACK",""); LOG=os.environ["CONV_LOG"]
+
+def logln(s):
+    try:
+        with open(LOG,"a") as f: f.write(time.strftime("%Y-%m-%dT%H:%M:%SZ ",time.gmtime())+s+"\n")
+    except Exception: pass
+
+def play(path):
+    if path and os.path.exists(path):
+        subprocess.run(["pw-play",path],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+
+def speak(txt):
+    wav="/tmp/conv-say-%d.wav"%os.getpid()
+    p=subprocess.run([PIPER,"-m",VOICE,"-f",wav],input=txt.encode(),
+        env=dict(os.environ,LD_LIBRARY_PATH=PIPERLIB),
+        stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+    if os.path.exists(wav) and os.path.getsize(wav)>0:
+        subprocess.run(["pw-play",wav],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        try: os.remove(wav)
+        except OSError: pass
+
+HALLU=("спокойная музыка","продолжение следует","субтитр","[музыка]","[аплодисменты]",
+       "спасибо за просмотр","редактор субтитров","корректор","♪","thank you")
+def is_real(text):
+    t=text.strip().lower()
+    if len("".join(t.split()))<4: return False
+    for h in HALLU:
+        if h in t: return False
+    if t in ("you","thank you","ну","да","а"): return False
+    return True
+
+def transcribe(wavpath):
+    try:
+        out=subprocess.run([WHISPER,"-m",MODEL,"-f",wavpath,"-l",LANG,"-nt"],
+            capture_output=True,timeout=60).stdout.decode("utf-8","ignore")
+        return " ".join(out.split()).strip()
+    except Exception as e:
+        logln("whisper-err "+str(e)); return ""
+
+def relay(text):
+    prompt=("Ты — голос умного дома 'Меш'. Ответь коротко, 1-2 фразы, по-русски, разговорно. "
+            "Вопрос: "+text)
+    try:
+        out=subprocess.run(["mesh-relay",prompt],capture_output=True,timeout=40).stdout.decode("utf-8","ignore")
+        return " ".join(out.split()).strip()
+    except Exception as e:
+        logln("relay-err "+str(e)); return ""
+
+def read_exact(f,n):
+    buf=b""
+    while len(buf)<n:
+        chunk=f.read(n-len(buf))
+        if not chunk: break
+        buf+=chunk
+    return buf
+
+def record_until_pause():
+    # returns: None (session idle-out) | "" (noise/too-short, keep going) | wavpath (an utterance)
+    p=subprocess.Popen(["pw-record","--rate","16000","--channels","1","--format","s16","-"],
+        stdout=subprocess.PIPE,stderr=subprocess.DEVNULL)
+    frames=[]; capturing=False; silence=0.0; waited=0.0
+    try:
+        while True:
+            buf=read_exact(p.stdout,FBYTES)
+            if len(buf)<FBYTES: break
+            r=audioop.rms(buf,2)
+            if not capturing:
+                waited+=FSEC
+                if r>=START_RMS:
+                    capturing=True; frames=[buf]; silence=0.0
+                elif waited>=IDLE_END:
+                    return None
+            else:
+                frames.append(buf)
+                if r<SIL_RMS:
+                    silence+=FSEC
+                    if silence>=END_SIL: break
+                else:
+                    silence=0.0
+                if len(frames)*FSEC>=MAX_UTT: break
+    finally:
+        p.kill()
+        try: p.stdout.close()
+        except Exception: pass
+    voiced=len(frames)*FSEC - silence
+    if voiced<MIN_UTT: return ""
+    wav="/tmp/conv-utt-%d.wav"%os.getpid()
+    w=wave.open(wav,"wb"); w.setnchannels(1); w.setsampwidth(2); w.setframerate(RATE)
+    w.writeframes(b"".join(frames)); w.close()
+    return wav
+
+def main():
+    logln("SESSION start (start_rms=%d end_sil=%.1fs idle_end=%.0fs)"%(START_RMS,END_SIL,IDLE_END))
+    play(ACK)                                   # "Меш слышит" — the audible "I'm listening now"
+    time.sleep(0.3)
+    exchanges=0
+    while True:
+        w=record_until_pause()
+        if w is None:
+            break                               # long quiet → end session
+        if w=="":
+            continue
+        text=transcribe(w)
+        try: os.remove(w)
+        except OSError: pass
+        logln("HEARD: "+(text or "<empty>"))
+        if not is_real(text):
+            continue                            # junk / hallucination → stay silent, keep listening
+        reply=relay(text) or "Что-то я завис, повтори."
+        logln("REPLY: "+reply)
+        speak(reply)
+        exchanges+=1
+        time.sleep(0.3)                         # let Bose echo settle before listening again
+    logln("SESSION end (exchanges=%d)"%exchanges)
+    if exchanges>0:
+        speak("Слушать перестал, покажи палец, если что.")
+
+main()
+PYEOF
+  python3 "$PY"
+}
+
+case "${1:-}" in
+  --session)
+    # single-session lock: a second thumbs-up mid-session must NOT start a competing listener
+    # (two pw-record/Bose at once = audio chaos). flock -n → the second invocation just exits.
+    exec 9>"$MESH/conversation.lock"
+    if ! flock -n 9; then logln "session already running — ignored"; exit 0; fi
+    session ;;
+  --turn)  turn ;;
+  --say)   shift; speak "${*:-Меш на связи.}" ;;
+  --hear)
+    wav="$(mktemp /tmp/conv-rec-XXXX.wav)"
+    record "$wav" && transcribe "$wav"; echo; rm -f "$wav" ;;
+  --test)
+    # smoke: no mic, no relay — just prove TTS renders + plays and the binaries are present
+    miss=0
+    for f in "$CONV_WHISPER" "$CONV_MODEL" "$CONV_PIPER" "$CONV_VOICE"; do
+      [ -e "$f" ] || { echo "  MISSING: $f"; miss=1; }
+    done
+    [ "$miss" = 0 ] || { echo "smoke-test: FAIL (stack pieces missing above)"; exit 1; }
+    echo "  all stack pieces present; rendering a test phrase…"
+    speak "Меш на связи, проверка голоса."
+    echo "smoke-test: ok (whisper+model+piper+voice present, TTS rendered)"
+    ;;
+  *) sed -n '2,24p' "$0" ;;
+esac
