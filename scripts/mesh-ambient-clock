@@ -9,8 +9,17 @@
 #   LYWSD03MMC seen    → temperature sensor active
 #   All TVs gone       → late night / neighbors asleep
 #
-# Reads the arrivals.state file (updated by mesh-arrivals) and/or presence.log.
+# Reads presence.log (updated by mesh-arrivals) for the last 25 scans (~15 min).
 # Emits a one-line ambient label + breakdown.
+#
+# Signal fidelity (2026-06-19):
+#   Rolling 25-scan window instead of last 2 — BLE advertising is bursty; a TV
+#   may miss 1-2 scans even when actively beaconing. 25 scans ≈ 15 min at 70s/scan.
+#   RSSI proximity bands: TVs at < -90 dBm are noise-floor and excluded entirely;
+#     TVs at ≥ -75 = NEARBY (in or adjacent room); < -75 = FAR (neighbor range).
+#   Vote-based counting: a TV must appear in ≥ 2 of the last 25 scans to count.
+#   Honest stale path: DATA-STALE when presence.log is > 20 min old (exit 0 still,
+#     verdict is explicitly degraded — not silently wrong).
 #
 #   mesh-ambient-clock            one-shot label
 #   mesh-ambient-clock --edge     emit only when label changes (for cron/stream wiring)
@@ -21,74 +30,201 @@ export PATH="$HOME/.local/bin:$PATH"
 [ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
 [ -f "$HOME/.mesh/nodes" ] && . "$HOME/.mesh/nodes" 2>/dev/null || true
 [ -r "$HOME/.local/bin/mesh-patterns.sh" ] && . "$HOME/.local/bin/mesh-patterns.sh" 2>/dev/null || true
-# Inline fallback if patterns not yet deployed
-MESH_FIXED_RE="${MESH_FIXED_RE:-\[TV\]|MiTV-|Mi Box|Bluedroid TV|GR-AC_|MI SCALE|LYWSD|Vega BLE|GEELY_BT|CAR-BT}"
 
 PRESENCE_LOG="$HOME/.mesh/presence.log"
 STATE_FILE="$HOME/.mesh/.ambient-clock.state"
 TS="$(date -u +%FT%TZ)"
 
+# ---- Smoke test ----
 [ "${1:-}" = --test ] && {
-  # Real dep: python3 — used for presence.log parsing (line ~41); grep/~/.mesh are always present
-  command -v python3 >/dev/null 2>&1 || { echo "smoke-test: FAIL (no python3 — required for presence.log parsing)"; exit 1; }
-  # Dry-run: feed a synthetic presence line through the embedded parser and verify it extracts names
-  result="$(printf 'devices=[-72|AA:BB:CC:DD:EE:FF|[TV] Samsung 6 Series (49) -65|11:22:33:44:55:66|Bose Revolve]\n' | python3 -c '
-import sys, re
-seen = set()
-for line in sys.stdin:
-    m = re.search(r"devices=\[(.+)\]", line)
-    if not m: continue
-    inner = m.group(1)
-    entries = list(re.finditer(r"-\d+\|[0-9A-Fa-f:]{17}\|", inner))
-    for i, e in enumerate(entries):
-        nstart = e.end()
-        nend = entries[i+1].start() if i+1 < len(entries) else len(inner)
-        name = inner[nstart:nend].rstrip("] ")
-        if name and name != "?": seen.add(name)
-print("\n".join(sorted(seen)))
-' 2>&1)" || { echo "smoke-test: FAIL (python3 presence parser errored)"; exit 1; }
-  echo "$result" | grep -q '\[TV\] Samsung' \
-    || { echo "smoke-test: FAIL (parser extracted wrong names; got: $result)"; exit 1; }
-  echo "smoke-test: ok (python3 ok; presence parser correctly extracts device names)"
+  command -v python3 >/dev/null 2>&1 || { echo "smoke-test: FAIL (no python3)"; exit 1; }
+
+  result="$(python3 -c '
+import re
+
+TV_RE = re.compile(r"\[TV\]|MiTV|Bluedroid TV|Mi Box|ваня тв", re.I)
+AC_RE = re.compile(r"GR-AC_", re.I)
+SENS_RE = re.compile(r"MI SCALE|LYWSD", re.I)
+SKIP_RE = re.compile(r"Bose|JBL|AirPods|Galaxy Buds|Pixel|iPhone|Redmi", re.I)
+
+def parse_scans(lines):
+    tvs_vote, tv_rssi, ac_names, sensor_names = {}, {}, set(), set()
+    scan_count = 0
+    for line in lines:
+        if not re.search(r"\bdevices=\[", line): continue
+        scan_count += 1
+        dm = re.search(r"devices=\[(.+)\]", line)
+        if not dm: continue
+        inner = dm.group(1)
+        entries = list(re.finditer(r"(-\d+)\|([0-9A-Fa-f:]{17})\|", inner))
+        seen = set()
+        for i, e in enumerate(entries):
+            rssi = int(e.group(1))
+            nstart = e.end()
+            nend = entries[i+1].start() if i+1 < len(entries) else len(inner)
+            name = inner[nstart:nend].rstrip("] ")
+            if not name or name == "?": continue
+            if SKIP_RE.search(name): continue
+            if TV_RE.search(name) and rssi >= -90:
+                seen.add(name)
+                tv_rssi[name] = max(tv_rssi.get(name, -999), rssi)
+            elif AC_RE.search(name):
+                ac_names.add(name)
+            elif SENS_RE.search(name):
+                sensor_names.add(name)
+        for n in seen:
+            tvs_vote[n] = tvs_vote.get(n, 0) + 1
+    min_v = 2 if scan_count >= 4 else 1
+    return tvs_vote, tv_rssi, min_v, scan_count
+
+errors = []
+
+# Test 1: TV extracted, Bose skipped, vote-based counting (2 scans → TV counts)
+lines1 = [
+    "2026-06-19T12:00:00Z n n=2 devices=[-72|AA:BB:CC:00:00:01|[TV] Samsung 5 Series -43|11:22:33:44:55:66|LE-Bose Revolve SoundLink]",
+    "2026-06-19T12:01:00Z n n=2 devices=[-72|AA:BB:CC:00:00:01|[TV] Samsung 5 Series -43|11:22:33:44:55:66|LE-Bose Revolve SoundLink]",
+]
+vote, rssi, min_v, sc = parse_scans(lines1)
+confirmed = [n for n,c in vote.items() if c >= min_v]
+if len(confirmed) != 1:
+    errors.append(f"T1 TV count wrong (got {len(confirmed)} {confirmed})")
+if any("Bose" in n for n in confirmed):
+    errors.append("T1 Bose should be skipped")
+
+# Test 2: RSSI filter — TV at -95 excluded
+lines2 = ["2026-06-19T12:00:00Z n n=1 devices=[-95|AA:BB:CC:00:00:02|[TV] Far Samsung]"]
+vote2, _, _, _ = parse_scans(lines2)
+if vote2:
+    errors.append(f"T2 RSSI -95 TV should be excluded (got {vote2})")
+
+# Test 3: Vote filter — TV in 1 of 4 scans → excluded (min_votes=2)
+# Empty scans (devices=[]) are counted toward scan_count so the 1 sighting is diluted.
+lines3 = [
+    "2026-06-19T12:00:00Z n n=1 devices=[-72|AA:BB:CC:00:00:03|[TV] Samsung rare]",
+    "2026-06-19T12:01:00Z n n=0 devices=[]",
+    "2026-06-19T12:02:00Z n n=0 devices=[]",
+    "2026-06-19T12:03:00Z n n=0 devices=[]",
+]
+vote3, _, min_v3, sc3 = parse_scans(lines3)
+confirmed3 = [n for n,c in vote3.items() if c >= min_v3]
+if confirmed3:
+    errors.append(f"T3 TV in 1/{sc3} scans should not count (min_votes={min_v3}, got {confirmed3})")
+
+# Test 4: RSSI band — TV at -82 is FAR (< -75 dBm), TV at -60 is NEARBY (>= -75 dBm)
+# Note: RSSI is negative; -60 > -75 (stronger signal = more negative = closer).
+lines4 = [
+    "2026-06-19T12:00:00Z n n=2 devices=[-82|AA:BB:CC:00:00:04|[TV] Far TV -60|BB:BB:BB:BB:BB:01|[TV] Near TV]",
+    "2026-06-19T12:01:00Z n n=2 devices=[-82|AA:BB:CC:00:00:04|[TV] Far TV -60|BB:BB:BB:BB:BB:01|[TV] Near TV]",
+]
+vote4, rssi4, min_v4, _ = parse_scans(lines4)
+confirmed4 = [n for n,c in vote4.items() if c >= min_v4]
+nearby4 = [n for n in confirmed4 if rssi4.get(n,-999) >= -75]
+far4    = [n for n in confirmed4 if rssi4.get(n,-999) < -75]
+if len(nearby4) != 1 or len(far4) != 1:
+    errors.append(f"T4 RSSI bands wrong: nearby={nearby4} far={far4}")
+
+if errors:
+    for e in errors: print("FAIL:", e)
+    exit(1)
+print("ok (TV+vote+Bose-skip + RSSI-filter + vote-filter + RSSI-bands)")
+' 2>&1)"
+  echo "$result" | grep -q '^ok ' || { echo "smoke-test: FAIL (python parser/logic: $result)"; exit 1; }
+  echo "smoke-test: ok (python3 ok; $result)"
   exit 0
 }
 
-# ---- Read fixed appliances from latest presence.log (last 2 scans) ----
-tv_count=0; ac_on=0; scale_on=0; temp_sensor=0; appliance_names=""
+# ---- Stale data detection ----
+# presence.log not updated in > 20 min → DATA-STALE (honest degraded path, exit 0).
+data_stale=0
+if [ ! -s "$PRESENCE_LOG" ]; then
+  data_stale=1
+else
+  log_mtime="$(stat -c %Y "$PRESENCE_LOG" 2>/dev/null || echo 0)"
+  now_s="$(date +%s)"
+  log_age_min=$(( (now_s - log_mtime) / 60 ))
+  [ "$log_age_min" -gt 20 ] && data_stale=1
+fi
 
-if [ -s "$PRESENCE_LOG" ]; then
-  # Format: devices=[-RSSI|MAC|Name -RSSI|MAC|Name ...]
-  # Use python3 to split on the -RSSI|MAC| separator (names can contain spaces and '[')
-  names="$(tail -n 2 "$PRESENCE_LOG" | python3 -c '
+# ---- Parse rolling 15-min window from presence.log ----
+# tail -n 25: at ~70s/scan, 25 scans covers ~29 min (safe window for 15 min useful data).
+# Python parser:
+#   TV_RE  — known TV device patterns (incl. local neighbor device "ваня тв")
+#   SKIP_RE — person/owner devices that happen to match appliance names (Bose etc.)
+#   RSSI < -90 dBm excluded (noise floor / too far for a useful signal)
+#   RSSI >= -75 = NEARBY; < -75 = FAR
+#   vote-based: TV must appear in >= 2 scans (min 1 if < 4 scans total)
+tv_count=0; tv_nearby_count=0; tv_far_count=0; ac_on=0; temp_sensor=0
+appliance_names=""; scan_count=0
+
+if [ "$data_stale" = 0 ]; then
+  parsed="$(tail -n 25 "$PRESENCE_LOG" | python3 -c '
 import sys, re
-seen = set()
+
+TV_RE   = re.compile(r"\[TV\]|MiTV|Bluedroid TV|Mi Box|ваня тв", re.I)
+AC_RE   = re.compile(r"GR-AC_", re.I)
+SENS_RE = re.compile(r"MI SCALE|LYWSD", re.I)
+SKIP_RE = re.compile(r"Bose|JBL|AirPods|Galaxy Buds|Pixel|iPhone|Redmi", re.I)
+
+tvs_vote = {}; tv_rssi = {}
+ac_names = set(); sensor_names = set()
+scan_count = 0
+
 for line in sys.stdin:
-    m = re.search(r"devices=\[(.+)\]", line)
-    if not m: continue
-    inner = m.group(1)
-    entries = list(re.finditer(r"-\d+\|[0-9A-Fa-f:]{17}\|", inner))
+    # Count every scan event (including empty scans with n=0 devices=[])
+    # so that min_votes tracks real scan density, not just non-empty scans.
+    if not re.search(r"\bdevices=\[", line): continue
+    scan_count += 1
+    dm = re.search(r"devices=\[(.+)\]", line)
+    if not dm: continue  # empty devices=[] — counted but no devices to parse
+    inner = dm.group(1)
+    entries = list(re.finditer(r"(-\d+)\|([0-9A-Fa-f:]{17})\|", inner))
+    seen = set()
     for i, e in enumerate(entries):
+        rssi = int(e.group(1))
         nstart = e.end()
         nend = entries[i+1].start() if i+1 < len(entries) else len(inner)
         name = inner[nstart:nend].rstrip("] ")
-        if name and name != "?": seen.add(name)
-print("\n".join(seen))
-' 2>/dev/null)"
+        if not name or name == "?": continue
+        if SKIP_RE.search(name): continue
+        if TV_RE.search(name) and rssi >= -90:
+            seen.add(name)
+            tv_rssi[name] = max(tv_rssi.get(name, -999), rssi)
+        elif AC_RE.search(name):
+            ac_names.add(name)
+        elif SENS_RE.search(name):
+            sensor_names.add(name)
+    for n in seen:
+        tvs_vote[n] = tvs_vote.get(n, 0) + 1
 
-  while IFS= read -r name; do
-    [ -z "$name" ] && continue
-    printf '%s' "$name" | grep -qiE "$MESH_FIXED_RE" || continue
-    case "$name" in
-      *\[TV\]*|*MiTV*|*Samsung*TV*|*Bluedroid\ TV*|*Mi\ Box*)
-        tv_count=$((tv_count+1)); appliance_names="${appliance_names}TV:${name} ";;
-      *GR-AC_*)
-        ac_on=1; appliance_names="${appliance_names}AC:${name} ";;
-      *MI\ SCALE*|*LYWSD*)
-        temp_sensor=1; appliance_names="${appliance_names}sensor:${name} ";;
-      *)
-        appliance_names="${appliance_names}${name} ";;
+min_votes = 2 if scan_count >= 4 else 1
+nearby = [n for n,c in tvs_vote.items() if c >= min_votes and tv_rssi.get(n,-999) >= -75]
+far    = [n for n,c in tvs_vote.items() if c >= min_votes and tv_rssi.get(n,-999) < -75]
+all_tv = nearby + far
+
+print("scan_count=" + str(scan_count))
+print("tv_count="   + str(len(all_tv)))
+print("tv_nearby="  + str(len(nearby)))
+print("tv_far="     + str(len(far)))
+print("ac="         + str(int(bool(ac_names))))
+print("sensor="     + str(int(bool(sensor_names))))
+print("appliances=" + "|".join(
+    ["TV:" + n for n in all_tv] +
+    ["AC:" + n for n in sorted(ac_names)] +
+    ["sensor:" + n for n in sorted(sensor_names)]
+))
+' 2>/dev/null || true)"
+
+  while IFS='=' read -r key val; do
+    case "$key" in
+      scan_count)  scan_count="$val" ;;
+      tv_count)    tv_count="$val" ;;
+      tv_nearby)   tv_nearby_count="$val" ;;
+      tv_far)      tv_far_count="$val" ;;
+      ac)          ac_on="$val" ;;
+      sensor)      temp_sensor="$val" ;;
+      appliances)  appliance_names="${val//|/ }" ;;
     esac
-  done <<< "$names"
+  done <<< "$parsed"
 fi
 
 # ---- Derive ambient label ----
@@ -96,19 +232,29 @@ HOUR="$(date +%H)"
 label="QUIET"
 detail=""
 
-if [ "$tv_count" -ge 3 ]; then
-  label="ACTIVE"; detail="${tv_count} TVs on"
+if [ "$data_stale" = 1 ]; then
+  label="DATA-STALE"
+  detail="presence.log >20min old — BLE data unavailable"
+elif [ "$tv_count" -ge 3 ] || [ "$tv_nearby_count" -ge 2 ]; then
+  label="ACTIVE"
+  detail="${tv_count} TVs on (${tv_nearby_count} nearby, ${tv_far_count} neighbor-range)"
 elif [ "$tv_count" -ge 1 ]; then
-  label="MODERATE"; detail="${tv_count} TV(s) on"
+  label="MODERATE"
+  if [ "$tv_nearby_count" -ge 1 ]; then
+    detail="${tv_count} TV(s) on incl. ${tv_nearby_count} nearby (≥-75dBm)"
+  else
+    detail="${tv_count} TV(s) on in neighbor range (<-75dBm)"
+  fi
 fi
 
-[ "$ac_on" = 1 ] && detail="${detail:+$detail, }AC running → hot outside"
+[ "$ac_on" = 1 ]     && detail="${detail:+$detail, }AC running → hot outside"
 [ "$temp_sensor" = 1 ] && detail="${detail:+$detail, }temp sensor active"
-[ -z "$detail" ] && detail="no appliances visible"
+[ -z "$detail" ]     && detail="no appliances in last ${scan_count} scans"
 
-# Late-night override
-if [ "$tv_count" = 0 ] && { [ "$HOUR" -ge 23 ] || [ "$HOUR" -le 5 ]; }; then
-  label="NIGHT-QUIET"; detail="no TVs, late hour"
+# Late-night override only when genuinely quiet (not stale)
+if [ "$label" = "QUIET" ] && { [ "$HOUR" -ge 23 ] || [ "$HOUR" -le 5 ]; }; then
+  label="NIGHT-QUIET"
+  detail="no TVs, late hour (${scan_count} scans)"
 fi
 
 output="${label} — ${detail} (${appliance_names:-none})"
@@ -122,13 +268,15 @@ case "${1:-}" in
       command -v mesh-chat >/dev/null 2>&1 && \
         mesh-chat "[ambient-clock] $output" >/dev/null 2>&1 || true
     fi
-    # touch every run so the state-file mtime tracks last-RUN (liveness), not last-CHANGE —
-    # else a stable label reads as a dead reflex to the sensorium roll-call's age/STALE check.
+    # touch every run so state-file mtime tracks last-RUN not last-CHANGE
     [ -e "$STATE_FILE" ] && touch "$STATE_FILE" 2>/dev/null || printf '%s\n' "$label" > "$STATE_FILE"
     ;;
   --json)
-    printf '{"label":"%s","tv_count":%d,"ac_on":%s,"ts":"%s","detail":"%s"}\n' \
-      "$label" "$tv_count" "$([ "$ac_on" = 1 ] && echo true || echo false)" "$TS" "$detail"
+    printf '{"label":"%s","tv_count":%d,"tv_nearby":%d,"tv_far":%d,"ac_on":%s,"data_stale":%s,"scan_count":%d,"ts":"%s","detail":"%s"}\n' \
+      "$label" "$tv_count" "$tv_nearby_count" "$tv_far_count" \
+      "$([ "$ac_on" = 1 ] && echo true || echo false)" \
+      "$([ "$data_stale" = 1 ] && echo true || echo false)" \
+      "$scan_count" "$TS" "$detail"
     ;;
   *)
     printf 'ambient: %s\n' "$output"
