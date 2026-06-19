@@ -1,0 +1,154 @@
+#!/usr/bin/env python3
+# mesh-transcribe-url — transcribe an audio recording from a URL via Groq whisper, fast + zero
+# local heat. Built for the operator's recurring "here's a Yandex.Disk meeting link, make a
+# transcript and drop it on a node" ask. Resolves a Yandex public link (or takes a direct URL),
+# downloads, chunks into <Groq-limit segments, transcribes each with whisper-large-v3-turbo, and
+# stitches an offset-corrected [HH:MM:SS]-timestamped transcript + a plain-text version.
+#
+# Why Groq, not local whisper.cpp: large-v3-turbo on this node's CPU runs ~3.4x SLOWER than
+# realtime — a 2h meeting = ~7h of full CPU on a box that thermally throttles and starves the
+# operator channel. Groq does the same model on cloud GPU in ~1 min for 2h, no local heat.
+#
+# Usage:
+#   mesh-transcribe-url <url> [--label NAME] [--out DIR] [--lang ru] [--dest user@host:DIR]
+#   mesh-transcribe-url --test
+# Notes:
+#   - <url> may be a Yandex public link (disk.360.yandex.ru / yadi.sk) or any direct audio URL.
+#   - --dest scp's both outputs to a remote dir after writing them locally.
+#   - Groq key: ~/.mesh/groq.env (GROQ_API_KEY / gsk_... ); never echoed.
+# reflex-cadence: none  (on-demand, operator-driven — not a scheduled reflex)
+import os, subprocess, json, sys, time, urllib.parse, re
+
+CHUNK = 600  # seconds per chunk (~4.6MB mp3 @64kbps — well under Groq's 25MB free-tier limit)
+HALLUC = ("Продолжение следует...", "Субтитры", "Спасибо за просмотр", "Редактор субтитров",
+          "Subtitles by", "Thank you for watching")
+
+def key():
+    k = subprocess.run("grep -oE 'gsk_[A-Za-z0-9]+' ~/.mesh/groq.env 2>/dev/null | head -1",
+                       shell=True, capture_output=True, text=True).stdout.strip()
+    return k
+
+def hms(s):
+    s = int(s); return f"{s//3600:02d}:{(s%3600)//60:02d}:{s%60:02d}"
+
+def arg(name, default=None):
+    if name in sys.argv:
+        i = sys.argv.index(name)
+        return sys.argv[i+1] if i+1 < len(sys.argv) else default
+    return default
+
+def resolve(url):
+    """Return (download_href, source_name). Yandex public links go through the public API;
+    any other URL is treated as a direct download."""
+    host = urllib.parse.urlparse(url).netloc
+    if "yandex" in host or "yadi.sk" in host:
+        q = urllib.parse.quote(url, safe="")
+        meta = json.loads(subprocess.run(
+            ["curl","-s","https://cloud-api.yandex.net/v1/disk/public/resources?public_key="+q],
+            capture_output=True, text=True).stdout)
+        href = json.loads(subprocess.run(
+            ["curl","-s","https://cloud-api.yandex.net/v1/disk/public/resources/download?public_key="+q],
+            capture_output=True, text=True).stdout)["href"]
+        return href, meta.get("name", "recording")
+    return url, url.rsplit("/", 1)[-1] or "recording"
+
+def groq_chunk(path, k, lang):
+    r = subprocess.run(["curl","-s","--max-time","180",
+        "https://api.groq.com/openai/v1/audio/transcriptions",
+        "-H", f"Authorization: Bearer {k}",
+        "-F", f"file=@{path}", "-F","model=whisper-large-v3-turbo",
+        "-F", f"language={lang}", "-F","response_format=verbose_json","-F","temperature=0"],
+        capture_output=True, text=True)
+    return r.stdout
+
+def test():
+    fail = 0
+    import shutil
+    for dep in ("curl","ffmpeg","ffprobe","python3"):
+        if shutil.which(dep): print(f"PASS: {dep} found")
+        else: print(f"FAIL: {dep} missing"); fail += 1
+    if key(): print("PASS: groq key present")
+    else: print("FAIL: no groq key in ~/.mesh/groq.env"); fail += 1
+    # resolve a known-shape yandex url without network side effects on transcription
+    href, name = (None, None)
+    try:
+        href, name = resolve("https://disk.360.yandex.ru/d/QFXCS5aTYABU8Q")
+        if href and href.startswith("http"): print(f"PASS: yandex resolve -> {name}")
+        else: print("WARN: yandex resolve returned no href (offline?)")
+    except Exception as e:
+        print(f"WARN: yandex resolve errored (offline?): {e}")
+    print(f"smoke-test: {'ok' if fail==0 else 'FAIL'} ({fail} failure(s))")
+    sys.exit(0 if fail == 0 else 1)
+
+def main():
+    if "--test" in sys.argv: return test()
+    if len(sys.argv) < 2 or sys.argv[1].startswith("--"):
+        print("usage: mesh-transcribe-url <url> [--label NAME] [--out DIR] [--lang ru] [--dest user@host:DIR]")
+        sys.exit(2)
+    url = sys.argv[1]
+    lang = arg("--lang", "ru")
+    outdir = arg("--out", "/tmp/transcripts")
+    dest = arg("--dest")
+    os.makedirs(outdir, exist_ok=True)
+    k = key()
+    if not k: print("no groq key (~/.mesh/groq.env)"); sys.exit(1)
+
+    href, srcname = resolve(url)
+    if not href: print("could not resolve download URL"); sys.exit(1)
+    label = arg("--label") or re.sub(r"[^0-9A-Za-z._-]+","_", os.path.splitext(srcname)[0])[:60]
+    src = f"/tmp/_tu_{label}.mp3"
+    print(f"file: {srcname}", flush=True)
+    subprocess.run(["curl","-s","-L","-o",src,href])
+    if not os.path.exists(src) or os.path.getsize(src) < 4000:
+        print("download failed / too small"); sys.exit(1)
+    print(f"downloaded {os.path.getsize(src)} bytes", flush=True)
+
+    dur = float(subprocess.run(["ffprobe","-v","error","-show_entries","format=duration",
+            "-of","default=noprint_wrappers=1:nokey=1", src], capture_output=True, text=True).stdout or 0)
+    nchunks = int(dur // CHUNK) + 1
+    print(f"duration {dur:.0f}s -> {nchunks} chunks", flush=True)
+
+    segments=[]; plain=[]
+    for i in range(nchunks):
+        start=i*CHUNK; cpath=f"/tmp/_tuc_{label}_{i:02d}.mp3"
+        subprocess.run(["ffmpeg","-y","-ss",str(start),"-t",str(CHUNK),"-i",src,
+            "-ar","16000","-ac","1","-b:a","48k",cpath],capture_output=True)
+        if not os.path.exists(cpath) or os.path.getsize(cpath)<2000:
+            print(f"chunk {i}: past end, stop",flush=True); break
+        d=None
+        for a in range(3):
+            raw=groq_chunk(cpath,k,lang)
+            try: d=json.loads(raw); break
+            except Exception: print(f"chunk {i} retry {a}: {raw[:150]}",flush=True); time.sleep(3)
+        if d is None: print(f"chunk {i} FAILED",flush=True); os.remove(cpath); continue
+        txt=d.get("text","").strip(); plain.append(txt)
+        for s in d.get("segments",[]): segments.append((start+s["start"], s["text"].strip()))
+        print(f"chunk {i:02d} [{hms(start)}] {len(txt)} chars",flush=True)
+        os.remove(cpath)
+
+    out_txt = f"{outdir}/{label}_transcript.txt"
+    out_plain = f"{outdir}/{label}_plain.txt"
+    with open(out_txt,"w") as f:
+        f.write(f"Транскрипт: {srcname}\nЯзык: {lang} · Groq whisper-large-v3-turbo\n"+"="*60+"\n\n")
+        last=-999
+        for t,txt in segments:
+            if not txt: continue
+            if any(h in txt for h in HALLUC) and len(txt)<40: continue
+            if t-last>=30:
+                f.write(f"\n[{hms(t)}]\n"); last=t
+            f.write(txt+" ")
+        f.write("\n")
+    with open(out_plain,"w") as f:
+        f.write("\n".join(p for p in plain if p)+"\n")
+    try: os.remove(src)
+    except OSError: pass
+    print(f"DONE: {len(segments)} segments\n  {out_txt}\n  {out_plain}", flush=True)
+
+    if dest:
+        r = subprocess.run(["scp","-o","StrictHostKeyChecking=no",out_txt,out_plain,dest],
+                           capture_output=True, text=True)
+        if r.returncode==0: print(f"copied to {dest}")
+        else: print(f"scp to {dest} FAILED: {r.stderr.strip()}")
+
+if __name__ == "__main__":
+    main()
