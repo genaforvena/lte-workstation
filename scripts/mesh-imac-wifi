@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+# mesh-imac-wifi — iMac WiFi link quality + RSSI-swing motion proxy.
+# Polls `airport -I` over SSH (ilya@192.168.8.214, LAN only), extracts agrCtlRSSI /
+# agrCtlNoise / lastTxRate, maintains a short rolling trend, and derives a STABLE/MOTION
+# label when RSSI swings exceed the measurement noise floor.
+#
+# Why: iMac has no BLE LE scan (Bluetooth Low Energy Supported: No — only static paired
+# devices, not a live scan). WiFi RSSI variance is the viable motion proxy: multipath on
+# the AP↔iMac path changes when people move nearby. Cross-validates with IdeaPad
+# mesh-wifi-link and phone GPS for multi-vantage triangulation.
+#
+# Labels:
+#   STABLE   — RSSI swing < SWING_THRESH dBm over last N readings (environment quiet)
+#   MOTION   — RSSI swing ≥ SWING_THRESH dBm (multipath change, possible occupancy/movement)
+#   WEAK     — SNR (RSSI − noise) < SNR_WEAK dBm (poor link quality, readings less reliable)
+#
+# Exit codes (honest-exit contract):
+#   0 = real reading from iMac airport
+#   2 = iMac unreachable or parse failed — never faked
+#
+#   mesh-imac-wifi           one-line status
+#   mesh-imac-wifi --status  full reading + trend
+#   mesh-imac-wifi --edge    emit only on label change (for cron/stream wiring)
+#   mesh-imac-wifi --json    machine-readable
+#   mesh-imac-wifi --test    smoke test
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+
+IMAC_HOST="${MESH_IMAC_HOST:-ilya@192.168.8.214}"
+AIRPORT="/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport"
+TREND_FILE="$HOME/.mesh/.imac-wifi-trend"
+STATE_FILE="$HOME/.mesh/.imac-wifi-state"
+TREND_LEN="${MESH_IMAC_WIFI_TREND:-8}"       # rolling window size (readings)
+SWING_THRESH="${MESH_IMAC_WIFI_SWING:-5}"    # dBm swing that triggers MOTION label
+SNR_WEAK="${MESH_IMAC_WIFI_SNR_WEAK:-20}"    # SNR below which link is WEAK
+
+# ---- Smoke test ----
+[ "${1:-}" = --test ] && {
+  # Negative control: if iMac unreachable, tool must exit 2 (not a crash or false-reading).
+  if ! timeout 5 ssh -o BatchMode=yes -o ConnectTimeout=3 "$IMAC_HOST" 'echo ok' >/dev/null 2>&1; then
+    # iMac offline — verify the tool itself exits 2 cleanly
+    rc=0; "$0" >/dev/null 2>&1 || rc=$?
+    [ "$rc" = 2 ] || { echo "smoke-test: FAIL (iMac unreachable but tool exited $rc, want 2)"; exit 1; }
+    echo "smoke-test: ok (iMac unreachable — exit 2 correct; SSH negative control passed)"
+    exit 0
+  fi
+  # Positive: parse synthetic airport output (pure logic, no SSH needed)
+  _raw="     agrCtlRSSI: -52
+     agrCtlNoise: -97
+         lastTxRate: 78"
+  _rssi="$(printf '%s' "$_raw"   | awk '/agrCtlRSSI:/{print $2+0}')"
+  _noise="$(printf '%s' "$_raw"  | awk '/agrCtlNoise:/{print $2+0}')"
+  _txrate="$(printf '%s' "$_raw" | awk '/lastTxRate:/{print $2+0}')"
+  [ "$_rssi" = "-52" ]  || { echo "smoke-test: FAIL (rssi parse: got '$_rssi', want -52)"; exit 1; }
+  [ "$_noise" = "-97" ] || { echo "smoke-test: FAIL (noise parse: got '$_noise', want -97)"; exit 1; }
+  [ "$_txrate" = "78" ] || { echo "smoke-test: FAIL (txrate parse: got '$_txrate', want 78)"; exit 1; }
+  _snr=$(( _rssi - _noise ))
+  [ "$_snr" = "45" ]    || { echo "smoke-test: FAIL (SNR calc: got '$_snr', want 45)"; exit 1; }
+  # Swing logic: all-same → 0; spread → max-min
+  _swing0="$(printf '%s\n' -52 -52 -52 -52 | awk 'NR==1{mn=$1;mx=$1} {if($1<mn)mn=$1;if($1>mx)mx=$1} END{print mx-mn}')"
+  [ "$_swing0" = "0" ]  || { echo "smoke-test: FAIL (swing 0 expected, got $_swing0)"; exit 1; }
+  _swing9="$(printf '%s\n' -52 -55 -49 -58 | awk 'NR==1{mn=$1;mx=$1} {if($1<mn)mn=$1;if($1>mx)mx=$1} END{print mx-mn}')"
+  [ "$_swing9" = "9" ]  || { echo "smoke-test: FAIL (swing 9 expected, got $_swing9)"; exit 1; }
+  echo "smoke-test: ok (parse:rssi/noise/txrate/snr + swing-logic verified; iMac reachable)"
+  exit 0
+}
+
+# ---- Fetch live airport -I from iMac ----
+raw="$(timeout 10 ssh -o BatchMode=yes -o ConnectTimeout=6 "$IMAC_HOST" "$AIRPORT -I" </dev/null 2>/dev/null)" || true
+[ -n "$raw" ] || { printf 'imac-wifi: iMac unreachable\n' >&2; exit 2; }
+
+rssi="$(printf '%s' "$raw"   | awk '/agrCtlRSSI:/{print $2+0}')"
+noise="$(printf '%s' "$raw"  | awk '/agrCtlNoise:/{print $2+0}')"
+txrate="$(printf '%s' "$raw" | awk '/lastTxRate:/{print $2+0}')"
+ssid="$(printf '%s' "$raw"   | awk '/[[:space:]]SSID:/{$1=""; print substr($0,2)}')"
+
+[ -n "$rssi" ] || { printf 'imac-wifi: parse failed (no agrCtlRSSI in output)\n' >&2; exit 2; }
+
+snr=$(( rssi - noise ))
+TS="$(date -u +%FT%TZ)"
+
+# ---- Update rolling trend buffer (ts|rssi|noise|txrate per line) ----
+mkdir -p "$HOME/.mesh" 2>/dev/null || true
+{ cat "$TREND_FILE" 2>/dev/null; printf '%s\n' "${TS}|${rssi}|${noise}|${txrate}"; } \
+  | tail -n "$TREND_LEN" > "${TREND_FILE}.new" && mv -f "${TREND_FILE}.new" "$TREND_FILE"
+
+# ---- Compute RSSI swing from trend buffer ----
+rssi_vals="$(awk -F'|' '{print $2}' "$TREND_FILE" 2>/dev/null)"
+n_trend="$(printf '%s\n' "$rssi_vals" | grep -c .)"
+swing=0
+[ "$n_trend" -ge 2 ] && swing="$(printf '%s\n' "$rssi_vals" | \
+  awk 'NR==1{mn=$1;mx=$1} {if($1<mn)mn=$1;if($1>mx)mx=$1} END{print mx-mn}')"
+
+# ---- Derive label ----
+label="STABLE"
+if [ "$snr" -lt "$SNR_WEAK" ] 2>/dev/null; then
+  label="WEAK"
+elif [ "$swing" -ge "$SWING_THRESH" ] 2>/dev/null; then
+  label="MOTION"
+fi
+
+detail="${rssi}dBm SNR=${snr}dB txRate=${txrate}Mbps swing=${swing}dB/${n_trend}pts ssid=${ssid# }"
+
+case "${1:-}" in
+  --json)
+    _ssid_safe="${ssid// /_}"; _ssid_safe="${_ssid_safe# }"
+    printf '{"label":"%s","rssi":%s,"noise":%s,"snr":%s,"txrate":%s,"swing":%s,"n_trend":%s,"ssid":"%s","ts":"%s"}\n' \
+      "$label" "$rssi" "$noise" "$snr" "$txrate" "$swing" "$n_trend" "$_ssid_safe" "$TS"
+    ;;
+  --status)
+    printf 'imac-wifi: %s — %s\n' "$label" "$detail"
+    printf 'trend (%s readings, SWING_THRESH=%sdBm):\n' "$n_trend" "$SWING_THRESH"
+    awk -F'|' '{printf "  %s  rssi=%s noise=%s txrate=%s\n", $1, $2, $3, $4}' "$TREND_FILE" 2>/dev/null
+    ;;
+  --edge)
+    prev="$(cat "$STATE_FILE" 2>/dev/null || echo "")"
+    if [ "$label" != "$prev" ]; then
+      printf '%s\n' "$label" > "$STATE_FILE"
+      printf '[imac-wifi] %s — %s\n' "$label" "$detail"
+    fi
+    [ -e "$STATE_FILE" ] && touch "$STATE_FILE" 2>/dev/null || printf '%s\n' "$label" > "$STATE_FILE"
+    ;;
+  *)
+    printf 'imac-wifi: %s — %s\n' "$label" "$detail"
+    ;;
+esac
