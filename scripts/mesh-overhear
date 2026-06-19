@@ -1,0 +1,225 @@
+#!/usr/bin/env bash
+# mesh-overhear — ambient "third party" reflex: keep a rolling TEXT transcript of the last ~15 min of
+# room conversation; on a thumbs-up, analyze it and speak a comment from the side. No minds, no cloud
+# except the LLM step. Lives on a node with a mic + speaker (default-string: webcam mic + Bose).
+#
+# Operator's design (2026-06-20): live back-and-forth is too slow, so DON'T converse — overhear. The
+# mic listens continuously; each spoken utterance is transcribed (whisper.cpp, local) and appended to a
+# rolling transcript that auto-prunes to OH_KEEP_MIN minutes (text only — nothing audio is kept, nothing
+# is permanent). A thumbs-up means "weigh in": take the last ~15 min, think (mesh-relay), and speak a
+# short observation on the Bose. Latency is fine here — it's after-the-fact commentary, not a dialogue.
+# Operator consented to home recording; the rolling text is the only retained artifact and it decays.
+#
+#   mesh-overhear --daemon        continuous listen → transcribe → append to the rolling transcript
+#   mesh-overhear --comment       analyze the last OH_KEEP_MIN min and SPEAK a third-party comment
+#   mesh-overhear --ingest W T    (internal) transcribe wav W stamped epoch T, append + prune
+#   mesh-overhear --show          print the current rolling transcript
+#   mesh-overhear --test          stack check + render a phrase (no mic, no relay)
+#
+# Tunables (env): OH_KEEP_MIN=15 · OH_LOG=~/.mesh/overheard.log · OH_LANG=ru
+#   VAD: OH_START_RMS=600 OH_SIL_RMS=300 OH_END_SIL=0.9 OH_MAX_UTT=18 OH_MIN_UTT=0.4
+#   stack: OH_WHISPER=~/.mesh/whispercpp/main OH_MODEL=~/.mesh/whispercpp/models/ggml-base.bin
+#          OH_PIPER=~/.mesh/piper/piper/piper OH_PIPERLIB=~/.mesh/piper/piper OH_VOICE=~/.mesh/piper/voices/ruslan.onnx
+set -uo pipefail
+export PATH="/usr/bin:$HOME/.local/bin:$PATH"   # /usr/bin first: never a snap-confined pw-*/curl
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"   # pipewire (mic + Bose sink)
+MESH="${MESH_DIR:-$HOME/.mesh}"
+
+export OH_KEEP_MIN="${OH_KEEP_MIN:-15}"
+export OH_LOG="${OH_LOG:-$MESH/overheard.log}"
+export OH_LANG="${OH_LANG:-ru}"
+export OH_START_RMS="${OH_START_RMS:-600}"
+export OH_SIL_RMS="${OH_SIL_RMS:-300}"
+export OH_END_SIL="${OH_END_SIL:-0.9}"
+export OH_MAX_UTT="${OH_MAX_UTT:-18}"
+export OH_MIN_UTT="${OH_MIN_UTT:-0.4}"
+export OH_FRAME_MS="${OH_FRAME_MS:-200}"
+export OH_WHISPER="${OH_WHISPER:-$MESH/whispercpp/main}"
+export OH_MODEL="${OH_MODEL:-$MESH/whispercpp/models/ggml-base.bin}"
+export OH_PIPER="${OH_PIPER:-$MESH/piper/piper/piper}"
+export OH_PIPERLIB="${OH_PIPERLIB:-$MESH/piper/piper}"
+export OH_VOICE="${OH_VOICE:-$MESH/piper/voices/ruslan.onnx}"
+
+# ---- shared python helpers (transcribe / speak / VAD), selected by argv[1] --------------------------
+runpy() {  # <mode> [args...]
+  local PY; PY="$(mktemp /tmp/overhear-XXXXXX.py)"; trap 'rm -f "$PY"' RETURN
+  cat > "$PY" <<'PYEOF'
+import os, sys, time, wave, audioop, subprocess
+
+KEEP=int(os.environ.get("OH_KEEP_MIN","15"))*60
+LOGF=os.environ["OH_LOG"]; LANG=os.environ.get("OH_LANG","ru")
+WHISPER=os.environ["OH_WHISPER"]; MODEL=os.environ["OH_MODEL"]
+PIPER=os.environ["OH_PIPER"]; PIPERLIB=os.environ["OH_PIPERLIB"]; VOICE=os.environ["OH_VOICE"]
+RATE=16000; FRAME_MS=int(os.environ.get("OH_FRAME_MS","200"))
+FBYTES=int(RATE*FRAME_MS/1000)*2; FSEC=FRAME_MS/1000.0
+START_RMS=int(os.environ.get("OH_START_RMS","600")); SIL_RMS=int(os.environ.get("OH_SIL_RMS","300"))
+END_SIL=float(os.environ.get("OH_END_SIL","0.9")); MAX_UTT=float(os.environ.get("OH_MAX_UTT","18"))
+MIN_UTT=float(os.environ.get("OH_MIN_UTT","0.4"))
+
+HALLU=("спокойная музыка","продолжение следует","субтитр","[музыка]","[аплодисменты]","музыка",
+       "спасибо за просмотр","редактор субтитров","корректор","♪","thank you")
+def is_real(text):
+    t=text.strip().lower()
+    if len("".join(t.split()))<4: return False
+    for h in HALLU:
+        if h in t: return False
+    if t in ("you","ну","да","а","э","и"): return False
+    return True
+
+def transcribe(wav):
+    try:
+        out=subprocess.run([WHISPER,"-m",MODEL,"-f",wav,"-l",LANG,"-nt"],
+            capture_output=True,timeout=90).stdout.decode("utf-8","ignore")
+        return " ".join(out.split()).strip()
+    except Exception: return ""
+
+def speak(txt):
+    wav="/tmp/oh-say-%d.wav"%os.getpid()
+    subprocess.run([PIPER,"-m",VOICE,"-f",wav],input=txt.encode(),
+        env=dict(os.environ,LD_LIBRARY_PATH=PIPERLIB),
+        stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+    if os.path.exists(wav) and os.path.getsize(wav)>0:
+        subprocess.run(["pw-play",wav],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        try: os.remove(wav)
+        except OSError: pass
+
+def read_exact(f,n):
+    b=b""
+    while len(b)<n:
+        c=f.read(n-len(b))
+        if not c: break
+        b+=c
+    return b
+
+def capture_utterance():
+    # block until one utterance (speech onset → pause); return wav path or "" (too short).
+    p=subprocess.Popen(["pw-record","--rate","16000","--channels","1","--format","s16","-"],
+        stdout=subprocess.PIPE,stderr=subprocess.DEVNULL)
+    frames=[]; capturing=False; silence=0.0
+    try:
+        while True:
+            buf=read_exact(p.stdout,FBYTES)
+            if len(buf)<FBYTES: break
+            r=audioop.rms(buf,2)
+            if not capturing:
+                if r>=START_RMS: capturing=True; frames=[buf]; silence=0.0
+            else:
+                frames.append(buf)
+                if r<SIL_RMS:
+                    silence+=FSEC
+                    if silence>=END_SIL: break
+                else: silence=0.0
+                if len(frames)*FSEC>=MAX_UTT: break
+    finally:
+        p.kill()
+        try: p.stdout.close()
+        except Exception: pass
+    if (len(frames)*FSEC - silence) < MIN_UTT: return ""
+    wav="/tmp/oh-utt-%d-%d.wav"%(os.getpid(),int(time.time()*1000)%100000)
+    w=wave.open(wav,"wb"); w.setnchannels(1); w.setsampwidth(2); w.setframerate(RATE)
+    w.writeframes(b"".join(frames)); w.close()
+    return wav
+
+def prune_and_read(stamp_now):
+    # read OH_LOG, drop lines older than KEEP, rewrite, return kept text lines (chronological)
+    keep=[]
+    try:
+        with open(LOGF) as f: lines=f.readlines()
+    except FileNotFoundError: lines=[]
+    out_text=[]
+    for ln in lines:
+        parts=ln.rstrip("\n").split("\t",2)
+        if len(parts)<3: continue
+        try: ep=int(parts[0])
+        except ValueError: continue
+        if stamp_now-ep<=KEEP:
+            keep.append(ln); out_text.append("[%s] %s"%(parts[1],parts[2]))
+    try:
+        with open(LOGF,"w") as f: f.writelines(keep)
+    except Exception: pass
+    return out_text
+
+def relay(prompt):
+    try:
+        out=subprocess.run(["mesh-relay",prompt],capture_output=True,timeout=60).stdout.decode("utf-8","ignore")
+        return " ".join(out.split()).strip()
+    except Exception: return ""
+
+mode=sys.argv[1]
+
+if mode=="daemon":
+    # continuous: each utterance → spawn a detached ingest worker, resume listening immediately
+    while True:
+        try:
+            w=capture_utterance()
+            if w:
+                subprocess.Popen(["mesh-overhear","--ingest",w,str(int(time.time()))],
+                    stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        except Exception:
+            time.sleep(0.5)
+
+elif mode=="ingest":
+    wav=sys.argv[2]; ep=int(sys.argv[3])
+    text=transcribe(wav)
+    try: os.remove(wav)
+    except OSError: pass
+    if is_real(text):
+        # flock-protected append+prune via a sibling lock file
+        import fcntl
+        lk=open(LOGF+".lock","w")
+        try:
+            fcntl.flock(lk,fcntl.LOCK_EX)
+            with open(LOGF,"a") as f:
+                f.write("%d\t%s\t%s\n"%(ep,time.strftime("%H:%M",time.localtime(ep)),text))
+            prune_and_read(int(time.time()))
+        finally:
+            fcntl.flock(lk,fcntl.LOCK_UN); lk.close()
+
+elif mode=="show":
+    for ln in prune_and_read(int(time.time())): print(ln)
+
+elif mode=="comment":
+    lines=prune_and_read(int(time.time()))
+    if not lines:
+        speak("Пока нечего комментировать, я ещё ничего не услышал."); sys.exit(0)
+    transcript="\n".join(lines[-120:])
+    prompt=("Ты — внимательная третья сторона, ты молча слушал разговор в комнате. Ниже транскрипт "
+            "последних минут (с метками времени, расшифровка на слух — возможны ошибки). Дай ОДИН "
+            "короткий полезный комментарий или наблюдение со стороны: что-то меткое, что добавить, "
+            "поправить или подметить. 1-3 фразы, по-русски, разговорно, по делу, без воды и без "
+            "пересказа.\n\nТРАНСКРИПТ:\n"+transcript)
+    reply=relay(prompt)
+    if not reply: reply="Что-то я не смог собрать мысль, попробуй ещё раз."
+    try:
+        with open(os.path.join(os.path.dirname(LOGF),"overhear-comments.log"),"a") as f:
+            f.write(time.strftime("%Y-%m-%dT%H:%M:%S ")+reply+"\n")
+    except Exception: pass
+    speak(reply)
+
+elif mode=="speak":
+    speak(sys.argv[2] if len(sys.argv)>2 else "Меш на связи.")
+PYEOF
+  python3 "$PY" "$@"
+}
+
+case "${1:-}" in
+  --daemon)  runpy daemon ;;
+  --ingest)  shift; runpy ingest "$@" ;;
+  --show)    runpy show ;;
+  --comment)
+    # single-flight: a 2nd thumb while a comment is being spoken just exits
+    exec 9>"$MESH/overhear-comment.lock"
+    if ! flock -n 9; then exit 0; fi
+    runpy comment ;;
+  --test)
+    miss=0
+    for f in "$OH_WHISPER" "$OH_MODEL" "$OH_PIPER" "$OH_VOICE"; do
+      [ -e "$f" ] || { echo "  MISSING: $f"; miss=1; }
+    done
+    [ "$miss" = 0 ] || { echo "smoke-test: FAIL (stack pieces missing)"; exit 1; }
+    echo "  stack present; rendering a test phrase…"
+    runpy speak "Меш слушает комнату, проверка." >/dev/null 2>&1
+    echo "smoke-test: ok (whisper+model+piper+voice present, TTS rendered)"
+    ;;
+  *) sed -n '2,28p' "$0" ;;
+esac
