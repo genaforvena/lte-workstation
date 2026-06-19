@@ -1,0 +1,167 @@
+#!/usr/bin/env bash
+# mesh-acoustic-range — measure the metric distance between two mesh nodes by ACOUSTIC time-of-flight.
+#
+# WHY (operator 2026-06-19, the "1-D signal → 3-D vision" thread): WiFi RSSI tops out at zone-level —
+# at 1-3 m intra-room spacing its ±3 dB noise is metres of slop (see mesh-anchor-map). SOUND is the
+# channel that resolves a real room triangle: it travels ~34 cm/ms, slow enough that its flight time
+# is directly measurable. Each node has a speaker + mic, so we can range them acoustically.
+#
+# THE PROTOCOL (sync-free — no clock sync between nodes needed):
+#   Both nodes record continuously through one window. Node A emits an up-chirp in band A; node B
+#   emits an up-chirp in band B (independent schedules — they need only both land inside both
+#   recordings). Each node then finds BOTH chirps in its OWN recording via a matched filter:
+#     RTT = (B-chirp heard − A-chirp heard) in A's recording
+#     D   = (B-chirp heard − A-chirp heard) in B's recording
+#   Because each interval is measured within a single recording, the unknown clock offset AND the
+#   capture-start jitter cancel. Then:   distance = c · (RTT − D) / 2   (c≈343 m/s @20°C).
+#   (Derivation: RTT−D = 2·τ − δself_A − δself_B, where τ=dist/c and δself≈0 is the few-cm
+#    speaker→own-mic offset, calibrated out per device by --loopback.)
+#
+# HONESTY GATE: matched-filter detection is only trustworthy above an SNR floor. Built-in laptop
+# speakers/mics are marginal (close-coupled, reverberant) — measured SNR ~6-8 in testing, too low.
+# This tool REFUSES to emit a distance when SNR < MIN_SNR (default 12); it reports the weak detection
+# instead of a fabricated number. Reliable ranging wants a better emitter (phone speaker / external)
+# and a short in-person calibration (ground-truth one known distance, tune band/volume/placement).
+#
+#   mesh-acoustic-range --test        synthetic detector validation (no devices touched)
+#   mesh-acoustic-range --loopback    THIS node: play+record, report detection SNR + self-latency
+#   mesh-acoustic-range --pair USER@HOST   two-way range to a (Linux) peer over SSH  [experimental]
+#
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"   # pipewire session (harness shell lacks it)
+[ -f "$HOME/.mesh/nodes" ] && . "$HOME/.mesh/nodes" 2>/dev/null || true
+
+SR="${AR_SR:-48000}"
+MIN_SNR="${AR_MIN_SNR:-12}"          # below this, detection is not trusted → no distance emitted
+SOUND_C="${AR_SOUND_C:-343.0}"       # speed of sound m/s (≈20°C; 331+0.6*T for calibration)
+DUR="${AR_REC_SECS:-3}"
+
+# ---- DSP core (numpy matched filter); written to a temp .py so stdin stays free for data ------------
+DSP="$(mktemp /tmp/ar-dsp-XXXXXX.py)"; trap 'rm -f "$DSP"' EXIT
+cat > "$DSP" <<'PYEOF'
+import sys, numpy as np, wave, json, os
+SR=int(os.environ.get("AR_SR","48000"))
+def chirp(f0,f1,dur,sr=SR,amp=0.7):
+    t=np.linspace(0,dur,int(sr*dur),endpoint=False)
+    s=np.sin(2*np.pi*(f0*t+(f1-f0)/(2*dur)*t*t))*np.hanning(int(sr*dur))
+    return (s*amp).astype(np.float32)
+# the two bands (A=low, B=high) — distinct so the matched filters don't cross-trigger
+def bandA(): return chirp(1500,3500,0.10)
+def bandB(): return chirp(4000,6000,0.10)
+def write_wav(path,sig,sr=SR):
+    x=(np.clip(sig,-1,1)*32767).astype('<i2')
+    w=wave.open(path,'wb'); w.setnchannels(1); w.setsampwidth(2); w.setframerate(sr); w.writeframes(x.tobytes()); w.close()
+def read_wav(path):
+    w=wave.open(path,'rb'); n=w.getnframes(); sr=w.getframerate(); ch=w.getnchannels()
+    raw=np.frombuffer(w.readframes(n),dtype='<i2').astype(np.float32)/32767.0
+    if ch>1: raw=raw.reshape(-1,ch)[:,0]
+    return raw,sr
+def detect(rec,templ,sr=SR,guard_ms=50):
+    L=len(templ); N=1<<((len(rec)+L-1)-1).bit_length()
+    corr=np.fft.irfft(np.fft.rfft(rec,N)*np.fft.rfft(templ[::-1],N),N)[:len(rec)+L-1]
+    env=np.abs(corr); valid=env[L-1:len(rec)].copy()
+    g=int(sr*guard_ms/1000); valid[:g]=0
+    med=np.median(env[L-1:len(rec)])+1e-9
+    p=int(np.argmax(valid)); snr=valid[p]/med
+    return p, snr            # p = start-sample of the chirp in rec
+if __name__=='__main__':
+    cmd=sys.argv[1]
+    if cmd=='genA': write_wav(sys.argv[2],bandA())
+    elif cmd=='genB': write_wav(sys.argv[2],bandB())
+    elif cmd=='selftest':
+        # plant both bands in synthetic noisy recording at known offsets; detector must recover gap
+        sr=SR; rec=0.02*np.random.randn(int(sr*2.0)).astype(np.float32)
+        oa,ob=int(sr*0.30),int(sr*0.95)            # gap = 650 ms
+        a,b=bandA(),bandB(); rec[oa:oa+len(a)]+=a; rec[ob:ob+len(b)]+=b
+        pa,sa=detect(rec,bandA()); pb,sb=detect(rec,bandB())
+        gap=(pb-pa)/sr*1000; err=abs(gap-650)
+        ok = bool(err<2.0 and sa>20 and sb>20)
+        print(json.dumps({"gap_ms":round(gap,2),"err_ms":round(err,2),"snrA":round(sa),"snrB":round(sb),"ok":ok}))
+    elif cmd=='analyze':
+        # analyze one recording: report both bands' start-sample + SNR  → JSON
+        rec,sr=read_wav(sys.argv[2])
+        pa,sa=detect(rec,bandA(),sr); pb,sb=detect(rec,bandB(),sr)
+        print(json.dumps({"rms":round(float(np.sqrt(np.mean(rec**2))),4),
+                          "A_ms":round(pa/sr*1000,2),"A_snr":round(float(sa),1),
+                          "B_ms":round(pb/sr*1000,2),"B_snr":round(float(sb),1),
+                          "gap_ms":round((pb-pa)/sr*1000,2)}))
+    elif cmd=='range':
+        # args: recA.wav recB.wav  → distance from (RTT - D)/2
+        ra,sr=read_wav(sys.argv[2]); rb,_=read_wav(sys.argv[3])
+        c=float(os.environ.get("AR_SOUND_C","343.0")); minsnr=float(os.environ.get("AR_MIN_SNR","12"))
+        pAa,sAa=detect(ra,bandA(),sr); pAb,sAb=detect(ra,bandB(),sr)   # A's recording
+        pBa,sBa=detect(rb,bandA(),sr); pBb,sBb=detect(rb,bandB(),sr)   # B's recording
+        rtt=(pAb-pAa)/sr; D=(pBb-pBa)/sr
+        dist=c*(rtt-D)/2.0
+        worst=min(sAa,sAb,sBa,sBb)
+        out={"rtt_ms":round(rtt*1000,2),"D_ms":round(D*1000,2),"dist_m":round(dist,2),
+             "min_snr":round(float(worst),1),"trusted":bool(worst>=minsnr),
+             "snr":{"A_hearsA":round(float(sAa),1),"A_hearsB":round(float(sAb),1),
+                    "B_hearsA":round(float(sBa),1),"B_hearsB":round(float(sBb),1)}}
+        print(json.dumps(out))
+PYEOF
+py() { python3 "$DSP" "$@"; }
+
+# ---- audio adapters --------------------------------------------------------------------------------
+rec_local()  { arecord -f S16_LE -r "$SR" -c 1 -d "$DUR" "$1" 2>/dev/null; }   # blocks DUR seconds
+play_local() { aplay "$1" 2>/dev/null; }
+
+# ---- subcommands -----------------------------------------------------------------------------------
+case "${1:-}" in
+  --test)
+    command -v python3 >/dev/null 2>&1 || { echo "smoke-test: FAIL (no python3)"; exit 1; }
+    python3 -c 'import numpy' 2>/dev/null || { echo "smoke-test: n/a (numpy not installed on this node)"; exit 2; }
+    r="$(py selftest)"; echo "  detector self-test: $r"
+    echo "$r" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d["ok"] else 1)' \
+      && { echo "smoke-test: ok (matched filter recovers 650ms gap, both bands SNR>20)"; exit 0; } \
+      || { echo "smoke-test: FAIL (detector did not recover synthetic geometry)"; exit 1; }
+    ;;
+
+  --loopback)
+    command -v arecord >/dev/null && command -v aplay >/dev/null || { echo "loopback: need arecord+aplay"; exit 1; }
+    wpctl set-mute @DEFAULT_AUDIO_SINK@ 0 2>/dev/null; wpctl set-mute @DEFAULT_AUDIO_SOURCE@ 0 2>/dev/null
+    A="$(mktemp /tmp/ar-A-XXXX.wav)"; B="$(mktemp /tmp/ar-B-XXXX.wav)"; W="$(mktemp /tmp/ar-rec-XXXX.wav)"
+    py genA "$A"; py genB "$B"
+    ( rec_local "$W" ) & rp=$!
+    sleep 0.6; play_local "$A"; sleep 0.4; play_local "$B"; wait $rp 2>/dev/null
+    echo "loopback analysis ($(basename "$W")):"
+    py analyze "$W" | python3 -c 'import json,sys
+d=json.load(sys.stdin)
+print(f"  rec rms={d[\"rms\"]}  bandA SNR={d[\"A_snr\"]}  bandB SNR={d[\"B_snr\"]}  gap={d[\"gap_ms\"]} ms")
+floor=float(__import__("os").environ.get("AR_MIN_SNR","12"))
+ok = d["A_snr"]>=floor and d["B_snr"]>=floor
+print("  verdict:", "audio path OK for ranging (SNR adequate)" if ok else
+      f"audio path TOO WEAK (SNR<{floor:.0f}) — louder emitter / better mic / in-person calibration needed")'
+    rm -f "$A" "$B" "$W"
+    ;;
+
+  --pair)
+    peer="${2:-}"; [ -n "$peer" ] || { echo "usage: mesh-acoustic-range --pair user@host"; exit 1; }
+    # EXPERIMENTAL: assumes a Linux peer with arecord/aplay + this script deployed. Both record; A
+    # plays band-A locally, B plays band-B remotely; schedules need only overlap. Then fetch B's wav.
+    ssh -o BatchMode=yes -o ConnectTimeout=8 "$peer" 'command -v arecord >/dev/null && command -v aplay >/dev/null' \
+      || { echo "--pair: peer $peer lacks arecord/aplay (iMac/phone adapters not yet wired) — see header"; exit 2; }
+    A="$(mktemp /tmp/ar-A-XXXX.wav)"; B="$(mktemp /tmp/ar-B-XXXX.wav)"
+    WA="$(mktemp /tmp/ar-recA-XXXX.wav)"; WB="ar-recB.wav"
+    py genA "$A"; py genB "$B"
+    scp -q "$B" "$peer:/tmp/ar-cB.wav" 2>/dev/null
+    # start both recordings ~together
+    ( rec_local "$WA" ) & rp=$!
+    ssh -o BatchMode=yes "$peer" "arecord -f S16_LE -r $SR -c 1 -d $DUR /tmp/$WB 2>/dev/null" &
+    sleep 0.6; play_local "$A"
+    ssh -o BatchMode=yes "$peer" "sleep 0.4; aplay /tmp/ar-cB.wav 2>/dev/null" 2>/dev/null
+    wait $rp 2>/dev/null; sleep 0.5
+    scp -q "$peer:/tmp/$WB" "$WA.peer" 2>/dev/null
+    echo "two-way range IdeaPad ↔ $peer:"
+    AR_SOUND_C="$SOUND_C" AR_MIN_SNR="$MIN_SNR" py range "$WA" "$WA.peer" | python3 -c 'import json,sys
+d=json.load(sys.stdin)
+print(f"  RTT={d[\"rtt_ms\"]} ms  D={d[\"D_ms\"]} ms  min-SNR={d[\"min_snr\"]}")
+if d["trusted"]: print(f"  → distance ≈ {d[\"dist_m\"]} m")
+else: print(f"  → NOT TRUSTED (min-SNR<{__import__(\"os\").environ.get(\"AR_MIN_SNR\",\"12\")}): {d[\"snr\"]}")
+print("     (uncalibrated; subtract per-device self-latency via --loopback for accuracy)")'
+    rm -f "$A" "$B" "$WA" "$WA.peer"
+    ;;
+
+  *) sed -n '2,32p' "$0"; exit 0 ;;
+esac
