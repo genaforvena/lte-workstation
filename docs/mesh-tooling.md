@@ -18,7 +18,7 @@ a reflex NOT a mind, so it never goes stale on a rate-limited/blocked chat mind;
 (the mesh's eye on the OUTSIDE — runs against the public-IP node phaedra: senses inbound KNOCKS on the
 public `:22` [who's scanning the mesh], external REACH from a clean datacenter vantage [reaches Anthropic
 where RU-egress home nodes 403 — a geo-bypass canary], and self-EXPOSURE [what the internet can reach];
-the inverse of the phone's eye-on-the-room; `--edge` on reach-flip/scan-spike, exit 2 = node unreachable) · `mesh-cam-watch` (motion-triggered camera reflex: when the frame changes, snaps a photo and sends it to Telegram; runs as a systemd --user service, zero minds involved; tune with CAM_THRESH/CAM_POLL/CAM_COOLDOWN; has `--daemon`, `--once`, `--noise`, and `--test` options). Perception is
+the inverse of the phone's eye-on-the-room; `--edge` on reach-flip/scan-spike, exit 2 = node unreachable) · `mesh-cam-watch` (motion-triggered camera reflex: when the frame changes, sends a burst of photos to Telegram so the motion sequence is visible; runs as a systemd --user service, zero minds involved; tune with CAM_THRESH/CAM_POLL/CAM_COOLDOWN/CAM_BURST; has `--daemon`, `--once`, `--noise`, and `--test` options). Perception is
 re-observed live, never stored (no DB — a live `presence` tmux window, decays on reboot).
 
 **Liveness / self-tend:** `mesh-card [--refresh]` (node card + invariant check) · `mesh-health` · `mesh-hw-health` (per-node HARDWARE health: cooling-efficiency / fan / disk SMART / battery-wear; catches a failing cooler early via cold-board+hot-cpu-at-light-load signature; exit 1 = FAIL) ·

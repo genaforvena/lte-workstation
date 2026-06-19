@@ -238,7 +238,7 @@ rest and the full contracts.
 - **Organs / actuators:** `mesh-organ` (capability router) · `mesh-tv-dlna`(+`mesh-url-watch`) · `mesh-sms` · `mesh-phone-ip`/`mesh-phone-watch`/`phone-setup`/`mesh-phone-ear`/`mesh-phone-sensors`/`mesh-phone-convo` · `mesh-sensor-log`.
 - **On-demand / audit:** `mesh-tools` · `mesh-digest` · `mesh-since` · `mesh-morning` · `mesh-novelty` · `mesh-review` · `mesh-study` · `mesh-claude-check` · `mesh-pyparse` · `mesh-chaos`(+`-doctor`/`-verify`) · `mesh-knowledge-sync` · `mesh-queue-tend` · `mesh-homeostasis` · `mesh-attach` · `mesh-guardian` · `mesh-neighbour-watch` · `mesh-fleet-health`/`mesh-fleet-states` · `mesh-plan` · `mesh-browse`/`mesh-breath`/`mesh-eye`/`mesh-hear`/`mesh-ear`/`mesh-transcribe`(+`-organ`) · `mesh-exit` · `mesh-anchor-map` · `mesh-acoustic-range` · `mesh-steward-deadman`.
 
-Node-specific units (deploy where relevant): `mesh-card-watchdog`/`mtg-watchdog`/`bore-mtg` (`.{sh,service,timer}`), `node-join-android.sh`, `test-*`. Decayed tools (mesh-health-watch, mesh-tg-recv, mesh-zone, vpn-hub.py, mesh-onboard, mesh-board-timerepair) live in git history — the attic.
+Node-specific units (deploy where relevant): `mesh-card-watchdog`/`mtg-watchdog`/`bore-mtg` (`.{sh,service,timer}`), `mesh-cam-watch.service`, `node-join-android.sh`, `test-*`. Decayed tools (mesh-health-watch, mesh-tg-recv, mesh-zone, vpn-hub.py, mesh-onboard, mesh-board-timerepair) live in git history — the attic.
 
 ## Capabilities (self-declared, opt-in by consumers)
 
