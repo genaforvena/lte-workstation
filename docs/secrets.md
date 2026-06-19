@@ -64,6 +64,8 @@ The offline recovery `age` key is the root of trust. It is generated once, shown
 
 ## Current recipients
 
-- `ideapad` — imozerov-IdeaPad-3-15IIL05 (<node-ip>)
-- `mind` — imozerov-Default-string (<mind-ip>)
+- `ideapad` — imozerov-IdeaPad-3-15IIL05
+- `mind` — imozerov-Default-string
 - `recovery` — offline root of trust
+
+Actual age public keys are in `.sops.yaml`.
