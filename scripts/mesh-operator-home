@@ -28,6 +28,7 @@ OP_HOME_STALE_MIN="${MESH_OP_HOME_STALE_MIN:-5}"
 PHONE_TS_IP="${PHONE_TS_IP:-}"  # set in ~/.mesh/nodes (node-local; no hardcoded default in genome)
 PRESENCE_LOG="$HOME/.mesh/presence.log"
 OP_STATE="$HOME/.mesh/.op-home.state"
+PHONE_ID="$HOME/.mesh/.phone-id"        # learned STABLE home-WiFi MAC of the phone (IP-drift anchor)
 NOW="$(date +%s)"
 
 _verdict() {
@@ -36,6 +37,13 @@ _verdict() {
   elif [ "$ble" = 1 ]; then echo HOME
   elif [ "$ts"  = 1 ]; then echo UNCERTAIN
   else echo AWAY; fi
+}
+
+_la_mac() {  # true if MAC's first octet has the locally-administered bit set (a randomized device).
+  # Android randomizes its per-SSID MAC (LA bit set); routers/PCs use universal (burned-in) MACs.
+  # We anchor "this host is the phone" to the LA bit so we never mis-learn the router/iMac.
+  local o; o="$(printf '%s' "$1" | cut -d: -f1)"
+  case "$o" in [0-9a-fA-F][0-9a-fA-F]) [ $(( 0x$o & 2 )) -ne 0 ] ;; *) return 1 ;; esac
 }
 
 [ "${1:-}" = --test ] && {
@@ -57,6 +65,9 @@ _verdict() {
   [ "$(_verdict 0 0 1)" = UNCERTAIN ] || { echo "  FAIL: only TS=1 → UNCERTAIN"; _f=1; }
   [ "$(_verdict 0 0 0)" = AWAY      ] || { echo "  FAIL: all=0 → AWAY"; _f=1; }
   # Debounce: AWAY requires MESH_OP_AWAY_MISSES; HOME/BLE fire instantly (not tested here — needs mock run).
+  # LA-MAC anchor: the phone's randomized MAC reads locally-administered; the router's universal does not.
+  _la_mac ca:dc:f3:77:04:53 || { echo "  FAIL: LA-MAC: a randomized (phone) MAC must read locally-administered"; _f=1; }
+  _la_mac 94:83:c4:68:07:66 && { echo "  FAIL: LA-MAC: a universal (router) MAC must NOT read as randomized"; _f=1; }
   [ "$_f" != 0 ] && { echo "smoke-test: FAIL (verdict decision logic drifted)"; exit 1; }
   [ "$fail" != 0 ] && { echo "smoke-test: FAIL (fusion-axis dep missing — see above)"; exit 1; }
   echo "smoke-test: ok (verdict logic: 7 combinations × 3 fusion axes + deps)"; exit 0
@@ -65,11 +76,54 @@ _verdict() {
 EDGE=0; [ "${1:-}" = --edge ] && EDGE=1
 MODE=text; [ "${1:-}" = --json ] && MODE=json
 
-# ---- SIGNAL 1: phone on LAN (most reliable — implies home WiFi) ----
-phone_lan_ok=0
+# ---- SIGNAL 1: phone on home WiFi (phone-centric; IP-drift + MAC-randomization robust) ----
+# The operator's position IS the phone's position — he is HOME iff his phone is on the home WiFi
+# (operator 2026-06-19: "моё положение нужно мерить по телефону"). Pinging a STATIC configured IP
+# is fragile — the DHCP lease drifts and MIUI flaps the phone off WiFi (sshd dies), so a stale IP
+# reads false-AWAY. Robust path: learn the phone's STABLE home-SSID MAC (Android randomizes per-SSID
+# but keeps it stable), then detect that MAC on the LAN even after the IP drifts.
+phone_lan_ok=0; phone_reason=""
+phone_mac="$(cat "$PHONE_ID" 2>/dev/null | grep -oiE '([0-9a-f]{2}:){5}[0-9a-f]{2}' | head -1 | tr 'A-F' 'a-f')"
+
+# 1a: ping the configured phone IPs; on a hit, (re)learn the phone's MAC from ARP if it is a
+# randomized (LA) MAC — self-calibrating + drift-correcting, and it won't latch onto the router/iMac
+# if DHCP ever hands a configured IP to a non-phone (their MACs are universal, so they're rejected).
 for lip in ${PHONE_LAN_IPS:-}; do
-  ping -c 1 -W 2 "$lip" >/dev/null 2>&1 && { phone_lan_ok=1; break; }
+  if ping -c 1 -W 2 "$lip" >/dev/null 2>&1; then
+    m="$(ip neigh show "$lip" 2>/dev/null | grep -oiE '([0-9a-f]{2}:){5}[0-9a-f]{2}' | head -1 | tr 'A-F' 'a-f')"
+    if [ -n "$m" ] && _la_mac "$m"; then
+      phone_mac="$m"; printf '%s' "$m" > "$PHONE_ID" 2>/dev/null
+      phone_lan_ok=1; phone_reason="phone on home WiFi ($lip)"; break
+    elif [ -z "$m" ]; then
+      phone_lan_ok=1; phone_reason="phone on home WiFi ($lip)"; break   # ping ok, ARP not resolved
+    fi
+    # a non-LA MAC answered this IP → that's a PC, not the phone — keep looking.
+  fi
 done
+
+# 1b: IP-drift recovery — no configured IP was the phone, but we know its stable MAC. Sweep the
+# home /24 to populate the ARP cache (root-free: the kernel learns MACs from ping replies), then
+# check whether the phone's MAC is present = it rejoined home WiFi on a NEW IP. Throttled so it is
+# only a fallback and never hammers the LAN more than once per MESH_OP_SWEEP_MIN minutes.
+if [ "$phone_lan_ok" = 0 ] && [ -n "$phone_mac" ]; then
+  SWEEP_TS="$HOME/.mesh/.op-home-sweep.ts"
+  last="$(cat "$SWEEP_TS" 2>/dev/null || echo 0)"
+  if [ $(( NOW - last )) -ge $(( ${MESH_OP_SWEEP_MIN:-4} * 60 )) ]; then
+    printf '%s' "$NOW" > "$SWEEP_TS" 2>/dev/null
+    myip="$(ip -4 route get 1.1.1.1 2>/dev/null | grep -oE 'src [0-9.]+' | awk '{print $2}')"
+    case "$myip" in
+      192.168.*|10.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*)
+        prefix="${myip%.*}"
+        seq 1 254 | xargs -P 64 -I{} ping -c1 -W1 "$prefix.{}" >/dev/null 2>&1 || true ;;
+    esac
+  fi
+  # capture the ARP cache into a var (NOT 'grep -q' in a pipe — pipefail+SIGPIPE would false-miss),
+  # then membership-test the learned MAC.
+  neigh_macs="$(ip neigh 2>/dev/null | grep -oiE '([0-9a-f]{2}:){5}[0-9a-f]{2}' | tr 'A-F' 'a-f')"
+  case " $(printf '%s ' $neigh_macs)" in
+    *" $phone_mac "*) phone_lan_ok=1; phone_reason="phone MAC on home WiFi (IP drifted from config)";;
+  esac
+fi
 
 # ---- SIGNAL 2: operator BLE device at strong RSSI (from cached log) ----
 ble_home=0; ble_device=""; ble_rssi=0
@@ -106,7 +160,7 @@ fi
 # ---- VERDICT ----
 status=UNCERTAIN; reason=""
 if [ "$phone_lan_ok" = 1 ]; then
-  status=HOME; reason="phone on home LAN (ping ok)"
+  status=HOME; reason="${phone_reason:-phone on home WiFi}"
 elif [ "$ble_home" = 1 ]; then
   status=HOME; reason="operator BLE device '$ble_device' at ${ble_rssi} dBm"
 elif [ "$ts_phone_online" = 1 ]; then
