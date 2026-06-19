@@ -63,6 +63,11 @@ START_RMS=int(os.environ.get("OH_START_RMS","600")); SIL_RMS=int(os.environ.get(
 END_SIL=float(os.environ.get("OH_END_SIL","0.9")); MAX_UTT=float(os.environ.get("OH_MAX_UTT","18"))
 MIN_UTT=float(os.environ.get("OH_MIN_UTT","0.4"))
 
+# ON-DEMAND model (operator 2026-06-20): a rolling AUDIO buffer; transcription happens only at a trigger,
+# so what Claude hears is always in sync with reality (no lagging continuous STT). Window ~7 min.
+BUFFER_DIR=os.path.join(os.path.dirname(LOGF),"audio-buffer")
+BUFFER_MIN=int(os.environ.get("OH_BUFFER_MIN","7"))*60
+TRANSCRIPT_FILE=os.path.join(os.path.dirname(LOGF),"room-transcript.txt")
 MUTE_FLAG=os.path.join(os.path.dirname(LOGF),"mesh-speaking")  # set while the mesh speaks → don't self-hear
 HALLU=("спокойная музыка","продолжение следует","субтитр","[музыка]","[аплодисменты]","музыка",
        "спасибо за просмотр","редактор субтитров","корректор","♪","thank you","тишина","субтитры")
@@ -103,6 +108,53 @@ def transcribe(wav):
             if t: return t
         except Exception: pass
     return transcribe_local(wav)
+
+def buffer_wavs(window_secs):
+    # buffered utterance wavs captured within window_secs, oldest→newest (filenames are capture-ms)
+    if not os.path.isdir(BUFFER_DIR): return []
+    cutoff=time.time()*1000 - window_secs*1000; items=[]
+    for fn in os.listdir(BUFFER_DIR):
+        if fn.endswith(".wav"):
+            try:
+                ms=int(fn[:-4])
+                if ms>=cutoff: items.append((ms,os.path.join(BUFFER_DIR,fn)))
+            except ValueError: pass
+    items.sort()
+    return [p for _,p in items]
+
+def newest_buffer_age():
+    # seconds since the most recent buffered utterance (big number if the buffer is empty)
+    ws=buffer_wavs(10**9)
+    if not ws: return 10**9
+    try: return time.time()-int(os.path.basename(ws[-1])[:-4])/1000.0
+    except ValueError: return 10**9
+
+def concat_wavs(paths, out):
+    data=b""
+    for p in paths:
+        try:
+            w=wave.open(p,"rb"); data+=w.readframes(w.getnframes()); w.close()
+        except Exception: pass
+    if not data: return False
+    w=wave.open(out,"wb"); w.setnchannels(1); w.setsampwidth(2); w.setframerate(RATE)
+    w.writeframes(data); w.close(); return True
+
+def transcribe_buffer():
+    # transcribe the WHOLE current audio buffer AT ONCE (at trigger time → synced with reality), write
+    # the result as the room transcript, and return it. This is the on-demand STT the trigger calls.
+    paths=buffer_wavs(BUFFER_MIN)
+    if not paths: return ""
+    big="/tmp/oh-buffer-%d.wav"%os.getpid()
+    if not concat_wavs(paths,big): return ""
+    text=transcribe(big)
+    try: os.remove(big)
+    except OSError: pass
+    if text:
+        try:
+            with open(TRANSCRIPT_FILE,"w") as f:
+                f.write("[%s] %s\n"%(time.strftime("%H:%M:%S"),text))
+        except Exception: pass
+    return text
 
 def bose_id():
     # the LIVE pipewire id of the Bose sink, or None if it's not connected right now
@@ -212,52 +264,56 @@ def relay(prompt):
 mode=sys.argv[1]
 
 if mode=="daemon":
-    # continuous: each utterance → spawn ONE detached ingest worker, resume listening immediately.
-    # CONCURRENCY GUARD: default-string has a cooling fault and FREEZES under sustained load (see memory
-    # ds-hardware-freeze). NEVER let whisper transcriptions pile up — allow at most ONE inflight; drop
-    # utterances that arrive while a transcribe is still running. nice the worker so it yields the box.
-    inflight=None
+    # ON-DEMAND: don't transcribe continuously (that lagged behind reality and desynced what Claude heard
+    # — operator 2026-06-20). Just VAD-capture utterances into a cheap rolling AUDIO buffer; whisper runs
+    # only at a trigger. default-string does ZERO whisper → never heats; IdeaPad transcribes only on demand.
+    os.makedirs(BUFFER_DIR, exist_ok=True)
+    last_prune=0.0
     while True:
         try:
             w=capture_utterance()
-            if not w: continue
-            if inflight is not None and inflight.poll() is None:
-                try: os.remove(w)
-                except OSError: pass
-                logln("DROP utterance (transcribe busy — load guard)")
-                continue
-            inflight=subprocess.Popen(["nice","-n","10","mesh-overhear","--ingest",w,str(int(time.time()))],
-                stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+            if w:
+                dst=os.path.join(BUFFER_DIR,"%d.wav"%int(time.time()*1000))
+                try:
+                    import shutil; shutil.move(w,dst)   # /tmp(tmpfs)→~/.mesh(disk) is cross-device; move handles it
+                except Exception:
+                    try: os.remove(w)
+                    except OSError: pass
+            now=time.time()
+            if now-last_prune>10:                      # prune the rolling window every 10s
+                last_prune=now; cutoff=(now-BUFFER_MIN)*1000
+                for fn in os.listdir(BUFFER_DIR):
+                    if fn.endswith(".wav"):
+                        try:
+                            if int(fn[:-4])<cutoff: os.remove(os.path.join(BUFFER_DIR,fn))
+                        except (ValueError,OSError): pass
         except Exception:
             time.sleep(0.5)
 
-elif mode=="ingest":
-    wav=sys.argv[2]; ep=int(sys.argv[3])
-    text=transcribe(wav)
-    try: os.remove(wav)
-    except OSError: pass
-    if is_real(text):
-        # flock-protected append+prune via a sibling lock file
-        import fcntl
-        lk=open(LOGF+".lock","w")
-        try:
-            fcntl.flock(lk,fcntl.LOCK_EX)
-            with open(LOGF,"a") as f:
-                f.write("%d\t%s\t%s\n"%(ep,time.strftime("%H:%M",time.localtime(ep)),text))
-            prune_and_read(int(time.time()))
-        finally:
-            fcntl.flock(lk,fcntl.LOCK_UN); lk.close()
+elif mode=="buffer_fresh":
+    # exit 0 if a buffered utterance exists within argv[2] secs — "is anyone talking right now"
+    sys.exit(0 if newest_buffer_age() <= float(sys.argv[2] if len(sys.argv)>2 else 150) else 1)
+
+elif mode=="transcribe_buffer":
+    sys.stdout.write(transcribe_buffer())
 
 elif mode=="show":
-    for ln in prune_and_read(int(time.time())): print(ln)
+    try:
+        with open(TRANSCRIPT_FILE) as f: sys.stdout.write(f.read())
+    except FileNotFoundError: pass
 
 elif mode=="dash":
-    lines=prune_and_read(int(time.time()))
-    print("-- rolling transcript (%d lines, last ~%d min, auto-pruned) --"%(len(lines),KEEP//60))
-    if lines:
-        for ln in lines[-14:]: print("  "+ln[:150])
+    paths=buffer_wavs(BUFFER_MIN); age=newest_buffer_age()
+    bufmin=BUFFER_MIN//60
+    if age<10**8:
+        print("-- audio buffer: %d utterances in last ~%d min · newest %ds ago (on-demand STT at a trigger) --"%(len(paths),bufmin,int(age)))
     else:
-        print("  (room quiet — nothing captured yet)")
+        print("-- audio buffer: empty (room quiet) · transcribed on a thumbs-up/motion trigger --")
+    print("-- last transcript (synced — written when Claude was last asked) --")
+    try:
+        with open(TRANSCRIPT_FILE) as f: txt=f.read().strip()
+        for ln in (txt.splitlines() or ["  (none yet)"]): print("  "+ln[:150])
+    except FileNotFoundError: print("  (none yet — thumbs-up or move to ask Claude)")
     try:
         cl=open(os.path.join(os.path.dirname(LOGF),"overhear-comments.log")).read().splitlines()[-3:]
     except Exception: cl=[]
@@ -332,25 +388,20 @@ case "${1:-}" in
   --say-stdin)  runpy say_stdin ;;
   --stt-stdin)  runpy stt_stdin ;;
   --ack)        runpy ack ;;
-  --fresh)      # exit 0 if there's a transcript line within $2 (default 150) secs — "is anyone talking now"
-    secs="${2:-150}"; ep="$(tail -1 "$OH_LOG" 2>/dev/null | cut -f1)"
-    [ -n "$ep" ] && [ "$(( $(date +%s) - ep ))" -le "$secs" ] && exit 0 || exit 1 ;;
+  --buffer-fresh)       shift; runpy buffer_fresh "${1:-150}" ;;   # exit 0 if buffered audio within $1 secs
+  --transcribe-buffer)  runpy transcribe_buffer ;;                 # transcribe the rolling buffer NOW → transcript
   --poke-mind)
-    # CENTRAL trigger for a room comment — fired by a thumbs-up (manual) or room motion (--motion, ambient).
-    # Plays the instant ack, then pokes the room MIND on the mind node to comment on the CURRENT talk.
-    # Gates: motion only fires when a real conversation is active (fresh speech) and not more than once per
-    # cooldown — so movement in a quiet room never makes the mesh blurt. The poke tells the mind to use
-    # ONLY the last couple minutes (fixes 2026-06-20 "ответил не на то" — it had commented on stale lines).
+    # CENTRAL trigger for a room comment — thumbs-up (manual) or room motion (--motion, ambient). ON-DEMAND
+    # (operator 2026-06-20): transcribe the rolling AUDIO buffer RIGHT NOW so the transcript is in sync with
+    # what was just said (no lagging continuous STT → no "тишина" when you actually talked), then poke the
+    # room MIND to weigh in. Motion only fires when audio is fresh + a cooldown, so a quiet room never blurts.
     shift; motion=0; [ "${1:-}" = "--motion" ] && motion=1
     MIND_NODE="${ROOM_MIND_NODE:-imozerov@100.73.170.56}"
     COOL="${ROOM_POKE_COOLDOWN:-120}"; FRESH="${ROOM_FRESH_SECS:-150}"; now="$(date +%s)"
-    # freshness, inline: is there a transcript line within FRESH secs?
-    ep="$(tail -1 "$OH_LOG" 2>/dev/null | cut -f1)"; is_fresh=0
-    [ -n "$ep" ] && [ "$(( now - ep ))" -le "$FRESH" ] && is_fresh=1
+    if mesh-overhear --buffer-fresh "$FRESH"; then is_fresh=1; else is_fresh=0; fi
     if [ "$is_fresh" = 0 ]; then
-      # no live conversation → the mind must NOT comment on stale lines (the 2026-06-20 "ответил не на то").
       [ "$motion" = 1 ] && exit 0                         # motion in a quiet room → stay silent
-      printf '%s' "Пока тихо, нечего комментировать." | mesh-overhear --say-stdin   # manual thumb → honest cue
+      printf '%s' "Пока тихо, нечего комментировать." | mesh-overhear --say-stdin
       exit 0
     fi
     if [ "$motion" = 1 ]; then                            # ambient: rate-limit so movement doesn't blurt
@@ -359,7 +410,8 @@ case "${1:-}" in
       echo "$now" > "$lp"
     fi
     mesh-overhear --ack 2>/dev/null                       # instant "думаю" cue on the Bose
-    poke="${ROOM_POKE_MSG:-👍 Сигнал из комнаты, разговор идёт прямо сейчас. Прочитай ВЕСЬ транскрипт — всё окно за последние 10-15 минут (mesh-room read даёт окно целиком), и вступи как умный, начитанный собеседник, который слушал всё это время. Дай не короткую реплику, а ВЗВЕШЕННОЕ, развёрнутое мнение по поводу всего, что обсуждалось за это окно — 3-5 содержательных фраз: своя позиция, наблюдение через весь разговор, уместный факт или контекст. Свяжи с тем, что было раньше в окне, а не только с последней фразой. Озвучь через mesh-room say. Мусор/бормотание whisper игнорируй, опирайся на понятное.}"
+    mesh-overhear --transcribe-buffer >/dev/null 2>&1     # NOW transcribe the buffer → synced room-transcript.txt
+    poke="${ROOM_POKE_MSG:-👍 Сигнал из комнаты. Прочитай свежий транскрипт командой mesh-room read — это всё, что было сказано в комнате за последние минут пять-семь, расшифровано прямо сейчас. Вступи как умный, начитанный собеседник, который всё это слышал: дай не короткую реплику, а ВЗВЕШЕННОЕ, развёрнутое мнение по всему разговору — 3-5 содержательных фраз со своей позицией, наблюдением, уместным фактом или контекстом, связывая всё окно, а не только последнюю фразу. Озвучь через mesh-room say. Мусор/бормотание игнорируй.}"
     mesh-tell --node "$MIND_NODE" room "$poke" 2>/dev/null ;;
   --comment)
     # single-flight: a 2nd thumb while a comment is being spoken just exits
