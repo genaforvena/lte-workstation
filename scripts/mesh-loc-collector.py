@@ -78,8 +78,24 @@ if __name__ == "__main__":
                 print(f"smoke-test: FAIL ({tag})"); sys.exit(1)
             print(f"smoke-test: ok (logic sound; not-deployed-here — {tag})"); sys.exit(0)
         print("smoke-test: ok (logic sound; deploy-ready)"); sys.exit(0)
-    httpd = ThreadingHTTPServer(("0.0.0.0", PORT), H)
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_cert_chain(CERT, KEY)
-    httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+
+    # ROBUSTNESS (2026-06-19): do NOT TLS-wrap the LISTENING socket — that makes the handshake
+    # run inside the accept loop, so one half-open/stalled client (e.g. an onVao-tunnelled push
+    # that opens TCP but never finishes TLS) blocks ALL new connections forever → the accept queue
+    # fills and every push times out (the exact hang that lost a walk's worth of data). Instead:
+    # raw TCP listen, wrap EACH accepted connection with a hard timeout, daemon threads, and
+    # swallow per-connection TLS errors so a bad client can never wedge the server.
+    class Collector(ThreadingHTTPServer):
+        daemon_threads = True
+        def get_request(self):
+            sock, addr = self.socket.accept()
+            sock.settimeout(15)            # a stalled handshake/read aborts in 15s, never forever
+            ssock = ctx.wrap_socket(sock, server_side=True)
+            return ssock, addr
+        def handle_error(self, request, client_address):
+            pass                            # aborted/slow TLS is normal noise — don't spam/crash
+
+    httpd = Collector(("0.0.0.0", PORT), H)
     httpd.serve_forever()
