@@ -23,9 +23,15 @@ PORT="${PHONE_SSH_PORT:-8022}"
 PUSER="${PHONE_USER:-u0_a380}"
 STATE_FILE="$HOME/.mesh/phone-ip.state"
 CACHE_TTL="${MESH_PHONE_IP_CACHE_TTL:-900}"
+# A negative/offline guess is honored only briefly so a returning phone reconnects fast instead of
+# being pinned to a dead IP for the whole positive TTL (the stale-Tailscale-IP poison bug: an offline
+# registry guess got cached and served as "fresh" for 900s, SSHing every sensor to a dead address).
+OFFLINE_TTL="${MESH_PHONE_IP_OFFLINE_TTL:-120}"
 
-# cache_ip — write resolved IP + timestamp to state file (used as offline fallback).
-cache_ip() { printf '%s\t%s\n' "$(date -u +%s)" "$1" > "$STATE_FILE"; }
+# cache_ip <ip> [status] — write IP + timestamp + status (ok|offline) to the state file. Default ok.
+# Only a verified-reachable IP is written 'ok'; an offline registry/cache guess is written 'offline'
+# so the fast path treats it as a short-lived negative cache, never a trusted positive answer.
+cache_ip() { printf '%s\t%s\t%s\n' "$(date -u +%s)" "$1" "${2:-ok}" > "$STATE_FILE"; }
 
 if [ "${1:-}" = --test ]; then
   command -v ssh >/dev/null 2>&1 || { echo "smoke-test: FAIL (no ssh)"; exit 1; }
@@ -84,13 +90,35 @@ if [ "${1:-}" = --test ]; then
   rm -rf "$_d3"
 
   # 5) Registry fallback: known phone but no live path/cache → exit 0 with a last-known candidate.
+  # LAN-first (Tailscale IP, often offline, is last) — so the guess is the more-likely-live LAN IP.
   _d4="$(mktemp -d)"
   mkdir -p "$_d4/home/.mesh" "$_d4/home/.local/bin"
   printf '%s\n' 'phone_reachable_ip() { return 2; }' > "$_d4/mp.sh"
   printf '#!/bin/sh\nexit 1\n' > "$_d4/home/.local/bin/adb"; chmod +x "$_d4/home/.local/bin/adb"
   _out4="$(HOME="$_d4/home" PHONE_IP="" PHONE_TS_IP="100.64.0.3" PHONE_LAN_IPS="192.168.1.201 192.168.1.202" MESH_PATTERNS="$_d4/mp.sh" bash "$_scr" 2>/dev/null)" || true
-  [ "$_out4" = "100.64.0.3" ] || { echo "  FAIL: registry fallback (got '${_out4:-}')"; _ret=1; }
+  [ "$_out4" = "192.168.1.201" ] || { echo "  FAIL: registry fallback should be LAN-first (got '${_out4:-}')"; _ret=1; }
   rm -rf "$_d4"
+
+  # 6) Poison regression: a STALE offline-status cache must NOT be served — it must fall through to a
+  # live probe. (The bug: a dead Tailscale IP got cached 'fresh' and pinned every sensor to it for
+  # 900s.) Here phone_reachable_ip returns a live LAN IP; a 10-min-old offline cache must be ignored.
+  _d5="$(mktemp -d)"
+  mkdir -p "$_d5/home/.mesh"
+  printf '%s\n' 'phone_reachable_ip() { echo "192.168.5.50"; return 0; }' > "$_d5/mp.sh"
+  printf '%s\t%s\t%s\n' "$(( $(date -u +%s) - 600 ))" "100.64.9.9" "offline" > "$_d5/home/.mesh/phone-ip.state"
+  _out5="$(HOME="$_d5/home" PHONE_IP="" MESH_PATTERNS="$_d5/mp.sh" bash "$_scr" 2>/dev/null)" || true
+  [ "$_out5" = "192.168.5.50" ] || { echo "  FAIL: stale offline cache pinned instead of re-probing (got '${_out5:-}')"; _ret=1; }
+  rm -rf "$_d5"
+
+  # 7) A FRESH offline cache IS honored briefly (avoid hammering probes when genuinely down).
+  _d6="$(mktemp -d)"
+  mkdir -p "$_d6/home/.mesh" "$_d6/home/.local/bin"
+  printf '%s\n' 'phone_reachable_ip() { return 2; }' > "$_d6/mp.sh"
+  printf '#!/bin/sh\nexit 1\n' > "$_d6/home/.local/bin/adb"; chmod +x "$_d6/home/.local/bin/adb"
+  printf '%s\t%s\t%s\n' "$(date -u +%s)" "192.168.6.60" "offline" > "$_d6/home/.mesh/phone-ip.state"
+  _out6="$(HOME="$_d6/home" PATH="$_d6/home/.local/bin:$PATH" PHONE_IP="" MESH_PATTERNS="$_d6/mp.sh" bash "$_scr" 2>/dev/null)" || true
+  [ "$_out6" = "192.168.6.60" ] || { echo "  FAIL: fresh offline cache should be honored briefly (got '${_out6:-}')"; _ret=1; }
+  rm -rf "$_d6"
 
   [ "$_ret" = 0 ] && { echo "smoke-test: ok"; exit 0; } || exit 1
 fi
@@ -103,12 +131,18 @@ if [ -n "${PHONE_IP:-}" ]; then
 fi
 
 # Fresh cache fast path: avoid spending every verifier tick on slow offline SSH probes.
+# A POSITIVE (status=ok) cache short-circuits for the full CACHE_TTL — it holds a verified-reachable
+# IP. A negative (status=offline) cache is honored only for the short OFFLINE_TTL, so a phone that
+# came back is re-probed within ~2min instead of being pinned to a dead IP for 900s.
 if [ -f "$STATE_FILE" ]; then
-  read -r _cache_ts _cached_ip < "$STATE_FILE" 2>/dev/null || _cached_ip=
+  read -r _cache_ts _cached_ip _cache_st < "$STATE_FILE" 2>/dev/null || _cached_ip=
+  _cache_st="${_cache_st:-ok}"
   _now="$(date -u +%s)"
+  _ttl="$CACHE_TTL"; [ "$_cache_st" = offline ] && _ttl="$OFFLINE_TTL"
   if [ -n "${_cached_ip:-}" ] && [ -n "${_cache_ts:-}" ] \
-    && [ $(( _now - _cache_ts )) -le "$CACHE_TTL" ] 2>/dev/null; then
-    echo "phone offline — returning fresh cached IP ${_cached_ip}" >&2
+    && [ $(( _now - _cache_ts )) -le "$_ttl" ] 2>/dev/null; then
+    if [ "$_cache_st" = ok ]; then echo "phone IP (cached ok) ${_cached_ip}" >&2
+    else echo "phone offline — cached fallback ${_cached_ip} (re-probe in ${OFFLINE_TTL}s)" >&2; fi
     echo "$_cached_ip"
     exit 0
   fi
@@ -145,20 +179,24 @@ if command -v adb >/dev/null 2>&1; then
 fi
 
 # 4. Cached-state fallback: phone was reachable before, now likely on cellular (expected).
+# Only serve a LAST-GOOD (status=ok) cache here; a stale offline guess must fall through to the
+# registry so we don't re-serve a dead IP we already know failed.
 if [ -f "$STATE_FILE" ]; then
-  read -r _ts _cached_ip < "$STATE_FILE" 2>/dev/null || _cached_ip=
-  if [ -n "${_cached_ip:-}" ]; then
-    echo "phone offline — returning cached IP ${_cached_ip}" >&2
+  read -r _ts _cached_ip _cst < "$STATE_FILE" 2>/dev/null || _cached_ip=
+  if [ -n "${_cached_ip:-}" ] && [ "${_cst:-ok}" = ok ]; then
+    echo "phone offline — returning last-good IP ${_cached_ip}" >&2
     echo "$_cached_ip"
     exit 0
   fi
 fi
 
 # 5. Registry fallback: the phone is known to this node, but no live probe currently accepts SSH.
-for _known_ip in ${PHONE_TS_IP:-} ${PHONE_LAN_IPS:-}; do
+# LAN-first (the often-offline Tailscale IP last) since this node is moving off Tailscale, and cache
+# the guess as 'offline' so the fast path re-probes it shortly rather than trusting it for 900s.
+for _known_ip in ${PHONE_LAN_IPS:-} ${PHONE_TS_IP:-}; do
   [ -n "$_known_ip" ] || continue
   echo "phone offline — returning registry IP ${_known_ip}" >&2
-  cache_ip "$_known_ip"
+  cache_ip "$_known_ip" offline
   echo "$_known_ip"
   exit 0
 done
