@@ -1,31 +1,65 @@
 #!/data/data/com.termux/files/usr/bin/sh
 # mesh phone MULTI-SENSOR beacon — pushes geo + motion + light + wifi + battery to the
-# phaedra collector every N sec, so the mesh can DERIVE the operator's state through the day
+# phaedra collector, so the mesh can DERIVE the operator's state through the day
 # (home/away, still/walking/driving, dark/lit, asleep/active) — not just dots on a map.
 # Deploy ON THE PHONE (Termux). Durable via Termux:Boot (~/.termux/boot/). No python on phone
 # → all parsing is grep/sed/awk. Needs: termux-api, location+sensors permission, internet.
+#
+# 2026-06-19 FIX (the "walk not tracked" bug): the old version called `termux-location -p network`
+# FIRST, which ALWAYS returns a cached last-known fix → GPS was never tried → a real walk logged the
+# stale HOME location, zero speed, and home WiFi, looking exactly like "phone sat at home". Now:
+#   1. GPS FIRST (real position + real speed when moving), network only as a flagged fallback.
+#   2. STALE DETECTION — a fix bit-identical to the previous one is a cached repeat, not movement;
+#      we push stale=1 so the reader NEVER again mistakes a cached read for "didn't move".
+#   3. ADAPTIVE cadence — sample fast while moving, slow while still (battery-kind, dense tracks).
+# Background reads still need: Termux location "Allow all the time" + battery-optimisation OFF for
+# Termux (operator's hands) — else Android hands back cached values when the screen is off.
 COLLECTOR="https://38-49-216-141.sslip.io:8092/loc"
 TOKEN="2ea85e3fa4f7c3d63e643d4fa4ab85a3"
-INTERVAL="${MESH_BEACON_INTERVAL:-600}"
+FAST="${MESH_BEACON_FAST:-120}"      # seconds between fixes while MOVING
+SLOW="${MESH_BEACON_SLOW:-600}"      # seconds between fixes while STILL
 LOG="$HOME/.locbeacon.log"
 LIGHT_SENSOR="tmd2755_l"
 
-termux-wake-lock 2>/dev/null
-echo "$(date) beacon2 start interval=${INTERVAL}s" >> "$LOG"
+echo "$(date) beacon2 start fast=${FAST}s slow=${SLOW}s (gps-first + stale-flag)" >> "$LOG"
 
 jval() { # extract first JSON numeric/string value for key $1 from stdin
   grep -oE "\"$1\"[ ]*:[ ]*\"?[-0-9A-Za-z._:+ -]*\"?" | head -1 | sed -E "s/.*:[ ]*\"?//; s/\"$//"
 }
 
+PREV_LAT=""; PREV_LON=""; PREV_ACC=""
+
 while true; do
-  # --- location (network fast, gps fallback) ---
-  LOC=$(termux-location -p network -r once 2>/dev/null)
-  case "$LOC" in *latitude*) ;; *) LOC=$(termux-location -p gps -r once 2>/dev/null);; esac
+  termux-wake-lock 2>/dev/null   # re-acquire EVERY loop — Doze drops the startup-only lock
+
+  # --- location: GPS FIRST (real movement + speed), network as a flagged fallback ---
+  GPS_OK=1
+  LOC=$(timeout 50 termux-location -p gps -r once 2>/dev/null)
+  case "$LOC" in
+    *latitude*) ;;
+    *) GPS_OK=0; LOC=$(timeout 20 termux-location -p network -r once 2>/dev/null);;
+  esac
   LAT=$(printf '%s' "$LOC" | jval latitude)
   LON=$(printf '%s' "$LOC" | jval longitude)
   ACC=$(printf '%s' "$LOC" | jval accuracy)
   SPD=$(printf '%s' "$LOC" | jval speed)
   PRV=$(printf '%s' "$LOC" | jval provider)
+
+  # --- STALE detection: identical lat+lon+acc to the previous fix = cached repeat, not a real fix ---
+  STALE=0
+  if [ -n "$LAT" ] && [ "$LAT" = "$PREV_LAT" ] && [ "$LON" = "$PREV_LON" ] && [ "$ACC" = "$PREV_ACC" ]; then
+    STALE=1
+  fi
+
+  # --- distance moved from previous fix (m), haversine in awk (no ^ for portability) ---
+  MOVED_M=$(awk -v a1="$PREV_LAT" -v o1="$PREV_LON" -v a2="$LAT" -v o2="$LON" 'BEGIN{
+    if(a1==""||a2==""){print -1; exit}
+    R=6371000; d2r=3.14159265358979/180;
+    la1=a1*d2r; la2=a2*d2r; dla=(a2-a1)*d2r; dlo=(o2-o1)*d2r;
+    sdla=sin(dla/2); sdlo=sin(dlo/2);
+    h=sdla*sdla + cos(la1)*cos(la2)*sdlo*sdlo;
+    print int(2*R*atan2(sqrt(h),sqrt(1-h)))
+  }')
 
   # --- battery ---
   BS=$(termux-battery-status 2>/dev/null)
@@ -42,8 +76,8 @@ while true; do
   LUX=$(timeout 6 termux-sensor -s "$LIGHT_SENSOR" -n 1 2>/dev/null \
         | tr -d '\n ' | grep -oE '"values":\[[-0-9.]+' | head -1 | grep -oE '[-0-9.]+$')
 
-  # --- motion: RMS magnitude of linear acceleration over 5 samples (gravity excluded) ---
-  MOT=$(timeout 7 termux-sensor -s LINEARACCEL -n 5 2>/dev/null \
+  # --- motion: RMS magnitude of linear acceleration over 8 samples (gravity excluded) ---
+  MOT=$(timeout 8 termux-sensor -s LINEARACCEL -n 8 2>/dev/null \
         | tr -d '\n ' | grep -oE '"values":\[[-0-9.,]+\]' \
         | sed -E 's/"values":\[//; s/\]//' \
         | awk -F, '{m=sqrt($1*$1+$2*$2+$3*$3); s+=m; n++} END{ if(n>0) printf "%.3f", s/n; else printf "" }')
@@ -52,15 +86,26 @@ while true; do
   STEPS=$(timeout 6 termux-sensor -s STEP_COUNTER -n 1 2>/dev/null \
           | tr -d '\n ' | grep -oE '"values":\[[-0-9.]+' | head -1 | grep -oE '[0-9]+' | head -1)
 
+  # --- MOVING? real GPS speed >= 0.7 m/s, OR moved > 40 m on a fresh (non-stale) fix, OR motion RMS high ---
+  MOVING=0
+  if [ "$GPS_OK" = 1 ] && [ -n "$SPD" ]; then
+    awk -v s="$SPD" 'BEGIN{exit !(s+0>=0.7)}' 2>/dev/null && MOVING=1
+  fi
+  if [ "$STALE" = 0 ] && [ "$MOVED_M" -ge 40 ] 2>/dev/null; then MOVING=1; fi
+  if [ -n "$MOT" ]; then awk -v m="$MOT" 'BEGIN{exit !(m+0>=0.6)}' 2>/dev/null && MOVING=1; fi
+
   if [ -n "$LAT" ] && [ -n "$LON" ]; then
     URL="${COLLECTOR}?token=${TOKEN}&lat=${LAT}&lon=${LON}&acc=${ACC}&spd=${SPD}&prov=${PRV}"
-    URL="${URL}&batt=${BAT}&bst=${BST}&btemp=${BTMP}&ssid=${SSID}&rssi=${RSSI}&lux=${LUX}&mot=${MOT}&steps=${STEPS}"
+    URL="${URL}&gps=${GPS_OK}&stale=${STALE}&moved=${MOVED_M}&batt=${BAT}&bst=${BST}&btemp=${BTMP}"
+    URL="${URL}&ssid=${SSID}&rssi=${RSSI}&lux=${LUX}&mot=${MOT}&steps=${STEPS}"
     RESP=$(curl -s --max-time 25 "$URL" 2>/dev/null)
-    echo "$(date) fix lat=$LAT lon=$LON acc=$ACC spd=$SPD bat=$BAT/$BST ssid=$SSID rssi=$RSSI lux=$LUX mot=$MOT steps=$STEPS resp=$RESP" >> "$LOG"
+    echo "$(date) fix gps=$GPS_OK stale=$STALE moved=${MOVED_M}m lat=$LAT lon=$LON acc=$ACC spd=$SPD prov=$PRV bat=$BAT/$BST ssid=$SSID lux=$LUX mot=$MOT move=$MOVING resp=$RESP" >> "$LOG"
+    PREV_LAT="$LAT"; PREV_LON="$LON"; PREV_ACC="$ACC"
   else
-    echo "$(date) no-fix (location off / no signal) lux=$LUX mot=$MOT bat=$BAT ssid=$SSID" >> "$LOG"
+    echo "$(date) no-fix (location off / no signal) gps=$GPS_OK lux=$LUX mot=$MOT bat=$BAT ssid=$SSID" >> "$LOG"
   fi
 
-  tail -300 "$LOG" > "$LOG.t" 2>/dev/null && mv "$LOG.t" "$LOG" 2>/dev/null
-  sleep "$INTERVAL"
+  tail -400 "$LOG" > "$LOG.t" 2>/dev/null && mv "$LOG.t" "$LOG" 2>/dev/null
+
+  if [ "$MOVING" = 1 ]; then sleep "$FAST"; else sleep "$SLOW"; fi
 done
