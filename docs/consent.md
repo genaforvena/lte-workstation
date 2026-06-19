@@ -13,8 +13,9 @@ Any script that captures sensor data from a space where a person other than the 
 - `mesh-blessyou` — always-on mic, energy-detection loop
 - `mesh-ear` — always-on mic, wake-word reflex (opt-in consent already built in)
 - `mesh-converse` — on-demand mic, voice conversation
-- `mesh-eye` — consent-gated camera/mic ambient sense (the current canonical camera organ); reduces
-  each capture to abstract signals (light/sound/motion) and keeps **no** raw frame or audio
+- `mesh-eye` — consent-gated camera/mic ambient sense; reduces each capture to abstract signals
+  (light/sound/motion) and keeps **no** raw frame or audio. The dedicated still-camera organ is
+  `mesh-camera`.
 
 ## Consent file: `~/.mesh/consent`
 
