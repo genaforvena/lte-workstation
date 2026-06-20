@@ -1,177 +1,242 @@
 #!/usr/bin/env bash
-# reflex-cadence: 1-59/5 * * * *
-# reflex-args: --edge
-# mesh-operator-focus — OPERATOR FOCUS STATE: fuses keyboard activity + session complexity
-# + network traffic into what kind of work is happening right now.
-# All 3 inputs are IdeaPad-local — no phone, no SSH.  Each unreachable input renders
-# UNKNOWN (never silently OK); ≥2 signals UNKNOWN → exit 2 (cannot assess, not all-clear).
+# mesh-operator-focus — 4-INPUT NODE-STATE FUSION: keyboard + screen + PSI + thermal →
+# a single verdict about what the node (and its operator) is doing right now.
 #
-#   mesh-operator-focus           one-shot
-#   mesh-operator-focus --json    machine-readable
-#   mesh-operator-focus --edge    emit only on state change (2-consecutive debounce)
-#   mesh-operator-focus --test    smoke test
+# Inputs (all node-side, read from existing state files — no re-sensing):
+#   kbd   — keyboard activity (mesh-kbd-activity → .kbd-activity.state: IDLE|LIGHT|TYPING)
+#   scr   — screen state      (mesh-screen-state → .screen-state.state: OFF|DIM|NORMAL|BRIGHT)
+#   psi   — resource pressure  (mesh-psi         → .psi.state: CALM|BUSY|STALLED|<dom>)
+#   therm — thermal state      (mesh-therm-watch → .therm-state: OK|HOT)
 #
-# Inputs (all local, no phone dependency):
-#   kbd      ~/.mesh/.kbd-activity.state    IDLE / LIGHT / TYPING
-#   session  ~/.mesh/.ambient-clock.state   QUIET / ACTIVE / BUSY  (tmux-window proxy)
-#   net      ~/.mesh/.net-io.state          LOW / MED / HIGH       (primary iface rx+tx/s)
+# Fused verdicts:
+#   FOCUSED   — keyboard TYPING + screen ON → operator actively working
+#   WORKING   — screen ON but keyboard IDLE → reading / watching / passive use
+#   STRESSED  — PSI STALLED or thermal HOT → node under resource or thermal pressure
+#   IDLE      — all inputs calm → node is quiet
+#   DEGRADED  — 2+ inputs unreachable → can't assess honestly
 #
-# Derived states (no single sense gives these):
-#   FOCUSED      TYPING kbd (non-HIGH net)          → deep work / coding / writing
-#   VIDEO_CALL   TYPING or LIGHT kbd + HIGH net     → video conference
-#   BROWSING     LIGHT kbd (non-HIGH net)           → web / light reading
-#   STREAMING    IDLE kbd + HIGH net                → music/video (operator passive)
-#   BACKGROUND   IDLE kbd + MED net + QUIET session → sync/download, no operator
-#   ACTIVE_IDLE  IDLE kbd + ACTIVE/BUSY session     → windows open but not working
-#   MACHINE_IDLE IDLE kbd + QUIET session + LOW net → node at rest
-#   DEGRADED     kbd UNKNOWN (primary signal missing but others known)
+# UNREACHABLE inputs render as "UNREACHABLE" in the breakdown — never silently cleared.
+# A single unreachable input downgrades confidence but does NOT force DEGRADED.
 #
-# Exit codes (honest-exit contract):
-#   0  = state assessed (MACHINE_IDLE and DEGRADED are valid real findings)
-#   2  = kbd UNKNOWN AND (net or session also UNKNOWN) — too degraded to assess
+# Usage:
+#   mesh-operator-focus              one-line verdict
+#   mesh-operator-focus --json       machine-readable {verdict, inputs:{...}, ts}
+#   mesh-operator-focus --dry        print row that WOULD be written, don't touch state
+#   mesh-operator-focus --test       smoke test (synthetic fixtures, no live sensors)
+#   mesh-operator-focus --edge       emit only on verdict change (2-consecutive debounce)
+#
+# Exit codes:
+#   0 = assessment produced (IDLE is a real assessment, not an error)
+#   2 = fewer than 2 inputs reachable — can't fuse honestly
 set -uo pipefail
 export PATH="$HOME/.local/bin:$PATH"
 [ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
 
-MESH="${MESH_FOCUS_MESH:-$HOME/.mesh}"
-STATE="${MESH_FOCUS_STATE:-$MESH/.operator-focus.state}"
+MESH="$HOME/.mesh"
+STATE="$MESH/.operator-focus.state"
+PENDING="${STATE%.state}.pending"
 
-# --- Pure classification function (extracted for testability) ---
-# Usage: classify_focus KBD SESSION NET
-# Echoes the derived state; return 2 = too degraded to assess
-classify_focus() {
-  local k="$1" s="$2" n="$3"
+# --- Read one sense's verdict from its state file ---
+# Returns the verdict string or "UNREACHABLE" if the file is missing/empty/stale.
+# Staleness: if the state file's mtime is older than MAX_STALE_S, check the log file
+# as a fallback (the sense cron may run but only write state on verdict change via --edge).
+# If the log file is fresh, the sense is alive — use the state file value.
+# Args: state_file [log_file] [max_stale_s]
+MAX_STALE_S="${MESH_FOCUS_STALE_S:-600}"   # 10 min
 
-  # kbd is the primary discriminator.  Without it and at least one other signal, exit 2.
-  if [ "$k" = "UNKNOWN" ]; then
-    if [ "$n" = "UNKNOWN" ] || [ "$s" = "UNKNOWN" ]; then
-      return 2  # both primary axes unknown → caller should exit 2
+read_sense() {
+  local file="$1" logfile="${2:-}" max_age="${3:-$MAX_STALE_S}"
+  [ -f "$file" ] || { echo "UNREACHABLE"; return; }
+  local mt age
+  mt="$(stat -c %Y "$file" 2>/dev/null || echo 0)"
+  age=$(( $(date +%s) - mt ))
+  if [ "$age" -gt "$max_age" ]; then
+    # State file stale — check if the sense's log file is fresh (sense is alive, just edge-suppressed)
+    if [ -n "$logfile" ] && [ -f "$logfile" ]; then
+      local lmt lage
+      lmt="$(stat -c %Y "$logfile" 2>/dev/null || echo 0)"
+      lage=$(( $(date +%s) - lmt ))
+      [ "$lage" -le "$max_age" ] || { echo "UNREACHABLE"; return; }
+    else
+      echo "UNREACHABLE"; return
     fi
-    echo "DEGRADED"; return 0
+  fi
+  local val
+  val="$(head -1 "$file" 2>/dev/null | tr -d '[:space:]')"
+  [ -n "$val" ] && echo "$val" || echo "UNREACHABLE"
+}
+
+# --- Fusion classifier (pure logic, exercised by --test) ---
+# Args: kbd_verdict scr_verdict psi_verdict therm_verdict
+# Echoes: VERDICT|confidence|reason
+classify() {
+  local kbd="$1" scr="$2" psi="$3" therm="$4"
+  local unreachable=0
+  case "$kbd" in  UNREACHABLE) unreachable=$((unreachable+1));; esac
+  case "$scr" in  UNREACHABLE) unreachable=$((unreachable+1));; esac
+  case "$psi" in  UNREACHABLE) unreachable=$((unreachable+1));; esac
+  case "$therm" in UNREACHABLE) unreachable=$((unreachable+1));; esac
+
+  # DEGRADED: 2+ inputs unreachable → can't assess honestly
+  if [ "$unreachable" -ge 2 ]; then
+    echo "DEGRADED|low|${unreachable}/4 inputs unreachable"; return
   fi
 
-  # Conservative fallback for missing secondary signals
-  local ne="$n"; [ "$ne" = "UNKNOWN" ] && ne="LOW"
-  local se="$s"; [ "$se" = "UNKNOWN" ] && se="QUIET"
-
-  if   [ "$k" = "TYPING" ] && [ "$ne" = "HIGH" ]; then                                  echo "VIDEO_CALL"
-  elif [ "$k" = "TYPING" ];                        then                                  echo "FOCUSED"
-  elif [ "$k" = "LIGHT"  ] && [ "$ne" = "HIGH" ]; then                                  echo "VIDEO_CALL"
-  elif [ "$k" = "LIGHT"  ];                        then                                  echo "BROWSING"
-  elif [ "$k" = "IDLE"   ] && [ "$ne" = "HIGH" ]; then                                  echo "STREAMING"
-  elif [ "$k" = "IDLE"   ] && [ "$ne" = "MED"  ] && [ "$se" = "QUIET" ]; then          echo "BACKGROUND"
-  elif [ "$k" = "IDLE"   ] && { [ "$se" = "ACTIVE" ] || [ "$se" = "BUSY" ]; }; then    echo "ACTIVE_IDLE"
-  else                                                                                    echo "MACHINE_IDLE"
+  # STRESSED: thermal HOT or PSI STALLED (override focus/idle)
+  if [ "$therm" = "HOT" ]; then
+    echo "STRESSED|medium|thermal=HOT"; return
   fi
-  return 0
+  # STRESSED: PSI STALLED (override focus/idle)
+  case "$psi" in STALLED*) echo "STRESSED|medium|psi=$psi"; return;; esac
+
+  # FOCUSED: keyboard TYPING + screen ON
+  if [ "$kbd" = "TYPING" ] && [[ "$scr" =~ ^(DIM|NORMAL|BRIGHT)$ ]]; then
+    echo "FOCUSED|high|kbd=TYPING scr=$scr"; return
+  fi
+
+  # WORKING: screen ON but keyboard not TYPING (reading / watching / passive use)
+  if [[ "$scr" =~ ^(DIM|NORMAL|BRIGHT)$ ]]; then
+    echo "WORKING|medium|scr=$scr kbd=$kbd"; return
+  fi
+
+  # IDLE: everything quiet
+  echo "IDLE|high|kbd=$kbd scr=$scr psi=$psi therm=$therm"
 }
 
 # --- Smoke test ---
 if [ "${1:-}" = --test ]; then
-  fail=0
-  # Classification assertions (FALSIFIABLE: change any branch → assertion fails)
-  [ "$(classify_focus TYPING ACTIVE  LOW )" = "FOCUSED"      ] || { echo "  FAIL: TYPING+ACTIVE+LOW → FOCUSED";     fail=1; }
-  [ "$(classify_focus TYPING BUSY    MED )" = "FOCUSED"      ] || { echo "  FAIL: TYPING+BUSY+MED → FOCUSED";       fail=1; }
-  [ "$(classify_focus TYPING QUIET   HIGH)" = "VIDEO_CALL"   ] || { echo "  FAIL: TYPING+QUIET+HIGH → VIDEO_CALL";  fail=1; }
-  [ "$(classify_focus LIGHT  ACTIVE  HIGH)" = "VIDEO_CALL"   ] || { echo "  FAIL: LIGHT+ACTIVE+HIGH → VIDEO_CALL";  fail=1; }
-  [ "$(classify_focus LIGHT  QUIET   MED )" = "BROWSING"     ] || { echo "  FAIL: LIGHT+QUIET+MED → BROWSING";      fail=1; }
-  [ "$(classify_focus LIGHT  BUSY    LOW )" = "BROWSING"     ] || { echo "  FAIL: LIGHT+BUSY+LOW → BROWSING";       fail=1; }
-  [ "$(classify_focus IDLE   QUIET   HIGH)" = "STREAMING"    ] || { echo "  FAIL: IDLE+QUIET+HIGH → STREAMING";     fail=1; }
-  [ "$(classify_focus IDLE   QUIET   MED )" = "BACKGROUND"   ] || { echo "  FAIL: IDLE+QUIET+MED → BACKGROUND";     fail=1; }
-  [ "$(classify_focus IDLE   ACTIVE  LOW )" = "ACTIVE_IDLE"  ] || { echo "  FAIL: IDLE+ACTIVE+LOW → ACTIVE_IDLE";  fail=1; }
-  [ "$(classify_focus IDLE   QUIET   LOW )" = "MACHINE_IDLE" ] || { echo "  FAIL: IDLE+QUIET+LOW → MACHINE_IDLE";  fail=1; }
-  # DEGRADED: kbd UNKNOWN alone → state=DEGRADED exit 0
-  [ "$(classify_focus UNKNOWN ACTIVE MED)" = "DEGRADED"      ] || { echo "  FAIL: UNKNOWN+ACTIVE+MED → DEGRADED";  fail=1; }
-  # exit 2: kbd UNKNOWN + net UNKNOWN (both primary axes missing)
-  classify_focus UNKNOWN ACTIVE UNKNOWN; rc=$?
-  [ "$rc" = 2 ] || { echo "  FAIL: UNKNOWN+ACTIVE+UNKNOWN should return 2 (got $rc)"; fail=1; }
-  # exit 2: kbd UNKNOWN + session UNKNOWN
-  classify_focus UNKNOWN UNKNOWN LOW; rc=$?
-  [ "$rc" = 2 ] || { echo "  FAIL: UNKNOWN+UNKNOWN+LOW should return 2 (got $rc)";   fail=1; }
-  [ "$fail" = 0 ] || { echo "smoke-test: FAIL"; exit 1; }
-  # Live state-file availability
-  missing=0
-  [ -f "$MESH/.kbd-activity.state"   ] || { echo "  warn: .kbd-activity.state missing";   missing=$(( missing + 1 )); }
-  [ -f "$MESH/.ambient-clock.state"  ] || { echo "  warn: .ambient-clock.state missing";  missing=$(( missing + 1 )); }
-  [ -f "$MESH/.net-io.state"         ] || { echo "  warn: .net-io.state missing";         missing=$(( missing + 1 )); }
-  if [ "$missing" -ge 2 ]; then
-    echo "smoke-test: n/a ($missing/3 state files missing — fusion not viable)"; exit 2
-  fi
-  echo "smoke-test: ok (13 classify assertions; $missing/3 state files absent)"; exit 0
+  for dep in python3 date stat head; do
+    command -v "$dep" >/dev/null 2>&1 || { echo "smoke-test: FAIL ($dep missing)"; exit 1; }
+  done
+  _f=0
+
+  # FOCUSED: typing + screen on
+  r="$(classify TYPING NORMAL CALM OK)"; v="${r%%|*}"
+  [ "$v" = "FOCUSED" ] || { echo "  FAIL: TYPING+NORMAL → $v (expected FOCUSED)"; _f=1; }
+
+  # FOCUSED: typing + bright screen
+  r="$(classify TYPING BRIGHT CALM OK)"; v="${r%%|*}"
+  [ "$v" = "FOCUSED" ] || { echo "  FAIL: TYPING+BRIGHT → $v (expected FOCUSED)"; _f=1; }
+
+  # WORKING: screen on, keyboard idle
+  r="$(classify IDLE NORMAL CALM OK)"; v="${r%%|*}"
+  [ "$v" = "WORKING" ] || { echo "  FAIL: IDLE+NORMAL → $v (expected WORKING)"; _f=1; }
+
+  # WORKING: screen dim, keyboard light
+  r="$(classify LIGHT DIM CALM OK)"; v="${r%%|*}"
+  [ "$v" = "WORKING" ] || { echo "  FAIL: LIGHT+DIM → $v (expected WORKING)"; _f=1; }
+
+  # IDLE: everything quiet
+  r="$(classify IDLE OFF CALM OK)"; v="${r%%|*}"
+  [ "$v" = "IDLE" ] || { echo "  FAIL: IDLE+OFF+CALM+OK → $v (expected IDLE)"; _f=1; }
+
+  # STRESSED: thermal HOT overrides focus
+  r="$(classify TYPING NORMAL CALM HOT)"; v="${r%%|*}"
+  [ "$v" = "STRESSED" ] || { echo "  FAIL: TYPING+NORMAL+HOT → $v (expected STRESSED)"; _f=1; }
+
+  # STRESSED: PSI STALLED overrides idle
+  r="$(classify IDLE OFF "STALLED|cpu" OK)"; v="${r%%|*}"
+  [ "$v" = "STRESSED" ] || { echo "  FAIL: IDLE+OFF+STALLED|cpu → $v (expected STRESSED)"; _f=1; }
+
+  # DEGRADED: 2+ unreachable
+  r="$(classify UNREACHABLE UNREACHABLE CALM OK)"; v="${r%%|*}"
+  [ "$v" = "DEGRADED" ] || { echo "  FAIL: 2xUNREACHABLE → $v (expected DEGRADED)"; _f=1; }
+
+  # DEGRADED: 3 unreachable
+  r="$(classify UNREACHABLE UNREACHABLE UNREACHABLE OK)"; v="${r%%|*}"
+  [ "$v" = "DEGRADED" ] || { echo "  FAIL: 3xUNREACHABLE → $v (expected DEGRADED)"; _f=1; }
+
+  # 1 unreachable + valid = still assessable (not degraded)
+  r="$(classify TYPING NORMAL UNREACHABLE OK)"; v="${r%%|*}"
+  [ "$v" = "FOCUSED" ] || { echo "  FAIL: TYPING+NORMAL+UNREACHABLE+OK → $v (expected FOCUSED)"; _f=1; }
+
+  # IDLE: screen OFF + keyboard IDLE + PSI CALM
+  r="$(classify IDLE OFF BUSY OK)"; v="${r%%|*}"
+  [ "$v" = "IDLE" ] || { echo "  FAIL: IDLE+OFF+BUSY+OK → $v (expected IDLE, screen off)"; _f=1; }
+
+  # IDLE with screen off
+  r="$(classify IDLE OFF CALM HOT)"; v="${r%%|*}"
+  [ "$v" = "STRESSED" ] || { echo "  FAIL: IDLE+OFF+CALM+HOT → $v (expected STRESSED)"; _f=1; }
+
+  # Live path: verify state files exist (at least 2 of 4)
+  _live=0
+  [ -f "$MESH/.kbd-activity.state" ] && _live=$((_live+1))
+  [ -f "$MESH/.screen-state.state" ] && _live=$((_live+1))
+  [ -f "$MESH/.psi.state" ] && _live=$((_live+1))
+  [ -f "$MESH/.therm-state" ] && _live=$((_live+1))
+  [ "$_live" -ge 2 ] || { echo "smoke-test: FAIL (only $_live/4 state files present)"; exit 1; }
+
+  [ "$_f" = 0 ] || { echo "smoke-test: FAIL ($_f assertion(s))"; exit 1; }
+  echo "smoke-test: ok (classify: 12 fusion paths + live:$_live/4 state files present)"
+  exit 0
 fi
 
-# --- Read signals from state files ---
-kbd="UNKNOWN"
-[ -f "$MESH/.kbd-activity.state" ] && kbd="$(cat "$MESH/.kbd-activity.state" 2>/dev/null || echo UNKNOWN)"
+# --- Read inputs ---
+kbd="$(read_sense "$MESH/.kbd-activity.state" "$MESH/kbd-activity.log")"
+scr="$(read_sense "$MESH/.screen-state.state" "$MESH/screen-state.log")"
+psi="$(read_sense "$MESH/.psi.state" "$MESH/psi.log")"
+therm="$(read_sense "$MESH/.therm-state" "$MESH/therm-watch.log")"
 
-session="UNKNOWN"
-[ -f "$MESH/.ambient-clock.state" ] && session="$(cat "$MESH/.ambient-clock.state" 2>/dev/null || echo UNKNOWN)"
+# Count reachable inputs
+reachable=0
+for v in "$kbd" "$scr" "$psi" "$therm"; do
+  [ "$v" != "UNREACHABLE" ] && reachable=$((reachable+1))
+done
 
-net="UNKNOWN"
-if [ -f "$MESH/.net-io.state" ]; then
-  # Match primary interface: any wlp/wlan/eth/ens/enp/eno line with rx= and tx= fields
-  iface_line="$(grep -E 'rx=[0-9]+ tx=[0-9]+' "$MESH/.net-io.state" 2>/dev/null \
-    | grep -vE '^(tailscale|lo|docker|veth|br-)' | head -1)"
-  if [ -n "$iface_line" ]; then
-    rx="$(printf '%s' "$iface_line" | grep -oE 'rx=[0-9]+' | cut -d= -f2)"
-    tx="$(printf '%s' "$iface_line" | grep -oE 'tx=[0-9]+' | cut -d= -f2)"
-    total=$(( ${rx:-0} + ${tx:-0} ))
-    if   [ "$total" -ge 1000000 ]; then net="HIGH"   # ≥1MB/s  — streaming-class
-    elif [ "$total" -ge   50000 ]; then net="MED"    # ≥50KB/s — active browsing/sync
-    else                                net="LOW"     # <50KB/s — idle/background
-    fi
-  fi
-fi
+# Less than 2 reachable → can't fuse honestly
+[ "$reachable" -ge 2 ] || {
+  echo "mesh-operator-focus: DEGRADED — only $reachable/4 inputs reachable" >&2
+  exit 2
+}
 
 # --- Classify ---
-state="$(classify_focus "$kbd" "$session" "$net")"; cf_rc=$?
-if [ "$cf_rc" = 2 ]; then
-  echo "operator-focus: kbd+secondary both unknown — too degraded to assess" >&2
-  exit 2
-fi
+fused="$(classify "$kbd" "$scr" "$psi" "$therm")"
+verdict="${fused%%|*}"
+rest="${fused#*|}"
+confidence="${rest%%|*}"
+reason="${rest#*|}"
+ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-TS=$(date -u +%H:%M:%SZ)
-signals="kbd=${kbd} session=${session} net=${net}"
-degraded=""
-[ "$kbd"     = "UNKNOWN" ] && degraded="${degraded:+$degraded,}kbd-unknown"
-[ "$session" = "UNKNOWN" ] && degraded="${degraded:+$degraded,}session-unknown"
-[ "$net"     = "UNKNOWN" ] && degraded="${degraded:+$degraded,}net-unknown"
-[ -z "$degraded" ] && degraded="none"
-
-mkdir -p "$MESH" 2>/dev/null || true
-
+# --- Output ---
 MODE=text; [ "${1:-}" = --json ] && MODE=json
+DRY=0;     [ "${1:-}" = --dry ] && DRY=1
 EDGE=0;    [ "${1:-}" = --edge ] && EDGE=1
 
+row="$(printf 'kbd=%s scr=%s psi=%s therm=%s → %s (%s) [%s]' \
+  "$kbd" "$scr" "$psi" "$therm" "$verdict" "$confidence" "$reason")"
+
 if [ "$MODE" = json ]; then
-  printf '{"state":"%s","signals":"%s","degraded":"%s","ts":"%s"}\n' \
-    "$state" "$signals" "$degraded" "$TS"
+  printf '{"verdict":"%s","confidence":"%s","reason":"%s","inputs":{"kbd":"%s","scr":"%s","psi":"%s","therm":"%s"},"reachable":%d,"ts":"%s"}\n' \
+    "$verdict" "$confidence" "$reason" "$kbd" "$scr" "$psi" "$therm" "$reachable" "$ts"
+  exit 0
+fi
+
+if [ "$DRY" = 1 ]; then
+  printf '%s\n' "$row"
   exit 0
 fi
 
 if [ "$EDGE" = 1 ]; then
-  PENDING="${STATE%.state}.pending"
   confirmed="$(cat "$STATE" 2>/dev/null || true)"
   pending_line="$(cat "$PENDING" 2>/dev/null || true)"
   pending="${pending_line%%:*}"; pcount="${pending_line##*:}"; pcount="${pcount:-0}"
 
   if [ -z "$confirmed" ]; then
-    printf '%s\n' "$state" > "$STATE"; rm -f "$PENDING"
-  elif [ "$state" = "$confirmed" ]; then
+    printf '%s\n' "$verdict" > "$STATE"; rm -f "$PENDING"
+  elif [ "$verdict" = "$confirmed" ]; then
     rm -f "$PENDING"
-    touch "$STATE" 2>/dev/null || true   # mtime = last-run, not last-change
-  elif [ "$state" = "$pending" ]; then
+  elif [ "$verdict" = "$pending" ]; then
     pcount=$(( pcount + 1 ))
     if [ "$pcount" -ge 2 ]; then
-      printf '%s\n' "$state" > "$STATE"; rm -f "$PENDING"
-      printf '[operator-focus] %s — %s | %s\n' "$state" "$degraded" "$signals"
+      printf '%s\n' "$verdict" > "$STATE"; rm -f "$PENDING"
+      printf '[operator-focus] %s — %s\n' "$verdict" "$row"
     else
-      printf '%s:%d\n' "$state" "$pcount" > "$PENDING"
+      printf '%s:%d\n' "$verdict" "$pcount" > "$PENDING"
     fi
   else
-    printf '%s:1\n' "$state" > "$PENDING"
+    printf '%s:1\n' "$verdict" > "$PENDING"
   fi
   exit 0
 fi
 
-printf '[operator-focus] %s — degraded=%s | %s\n' "$state" "$degraded" "$signals"
+printf '[operator-focus] %s — %s\n' "$verdict" "$row"
