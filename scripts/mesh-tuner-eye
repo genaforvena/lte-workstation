@@ -1,0 +1,253 @@
+#!/usr/bin/env bash
+# mesh-tuner-eye — CAMERA TRIGGER for the tuner. Watches the room webcam; when a guitar or
+# cello (any held string instrument) ENTERS the frame it announces "запускаю тюнер" on the Bose
+# and launches `mesh-tuner --loop`; when the instrument LEAVES the frame it stops the tuner.
+# Operator 2026-06-20: "распознавать виолончель или гитару — если она в кадре, голосом сказать
+# 'запускаю тюнер' и запускать тюнер".
+#
+# Vision = Groq zero-shot (qwen vision, same path as mesh-face-recognize) — a couple seconds of
+# latency is fine for a TRIGGER (the tuner itself stays pure-local + fast). The webcam frame is
+# captured to a temp file, classified, then DELETED — no image is ever kept (mesh-eye doctrine).
+# CONSENT-GATED: refuses unless ~/.mesh/consent grants camera=yes (the room node already does).
+#
+# Runs on the mic + Bose + webcam node (default-string), same node as mesh-tuner / mesh-overhear.
+#
+#   mesh-tuner-eye --loop        watch continuously: instrument in frame → start tuner, gone → stop
+#   mesh-tuner-eye --once        one capture → classify → print (guitar|cello|none), no action
+#   mesh-tuner-eye --detect      alias of --once (frame → label only, no tuner, no voice)
+#   mesh-tuner-eye --test        logic self-test (no cam, no cloud) — state machine + parsing
+#
+# Tunables (env): EYE_CAM=/dev/video0 · CAM_RES=640x480 · TUNEREYE_POLL=3 (seconds between frames)
+#   · TUNEREYE_ON=2 (consecutive instrument-frames to START) · TUNEREYE_OFF=3 (consecutive
+#   empty-frames to STOP) — hysteresis so a blurred/averted frame doesn't flap the tuner.
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+MESH="${MESH_DIR:-$HOME/.mesh}"
+CONSENT="$MESH/consent"
+export OH_PIPER="${OH_PIPER:-$MESH/piper/piper/piper}"
+export OH_PIPERLIB="${OH_PIPERLIB:-$MESH/piper/piper}"
+export OH_VOICE="${OH_VOICE:-$MESH/piper/voices/ruslan.onnx}"
+export MUTE_FLAG="${MUTE_FLAG:-$MESH/mesh-speaking}"
+export TUNEREYE_VOICE="${TUNEREYE_VOICE:-$MESH/tuner-voice/start.wav}"
+export EYE_CAM="${EYE_CAM:-/dev/video0}"
+export CAM_RES="${CAM_RES:-640x480}"
+export GROQ_ENV="${GROQ_ENV:-$MESH/groq.env}"
+export TUNEREYE_POLL="${TUNEREYE_POLL:-3}"
+export TUNEREYE_ON="${TUNEREYE_ON:-2}"
+export TUNEREYE_OFF="${TUNEREYE_OFF:-3}"
+export TUNEREYE_PID="${TUNEREYE_PID:-$MESH/tuner-eye.tunerpid}"
+export LOG="${TUNEREYE_LOG:-$MESH/tuner-eye.log}"
+
+consent_camera_ok(){
+  [ -f "$CONSENT" ] && grep -qiE '^[[:space:]]*camera[[:space:]]*=[[:space:]]*(yes|true|1)' "$CONSENT"
+}
+
+PY="$(mktemp /tmp/tunereye-XXXXXX.py)"; trap 'rm -f "$PY"' EXIT
+cat > "$PY" <<'PYEOF'
+import os, sys, json, time, base64, subprocess
+
+CAM   = os.environ["EYE_CAM"]; RES = os.environ["CAM_RES"]
+POLL  = float(os.environ.get("TUNEREYE_POLL","3"))
+NEED_ON  = int(os.environ.get("TUNEREYE_ON","2"))
+NEED_OFF = int(os.environ.get("TUNEREYE_OFF","3"))
+GROQ_ENV = os.environ["GROQ_ENV"]; MODEL = "qwen/qwen3.6-27b"
+PIPER = os.environ["OH_PIPER"]; PIPERLIB = os.environ["OH_PIPERLIB"]; VOICE = os.environ["OH_VOICE"]
+STARTWAV = os.environ["TUNEREYE_VOICE"]; MUTE = os.environ["MUTE_FLAG"]
+PIDFILE = os.environ["TUNEREYE_PID"]; LOG = os.environ["LOG"]
+
+def log(msg):
+    line = "%s  tuner-eye  ::  %s" % (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), msg)
+    try:
+        with open(LOG,"a") as f: f.write(line+"\n")
+    except Exception: pass
+    print(line, flush=True)
+
+def groq_key():
+    try:
+        with open(GROQ_ENV) as f:
+            for ln in f:
+                if ln.startswith("GROQ_API_KEY="):
+                    return ln.split("=",1)[1].strip().strip('"').strip("'")
+    except Exception: pass
+    return None
+
+def capture():
+    f = "/tmp/tunereye-%d.jpg" % os.getpid()
+    subprocess.run(["fswebcam","--no-banner","-d",CAM,"-r",RES,"-S","8",f],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return f if (os.path.exists(f) and os.path.getsize(f)>0) else None
+
+# Groq zero-shot: is a guitar / cello (held string instrument) in frame? -> "guitar"|"cello"|"none"
+def classify(jpg, key):
+    try:
+        b64 = base64.b64encode(open(jpg,"rb").read()).decode()
+    except Exception:
+        return "none"
+    prompt = ("Look at this webcam frame of a room. Is a person holding, playing, or about to "
+              "play a string instrument? Answer with EXACTLY one lowercase word:\n"
+              "- 'guitar' if a guitar (acoustic or electric) is present/held,\n"
+              "- 'cello' if a cello or similar large bowed string instrument is present/held,\n"
+              "- 'none' if there is no such instrument in the frame.\n"
+              "Output only the one word, no punctuation, no explanation.")
+    payload = {"model": MODEL, "temperature": 0.0, "max_tokens": 200, "messages": [
+        {"role":"user","content":[
+            {"type":"text","text":prompt},
+            {"type":"image_url","image_url":{"url":"data:image/jpeg;base64,%s"%b64}}]}]}
+    cmd = ["curl","-s","-m","30","https://api.groq.com/openai/v1/chat/completions",
+           "-H","Content-Type: application/json","-H","Authorization: Bearer %s"%key,
+           "-d", json.dumps(payload)]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True).stdout
+        data = json.loads(out)
+        r = data["choices"][0]["message"]["content"]
+        if "</think>" in r: r = r.split("</think>",1)[1]
+        return parse_label(r)
+    except Exception as e:
+        log("[warn] vision call failed: %s" % e)
+        return "error"
+
+def parse_label(raw):
+    r = (raw or "").strip().lower()
+    if "guitar" in r: return "guitar"
+    if "cello" in r or "violoncello" in r: return "cello"
+    if "none" in r or "no " in r or "empty" in r: return "none"
+    return "none"
+
+def piper_render(text, outwav):
+    try:
+        subprocess.run([PIPER,"-m",VOICE,"-f",outwav], input=text.encode(),
+            env=dict(os.environ, LD_LIBRARY_PATH=PIPERLIB),
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return os.path.exists(outwav) and os.path.getsize(outwav)>0
+    except Exception: return False
+
+def bose_id():
+    try:
+        import re
+        out = subprocess.run(["wpctl","status"],capture_output=True,timeout=5).stdout.decode("utf-8","ignore")
+        in_sinks=False
+        for ln in out.splitlines():
+            if "Sinks:" in ln: in_sinks=True; continue
+            if "Sources:" in ln or "endpoints" in ln: in_sinks=False
+            if in_sinks and ("bose" in ln.lower() or "soundlink" in ln.lower()):
+                m=re.search(r'(\d+)\.', ln)
+                if m: return m.group(1)
+    except Exception: pass
+    return None
+
+def say(text):
+    os.makedirs(os.path.dirname(STARTWAV), exist_ok=True)
+    if not (os.path.exists(STARTWAV) and os.path.getsize(STARTWAV)>0):
+        piper_render(text, STARTWAV)
+    if not os.path.exists(STARTWAV): return
+    try: open(MUTE,"w").close()          # tell the overhear listener "that's me"
+    except Exception: pass
+    bid = bose_id()
+    if bid:
+        try: subprocess.run(["wpctl","set-default",bid],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=5)
+        except Exception: pass
+        subprocess.run(["pw-play","--target",bid,STARTWAV],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+    else:
+        subprocess.run(["pw-play",STARTWAV],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+    try: time.sleep(0.2); os.remove(MUTE)
+    except Exception: pass
+
+def tuner_running():
+    try:
+        pid = int(open(PIDFILE).read().strip())
+        os.killpg(pid, 0); return pid
+    except Exception:
+        return None
+
+def start_tuner():
+    if tuner_running(): return
+    say("Запускаю тюнер")
+    p = subprocess.Popen(["mesh-tuner","--loop"], stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+    try:
+        with open(PIDFILE,"w") as f: f.write(str(p.pid))
+    except Exception: pass
+    log("[on] instrument in frame → tuner started (pid %d)" % p.pid)
+
+def stop_tuner():
+    pid = tuner_running()
+    if pid:
+        try: os.killpg(pid, 15)
+        except Exception: pass
+        log("[off] instrument left frame → tuner stopped (pid %d)" % pid)
+    try: os.remove(PIDFILE)
+    except Exception: pass
+
+def mode_once(key):
+    jpg = capture()
+    if not jpg: print("none (no-frame)"); return 2
+    label = classify(jpg, key) if key else "none"
+    try: os.remove(jpg)
+    except Exception: pass
+    print(label); return 0
+
+def mode_loop(key):
+    log("[start] watching %s every %ss (on=%d off=%d frames)" % (CAM, POLL, NEED_ON, NEED_OFF))
+    on=0; off=0; active=False
+    while True:
+        jpg = capture()
+        label = classify(jpg, key) if (jpg and key) else "none"
+        if jpg:
+            try: os.remove(jpg)
+            except Exception: pass
+        present = label in ("guitar","cello")
+        if present: on+=1; off=0
+        elif label=="none": off+=1; on=0
+        # 'error' frames neither confirm nor deny — hold state
+        if not active and on>=NEED_ON:
+            start_tuner(); active=True; on=0
+        elif active and off>=NEED_OFF:
+            stop_tuner(); active=False; off=0
+        time.sleep(POLL)
+
+def mode_test():
+    ok=True
+    cases=[("guitar","guitar"),("  Guitar.","guitar"),("cello","cello"),
+           ("a cello is held","cello"),("none","none"),("There is no instrument","none"),
+           ("<think>hmm</think> guitar","guitar")]
+    for raw,exp in cases:
+        # strip think like the live path does
+        r = raw.split("</think>",1)[1] if "</think>" in raw else raw
+        got=parse_label(r); good=(got==exp)
+        print("  %-28s → %-7s %s" % (repr(raw), got, "ok" if good else "FAIL")); ok=ok and good
+    # hysteresis state machine: 2 guitar frames start, 3 none frames stop
+    seq=["none","guitar","guitar","none","none","none","guitar"]
+    on=0; off=0; active=False; events=[]
+    for lbl in seq:
+        present=lbl in ("guitar","cello")
+        if present: on+=1; off=0
+        elif lbl=="none": off+=1; on=0
+        if not active and on>=2: events.append("START"); active=True; on=0
+        elif active and off>=3: events.append("STOP"); active=False; off=0
+    exp_ev=["START","STOP"]
+    hok=(events==exp_ev); print("  hysteresis %-18s → %s %s" % (seq, events, "ok" if hok else "FAIL")); ok=ok and hok
+    print("smoke-test: %s" % ("ok (parse + state machine sound)" if ok else "FAIL")); return 0 if ok else 1
+
+mode = sys.argv[1] if len(sys.argv)>1 else "once"
+if mode=="test": sys.exit(mode_test())
+key = groq_key()
+if not key and mode in ("once","loop"):
+    print("mesh-tuner-eye: no Groq key in %s" % GROQ_ENV, file=sys.stderr); sys.exit(1)
+if   mode=="loop": sys.exit(mode_loop(key) or 0)
+elif mode=="once": sys.exit(mode_once(key))
+else: print("unknown mode: %s"%mode, file=sys.stderr); sys.exit(2)
+PYEOF
+
+case "${1:-}" in
+  --loop)
+    consent_camera_ok || { echo "mesh-tuner-eye: REFUSED — camera consent not granted in $CONSENT" >&2; exit 3; }
+    exec python3 "$PY" loop ;;
+  --once|--detect)
+    consent_camera_ok || { echo "mesh-tuner-eye: REFUSED — camera consent not granted in $CONSENT" >&2; exit 3; }
+    python3 "$PY" once ;;
+  --test)
+    command -v python3 >/dev/null || { echo "smoke-test: n/a (no python3)"; exit 2; }
+    python3 "$PY" test ;;
+  *) sed -n '2,18p' "$0" ;;
+esac
