@@ -242,7 +242,24 @@ rest and the full contracts.
 - **Organs / actuators:** `mesh-organ` (capability router) · `mesh-tv-dlna`(+`mesh-url-watch`) · `mesh-sms` · `mesh-phone-ip`/`mesh-phone-watch`/`phone-setup`/`mesh-phone-ear`/`mesh-phone-sensors`/`mesh-phone-convo` · `mesh-sensor-log`.
 - **On-demand / audit:** `mesh-tools` · `mesh-digest` · `mesh-since` · `mesh-morning` · `mesh-novelty` · `mesh-review` · `mesh-study` · `mesh-claude-check` · `mesh-pyparse` · `mesh-chaos`(+`-doctor`/`-verify`) · `mesh-knowledge-sync` · `mesh-queue-tend` · `mesh-homeostasis` · `mesh-attach` · `mesh-guardian` · `mesh-neighbour-watch` · `mesh-fleet-health`/`mesh-fleet-states` · `mesh-plan` · `mesh-browse`/`mesh-breath`/`mesh-eye`/`mesh-hear`/`mesh-ear`/`mesh-transcribe`(+`-organ`) · `mesh-exit` · `mesh-anchor-map` · `mesh-acoustic-range` · `mesh-steward-deadman`.
 
-Node-specific units (deploy where relevant): `mesh-card-watchdog`/`mtg-watchdog`/`bore-mtg` (`.{sh,service,timer}`), `mesh-cam-watch.service`, `node-join-android.sh`, `test-*`. Decayed tools (mesh-health-watch, mesh-tg-recv, mesh-zone, vpn-hub.py, mesh-onboard, mesh-board-timerepair) live in git history — the attic.
+## On-demand canon (intentionally unwired — NOT orphans)
+
+These are invoked manually, by node-specific install, or as test harnesses — deliberately NOT
+wired into cron/systemd/supervise. `mesh-doctor`'s orphan check reads THIS section and skips
+anything matching (glob/brace patterns are expanded; bare `backticked` names match literally), so
+the orphan WARN keeps meaning "a tool built to be wired but isn't" instead of drowning in intended
+unwired tools. Add a tool here (or give it a `# orphan-ok: <why>` header) when it is on-demand by
+design. Keep entries CONSERVATIVE — only list a tool you can affirmatively classify as intentional;
+when unsure, leave it flagged so a genuinely dead-on-arrival orphan stays visible.
+
+- **Test harnesses:** `test-*`
+- **Node-specific units (deploy where relevant):** `mesh-card-watchdog.{sh,service,timer}` ·
+  `mtg-watchdog.{sh,service,timer}` · `bore-mtg.{sh,service,timer}` · `mesh-cam-watch.*` ·
+  `mesh-tuner-eye.*` · `node-join-android.sh`
+- **Operator instruments (music + mic, played on demand):** `mesh-drone` · `mesh-metronome` ·
+  `mesh-looper` · `mesh-oscilloscope` · `mesh-mic-correlate` · `mesh-mic-crossvalidate`
+
+Decayed tools (mesh-health-watch, mesh-tg-recv, mesh-zone, vpn-hub.py, mesh-onboard, mesh-board-timerepair) live in git history — the attic.
 
 ## Capabilities (self-declared, opt-in by consumers)
 
