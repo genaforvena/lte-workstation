@@ -1,0 +1,207 @@
+#!/usr/bin/env bash
+# mesh-sensor-tape — the timestamped, aligned sensor dataset (the "machine dataset").
+#
+# WHY: the rich categorical sense streams (home-state, room-sense, activity-tempo, body-state, ...)
+# have ZERO per-line timestamps — only the numeric ones (presence) are stamped. Without per-line
+# time, cross-stream ALIGNMENT is impossible, which blocks BOTH correlation mining and prediction
+# (see ~/.mesh/knowledge/design-correlation-miner-2026-06-20.md). This tool fixes that at the
+# source: every run it samples each sense's LATEST emitted state on ONE clock and appends a single
+# tab-separated row — ts + one column per sense. One writer, one schema; the file IS the substrate
+# that mesh-correlate (next) reads.
+#
+# HONEST-FUSION (never fabricate a reading): a sense that is not giving a real current reading is
+# recorded with a token that says WHY, never a faked all-clear:
+#   NOLOG    — the sense has no log file at all
+#   STALE    — the log exists but its mtime is older than the freshness window (reflex stopped/slow)
+#   UNKNOWN  — the log is fresh but the last line carries no parseable state token (degraded read,
+#              e.g. "phone unreachable — can't read ambient light")
+# A real state token (ALLCAPS category, e.g. ACTIVE_SOCIAL / COVERED / SILENT) is recorded verbatim.
+#
+#   mesh-sensor-tape          sample now, append one row to the tape (create with header if new)
+#   mesh-sensor-tape --dry    print the row that WOULD be written to stdout; do not touch the tape
+#   mesh-sensor-tape --head   print the schema/header + last few rows
+#   mesh-sensor-tape --test   self-test (temp logs): extraction, stale-gate, dry-no-write, header-once
+#
+# reflex-cadence: */10 * * * *
+set -uo pipefail
+
+LOGDIR="${MESH_TAPE_LOGDIR:-$HOME/.mesh}"
+TAPE="${MESH_SENSOR_TAPE:-$HOME/.mesh/sensor-tape.tsv}"
+# A categorical state PERSISTS until it changes, and many senses edge-emit on a slow cadence
+# (household/room-sense/perimeter/ambient legitimately ~30-70min apart). So a short threshold would
+# mislabel a quiet-but-alive sense as STALE and throw away its still-current token. STALE must mean
+# "silent so long the reflex is almost certainly DEAD" — 6h catches a 19h-dead sense while preserving
+# slow edge-emitters. mesh-correlate weights STALE/UNKNOWN as their own categories regardless.
+STALE_SEC="${MESH_TAPE_STALE_SEC:-21600}"   # >6h since last write → STALE (reflex almost certainly dead)
+SCHEMA_VERSION="v1"
+
+# Column set: short stable name : log basename (in $LOGDIR, "<base>.log").
+# Stable ORDER — appended rows must keep matching the header. A schema change = a NEW tape decision
+# (rotate the file), never a silent column insert (would mis-align every consumer).
+SENSES="\
+home_state:home-state
+household:household-state
+room_sense:room-sense
+room_activity:room-activity
+tempo:activity-tempo
+body_state:body-state
+body_motion:body-motion
+body_power:body-power
+wifi:wifi-link
+light:light
+desk:desk-state
+situation:situation
+perimeter:perimeter
+social:social-context
+ambient:ambient-clock
+psi:psi
+presence:presence"
+
+now_epoch() { date +%s; }
+now_iso()   { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+# Extract the primary state token from one log line.
+# - strips a leading ISO-ts + host prefix if present (presence-style stamped lines)
+# - presence is special: bucket the numeric device count n=N into a category
+# - else: drop a leading [bracket], take the first ALLCAPS category word (>=3 chars, _ and - allowed);
+#   if none, fall back to the bracket's own suffix after '-' (e.g. [body-degraded] -> DEGRADED);
+#   if still nothing, UNKNOWN.
+extract_token() {
+  local sense="$1" line="$2" body rest tok br
+  # strip a leading "ISO_TS host " prefix (only stamped lines have it)
+  body="$(printf '%s' "$line" | sed -E 's/^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]+Z[[:space:]]+[^[:space:]]+[[:space:]]+//')"
+  if [ "$sense" = "presence" ]; then
+    local n
+    n="$(printf '%s' "$body" | grep -oE 'n=[0-9]+' | head -1 | grep -oE '[0-9]+')"
+    [ -n "$n" ] || { printf 'UNKNOWN'; return; }
+    if   [ "$n" -eq 0 ]; then printf 'NONE'
+    elif [ "$n" -le 3 ]; then printf 'FEW'
+    elif [ "$n" -le 8 ]; then printf 'SOME'
+    else                      printf 'MANY'
+    fi
+    return
+  fi
+  # drop a leading [bracket], then a leading "label:" / "host:" prefix (e.g.
+  # "[perimeter-notice] imozerov-IdeaPad-3-15IIL05: O=CALM" -> "O=CALM", "body-power: ok DISCHARGING"
+  # -> "ok DISCHARGING"). The label regex excludes '=' so it never eats a "KEY=VAL" state field.
+  # the label regex requires a lowercase letter so it strips host/labels (imozerov-IdeaPad:, body-power:)
+  # but NOT an ALLCAPS state that happens to be colon-suffixed (home-state's "ACTIVE_SOCIAL: desc").
+  rest="$(printf '%s' "$body" | sed -E 's/^\[[^]]*\][[:space:]]*//; s/^[A-Za-z0-9._-]*[a-z][A-Za-z0-9._-]*:[[:space:]]+//')"
+  tok="$(printf '%s' "$rest" | grep -oE '[A-Z][A-Z0-9_-]{1,}[A-Z0-9]' | head -1)"
+  if [ -n "$tok" ]; then printf '%s' "$tok"; return; fi
+  # fallback: bracket suffix after the last '-'  ([body-degraded] -> DEGRADED)
+  br="$(printf '%s' "$body" | grep -oE '^\[[^]]*\]' | tr -d '[]')"
+  if printf '%s' "$br" | grep -q '-'; then
+    printf '%s' "${br##*-}" | tr 'a-z' 'A-Z'; return
+  fi
+  printf 'UNKNOWN'
+}
+
+# Sample one sense -> token, applying the NOLOG/STALE freshness gate.
+sample_sense() {
+  local base="$1" lg="$LOGDIR/$1.log" mt age last
+  [ -f "$lg" ] || { printf 'NOLOG'; return; }
+  mt="$(stat -c %Y "$lg" 2>/dev/null || echo 0)"
+  age=$(( $(now_epoch) - mt ))
+  [ "$age" -gt "$STALE_SEC" ] && { printf 'STALE'; return; }
+  last="$(tail -1 "$lg" 2>/dev/null)"
+  [ -n "$last" ] && extract_token "$base" "$last" || printf 'UNKNOWN'
+}
+
+header_row() {
+  local out="ts" line name
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    name="${line%%:*}"
+    out="$out	$name"
+  done <<EOF
+$SENSES
+EOF
+  printf '%s' "$out"
+}
+
+build_row() {
+  local out name base line
+  out="$(now_iso)"
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    name="${line%%:*}"; base="${line#*:}"
+    out="$out	$(sample_sense "$base")"
+  done <<EOF
+$SENSES
+EOF
+  printf '%s' "$out"
+}
+
+write_row() {
+  local row; row="$(build_row)"
+  if [ ! -f "$TAPE" ]; then
+    mkdir -p "$(dirname "$TAPE")"
+    {
+      printf '# mesh-sensor-tape %s schema — TAB-separated; one row per sample.\n' "$SCHEMA_VERSION"
+      printf '# tokens: real state = ALLCAPS category; NOLOG/STALE/UNKNOWN = sense not giving a real current reading (honest-fusion).\n'
+      header_row; printf '\n'
+    } > "$TAPE"
+  fi
+  printf '%s\n' "$row" >> "$TAPE"
+}
+
+case "${1:-}" in
+  --dry)  build_row; printf '\n' ;;
+  --head)
+    [ -f "$TAPE" ] || { echo "mesh-sensor-tape: no tape yet ($TAPE)"; exit 0; }
+    grep '^#' "$TAPE"
+    grep -v '^#' "$TAPE" | head -1               # header row
+    echo "..."
+    grep -v '^#' "$TAPE" | tail -4               # recent rows
+    ;;
+  --test)
+    tmp="$(mktemp -d)" || { echo "smoke-test: FAIL (mktemp)"; exit 1; }
+    trap 'rm -rf "$tmp"' EXIT
+    ld="$tmp/logs"; mkdir -p "$ld"
+    # fresh logs with the real line shapes
+    printf '%s\n' '[home-state] ACTIVE_SOCIAL: home lively (multiple devices/people)' > "$ld/home-state.log"
+    printf '%s\n' '[body-degraded] unreachable: body-motion + tamper + light (phone offline)' > "$ld/body-state.log"
+    printf '%s\n' 'phone unreachable — can'\''t read ambient light (not an alarm)' > "$ld/light.log"
+    printf '%s\n' '2026-06-20T05:15:35Z imozerov-IdeaPad-3-15IIL05 n=9 devices=[-60|aa]' > "$ld/presence.log"
+    printf '%s\n' '[desk-state] NEAR-IMAC — RF disturbance near iMac' > "$ld/desk-state.log"
+    # a STALE log: exists but old mtime
+    printf '%s\n' '[room-sense] PRESENT occupancy=high' > "$ld/room-sense.log"
+    touch -d '2000-01-01' "$ld/room-sense.log"
+    fail=0
+    # extraction (extract_token is logdir-independent)
+    [ "$(extract_token home-state '[home-state] ACTIVE_SOCIAL: x')" = "ACTIVE_SOCIAL" ] || { echo "FAIL: home_state token"; fail=1; }
+    [ "$(extract_token body-state '[body-degraded] unreachable: x')" = "DEGRADED" ]               || { echo "FAIL: bracket-suffix fallback"; fail=1; }
+    [ "$(extract_token light 'phone unreachable — cannot read')" = "UNKNOWN" ]                    || { echo "FAIL: unparseable -> UNKNOWN"; fail=1; }
+    [ "$(extract_token presence '2026-06-20T05:15:35Z host n=9 devices=[]')" = "MANY" ]           || { echo "FAIL: presence bucket MANY"; fail=1; }
+    [ "$(extract_token presence '2026-06-20T05:15:35Z host n=0 devices=[]')" = "NONE" ]           || { echo "FAIL: presence bucket NONE"; fail=1; }
+    [ "$(extract_token presence '2026-06-20T05:15:35Z host n=2 devices=[]')" = "FEW" ]            || { echo "FAIL: presence bucket FEW"; fail=1; }
+    [ "$(extract_token desk-state '[desk-state] NEAR-IMAC — x')" = "NEAR-IMAC" ]                  || { echo "FAIL: hyphen token"; fail=1; }
+    [ "$(extract_token perimeter '[perimeter-notice] imozerov-IdeaPad-3-15IIL05: O=CALM N=UNRE')" = "CALM" ] || { echo "FAIL: host-label strip (perimeter)"; fail=1; }
+    [ "$(extract_token body-power 'body-power: ok 85% DISCHARGING')" = "DISCHARGING" ]            || { echo "FAIL: label strip (body-power)"; fail=1; }
+    # stale gate + nolog — sample_sense reads the global $LOGDIR (frozen at script start), so point
+    # it at the temp logs directly (an env-prefix on a function would NOT re-evaluate that global).
+    LOGDIR="$ld"
+    [ "$(sample_sense room-sense)" = "STALE" ]        || { echo "FAIL: stale-gate"; fail=1; }
+    [ "$(sample_sense does-not-exist)" = "NOLOG" ]    || { echo "FAIL: nolog"; fail=1; }
+    [ "$(sample_sense home-state)" = "ACTIVE_SOCIAL" ] || { echo "FAIL: fresh sample"; fail=1; }
+    # --dry must not create the tape
+    tp="$tmp/tape.tsv"
+    MESH_TAPE_LOGDIR="$ld" MESH_SENSOR_TAPE="$tp" "$0" --dry >/dev/null
+    [ ! -f "$tp" ] || { echo "FAIL: --dry wrote the tape"; fail=1; }
+    # real write creates header once; second write does NOT duplicate header
+    MESH_TAPE_LOGDIR="$ld" MESH_SENSOR_TAPE="$tp" "$0" >/dev/null
+    MESH_TAPE_LOGDIR="$ld" MESH_SENSOR_TAPE="$tp" "$0" >/dev/null
+    hdrs=$(grep -c '^ts	' "$tp")
+    [ "$hdrs" -eq 1 ] || { echo "FAIL: header written $hdrs times (want 1)"; fail=1; }
+    rows=$(grep -vc '^#' "$tp"); rows=$((rows - 1))   # minus the header row
+    [ "$rows" -eq 2 ] || { echo "FAIL: expected 2 data rows, got $rows"; fail=1; }
+    # column count: header cols == data cols
+    hc=$(head -3 "$tp" | grep '^ts	' | awk -F'\t' '{print NF}')
+    dc=$(grep -v '^#' "$tp" | tail -1 | awk -F'\t' '{print NF}')
+    [ "$hc" = "$dc" ] || { echo "FAIL: header cols $hc != data cols $dc"; fail=1; }
+    [ "$fail" -eq 0 ] && echo "smoke-test: ok (extraction + stale/nolog gate + dry-no-write + header-once + col-align)" || { echo "smoke-test: FAIL"; exit 1; }
+    ;;
+  ""|--append) write_row ;;
+  *) echo "usage: mesh-sensor-tape [--dry|--head|--test]" >&2; exit 1 ;;
+esac
