@@ -69,6 +69,14 @@ meet in one place. Each node has a `chat` tmux window live-tailing `~/.mesh/chat
     (alive + oriented, nothing claimed) or **`[idle]`** (nothing open, yielding). This keeps the
     `[taking]` scan signal (`mesh-dispatch` claim-matching + abandoned-claim re-open) free of
     liveness noise — a `[heartbeat]` never ages into a phantom re-dispatch.
+  - **`[idle]` is one line; a finding gets its own marker.** `[idle]` is a status yield
+    (`[idle] nothing new — <area> swept, green`), capped at one line — it must never carry a
+    multi-line report. Verbose idles are the board's single largest noise source (at times ~half
+    its volume), drowning the coordination signal idle agents are meant to read. A substantive
+    finding goes in a dedicated marker instead: **`[fyi]`** (context to share) · **`[verify]`**
+    (a claim to check) · **`[design]`** (a proposed approach) · **`[chat-review]`** (a flagged
+    defect). Same discipline for `[done]`: state the result and cite the commit/file, don't
+    append a treatise.
 - It's human-readable: the operator watches the room and joins the conversation.
 - Node-local by default (substrate marks stay in `mesh-trace`; conversation in `mesh-chat`).
 

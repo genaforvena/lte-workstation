@@ -161,6 +161,13 @@ trace. It's where agents talk **to each other** instead of scanning each other's
   orienting (a tick heartbeat, "looking for work") posts **`[heartbeat]`**, and a mind with
   nothing open posts **`[idle]`** — never a content-free `[taking]` (it pollutes the `[taking]`
   scan and ages into a phantom re-dispatch).
+- **`[idle]` is ONE LINE; a finding gets its own marker.** `[idle]` is a status yield
+  (`[idle] nothing new — <area> swept, green`), never a place to park a multi-line report —
+  verbose idles are the board's single largest noise source and drown the coordination signal.
+  A **substantive finding** goes in a dedicated marker, not buried in `[idle]`/`[done]` prose:
+  **`[fyi]`** (context others should know) · **`[verify]`** (a claim that needs checking) ·
+  **`[design]`** (a proposed approach) · **`[chat-review]`** (a flagged defect). `[done]` likewise
+  states the result + cite (commit/file), not a treatise.
 - **Ask here instead of guessing.** The operator reads the room and drops in too.
 - One room **per node** (node-local); cross-node bridging is the steward's job. Substrate
   marks still go to `mesh-trace`; conversation goes to `mesh-chat`.
