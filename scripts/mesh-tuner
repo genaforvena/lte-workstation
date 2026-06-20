@@ -1,0 +1,257 @@
+#!/usr/bin/env bash
+# mesh-tuner — instrument tuner REFLEX. Listens to the room mic, detects the pitch of a played
+# note (guitar / cello / any monophonic instrument), finds the NEAREST chromatic note and how many
+# cents off it is, and SAYS it on the Bose: "<нота> выше / ниже / чисто". Pure local DSP (numpy YIN
+# pitch detection) — NO speech recognition, NO cloud — so it is fast enough to be a real tuner.
+# Operator 2026-06-20: "тюнер чисто на рефлексе … какую ноту определил и выше/ниже".
+#
+# Runs on the node with the mic + Bose (default-string). Reuses the piper voice + Bose-sink
+# targeting that mesh-overhear uses, so the voice comes out the Bose like everything else.
+#
+#   mesh-tuner --loop      continuous tuner: keep listening, announce note + выше/ниже as you tune
+#   mesh-tuner --once      one capture → detect → say once (and print the reading)
+#   mesh-tuner --detect    print freq/note/cents only, no audio out — for tuning TUNER_RMS / debug
+#   mesh-tuner --render    (re)render the spoken note/direction phrase cache (idempotent)
+#   mesh-tuner --test      synthetic-sine self-test (no mic, no Bose) — verifies the pitch math
+#
+# Tunables (env): TUNER_RMS=350 (s16 RMS gate below which a frame is "silence") · TUNER_WIN=0.45
+#   (capture seconds per reading) · TUNER_GAP=1.0 (min seconds between spoken readings) ·
+#   TUNER_IN_CENTS=6 ("чисто" band) · TUNER_NEAR_CENTS=22 ("чуть выше/ниже" band).
+#   Piper: OH_PIPER / OH_PIPERLIB / OH_VOICE (default the ruslan voice, same as mesh-overhear).
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"   # pipewire mic + Bose sink
+MESH="${MESH_DIR:-$HOME/.mesh}"
+export OH_PIPER="${OH_PIPER:-$MESH/piper/piper/piper}"
+export OH_PIPERLIB="${OH_PIPERLIB:-$MESH/piper/piper}"
+export OH_VOICE="${OH_VOICE:-$MESH/piper/voices/ruslan.onnx}"
+export TUNER_VOICE_DIR="${TUNER_VOICE_DIR:-$MESH/tuner-voice}"
+export MUTE_FLAG="${MUTE_FLAG:-$MESH/mesh-speaking}"
+export TUNER_RMS="${TUNER_RMS:-350}"
+export TUNER_WIN="${TUNER_WIN:-0.45}"
+export TUNER_GAP="${TUNER_GAP:-1.0}"
+export TUNER_IN_CENTS="${TUNER_IN_CENTS:-6}"
+export TUNER_NEAR_CENTS="${TUNER_NEAR_CENTS:-22}"
+
+PY="$(mktemp /tmp/tuner-XXXXXX.py)"; trap 'rm -f "$PY"' EXIT
+cat > "$PY" <<'PYEOF'
+import os, sys, time, math, subprocess
+import numpy as np
+
+RATE       = 16000
+WIN        = float(os.environ.get("TUNER_WIN","0.45"))
+RMS_GATE   = float(os.environ.get("TUNER_RMS","350"))
+GAP        = float(os.environ.get("TUNER_GAP","1.0"))
+IN_CENTS   = float(os.environ.get("TUNER_IN_CENTS","6"))
+NEAR_CENTS = float(os.environ.get("TUNER_NEAR_CENTS","22"))
+FMIN, FMAX = 60.0, 1200.0          # cello C2≈65, guitar E2≈82 … up past violin/guitar top range
+PIPER   = os.environ["OH_PIPER"]; PIPERLIB = os.environ["OH_PIPERLIB"]; VOICE = os.environ["OH_VOICE"]
+VOICEDIR= os.environ["TUNER_VOICE_DIR"]; MUTE = os.environ["MUTE_FLAG"]
+
+# Russian solfège names, index = MIDI note number mod 12 (0 = до/C)
+NAMES = ["до","до-диез","ре","ре-диез","ми","фа","фа-диез","соль","соль-диез","ля","ля-диез","си"]
+
+# ---------- audio capture (raw s16 mono PCM from the mic, same stream mesh-overhear uses) ----------
+def capture(dur=WIN):
+    n = int(dur*RATE); need = n*2
+    p = subprocess.Popen(["pw-record","--rate","16000","--channels","1","--format","s16","-"],
+                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    buf = b""
+    try:
+        while len(buf) < need:
+            chunk = p.stdout.read(need-len(buf))
+            if not chunk: break
+            buf += chunk
+    finally:
+        try: p.terminate(); p.wait(timeout=1)
+        except Exception:
+            try: p.kill()
+            except Exception: pass
+    if len(buf) < need//2: return None
+    return np.frombuffer(buf[:len(buf)-(len(buf)%2)], dtype="<i2").astype(np.float64)
+
+# ---------- YIN pitch detection: returns (freq, midi_float) or None ----------
+def detect_pitch(x):
+    if x is None or len(x) < 2048: return None
+    rms = float(np.sqrt(np.mean(x*x)))
+    if rms < RMS_GATE: return ("quiet", rms)
+    x = x - np.mean(x)
+    N = len(x)
+    tau_max = min(int(RATE/FMIN), N//2)
+    tau_min = max(2, int(RATE/FMAX))
+    # difference function d(tau) = sum (x[j]-x[j+tau])^2
+    d = np.zeros(tau_max+1)
+    for tau in range(1, tau_max+1):
+        diff = x[:N-tau] - x[tau:N]
+        d[tau] = float(np.dot(diff, diff))
+    # cumulative mean normalised difference (CMND)
+    cmnd = np.ones(tau_max+1); running = 0.0
+    for tau in range(1, tau_max+1):
+        running += d[tau]
+        cmnd[tau] = d[tau]*tau/running if running > 0 else 1.0
+    # first dip below the absolute threshold, walked to its local minimum
+    thr = 0.12; tau = -1; t = tau_min
+    while t <= tau_max:
+        if cmnd[t] < thr:
+            while t+1 <= tau_max and cmnd[t+1] < cmnd[t]: t += 1
+            tau = t; break
+        t += 1
+    if tau == -1:
+        seg = cmnd[tau_min:tau_max+1]
+        tau = tau_min + int(np.argmin(seg))
+        if cmnd[tau] > 0.55: return ("noisy", rms)      # no confident periodicity
+    # parabolic interpolation around the dip for sub-sample period
+    if 1 <= tau < tau_max:
+        a,b,c = cmnd[tau-1], cmnd[tau], cmnd[tau+1]
+        denom = a + c - 2*b
+        shift = 0.5*(a-c)/denom if denom != 0 else 0.0
+    else:
+        shift = 0.0
+    period = tau + shift
+    if period <= 0: return ("noisy", rms)
+    freq = RATE/period
+    if freq < FMIN or freq > FMAX: return ("noisy", rms)
+    midi = 69 + 12*math.log2(freq/440.0)
+    return ("note", rms, freq, midi)
+
+def note_of(midi):
+    nearest = int(round(midi))
+    cents   = (midi - nearest)*100.0
+    return NAMES[nearest % 12], cents, nearest
+
+# ---------- voice: pre-rendered phrase cache, played on the Bose ----------
+def bose_id():
+    try:
+        out = subprocess.run(["wpctl","status"],capture_output=True,timeout=5).stdout.decode("utf-8","ignore")
+        in_sinks = False
+        import re
+        for ln in out.splitlines():
+            if "Sinks:" in ln: in_sinks=True; continue
+            if "Sources:" in ln or "endpoints" in ln: in_sinks=False
+            if in_sinks and ("bose" in ln.lower() or "soundlink" in ln.lower()):
+                m=re.search(r'(\d+)\.', ln)
+                if m: return m.group(1)
+    except Exception: pass
+    return None
+
+def pwplay(wav):
+    bid = bose_id()
+    if bid:
+        try: subprocess.run(["wpctl","set-default",bid],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=5)
+        except Exception: pass
+        subprocess.run(["pw-play","--target",bid,wav],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+    else:
+        subprocess.run(["pw-play",wav],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+
+def piper_render(text, outwav):
+    subprocess.run([PIPER,"-m",VOICE,"-f",outwav],input=text.encode(),
+        env=dict(os.environ,LD_LIBRARY_PATH=PIPERLIB),
+        stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+    return os.path.exists(outwav) and os.path.getsize(outwav) > 0
+
+PHRASES = {**{"n%d"%i: NAMES[i] for i in range(12)},
+           "in":"чисто", "up":"выше", "down":"ниже", "up_a":"чуть выше", "down_a":"чуть ниже"}
+
+def render_cache(force=False):
+    os.makedirs(VOICEDIR, exist_ok=True); ok=0; total=0
+    for key,text in PHRASES.items():
+        total += 1
+        path=os.path.join(VOICEDIR, key+".wav")
+        if force or not (os.path.exists(path) and os.path.getsize(path)>0):
+            if piper_render(text, path): ok+=1
+        else: ok+=1
+    return ok, total
+
+def ensure_cache():
+    if not all(os.path.exists(os.path.join(VOICEDIR,k+".wav")) for k in PHRASES):
+        render_cache()
+
+def say_reading(nearest, cents):
+    ensure_cache()
+    parts=[os.path.join(VOICEDIR,"n%d.wav"%(nearest%12))]
+    ac=abs(cents)
+    if ac <= IN_CENTS:      parts.append(os.path.join(VOICEDIR,"in.wav"))
+    elif cents < 0:         parts.append(os.path.join(VOICEDIR,("up_a" if ac<=NEAR_CENTS else "up")+".wav"))
+    else:                   parts.append(os.path.join(VOICEDIR,("down_a" if ac<=NEAR_CENTS else "down")+".wav"))
+    try: open(MUTE,"w").close()          # tell the overhear listener "that's me" — don't self-transcribe
+    except Exception: pass
+    for w in parts:
+        if os.path.exists(w): pwplay(w)
+    try:
+        time.sleep(0.2); os.remove(MUTE)
+    except Exception: pass
+
+def fmt(nearest, cents):
+    name=NAMES[nearest%12]; octv=nearest//12 - 1
+    arrow = "чисто" if abs(cents)<=IN_CENTS else ("выше ↑" if cents<0 else "ниже ↓")
+    return "%s%d  %+.0f cents  → %s" % (name, octv, cents, arrow)
+
+# ---------- modes ----------
+def mode_detect(say=False):
+    r = detect_pitch(capture())
+    if not r or r[0] != "note":
+        print("(%s)" % (r[0] if r else "no-audio")); return 2
+    _, rms, freq, midi = r
+    name, cents, nearest = note_of(midi)
+    print("%.1f Hz  rms=%.0f  %s" % (freq, rms, fmt(nearest, cents)))
+    if say: say_reading(nearest, cents)
+    return 0
+
+def mode_loop():
+    print("tuner: play a note (Ctrl-C to stop)", flush=True)
+    last_key=None; last_t=0.0
+    while True:
+        r = detect_pitch(capture())
+        if not r or r[0] != "note":
+            last_key=None            # silence resets, so the next note always re-announces
+            time.sleep(0.03); continue
+        _, rms, freq, midi = r
+        name, cents, nearest = note_of(midi)
+        ac=abs(cents)
+        if ac <= IN_CENTS:           key=(nearest,"in")
+        else:                        key=(nearest, "up" if cents<0 else "down", "a" if ac<=NEAR_CENTS else "b")
+        now=time.time()
+        print("\r%-34s" % fmt(nearest,cents), end="", flush=True)
+        if key != last_key and now-last_t >= GAP:
+            say_reading(nearest, cents); last_key=key; last_t=now
+        time.sleep(0.03)
+
+def mode_test():
+    def synth(freq, secs=0.45, amp=6000):
+        t=np.arange(int(secs*RATE))/RATE
+        # fundamental + a couple of harmonics, like a real string
+        return amp*(np.sin(2*math.pi*freq*t)+0.4*np.sin(4*math.pi*freq*t)+0.2*np.sin(6*math.pi*freq*t))
+    cases=[("ля (A4)",440.0,9),("ля (A3)",220.0,9),("ми (E2 guitar)",82.41,4),
+           ("до (C2 cello)",65.41,0),("ре (D3)",146.83,2)]
+    ok=True
+    for label,f,exp_idx in cases:
+        r=detect_pitch(synth(f))
+        if not r or r[0]!="note": print("  %-18s FAIL (%s)"%(label, r[0] if r else "none")); ok=False; continue
+        name,cents,nearest=note_of(r[3])
+        good = (nearest%12==exp_idx) and abs(cents)<15
+        print("  %-18s → %-9s %+.1f cents  %s"%(label, NAMES[nearest%12], cents, "ok" if good else "FAIL"))
+        ok = ok and good
+    # a silent buffer must read as quiet, not hallucinate a note
+    q=detect_pitch(np.zeros(int(0.45*RATE)))
+    qok = (q is not None and q[0]=="quiet"); print("  silence            → %s  %s"%(q[0] if q else "none","ok" if qok else "FAIL"))
+    print("smoke-test: %s"%("ok (pitch math sound)" if (ok and qok) else "FAIL")); return 0 if (ok and qok) else 1
+
+mode = sys.argv[1] if len(sys.argv)>1 else "detect"
+if   mode=="loop":    sys.exit(mode_loop() or 0)
+elif mode=="once":    sys.exit(mode_detect(say=True))
+elif mode=="detect":  sys.exit(mode_detect(say=False))
+elif mode=="render":  ok,total=render_cache(force=True); print("rendered %d/%d phrases → %s"%(ok,total,VOICEDIR)); sys.exit(0 if ok==total else 1)
+elif mode=="test":    sys.exit(mode_test())
+else: print("unknown mode: %s"%mode); sys.exit(2)
+PYEOF
+
+case "${1:-}" in
+  --loop)    exec python3 "$PY" loop ;;
+  --once)    python3 "$PY" once ;;
+  --detect)  python3 "$PY" detect ;;
+  --render)  python3 "$PY" render ;;
+  --test)
+    command -v python3 >/dev/null && python3 -c 'import numpy' 2>/dev/null || { echo "smoke-test: n/a (no numpy)"; exit 2; }
+    python3 "$PY" test ;;
+  *) sed -n '2,16p' "$0" ;;
+esac
