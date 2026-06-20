@@ -1,0 +1,326 @@
+#!/usr/bin/env python3
+# mesh-zonemap — coarse apartment ZONE-map by multi-anchor BLE RSSI (room-level, NOT CSI pose).
+#
+# The room mind's SPATIAL sense. Several physically-separated anchors each BLE-scan the apartment
+# on ONE clock; a device's zone = the anchor that hears it strongest (argmax RSSI). With the anchors
+# spread across rooms, "strong at ds, absent at IdeaPad" = "device is in the ds zone" — a real,
+# verifiable coarse fact. Honest ceiling: RSSI ±3-5 dB ⇒ ROOM-scale zones (4-6 m), NOT metre/CSI
+# precision (we have no CSI-capable chipsets — stated plainly, never faked).
+#
+# Continues the co-oscillation work (mesh-cooscillate: co-moving RSSI = co-located devices) — same
+# BLE-RSSI substrate, now read from MULTIPLE vantages so we get WHERE, not just WHO-with-WHOM.
+#
+# Anchors (live status probed every run; a dark anchor is reported UNKNOWN and EXCLUDED from the
+# argmax — never silently treated as "device not there"):
+#   - ble-local : this node's own BLE scan via `mesh-presence`            (no SSH)
+#   - ble-ssh   : a peer node's BLE scan via `ssh <target> mesh-presence` (e.g. the room node ds)
+#   - imac-link : iMac's own airport link-RSSI via `mesh-imac-wifi`  — MOTION-only vantage, NOT a
+#                 device locator (it only sees the iMac's own link to the AP); reported separately.
+#   - router    : per-CLIENT RSSI via `mesh-router-presence` (iwinfo assoclist) — auto-included the
+#                 instant the router is SSH-reachable; today it is Tailscale-offline + no LAN key.
+#
+# Anchor list comes from ~/.mesh/zonemap-anchors (optional, node-local); built-in default below.
+# Each anchor line:  <zone-label>  <kind>  <target>     (zone-label lets you name rooms.)
+#
+#   mesh-zonemap            one-clock sample → coarse zone per device + live/dark anchor honesty
+#   mesh-zonemap --json     machine-readable
+#   mesh-zonemap --dry      anchor LIVENESS only (fast, no BLE scan) — what it WOULD sample
+#   mesh-zonemap --win N    BLE scan window seconds (default 8)
+#   mesh-zonemap --test     synthetic self-test (no I/O: argmax/dark-exclusion/single-anchor logic)
+#
+# Exit: 0 = a real sample (>=1 live anchor); 2 = no live anchor (honest total blackout, not "empty").
+# STAGE A (this file): sampler + zone attribution + honesty. STAGE B (next): DATA-pane --watch +
+# # reflex-cadence (deferred until this is live-verified non-spammy).
+import os, sys, time, json, subprocess, threading
+
+MESH = os.path.expanduser("~/.mesh")
+ANCHOR_CFG = os.path.join(MESH, "zonemap-anchors")
+WIN = 8
+
+# Proximity buckets (match mesh-presence so the vocab is one contract — see cross-sense-vocab-contract)
+def proximity(rssi):
+    if rssi is None: return "UNKNOWN"
+    if rssi >= -55: return "IMMEDIATE"
+    if rssi >= -70: return "NEAR"
+    if rssi >= -85: return "ROOM"
+    return "FAR"
+
+# Built-in default anchors — works out of the box; override per-node in ~/.mesh/zonemap-anchors.
+DEFAULT_ANCHORS = [
+    ("study", "ble-local", "-"),                       # this node (IdeaPad)
+    ("room",  "ble-ssh",   "imozerov@100.125.157.75"), # ds — the room mic+Bose node
+    ("imac",  "imac-link", "-"),                       # iMac airport — MOTION vantage only
+    ("router","router",    "-"),                       # GL-MT3000 per-client RSSI (auto when reachable)
+]
+
+def load_anchors():
+    if not os.path.exists(ANCHOR_CFG):
+        return list(DEFAULT_ANCHORS)
+    out = []
+    try:
+        with open(ANCHOR_CFG) as f:
+            for ln in f:
+                ln = ln.strip()
+                if not ln or ln.startswith("#"): continue
+                parts = ln.split()
+                if len(parts) >= 2:
+                    label, kind = parts[0], parts[1]
+                    target = parts[2] if len(parts) >= 3 else "-"
+                    out.append((label, kind, target))
+    except Exception:
+        return list(DEFAULT_ANCHORS)
+    return out or list(DEFAULT_ANCHORS)
+
+def _run(cmd, timeout):
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout, p.stderr
+    except Exception as e:
+        return 124, "", str(e)
+
+def parse_presence(stdout):
+    """mesh-presence emits 'rssi|mac|name' lines (header/--- /inventory ignored). → {mac:(rssi,name)}"""
+    devs = {}
+    for ln in (stdout or "").splitlines():
+        ln = ln.strip()
+        if not ln or ln.startswith("===") or ln == "---" or ln.startswith("inventory"):
+            continue
+        parts = ln.split("|")
+        if len(parts) < 2: continue
+        try:
+            rssi = int(parts[0])
+        except ValueError:
+            continue
+        mac = parts[1].strip()
+        name = parts[2].strip() if len(parts) >= 3 and parts[2].strip() not in ("", "?") else ""
+        if mac:
+            devs[mac] = (rssi, name)
+    return devs
+
+# ---- per-kind anchor samplers; each returns dict(status=..., devices={mac:(rssi,name)}, note=...) ----
+def sample_ble_local(target, win):
+    rc, out, err = _run(["mesh-presence", str(win)], timeout=win + 18)
+    if rc == 2:  # mesh-presence: BT adapter not powered / unreachable
+        return {"status": "dark", "devices": {}, "note": "BT unreachable"}
+    if rc not in (0,):
+        return {"status": "dark", "devices": {}, "note": (err or "scan failed").strip()[:60]}
+    return {"status": "live", "devices": parse_presence(out), "note": ""}
+
+def sample_ble_ssh(target, win):
+    cmd = ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=6", target,
+           "bash -lc 'mesh-presence %d 2>/dev/null'" % win]
+    rc, out, err = _run(cmd, timeout=win + 24)
+    devs = parse_presence(out)
+    if rc != 0 and not devs:
+        return {"status": "dark", "devices": {}, "note": ("unreachable: " + (err or "").strip())[:60]}
+    return {"status": "live", "devices": devs, "note": ""}
+
+def sample_imac_link(target, win):
+    # MOTION-only vantage: iMac's own link RSSI + swing. NOT a device locator → never enters argmax.
+    rc, out, err = _run(["mesh-imac-wifi", "--json"], timeout=20)
+    if rc != 0:
+        return {"status": "dark", "devices": {}, "note": "iMac unreachable", "motion": None}
+    try:
+        d = json.loads(out)
+        return {"status": "live", "devices": {}, "note": "",
+                "motion": {"label": d.get("label"), "rssi": d.get("rssi"), "swing": d.get("swing")}}
+    except Exception:
+        return {"status": "dark", "devices": {}, "note": "iMac parse failed", "motion": None}
+
+def sample_router(target, win):
+    rc, out, err = _run(["mesh-router-presence", "--json"], timeout=20)
+    if rc != 0 or not out.strip():
+        return {"status": "dark", "devices": {}, "note": "router SSH unreachable (offline/no-key)"}
+    try:
+        arr = json.loads(out)
+    except Exception:
+        return {"status": "dark", "devices": {}, "note": "router parse failed"}
+    devs = {}
+    for c in arr:
+        mac = (c.get("mac") or "").strip()
+        try:
+            rssi = int(c.get("rssi_dbm"))
+        except (TypeError, ValueError):
+            continue
+        if mac:
+            devs[mac] = (rssi, (c.get("hostname") or "").strip())
+    return {"status": "live", "devices": devs, "note": ""}
+
+SAMPLERS = {"ble-local": sample_ble_local, "ble-ssh": sample_ble_ssh,
+            "imac-link": sample_imac_link, "router": sample_router}
+
+def sample_all(anchors, win):
+    """Fire every anchor sampler CONCURRENTLY so they cover the same wall-clock window (one clock)."""
+    results = {}
+    threads = []
+    def go(label, kind, target):
+        fn = SAMPLERS.get(kind)
+        if not fn:
+            results[label] = {"status": "dark", "devices": {}, "note": "unknown kind " + kind, "kind": kind, "target": target}
+            return
+        r = fn(target, win)
+        r["kind"] = kind; r["target"] = target
+        results[label] = r
+    for label, kind, target in anchors:
+        t = threading.Thread(target=go, args=(label, kind, target))
+        t.start(); threads.append(t)
+    for t in threads:
+        t.join()
+    return results
+
+def attribute_zones(results):
+    """Per device, build the RSSI vector across DEVICE-LOCATING anchors (ble + router), pick the
+    zone by argmax RSSI, and grade confidence by the gap to the 2nd-best anchor. Motion-only
+    vantages (imac-link) never participate. Honest: a dark anchor simply isn't in any vector."""
+    locating = {lbl: r for lbl, r in results.items()
+                if r.get("kind") in ("ble-local", "ble-ssh", "router") and r.get("status") == "live"}
+    # device key → {anchor_label: (rssi, name)}
+    devmap = {}
+    for lbl, r in locating.items():
+        for mac, (rssi, name) in r["devices"].items():
+            devmap.setdefault(mac, {"name": "", "vec": {}})
+            devmap[mac]["vec"][lbl] = rssi
+            if name and not devmap[mac]["name"]:
+                devmap[mac]["name"] = name
+    devices = []
+    for mac, d in devmap.items():
+        vec = d["vec"]
+        ranked = sorted(vec.items(), key=lambda kv: kv[1], reverse=True)
+        best_zone, best_rssi = ranked[0]
+        if len(ranked) >= 2:
+            second_zone, second_rssi = ranked[1]
+            gap = best_rssi - second_rssi
+            if gap >= 10:   conf, zone = "high", best_zone
+            elif gap >= 4:  conf, zone = "medium", best_zone
+            else:           conf, zone = "low", "%s~%s" % (best_zone, second_zone)
+        else:
+            # single anchor heard it; absence elsewhere = out of their range → supports this zone
+            conf = {"IMMEDIATE": "high", "NEAR": "medium", "ROOM": "medium", "FAR": "low"}.get(proximity(best_rssi), "low")
+            zone = best_zone
+        devices.append({"mac": mac, "name": d["name"] or "?", "zone": zone, "confidence": conf,
+                        "best_rssi": best_rssi, "proximity": proximity(best_rssi), "vector": vec})
+    devices.sort(key=lambda x: x["best_rssi"], reverse=True)
+    return devices
+
+def render_text(results, devices, win):
+    ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    live = [l for l, r in results.items() if r.get("status") == "live"]
+    dark = [(l, r) for l, r in results.items() if r.get("status") != "live"]
+    out = []
+    out.append("=== mesh-zonemap @ %s · window %ds ===" % (ts, win))
+    locating_live = [l for l, r in results.items()
+                     if r.get("kind") in ("ble-local","ble-ssh","router") and r.get("status")=="live"]
+    out.append("anchors LIVE: %s | DARK: %s"
+               % (", ".join(live) or "none",
+                  ", ".join("%s(%s)" % (l, (r.get("note") or "dark")) for l, r in dark) or "none"))
+    if len(locating_live) < 2:
+        out.append("⚠ only %d device-locating anchor(s) live — zones are COARSE/degraded "
+                   "(need >=2 separated BLE vantages for cross-anchor argmax)" % len(locating_live))
+    out.append("-- devices by zone (coarse, RSSI argmax across anchors) --")
+    if not devices:
+        out.append("  (no BLE devices heard by any live locating anchor — honest-empty, room quiet)")
+    for d in devices:
+        vec = " ".join("%s=%d" % (a, rssi) for a, rssi in sorted(d["vector"].items(), key=lambda kv: kv[1], reverse=True))
+        out.append("  %-26s → zone=%-14s conf=%-6s [%s]  (%s)"
+                   % (d["name"][:26], d["zone"], d["confidence"], vec, d["proximity"]))
+    # motion-only vantages, reported separately and labelled
+    for l, r in results.items():
+        if r.get("kind") == "imac-link" and r.get("status") == "live" and r.get("motion"):
+            m = r["motion"]
+            out.append("-- motion vantage (NOT device location) --")
+            out.append("  %-10s link=%sdBm swing=%sdBm → %s" % (l, m.get("rssi"), m.get("swing"), m.get("label")))
+    return "\n".join(out)
+
+# --------------------------------------------------------------------------- self-test (no I/O)
+def selftest():
+    fails = []
+    def ok(c, m):
+        if not c: fails.append(m)
+    # synthetic anchor results: study(IdeaPad) + room(ds) live BLE, imac motion-only, router dark
+    res = {
+        "study": {"kind": "ble-local", "status": "live", "devices": {
+            "AA": (-75, "PhoneX"), "BB": (-50, "WatchY")}},
+        "room":  {"kind": "ble-ssh",   "status": "live", "devices": {
+            "AA": (-40, "PhoneX"), "CC": (-8, "Bose")}},
+        "imac":  {"kind": "imac-link", "status": "live", "devices": {}, "motion": {"rssi": -54, "swing": 9, "label": "MOTION"}},
+        "router":{"kind": "router",    "status": "dark", "devices": {}, "note": "offline"},
+    }
+    devs = attribute_zones(res)
+    byname = {d["name"]: d for d in devs}
+    # PhoneX: -40@room vs -75@study, gap 35 ≥10 → zone=room, high
+    ok(byname["PhoneX"]["zone"] == "room" and byname["PhoneX"]["confidence"] == "high",
+       "PhoneX should be room/high (got %s/%s)" % (byname["PhoneX"]["zone"], byname["PhoneX"]["confidence"]))
+    # WatchY: only study heard it (-50 NEAR) → zone=study, single-anchor medium
+    ok(byname["WatchY"]["zone"] == "study", "WatchY should be study (got %s)" % byname["WatchY"]["zone"])
+    ok(byname["WatchY"]["confidence"] in ("high", "medium"), "WatchY conf from NEAR rssi")
+    # Bose: only room heard it (-8 IMMEDIATE) → zone=room, high
+    ok(byname["Bose"]["zone"] == "room" and byname["Bose"]["confidence"] == "high",
+       "Bose should be room/high (got %s/%s)" % (byname["Bose"]["zone"], byname["Bose"]["confidence"]))
+    # dark router must be EXCLUDED — no device should have a 'router' key in its vector
+    ok(all("router" not in d["vector"] for d in devs), "dark router must not appear in any vector")
+    # imac-link is motion-only → never a zone
+    ok(all(d["zone"] not in ("imac",) for d in devs), "imac (motion-only) must never be a device zone")
+    # ambiguous case: close RSSI → 'between' low-confidence
+    res2 = {"study": {"kind": "ble-local", "status": "live", "devices": {"DD": (-61, "Tab")}},
+            "room":  {"kind": "ble-ssh",   "status": "live", "devices": {"DD": (-63, "Tab")}}}
+    d2 = attribute_zones(res2)[0]
+    ok(d2["confidence"] == "low" and "~" in d2["zone"], "close RSSI → low conf 'a~b' (got %s/%s)" % (d2["zone"], d2["confidence"]))
+    # parse_presence ignores header/inventory, keeps real rows
+    p = parse_presence("=== hdr ===\n-8|28:11:A5:B8:9E:A2|LE-Bose\n-56|7E:F1:06:F1:76:77|?\n---\ninventory: 5")
+    ok(len(p) == 2 and p["28:11:A5:B8:9E:A2"][0] == -8, "parse_presence shape (got %r)" % p)
+    ok(p["7E:F1:06:F1:76:77"][1] == "", "'?' name normalised to empty")
+    if fails:
+        print("smoke-test: FAIL"); [print("  -", f) for f in fails]; sys.exit(1)
+    print("smoke-test: ok (argmax zoning, dark-anchor exclusion, motion-only iMac, single-anchor "
+          "proximity, ambiguous-between, presence parse — all green; no I/O)")
+    sys.exit(0)
+
+def dry(anchors):
+    # Fast liveness probe only — NO BLE scan. Reports which anchors WOULD sample.
+    print("=== mesh-zonemap --dry · anchor liveness (no scan) ===")
+    for label, kind, target in anchors:
+        if kind == "ble-local":
+            rc, out, _ = _run(["bash", "-lc", "bluetoothctl show 2>/dev/null | grep -q 'Powered: yes' && echo up"], 8)
+            status = "live" if "up" in out else "dark (BT not powered)"
+        elif kind == "ble-ssh":
+            rc, out, _ = _run(["ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=5", target, "echo up"], 10)
+            status = "live" if "up" in out else "dark (ssh unreachable)"
+        elif kind == "imac-link":
+            rc, _, _ = _run(["ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=5", "ilya@192.168.8.214", "echo up"], 10)
+            status = "live (motion-only)" if rc == 0 else "dark (iMac unreachable)"
+        elif kind == "router":
+            rc, _, _ = _run(["mesh-router-presence", "--test"], 12)
+            status = "live" if rc == 0 else "dark (offline / no LAN key)"
+        else:
+            status = "unknown-kind"
+        print("  %-8s %-10s %-26s → %s" % (label, kind, target if target != "-" else "(local)", status))
+
+def main():
+    global WIN
+    args = sys.argv[1:]
+    as_json = "--json" in args
+    if "--test" in args: selftest()
+    if "--win" in args:
+        try: WIN = int(args[args.index("--win") + 1])
+        except (IndexError, ValueError): pass
+    anchors = load_anchors()
+    if "--dry" in args:
+        dry(anchors); return
+    results = sample_all(anchors, WIN)
+    devices = attribute_zones(results)
+    live_locating = [l for l, r in results.items()
+                     if r.get("kind") in ("ble-local","ble-ssh","router") and r.get("status")=="live"]
+    if as_json:
+        ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        anch = {l: {"kind": r.get("kind"), "target": r.get("target"), "status": r.get("status"),
+                    "n_devices": len(r.get("devices", {})), "note": r.get("note", ""),
+                    "motion": r.get("motion")} for l, r in results.items()}
+        print(json.dumps({"ts": ts, "window_s": WIN, "anchors": anch, "devices": devices,
+                          "live_locating_anchors": live_locating}, ensure_ascii=False))
+    else:
+        print(render_text(results, devices, WIN))
+    # exit 2 = honest total blackout (no live locating anchor), distinct from "empty room"
+    sys.exit(0 if live_locating else 2)
+
+if __name__ == "__main__":
+    main()
