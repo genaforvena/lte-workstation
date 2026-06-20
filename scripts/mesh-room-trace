@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 # mesh-room-trace — temporal occupancy trace: was this room occupied recently?
-# Fuses room-sense + proximity + light-transitions into a 4-level occupancy history.
+# Fuses room-sense + proximity + light-pheromone (stigmergic) into a 4-level occupancy history.
+#
+# Light signal uses a DECAYING PHEROMONE SCORE rather than a binary recency flag.
+# Each light-level transition detected in .light-transitions deposits PHERO_DEPOSIT to
+# .light-pheromone; on every call the score evaporates with a 20-min half-life before
+# being read. This is genuine stigmergy: mesh-light writes the environment (deposits
+# pheromone traces); this tool reads and decays them — zero direct coupling, emergent
+# coordination via shared state alone.
 #
 # Usage:
 #   mesh-room-trace              one-shot verdict to stdout
@@ -12,13 +19,14 @@
 # Signals (read from state files — zero subprocesses, instant):
 #   room-sense.state:         PRESENT/EMPTY/UNCERTAIN
 #   proximity.state:          HERE/NEAR/FAR/OUT_OF_RANGE
-#   light-transitions:        level|lux|epoch|change_count
+#   .light-pheromone:         decaying float score (deposited by light-level transitions)
+#   .light-transitions:       level|lux|epoch|change_count  (source for deposit detection)
 #   activity.state:           IDLE/AMBIENT/MODERATE/ACTIVE/UNCERTAIN
 #
 # Trace levels:
 #   OCCUPIED  = room present + (close device OR active)
-#   RECENT    = room NOT present BUT light changed recently OR close device lingers
-#   VACANT    = room empty + no recent light change + no close device
+#   RECENT    = room NOT present BUT light-pheromone ≥ 0.5 OR close device lingers
+#   VACANT    = room empty + pheromone near-zero + no close device
 #   UNKNOWN   = all signals unreachable or conflicting
 #
 # UNREACHABLE ≠ VACANT: missing signals render UNKNOWN, never silent all-clear.
@@ -32,9 +40,20 @@ set -euo pipefail
 STATE_DIR="${MESH_STATE_DIR:-$HOME/.mesh}"
 STATE="$STATE_DIR/.room-trace.state"
 PENDING="$STATE_DIR/.room-trace.pending"
+PHERO_STATE="$STATE_DIR/.light-pheromone"   # stigmergic trace: score|last_epoch
 MODE="oneshot"
 EDGE_WINDOW=2
 LOOKBACK_MIN=30
+
+# --- Pheromone constants ---
+# DEPOSIT: score added per detected light-level transition
+# HALFLIFE_S: seconds for score to decay to 50% (20 min)
+# THRESHOLD_RECENT: minimum score to classify as RECENT occupancy signal
+# THRESHOLD_STRONG: score indicating multiple recent transitions → high-confidence RECENT
+PHERO_DEPOSIT="1.0"
+PHERO_HALFLIFE_S="1200"
+PHERO_THRESHOLD_RECENT="0.5"
+PHERO_THRESHOLD_STRONG="2.0"
 
 for arg in "$@"; do
   case "$arg" in
@@ -48,8 +67,10 @@ done
 mkdir -p "$STATE_DIR"
 
 # --- Fusion engine (defined first for --test access) ---
+# Args: room  proximity  activity  phero_score  light_prev_level  light_changes
+# phero_score is a float (awk-produced); comparisons use awk for float safety.
 _fuse() {
-  local rm="$1" pm="$2" am="$3" lcr="$4" lpc="$5" lch="$6"
+  local rm="$1" pm="$2" am="$3" ps="$4" lpc="$5" lch="$6"
 
   if [ "$rm" = "UNKNOWN" ] && [ "$pm" = "UNKNOWN" ] && [ "$am" = "UNKNOWN" ]; then
     verdict="UNKNOWN"; reason="all signals unreachable"; return 2
@@ -65,8 +86,20 @@ _fuse() {
     verdict="OCCUPIED"; reason="room present (room-sense only)"; return 0
   fi
 
-  if [ "$lcr" = "1" ]; then
-    verdict="RECENT"; reason="light changed ${lpc} (${lch} total) within ${LOOKBACK_MIN}m"
+  # Pheromone-based recency: replaces binary light_changed_recently flag.
+  # Score ≥ THRESHOLD_RECENT → light environment was recently disturbed (occupancy residue).
+  # Score ≥ THRESHOLD_STRONG → multiple transitions → high-confidence recent activity.
+  local phero_recent=0 phero_strong=0
+  phero_recent="$(awk -v s="$ps" -v t="$PHERO_THRESHOLD_RECENT" 'BEGIN{print (s+0>=t)?1:0}')"
+  phero_strong="$(awk -v s="$ps" -v t="$PHERO_THRESHOLD_STRONG" 'BEGIN{print (s+0>=t)?1:0}')"
+
+  if [ "$phero_recent" = "1" ]; then
+    verdict="RECENT"
+    if [ "$phero_strong" = "1" ]; then
+      reason="light-pheromone strong (score=${ps}, ${lch} transitions) — repeated recent activity"
+    else
+      reason="light-pheromone (score=${ps}, prev=${lpc}, ${lch} transitions)"
+    fi
     [ "$pm" = "HERE" ] || [ "$pm" = "NEAR" ] && reason="$reason + device nearby"
     return 0
   fi
@@ -74,35 +107,112 @@ _fuse() {
     verdict="RECENT"; reason="proximity $pm (device lingers after room empty)"; return 0
   fi
 
-  if [ "$rm" = "EMPTY" ] && [ "$lcr" = "0" ] && [ "$pm" != "HERE" ] && [ "$pm" != "NEAR" ]; then
-    verdict="VACANT"; reason="room empty + no recent light change + no close device"; return 0
+  if [ "$rm" = "EMPTY" ] && [ "$phero_recent" = "0" ] && [ "$pm" != "HERE" ] && [ "$pm" != "NEAR" ]; then
+    verdict="VACANT"; reason="room empty + pheromone near-zero (score=${ps}) + no close device"; return 0
   fi
 
-  verdict="UNKNOWN"; reason="mixed: room=$rm proximity=$pm activity=$am light_changed=$lcr"; return 0
+  verdict="UNKNOWN"; reason="mixed: room=$rm proximity=$pm activity=$am pheromone=$ps"; return 0
+}
+
+# --- Pheromone engine ---
+# _phero_update: read .light-pheromone + .light-transitions; apply decay; deposit if new
+# transition detected; write updated state. Sets: phero_score, phero_changes, phero_prev_level.
+_phero_update() {
+  local now="$1"
+  phero_score="0.0"
+  phero_changes=0
+  phero_prev_level="UNKNOWN"
+  local stored_score="0.0" stored_epoch="$now" stored_trans_count="-1"
+
+  # Read existing pheromone state: score|last_decay_epoch|last_known_trans_count
+  if [ -f "$PHERO_STATE" ]; then
+    IFS='|' read -r stored_score stored_epoch stored_trans_count < "$PHERO_STATE" 2>/dev/null || true
+  fi
+
+  # Apply exponential decay since last call: score *= e^(-ln(2)/halflife * delta_t)
+  local decayed_score
+  decayed_score="$(awk -v s="${stored_score:-0}" -v hl="$PHERO_HALFLIFE_S" \
+      -v t0="${stored_epoch:-$now}" -v t1="$now" \
+      'BEGIN { dt=t1-t0; if(dt<0)dt=0; lambda=log(2)/hl; printf "%.6f", s*exp(-lambda*dt) }')"
+
+  # Read current transition count from mesh-light's state file (the pheromone SOURCE)
+  local cur_trans_count="0" cur_level="UNKNOWN"
+  local trans_file="$STATE_DIR/.light-transitions"
+  if [ -f "$trans_file" ]; then
+    local _lux _ts
+    IFS='|' read -r cur_level _lux _ts cur_trans_count < "$trans_file" 2>/dev/null || true
+    phero_prev_level="${cur_level:-UNKNOWN}"
+    phero_changes="${cur_trans_count:-0}"
+  fi
+
+  # Detect new transitions since last call → deposit pheromone quantum per new transition
+  local new_transitions=0
+  if [ "${stored_trans_count:-0}" != "-1" ] && \
+     [ -n "${cur_trans_count:-}" ] && \
+     [ "${cur_trans_count:-0}" -gt "${stored_trans_count:-0}" ] 2>/dev/null; then
+    new_transitions=$(( cur_trans_count - stored_trans_count ))
+  elif [ "${stored_trans_count:-0}" = "-1" ] && [ "${cur_trans_count:-0}" -gt 0 ]; then
+    # First run: treat existing transitions as new (seed the pheromone trail)
+    new_transitions=1
+  fi
+
+  # Deposit: score += new_transitions * DEPOSIT
+  phero_score="$(awk -v d="$decayed_score" -v n="$new_transitions" -v q="$PHERO_DEPOSIT" \
+      'BEGIN { printf "%.6f", d + n*q }')"
+
+  # Write updated pheromone state
+  printf '%s|%s|%s\n' "$phero_score" "$now" "${cur_trans_count:-0}" > "$PHERO_STATE"
 }
 
 # --- Test mode: run assertions in subshell to isolate return 2 ---
 if [ "$MODE" = "test" ]; then
   (
     set +e
-    _fuse 'PRESENT' 'HERE' 'IDLE' 0 'UNKNOWN' 0
+    # Original fusion assertions (unchanged logic — only phero_score arg replaces binary flag)
+    _fuse 'PRESENT' 'HERE' 'IDLE' '0.0' 'UNKNOWN' '0'
     [ "$verdict" = "OCCUPIED" ] || { echo "  FAIL: present+here → OCCUPIED (got $verdict)"; exit 1; }
-    _fuse 'PRESENT' 'OUT_OF_RANGE' 'ACTIVE' 0 'UNKNOWN' 0
+    _fuse 'PRESENT' 'OUT_OF_RANGE' 'ACTIVE' '0.0' 'UNKNOWN' '0'
     [ "$verdict" = "OCCUPIED" ] || { echo "  FAIL: present+active → OCCUPIED (got $verdict)"; exit 1; }
-    _fuse 'EMPTY' 'OUT_OF_RANGE' 'IDLE' 1 'LIT' 5
-    [ "$verdict" = "RECENT" ] || { echo "  FAIL: empty+light → RECENT (got $verdict)"; exit 1; }
-    _fuse 'EMPTY' 'NEAR' 'IDLE' 0 'UNKNOWN' 0
+    # Pheromone ≥ THRESHOLD_RECENT (1.0 ≥ 0.5) → RECENT even with empty room
+    _fuse 'EMPTY' 'OUT_OF_RANGE' 'IDLE' '1.0' 'LIT' '5'
+    [ "$verdict" = "RECENT" ] || { echo "  FAIL: empty+phero→RECENT (got $verdict)"; exit 1; }
+    _fuse 'EMPTY' 'NEAR' 'IDLE' '0.0' 'UNKNOWN' '0'
     [ "$verdict" = "RECENT" ] || { echo "  FAIL: empty+near → RECENT (got $verdict)"; exit 1; }
-    _fuse 'EMPTY' 'OUT_OF_RANGE' 'IDLE' 0 'UNKNOWN' 0
+    _fuse 'EMPTY' 'OUT_OF_RANGE' 'IDLE' '0.0' 'UNKNOWN' '0'
     [ "$verdict" = "VACANT" ] || { echo "  FAIL: empty+nothing → VACANT (got $verdict)"; exit 1; }
-    _fuse 'UNKNOWN' 'UNKNOWN' 'UNKNOWN' 0 'UNKNOWN' 0; rc=$?
+    _fuse 'UNKNOWN' 'UNKNOWN' 'UNKNOWN' '0.0' 'UNKNOWN' '0'; rc=$?
     [ "$verdict" = "UNKNOWN" ] || { echo "  FAIL: all-unknown → UNKNOWN (got $verdict)"; exit 1; }
     [ "$rc" = "2" ] || { echo "  FAIL: all-unknown → exit 2 (got $rc)"; exit 1; }
-    _fuse 'UNCERTAIN' 'OUT_OF_RANGE' 'UNKNOWN' 0 'UNKNOWN' 0
+    _fuse 'UNCERTAIN' 'OUT_OF_RANGE' 'UNKNOWN' '0.0' 'UNKNOWN' '0'
     [ "$verdict" = "UNKNOWN" ] || { echo "  FAIL: uncertain → UNKNOWN (got $verdict)"; exit 1; }
-    _fuse 'PRESENT' 'FAR' 'IDLE' 0 'UNKNOWN' 0
+    _fuse 'PRESENT' 'FAR' 'IDLE' '0.0' 'UNKNOWN' '0'
     [ "$verdict" = "OCCUPIED" ] || { echo "  FAIL: present+far → OCCUPIED (got $verdict)"; exit 1; }
-    echo "smoke-test: ok (8 assertions: present+here→OCCUPIED, present+active→OCCUPIED, empty+light→RECENT, empty+near→RECENT, empty+nothing→VACANT, all-unknown→UNKNOWN/exit2, uncertain→UNKNOWN, present+far→OCCUPIED)"
+    # Strong pheromone (≥ THRESHOLD_STRONG = 2.0) → RECENT with strong-reason label
+    _fuse 'EMPTY' 'OUT_OF_RANGE' 'IDLE' '3.5' 'LIT' '7'
+    [ "$verdict" = "RECENT" ] || { echo "  FAIL: empty+strong-phero → RECENT (got $verdict)"; exit 1; }
+    printf '%s' "$reason" | grep -q 'repeated recent activity' || { echo "  FAIL: strong-phero reason should mention 'repeated recent activity' (got: $reason)"; exit 1; }
+    # Pheromone just below threshold → no RECENT from light (proximity decides)
+    _fuse 'EMPTY' 'OUT_OF_RANGE' 'IDLE' '0.3' 'LIT' '1'
+    [ "$verdict" = "VACANT" ] || { echo "  FAIL: empty+sub-threshold-phero → VACANT (got $verdict)"; exit 1; }
+    # Pheromone decay test via _phero_update: a score decays to near-zero after many halflives
+    tdir="$(mktemp -d /tmp/room-trace-test.XXXXXX)"
+    PHERO_STATE="$tdir/.light-pheromone"
+    # Seed: score=4.0 written 3 halflives ago (3*1200=3600s), no new transitions
+    printf '4.0|%s|5\n' "$(( $(date +%s) - 3600 ))" > "$PHERO_STATE"
+    # Write a transitions file with same count (no new transitions)
+    printf 'LIT|500|%s|5\n' "$(date +%s)" > "$tdir/.light-transitions"
+    MESH_STATE_DIR="$tdir" STATE_DIR="$tdir" PHERO_HALFLIFE_S=1200 PHERO_DEPOSIT=1.0 \
+      PHERO_THRESHOLD_RECENT=0.5 PHERO_THRESHOLD_STRONG=2.0 _phero_update "$(date +%s)"
+    decayed_check="$(awk -v s="$phero_score" 'BEGIN{print (s+0 < 0.6) ? "ok" : "too-high"}')"
+    [ "$decayed_check" = "ok" ] || { echo "  FAIL: phero after 3 halflives should be <0.6 (got $phero_score)"; rm -rf "$tdir"; exit 1; }
+    # Deposit test: same file, but add 2 new transitions (count goes from 5 to 7)
+    printf 'LIT|500|%s|7\n' "$(date +%s)" > "$tdir/.light-transitions"
+    MESH_STATE_DIR="$tdir" STATE_DIR="$tdir" PHERO_HALFLIFE_S=1200 PHERO_DEPOSIT=1.0 \
+      PHERO_THRESHOLD_RECENT=0.5 PHERO_THRESHOLD_STRONG=2.0 _phero_update "$(date +%s)"
+    deposit_check="$(awk -v s="$phero_score" 'BEGIN{print (s+0 >= 1.5 && s+0 <= 2.8) ? "ok" : "out-of-range"}')"
+    [ "$deposit_check" = "ok" ] || { echo "  FAIL: phero after 2 deposits should be in [1.5,2.8] (got $phero_score)"; rm -rf "$tdir"; exit 1; }
+    rm -rf "$tdir"
+    echo "smoke-test: ok (10 fusion assertions: present+here→OCCUPIED, present+active→OCCUPIED, empty+phero→RECENT, empty+near→RECENT, empty+nothing→VACANT, all-unknown→UNKNOWN/exit2, uncertain→UNKNOWN, present+far→OCCUPIED, strong-phero-reason, sub-threshold→VACANT; 2 pheromone assertions: decay, deposit)"
   )
   exit $?
 fi
@@ -126,21 +236,13 @@ case "$proximity" in HERE|NEAR|FAR|OUT_OF_RANGE) ;; *) proximity="UNKNOWN" ;; es
 activity="$(_read_state .activity.state)"
 case "$activity" in IDLE|AMBIENT|MODERATE|ACTIVE|UNCERTAIN) ;; *) activity="UNKNOWN" ;; esac
 
-light_changed_recently=0
-light_prev_level="UNKNOWN"
-light_changes=0
-trans_file="$STATE_DIR/.light-transitions"
-if [ -f "$trans_file" ]; then
-  IFS='|' read -r light_prev_level _lux prev_ts light_changes < "$trans_file" 2>/dev/null || true
-  if [ -n "$prev_ts" ] && [ "$prev_ts" -eq "$prev_ts" ] 2>/dev/null; then
-    age=$(( NOW - prev_ts ))
-    if [ "$age" -le "$LOOKBACK_S" ]; then
-      light_changed_recently=1
-    fi
-  fi
-fi
+# --- Pheromone: decay existing score + deposit for new light-level transitions ---
+# This is the stigmergic step: mesh-light deposits by writing .light-transitions;
+# we read that environment and maintain a decaying accumulator. Zero direct coupling.
+_phero_update "$NOW"
+# phero_score, phero_changes, phero_prev_level now set
 
-_fuse "$room" "$proximity" "$activity" "$light_changed_recently" "$light_prev_level" "$light_changes"
+_fuse "$room" "$proximity" "$activity" "$phero_score" "$phero_prev_level" "$phero_changes"
 ec=$?
 
 # --- Edge mode ---
@@ -169,12 +271,12 @@ fi
 # --- Output ---
 case "$MODE" in
   oneshot|edge)
-    printf 'room-trace: %s — %s [room=%s prox=%s activity=%s light_changed=%s window=%sm]\n' \
-      "$verdict" "$reason" "$room" "$proximity" "$activity" "$light_changed_recently" "$LOOKBACK_MIN"
+    printf 'room-trace: %s — %s [room=%s prox=%s activity=%s phero=%.3f window=%sm]\n' \
+      "$verdict" "$reason" "$room" "$proximity" "$activity" "$phero_score" "$LOOKBACK_MIN"
     ;;
   json)
-    printf '{"verdict":"%s","reason":"%s","room":"%s","proximity":"%s","activity":"%s","light_changed":%s,"light_changes":%s,"window_min":%d,"ts":"%s"}\n' \
-      "$verdict" "$reason" "$room" "$proximity" "$activity" "$light_changed_recently" "${light_changes:-0}" "$LOOKBACK_MIN" "$TS"
+    printf '{"verdict":"%s","reason":"%s","room":"%s","proximity":"%s","activity":"%s","phero_score":%.3f,"phero_changes":%d,"phero_prev_level":"%s","window_min":%d,"ts":"%s"}\n' \
+      "$verdict" "$reason" "$room" "$proximity" "$activity" "$phero_score" "$phero_changes" "$phero_prev_level" "$LOOKBACK_MIN" "$TS"
     ;;
 esac
 
