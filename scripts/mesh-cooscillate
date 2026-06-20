@@ -1,0 +1,263 @@
+#!/usr/bin/env bash
+# reflex-cadence: 13-59/30 * * * *
+# mesh-cooscillate — DATA-DRIVEN idea source #4 (operator 2026-06-20): the SIGNAL layer beneath
+# mesh-correlate. Where mesh-correlate mines CATEGORICAL state co-occurrence (when A reads x, B
+# reads y), this watches the numeric QUANTITIES as signals over time and surfaces pairs that
+# FLUCTUATE IN SYNC — rise and fall together (in-phase) or oppose (anti-phase). Operator's framing:
+# "если мы замечаем, что одинаково колеблются величины, можно исследовать" — co-movement of
+# waveforms, not co-occurrence of categories. Often richer: two signals can wobble together even
+# when their categories never line up.
+#
+# Method (all text, one script): extract numeric series from the timestamped raw logs, bin to a
+# common clock, and for each pair compute Pearson r of their FIRST-DIFFERENCES (Δ between bins =
+# "how it's moving") over the overlapping window. High |r| on the deltas = synchronized oscillation.
+# Sign tells phase. A finding is a HYPOTHESIS (same driver? co-located? spurious?); the mind that
+# takes it is the value filter — identical discipline to mesh-correlate.
+#
+# Live numeric source today: presence.log (BLE) — `n=` device count + each device's RSSI (keyed by
+# MAC). The flagship case: two devices whose RSSI rises/falls together are physically co-located
+# (same bag / person) — a real, non-obvious fact about the home, discovered from raw signal. Other
+# numeric logs (light lux, baro hPa, battery %, wifi rssi) auto-join WHEN live; they're phone-bound
+# and degrade to empty when the phone is unreachable (honest — a degraded source is simply absent,
+# never a fabricated reading). psi.log is excluded: its lines carry no per-line timestamp (can't align).
+#
+# Seeds the SAME pipeline mesh-correlate does: the top finding's pair is written to
+# ~/.mesh/.correlation-seeds so mesh-ideate's connection generator fuses a DATA-grounded pair.
+# Floor-gated into ideas-queue exactly like mesh-ideate / mesh-correlate (one provocation at a time).
+#
+#   mesh-cooscillate          emit ONE best finding to ideas-queue (floor-gated)
+#   mesh-cooscillate --dry    print ALL candidate findings to stdout, do NOT append (preview)
+#   mesh-cooscillate --list   alias for --dry
+#   mesh-cooscillate --test   smoke test (planted synthetic series, no queue write)
+set -uo pipefail
+
+MESH="${MESH:-$HOME/.mesh}"
+PRESENCE="${COOSC_PRESENCE:-$MESH/presence.log}"
+Q="$MESH/ideas-queue"
+LOCK="$MESH/.ideas-queue.lock"
+STATE="$MESH/.cooscillate-state"                 # recently-emitted pair keys (one/line, capped)
+SEEDS="$MESH/.correlation-seeds"                 # shared with mesh-correlate → SEED mesh-ideate
+SEED_MAX="${COOSC_SEED_MAX:-12}"
+RECENT_MAX="${COOSC_RECENT_MAX:-40}"
+WINDOW_H="${COOSC_WINDOW_H:-48}"                 # look back this many hours (stable devices need time to accrue Δ)
+BIN_S="${COOSC_BIN_S:-300}"                      # resample bin size (seconds)
+MIN_BINS="${COOSC_MIN_BINS:-6}"                  # a channel must appear in ≥ this many bins to count —
+                                                 # filters EPHEMERAL BLE random-MACs (rotate ~15min) → keeps stable entities
+MIN_OVERLAP="${COOSC_MIN_OVERLAP:-8}"            # min Δ-steps in common — below this it's noise
+MIN_R="${COOSC_MIN_R:-0.6}"                      # |Pearson r| on deltas must exceed this
+ts(){ date -u +%FT%TZ; }
+
+recent_has(){ [ -f "$STATE" ] && grep -qxF "$1" "$STATE"; }
+recent_add(){ printf '%s\n' "$1" >> "$STATE"; tail -n "$RECENT_MAX" "$STATE" > "$STATE.tmp" 2>/dev/null && mv "$STATE.tmp" "$STATE"; }
+
+# SEED mesh-ideate (operator 2026-06-20 "связь между корреляциями и генерацией идей"): same shared
+# seed file mesh-correlate writes. $1=key (coosc:A:B, colons in labels pre-sanitized), $2=idea-text.
+write_seed(){
+  local k="$1" txt="$2" kind rest a b ev
+  kind="${k%%:*}"; rest="${k#*:}"; a="${rest%%:*}"; b="${rest#*:}"
+  [ -z "$a" ] || [ -z "$b" ] && return 0
+  ev="$(printf '%s' "$txt" | grep -oE '\(r=[^)]*\)' | head -1 | tr -d '()')"
+  [ -z "$ev" ] && ev="co-oscillation"
+  [ -f "$SEEDS" ] && grep -qF "$(printf '%s\t%s\t' "$a" "$b")" "$SEEDS" && return 0
+  printf '%s\t%s\t%s\t%s\n' "$a" "$b" "$kind" "$ev" >> "$SEEDS"
+  tail -n "$SEED_MAX" "$SEEDS" > "$SEEDS.tmp" 2>/dev/null && mv "$SEEDS.tmp" "$SEEDS"
+}
+
+# analyze <presence-log> -> sorted candidate findings, one/line: score<TAB>kind<TAB>key<TAB>idea-text
+analyze() {
+  COOSC_LOG="$1" COOSC_WINDOW_H="$WINDOW_H" COOSC_BIN_S="$BIN_S" \
+  COOSC_MIN_BINS="$MIN_BINS" COOSC_MIN_OVERLAP="$MIN_OVERLAP" COOSC_MIN_R="$MIN_R" python3 - <<'PY'
+import os, re, math, collections, datetime as dt
+
+LOG=os.environ["COOSC_LOG"]
+WINDOW_H=float(os.environ["COOSC_WINDOW_H"])
+BIN_S=int(os.environ["COOSC_BIN_S"])
+MIN_BINS=int(os.environ["COOSC_MIN_BINS"])
+MIN_OVERLAP=int(os.environ["COOSC_MIN_OVERLAP"])
+MIN_R=float(os.environ["COOSC_MIN_R"])
+
+TS_RE=re.compile(r'^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)')
+N_RE=re.compile(r'\bn=(\d+)')
+DEVS_RE=re.compile(r'devices=\[(.*)\]')           # the whole device list (last ] closes it)
+# start of a device token: -RSSI|MAC|  — names (which may themselves contain "[]() ") run to the NEXT start
+START_RE=re.compile(r'(-?\d+)\|([0-9A-Fa-f:]{17})\|')
+
+def epoch(s):
+    return dt.datetime.fromisoformat(s.replace("Z","+00:00")).timestamp()
+
+# (epoch, channel, value) samples. channel: "n" (device count) or "rssi:<MAC>".
+samples=[]
+macname={}   # MAC -> most-recent non-"?" name
+try:
+    rows=open(LOG, errors="replace").read().splitlines()
+except Exception:
+    rows=[]
+for line in rows:
+    m=TS_RE.match(line)
+    if not m: continue
+    try: t=epoch(m.group(1))
+    except Exception: continue
+    mn=N_RE.search(line)
+    if mn: samples.append((t,"n",float(mn.group(1))))
+    md=DEVS_RE.search(line)
+    if not md: continue
+    inner=md.group(1)
+    starts=list(START_RE.finditer(inner))
+    for k,sm in enumerate(starts):
+        rssi=sm.group(1); mac=sm.group(2).upper()
+        nstart=sm.end()
+        nend=starts[k+1].start() if k+1<len(starts) else len(inner)
+        nm=inner[nstart:nend].strip()
+        samples.append((t,"rssi:"+mac,float(rssi)))
+        if nm and nm!="?": macname[mac]=nm
+
+if samples:
+    tmax=max(s[0] for s in samples)
+    tmin=tmax-WINDOW_H*3600
+    samples=[s for s in samples if s[0]>=tmin]
+
+# bin -> channel -> mean value
+binvals=collections.defaultdict(lambda: collections.defaultdict(list))
+for t,ch,v in samples:
+    binvals[int(t//BIN_S)][ch].append(v)
+series=collections.defaultdict(dict)   # channel -> {bin: mean}
+chans=set()
+for b,chm in binvals.items():
+    for ch,vs in chm.items():
+        series[ch][b]=sum(vs)/len(vs); chans.add(ch)
+# EPHEMERAL filter: drop channels seen in too few bins (BLE random-MAC churn → spurious short corrs)
+chans={c for c in chans if len(series[c])>=MIN_BINS}
+
+def label(ch):
+    if ch=="n": return "BLE device-count"
+    mac=ch.split(":",1)[1]
+    nm=macname.get(mac)
+    base = nm if nm else mac
+    # sanitize for the colon-delimited seed key
+    return base.replace(":","-").strip()
+
+def pearson(xs,ys):
+    n=len(xs)
+    if n<2: return 0.0
+    mx=sum(xs)/n; my=sum(ys)/n
+    sx=sum((x-mx)**2 for x in xs); sy=sum((y-my)**2 for y in ys)
+    if sx<=0 or sy<=0: return 0.0
+    cov=sum((x-mx)*(y-my) for x,y in zip(xs,ys))
+    return cov/math.sqrt(sx*sy)
+
+chlist=sorted(chans)
+cands=[]
+for i in range(len(chlist)):
+    for j in range(i+1,len(chlist)):
+        A,B=chlist[i],chlist[j]
+        common=sorted(set(series[A]) & set(series[B]))
+        if len(common)<MIN_OVERLAP+1: continue   # need ≥MIN_OVERLAP deltas
+        # FIRST-DIFFERENCES over consecutive common bins = "how each is moving"
+        da=[series[A][common[k]]-series[A][common[k-1]] for k in range(1,len(common))]
+        db=[series[B][common[k]]-series[B][common[k-1]] for k in range(1,len(common))]
+        nd=len(da)
+        if nd<MIN_OVERLAP: continue
+        r=pearson(da,db)
+        if abs(r)<MIN_R: continue
+        la,lb=label(A),label(B)
+        if la==lb: continue
+        phase = "in sync (rise & fall together)" if r>0 else "in anti-phase (one rises as the other falls)"
+        score=abs(r)*math.sqrt(nd)
+        key="coosc:%s:%s" % tuple(sorted([la,lb]))
+        idea=("CO-OSCILLATION (auto, real data): %s and %s fluctuate %s (r=%.2f, %d Δ-steps over %.1fh of BLE scans) — "
+              "same carrier/zone, a shared driver, or coincidence? If real, propose a fused sense "
+              "(e.g. a co-moving-device cluster as one presence signal) or a reflex; if spurious, discard in one line."
+              % (la, lb, phase, r, nd, WINDOW_H))
+        cands.append((score,"COOSC",key,idea))
+
+cands.sort(key=lambda c:-c[0])
+for sc,kind,key,idea in cands:
+    print("%.4f\t%s\t%s\t%s" % (sc,kind,key,idea))
+PY
+}
+
+# ---------- args ----------
+mode="run"
+case "${1:-}" in
+  --dry|--list) mode="dry" ;;
+  --test) mode="test" ;;
+  "" ) mode="run" ;;
+  *) echo "usage: mesh-cooscillate [--dry|--list|--test]" >&2; exit 2 ;;
+esac
+
+# ---------- self-test ----------
+if [ "$mode" = "test" ]; then
+  _td="$(mktemp -d)"; trap 'rm -rf "$_td"' EXIT
+  tp="$_td/presence.log"
+  # plant: device AA and device BB RSSI fluctuate IN SYNC; CC moves opposite to AA; n is flat-ish.
+  python3 - "$tp" <<'PY'
+import sys,datetime as dt
+out=open(sys.argv[1],"w")
+base=dt.datetime(2026,6,20,0,0,0,tzinfo=dt.timezone.utc)
+wob=[0,4,-3,5,-2,6,-4,3,-5,2,7,-6,4,-3,5,-2]   # a shared wobble
+for k,w in enumerate(wob):
+    t=(base+dt.timedelta(minutes=6*k)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    aa=-60+w; bb=-70+w; cc=-80-w     # AA,BB in-phase; CC anti-phase
+    devs="%d|AA:AA:AA:AA:AA:AA|PhoneA %d|BB:BB:BB:BB:BB:BB|WatchB %d|CC:CC:CC:CC:CC:CC|TV" % (aa,bb,cc)
+    out.write("%s host n=3 devices=[%s]\n" % (t,devs))
+out.close()
+PY
+  raw="$(COOSC_PRESENCE="$tp" COOSC_WINDOW_H=48 COOSC_BIN_S=300 COOSC_MIN_OVERLAP=6 COOSC_MIN_R=0.6 analyze "$tp")"
+  echo "$raw" | grep -q '^[0-9]' || { echo "smoke-test: FAIL (no candidate from planted in-sync series): $raw"; exit 1; }
+  top="$(printf '%s\n' "$raw" | head -1)"
+  echo "$top" | grep -q 'PhoneA' && echo "$top" | grep -q 'WatchB' \
+    || { echo "smoke-test: FAIL (top finding is not the in-sync PhoneA/WatchB pair): $top"; exit 1; }
+  echo "$top" | grep -q 'in sync' || { echo "smoke-test: FAIL (in-phase pair not labelled 'in sync'): $top"; exit 1; }
+  # anti-phase pair (PhoneA vs TV) must appear and be labelled anti-phase
+  printf '%s\n' "$raw" | grep -q 'in anti-phase' || { echo "smoke-test: FAIL (anti-phase coupling not detected): $raw"; exit 1; }
+  # seed write + floor-gate parity with mesh-correlate
+  MESH="$_td" COOSC_PRESENCE="$tp" COOSC_WINDOW_H=48 COOSC_MIN_OVERLAP=6 IDEATE_FLOOR=1 bash "$0" >/dev/null 2>&1
+  n="$(grep -c '^\[ \] CO-OSCILLATION' "$_td/ideas-queue" 2>/dev/null)"; n="${n:-0}"
+  [ "$n" = "1" ] || { echo "smoke-test: FAIL (expected exactly 1 emitted finding, got $n): $(cat "$_td/ideas-queue" 2>/dev/null)"; exit 1; }
+  [ -s "$_td/.correlation-seeds" ] || { echo "smoke-test: FAIL (no seed written for mesh-ideate)"; exit 1; }
+  grep -qF "$(printf 'PhoneA\tWatchB')" "$_td/.correlation-seeds" || grep -qF "$(printf 'WatchB\tPhoneA')" "$_td/.correlation-seeds" \
+    || { echo "smoke-test: FAIL (seed pair not the in-sync PhoneA/WatchB): $(cat "$_td/.correlation-seeds")"; exit 1; }
+  # floor-gate: a busy queue must HOLD
+  printf '[ ] something open\n' > "$_td/ideas-queue"
+  out2="$(MESH="$_td" COOSC_PRESENCE="$tp" COOSC_WINDOW_H=48 COOSC_MIN_OVERLAP=6 IDEATE_FLOOR=1 bash "$0" 2>&1)"
+  echo "$out2" | grep -qi 'hold' || { echo "smoke-test: FAIL (floor-gate did not hold on non-empty queue): $out2"; exit 1; }
+  echo "smoke-test: ok (in-sync pair found & ranked top; anti-phase detected; one finding emitted; seed written; floor-gate holds)"
+  exit 0
+fi
+
+[ -f "$PRESENCE" ] || { echo "$(ts) mesh-cooscillate: no presence log yet ($PRESENCE) — need a live numeric source" >&2; exit 1; }
+
+raw="$(analyze "$PRESENCE")" || { echo "$(ts) mesh-cooscillate: analyze failed" >&2; exit 1; }
+
+# Seed the connection generator with the TOP finding's pair (independent of the floor gate).
+if [ -n "$raw" ]; then
+  IFS=$'\t' read -r _sc _kind _tk _ttext <<< "$(printf '%s\n' "$raw" | head -1)"
+  [ -n "$_tk" ] && write_seed "$_tk" "$_ttext"
+fi
+
+if [ "$mode" = "dry" ]; then
+  if [ -z "$raw" ]; then echo "$(ts) mesh-cooscillate: no pair fluctuates in sync above threshold (need more data / more live numeric streams — honest empty, not a failure)"; else echo "$raw"; fi
+  exit 0
+fi
+
+# FLOOR gate — seed a genuinely-empty queue, one provocation at a time (mesh-ideate discipline).
+floor="${IDEATE_FLOOR:-1}"
+open=$(grep -c '^\[ \]' "$Q" 2>/dev/null); open="${open:-0}"
+if [ "$open" -ge "$floor" ]; then
+  echo "$(ts) mesh-cooscillate: queue has $open open idea(s) (>= floor $floor) — hold, not piling on"; exit 0
+fi
+
+idea=""; key=""
+while IFS=$'\t' read -r sc kind k text; do
+  [ -z "$text" ] && continue
+  recent_has "$k" && continue
+  idea="$text"; key="$k"; break
+done <<< "$raw"
+
+[ -z "$idea" ] && { echo "$(ts) mesh-cooscillate: no fresh finding (none meet thresholds, or all recently emitted)"; exit 0; }
+
+exec 9>"$LOCK" 2>/dev/null || true
+flock -w 30 9 2>/dev/null || true
+printf '[ ] %s\n' "$idea" >> "$Q"
+recent_add "$key"
+echo "$(ts) mesh-cooscillate: +1 finding -> ideas-queue ($key)"
