@@ -1,0 +1,233 @@
+#!/usr/bin/env bash
+# reflex-cadence: 2-59/5 * * * *
+# reflex-args: --edge
+# mesh-baro — the phone body's BAROMETRIC PRESSURE sense.
+#
+# Reads the phone's onboard barometer (bmp280 or lps22hb, whichever responds)
+# via termux-sensor over SSH and derives:
+#   1. Absolute pressure in hPa (hectopascals)
+#   2. Estimated altitude relative to a rolling baseline (floor proxy)
+#   3. Short-term trend: RISING / FALLING / STABLE
+#
+# WHY THIS IS NEW: mesh-sensor-log line 99 already logs baro_hpa as a raw
+# number, but NO dedicated tool exists for it.  Nothing interprets the reading,
+# nothing classifies altitude change, nothing posts an edge event when pressure
+# shifts.  This tool fills that gap.
+#
+# Signal origin:
+#   bmp280  — Bosch pressure/temperature sensor (many Qualcomm phones)
+#   lps22hb — STMicro pressure sensor (some MediaTek phones)
+#   Both report hPa via termux-sensor.  We try bmp280 first, fall back to lps22hb.
+#
+# Altitude proxy (coarse):
+#   Barometric formula: Δalt ≈ −8.43 m per hPa change near sea level.
+#   We track a slow baseline (updated only when STABLE) and express current
+#   pressure as Δhpa from baseline → floor estimate (rough; not GPS altitude).
+#   One floor ≈ 3 m ≈ 0.36 hPa.  Useful for elevator/stair detection, not
+#   for absolute location.
+#
+# Trend classification (vs previous reading):
+#   RISING   — delta > +MESH_BARO_TREND_THRESHOLD hPa (default 0.3)
+#   FALLING  — delta < -MESH_BARO_TREND_THRESHOLD hPa
+#   STABLE   — |delta| ≤ threshold
+#
+# Usage:
+#   mesh-baro              one trend line (text)
+#   mesh-baro --edge       emit only on trend change (for cron wiring)
+#   mesh-baro --json       machine-readable JSON
+#   mesh-baro --test       smoke test (exit 0 ok; exit 2 = phone unreachable)
+#   mesh-baro --forget     reset state (next run re-seeds silently)
+#
+# Exit codes (honest-exit contract):
+#   0 = assessment produced
+#   2 = phone unreachable or sensor absent — never fakes a reading
+#   1 = unexpected error
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+[ -f "$HOME/.mesh/nodes" ] && . "$HOME/.mesh/nodes"
+
+STATE="$HOME/.mesh/.baro-state"         # format: <hpa> <trend> <baseline_hpa>
+OFFLINEFILE="$HOME/.mesh/.baro-offline"
+TREND_THRESHOLD="${MESH_BARO_TREND_THRESHOLD:-0.3}"   # hPa — one stair ≈ 0.36 hPa
+BASELINE_NUDGE="${MESH_BARO_BASELINE_NUDGE:-0.05}"    # slow drift factor for baseline
+
+# ─── Python helper: trend + altitude delta classifier ──────────────────────
+CLASSIFY_PY='
+import sys, math
+hpa_now  = float(sys.argv[1])
+hpa_prev = float(sys.argv[2])
+hpa_base = float(sys.argv[3])
+thresh   = float(sys.argv[4])
+nudge    = float(sys.argv[5])
+
+delta = hpa_now - hpa_prev
+if delta > thresh:
+    trend = "RISING"
+elif delta < -thresh:
+    trend = "FALLING"
+else:
+    trend = "STABLE"
+
+# altitude proxy: negative because higher altitude = lower pressure
+alt_delta_m = -8.43 * (hpa_now - hpa_base)
+
+# update baseline only when stable (avoids chasing transients)
+if trend == "STABLE":
+    new_base = hpa_base * (1 - nudge) + hpa_now * nudge
+else:
+    new_base = hpa_base
+
+print(f"{trend} {alt_delta_m:.1f} {new_base:.2f}")
+'
+
+# ─── --test: smoke test without a phone ────────────────────────────────────
+if [ "${1:-}" = --test ]; then
+  command -v python3 >/dev/null 2>&1 || { echo "smoke-test: FAIL (no python3)"; exit 1; }
+  command -v ssh     >/dev/null 2>&1 || { echo "smoke-test: FAIL (no ssh)"; exit 1; }
+  command -v mesh-phone-ip >/dev/null 2>&1 || { echo "smoke-test: FAIL (no mesh-phone-ip)"; exit 1; }
+  mkdir -p "$HOME/.mesh" 2>/dev/null || { echo "smoke-test: FAIL (no ~/.mesh)"; exit 1; }
+
+  _f=0
+  _classify() {
+    python3 -c "$CLASSIFY_PY" "$1" "$2" "$3" "$4" "$5" 2>/dev/null
+  }
+
+  # Case 1: rising pressure
+  r="$(_classify 1015.0 1014.5 1015.0 0.3 0.05)"
+  trend="$(echo "$r" | awk '{print $1}')"
+  [ "$trend" = "RISING" ] || { echo "  FAIL: +0.5 hPa should be RISING, got '$trend'"; _f=1; }
+
+  # Case 2: falling pressure
+  r="$(_classify 1013.0 1013.8 1013.0 0.3 0.05)"
+  trend="$(echo "$r" | awk '{print $1}')"
+  [ "$trend" = "FALLING" ] || { echo "  FAIL: -0.8 hPa should be FALLING, got '$trend'"; _f=1; }
+
+  # Case 3: stable pressure (delta within threshold)
+  r="$(_classify 1013.1 1013.0 1013.0 0.3 0.05)"
+  trend="$(echo "$r" | awk '{print $1}')"
+  [ "$trend" = "STABLE" ] || { echo "  FAIL: +0.1 hPa should be STABLE, got '$trend'"; _f=1; }
+
+  # Case 4: altitude proxy — 1 hPa below baseline ≈ +8.43 m above baseline
+  r="$(_classify 1012.0 1012.0 1013.0 0.3 0.05)"
+  alt="$(echo "$r" | awk '{print $2}')"
+  ok="$(python3 -c "print(1 if 8.0 < float('$alt') < 9.0 else 0)" 2>/dev/null)"
+  [ "$ok" = "1" ] || { echo "  FAIL: -1 hPa from baseline should yield ~8.43 m alt_delta, got '$alt'"; _f=1; }
+
+  # Case 5: baseline nudges toward current when stable
+  r="$(_classify 1014.0 1014.0 1013.0 0.3 0.05)"
+  new_base="$(echo "$r" | awk '{print $3}')"
+  ok="$(python3 -c "print(1 if float('$new_base') > 1013.0 else 0)" 2>/dev/null)"
+  [ "$ok" = "1" ] || { echo "  FAIL: baseline should nudge toward current (1014) from 1013, got '$new_base'"; _f=1; }
+
+  # Case 6: exactly at threshold counts as STABLE (not RISING)
+  r="$(_classify 1013.3 1013.0 1013.0 0.3 0.05)"
+  trend="$(echo "$r" | awk '{print $1}')"
+  [ "$trend" = "STABLE" ] || { echo "  FAIL: delta=0.3 == threshold should be STABLE, got '$trend'"; _f=1; }
+
+  # Case 7: phone reachability check (exit 2 if unreachable — honest n/a)
+  mesh-phone-ip >/dev/null 2>&1 || {
+    echo "smoke-test: n/a (phone unreachable — baro sense unavailable)"
+    [ "$_f" = 0 ] && exit 2; exit 1
+  }
+
+  [ "$_f" = 0 ] || { echo "smoke-test: FAIL (classify contract violated)"; exit 1; }
+  echo "smoke-test: ok (6 trend/alt/baseline assertions + phone reachable)"
+  exit 0
+fi
+
+[ "${1:-}" = --forget ] && { rm -f "$STATE"; echo "baro state forgotten — next run re-seeds"; exit 0; }
+
+# ─── Resolve phone IP ──────────────────────────────────────────────────────
+pip="$(mesh-phone-ip 2>/dev/null)" || {
+  if [ ! -f "$OFFLINEFILE" ]; then
+    echo "phone unreachable — can't read barometer (not an alarm)" >&2
+    touch "$OFFLINEFILE"
+  fi
+  exit 2
+}
+rm -f "$OFFLINEFILE"
+
+# ─── Read sensor via SSH ───────────────────────────────────────────────────
+# Try bmp280 first; fall back to lps22hb.  Both expose a single hPa value.
+j="$(timeout 14 ssh -p "${PHONE_SSH_PORT:-8022}" -o BatchMode=yes -o ConnectTimeout=6 \
+  -o StrictHostKeyChecking=accept-new "${PHONE_USER:-u0_a380}@$pip" \
+  'timeout 8 termux-sensor -s bmp280 -n 1 2>/dev/null || timeout 8 termux-sensor -s lps22hb -n 1 2>/dev/null' \
+  </dev/null 2>/dev/null)"
+[ -n "$j" ] || {
+  if [ ! -f "$OFFLINEFILE" ]; then
+    echo "phone barometer SSH failed (not an alarm)" >&2
+    touch "$OFFLINEFILE"
+  fi
+  exit 2
+}
+
+# ─── Parse hPa value ───────────────────────────────────────────────────────
+hpa="$(printf '%s' "$j" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    # try both sensor names
+    for key in ("bmp280", "lps22hb"):
+        vals = d.get(key, {}).get("values", [])
+        if vals:
+            v = float(vals[0])
+            # sanity: valid atmospheric pressure 800-1100 hPa
+            if 800 < v < 1100:
+                print(f"{v:.2f}")
+                break
+except Exception:
+    pass
+' 2>/dev/null)"
+[ -n "$hpa" ] || {
+  echo "baro parse failed — sensor absent or outside 800-1100 hPa range (not an alarm)" >&2
+  exit 2
+}
+
+TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+# ─── Read previous state ───────────────────────────────────────────────────
+prev_hpa=""
+prev_trend=""
+prev_base=""
+if [ -f "$STATE" ]; then
+  read -r prev_hpa prev_trend prev_base <"$STATE" 2>/dev/null || true
+fi
+
+# First run: seed state silently
+if [ -z "$prev_hpa" ]; then
+  printf '%s %s %s\n' "$hpa" "STABLE" "$hpa" >"$STATE"
+  printf '[baro-seed] %.2f hPa (first reading — baseline set)\n' "$hpa"
+  exit 0
+fi
+
+# ─── Classify trend + altitude delta ──────────────────────────────────────
+result="$(python3 -c "$CLASSIFY_PY" "$hpa" "$prev_hpa" "${prev_base:-$prev_hpa}" \
+  "$TREND_THRESHOLD" "$BASELINE_NUDGE" 2>/dev/null)"
+[ -n "$result" ] || { echo "baro classify failed (not an alarm)" >&2; exit 2; }
+
+read -r trend alt_delta new_base <<<"$result"
+
+# ─── Write state ───────────────────────────────────────────────────────────
+printf '%s %s %s\n' "$hpa" "$trend" "$new_base" >"$STATE"
+
+# ─── Output ────────────────────────────────────────────────────────────────
+tag="[baro-${trend,,}]"
+
+case "${1:-}" in
+  --json)
+    printf '{"hpa":%s,"trend":"%s","alt_delta_m":%s,"baseline_hpa":%s,"prev_hpa":%s,"ts":"%s"}\n' \
+      "$hpa" "$trend" "$alt_delta" "$new_base" "$prev_hpa" "$TS"
+    ;;
+  --edge)
+    # Emit only when trend changes
+    [ "$trend" = "${prev_trend:-STABLE}" ] && exit 0
+    printf '%s %.2f hPa — %s (Δ=%.2f hPa, alt_delta=%.1f m, baseline=%.2f hPa)\n' \
+      "$tag" "$hpa" "$trend" "$(python3 -c "print(f'{$hpa - $prev_hpa:.2f}')" 2>/dev/null || echo "?")" \
+      "$alt_delta" "$new_base"
+    ;;
+  *)
+    printf '%s %.2f hPa — %s (Δalt≈%.1f m from baseline %.2f hPa)\n' \
+      "$tag" "$hpa" "$trend" "$alt_delta" "$new_base"
+    ;;
+esac
