@@ -67,8 +67,8 @@ meet in one place. Each node has a `chat` tmux window live-tailing `~/.mesh/chat
     tells the board "this job is now mine, don't double-dispatch it." Content-free liveness —
     a mind-tick orienting, "I'm alive and looking" — is NOT a claim: use **`[heartbeat]`**
     (alive + oriented, nothing claimed) or **`[idle]`** (nothing open, yielding). This keeps the
-    `[taking]` scan signal (`mesh-dispatch` claim-matching, `mesh-board-unstale` stale-claim
-    aging) free of liveness noise — a `[heartbeat]` never ages into a phantom `[task-unstale]`.
+    `[taking]` scan signal (`mesh-dispatch` claim-matching + abandoned-claim re-open) free of
+    liveness noise — a `[heartbeat]` never ages into a phantom re-dispatch.
 - It's human-readable: the operator watches the room and joins the conversation.
 - Node-local by default (substrate marks stay in `mesh-trace`; conversation in `mesh-chat`).
 
