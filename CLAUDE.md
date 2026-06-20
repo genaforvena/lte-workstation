@@ -264,7 +264,7 @@ when unsure, leave it flagged so a genuinely dead-on-arrival orphan stays visibl
   `mtg-watchdog.{sh,service,timer}` · `bore-mtg.{sh,service,timer}` · `mesh-cam-watch.*` ·
   `mesh-tuner-eye.*` · `node-join-android.sh`
 - **Operator instruments (music + mic, played on demand):** `mesh-drone` · `mesh-metronome` ·
-  `mesh-looper` · `mesh-oscilloscope` · `mesh-mic-correlate` · `mesh-mic-crossvalidate`
+  `mesh-changes` · `mesh-looper` · `mesh-oscilloscope` · `mesh-mic-correlate` · `mesh-mic-crossvalidate`
 
 Decayed tools (mesh-health-watch, mesh-tg-recv, mesh-zone, vpn-hub.py, mesh-onboard, mesh-board-timerepair) live in git history — the attic.
 
