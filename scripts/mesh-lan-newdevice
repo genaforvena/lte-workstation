@@ -27,12 +27,38 @@ SSH=(ssh -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-ne
 # stronger wording. (Same insight as mesh-novelty excluding randomized BLE MACs.)
 is_laa() { local o="${1%%:*}"; [ -n "$o" ] && (( (16#$o & 2) != 0 )) 2>/dev/null; }
 
+# Convert `ip neigh` output → DHCP-lease-shaped lines ("0 <mac> <ip> ?") so the SAME baseline +
+# alarm parser handles both sources. Finds the lladdr field (robust to column order).
+neigh_to_leases(){ awk '{ mac=""; for(i=1;i<=NF;i++) if($i=="lladdr") mac=$(i+1);
+    if(mac!="" && $1 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) print "0", tolower(mac), $1, "?" }'; }
+
+# LAN-side fallback observation (Tailscale-INDEPENDENT): when the router DHCP read fails (e.g. the
+# router's Tailscale is offline — a recurring SPOF), observe the LAN from THIS node, which sits on it.
+# A gentle ARP sweep makes LAN devices resolve, then `ip neigh` yields their MACs. Less authoritative
+# than DHCP (no hostnames; only L2-reachable devices) — so callers label it + cap confidence — but the
+# security sense is no longer BLIND whenever Tailscale to the router flaps (cf. egress-via-router-lan).
+lan_arp_observe(){
+  command -v ip >/dev/null 2>&1 || return 0
+  local myip subnet i
+  myip="$(ip -4 route get 192.168.8.1 2>/dev/null | grep -oE 'src [0-9.]+' | awk '{print $2}')"
+  [ -n "$myip" ] || myip="$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^(192\.168|10\.|172\.)' | head -1)"
+  [ -n "$myip" ] || return 0
+  subnet="${myip%.*}"
+  for i in $(seq 1 254); do ping -c1 -W1 "$subnet.$i" >/dev/null 2>&1 & done; wait 2>/dev/null
+  ip neigh show 2>/dev/null | grep -F "$subnet." | neigh_to_leases | sort -u
+}
+
 if [ "${1:-}" = --test ]; then
   command -v ssh >/dev/null 2>&1 || { echo "smoke-test: FAIL (no ssh)"; exit 1; }
   command -v awk >/dev/null 2>&1 || { echo "smoke-test: FAIL (no awk)"; exit 1; }
   mkdir -p "$HOME/.mesh" 2>/dev/null || { echo "smoke-test: FAIL (no ~/.mesh)"; exit 1; }
   [ -n "$ROUTER" ] || { echo "smoke-test: n/a (no router in ~/.mesh/nodes — nothing to watch)"; exit 2; }
-  echo "smoke-test: ok"; exit 0
+  # neigh_to_leases: ip-neigh line → DHCP-lease shape ("0 <mac> <ip> ?") so the shared parser works
+  r="$(printf '192.168.8.55 dev wlp0s20f3 lladdr AA:BB:CC:DD:EE:FF REACHABLE\n' | neigh_to_leases)"
+  [ "$r" = "0 aa:bb:cc:dd:ee:ff 192.168.8.55 ?" ] || { echo "smoke-test: FAIL (neigh_to_leases: '$r')"; exit 1; }
+  r="$(printf '192.168.8.1 dev eth0 FAILED\n' | neigh_to_leases)"   # no lladdr → dropped
+  [ -z "$r" ] || { echo "smoke-test: FAIL (neigh_to_leases should drop no-lladdr: '$r')"; exit 1; }
+  echo "smoke-test: ok (neigh-parse: 2 assertions)"; exit 0
 fi
 
 [ "${1:-}" = --forget ] && { rm -f "$KNOWN"; echo "baseline forgotten — next run re-seeds"; exit 0; }
@@ -41,7 +67,13 @@ mkdir -p "$HOME/.mesh"
 
 # DHCP lease line: <expiry> <mac> <ip> <hostname> <client-id>
 leases="$(timeout 12 "${SSH[@]}" "$RUSER@$ROUTER" 'cat /tmp/dhcp.leases 2>/dev/null' </dev/null 2>/dev/null)"
-[ -n "$leases" ] || { echo "router unreachable / no leases — can't assess (not an alarm)"; exit 0; }
+LAN_SRC="dhcp"
+if [ -z "$leases" ]; then
+  # Router DHCP unreachable → Tailscale-independent LAN-side fallback (see lan_arp_observe).
+  leases="$(lan_arp_observe)"
+  LAN_SRC="arp"
+fi
+[ -n "$leases" ] || { echo "router DHCP + LAN ARP both unreachable — can't assess (not an alarm)"; exit 0; }
 # liveness heartbeat: this silent-on-no-news reflex has no other per-run artifact, so prove it
 # actually OBSERVED the LAN this run (router reachable + leases read) for mesh-reflex-health. Placed
 # AFTER the lease read so a router outage (watch silently non-functional) lets the beat go stale.
@@ -49,6 +81,7 @@ leases="$(timeout 12 "${SSH[@]}" "$RUSER@$ROUTER" 'cat /tmp/dhcp.leases 2>/dev/n
 
 if [ "${1:-}" = --status ]; then
   echo "known LAN devices: $(wc -l < "$KNOWN" 2>/dev/null || echo 0)"
+  echo "source: $LAN_SRC$([ "$LAN_SRC" = arp ] && echo ' (router DHCP unreachable — LAN-side ARP fallback)')"
   echo "--- current leases (host / ip / mac) ---"
   printf '%s\n' "$leases" | awk '{printf "  %-22s %-15s %s\n", $4, $3, $2}'
   exit 0
@@ -61,16 +94,35 @@ if [ ! -f "$KNOWN" ]; then
   exit 0
 fi
 
+# First ARP-FALLBACK reconciliation: the ARP view is a DIFFERENT population than the DHCP-seeded
+# baseline (static-IP devices, L2-only reachables). On the FIRST fallback, MERGE current ARP MACs
+# into the baseline SILENTLY (no alert) so the DHCP↔ARP discrepancy doesn't flood [lan-new-device];
+# only devices appearing AFTER this fallback baseline is established are real intrusion signals.
+ARP_SEEDED="$HOME/.mesh/.lan-arp-seeded"
+if [ "$LAN_SRC" = arp ] && [ ! -f "$ARP_SEEDED" ]; then
+  merged=0
+  while read -r mac; do
+    [ -n "$mac" ] || continue
+    grep -qixF "$mac" "$KNOWN" 2>/dev/null && continue
+    echo "$mac" >> "$KNOWN"; merged=$((merged + 1))
+  done < <(printf '%s\n' "$leases" | awk 'NF>=2{print $2}')
+  : > "$ARP_SEEDED"
+  echo "LAN ARP fallback first run: merged $merged previously-unseen MAC(s) into baseline silently (router DHCP unreachable; no false alerts on the DHCP↔ARP population discrepancy)"
+  exit 0
+fi
+
 new=0
 while read -r mac host ip; do
   [ -n "$mac" ] || continue
   grep -qixF "$mac" "$KNOWN" 2>/dev/null && continue   # already known
   echo "$mac" >> "$KNOWN"                               # learn it (alert once)
   new=$((new + 1))
+  src_note=""
+  [ "$LAN_SRC" = arp ] && src_note=" [via LAN ARP fallback — router DHCP unreachable, no hostname, lower confidence]"
   if is_laa "$mac"; then
-    msg="[lan-new-device] (low) private/rotating MAC joined the LAN: ${host:-?} ($mac, ${ip:-?}) — locally-administered address (iOS/Android Wi-Fi randomization), most likely a KNOWN device with a new random MAC, not a newcomer. Only suspicious if you expected no one."
+    msg="[lan-new-device] (low) private/rotating MAC joined the LAN: ${host:-?} ($mac, ${ip:-?}) — locally-administered address (iOS/Android Wi-Fi randomization), most likely a KNOWN device with a new random MAC, not a newcomer. Only suspicious if you expected no one.${src_note}"
   else
-    msg="[lan-new-device] NEW device on the home LAN: ${host:-?} ($mac, ${ip:-?}) — globally-unique MAC, never seen before. If unexpected while you're away, investigate."
+    msg="[lan-new-device] NEW device on the home LAN: ${host:-?} ($mac, ${ip:-?}) — globally-unique MAC, never seen before. If unexpected while you're away, investigate.${src_note}"
   fi
   command -v mesh-chat >/dev/null 2>&1 && MESH_WHO="lan-watch@$(hostname)" \
     mesh-chat "$msg" >/dev/null 2>&1
