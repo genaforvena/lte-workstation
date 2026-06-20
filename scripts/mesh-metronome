@@ -1,0 +1,216 @@
+#!/usr/bin/env bash
+# mesh-metronome — the TEMPO clock for musical accompaniment. Sets a beat the operator can play to,
+# and — the part he asked for — DETECTS tempo from him clapping it out or from his playing ("темп я
+# мог бы просто нахлопать, или я начинаю играть, он определяет темп"). Pure local numpy: a percussive
+# click track (accented downbeat) + energy-onset tap-tempo detection. This is the rhythmic foundation a
+# jazz-standard backing player (Giant Steps changes, etc.) sits on — the changes need a clock.
+#
+# Operator 2026-06-20: jazz standards w/ settable tempo, tempo by clapping or detected from playing.
+#
+#   mesh-metronome <bpm> [beats] [--play]   synthesize a click track at <bpm> (default 32 beats = 8 bars
+#                                           of 4/4, downbeat accented) → write a WAV, print its path. NO
+#                                           audio out by default (room audio-silent gate). --play loops it
+#                                           on the Bose (opt-in; refuses while MUTE_FLAG present).
+#   mesh-metronome --tap [file.wav]         TAP TEMPO: detect BPM from claps. Reads <file.wav> if given,
+#                                           else captures ~8s from the mic. Energy-onset → inter-onset
+#                                           intervals → BPM (folded into 40..240). Prints onsets + BPM.
+#   mesh-metronome --test                   closed-loop self-test: synthesize a click train at a known
+#                                           BPM, recover it through the onset detector, assert it matches
+#                                           + a valid WAV. NO mic, NO audio out.
+#
+# Default-silent for the same reason as mesh-drone: the operator put room audio under a FULLY-SILENT gate
+# (2026-06-20 01:43). This BUILDS + VERIFIES silently; he triggers --play when audio is back on. --tap
+# only READS the mic (no output), so it is safe under the gate.
+#
+# Tunables (env): METRO_DIR (out, default $MESH/metronome) · METRO_SR (default 44100) ·
+#   METRO_BEATS (default 32) · METRO_SIG (beats/bar for the accent, default 4) · METRO_GAIN (0..1, 0.6) ·
+#   METRO_TAP_SECS (mic capture seconds for --tap, default 8) · MUTE_FLAG ($MESH/mesh-speaking).
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"   # pipewire mic + Bose sink
+MESH="${MESH_DIR:-$HOME/.mesh}"
+METRO_DIR="${METRO_DIR:-$MESH/metronome}"
+MUTE_FLAG="${MUTE_FLAG:-$MESH/mesh-speaking}"
+TAP_SECS="${METRO_TAP_SECS:-8}"
+
+PY=$(cat <<'PYEOF'
+import sys, os, math, wave
+import numpy as np
+
+SR    = int(os.environ.get("METRO_SR", "44100"))
+BEATS = int(os.environ.get("METRO_BEATS", "32"))
+SIG   = int(os.environ.get("METRO_SIG", "4"))
+GAIN  = float(os.environ.get("METRO_GAIN", "0.6"))
+MDIR  = os.environ.get("METRO_DIR")
+
+def click(freq, dur=0.04):
+    """One percussive click: a short sine burst with a fast exponential decay (a tick, not a tone)."""
+    n = int(SR*dur)
+    t = np.arange(n)/SR
+    env = np.exp(-t/0.008)                 # ~8ms decay → sharp transient
+    return np.sin(2*np.pi*freq*t)*env
+
+def synth_clicks(bpm, beats=None):
+    beats = beats if beats else BEATS
+    spb = 60.0/bpm                          # seconds per beat
+    n = int(SR*spb*beats)
+    buf = np.zeros(n + SR//10, dtype=np.float64)
+    hi, lo = click(1600), click(1000)       # accented downbeat (1600Hz) vs normal beat (1000Hz)
+    for b in range(beats):
+        start = int(round(b*spb*SR))
+        c = hi if (b % SIG == 0) else lo
+        buf[start:start+len(c)] += c*(1.0 if (b % SIG == 0) else 0.7)
+    buf /= np.max(np.abs(buf)) + 1e-9
+    return (buf*GAIN*32767).astype(np.int16)
+
+def write_wav(path, samples, sr=None):
+    sr = sr or SR
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with wave.open(path, "wb") as w:
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(sr)
+        w.writeframes(samples.tobytes())
+
+def detect_onsets(samples, sr, hop=0.010, refractory=0.18):
+    """Energy-onset detection: frame RMS, adaptive threshold, rising-edge + refractory. Returns onset
+    times (s). Robust to a noise floor; refractory caps the max tempo (~330 BPM) and kills double-triggers."""
+    x = samples.astype(np.float64)
+    if x.size == 0: return []
+    h = max(1, int(sr*hop))
+    nfr = x.size // h
+    if nfr < 2: return []
+    energy = np.array([np.sqrt(np.mean(x[i*h:(i+1)*h]**2)) for i in range(nfr)])
+    floor = np.percentile(energy, 20)
+    peak  = energy.max()
+    if peak <= floor*1.5: return []         # essentially silence / no transients
+    thr = floor + 0.20*(peak - floor)
+    onsets = []
+    last = -1e9
+    for i in range(1, nfr):
+        t = i*h/sr
+        if energy[i] >= thr and energy[i-1] < thr and (t - last) >= refractory:
+            onsets.append(t); last = t
+    return onsets
+
+def fold_bpm(bpm):
+    """Fold a detected tempo into a musical 40..240 range (handles octave errors gracefully)."""
+    if bpm <= 0: return bpm
+    while bpm < 40:  bpm *= 2
+    while bpm > 240: bpm /= 2
+    return bpm
+
+def bpm_from_onsets(onsets):
+    if len(onsets) < 2: return None
+    iois = np.diff(np.array(onsets))
+    iois = iois[iois > 0.05]                # drop spurious sub-50ms gaps
+    if iois.size == 0: return None
+    return fold_bpm(60.0/float(np.median(iois)))
+
+def cmd_gen(bpm, beats):
+    samples = synth_clicks(bpm, beats)
+    path = os.path.join(MDIR, "click_%dbpm.wav" % int(round(bpm)))
+    write_wav(path, samples)
+    print("%.1f\t%d\t%s" % (bpm, beats or BEATS, path))   # bpm<TAB>beats<TAB>path
+    return 0
+
+def cmd_tap(wavpath):
+    with wave.open(wavpath, "rb") as w:
+        sr = w.getframerate()
+        x = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16)
+        if w.getnchannels() > 1: x = x[::w.getnchannels()]
+    onsets = detect_onsets(x, sr)
+    bpm = bpm_from_onsets(onsets)
+    if bpm is None:
+        print("TAP\t0\tnone (need >=2 clear taps; got %d onset(s))" % len(onsets)); return 2
+    print("TAP\t%d\t%.1f" % (len(onsets), bpm))           # TAP<TAB>n_onsets<TAB>bpm
+    return 0
+
+def cmd_test():
+    fails = 0
+    # 1) click WAV is valid + non-silent
+    s = synth_clicks(120, 8)
+    if s.dtype != np.int16 or int(np.max(np.abs(s))) == 0:
+        print("smoke-test: FAIL (click buffer invalid/silent)"); return 1
+    # 2) CLOSED LOOP: recover the synthesized tempo through the detector, for several tempos
+    for target in (60, 92, 120, 160):
+        clicks = synth_clicks(target, 12)
+        onsets = detect_onsets(clicks, SR)
+        got = bpm_from_onsets(onsets)
+        if got is None:
+            print("smoke-test: FAIL (%dbpm: no tempo recovered)" % target); fails += 1; continue
+        err = abs(got-target)
+        if err > 2:
+            print("smoke-test: FAIL (%dbpm → detected %.1f, %d onsets, off by %.1f)" % (target, got, len(onsets), err)); fails += 1
+    # 3) WAV round-trip
+    import tempfile
+    tmp = tempfile.mkdtemp(); p = os.path.join(tmp, "c.wav"); write_wav(p, s)
+    with wave.open(p, "rb") as w:
+        ok = (w.getnchannels()==1 and w.getsampwidth()==2 and w.getframerate()==SR)
+    os.remove(p); os.rmdir(tmp)
+    if not ok: print("smoke-test: FAIL (WAV round-trip)"); fails += 1
+    if fails: print("smoke-test: FAIL (%d)" % fails); return 1
+    print("smoke-test: ok (click valid + tempo recovered within 2bpm @ 60/92/120/160, valid WAV)")
+    return 0
+
+mode = sys.argv[1]
+if   mode == "gen":  sys.exit(cmd_gen(float(sys.argv[2]), int(sys.argv[3])))
+elif mode == "tap":  sys.exit(cmd_tap(sys.argv[2]))
+elif mode == "test": sys.exit(cmd_test())
+PYEOF
+)
+
+bose_target() {
+  pw-cli ls Node 2>/dev/null | awk '
+    /node.name/ { name=tolower($0) }
+    /object.id/ && (name ~ /bose/ || name ~ /soundlink/) { gsub(/[^0-9]/,"",$0); print; exit }' 2>/dev/null
+}
+
+play_loop() {
+  local wav="$1"
+  if [ -e "$MUTE_FLAG" ]; then
+    echo "mesh-metronome: MUTE_FLAG present ($MUTE_FLAG) — refusing to play (room muted). Remove it to enable." >&2
+    return 3
+  fi
+  local bid; bid="$(bose_target)"
+  echo "mesh-metronome: playing $wav on the Bose (Ctrl-C to stop)…"
+  while :; do
+    if [ -n "$bid" ]; then pw-play --target "$bid" "$wav" 2>/dev/null || pw-play "$wav" 2>/dev/null
+    else pw-play "$wav" 2>/dev/null || aplay -q "$wav" 2>/dev/null; fi
+    [ -e "$MUTE_FLAG" ] && { echo "mesh-metronome: MUTE_FLAG appeared — stopping."; break; }
+  done
+}
+
+usage() { echo "usage: mesh-metronome <bpm> [beats] [--play]   |   --tap [file.wav]   |   --test" >&2; }
+
+case "${1:-}" in
+  ""|--help|-h) usage ;;
+  --test) METRO_DIR="$METRO_DIR" python3 -c "$PY" test ;;
+  --tap)
+    wav="${2:-}"
+    if [ -z "$wav" ]; then
+      wav="$(mktemp --suffix=.wav)"
+      echo "mesh-metronome: clap a steady beat… capturing ${TAP_SECS}s from the mic." >&2
+      # raw s16 mono @ the mic, same stream mesh-tuner/overhear use, wrapped to a WAV via ffmpeg.
+      pw-record --rate 16000 --channels 1 --format s16 - 2>/dev/null | \
+        timeout "$TAP_SECS" ffmpeg -loglevel error -f s16le -ar 16000 -ac 1 -i - -y "$wav" 2>/dev/null || true
+    fi
+    [ -s "$wav" ] || { echo "mesh-metronome: no audio captured (mic unavailable?)" >&2; exit 1; }
+    out="$(METRO_DIR="$METRO_DIR" python3 -c "$PY" tap "$wav")" || { echo "$out" | sed 's/\t/ /g'; exit 2; }
+    n="$(printf '%s' "$out" | cut -f2)"; bpm="$(printf '%s' "$out" | cut -f3)"
+    printf 'tap-tempo: %s onsets → %s BPM\n' "$n" "$bpm"
+    ;;
+  *)
+    bpm="$1"; shift
+    case "$bpm" in ''|*[!0-9.]*) echo "mesh-metronome: bpm must be a number, got '$bpm'" >&2; usage; exit 1;; esac
+    beats="${METRO_BEATS:-32}"; play=0
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --play) play=1 ;;
+        *[0-9]*) beats="$1" ;;
+      esac; shift
+    done
+    out="$(METRO_DIR="$METRO_DIR" METRO_BEATS="$beats" python3 -c "$PY" gen "$bpm" "$beats")" || { echo "mesh-metronome: synth failed" >&2; exit 1; }
+    rbpm="$(printf '%s' "$out" | cut -f1)"; rbeats="$(printf '%s' "$out" | cut -f2)"; wav="$(printf '%s' "$out" | cut -f3)"
+    printf 'metronome: %s BPM, %s beats → %s\n' "$rbpm" "$rbeats" "$wav"
+    [ "$play" = 1 ] && play_loop "$wav"
+    ;;
+esac
