@@ -1,0 +1,198 @@
+#!/usr/bin/env bash
+# mesh-temp-display — a full-screen, glanceable, always-on TEMPERATURE readout for a node's own screen.
+#
+# Built for the operator's explicit ask (2026-06-21): "put the temperature always in front of my eyes on
+# Default String and run it so it's always on screen." ds is the thermally-fragile box (cooling fault:
+# CPU package climbs to ~90C and FREEZES while the board stays ~27C) — so when the operator uses it "at
+# his own risk", he wants the package temp glanceable at all times to catch a climb before the freeze.
+#
+# This is a HUMAN display, not an alerter (that's mesh-therm-watch, which tiers alerts to trace/TG). It
+# reads /sys/class/thermal directly — portable, needs NO lm-sensors (ds has none) — keys on x86_pkg_temp
+# (the package temp that actually drives the freeze), renders it in BIG digits with a 0-100C gauge and a
+# colour band (green<warm, yellow<hot, red>=hot, flashing CRITICAL>=freeze-risk), refreshing every 2s.
+#
+#   mesh-temp-display            full-screen loop (clear+paint every MESH_TEMP_INTERVAL s)
+#   mesh-temp-display --once      render ONE frame and exit (for a pane snapshot / piping)
+#   mesh-temp-display --test      pure-logic smoke (level bands + big-digit render; no sysfs/tty needed)
+#
+# Tunables (env): MESH_TEMP_WARM=60  MESH_TEMP_HOT=80  MESH_TEMP_CRIT=88  MESH_TEMP_INTERVAL=2
+#
+# orphan-ok: on-demand operator instrument — a human-facing always-on display launched into a node's
+#   tmux window / tty by hand (or by mesh-restore on a node that opts in), never a cron/supervise reflex.
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+
+# --attach: idempotently install the always-on display into THIS node's tmux session — a dedicated
+# `temp` window (big full-screen readout) + a compact temp in the status bar (visible in every window).
+# Reusable on any node; on the freeze-prone ds it's wired to @reboot so the display returns after a crash.
+if [ "${1:-}" = --attach ]; then
+  SESS="$(hostname)"; BIN="$HOME/.local/bin/mesh-temp-display"
+  command -v tmux >/dev/null 2>&1 || { echo "mesh-temp-display --attach: no tmux"; exit 1; }
+  tmux has-session -t "$SESS" 2>/dev/null || { echo "mesh-temp-display --attach: no session '$SESS'"; exit 1; }
+  if tmux list-windows -t "$SESS" -F '#{window_name}' 2>/dev/null | grep -qx temp; then
+    tmux respawn-window -k -t "$SESS:temp" "$BIN" 2>/dev/null || true
+  else
+    tmux new-window -t "$SESS" -n temp "$BIN"
+  fi
+  cur="$(tmux show -gv status-right 2>/dev/null || echo '')"
+  case "$cur" in
+    *mesh-temp-display*) : ;;  # already carries temp — leave the operator's bar untouched
+    *) tmux set -g status-interval 3
+       tmux set -g status-right-length 80
+       tmux set -g status-right "#[bold]🌡 #($BIN --line)#[default]  ${cur}" ;;
+  esac
+  echo "mesh-temp-display: attached to '$SESS' (temp window + status bar)"
+  exit 0
+fi
+
+PY='
+import os, sys, time, glob
+
+WARM = float(os.environ.get("MESH_TEMP_WARM", "60"))
+HOT  = float(os.environ.get("MESH_TEMP_HOT",  "80"))
+CRIT = float(os.environ.get("MESH_TEMP_CRIT", "88"))
+INTERVAL = float(os.environ.get("MESH_TEMP_INTERVAL", "2"))
+
+RESET="\033[0m"; BOLD="\033[1m"
+GREEN="\033[32m"; YELLOW="\033[33m"; RED="\033[31m"; REDBG="\033[41m\033[97m"; DIM="\033[2m"; CYAN="\033[36m"
+
+# ── pure decision: temperature -> band (exercised by --test) ─────────────
+def level(c):
+    if c >= CRIT: return "CRITICAL"
+    if c >= HOT:  return "HOT"
+    if c >= WARM: return "WARM"
+    return "OK"
+
+def colour(lvl):
+    return {"OK":GREEN, "WARM":YELLOW, "HOT":RED, "CRITICAL":REDBG}.get(lvl, "")
+
+# ── 5-row big digits (glanceable across a room) ──────────────────────────
+FONT = {
+ "0":["█████","█   █","█   █","█   █","█████"],
+ "1":["  ██ "," ███ ","  ██ ","  ██ "," ████"],
+ "2":["█████","    █","█████","█    ","█████"],
+ "3":["█████","    █","█████","    █","█████"],
+ "4":["█   █","█   █","█████","    █","    █"],
+ "5":["█████","█    ","█████","    █","█████"],
+ "6":["█████","█    ","█████","█   █","█████"],
+ "7":["█████","    █","   █ ","  █  ","  █  "],
+ "8":["█████","█   █","█████","█   █","█████"],
+ "9":["█████","█   █","█████","    █","█████"],
+ ".":["     ","     ","     ","  ██ ","  ██ "],
+ "C":["█████","█    ","█    ","█    ","█████"],
+ "°":["██ ","█ █","██ ","   ","   "],
+ " ":["   ","   ","   ","   ","   "],
+}
+def big(s):
+    rows=["","","","",""]
+    for ch in s:
+        g=FONT.get(ch, FONT[" "])
+        for i in range(5): rows[i]+=g[i]+" "
+    return rows
+
+def read_zones():
+    zs=[]
+    for tf in sorted(glob.glob("/sys/class/thermal/thermal_zone*/temp")):
+        d=os.path.dirname(tf)
+        try:
+            t=int(open(tf).read().strip())/1000.0
+            typ=open(os.path.join(d,"type")).read().strip()
+        except Exception:
+            continue
+        zs.append((typ, t))
+    return zs
+
+def pkg(zs):
+    # the package temp drives the freeze; fall back to the hottest zone if absent
+    for typ,t in zs:
+        if typ=="x86_pkg_temp": return typ,t
+    return max(zs, key=lambda z: z[1]) if zs else ("none", 0.0)
+
+def gauge(c, width=40):
+    filled=max(0, min(width, int(round(c/100.0*width))))
+    lvl=level(c); col=colour(lvl)
+    return col + "█"*filled + RESET + DIM + "·"*(width-filled) + RESET
+
+def frame(zs, host):
+    if not zs:
+        return REDBG+BOLD+"  NO THERMAL ZONES READABLE — cannot show temperature  "+RESET
+    ptyp,pc = pkg(zs)
+    lvl=level(pc); col=colour(lvl)
+    ts=time.strftime("%H:%M:%SZ", time.gmtime())
+    out=[]
+    out.append(BOLD+CYAN+"  "+host.upper()+" THERMALS"+RESET+DIM+"   "+ts+"   refresh %gs"%INTERVAL+RESET)
+    out.append("")
+    for r in big("%.0f°C" % pc):
+        out.append("   "+col+BOLD+r+RESET)
+    out.append("")
+    out.append("   %s  %s  %s(freeze-risk ≥%g°C)%s" % (gauge(pc), col+BOLD+lvl+RESET, DIM, CRIT, RESET))
+    out.append("")
+    out.append("   "+DIM+"package: %s = %.1f°C"%(ptyp,pc)+RESET)
+    out.append("   "+DIM+"all zones:"+RESET)
+    for typ,t in zs:
+        c2=colour(level(t))
+        flag = "  <<< " + level(t) if t>=HOT else ""
+        out.append("     %-18s %s%5.1f°C%s%s" % (typ, c2, t, RESET, c2+BOLD+flag+RESET))
+    out.append("")
+    if lvl=="CRITICAL":
+        out.append("   "+REDBG+BOLD+"  *** FREEZE RISK — COOL THE NODE NOW ***  "+RESET)
+    return "\n".join(out)
+
+# ── modes ────────────────────────────────────────────────────────────────
+if len(sys.argv) > 1 and sys.argv[1]=="--test":
+    f=0
+    def eq(a,b,m):
+        global f
+        if a!=b: print("FAIL %s: got %r want %r"%(m,a,b)); f=1
+    eq(level(20),"OK","20->OK"); eq(level(59.9),"OK","59.9->OK")
+    eq(level(60),"WARM","60->WARM"); eq(level(79.9),"WARM","79.9->WARM")
+    eq(level(80),"HOT","80->HOT"); eq(level(87.9),"HOT","87.9->HOT")
+    eq(level(88),"CRITICAL","88->CRITICAL"); eq(level(95),"CRITICAL","95->CRITICAL")
+    rows=big("58°C")
+    eq(len(rows),5,"big->5 rows")
+    if not all(rows): print("FAIL: big rows non-empty"); f=1
+    # pkg() prefers x86_pkg_temp over a hotter other zone
+    p=pkg([("acpitz",27.0),("x86_pkg_temp",58.0),("SEN1",82.0)])
+    eq(p[0],"x86_pkg_temp","pkg prefers package")
+    # pkg() falls back to hottest when no package zone
+    p2=pkg([("acpitz",27.0),("SEN1",82.0)])
+    eq(p2[1],82.0,"pkg fallback=hottest")
+    # frame renders without a tty and contains the temp (plain-digit line) + the right band word
+    fr=frame([("acpitz",27.0),("x86_pkg_temp",65.0)], "test-node")
+    if "65" not in fr or "WARM" not in fr: print("FAIL: frame missing temp/band"); f=1
+    fr2=frame([], "test-node")
+    if "NO THERMAL ZONES" not in fr2: print("FAIL: empty-zones must say so, not a false 0C"); f=1
+    print("smoke-test: ok (level bands + big-digit + pkg-pick + honest-empty)" if f==0 else "smoke-test: FAILED"); sys.exit(f)
+
+# --line: one compact uncoloured line (for a tmux status bar / quick glance / piping)
+if len(sys.argv) > 1 and sys.argv[1]=="--line":
+    zs=read_zones()
+    if not zs: print("temp: UNREADABLE"); sys.exit(0)
+    ptyp,pc=pkg(zs); print("CPU %.0f°C %s" % (pc, level(pc))); sys.exit(0)
+
+ONCE = (len(sys.argv) > 1 and sys.argv[1]=="--once")
+host = os.environ.get("MESH_TEMP_HOST") or os.uname().nodename
+
+def paint():
+    zs=read_zones()
+    body=frame(zs, host)
+    # build then clear+paint atomically (a slow read leaves the last good frame, never a blank screen)
+    sys.stdout.write("\033[H\033[2J" + body + "\n")
+    sys.stdout.flush()
+
+if ONCE:
+    paint(); sys.exit(0)
+
+# full-screen loop: hide cursor, restore on exit
+sys.stdout.write("\033[?25l")
+try:
+    while True:
+        paint()
+        time.sleep(INTERVAL)
+except KeyboardInterrupt:
+    pass
+finally:
+    sys.stdout.write("\033[?25h\n"); sys.stdout.flush()
+'
+
+exec python3 -c "$PY" "$@"
