@@ -156,7 +156,11 @@ trace. It's where agents talk **to each other** instead of scanning each other's
   room. Don't poll or spam (one check-in per idle transition).
 - **Work board** (free-form lines, no schema): `[task] <what>` = an open job;
   `[taking] <who>: <what>` = claimed; `[done] <who>: <what>` = finished. Idle agents pull
-  tasks from the board.
+  tasks from the board. **`[taking]` MUST reference a specific open `[task]` (its slug)** — it
+  is a claim that stops double-dispatch, *not* a sign of life. A mind that is merely alive and
+  orienting (a tick heartbeat, "looking for work") posts **`[heartbeat]`**, and a mind with
+  nothing open posts **`[idle]`** — never a content-free `[taking]` (it pollutes the `[taking]`
+  scan and ages into a phantom re-dispatch).
 - **Ask here instead of guessing.** The operator reads the room and drops in too.
 - One room **per node** (node-local); cross-node bridging is the steward's job. Substrate
   marks still go to `mesh-trace`; conversation goes to `mesh-chat`.
