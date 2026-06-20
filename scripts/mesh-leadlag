@@ -1,0 +1,333 @@
+#!/usr/bin/env bash
+# mesh-leadlag — idea source #5: TIME-LAGGED lead-lag prediction across numeric sensor streams.
+#
+# The operator's direction (2026-06-20, relayed framing he endorsed): don't guess processes in
+# advance — find "which sensor most often KNOWS THE FUTURE", "which events PROPAGATE between
+# nodes with a lag". The worked examples: bluetooth_count near a window +20 → 15min later street
+# noise rises (a bus stop — you discovered the bus without measuring the bus); a Wi-Fi appears →
+# 5min later noise (the neighbour comes home); light drops on node A → 40min later on node B
+# (a weather front moving). "You don't see the wind, you see the leaves." This tool looks for the
+# leaves that move BEFORE other leaves.
+#
+# Where mesh-cooscillate finds SAME-TIME co-oscillation (ΔX_t vs ΔY_t), this finds LAGGED
+# prediction: does ΔX_t predict ΔY_{t+k} for some lag k>0? The winning (X→Y, k) is "X movement
+# predicts Y movement ~k·bin minutes later". Reuses cooscillate's parse (incl. the 758880f
+# name-aggregation that killed MAC-rotation winner's curse) + the same floor-gated seed machinery.
+#
+# WINNER'S-CURSE GUARDS (scanning many pairs × many lags = many lottery tickets — the exact trap
+# that produced the spurious Quest3×DV8235 r=-0.70; guarded from the start here):
+#   (1) name-aggregate BLE MACs → stable channels (mirror mesh-cooscillate 758880f);
+#   (2) the lead must BEAT the persistence/autocorrelation baseline — |corr(ΔX_t, ΔY_{t+k})| must
+#       exceed |corr(ΔY_t, ΔY_{t+k})| (Y predicting its OWN future) by a margin, else it's just
+#       Y's self-correlation leaking through;
+#   (3) a PERMUTATION significance test on the GLOBAL MAX statistic: shuffle each channel's deltas
+#       M times, recompute the best |effective r| over ALL pairs×lags; emit only if the observed
+#       best exceeds the (1-ALPHA) quantile of that null (controls the multiple-comparison curse
+#       for the REPORTED finding). honest-empty when nothing clears the null.
+#
+# Floor-gated into ideas-queue exactly like mesh-ideate / mesh-correlate / mesh-cooscillate.
+#   mesh-leadlag          emit ONE best finding to ideas-queue (floor-gated)
+#   mesh-leadlag --dry    print ALL candidate findings to stdout, do NOT append (preview)
+#   mesh-leadlag --list   alias for --dry
+#   mesh-leadlag --test   smoke test (planted X-leads-Y series, no queue write)
+#
+# reflex-cadence: 17-59/45 * * * *
+# Slower than cooscillate (30m): lagged scan + permutation is heavier and lead-lag structure
+# accrues over hours, not minutes. Floor-gated + recent-deduped so it never piles on.
+set -uo pipefail
+
+MESH="${MESH:-$HOME/.mesh}"
+PRESENCE="${LEADLAG_PRESENCE:-${COOSC_PRESENCE:-$MESH/presence.log}}"
+Q="$MESH/ideas-queue"
+LOCK="$MESH/.ideas-queue.lock"
+STATE="$MESH/.leadlag-state"
+SEEDS="$MESH/.correlation-seeds"                 # shared seed file → mesh-ideate
+SEED_MAX="${LEADLAG_SEED_MAX:-12}"
+RECENT_MAX="${LEADLAG_RECENT_MAX:-40}"
+WINDOW_H="${LEADLAG_WINDOW_H:-48}"
+BIN_S="${LEADLAG_BIN_S:-300}"                    # 5-min bins (lags become 5,10,15,20,30,40 min)
+MIN_BINS="${LEADLAG_MIN_BINS:-6}"
+MIN_OVERLAP="${LEADLAG_MIN_OVERLAP:-10}"         # min aligned Δ-steps per (pair,lag) — lag eats samples
+MIN_R="${LEADLAG_MIN_R:-0.6}"
+MARGIN="${LEADLAG_MARGIN:-0.10}"                 # lead must beat Y self-prediction by this |r| margin
+LAGS="${LEADLAG_LAGS:-1 2 3 4 6 8}"             # bins ahead (×BIN_S); k>0 = genuinely predictive
+TOPN="${LEADLAG_TOPN:-12}"                       # cap channels (most-sampled) to bound the perm scan
+PERM="${LEADLAG_PERM:-200}"                      # permutations for the global-max null
+ALPHA="${LEADLAG_ALPHA:-0.05}"
+ts(){ date -u +%FT%TZ; }
+
+recent_has(){ [ -f "$STATE" ] && grep -qxF "$1" "$STATE"; }
+recent_add(){ printf '%s\n' "$1" >> "$STATE"; tail -n "$RECENT_MAX" "$STATE" > "$STATE.tmp" 2>/dev/null && mv "$STATE.tmp" "$STATE"; }
+
+# SEED mesh-ideate — identical scheme to mesh-cooscillate. $1=key (leadlag:X:Y, colons sanitized
+# out of labels), $2=idea-text. Direction matters (X leads Y) so the key is NOT sorted.
+write_seed(){
+  local k="$1" txt="$2" kind rest a b ev
+  kind="${k%%:*}"; rest="${k#*:}"; a="${rest%%:*}"; b="${rest#*:}"
+  [ -z "$a" ] || [ -z "$b" ] && return 0
+  ev="$(printf '%s' "$txt" | grep -oE '\(r=[^)]*\)' | head -1 | tr -d '()')"
+  [ -z "$ev" ] && ev="lead-lag"
+  [ -f "$SEEDS" ] && grep -qF "$(printf '%s\t%s\t' "$a" "$b")" "$SEEDS" && return 0
+  printf '%s\t%s\t%s\t%s\n' "$a" "$b" "$kind" "$ev" >> "$SEEDS"
+  tail -n "$SEED_MAX" "$SEEDS" > "$SEEDS.tmp" 2>/dev/null && mv "$SEEDS.tmp" "$SEEDS"
+}
+
+# analyze <presence-log> -> sorted candidate findings, one/line: score<TAB>kind<TAB>key<TAB>idea
+analyze() {
+  LEADLAG_LOG="$1" LEADLAG_WINDOW_H="$WINDOW_H" LEADLAG_BIN_S="$BIN_S" \
+  LEADLAG_MIN_BINS="$MIN_BINS" LEADLAG_MIN_OVERLAP="$MIN_OVERLAP" LEADLAG_MIN_R="$MIN_R" \
+  LEADLAG_MARGIN="$MARGIN" LEADLAG_LAGS="$LAGS" LEADLAG_TOPN="$TOPN" LEADLAG_PERM="$PERM" \
+  LEADLAG_ALPHA="$ALPHA" python3 - <<'PY'
+import os, re, math, random, collections, datetime as dt
+LOG=os.environ["LEADLAG_LOG"]; WINDOW_H=float(os.environ["LEADLAG_WINDOW_H"]); BIN_S=int(os.environ["LEADLAG_BIN_S"])
+MIN_BINS=int(os.environ["LEADLAG_MIN_BINS"]); MIN_OVERLAP=int(os.environ["LEADLAG_MIN_OVERLAP"])
+MIN_R=float(os.environ["LEADLAG_MIN_R"]); MARGIN=float(os.environ["LEADLAG_MARGIN"])
+LAGS=[int(x) for x in os.environ["LEADLAG_LAGS"].split()]; TOPN=int(os.environ["LEADLAG_TOPN"])
+PERM=int(os.environ["LEADLAG_PERM"]); ALPHA=float(os.environ["LEADLAG_ALPHA"])
+random.seed(1729)  # deterministic permutation null (reproducible --test + stable reflex)
+
+TS_RE=re.compile(r'^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)')
+N_RE=re.compile(r'\bn=(\d+)'); DEVS_RE=re.compile(r'devices=\[(.*)\]')
+START_RE=re.compile(r'(-?\d+)\|([0-9A-Fa-f:]{17})\|')
+def epoch(s): return dt.datetime.fromisoformat(s.replace("Z","+00:00")).timestamp()
+
+# ---- parse + NAME-aggregate (mirror mesh-cooscillate 758880f) ----
+samples=[]; macname={}
+try: rows=open(LOG,errors="replace").read().splitlines()
+except Exception: rows=[]
+for line in rows:
+    m=TS_RE.match(line)
+    if not m: continue
+    try: t=epoch(m.group(1))
+    except Exception: continue
+    mn=N_RE.search(line)
+    if mn: samples.append((t,"n",float(mn.group(1))))
+    md=DEVS_RE.search(line)
+    if not md: continue
+    starts=list(START_RE.finditer(md.group(1))); inner=md.group(1)
+    for k,sm in enumerate(starts):
+        mac=sm.group(2).upper()
+        nstart=sm.end(); nend=starts[k+1].start() if k+1<len(starts) else len(inner)
+        nm=inner[nstart:nend].strip()
+        key = nm if (nm and nm != "?") else mac   # stable NAME, nameless '?' stay per-MAC
+        samples.append((t,"rssi:"+key,float(sm.group(1))))
+        if nm and nm!="?": macname[mac]=nm
+
+if samples:
+    tmax=max(s[0] for s in samples); tmin=tmax-WINDOW_H*3600
+    samples=[s for s in samples if s[0]>=tmin]
+if not samples: raise SystemExit(0)
+
+binvals=collections.defaultdict(lambda: collections.defaultdict(list))
+for t,ch,v in samples: binvals[int(t//BIN_S)][ch].append(v)
+series=collections.defaultdict(dict)
+for b,chm in binvals.items():
+    for ch,vs in chm.items(): series[ch][b]=sum(vs)/len(vs)
+chans=[c for c in series if len(series[c])>=MIN_BINS]
+chans.sort(key=lambda c:-len(series[c]))
+chans=chans[:TOPN]                                # bound the pair×lag×perm scan
+if len(chans)<2: raise SystemExit(0)
+
+def label(ch):
+    if ch=="n": return "BLE-device-count"
+    mac=ch.split(":",1)[1]; nm=macname.get(mac); base=nm if nm else mac
+    return base.replace(":","-").strip()          # colon-safe for the seed key
+
+# first-differences keyed by the LATER bin: d[b] = val[b]-val[b-1] when both bins present
+def deltas(ch):
+    s=series[ch]; out={}
+    for b in s:
+        if (b-1) in s: out[b]=s[b]-s[b-1]
+    return out
+dser={c:deltas(c) for c in chans}
+dser={c:d for c,d in dser.items() if len(d)>=MIN_OVERLAP}
+chans=[c for c in chans if c in dser]
+if len(chans)<2: raise SystemExit(0)
+
+def pearson(xs,ys):
+    n=len(xs)
+    if n<2: return 0.0
+    mx=sum(xs)/n; my=sum(ys)/n
+    sx=sum((x-mx)**2 for x in xs); sy=sum((y-my)**2 for y in ys)
+    if sx<=0 or sy<=0: return 0.0
+    return sum((x-mx)*(y-my) for x,y in zip(xs,ys))/math.sqrt(sx*sy)
+
+# effective lead strength of (X->Y) at lag k using given delta-dicts (dx,dy):
+#   align ΔX_t (dx[b]) with ΔY_{t+k} (dy[b+k]); compare to Y self-prediction corr(ΔY_t,ΔY_{t+k})
+def eval_pair(dx,dy,k):
+    bs=[b for b in dx if (b+k) in dy]
+    if len(bs)<MIN_OVERLAP: return None
+    xs=[dx[b] for b in bs]; ys=[dy[b+k] for b in bs]
+    r=pearson(xs,ys)
+    ab=[b for b in dy if (b+k) in dy]
+    ra=pearson([dy[b] for b in ab],[dy[b+k] for b in ab]) if len(ab)>=2 else 0.0
+    eff=abs(r)-abs(ra)
+    return (r,ra,eff,len(bs))
+
+def scan(dmap):
+    cands=[]
+    cl=list(dmap.keys())
+    for X in cl:
+        for Y in cl:
+            if X==Y or label(X)==label(Y): continue
+            for k in LAGS:
+                res=eval_pair(dmap[X],dmap[Y],k)
+                if not res: continue
+                r,ra,eff,n=res
+                cands.append((eff,r,ra,n,X,Y,k))
+    return cands
+
+cands=scan(dser)
+if not cands: raise SystemExit(0)
+cands.sort(key=lambda c:-c[0])
+S_obs=cands[0][0]                                 # global max effective statistic
+
+# ---- permutation null on the GLOBAL MAX (controls multiple-comparison winner's curse) ----
+# shuffle each channel's delta VALUES across its bins → breaks temporal/cross structure, keeps marginals.
+def shuffled(dmap):
+    out={}
+    for c,d in dmap.items():
+        bs=list(d.keys()); vs=list(d.values()); random.shuffle(vs)
+        out[c]=dict(zip(bs,vs))
+    return out
+ge=1                                              # +1 (observed counts as one) — conservative
+for _ in range(PERM):
+    sc=scan(shuffled(dser))
+    sm=max((c[0] for c in sc), default=0.0)
+    if sm>=S_obs: ge+=1
+pval=ge/(PERM+1)
+
+# emit only candidates that clear ALL guards AND the global-max permutation test
+out=[]
+for eff,r,ra,n,X,Y,k in cands:
+    if abs(r)<MIN_R: continue
+    if eff<MARGIN: continue
+    if pval>ALPHA: break                          # global finding not significant → honest-empty
+    mins=k*BIN_S//60
+    la,lb=label(X),label(Y)
+    score=eff*math.sqrt(n)
+    key="leadlag:%s:%s" % (la,lb)
+    idea=("LEAD-LAG (auto, real data): %s movement PREDICTS %s movement ~%d min later "
+          "(r=%.2f at lag %d bins; beats %s self-prediction r=%.2f; %d aligned Δ-steps over %.0fh; perm p=%.3f) — "
+          "a propagating process or a shared delayed driver? Name the hidden process (what moves FIRST, "
+          "what it's a trace of); if spurious, discard in one line."
+          % (la, lb, mins, r, k, lb, ra, n, WINDOW_H, pval))
+    out.append((score,"LEADLAG",key,idea))
+# de-dup by directed pair (keep the strongest lag per X->Y)
+seen=set(); ded=[]
+for c in out:
+    if c[2] in seen: continue
+    seen.add(c[2]); ded.append(c)
+for sc,kind,key,idea in ded:
+    print("%.4f\t%s\t%s\t%s" % (sc,kind,key,idea))
+PY
+}
+
+# ---------- args ----------
+mode="run"
+case "${1:-}" in
+  --dry|--list) mode="dry" ;;
+  --test) mode="test" ;;
+  "" ) mode="run" ;;
+  *) echo "usage: mesh-leadlag [--dry|--list|--test]" >&2; exit 2 ;;
+esac
+
+# ---------- self-test ----------
+if [ "$mode" = "test" ]; then
+  _td="$(mktemp -d)"; trap 'rm -rf "$_td"' EXIT
+  tp="$_td/presence.log"
+  # plant: WatchA's movement LEADS LampB by exactly 2 bins (LampB_t = WatchA_{t-2}); a noise device
+  # NoiseC is independent; n flat. A rotating-MAC "Roamer" (4 MACs × 4 bins) tests name-aggregation.
+  python3 - "$tp" <<'PY'
+import sys,datetime as dt
+out=open(sys.argv[1],"w"); base=dt.datetime(2026,6,20,0,0,0,tzinfo=dt.timezone.utc)
+N=40
+# LOW-autocorrelation (white) driver via a deterministic LCG — so Y's self-prediction baseline is
+# ~0 at every lag and the lead peak sits cleanly at the TRUE lag (a smooth/sinusoidal driver would
+# predict its own future, shifting the effective-lead peak — the guard working, but a bad test signal).
+drv=[]; _x=12345
+for _ in range(N+4):
+    _x=(_x*1103515245+12345)&0x7fffffff; drv.append(_x%21-10)
+noise=[(i*37%11)-5 for i in range(N)]                    # deterministic pseudo-noise, independent
+ROT=["E0:E0:E0:E0:E0:%02X"%(1+i//4) for i in range(N)]   # Roamer MAC rotates every 4 bins
+for i in range(N):
+    t=(base+dt.timedelta(seconds=300*i)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    wa=-55+drv[i+2]            # WatchA = driver NOW (leads)
+    lb=-60+drv[i]             # LampB  = driver 2 bins ago  → WatchA_{t} predicts LampB_{t+2}
+    nc=-70+noise[i]          # NoiseC independent
+    rm=-65+((i*13)%9-4)     # Roamer, weak/independent
+    devs="%d|AA:AA:AA:AA:AA:AA|WatchA %d|BB:BB:BB:BB:BB:BB|LampB %d|CC:CC:CC:CC:CC:CC|NoiseC %d|%s|Roamer"%(wa,lb,nc,rm,ROT[i])
+    out.write("%s host n=4 devices=[%s]\n"%(t,devs))
+out.close()
+PY
+  raw="$(LEADLAG_PRESENCE="$tp" LEADLAG_WINDOW_H=48 LEADLAG_BIN_S=300 LEADLAG_MIN_OVERLAP=8 \
+         LEADLAG_PERM=120 analyze "$tp")"
+  fail=0
+  echo "$raw" | grep -q '^[0-9]' || { echo "  FAIL: no candidate from planted lead-lag series: $raw"; fail=1; }
+  top="$(printf '%s\n' "$raw" | head -1)"
+  # WatchA must be found to LEAD LampB (directionality: WatchA predicts LampB, not the reverse)
+  echo "$top" | grep -q 'WatchA movement PREDICTS LampB' || { echo "  FAIL: did not recover WatchA→LampB lead direction: $top"; fail=1; }
+  echo "$top" | grep -q '~10 min later' || { echo "  FAIL: did not recover the 2-bin (10min) lag: $top"; fail=1; }
+  # NoiseC must NOT be the top predictor (independent stream)
+  echo "$top" | grep -q 'NoiseC movement PREDICTS' && { echo "  FAIL: independent NoiseC surfaced as a lead: $top"; fail=1; }
+  # NULL guard: a PURE-NOISE log must yield NOTHING (permutation test rejects the winner's curse)
+  np="$_td/noise.log"
+  python3 - "$np" <<'PY'
+import sys,datetime as dt
+out=open(sys.argv[1],"w"); base=dt.datetime(2026,6,20,0,0,0,tzinfo=dt.timezone.utc)
+for i in range(40):
+    t=(base+dt.timedelta(seconds=300*i)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    a=-55+((i*31)%13-6); b=-60+((i*17)%11-5); c=-70+((i*7)%9-4)
+    out.write("%s host n=3 devices=[%d|AA:AA:AA:AA:AA:AA|RandA %d|BB:BB:BB:BB:BB:BB|RandB %d|CC:CC:CC:CC:CC:CC|RandC]\n"%(t,a,b,c))
+out.close()
+PY
+  nraw="$(LEADLAG_PRESENCE="$np" LEADLAG_WINDOW_H=48 LEADLAG_BIN_S=300 LEADLAG_MIN_OVERLAP=8 LEADLAG_PERM=120 analyze "$np")"
+  [ -z "$nraw" ] || { echo "  FAIL: pure-noise log produced a finding (permutation guard failed): $nraw"; fail=1; }
+  # seed write + floor-gate parity
+  MESH="$_td" LEADLAG_PRESENCE="$tp" LEADLAG_WINDOW_H=48 LEADLAG_MIN_OVERLAP=8 LEADLAG_PERM=120 IDEATE_FLOOR=1 bash "$0" >/dev/null 2>&1
+  n="$(grep -c '^\[ \] LEAD-LAG' "$_td/ideas-queue" 2>/dev/null)"; n="${n:-0}"
+  [ "$n" = "1" ] || { echo "  FAIL: expected exactly 1 emitted finding, got $n: $(cat "$_td/ideas-queue" 2>/dev/null)"; fail=1; }
+  grep -qF "$(printf 'WatchA\tLampB')" "$_td/.correlation-seeds" 2>/dev/null || { echo "  FAIL: directed seed WatchA->LampB not written: $(cat "$_td/.correlation-seeds" 2>/dev/null)"; fail=1; }
+  # floor-gate: a busy queue must HOLD
+  printf '[ ] something open\n' > "$_td/ideas-queue"
+  out2="$(MESH="$_td" LEADLAG_PRESENCE="$tp" LEADLAG_WINDOW_H=48 LEADLAG_MIN_OVERLAP=8 LEADLAG_PERM=60 IDEATE_FLOOR=1 bash "$0" 2>&1)"
+  echo "$out2" | grep -qi 'hold' || { echo "  FAIL: floor-gate did not hold on non-empty queue: $out2"; fail=1; }
+  [ "$fail" = 0 ] && { echo "smoke-test: ok (recovered WatchA→LampB @10min lag; noise rejected by permutation; 1 finding; directed seed; floor-gate holds)"; exit 0; } || { echo "smoke-test: FAIL"; exit 1; }
+fi
+
+[ -f "$PRESENCE" ] || { echo "$(ts) mesh-leadlag: no presence log yet ($PRESENCE) — need a live numeric source" >&2; exit 1; }
+
+raw="$(analyze "$PRESENCE")" || { echo "$(ts) mesh-leadlag: analyze failed" >&2; exit 1; }
+
+# SEED the connection generator with the TOP finding (not on --dry: preview must be side-effect-free).
+if [ "$mode" != "dry" ] && [ -n "$raw" ]; then
+  IFS=$'\t' read -r _sc _kind _tk _ttext <<< "$(printf '%s\n' "$raw" | head -1)"
+  [ -n "$_tk" ] && write_seed "$_tk" "$_ttext"
+fi
+
+if [ "$mode" = "dry" ]; then
+  if [ -z "$raw" ]; then echo "$(ts) mesh-leadlag: no stream predicts another above the permutation null (honest empty, not a failure — need more data / more live numeric streams / cross-node tapes)"; else echo "$raw"; fi
+  exit 0
+fi
+
+# FLOOR gate — one provocation at a time (mesh-ideate discipline).
+floor="${IDEATE_FLOOR:-1}"
+open=$(grep -c '^\[ \]' "$Q" 2>/dev/null); open="${open:-0}"
+if [ "$open" -ge "$floor" ]; then
+  echo "$(ts) mesh-leadlag: queue has $open open idea(s) (>= floor $floor) — hold, not piling on"; exit 0
+fi
+
+idea=""; key=""
+while IFS=$'\t' read -r sc kind k text; do
+  [ -z "$text" ] && continue
+  recent_has "$k" && continue
+  idea="$text"; key="$k"; break
+done <<< "$raw"
+
+[ -z "$idea" ] && { echo "$(ts) mesh-leadlag: no fresh finding (none meet thresholds, or all recently emitted)"; exit 0; }
+
+exec 9>"$LOCK" 2>/dev/null || true
+flock -w 30 9 2>/dev/null || true
+printf '[ ] %s\n' "$idea" >> "$Q"
+recent_add "$key"
+echo "$(ts) mesh-leadlag: +1 finding -> ideas-queue ($key)"
