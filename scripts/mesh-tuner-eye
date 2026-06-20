@@ -17,9 +17,11 @@
 #   mesh-tuner-eye --detect      alias of --once (frame → label only, no tuner, no voice)
 #   mesh-tuner-eye --test        logic self-test (no cam, no cloud) — state machine + parsing
 #
-# Tunables (env): EYE_CAM=/dev/video0 · CAM_RES=640x480 · TUNEREYE_POLL=3 (seconds between frames)
-#   · TUNEREYE_ON=2 (consecutive instrument-frames to START) · TUNEREYE_OFF=3 (consecutive
-#   empty-frames to STOP) — hysteresis so a blurred/averted frame doesn't flap the tuner.
+# Tunables (env): EYE_CAM=/dev/video0 · CAM_RES=640x480 · TUNEREYE_POLL=18 (seconds between frames
+#   — the Groq vision call costs a FIXED ~1900 input tokens/frame and the on_demand TPM ceiling is
+#   8000/min SHARED with mesh-relay/face-recognize, so poll slowly: ~3 frames/min leaves headroom) ·
+#   TUNEREYE_ON=2 (consecutive instrument-frames to START) · TUNEREYE_OFF=3 (consecutive empty-frames
+#   to STOP) — hysteresis so a blurred/averted frame doesn't flap the tuner.
 set -uo pipefail
 export PATH="$HOME/.local/bin:$PATH"
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
@@ -33,9 +35,11 @@ export TUNEREYE_VOICE="${TUNEREYE_VOICE:-$MESH/tuner-voice/start.wav}"
 export EYE_CAM="${EYE_CAM:-/dev/video0}"
 export CAM_RES="${CAM_RES:-640x480}"
 export GROQ_ENV="${GROQ_ENV:-$MESH/groq.env}"
-export TUNEREYE_POLL="${TUNEREYE_POLL:-3}"
+export TUNEREYE_POLL="${TUNEREYE_POLL:-18}"           # idle watch cadence (TPM-safe ~3.3 frames/min)
+export TUNEREYE_ACTIVE_POLL="${TUNEREYE_ACTIVE_POLL:-16}"  # cadence while the tuner is running
+export TUNEREYE_CONFIRM="${TUNEREYE_CONFIRM:-3}"      # fast re-poll mid-transition (enter/leave) → snappy
 export TUNEREYE_ON="${TUNEREYE_ON:-2}"
-export TUNEREYE_OFF="${TUNEREYE_OFF:-3}"
+export TUNEREYE_OFF="${TUNEREYE_OFF:-2}"              # stop within ~CONFIRM of the 2nd empty frame
 export TUNEREYE_PID="${TUNEREYE_PID:-$MESH/tuner-eye.tunerpid}"
 export LOG="${TUNEREYE_LOG:-$MESH/tuner-eye.log}"
 
@@ -48,9 +52,15 @@ cat > "$PY" <<'PYEOF'
 import os, sys, json, time, base64, subprocess
 
 CAM   = os.environ["EYE_CAM"]; RES = os.environ["CAM_RES"]
-POLL  = float(os.environ.get("TUNEREYE_POLL","3"))
+POLL  = float(os.environ.get("TUNEREYE_POLL","18"))
+ACTIVE_POLL = float(os.environ.get("TUNEREYE_ACTIVE_POLL","16"))
+CONFIRM     = float(os.environ.get("TUNEREYE_CONFIRM","3"))
 NEED_ON  = int(os.environ.get("TUNEREYE_ON","2"))
-NEED_OFF = int(os.environ.get("TUNEREYE_OFF","3"))
+NEED_OFF = int(os.environ.get("TUNEREYE_OFF","2"))
+VOICEDIR = os.path.dirname(os.environ["TUNEREYE_VOICE"])
+# Two start phrases, keyed by what the camera saw — operator wants "Вижу <инструмент>, запускаю тюнер".
+START_PHRASES = {"guitar": ("Вижу гитару, запускаю тюнер",     "start_guitar.wav"),
+                 "cello":  ("Вижу виолончель, запускаю тюнер", "start_cello.wav")}
 GROQ_ENV = os.environ["GROQ_ENV"]; MODEL = "qwen/qwen3.6-27b"
 PIPER = os.environ["OH_PIPER"]; PIPERLIB = os.environ["OH_PIPERLIB"]; VOICE = os.environ["OH_VOICE"]
 STARTWAV = os.environ["TUNEREYE_VOICE"]; MUTE = os.environ["MUTE_FLAG"]
@@ -90,7 +100,9 @@ def classify(jpg, key):
               "- 'cello' if a cello or similar large bowed string instrument is present/held,\n"
               "- 'none' if there is no such instrument in the frame.\n"
               "Output only the one word, no punctuation, no explanation.")
-    payload = {"model": MODEL, "temperature": 0.0, "max_tokens": 200, "messages": [
+    # max_tokens must clear the reasoning model's <think> block + the one-word answer; 200 truncated
+    # mid-think → parse fell through to 'none' (silent no-trigger). 1000 matches mesh-face-recognize.
+    payload = {"model": MODEL, "temperature": 0.0, "max_tokens": 1000, "messages": [
         {"role":"user","content":[
             {"type":"text","text":prompt},
             {"type":"image_url","image_url":{"url":"data:image/jpeg;base64,%s"%b64}}]}]}
@@ -136,20 +148,42 @@ def bose_id():
     except Exception: pass
     return None
 
-def say(text):
-    os.makedirs(os.path.dirname(STARTWAV), exist_ok=True)
-    if not (os.path.exists(STARTWAV) and os.path.getsize(STARTWAV)>0):
-        piper_render(text, STARTWAV)
-    if not os.path.exists(STARTWAV): return
+def _vol_floor(bid, floor=0.9):
+    """Operator couldn't hear the start announcement. Unmute the Bose and raise it to >= floor JUST for
+    the announcement, returning the prior volume so we restore it after (don't hijack the music level)."""
+    prev=None
+    try:
+        import re
+        out=subprocess.run(["wpctl","get-volume",bid],capture_output=True,text=True,timeout=5).stdout
+        m=re.search(r'Volume:\s*([0-9.]+)', out); prev=float(m.group(1)) if m else None
+        subprocess.run(["wpctl","set-mute",bid,"0"],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=5)
+        if prev is None or prev < floor:
+            subprocess.run(["wpctl","set-volume",bid,str(floor)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=5)
+    except Exception: pass
+    return prev
+
+def _vol_restore(bid, prev):
+    if prev is None: return
+    try: subprocess.run(["wpctl","set-volume",bid,str(prev)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=5)
+    except Exception: pass
+
+def say(text, wav=None):
+    wav = wav or STARTWAV
+    os.makedirs(os.path.dirname(wav), exist_ok=True)
+    if not (os.path.exists(wav) and os.path.getsize(wav)>0):
+        piper_render(text, wav)
+    if not os.path.exists(wav): return
     try: open(MUTE,"w").close()          # tell the overhear listener "that's me"
     except Exception: pass
-    bid = bose_id()
+    bid = bose_id(); prev=None
     if bid:
         try: subprocess.run(["wpctl","set-default",bid],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=5)
         except Exception: pass
-        subprocess.run(["pw-play","--target",bid,STARTWAV],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        prev=_vol_floor(bid)             # make sure it's actually audible
+        subprocess.run(["pw-play","--target",bid,wav],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        _vol_restore(bid, prev)
     else:
-        subprocess.run(["pw-play",STARTWAV],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        subprocess.run(["pw-play",wav],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
     try: time.sleep(0.2); os.remove(MUTE)
     except Exception: pass
 
@@ -160,15 +194,16 @@ def tuner_running():
     except Exception:
         return None
 
-def start_tuner():
+def start_tuner(label="guitar"):
     if tuner_running(): return
-    say("Запускаю тюнер")
+    text, fn = START_PHRASES.get(label, ("Запускаю тюнер", "start.wav"))
+    say(text, os.path.join(VOICEDIR, fn))
     p = subprocess.Popen(["mesh-tuner","--loop"], stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL, start_new_session=True)
     try:
         with open(PIDFILE,"w") as f: f.write(str(p.pid))
     except Exception: pass
-    log("[on] instrument in frame → tuner started (pid %d)" % p.pid)
+    log("[on] %s in frame → tuner started (pid %d)" % (label, p.pid))
 
 def stop_tuner():
     pid = tuner_running()
@@ -188,8 +223,9 @@ def mode_once(key):
     print(label); return 0
 
 def mode_loop(key):
-    log("[start] watching %s every %ss (on=%d off=%d frames)" % (CAM, POLL, NEED_ON, NEED_OFF))
-    on=0; off=0; active=False
+    log("[start] watching %s (idle %ss / active %ss / confirm %ss · on=%d off=%d)"
+        % (CAM, POLL, ACTIVE_POLL, CONFIRM, NEED_ON, NEED_OFF))
+    on=0; off=0; active=False; errs=0; seen="guitar"
     while True:
         jpg = capture()
         label = classify(jpg, key) if (jpg and key) else "none"
@@ -197,14 +233,22 @@ def mode_loop(key):
             try: os.remove(jpg)
             except Exception: pass
         present = label in ("guitar","cello")
-        if present: on+=1; off=0
+        if present: on+=1; off=0; seen=label    # remember WHICH instrument for the start phrase
         elif label=="none": off+=1; on=0
-        # 'error' frames neither confirm nor deny — hold state
+        # 'error' frames (incl. TPM 429) neither confirm nor deny — hold state, just back off.
         if not active and on>=NEED_ON:
-            start_tuner(); active=True; on=0
+            start_tuner(seen); active=True; on=0
         elif active and off>=NEED_OFF:
             stop_tuner(); active=False; off=0
-        time.sleep(POLL)
+        # adaptive cadence: poll FAST mid-transition (a change just started → confirm it quickly so
+        # start/stop land within ~CONFIRM s), ACTIVE_POLL while tracking, slow POLL while idle-watching.
+        if (not active and 0 < on < NEED_ON) or (active and 0 < off < NEED_OFF):
+            delay = CONFIRM
+        else:
+            delay = ACTIVE_POLL if active else POLL
+        errs = errs+1 if label=="error" else 0   # back off only when the TPM is exhausted
+        if label=="error": delay = max(delay, POLL) * (1 + min(errs, 4))
+        time.sleep(delay)
 
 def mode_test():
     ok=True
@@ -216,17 +260,18 @@ def mode_test():
         r = raw.split("</think>",1)[1] if "</think>" in raw else raw
         got=parse_label(r); good=(got==exp)
         print("  %-28s → %-7s %s" % (repr(raw), got, "ok" if good else "FAIL")); ok=ok and good
-    # hysteresis state machine: 2 guitar frames start, 3 none frames stop
-    seq=["none","guitar","guitar","none","none","none","guitar"]
-    on=0; off=0; active=False; events=[]
+    # hysteresis state machine: NEED_ON instrument-frames START, NEED_OFF empty-frames STOP, and an
+    # 'error' frame (TPM 429) must HOLD state — never spuriously stop the tuner mid-tuning.
+    seq=["none","guitar","guitar","error","none","none","guitar","cello"]
+    on=0; off=0; active=False; events=[]; seen="guitar"
     for lbl in seq:
         present=lbl in ("guitar","cello")
-        if present: on+=1; off=0
+        if present: on+=1; off=0; seen=lbl
         elif lbl=="none": off+=1; on=0
-        if not active and on>=2: events.append("START"); active=True; on=0
-        elif active and off>=3: events.append("STOP"); active=False; off=0
-    exp_ev=["START","STOP"]
-    hok=(events==exp_ev); print("  hysteresis %-18s → %s %s" % (seq, events, "ok" if hok else "FAIL")); ok=ok and hok
+        if not active and on>=NEED_ON: events.append("START:"+seen); active=True; on=0
+        elif active and off>=NEED_OFF: events.append("STOP"); active=False; off=0
+    exp_ev=["START:guitar","STOP","START:cello"]
+    hok=(events==exp_ev); print("  hysteresis(on=%d off=%d) → %s %s" % (NEED_ON,NEED_OFF,events,"ok" if hok else "FAIL")); ok=ok and hok
     print("smoke-test: %s" % ("ok (parse + state machine sound)" if ok else "FAIL")); return 0 if ok else 1
 
 mode = sys.argv[1] if len(sys.argv)>1 else "once"
