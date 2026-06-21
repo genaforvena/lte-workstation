@@ -47,6 +47,31 @@ wd_should_post() {  # $1=window name  $2=kind(blocked|limited) → exit 0 = post
   return 0
 }
 
+# health_step <prev-state> <result FAIL|PASS> <debounce> -> "<new-state> <action>"  (PURE — dry-runnable,
+# the reason the debounce can be --test'd without a live mesh-health run). state = "FAIL:<count>:<posted>";
+# legacy bare "FAIL"/"PASS" migrate. action: postfail | postok | silent.
+health_step() {
+  local prev="$1" result="$2" deb="$3" cnt posted act
+  if [ "$result" = FAIL ]; then
+    case "$prev" in
+      FAIL:*) cnt=${prev#FAIL:}; posted=${cnt#*:}; cnt=${cnt%%:*} ;;
+      FAIL)   cnt=$deb; posted=1 ;;          # legacy: old logic already posted on cycle 1
+      *)      cnt=0; posted=0 ;;
+    esac
+    cnt=$((cnt+1)); act=silent
+    if [ "$cnt" -ge "$deb" ] && [ "$posted" != 1 ]; then act=postfail; posted=1; fi
+    echo "FAIL:$cnt:$posted $act"
+  else
+    case "$prev" in
+      FAIL:*) posted=${prev##*:} ;;
+      FAIL)   posted=1 ;;                     # legacy posted-fail → recover (don't strand the alarm)
+      *)      posted=0 ;;
+    esac
+    [ "$posted" = 1 ] && act=postok || act=silent   # recover only if we actually posted a [health-fail]
+    echo "PASS $act"
+  fi
+}
+
 # --edge / --once: run ONE check cycle then exit (the */10 cron backup path). Parse + shift BEFORE
 # SESSION= so the flag is never mistaken for a session name — that was the watchdog-edge-noop bug:
 # the cron's '--edge' became SESSION="${1:-...}", so the watchdog watched a nonexistent session and
@@ -69,7 +94,20 @@ if [ "${1:-}" = --test ]; then
   # distinct kind/mind must be independent (not share a counter)
   MESH_DIR="$_td" wd_should_post plan limited || { echo "smoke-test: FAIL (cooldown leaked across mind+kind)"; rm -rf "$_td"; exit 1; }
   rm -rf "$_td"
-  echo "smoke-test: ok (repost-cooldown verified)"; exit 0
+  # health_step debounce state machine (the 2026-06-21 [health-fail] de-flap): a transient blip (1 FAIL
+  # then recover) must be SILENT both ways; a real outage (≥DEBOUNCE consecutive) posts once + recovers;
+  # legacy bare-FAIL migrates without re-posting or stranding. A regression here = the daily ~01:00 self
+  # cry-wolf returns, OR a real outage goes unannounced.
+  hf=0
+  [ "$(health_step PASS FAIL 2)"     = "FAIL:1:0 silent" ]   || { echo "FAIL health_step: blip cycle1 should be silent"; hf=1; }
+  [ "$(health_step FAIL:1:0 PASS 2)" = "PASS silent" ]       || { echo "FAIL health_step: debounced blip must recover silently (no post)"; hf=1; }
+  [ "$(health_step FAIL:1:0 FAIL 2)" = "FAIL:2:1 postfail" ] || { echo "FAIL health_step: 2nd consecutive must post"; hf=1; }
+  [ "$(health_step FAIL:2:1 FAIL 2)" = "FAIL:3:1 silent" ]   || { echo "FAIL health_step: already-posted must not re-post"; hf=1; }
+  [ "$(health_step FAIL:3:1 PASS 2)" = "PASS postok" ]       || { echo "FAIL health_step: real outage must post recovery"; hf=1; }
+  [ "$(health_step FAIL PASS 2)"     = "PASS postok" ]       || { echo "FAIL health_step: legacy bare-FAIL must recover (no strand)"; hf=1; }
+  [ "$(health_step FAIL FAIL 2)"     = "FAIL:3:1 silent" ]   || { echo "FAIL health_step: legacy bare-FAIL must not re-post"; hf=1; }
+  [ "$hf" = 0 ] || { echo "smoke-test: FAIL (health_step debounce regressed)"; exit 1; }
+  echo "smoke-test: ok (repost-cooldown + health_step debounce verified)"; exit 0
 fi
 
 INTERVAL="${2:-120}"
@@ -168,48 +206,25 @@ while true; do
         mkdir -p "$health_dir"
         health_out=$(mesh-health 2>/dev/null) || true
         while read -r result host rest; do
-            case "$result" in
-                FAIL)
-                    prev=$(cat "$health_dir/$host" 2>/dev/null || echo "")
-                    # state = "FAIL:<consecutive-count>:<posted 0|1>"; legacy bare "FAIL" = old logic
-                    # already posted on cycle 1 → treat as past-threshold+posted so it neither re-posts
-                    # now nor strands its recovery.
-                    case "$prev" in
-                        FAIL:*) cnt=${prev#FAIL:}; posted=${cnt#*:}; cnt=${cnt%%:*} ;;
-                        FAIL)   cnt=$HEALTH_DEBOUNCE; posted=1 ;;
-                        *)      cnt=0; posted=0 ;;
-                    esac
-                    cnt=$((cnt+1))
-                    if [ "$cnt" -ge "$HEALTH_DEBOUNCE" ] && [ "$posted" != 1 ]; then
-                        trace "HEALTH FAIL: $host $rest ($cnt consecutive ≥ debounce $HEALTH_DEBOUNCE)"
-                        command -v mesh-chat >/dev/null 2>&1 && MESH_WHO="watchdog@$(hostname)" \
-                            mesh-chat "[health-fail] $host — $rest" >/dev/null 2>&1
-                        posted=1
-                    elif [ "$posted" != 1 ]; then
-                        trace "HEALTH FAIL(debounce $cnt/$HEALTH_DEBOUNCE): $host $rest — transient, not yet posted"
-                    fi
-                    echo "FAIL:$cnt:$posted" > "$health_dir/$host"
-                    ;;
-                PASS)
-                    prev=$(cat "$health_dir/$host" 2>/dev/null || echo "")
-                    # recover ONLY if we actually posted a [health-fail] (posted=1, or legacy bare FAIL).
-                    # A debounced blip (failed <DEBOUNCE then recovered, posted=0) is silent both ways.
-                    case "$prev" in
-                        FAIL:*) posted=${prev##*:} ;;
-                        FAIL)   posted=1 ;;
-                        *)      posted=0 ;;
-                    esac
-                    if [ "$posted" = 1 ]; then
-                        trace "HEALTH RECOVERED: $host $rest"
-                        # post recovery to the BOARD too (not just the trace): a [health-fail] with no
-                        # board-visible recovery strands a resolved alarm → other minds think the node is
-                        # still down (the same stale-alarm class fixed for mesh-doctor's RECOVERED, 2026-06-12).
-                        command -v mesh-chat >/dev/null 2>&1 && MESH_WHO="watchdog@$(hostname)" \
-                            mesh-chat "[health-ok] $host — RECOVERED ($rest)" >/dev/null 2>&1
-                    fi
-                    echo "PASS" > "$health_dir/$host"
-                    ;;
+            case "$result" in FAIL|PASS) ;; *) continue ;; esac
+            prev=$(cat "$health_dir/$host" 2>/dev/null || echo "")
+            read -r newstate act < <(health_step "$prev" "$result" "$HEALTH_DEBOUNCE")
+            case "$act" in
+                postfail)
+                    trace "HEALTH FAIL: $host $rest (debounce ${HEALTH_DEBOUNCE} reached)"
+                    command -v mesh-chat >/dev/null 2>&1 && MESH_WHO="watchdog@$(hostname)" \
+                        mesh-chat "[health-fail] $host — $rest" >/dev/null 2>&1 ;;
+                postok)
+                    # post recovery to the BOARD too (not just the trace): a [health-fail] with no
+                    # board-visible recovery strands a resolved alarm → other minds think the node is
+                    # still down (the same stale-alarm class fixed for mesh-doctor's RECOVERED, 2026-06-12).
+                    trace "HEALTH RECOVERED: $host $rest"
+                    command -v mesh-chat >/dev/null 2>&1 && MESH_WHO="watchdog@$(hostname)" \
+                        mesh-chat "[health-ok] $host — RECOVERED ($rest)" >/dev/null 2>&1 ;;
+                silent)
+                    [ "$result" = FAIL ] && trace "HEALTH FAIL(debounce, $newstate): $host $rest — transient, not yet posted" ;;
             esac
+            echo "$newstate" > "$health_dir/$host"
         done <<< "$health_out"
     fi
 
