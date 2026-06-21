@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+# mesh-room-music — "music from the home": capture short chunks of whatever sound is playing in the
+# room (mic on the room node), then re-grind them into NEW music with the revived granular sampler
+# (grainneukeln). Operator's idea 2026-06-21: not synth-from-zero but generative-from-ambient — the
+# room's own sound, beat-windowed and recombined. Slow is fine (operator: "можно ночью") so the heavy
+# remix runs as a nightly batch on the mind node (8c), never on the freeze-prone room node.
+#
+#   mesh-room-music --capture [secs]   record ~secs (default 20) of the room mic into today's buffer;
+#                                      discards near-silent grabs (don't remix silence). DAYTIME reflex.
+#   mesh-room-music --remix [src.wav]  re-grind today's captures (or one file) -> a granular remix mp3;
+#                                      prints the output path. Bounded: concats only the last few grabs
+#                                      and caps length so the O(n^2) automix stays cheap-ish.
+#   mesh-room-music --nightly          --remix the day + send the track to the operator (TG) + tell Миша.
+#   mesh-room-music --play <file>      play a finished track on the room Bose (mind/Миша choice, not auto).
+#   mesh-room-music --test             smoke: deps + grainneukeln venv present (no capture, no Bose).
+#
+# Heavy compute stays OFF the room node. Capture is the only thing that touches it (cheap pw-record).
+# reflex-cadence: none
+# orphan-ok: capture/nightly cadences are wired explicitly below per-node (daytime capture + 03:0x remix);
+#            left unwired in the genome so a node opts in via mesh-autowire only where a room mic exists.
+set -uo pipefail
+[ -f "$HOME/.mesh/restore.env" ] && . "$HOME/.mesh/restore.env" 2>/dev/null || true
+
+GRAIN_DIR="${MESH_GRAIN_DIR:-$HOME/grainneukeln}"
+PY="$GRAIN_DIR/.venv/bin/python"
+CAPROOT="$GRAIN_DIR/captures"
+OUTROOT="$GRAIN_DIR/output"
+ROOM_NODE="${ROOM_NODE:-imozerov@100.125.157.75}"
+KEEP_DAYS="${MESH_RMC_KEEP_DAYS:-3}"          # prune capture day-folders older than this
+SILENCE_DB="${MESH_RMC_SILENCE_DB:--55}"      # mean_volume below this (dB) = silence, skip
+CAP_SECS="${MESH_RMC_CAP_SECS:-90}"           # max audio fed to the automix (bounds remix time)
+SSH=(ssh -o StrictHostKeyChecking=no -o ConnectTimeout=6 "$ROOM_NODE")
+day="$(date +%F)"; capdir="$CAPROOT/$day"
+
+mean_db() { # $1 wav -> mean volume in dB (empty if undetectable)
+  ffmpeg -hide_banner -nostats -i "$1" -af volumedetect -f null - 2>&1 \
+    | grep -oE 'mean_volume: [-0-9.]+ dB' | grep -oE '[-0-9.]+' | head -1
+}
+
+case "${1:-}" in
+  --test)
+    command -v ffmpeg >/dev/null 2>&1 || { echo "smoke-test: FAIL (no ffmpeg)"; exit 1; }
+    command -v ssh    >/dev/null 2>&1 || { echo "smoke-test: FAIL (no ssh)"; exit 1; }
+    [ -x "$PY" ] || { echo "smoke-test: FAIL (grainneukeln venv python missing at $PY — run uv venv in $GRAIN_DIR)"; exit 1; }
+    [ -f "$GRAIN_DIR/main.py" ] || { echo "smoke-test: FAIL (grainneukeln main.py missing in $GRAIN_DIR)"; exit 1; }
+    echo "smoke-test: ok (ffmpeg+ssh+grainneukeln present; ROOM_NODE=$ROOM_NODE; no capture/Bose side-effect)"
+    exit 0 ;;
+
+  --capture)
+    secs="${2:-20}"; mkdir -p "$capdir"
+    ts="$(date +%Y%m%d-%H%M%S)"; remote="/tmp/rmc-$ts.wav"; local="$capdir/$ts.wav"
+    # FEEDBACK GATE (operator 2026-06-21): never record while the mesh itself is making sound — the mic
+    # hears the Bose and we'd remix our OWN voice/output (and mis-count it as room "music"/presence). Skip
+    # when mesh-overhear's mesh-speaking flag is set (TTS in progress) OR pw-play is running (we're playing
+    # something on the Bose). The operator's OWN music (Bluetooth → Bose) has neither, so it still captures.
+    # Record on the room node. PipeWire needs XDG_RUNTIME_DIR, absent in a bare ssh shell. timeout ends
+    # the record (pw-record runs until killed); `true` swallows the timeout's 124 so the hop succeeds.
+    rout="$("${SSH[@]}" "bash -lc 'export XDG_RUNTIME_DIR=/run/user/\$(id -u); if [ -f \$HOME/.mesh/mesh-speaking ] || pgrep -x pw-play >/dev/null 2>&1; then echo RMC_SKIP_SPEAKING; exit 0; fi; timeout $secs pw-record --rate 44100 --channels 2 --format s16 $remote 2>/dev/null; true'" 2>/dev/null)" \
+      || { echo "capture: room node unreachable ($ROOM_NODE)"; exit 1; }
+    case "$rout" in *RMC_SKIP_SPEAKING*) echo "capture: skipped — mesh is speaking/playing on the Bose (no self-record)"; exit 0;; esac
+    scp -o StrictHostKeyChecking=no -o ConnectTimeout=6 "$ROOM_NODE:$remote" "$local" >/dev/null 2>&1 \
+      || { echo "capture: pull failed (no audio produced — PipeWire/mic down on room node?)"; "${SSH[@]}" "rm -f $remote" 2>/dev/null; exit 1; }
+    "${SSH[@]}" "rm -f $remote" 2>/dev/null || true
+    [ -s "$local" ] || { echo "capture: empty wav, discarded"; rm -f "$local"; exit 1; }
+    db="$(mean_db "$local")"
+    if [ -n "$db" ] && awk "BEGIN{exit !($db < $SILENCE_DB)}"; then
+      rm -f "$local"; echo "capture: silent (${db}dB < ${SILENCE_DB}dB) — discarded, nothing playing"; exit 0
+    fi
+    # prune old day-folders
+    if [ -d "$CAPROOT" ]; then
+      find "$CAPROOT" -mindepth 1 -maxdepth 1 -type d -mtime +"$KEEP_DAYS" -exec rm -rf {} + 2>/dev/null || true
+    fi
+    echo "capture: kept $local (${db:-?}dB, ${secs}s)"
+    exit 0 ;;
+
+  --remix)
+    mkdir -p "$OUTROOT"
+    src="${2:-}"
+    if [ -n "$src" ]; then
+      [ -f "$src" ] || { echo "remix: no such file $src"; exit 1; }
+      feed="$src"
+    else
+      # today's captures, newest few, concat + cap length so the automix stays bounded
+      mapfile -t files < <(ls -t "$capdir"/*.wav 2>/dev/null | head -6)
+      [ "${#files[@]}" -gt 0 ] || { echo "remix: no captures today ($capdir) — nothing to grind"; exit 1; }
+      feed="/tmp/rmc-feed-$$.wav"
+      if [ "${#files[@]}" -eq 1 ]; then
+        ffmpeg -hide_banner -nostats -y -i "${files[0]}" -t "$CAP_SECS" -ac 2 -ar 44100 "$feed" >/dev/null 2>&1
+      else
+        list="/tmp/rmc-list-$$.txt"; : > "$list"
+        for f in "${files[@]}"; do printf "file '%s'\n" "$f" >> "$list"; done
+        ffmpeg -hide_banner -nostats -y -f concat -safe 0 -i "$list" -t "$CAP_SECS" -ac 2 -ar 44100 "$feed" >/dev/null 2>&1
+        rm -f "$list"
+      fi
+      [ -s "$feed" ] || { echo "remix: concat produced no audio"; exit 1; }
+    fi
+    # grind it (grainneukeln CLI: short clips remix fast; nightly run can afford slow anyway)
+    ( cd "$GRAIN_DIR" && "$PY" main.py "$feed" "$OUTROOT/" amc l /2 ) >/dev/null 2>&1
+    [ -n "${2:-}" ] || rm -f "$feed"
+    out="$(ls -t "$OUTROOT"/*.mp3 2>/dev/null | head -1)"
+    [ -n "$out" ] && [ -s "$out" ] || { echo "remix: automix produced no output"; exit 1; }
+    echo "$out"
+    exit 0 ;;
+
+  --nightly)
+    out="$("$0" --remix)" || { echo "nightly: $out"; exit 1; }
+    echo "nightly: remix -> $out"
+    # deliver to the operator (TG audio) — best-effort
+    ENVF="$HOME/.config/remote-access/env"; [ -f "$ENVF" ] && { set -a; . "$ENVF" 2>/dev/null; set +a; }
+    if [ -n "${BOT_TOKEN:-}" ] && [ -n "${CHAT_ID:-}" ]; then
+      curl -s --max-time 90 "https://api.telegram.org/bot${BOT_TOKEN}/sendAudio" \
+        -F "chat_id=${CHAT_ID}" -F "audio=@${out};type=audio/mpeg" \
+        -F "title=Room remix ($day)" \
+        -F "caption=Ночная склейка: звук твоей комнаты за сегодня, перемолотый грануляром в новый трек." \
+        >/dev/null 2>&1 && echo "nightly: sent to operator TG"
+    fi
+    # let Миша know his expressive material is ready (he decides whether to play it on the Bose)
+    command -v mesh-tell >/dev/null 2>&1 && \
+      mesh-tell room "[room-music] Ночной трек-склейка из звука комнаты готов: $out . Если оператор в комнате и уместно — можешь поставить его на Bose (mesh-room-music --play \"$out\") как свой музыкальный ход к контакту. Не блокируйся на этом." >/dev/null 2>&1
+    exit 0 ;;
+
+  --play)
+    f="${2:-}"; [ -f "$f" ] || { echo "play: no such file $f"; exit 1; }
+    # convert to wav (pw-play wants pcm) and push to the room node
+    wav="/tmp/rmc-play-$$.wav"; rf="/tmp/rmc-play-$$.wav"
+    ffmpeg -hide_banner -nostats -y -i "$f" -ac 2 -ar 44100 "$wav" >/dev/null 2>&1
+    scp -o StrictHostKeyChecking=no -o ConnectTimeout=6 "$wav" "$ROOM_NODE:$rf" >/dev/null 2>&1 \
+      || { echo "play: push to room node failed"; rm -f "$wav"; exit 1; }
+    rm -f "$wav"
+    # play on the room node, aimed at the Bose sink (fall back to default if it dropped). Single-quoted
+    # remote payload keeps the awk clean; only $rf is templated in by the outer shell.
+    remote_play="
+export XDG_RUNTIME_DIR=/run/user/\$(id -u)
+bid=\$(wpctl status 2>/dev/null | awk '/Sinks:/{s=1;next} /Sources:/{s=0} s && tolower(\$0) ~ /bose|soundlink/ {for(i=1;i<=NF;i++) if(\$i ~ /^[0-9]+\.$/){gsub(/\./,\"\",\$i); print \$i; exit}}')
+[ -n \"\$bid\" ] && wpctl set-default \$bid 2>/dev/null
+if [ -n \"\$bid\" ]; then pw-play --target \$bid $rf 2>/dev/null; else pw-play $rf 2>/dev/null; fi
+rm -f $rf
+"
+    "${SSH[@]}" "bash -lc '$remote_play'" && echo "play: sent to room Bose ($f)"
+    exit 0 ;;
+
+  *)
+    echo "usage: mesh-room-music --capture [secs] | --remix [src.wav] | --nightly | --play <file> | --test"; exit 1 ;;
+esac
