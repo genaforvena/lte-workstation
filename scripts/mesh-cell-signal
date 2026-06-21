@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+# mesh-cell-signal — CELLULAR LINK sense: the phone body's mobile-uplink quality (serving-cell RSRP/dBm,
+# quality, network type, band) — a real signal the mesh did not perceive before. Distinct from
+# mesh-wifi-link (the LAN/wifi side): this is the MOBILE radio. Why the mesh cares:
+#   - the phone is an ACTUATOR (SMS / calls / mobile tether) — its cell link quality says whether those
+#     would actually work right now (a -116 dBm fringe cell ≠ a -75 dBm strong cell).
+#   - signal level tracks the phone's RF environment as it moves (window vs basement vs outdoors) — a
+#     coarse motion/where-is-the-body hint independent of GPS/wifi.
+#   - serving-cell id (ci/pci/tac) + neighbor count = a stable coarse-location / tower fingerprint.
+#
+# Reads `termux-telephony-cellinfo` over SSH (phone resolved LAN-FIRST via mesh-phone-ip — the phone is
+# often off Tailscale but reachable on the home LAN). HONEST: exit 2 when the phone is unreachable OR
+# there is no registered cell (airplane mode / no SIM / no service) — NEVER a faked reading.
+#
+# reflex-cadence: 5-59/15 * * * *
+# reflex-args: --edge
+#
+#   mesh-cell-signal            one read → classified verdict line
+#   mesh-cell-signal --json     machine-readable
+#   mesh-cell-signal --edge     debounced state write (for the reflex / dash)
+#   mesh-cell-signal --test     synthetic classify smoke (no phone, no SSH)
+#
+# Exit: 0 ok · 2 phone unreachable / no cellular service (honest-degraded, never faked).
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+
+MESH="${MESH_DIR:-$HOME/.mesh}"; mkdir -p "$MESH" 2>/dev/null || true
+STATE="$MESH/.cell-signal.state"
+OFFLINEFILE="$MESH/.cell-signal-offline"
+PHONE_USER_DEF="${PHONE_USER:-u0_a380}"
+PHONE_PORT="${PHONE_SSH_PORT:-8022}"
+SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=6 -o StrictHostKeyChecking=no"
+
+# Classify a serving-cell signal into a stable vocab. LTE → RSRP thresholds (the meaningful LTE metric);
+# other RATs (gsm/wcdma/nr) → generic dBm thresholds. Pure function (testable, no I/O).
+classify() {  # <metric_dbm> -> EXCELLENT|GOOD|FAIR|POOR|MARGINAL
+  local m="$1"
+  case "$m" in ''|*[!0-9-]*) echo UNKNOWN; return;; esac
+  if   [ "$m" -ge -90  ]; then echo EXCELLENT
+  elif [ "$m" -ge -100 ]; then echo GOOD
+  elif [ "$m" -ge -110 ]; then echo FAIR
+  elif [ "$m" -ge -120 ]; then echo POOR
+  else                         echo MARGINAL
+  fi
+}
+
+if [ "${1:-}" = --test ]; then
+  f=0
+  [ "$(classify -75)"  = EXCELLENT ] || { echo "  FAIL: -75 → EXCELLENT (got $(classify -75))"; f=1; }
+  [ "$(classify -90)"  = EXCELLENT ] || { echo "  FAIL: -90 boundary → EXCELLENT (got $(classify -90))"; f=1; }
+  [ "$(classify -95)"  = GOOD      ] || { echo "  FAIL: -95 → GOOD (got $(classify -95))"; f=1; }
+  [ "$(classify -105)" = FAIR      ] || { echo "  FAIL: -105 → FAIR (got $(classify -105))"; f=1; }
+  [ "$(classify -116)" = POOR      ] || { echo "  FAIL: -116 → POOR (got $(classify -116))"; f=1; }
+  [ "$(classify -125)" = MARGINAL  ] || { echo "  FAIL: -125 → MARGINAL (got $(classify -125))"; f=1; }
+  # FALSIFIABLE honest-degraded: a non-numeric / empty metric must be UNKNOWN, never a faked band.
+  [ "$(classify '')"   = UNKNOWN   ] || { echo "  FAIL: empty → UNKNOWN (got $(classify ''))"; f=1; }
+  [ "$(classify NA)"   = UNKNOWN   ] || { echo "  FAIL: NA → UNKNOWN (got $(classify NA))"; f=1; }
+  # parse: pick the REGISTERED cell's rsrp from a synthetic cellinfo blob (mirrors the real path).
+  command -v python3 >/dev/null 2>&1 || { echo "smoke-test: FAIL (no python3)"; exit 1; }
+  blob='[{"type":"lte","registered":false,"dbm":-109,"rsrp":-109},{"type":"lte","registered":true,"dbm":-116,"rsrp":-116,"rsrq":-9,"level":0,"bands":[7]}]'
+  got="$(printf '%s' "$blob" | python3 -c '
+import json,sys
+cells=json.load(sys.stdin)
+reg=[c for c in cells if c.get("registered")]
+c=reg[0]; print(c.get("rsrp", c.get("dbm","")), c.get("type",""), (c.get("bands") or [""])[0])' 2>/dev/null)"
+  [ "$got" = "-116 lte 7" ] || { echo "  FAIL: registered-cell parse got [$got] want [-116 lte 7]"; f=1; }
+  [ "$f" = 0 ] && echo "smoke-test: ok (classify:6 + honest-unknown:2 + registered-parse:1 assertions)" || { echo "smoke-test: FAIL"; exit 1; }
+  exit 0
+fi
+
+JSON=0; EDGE=0
+case "${1:-}" in --json) JSON=1;; --edge) EDGE=1;; esac
+TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+# Resolve the phone LAN-FIRST (see header). Reachability is gated by the real SSH below.
+PHONE_IP="${PHONE_IP:-$(mesh-phone-ip 2>/dev/null | tail -1)}"
+[ -n "$PHONE_IP" ] || PHONE_IP="$(mesh-peer-addr Redmi 2>/dev/null || true)"
+
+honest_unreach() {  # <reason> — print/exit 2 without faking a reading
+  local why="$1"
+  [ -f "$OFFLINEFILE" ] || { echo "mesh-cell-signal: $why — cellular sense unavailable (not faked)" >&2; touch "$OFFLINEFILE"; }
+  if [ "$JSON" = 1 ]; then printf '{"ts":"%s","status":"UNREACHABLE","reason":"%s"}\n' "$TS" "$why"; fi
+  exit 2
+}
+
+[ -n "$PHONE_IP" ] || honest_unreach "no phone address"
+timeout 2 bash -c "echo >/dev/tcp/$PHONE_IP/$PHONE_PORT" 2>/dev/null || honest_unreach "phone unreachable ($PHONE_IP:$PHONE_PORT)"
+
+raw="$(timeout 12 ssh $SSH_OPTS -p "$PHONE_PORT" "${PHONE_USER_DEF}@${PHONE_IP}" \
+  'timeout 8 termux-telephony-cellinfo 2>/dev/null' </dev/null 2>/dev/null)"
+[ -n "$raw" ] || honest_unreach "no cellinfo (telephony permission / airplane mode?)"
+
+# Parse the REGISTERED serving cell. No registered cell = no service → honest exit 2.
+parsed="$(printf '%s' "$raw" | python3 -c '
+import json,sys
+try: cells=json.load(sys.stdin)
+except Exception: sys.exit(3)
+if not isinstance(cells,list): sys.exit(3)
+reg=[c for c in cells if c.get("registered")]
+if not reg: sys.exit(4)
+c=reg[0]
+metric=c.get("rsrp", c.get("dbm",""))
+band=(c.get("bands") or ["?"])[0]
+# plain str-join (NOT an f-string with escaped quotes — backslashes in f-string braces are a
+# SyntaxError on Python <3.12; that bug made the first real read falsely report "unparseable").
+print("\t".join(str(x) for x in (metric, c.get("type","?"), c.get("rsrq","?"), c.get("level","?"), band, len(cells))))
+' 2>/dev/null)"; prc=$?
+[ "$prc" = 4 ] && honest_unreach "no registered cell (no service / airplane mode)"
+[ "$prc" = 0 ] && [ -n "$parsed" ] || honest_unreach "cellinfo unparseable"
+
+rm -f "$OFFLINEFILE"
+IFS=$'\t' read -r METRIC RAT RSRQ LEVEL BAND NCELLS <<<"$parsed"
+VERDICT="$(classify "$METRIC")"
+line="cell=$VERDICT (${METRIC}dBm rsrq=${RSRQ} ${RAT} band=${BAND} bars=${LEVEL} | ${NCELLS} cells visible)"
+
+if [ "$JSON" = 1 ]; then
+  printf '{"ts":"%s","status":"OK","verdict":"%s","dbm":%s,"rat":"%s","rsrq":"%s","level":"%s","band":"%s","cells":%s}\n' \
+    "$TS" "$VERDICT" "${METRIC:-null}" "$RAT" "$RSRQ" "$LEVEL" "$BAND" "${NCELLS:-0}"
+elif [ "$EDGE" = 1 ]; then
+  # Debounced-ish: write state on every successful read (value + freshness). A consumer dash ages by
+  # mtime; an unreachable phone simply stops updating it → it goes STALE honestly (never a faked level).
+  printf '%s\n' "$VERDICT" > "$STATE"
+  printf '[cell-signal] %s\n' "$line"
+else
+  printf '%s\n' "$line"
+fi
