@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+# mesh-liveness-loop — the LIVENESS supervisor as ONE always-on LOOP (operator 2026-06-21, plan A:
+# "хочу избавиться от кронов вообще … нужен реально замкнутый круг"). Folds the ~9 liveness CRONS into a
+# single persistent process: nothing schedules them from crontab; the loop keeps the node alive, and the
+# loop itself is kept alive by a systemd user service (Restart=always + linger → reboot-survivable). A
+# supervised loop, not a schedule.
+#
+# Honest tradeoff (stated to the operator): collapsing 9 INDEPENDENT crons into one loop is a SPOF — a
+# crashed cron entry used to fail in isolation. Mitigation: systemd Restart=always revives a dead loop, and
+# a heartbeat file (.liveness-loop.heartbeat, touched every tick) makes a STALLED loop detectable.
+#
+# It does NOT reimplement the liveness tools — it ORCHESTRATES the existing ones on their own cadence, and
+# additionally keeps the consume drivers (the mind-side closed loop) alive + kicks freshly-(re)spawned minds
+# to read their pane immediately (operator's CRITICAL spawn-moment rule).
+#
+#   mesh-liveness-loop           run the supervisor loop (foreground; systemd owns it)
+#   mesh-liveness-loop --once    run ONE due-pass then exit (test / manual tick)
+#   mesh-liveness-loop --test    smoke test
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+[ -f "$HOME/.mesh/restore.env" ] && . "$HOME/.mesh/restore.env" 2>/dev/null || true
+MESH="$HOME/.mesh"
+LOG="$MESH/liveness-loop.log"
+HB="$MESH/.liveness-loop.heartbeat"
+STATE="$MESH/.liveness-loop.state"   # "name=lastepoch" lines
+BASE="${MESH_LIVENESS_TICK:-30}"     # loop tick seconds
+ts(){ date -u +%FT%TZ; }
+now(){ date +%s; }
+
+# task table: "name|cadence_sec|command". The cadences mirror the retired cron periods; the load-bearing
+# ones are session-revival (restore) + mind-relaunch (channel-keepalive) + consume-driver supervision.
+# consume-ensure makes the mind-side closed loop durable WITHOUT cron (the drivers were bare bg processes).
+TASKS=(
+  "consume-ensure|60|mesh-consume-all"
+  "channel-keepalive|240|mesh-channel-keepalive"
+  "restore|300|mesh-restore"
+  "supervise|120|mesh-supervise"
+  "session-watchdog|600|mesh-session-watchdog --edge"
+  "organ-keepalive|600|mesh-organ-keepalive"
+  "failover-scan|120|mesh-failover --scan"
+  "failover-dead|300|mesh-failover --scan-dead"
+  "node-care|300|mesh-node-care"
+  "mind-state|600|mesh-mind-state --watch"
+  "pane-watch|300|mesh-pane-watch"
+)
+
+last_run(){ grep -E "^$1=" "$STATE" 2>/dev/null | tail -1 | cut -d= -f2; }
+set_run(){ # name epoch
+  local tmp="$STATE.tmp"; { grep -vE "^$1=" "$STATE" 2>/dev/null; echo "$1=$2"; } > "$tmp" && mv "$tmp" "$STATE"; }
+
+run_due(){ # run every task whose cadence elapsed; track mind-relaunch to fire the spawn-moment kick
+  local n="$(now)" relaunched=0
+  for t in "${TASKS[@]}"; do
+    # NB: separate statements — `local a=.. b=$a` expands $a BEFORE the local takes effect (set -u → unbound)
+    local name rest cad cmd lr
+    name="${t%%|*}"; rest="${t#*|}"; cad="${rest%%|*}"; cmd="${rest#*|}"
+    lr="$(last_run "$name")"; lr="${lr:-0}"
+    [ $((n - lr)) -ge "$cad" ] || continue
+    # 110s hard cap so one hung tool can't freeze the whole liveness loop
+    local out; out="$(timeout 110 bash -lc "$cmd" 2>&1)"; local rc=$?
+    set_run "$name" "$n"
+    [ "$rc" = 0 ] || echo "$(ts) $name rc=$rc: ${out##*$'\n'}" >> "$LOG"
+    # channel-keepalive / restore (re)launch minds → a fresh mind must IMMEDIATELY read its pane
+    case "$name" in channel-keepalive|restore) printf '%s' "$out" | grep -qiE 'relaunch|launch|respawn|started|reincarnat' && relaunched=1 ;; esac
+  done
+  [ "$relaunched" = 1 ] && { mesh-consume-all --kick >/dev/null 2>&1; echo "$(ts) spawn-moment KICK (mind (re)launched)" >> "$LOG"; }
+}
+
+if [ "${1:-}" = --test ]; then
+  command -v mesh-consume-all >/dev/null 2>&1 || { echo "smoke-test: FAIL (mesh-consume-all missing)"; exit 1; }
+  command -v mesh-channel-keepalive >/dev/null 2>&1 || { echo "smoke-test: FAIL (channel-keepalive missing)"; exit 1; }
+  # every task command's tool must exist on PATH
+  for t in "${TASKS[@]}"; do c="${t##*|}"; b="${c%% *}"; command -v "$b" >/dev/null 2>&1 || { echo "smoke-test: FAIL (task tool '$b' missing)"; exit 1; }; done
+  # state read/write round-trips
+  set_run __selftest 123 && [ "$(last_run __selftest)" = 123 ] || { echo "smoke-test: FAIL (state rw)"; exit 1; }
+  { grep -vE '^__selftest=' "$STATE" 2>/dev/null || true; } > "$STATE.tmp" && mv "$STATE.tmp" "$STATE"
+  echo "smoke-test: ok (${#TASKS[@]} liveness tasks orchestrated; spawn-kick on relaunch; heartbeat+state wired)"; exit 0
+fi
+
+case "${1:-}" in
+  --once) touch "$HB"; run_due; exit 0 ;;
+  "")
+    echo "$(ts) liveness-loop START tick=${BASE}s tasks=${#TASKS[@]}" >> "$LOG"
+    while :; do touch "$HB"; run_due || true; sleep "$BASE"; done ;;
+  *) echo "mesh-liveness-loop: unknown arg '$1'" >&2; exit 1 ;;
+esac
