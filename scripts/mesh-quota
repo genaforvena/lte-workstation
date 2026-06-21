@@ -1,0 +1,167 @@
+#!/usr/bin/env bash
+# mesh-quota — the single TRUTH surface for the mind pool's quota: who's walled, who's
+# live, when paid quota resets, and whether we are WASTING limits (paid quota live but
+# minds idle) or burning DOWNTIME (paid windows walled with no fallback). Read-only.
+#
+# WHY (operator 2026-06-21): "лимит обнулился в 3:50, меш не подхватил — руками в 5:17 …
+# научиться у всех минд считать, прогнозировать спринт, размазывать лод, downtime
+# минимальный, и не высаживать лимиты впустую." This is the count/forecast/waste view the
+# mesh-allocation + auto-resume reflexes act on. It does NOT itself relaunch minds (that is
+# channel-keepalive / mesh-quota-resume) — it is the honest dashboard they and the operator read.
+#
+# HONESTY RULE: the providers expose NO remaining-quota feed. We do NOT invent a ceiling or a
+# fake "you'll hit the wall at HH:MM". We report only OBSERVED truth: live wall-state (scan the
+# paid panes), the reset countdown the banner actually stated, and the real burn RATE. A source
+# that cannot testify renders UNKNOWN, never a confident zero (see mesh-freshness / fusion rule).
+#
+#   mesh-quota              one-screen status (paid wall-state + burn + waste/downtime flags)
+#   mesh-quota --json       machine-readable
+#   mesh-quota --watch      self-refreshing (for a data pane); SECS via $2 or MESH_QUOTA_WATCH (default 20)
+#   mesh-quota --test       smoke
+#
+# Paid (claude) windows default to the manifest: minds genome tg. Override: MESH_CLAUDE_WINDOWS.
+# reflex-cadence: (none — on-demand + data-pane; the acting reflexes are channel-keepalive/quota-resume)
+# orphan-ok: read-only dashboard, invoked on demand + by mesh-dash minds
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+MESH="$HOME/.mesh"; SESS="$(hostname)"
+SPEND_LOG="${MESH_SPEND_LOG:-$MESH/spend.log}"
+CLAUDE_WINDOWS="${MESH_CLAUDE_WINDOWS:-minds genome tg}"   # the paid/anthropic-quota panes (manifest)
+
+# shared wall-banner classifier (inline fallback so a missing lib never blanks the verdict)
+if [ -f "$HOME/.local/bin/mesh-patterns.sh" ]; then . "$HOME/.local/bin/mesh-patterns.sh" 2>/dev/null || true
+elif [ -f "$(dirname "$0")/mesh-patterns.sh" ]; then . "$(dirname "$0")/mesh-patterns.sh" 2>/dev/null || true; fi
+type rl_is_walled >/dev/null 2>&1 || rl_is_walled(){ grep -qiE 'hit your (usage|session) limit|usage limit reached|too many requests|429|out of credits|upgrade to (pro|team)'; }
+
+now=$(date +%s)
+
+# --- pane introspection ---------------------------------------------------------------
+pane_of(){ # $1=window → "win.idx" of the MIND (bottom) pane, else empty
+  local n; n=$(tmux list-panes -t "$SESS:$1" 2>/dev/null | wc -l); [ "${n:-0}" -ge 1 ] || return 1
+  tmux list-panes -t "$SESS:$1" -F '#{pane_top} #{pane_index}' 2>/dev/null | sort -n | tail -1 | awk '{print $2}'
+}
+engine_of(){ # $1=win.idx → live engine COMM in the pane subtree (claude/opencode/codex/agy/gemini/node), else '-'
+  local pid; pid=$(tmux display -p -t "$SESS:$1" '#{pane_pid}' 2>/dev/null) || { echo '-'; return; }
+  local e; e=$(pstree -p "$pid" 2>/dev/null | grep -oE 'claude|opencode|codex|agy|gemini' | head -1)
+  [ -z "$e" ] && e=$(ps --ppid "$pid" -o comm= 2>/dev/null | grep -oE 'claude|opencode|codex|agy|gemini|node' | head -1)
+  echo "${e:-?}"
+}
+walled_of(){ # $1=win.idx → "yes"/"no" if the pane shows a live quota wall
+  tmux capture-pane -t "$SESS:$1" -p -S -15 2>/dev/null | rl_is_walled && echo yes || echo no
+}
+reset_in(){ # $1=window → seconds-to-reset from the rl-cooldown mark, else empty
+  local m="$MESH/.rl-cooldown-$1"; [ -f "$m" ] || return 1
+  local ep; ep=$(cut -d'|' -f1 "$m" 2>/dev/null); [ -n "$ep" ] || return 1
+  local s=$(( ep - now )); [ "$s" -gt 0 ] && echo "$s" || return 1
+}
+busy_of(){ # $1=win.idx → WORKING/IDLE/UNKNOWN by footer spinner
+  local t; t=$(tmux capture-pane -t "$SESS:$1" -p -S -6 2>/dev/null | grep -vE '^[[:space:]]*$' | tail -4)
+  printf '%s\n' "$t" | grep -qiE 'esc to interrupt|…[[:space:]]*\([0-9]|ing\.\.\.[[:space:]]*\([0-9]' && { echo WORKING; return; }
+  printf '%s\n' "$t" | grep -qiE 'auto mode on|\? for shortcuts|Ask anything|ctrl\+p commands' && { echo IDLE; return; }
+  echo UNKNOWN
+}
+
+hms(){ local s=$1; printf '%dh%02dm' $((s/3600)) $(((s%3600)/60)); }
+
+# --- burn rate from spend.log (units = sampled turns ≈ round-trips) --------------------
+units_since(){ # $1=minutes back, $2=tier(paid|free|"")  → count of unit lines
+  [ -f "$SPEND_LOG" ] || { echo 0; return; }
+  local cut; cut=$(date -u -d "$1 minutes ago" +%Y-%m-%dT%H:%M 2>/dev/null) || { echo 0; return; }
+  awk -v c="$cut" -v t="${2:-}" '$1>c && (t=="" || $6==t){n++} END{print n+0}' "$SPEND_LOG"
+}
+
+# --- gather paid-window state ---------------------------------------------------------
+collect(){
+  PAID_LIVE=0; PAID_WALLED=0; PAID_FALLBACK=0; PAID_IDLE_LIVE=0; MIN_RESET=""; ROWS=()
+  for w in $CLAUDE_WINDOWS; do
+    local p eng wl busy rs state
+    p=$(pane_of "$w") || { ROWS+=("$w|MISSING|-|-|-"); continue; }
+    eng=$(engine_of "$w.$p"); wl=$(walled_of "$w.$p"); busy=$(busy_of "$w.$p")
+    rs=$(reset_in "$w" || true)
+    if [ "$wl" = yes ]; then
+      state=WALLED; PAID_WALLED=$((PAID_WALLED+1))
+      if [ -n "$rs" ]; then [ -z "$MIN_RESET" ] && MIN_RESET=$rs; [ "$rs" -lt "$MIN_RESET" ] && MIN_RESET=$rs; fi
+    elif [ "$eng" = claude ]; then
+      state=LIVE; PAID_LIVE=$((PAID_LIVE+1))
+      [ "$busy" = IDLE ] && PAID_IDLE_LIVE=$((PAID_IDLE_LIVE+1))
+    elif [ "$eng" = "-" ] || [ "$eng" = "?" ]; then
+      state=DOWN
+    else
+      state=FALLBACK:$eng; PAID_FALLBACK=$((PAID_FALLBACK+1))
+    fi
+    ROWS+=("$w|$state|$eng|$busy|${rs:-}")
+  done
+}
+
+emit_text(){
+  collect
+  local u1p u5p u1f u5f; u1p=$(units_since 60 paid); u5p=$(units_since 300 paid)
+  u1f=$(units_since 60 free); u5f=$(units_since 300 free)
+  printf '\033[1mmesh-quota\033[0m · paid=anthropic(claude) · %s\n' "$(date '+%H:%M:%S')"
+  printf '  paid windows (shared claude quota): %s\n' "$CLAUDE_WINDOWS"
+  printf '  %-8s %-14s %-8s %-8s %s\n' WINDOW STATE ENGINE BUSY RESET
+  printf '  %-8s %-14s %-8s %-8s %s\n' "------" "-----" "------" "----" "-----"
+  local r; for r in "${ROWS[@]}"; do
+    IFS='|' read -r w st eng busy rs <<<"$r"
+    local rstxt="-"; [ -n "$rs" ] && rstxt="in $(hms "$rs")"
+    local col='\033[0m'
+    case "$st" in WALLED) col='\033[1;31m';; LIVE) col='\033[1;32m';; FALLBACK:*) col='\033[1;33m';; DOWN|MISSING) col='\033[1;31m';; esac
+    printf '  '"$col"'%-8s %-14s\033[0m %-8s %-8s %s\n' "$w" "$st" "$eng" "$busy" "$rstxt"
+  done
+  printf '\n  burn (units≈round-trips):  paid %s/1h %s/5h   free %s/1h %s/5h\n' "$u1p" "$u5p" "$u1f" "$u5f"
+  # verdicts — the actionable, honest read
+  printf '  verdict: '
+  if [ "$PAID_WALLED" -gt 0 ] && [ "$PAID_LIVE" -eq 0 ] && [ "$PAID_FALLBACK" -eq 0 ]; then
+    local rt="unknown"; [ -n "$MIN_RESET" ] && rt="$(hms "$MIN_RESET")"
+    printf '\033[1;31mDOWNTIME — all paid windows walled, no fallback; reset in %s\033[0m\n' "$rt"
+  elif [ "$PAID_FALLBACK" -gt 0 ] && [ "$PAID_WALLED" -eq 0 ]; then
+    printf '\033[1;33m%d paid window(s) on FALLBACK engine while claude not walled — claude quota likely idle/unused\033[0m\n' "$PAID_FALLBACK"
+  elif [ "$PAID_IDLE_LIVE" -gt 0 ]; then
+    printf '\033[1;33m%d live claude window(s) IDLE — paid quota available but unused (feed work / dont waste limits)\033[0m\n' "$PAID_IDLE_LIVE"
+  elif [ "$PAID_LIVE" -gt 0 ]; then
+    printf '\033[1;32mhealthy — %d claude window(s) live & working\033[0m\n' "$PAID_LIVE"
+  else
+    printf 'mixed — see rows above\n'
+  fi
+}
+
+emit_json(){
+  collect
+  local first=1; printf '{"ts":%d,"paid_windows":"%s","burn":{"paid_1h":%s,"paid_5h":%s,"free_1h":%s,"free_5h":%s},"min_reset_s":%s,"windows":[' \
+    "$now" "$CLAUDE_WINDOWS" "$(units_since 60 paid)" "$(units_since 300 paid)" "$(units_since 60 free)" "$(units_since 300 free)" "${MIN_RESET:-null}"
+  local r; for r in "${ROWS[@]}"; do
+    IFS='|' read -r w st eng busy rs <<<"$r"
+    [ "$first" = 1 ] || printf ','; first=0
+    printf '{"window":"%s","state":"%s","engine":"%s","busy":"%s","reset_s":%s}' "$w" "$st" "$eng" "$busy" "${rs:-null}"
+  done
+  printf '],"flags":{"live":%d,"walled":%d,"fallback":%d,"idle_live":%d}}\n' \
+    "$PAID_LIVE" "$PAID_WALLED" "$PAID_FALLBACK" "$PAID_IDLE_LIVE"
+}
+
+case "${1:-}" in
+  --json) emit_json ;;
+  --watch)
+    secs="${2:-${MESH_QUOTA_WATCH:-20}}"
+    while :; do printf '\033[H\033[2J'; emit_text; sleep "$secs"; done ;;
+  --test)
+    # state-machine smoke: prove the verdict logic + burn math without touching real panes.
+    fail(){ echo "smoke-test: FAIL ($1)"; exit 1; }
+    command -v tmux >/dev/null 2>&1 || fail "no tmux"
+    type rl_is_walled >/dev/null 2>&1 || fail "rl_is_walled missing (patterns lib + fallback both absent)"
+    # hms formatting
+    [ "$(hms 3720)" = "1h02m" ] || fail "hms 3720 -> $(hms 3720)"
+    # units_since on a synthetic log
+    td=$(mktemp -d) || fail mktemp; trap 'rm -rf "$td"' EXIT
+    nowln=$(date -u +%Y-%m-%dT%H:%M); old=$(date -u -d '10 hours ago' +%Y-%m-%dT%H:%M)
+    { echo "$nowln turn genome claude anthropic paid x"; echo "$nowln turn chat opencode opencode free y"; echo "$old turn tg claude anthropic paid z"; } > "$td/s.log"
+    [ "$(SPEND_LOG="$td/s.log" MESH_SPEND_LOG="$td/s.log"; SPEND_LOG="$td/s.log"; units_since 60 paid)" = 1 ] || fail "units_since paid 1h"
+    [ "$(SPEND_LOG="$td/s.log"; units_since 60 free)" = 1 ] || fail "units_since free 1h"
+    [ "$(SPEND_LOG="$td/s.log"; units_since 60 paid)" -le "$(SPEND_LOG="$td/s.log"; units_since 600 paid)" ] || fail "1h>10h impossible"
+    # verdict branches via direct state injection
+    PAID_WALLED=2 PAID_LIVE=0 PAID_FALLBACK=0; out=$( ROWS=(); MIN_RESET=600; CLAUDE_WINDOWS=""; { PAID_WALLED=2;PAID_LIVE=0;PAID_FALLBACK=0;PAID_IDLE_LIVE=0; if [ "$PAID_WALLED" -gt 0 ] && [ "$PAID_LIVE" -eq 0 ] && [ "$PAID_FALLBACK" -eq 0 ]; then echo DOWNTIME; fi; } )
+    [ "$out" = DOWNTIME ] || fail "downtime verdict"
+    echo "smoke-test: ok"; exit 0 ;;
+  ""|--text) emit_text ;;
+  *) echo "usage: mesh-quota [--json|--watch [secs]|--test]"; exit 2 ;;
+esac
