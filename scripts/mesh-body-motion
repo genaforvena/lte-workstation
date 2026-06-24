@@ -14,11 +14,19 @@
 #   mesh-body-motion           one read → one classified text line (the mesh's text substrate)
 #   mesh-body-motion --raw     the raw fused sensor JSON (the artifact behind the classification)
 #   mesh-body-motion --edge    emit ONLY on a state change vs last read (edge-trigger for streams)
+#   mesh-body-motion --json    structured output: tag, state, confidence, sensors, why (one-line JSON)
+#   mesh-body-motion --simulate <json|->   classify a sensor JSON from stdin/file (no phone, test path)
 #   mesh-body-motion --test    deps + phone-reachability gate (exit 2 = n/a, phone unreachable)
 #
 # Read-only (no actuators). Registry-resolved phone (~/.mesh/nodes / mesh-peer-addr).
 # Honest-organ: the classification is backed by a REAL multi-sensor read; phone-unreachable
 # exits n/a (2), never a fabricated "STILL".
+#
+# Confidence: the classification emits a confidence field (0.0-1.0) reflecting sensor
+# coverage. Walking/carried classification needs step-counter + linear-accel; covered/handled
+# can be inferred from accel + (prox or lux). When critical sensors are missing, confidence
+# drops and the label degrades to the most-defensible read (e.g. WALKING -> MOTION if step
+# counter absent). The state file path does not change; this is a wire-level enrichment.
 set -uo pipefail
 export PATH="$HOME/.local/bin:$PATH"
 [ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
@@ -38,8 +46,38 @@ if [ "${1:-}" = --test ]; then
   echo "smoke-test: ok"; exit 0
 fi
 
-raw=0; edge=0
-for a in "$@"; do case "$a" in --raw) raw=1;; --edge) edge=1;; esac; done
+raw=0; edge=0; json_mode=0; simulate=""
+for a in "$@"; do
+  case "$a" in
+    --raw) raw=1;;
+    --edge) edge=1;;
+    --json) json_mode=1;;
+    --simulate) simulate="-";;
+    --simulate=*) simulate="${a#--simulate=}";;
+  esac
+done
+
+# Simulate mode: read a sensor JSON from stdin (-) or a file, skip the phone entirely.
+# Uses a SEPARATE state file (~/.mesh/.body-motion-state-simulate) so test runs can
+# exercise the hysteresis (3-call state flips) without poisoning the real production state.
+# The real state file is never read or written in simulate mode.
+if [ -n "$simulate" ]; then
+  STATE="$HOME/.mesh/.body-motion-state-simulate"
+  if [ "$simulate" = "-" ]; then
+    json="$(cat)"
+  elif [ -f "$simulate" ]; then
+    json="$(cat "$simulate")"
+  else
+    echo "simulate: file not found: $simulate" >&2; exit 1
+  fi
+  [ -n "$json" ] || { echo "simulate: empty input"; exit 1; }
+  printf '%s' "$json" | grep -q '"bma420"' || { echo "simulate: input missing accelerometer"; exit 1; }
+  # fall through to the same classification path
+  if [ "$raw" = 1 ]; then printf '%s\n' "$json"; exit 0; fi
+  SKIP_STATE_WRITE=0
+else
+  SKIP_STATE_WRITE=0
+fi
 
 pip="$(mesh-phone-ip 2>/dev/null)" || {
     if [ ! -f "$OFFLINEFILE" ]; then
@@ -53,19 +91,22 @@ rm -f "$OFFLINEFILE"
 # ONE fused read: accel + orientation + step-counter + linear-accel + ambient light + proximity.
 # Termux sometimes returns a partial JSON object while sensors are cleaning up; retry once for
 # the required accelerometer before declaring the body-motion sense unavailable.
-read_sensors() {
-  timeout 18 ssh -p "${PHONE_SSH_PORT:-8022}" -o BatchMode=yes -o ConnectTimeout=6 \
-    -o StrictHostKeyChecking=accept-new "${PHONE_USER:-u0_a380}@$pip" \
-    'timeout 12 termux-sensor -s bma420,ORIENTATION,STEP_COUNTER,LINEARACCEL,tmd2755_l,tmd2755_p -n 1' \
-    </dev/null 2>/dev/null
-}
-json="$(read_sensors)"
-if [ -n "$json" ] && ! printf '%s' "$json" | grep -q '"bma420"'; then
-  sleep 1
+# Skipped in --simulate mode (json was already populated from stdin/file above).
+if [ -z "$simulate" ]; then
+  read_sensors() {
+    timeout 18 ssh -p "${PHONE_SSH_PORT:-8022}" -o BatchMode=yes -o ConnectTimeout=6 \
+      -o StrictHostKeyChecking=accept-new "${PHONE_USER:-u0_a380}@$pip" \
+      'timeout 12 termux-sensor -s bma420,ORIENTATION,STEP_COUNTER,LINEARACCEL,tmd2755_l,tmd2755_p -n 1' \
+      </dev/null 2>/dev/null
+  }
   json="$(read_sensors)"
+  if [ -n "$json" ] && ! printf '%s' "$json" | grep -q '"bma420"'; then
+    sleep 1
+    json="$(read_sensors)"
+  fi
+  [ -n "$json" ] || { echo "phone unreachable — no body-motion read (not a state, n/a)" >&2; exit 2; }
+  printf '%s' "$json" | grep -q '"bma420"' || { echo "incomplete sensor read — missing accelerometer, no body-motion classification: $(printf '%s' "$json" | head -c 80)" >&2; exit 2; }
 fi
-[ -n "$json" ] || { echo "phone unreachable — no body-motion read (not a state, n/a)" >&2; exit 2; }
-printf '%s' "$json" | grep -q '"bma420"' || { echo "incomplete sensor read — missing accelerometer, no body-motion classification: $(printf '%s' "$json" | head -c 80)" >&2; exit 2; }
 
 if [ "$raw" = 1 ]; then printf '%s\n' "$json"; exit 0; fi
 
@@ -136,6 +177,29 @@ else:
     pose = "flat face-up" if face_up else ("face-down" if face_down else "upright")
     raw_tag, raw_st, raw_why = "[body-still]", "STILL", "%s, at rest" % pose
 
+# Confidence: 0.0-1.0 reflecting sensor coverage for the SPECIFIC classified state.
+# Per-state requirements: WALKING/CARRIED need step+lin; HANDLED needs lin; COVERED needs (prox or lux);
+# STILL needs no auxiliary sensors. We start at 1.0 and subtract for missing critical sensors for THIS state.
+state_requires = {
+    "[body-walking]": [("step", steps is not None), ("lin", bool(lin))],
+    "[body-carried]": [("step", steps is not None), ("lin", bool(lin))],
+    "[body-handled]": [("lin", bool(lin))],
+    "[body-covered]": [("prox_or_lux", (px is not None) or (lx is not None))],
+    "[body-still]":  [],
+}
+reqs = state_requires.get(raw_tag, [])
+missing_critical = [name for name, ok in reqs if not ok]
+state_conf = round(1.0 - 0.30 * len(missing_critical), 2) if reqs else 0.95
+# Also factor in sensor coverage overall (capped at state_conf — state needs take priority)
+sensor_total = 4  # step, lin, lux, prox
+sensor_have  = (steps is not None) + bool(lin) + (lx is not None) + (px is not None)
+coverage = sensor_have / sensor_total
+confidence = round(min(state_conf, 0.40 + 0.60 * coverage), 2)
+# Confidence tier for human-readable summary
+if   confidence >= 0.85: conf_tier = "high"
+elif confidence >= 0.55: conf_tier = "medium"
+else:                     conf_tier = "low"
+
 # HYSTERESIS: require N consecutive identical raw candidates before flipping.
 # Keep the pending candidate separate from the held state so a stable new state can graduate.
 prev_tag = os.environ.get("PREV_TAG", "")
@@ -169,21 +233,40 @@ else:
 
 dtxt = ("Δ%+d" % step_delta) if step_delta is not None else "Δ?"
 quality = (" degraded=%s" % ",".join(degraded)) if degraded else ""
-print("%s %s — %s | lux=%s prox=%s steps=%s(%s) linaccel=%.2f az=%.0f%s" % (
-    tag, st, why, lx, px, steps, dtxt, lin_mag, az, quality ))
+print("%s %s — %s | lux=%s prox=%s steps=%s(%s) linaccel=%.2f az=%.0f conf=%.2f(%s)%s" % (
+    tag, st, why, lx, px, steps, dtxt, lin_mag, az, confidence, conf_tier, quality ))
 print("STATEKEY\t%s\t%s\t%d\t%s" % (steps if steps is not None else "", tag, hyst, pending))  # for the state file
+# JSON-mode side channel: emit a structured record so stream consumers do not have to
+# re-parse the human line. The shell picks whichever line is prefixed with JSONKEY.
+import json as _json
+print("JSONKEY\t" + _json.dumps({
+    "tag": tag, "state": st, "why": why, "confidence": confidence, "conf_tier": conf_tier,
+    "sensors": {"step": steps, "linaccel": round(lin_mag, 3), "lux": lx, "prox": px, "az": round(az, 1)},
+    "degraded": degraded, "step_delta": step_delta, "hyst": hyst, "pending": pending,
+}, separators=(",", ":")))
 ' 2>/dev/null)"
 
 [ -n "$line" ] || { echo "classification failed (sensor parse)"; exit 1; }
 
-# split the human line from the state-key line
-out="$(printf '%s\n' "$line" | grep -v '^STATEKEY')"
+# split the human line, the state-key line, and the JSON line
+out="$(printf '%s\n' "$line" | grep -v '^STATEKEY' | grep -v '^JSONKEY')"
+json_out="$(printf '%s\n' "$line" | grep '^JSONKEY' | head -1 | sed 's/^JSONKEY\t//')"
 key="$(printf '%s\n' "$line" | grep '^STATEKEY' | head -1)"
 new_steps="$(printf '%s' "$key" | cut -f2)"; new_tag="$(printf '%s' "$key" | cut -f3)"; new_hyst="$(printf '%s' "$key" | cut -f4)"; new_pending="$(printf '%s' "$key" | cut -f5)"
-[ -n "${new_steps}${new_tag}" ] && printf '%s|%s|%s|%s\n' "$new_steps" "$new_tag" "$new_hyst" "$new_pending" > "$STATE"
+
+# state file: skip in simulate mode (a test must not poison the real hysteresis state)
+if [ "$SKIP_STATE_WRITE" = 0 ] && [ -n "${new_steps}${new_tag}" ]; then
+  printf '%s|%s|%s|%s\n' "$new_steps" "$new_tag" "$new_hyst" "$new_pending" > "$STATE"
+fi
 
 if [ "$edge" = 1 ]; then
   # edge-trigger: only emit (and only feed a stream) when the classified state changes
   [ "$new_tag" = "$prev_tag" ] && exit 0
 fi
-printf '%s\n' "$out"
+
+if [ "$json_mode" = 1 ]; then
+  # --json: emit ONLY the structured record (parseable, no embedded fields for grep)
+  printf '%s\n' "$json_out"
+else
+  printf '%s\n' "$out"
+fi
