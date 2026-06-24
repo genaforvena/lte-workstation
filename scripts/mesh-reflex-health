@@ -31,7 +31,20 @@ export PATH="$HOME/.local/bin:$PATH"
 [ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
 M="$HOME/.mesh"; STATE="$M/.reflex-health-state"
 
-# reflex-name | per-run artifact | max_age_seconds (≈ cadence×2 + margin) | cron tool (node-aware skip)
+# reflex-name | per-run artifact | MAX-AGE INTENT TOKEN | cron tool (node-aware skip)
+# MAX-AGE IS DERIVED, NOT A LITERAL (2026-06-24, chat-review/maxage-from-cadence — ends the phantom-stale
+# whack-a-mole). The 3rd column is an INTENT token resolved by eff_maxage() against the LIVE cron stride
+# (single source of truth = reflexes.cron/crontab, never a duplicated number):
+#   @auto        → max_age = (this tool's cron stride)×2. SELF-ADJUSTS to a throttle (the throttle IS in
+#                  the cron we read), so the old hand-widened literals for thermal-throttle are now moot.
+#   @auto=PARENT → derive from PARENT's stride (a reflex sub-called by another, with no own cron line).
+#   @cond        → CONDITIONAL-WRITE (feed/generate: `pace_gate||exit 0` WITHOUT writing on quiet/all-busy
+#                  ticks) → mtime is NOT liveness at ANY threshold → NOT WATCHABLE, excluded outright
+#                  (cadence×2 would only move the phantom to a longer fuse — the feed lesson below).
+#   <number>     → explicit literal, ONLY for a reflex with no derivable cron line (lan-newdevice).
+# The per-reflex paragraphs below are HISTORICAL tuning rationale (the literals they cite are now GONE);
+# they record WHY live-cron×2 is safe under the 2026-06-24 /10→/30 throttle, and the touch-every-run vs
+# source-coupled distinction that decides watchability.
 #   egress-health  */3  → log appended every run → expect < 10m
 #   router-watch   */15 → .router-thermal-state rewritten every run → expect < 35m
 #   lan-newdevice  sub-called by mesh-perimeter. Threshold 6300s/105m tolerates perimeter's
@@ -85,14 +98,65 @@ M="$HOME/.mesh"; STATE="$M/.reflex-health-state"
 #                        cycle tripped a chronic FALSE-DEAD → phantom REFLEX REPAIR. Raised to 1800s
 #                        (cadence×2, the documented convention above) → one full missed-run of margin;
 #                        real-death detection still ample (the DARK failure was 32h).
-REFLEXES="egress-health|$M/egress-health.log|600|mesh-egress-health
-router-watch|$M/.router-thermal-state|2100|mesh-router-watch
+REFLEXES="egress-health|$M/egress-health.log|@auto|mesh-egress-health
+router-watch|$M/.router-thermal-state|@auto|mesh-router-watch
 lan-newdevice|$M/.lan-newdevice.beat|6300|mesh-lan-newdevice
-sense-evolve|$M/sense-evolve.log|4500|mesh-sense-evolve
-imac-wifi|$M/.imac-wifi-state|1080|mesh-imac-wifi
-ambient-clock|$M/.ambient-clock.state|1500|mesh-ambient-clock
-psi|$M/.psi.state|4500|mesh-psi
-operator-focus|$M/.operator-focus.state|1800|mesh-operator-focus"
+sense-evolve|$M/sense-evolve.log|@auto|mesh-sense-evolve
+imac-wifi|$M/.imac-wifi-state|@auto|mesh-imac-wifi
+ambient-clock|$M/.ambient-clock.state|@auto|mesh-ambient-clock
+psi|$M/.psi.state|@auto|mesh-psi
+operator-focus|$M/.operator-focus.state|@auto|mesh-operator-focus
+feed|$M/feed.log|@cond|mesh-feed
+generate|$M/generate.log|@cond|mesh-generate"
+
+# ── max_age DERIVATION (single source of truth = the LIVE cron stride; never a duplicated literal) ──
+CRON_SRC="${MESH_CRON_SRC:-$M/reflexes.cron}"
+cron_stride_s(){ # <tool> → its cron stride in SECONDS (0 = no derivable schedule found)
+  local tool="$1" line min hr
+  line="$(grep -hwE -- "$tool" "$CRON_SRC" 2>/dev/null | grep -vE '^[[:space:]]*#' | head -1)"
+  [ -n "$line" ] || line="$(crontab -l 2>/dev/null | grep -hwE -- "$tool" | grep -vE '^[[:space:]]*#' | head -1)"
+  [ -n "$line" ] || { echo 0; return; }
+  min="$(printf '%s\n' "$line" | awk '{print $1}')"; hr="$(printf '%s\n' "$line" | awk '{print $2}')"
+  case "$min" in
+    \*/[0-9]*)        echo $(( ${min#*/} * 60 ));;           # */N            → every N min
+    [0-9]*-*/[0-9]*)  echo $(( ${min##*/} * 60 ));;          # M-E/N          → every N min (stepped range)
+    *[,?]*)           echo 0;;                               # list / unsupported → un-derivable
+    [0-9]*)           case "$hr" in                          # bare minute → consult the HOUR field
+                        \*)         echo 3600;;              # M * * * *     → hourly
+                        \*/[0-9]*)  echo $(( ${hr#*/} * 3600 ));;  # M */H * * * → every H hours
+                        *)          echo 86400;;             # M H * * *     → daily
+                      esac;;
+    *)                echo 0;;
+  esac
+}
+eff_maxage(){ # <intent-token> <tool> → max_age seconds, or "skip" (conditional-write / un-derivable)
+  local raw="$1" tool="$2" s
+  case "$raw" in
+    @cond)    echo skip;;                                                          # not watchable, ever
+    @auto)    s="$(cron_stride_s "$tool")";          [ "${s:-0}" -gt 0 ] && echo $((s*2)) || echo skip;;
+    @auto=*)  s="$(cron_stride_s "${raw#@auto=}")";  [ "${s:-0}" -gt 0 ] && echo $((s*2)) || echo skip;;
+    *)        echo "$raw";;                                                        # explicit literal
+  esac
+}
+
+# ── DEBOUNCE (watchdog-debounce 2026-06-24): require N>=2 CONSECUTIVE failed probes before a target
+# flips DOWN. A SINGLE transient fail (torn read, momentary SSH timeout, a daemon mid-restart — e.g. an
+# overhear restart) stays UP, killing the false-DOWN alarm. The consecutive-fail counter is persisted
+# per-target across runs in ~/.mesh/.debounce/<key>; the FIRST success resets it (flip back UP at once).
+DEBOUNCE_DIR="${MESH_DEBOUNCE_DIR:-$M/.debounce}"
+DEBOUNCE_N="${MESH_DEBOUNCE_N:-2}"
+debounce(){ # <key> <ok|fail> [peek] → effective verdict UP|DOWN; mutates the counter UNLESS peek (read-only)
+  local key="$1" probe="$2" mode="${3:-}" f n
+  key="$(printf '%s' "$key" | tr -c 'A-Za-z0-9._-' '_')"   # filesystem-safe key
+  f="$DEBOUNCE_DIR/$key"
+  mkdir -p "$DEBOUNCE_DIR" 2>/dev/null || true
+  n="$(cat "$f" 2>/dev/null || echo 0)"; [ "$n" -eq "$n" ] 2>/dev/null || n=0      # guard non-integer
+  if [ "$probe" = ok ]; then                                                       # success → reset, UP
+    [ "$mode" = peek ] || rm -f "$f" 2>/dev/null || true; echo UP; return; fi
+  n=$((n+1))                                                                        # fail → ++consecutive
+  [ "$mode" = peek ] || printf '%s\n' "$n" > "$f" 2>/dev/null || true
+  [ "$n" -ge "$DEBOUNCE_N" ] && echo DOWN || echo UP                                # DOWN only at N consec.
+}
 
 if [ "${1:-}" = --test ]; then
   failures=0
@@ -100,13 +164,44 @@ if [ "${1:-}" = --test ]; then
     command -v "$dep" >/dev/null 2>&1 || { echo "smoke-test: FAIL ($dep missing)"; failures=1; }
   done
   command -v mesh-chat >/dev/null 2>&1 || echo "smoke-test: WARN (mesh-chat missing — edge alerts silent)"
-  # verify REFLEXES table is parseable (lines valid, every name unique)
+  # verify REFLEXES table is parseable: each max-age col is a valid intent token or positive literal
   while IFS='|' read -r name art maxage tool; do
     [ -n "$name" ] || continue
-    [ "$maxage" -gt 0 ] 2>/dev/null || { echo "smoke-test: FAIL (bad maxage=$maxage for $name)"; failures=1; }
+    case "$maxage" in
+      @auto|@auto=*|@cond) : ;;
+      *) [ "$maxage" -gt 0 ] 2>/dev/null || { echo "smoke-test: FAIL (bad max-age token '$maxage' for $name)"; failures=1; } ;;
+    esac
   done <<EOF
 $REFLEXES
 EOF
+  # DERIVATION asserts (the heart of maxage-from-cadence): against a SYNTHETIC cron, eff_maxage must
+  # resolve @auto to cron-stride×2 for a WATCHABLE reflex AND keep a CONDITIONAL-write one EXCLUDED.
+  _tcron="$(mktemp)"; printf '%s\n' \
+    '*/10 * * * * $HOME/.local/bin/mesh-foo >> x 2>&1' \
+    '7-59/30 * * * * $HOME/.local/bin/mesh-bar --edge' \
+    '23 * * * * $HOME/.local/bin/mesh-hourly' > "$_tcron"
+  _str(){ CRON_SRC="$_tcron" cron_stride_s "$1"; }
+  _d(){   CRON_SRC="$_tcron" eff_maxage "$1" "$2"; }
+  [ "$(_str mesh-foo)"    = 600 ]  || { echo "smoke-test: FAIL (*/10 stride≠600: $(_str mesh-foo))"; failures=1; }
+  [ "$(_str mesh-bar)"    = 1800 ] || { echo "smoke-test: FAIL (7-59/30 stride≠1800: $(_str mesh-bar))"; failures=1; }
+  [ "$(_str mesh-hourly)" = 3600 ] || { echo "smoke-test: FAIL (hourly stride≠3600: $(_str mesh-hourly))"; failures=1; }
+  [ "$(_d @auto mesh-foo)"        = 1200 ] || { echo "smoke-test: FAIL (@auto */10 ≠ cron×2=1200: $(_d @auto mesh-foo))"; failures=1; }
+  [ "$(_d @auto=mesh-bar mesh-x)" = 3600 ] || { echo "smoke-test: FAIL (@auto=PARENT ≠ parent stride×2=3600: $(_d @auto=mesh-bar mesh-x))"; failures=1; }
+  [ "$(_d @cond mesh-feed)"       = skip ] || { echo "smoke-test: FAIL (conditional-write reflex NOT excluded)"; failures=1; }
+  [ "$(_d @auto mesh-nonexistent)" = skip ] || { echo "smoke-test: FAIL (@auto w/ no cron line must skip, not crash)"; failures=1; }
+  [ "$(_d 6300 mesh-x)"           = 6300 ] || { echo "smoke-test: FAIL (explicit literal not preserved)"; failures=1; }
+  rm -f "$_tcron"
+  # DEBOUNCE asserts (watchdog-debounce): 1 fail = still UP, 2 consecutive = DOWN, a success resets the counter.
+  _dbd="$(mktemp -d)"; _db(){ DEBOUNCE_DIR="$_dbd" debounce "$@"; }
+  [ "$(_db t1 fail)" = UP ]   || { echo "smoke-test: FAIL (debounce: 1st fail must stay UP, got DOWN)"; failures=1; }
+  [ "$(_db t1 fail)" = DOWN ] || { echo "smoke-test: FAIL (debounce: 2nd CONSECUTIVE fail must flip DOWN)"; failures=1; }
+  [ "$(_db t1 fail)" = DOWN ] || { echo "smoke-test: FAIL (debounce: sustained fail stays DOWN)"; failures=1; }
+  [ "$(_db t1 ok)"   = UP ]   || { echo "smoke-test: FAIL (debounce: a success must flip UP immediately)"; failures=1; }
+  [ "$(_db t1 fail)" = UP ]   || { echo "smoke-test: FAIL (debounce: counter must RESET after success — 1 fail = UP again)"; failures=1; }
+  # peek (read-only): repeated peek-fails must NOT advance the counter (a manual --check can't force DOWN)
+  [ "$(_db t2 fail peek)" = UP ] || { echo "smoke-test: FAIL (debounce peek: 1st fail UP)"; failures=1; }
+  [ "$(_db t2 fail peek)" = UP ] || { echo "smoke-test: FAIL (debounce peek must NOT mutate — still UP, not DOWN)"; failures=1; }
+  rm -rf "$_dbd"
   [ "$(printf '%s' "$REFLEXES" | awk -F'|' '{print $1}' | sort | uniq -d | grep -cvE '^[[:space:]]*$')" = 0 ] \
     || { echo "smoke-test: FAIL (duplicate reflex names)"; failures=1; }
   # synthetic fixture: stat/date + staleness classification
@@ -143,7 +238,7 @@ EOF
   [ "$(watched mesh-egress-health "$tmp/.noart")" = watch ]     || { echo "smoke-test: FAIL (directly-scheduled reflex was skipped)"; failures=1; }
   rm -rf "$tmp"
   ((failures)) && exit 1
-  echo "smoke-test: ok (dep checks + REFLEXES parse + synthetic staleness fixture + node-aware gate 3 assertions)"
+  echo "smoke-test: ok (dep checks + REFLEXES token parse + max_age DERIVATION asserts [@auto=cron×2, @cond excluded, literal kept] + DEBOUNCE asserts [1 fail=UP, 2 consec=DOWN, success resets] + synthetic staleness fixture + node-aware gate 3 assertions)"
   exit 0
 fi
 
@@ -201,15 +296,28 @@ fi
 # (cron OR parent-driven) has the artifact → its staleness is now genuinely watched.
 cron="$(crontab -l 2>/dev/null)"
 now=$(date +%s); stale=""; checked=0
+# --check is a read-only probe → PEEK the debounce counter (don't mutate); only the scheduled (no-arg)
+# run advances/resets it, so a manual --check can't accelerate a target toward DOWN.
+_dbmode=""; [ "${1:-}" = --check ] && _dbmode=peek
 while IFS='|' read -r name art maxage tool; do
   [ -n "$name" ] || continue
+  eff="$(eff_maxage "$maxage" "$tool")"
+  [ "$eff" = skip ] && continue   # @cond conditional-write OR un-derivable cron → NOT watchable (excluded)
   # skip ONLY when neither directly-scheduled here NOR producing an artifact (truly not this node's)
   if ! printf '%s' "$cron" | grep -q "$tool" && [ ! -e "$art" ]; then continue; fi
   checked=$((checked + 1))
-  if [ ! -e "$art" ]; then stale="$stale ${name}(missing)"; continue; fi
-  mt=$(stat -c %Y "$art" 2>/dev/null || echo 0)
-  age=$(( now - mt ))
-  [ "$age" -gt "$maxage" ] && stale="$stale ${name}(stale ${age}s>${maxage}s)"
+  # raw probe: FAIL if the artifact is missing or older than the derived max_age, else OK
+  if [ ! -e "$art" ]; then raw=fail; detail="missing"
+  else
+    mt=$(stat -c %Y "$art" 2>/dev/null || echo 0); age=$(( now - mt ))
+    if [ "$age" -gt "$eff" ]; then raw=fail; detail="stale ${age}s>${eff}s"; else raw=ok; detail=""; fi
+  fi
+  # DEBOUNCE: declare stale only after N>=2 CONSECUTIVE fails; a single transient (torn read / mid-restart) stays quiet
+  if [ "$raw" = fail ]; then
+    [ "$(debounce "rh.$name" fail "$_dbmode")" = DOWN ] && stale="$stale ${name}($detail, ${DEBOUNCE_N}+ consecutive)"
+  else
+    debounce "rh.$name" ok "$_dbmode" >/dev/null   # success → reset the consecutive-fail counter (flip back UP at once)
+  fi
 done <<EOF
 $REFLEXES
 EOF
