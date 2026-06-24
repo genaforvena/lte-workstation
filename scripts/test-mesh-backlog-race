@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# orphan-ok: on-demand test harness (test-*) — verifies mesh-feed's lock-coordinated backlog
+#            removal. Invoked by hand / by autoland's --test gate, never wired to cron.
+# reflex-cadence: none
+#
+# test-mesh-backlog-race — the backlog read-modify-write race, and the lock that closes it.
+#
+# THE BUG (CALM theorem — Hellerstein & Alvaro, "Keeping CALM: When Distributed Consistency is
+#   Easy", CACM 2020 / arXiv:1901.01930): a computation is eventually consistent WITHOUT
+#   coordination iff it is MONOTONIC (only accumulates, never retracts). mesh-feed consumes a
+#   backlog task by RETRACTING its line — `grep -vF LINE $BL > $BL.tmp; mv $BL.tmp $BL` — a
+#   NON-MONOTONIC read-modify-write. mesh-generate (cron 1-59/5) APPENDS to the same file and
+#   already serializes its writes under ~/.mesh/.ideas-queue.lock; mesh-feed (cron */3) was the
+#   ONE writer skipping the lock. A one-sided lock = ZERO mutual exclusion: an append landing
+#   between feed's grep-snapshot and its mv is clobbered (a generated task silently lost), and two
+#   concurrent feeds can resurrect a just-consumed line (double-dispatch). The fix: feed's
+#   bl_remove holds the SAME lock for the read-rewrite-mv critical section.
+#
+# WHAT THIS HARNESS DOES (deterministic, no real backlog/cron touched):
+#   1. CONTROL — reproduces the lost-write by ORDERING the steps (snapshot → append → mv); proves
+#      the hazard is real (no flaky timing: the window is forced, not raced).
+#   2. FIX — runs the lock-coordinated remover with a dwell while a lock-guarded appender contends;
+#      the append is forced to serialize AFTER the mv → the appended task SURVIVES, the consumed
+#      one is gone. (Skipped with a note if `flock` is unavailable — degrade, don't false-FAIL.)
+#   3. TRIPWIRE — asserts the shipped mesh-feed still lock-coordinates removal (bl_remove + flock),
+#      so a future revert to the bare grep/mv re-fails this gate.
+#
+# HONEST LIMITATION: like test-mesh-pump, sections 1-2 exercise the bl_remove PATTERN (kept in
+#   sync with mesh-feed), not the live cron timing; section 3 ties the pattern to the real tool.
+set -uo pipefail
+T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
+BL="$T/backlog"; LOCK="$T/.ideas-queue.lock"
+fail=0; note(){ echo "  $1"; }
+
+# the FIX as shipped in mesh-feed (same flock fd + `;`-not-`&&` empty-grep critical section)
+bl_remove(){ ( flock -w 10 8 2>/dev/null || true; grep -vF "$1" "$BL" > "$BL.tmp"; mv "$BL.tmp" "$BL"; ) 8>"$LOCK"; }
+
+# --- 1. CONTROL: unlocked RMW with the window forced open → the appended line is LOST ----------
+printf 'A\nB\nC\n' > "$BL"
+grep -vF "B" "$BL" > "$BL.tmp"   # feed snapshots A,C (consuming B)
+printf 'D\n' >> "$BL"            # generate appends D INTO the window
+mv "$BL.tmp" "$BL"               # unlocked mv clobbers the file → D never existed
+if grep -qx D "$BL"; then
+  note "1 control: FAIL — D survived an unlocked clobber (test cannot reproduce the bug)"; fail=1
+else
+  note "1 control: ok (unlocked RMW LOST the concurrent append D → backlog = $(tr '\n' ',' <"$BL"))"
+fi
+
+# --- 2. FIX: lock-coordinated remover + lock-guarded appender → the append SURVIVES ------------
+if command -v flock >/dev/null 2>&1; then
+  printf 'A\nB\nC\n' > "$BL"
+  # remover dwells inside the lock so the appender MUST wait its turn
+  ( flock -w 10 8 2>/dev/null || true; grep -vF "B" "$BL" > "$BL.tmp"; sleep 0.5; mv "$BL.tmp" "$BL"; ) 8>"$LOCK" &
+  sleep 0.1                                  # let the remover take the lock first
+  ( flock -w 10 8 2>/dev/null || true; printf 'D\n' >> "$BL"; ) 8>"$LOCK" &  # blocks on the lock
+  wait
+  if grep -qx D "$BL" && ! grep -qx B "$BL"; then
+    note "2 fix:     ok (lock serialized the append AFTER the mv → D survived, B removed → $(tr '\n' ',' <"$BL"))"
+  else
+    note "2 fix:     FAIL — expected A,C,D (D survived, B gone), got $(tr '\n' ',' <"$BL")"; fail=1
+  fi
+else
+  note "2 fix:     SKIP (flock unavailable on this host — cannot exercise lock serialization)"
+fi
+
+# --- 3. TRIPWIRE: the shipped mesh-feed must still lock-coordinate the removal -----------------
+# Prefer the genome SOURCE (source of truth — where the fix lands and must persist) over the
+# deployed ~/.local/bin copy, which lags until the steward deploys.
+FEED="${MESH_FEED_BIN:-}"
+[ -n "$FEED" ] || { for c in "$HOME/lte-workstation/scripts/mesh-feed" "$(command -v mesh-feed 2>/dev/null || true)"; do [ -r "$c" ] && { FEED="$c"; break; }; done; }
+if [ -r "$FEED" ] && grep -q 'bl_remove' "$FEED" && grep -Eq 'flock -w[ ]+[0-9]+[ ]+8' "$FEED"; then
+  note "3 tripwire: ok (mesh-feed removes via lock-coordinated bl_remove)"
+else
+  note "3 tripwire: FAIL — mesh-feed no longer lock-coordinates backlog removal (reverted to bare grep/mv?)"; fail=1
+fi
+
+if [ "$fail" = 0 ]; then echo "smoke-test: ok (race reproduced unlocked; lock prevents the lost append; source still coordinated)"; exit 0; fi
+echo "smoke-test: FAIL"; exit 1
