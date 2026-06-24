@@ -263,6 +263,14 @@ when unsure, leave it flagged so a genuinely dead-on-arrival orphan stays visibl
 - **Node-specific units (deploy where relevant):** `mesh-card-watchdog.{sh,service,timer}` ·
   `mtg-watchdog.{sh,service,timer}` · `bore-mtg.{sh,service,timer}` · `mesh-cam-watch.*` ·
   `mesh-tuner-eye.*` · `node-join-android.sh`
+- **Node-bound senses/reflexes (run only on the node whose organ they read — unwired elsewhere by design):**
+  `mesh-phone-beacon2` · `mesh-sms-monitor` · `mesh-sms-rx` (phone BODY / Termux) · `mesh-tg-watchdog`
+  (default-string's TG organ) · `mesh-tv-watch` (the TV-reachable node) · `mesh-wan-traffic` (GL-MT3000 router) ·
+  `mesh-ss-altport` (phaedra SS admin, operator-driven)
+- **On-demand senses / fusion / queries (pulled when asked or consumed by a caller — not scheduled):**
+  `mesh-overview` · `mesh-operator-context` · `mesh-operator-engagement` (these two overlap — operator-activity
+  fusion) · `mesh-social-fusion` · `mesh-net-io` · `mesh-socket-state` · `mesh-power-source` · `mesh-proximity` ·
+  `mesh-travels`
 - **Operator instruments (music + mic, played on demand):** `mesh-drone` · `mesh-metronome` ·
   `mesh-changes` · `mesh-looper` · `mesh-oscilloscope` · `mesh-mic-correlate` · `mesh-mic-crossvalidate` ·
   `mesh-tuner-web` (bass-clef practice page: serves the live `mesh-tuner` reading on a staff + browser metronome)
