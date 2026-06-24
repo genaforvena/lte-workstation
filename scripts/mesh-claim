@@ -1,0 +1,217 @@
+#!/usr/bin/env bash
+# mesh-claim — real CLAIMS on the mesh-chat board ("the bus IS the lock"), upgrading the weak
+# [taking] marker into a claim with TTL + LIVENESS + an artifact KEY. Borrowing #1 from the
+# operator's work mesh (guy-fawxible / Foxible), re-derived as OUR tool over OUR mesh-chat markers
+# — never their repo/instance. Fixes the double-dispatch / two-minds-race-same-task bug
+# (parallel-minds-same-goal-different-file): before working an artifact, claim it; a peer's --check
+# sees the live claim and stands down.
+#
+# Why a claim beats a bare [taking]:
+#   - KEY MUST BE AN ARTIFACT (alert id, repo+run, card id, file path, design slug) — never free
+#     text. A claim names the THING, so two minds aiming at the same goal collide on the same key.
+#   - TTL: a claim ages out (default 2h) so a forgotten claim never blocks the artifact forever.
+#   - LIVENESS beats the clock: if the claimer's mind window is IDLE or DEAD (via mesh-mind-state),
+#     the claim is STALE immediately — it walked away — without waiting for the TTL.
+#
+# Claims are board markers (so every node sees them, decay on reboot like the rest of the bus):
+#   [claim] <key> ttl=<seconds>      a claim (owner = the board WHO field, i.e. the poster)
+#   [claim-done] <key>               released by completion
+#   [yield] <key>                    released without completing (handing it back)
+# The ACTIVE claim for a key = its latest [claim] with no later [claim-done]/[yield].
+#
+# Usage:
+#   mesh-claim <key> [--ttl <sec>]   claim <key> (refuses if someone else holds a LIVE claim; exit 2)
+#   mesh-claim --done <key>          mark your claim complete
+#   mesh-claim --yield <key>         release your claim without completing
+#   mesh-claim --check <key>         status only, no post — prints verdict, sets exit code:
+#                                      0 unclaimed · 1 yours · 2 theirs(live) · 3 stale
+#   mesh-claim --list                active (unreleased) claims, one per line: key  owner  age  LIVE/STALE
+#   mesh-claim --test                smoke test (pure: valid_key / parse_latest / classify / is_stale)
+#
+# debounce: this tool only POSTS on an explicit verb (claim/done/yield) — it never re-posts on its
+# own. The increment-2 stale-SWEEP reflex pipes `mesh-claim --list` through `mesh-delta` so an
+# unchanged claim set emits NOTHING (the guy-fawxible-claim-sweep every-minute-spam anti-pattern).
+#
+# reflex-cadence: none   # a verb tool; the sweep that consumes --list is the wired reflex (increment 2)
+set -uo pipefail
+
+BOARD="${MESH_CHAT_LOG:-$HOME/.mesh/chat.log}"
+WHO="${MESH_WHO:-${USER:-?}@$(hostname)}"
+HOST="$(hostname)"
+DEFAULT_TTL="${MESH_CLAIM_TTL:-7200}"        # 2h default; a claim older than this with no liveness signal is stale
+SEP=" :: "                                    # mesh-chat field separator (ts<2sp>who<2sp>::<sp>msg)
+
+# --- pure: an artifact key is a single token, never free text (no spaces), bounded, sane charset ----
+valid_key() {  # <key> -> 0 valid / 1 invalid
+  local k="${1:-}"
+  [ -n "$k" ] || return 1
+  case "$k" in *[!A-Za-z0-9._:/#-]* | *" "*) return 1 ;; esac
+  [ "${#k}" -le 120 ] || return 1
+  return 0
+}
+
+# --- pure: from board lines on STDIN, emit the LATEST lifecycle event for <key> as "type|who|epoch|ttl"
+# (type = claim|done|yield; empty output = no event = unclaimed). Marker is BODY-ANCHORED (right after
+# the ' :: ' separator) so prose quoting "[claim]" never false-matches (board-marker-grep-must-anchor).
+parse_latest() {  # <key>  (reads board on stdin)
+  local key="$1"
+  awk -v key="$key" '
+    {
+      i = index($0, " :: "); if (i == 0) next
+      meta = substr($0, 1, i-1); msg = substr($0, i+4)
+      sub(/[ \t]+$/, "", meta); sub(/^[ \t]+/, "", msg)   # board sep is "  ::  " (2sp) — trim the stray space
+      # who = last whitespace-run-delimited field of meta; ts = first field
+      ts = meta; sub(/[ \t].*$/, "", ts)
+      who = meta; sub(/^.*[ \t]/, "", who)
+      type = ""
+      if (msg ~ /^\[claim\] /)       type = "claim"
+      else if (msg ~ /^\[claim-done\] /) type = "done"
+      else if (msg ~ /^\[yield\] /)  type = "yield"
+      else next
+      # first token of the marker body is the key
+      body = msg; sub(/^\[[a-z-]+\] /, "", body)
+      k = body; sub(/[ \t].*$/, "", k)
+      if (k != key) next
+      ttl = ""
+      if (match(msg, /ttl=[0-9]+/)) ttl = substr(msg, RSTART+4, RLENGTH-4)
+      print type "|" who "|" ts "|" ttl
+    }
+  ' | tail -1
+}
+
+# --- liveness: is the OWNER mind still tending its claim? STALE if its window is IDLE or DEAD/ABSENT.
+# Only resolvable for a LOCAL-host owner (window@thishost); a remote owner falls back to TTL (prints "").
+owner_liveness() {  # <who>  ->  prints LIVE|STALE|UNKNOWN
+  local who="$1" win="${1%@*}" ohost="${1##*@}"
+  [ "$ohost" = "$HOST" ] || { echo UNKNOWN; return; }   # remote owner: clock-only, not liveness
+  command -v mesh-mind-state >/dev/null 2>&1 || { echo UNKNOWN; return; }
+  mesh-mind-state "$win" >/dev/null 2>&1
+  case "$?" in
+    5)   echo STALE ;;          # DEAD pane → the claimer window existed and is gone
+    7)   echo UNKNOWN ;;        # ABSENT: no such window — a reflex/non-window owner, NOT provably dead → clock only
+    4)   echo LIVE  ;;          # NEEDS-INPUT: blocked but alive — keep the claim (clock can still age it)
+    *)   # 0 = WORKING/IDLE/UNKNOWN — distinguish IDLE (walked away) from WORKING via the evidence line
+         if mesh-mind-state "$win" 2>/dev/null | grep -qiw IDLE; then echo STALE; else echo LIVE; fi ;;
+  esac
+}
+
+# --- pure: stale by the CLOCK? claim epoch + ttl < now. (liveness is layered on top by the caller) ---
+is_stale_clock() {  # <claim_epoch> <ttl> <now> -> 0 stale / 1 fresh
+  local ce="${1:-0}" ttl="${2:-0}" now="${3:-0}"
+  [ "$ce" -gt 0 ] 2>/dev/null || return 1
+  [ "$ttl" -gt 0 ] 2>/dev/null || ttl="$DEFAULT_TTL"
+  [ $(( ce + ttl )) -lt "$now" ] && return 0 || return 1
+}
+
+# --- pure: final verdict from (last event type, owner, me, stale-flag) -> "<verdict> <code>" ----------
+classify() {  # <type> <owner> <me> <stale:0|1>  ->  prints "verdict code"
+  local type="${1:-}" owner="${2:-}" me="${3:-}" stale="${4:-0}"
+  case "$type" in
+    ""|done|yield) echo "unclaimed 0" ;;
+    claim)
+      if [ "$stale" = 1 ]; then echo "stale 3"
+      elif [ "$owner" = "$me" ]; then echo "yours 1"
+      else echo "theirs 2"; fi ;;
+    *) echo "unclaimed 0" ;;
+  esac
+}
+
+# --- resolve a key's current state into "verdict code owner age_seconds" (the shared read path) -------
+_resolve() {  # <key>  ->  echoes: verdict code owner age
+  local key="$1" rec type who ts ttl epoch now age live stale
+  rec="$(parse_latest "$key" < "$BOARD" 2>/dev/null)"
+  now="$(date +%s)"
+  if [ -z "$rec" ]; then echo "unclaimed 0  0"; return; fi
+  IFS='|' read -r type who ts ttl <<<"$rec"
+  epoch="$(date -d "$ts" +%s 2>/dev/null || echo 0)"
+  age=$(( now - epoch )); [ "$age" -ge 0 ] || age=0
+  stale=0
+  if [ "$type" = claim ]; then
+    live="$(owner_liveness "$who")"
+    if [ "$live" = STALE ]; then stale=1
+    elif is_stale_clock "$epoch" "${ttl:-$DEFAULT_TTL}" "$now"; then stale=1; fi
+  fi
+  set -- $(classify "$type" "$who" "$WHO" "$stale")
+  echo "$1 $2 $who $age"
+}
+
+_post() { mesh-chat "$1" >/dev/null; }   # canonical arg form (the whole codebase posts this way)
+
+case "${1:-}" in
+  --test)
+    f=""
+    valid_key "alert:ds-freeze-2026"      || f="$f key-good"
+    valid_key "repo/run#42"               || f="$f key-good2"
+    ! valid_key ""                        || f="$f empty-key"
+    ! valid_key "free text claim"         || f="$f free-text"
+    ! valid_key "bad;rm"                  || f="$f badchar"
+    # parse_latest: latest event per key wins, body-anchored, ignores prose mention
+    board='2026-06-24T01:00:00Z  a@h  ::  [claim] task-x ttl=60
+2026-06-24T01:05:00Z  b@h  ::  prose mentioning [claim] task-x should not match
+2026-06-24T01:10:00Z  a@h  ::  [claim-done] task-x
+2026-06-24T02:00:00Z  c@h  ::  [claim] task-y ttl=99'
+    [ "$(printf '%s\n' "$board" | parse_latest task-x)" = "done|a@h|2026-06-24T01:10:00Z|" ] || f="$f parse-x"
+    [ "$(printf '%s\n' "$board" | parse_latest task-y)" = "claim|c@h|2026-06-24T02:00:00Z|99" ] || f="$f parse-y"
+    [ -z "$(printf '%s\n' "$board" | parse_latest task-z)" ] || f="$f parse-none"
+    # is_stale_clock
+    is_stale_clock 1000 60 2000           || f="$f clock-stale"
+    ! is_stale_clock 1000 60 1030         || f="$f clock-fresh"
+    # classify
+    [ "$(classify '' '' me 0)"          = "unclaimed 0" ] || f="$f cl-unclaimed"
+    [ "$(classify done a@h me 0)"       = "unclaimed 0" ] || f="$f cl-done"
+    [ "$(classify claim me@h me@h 0)"   = "yours 1" ]     || f="$f cl-yours"
+    [ "$(classify claim other@h me@h 0)" = "theirs 2" ]   || f="$f cl-theirs"
+    [ "$(classify claim other@h me@h 1)" = "stale 3" ]    || f="$f cl-stale"
+    if [ -n "$f" ]; then echo "smoke-test: FAIL ($f )"; exit 1; fi
+    echo "smoke-test: ok (valid_key, parse_latest body-anchor, is_stale_clock, classify)"; exit 0 ;;
+
+  --check)
+    key="${2:-}"; valid_key "$key" || { echo "mesh-claim: invalid key (artifact id, no spaces): '$key'" >&2; exit 64; }
+    set -- $(_resolve "$key"); verdict="$1"; code="$2"; owner="${3:-}"; age="${4:-0}"
+    case "$verdict" in
+      unclaimed) echo "unclaimed: $key" ;;
+      yours)     echo "yours: $key (held ${age}s)" ;;
+      theirs)    echo "theirs: $key — held by $owner (${age}s, live)" ;;
+      stale)     echo "stale: $key — $owner abandoned it (${age}s; owner idle/dead or past TTL) → reclaimable" ;;
+    esac
+    exit "$code" ;;
+
+  --list)
+    # active claims = a [claim] with no later [claim-done]/[yield], one line: key owner age LIVE/STALE
+    keys="$(awk -v sep=' :: ' '
+      { i=index($0,sep); if(i==0)next; msg=substr($0,i+4); sub(/^[ \t]+/,"",msg)
+        if(msg ~ /^\[(claim|claim-done|yield)\] /){ b=msg; sub(/^\[[a-z-]+\] /,"",b); sub(/[ \t].*$/,"",b); print b } }
+    ' "$BOARD" 2>/dev/null | sort -u)"
+    [ -n "$keys" ] || exit 0
+    while IFS= read -r key; do
+      [ -n "$key" ] || continue
+      set -- $(_resolve "$key"); verdict="$1"; owner="${3:-}"; age="${4:-0}"
+      case "$verdict" in
+        theirs|yours) printf '%s\t%s\t%ss\tLIVE\n'  "$key" "$owner" "$age" ;;
+        stale)        printf '%s\t%s\t%ss\tSTALE\n' "$key" "$owner" "$age" ;;
+      esac
+    done <<<"$keys"
+    exit 0 ;;
+
+  --done)
+    key="${2:-}"; valid_key "$key" || { echo "mesh-claim: invalid key: '$key'" >&2; exit 64; }
+    _post "[claim-done] $key"; echo "released (done): $key"; exit 0 ;;
+
+  --yield)
+    key="${2:-}"; valid_key "$key" || { echo "mesh-claim: invalid key: '$key'" >&2; exit 64; }
+    _post "[yield] $key"; echo "yielded: $key"; exit 0 ;;
+
+  ""|-h|--help)
+    sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+
+  *)
+    key="$1"; shift; ttl="$DEFAULT_TTL"
+    while [ $# -gt 0 ]; do case "$1" in --ttl) ttl="${2:-$DEFAULT_TTL}"; shift 2 ;; *) shift ;; esac; done
+    valid_key "$key" || { echo "mesh-claim: invalid key (artifact id, no spaces): '$key'" >&2; exit 64; }
+    set -- $(_resolve "$key"); verdict="$1"; owner="${3:-}"
+    case "$verdict" in
+      theirs) echo "mesh-claim: '$key' already held by $owner (live) — standing down" >&2; exit 2 ;;
+      yours)  echo "already yours: $key (re-claim is a no-op; not re-posting)"; exit 1 ;;   # debounce: no spam
+      *)      _post "[claim] $key ttl=$ttl"; echo "claimed: $key (ttl=${ttl}s)"; exit 0 ;;   # unclaimed or stale → take it
+    esac ;;
+esac
