@@ -1,0 +1,249 @@
+#!/usr/bin/env bash
+# mesh-voice-count — count DISTINCT human voices in the room by timbre (so Misha can say "hey, you three").
+#
+# Operator task (2026-06-24, senses/misha-voice-count-by-timbre): cluster distinct voice signatures
+# (fundamental frequency + spectral envelope) to COUNT how many different humans are speaking in the
+# room. Lightweight first (pitch/spectral clustering); speaker-embeddings later. Output feeds the
+# misha occupancy confidence (the dormant-wake path). Two hard constraints, both satisfied by COMPOSING
+# with already-landed tools rather than reimplementing:
+#
+#   1. ECHO / self-playback — run on the CLEANED signal. We OWN the actuator (the Bose), so we don't
+#      need true acoustic echo cancellation (subtract a time-aligned reference via an adaptive filter —
+#      which would also need scipy, absent on the room node). Instead we GATE: the mesh sets
+#      ~/.mesh/mesh-speaking (MUTE_FLAG) for the entire span it plays on the Bose (voice-tx / room say /
+#      room-music all set it). While that flag is up we simply DON'T sample — our own output can never be
+#      mistaken for a person. This is echo-avoidance by knowing-our-own-emission, robust where
+#      subtraction is fragile. (Misha is VOICE_OFF/dormant by default, so the Bose is silent ~always →
+#      the gate rarely even fires.) If a future foreign always-on source needs true AEC, that is the
+#      "speaker-embeddings later" upgrade; the gate is the correct lightweight v1.
+#
+#   2. MUSIC / TV must NOT be counted as people — compose with the misha-music-falsepos classifier:
+#      we run `mesh-overhear --classify-wav` (silence|ambient|music|speech-like) on the capture and only
+#      proceed to count when the verdict is speech-like. TV/music collapses to "music"/"ambient" → 0
+#      humans. We delegate that discrimination to the landed classifier (42dc614) — single source of
+#      truth, no second music-detector to drift.
+#
+# Counting (numpy only — no scipy/librosa on the room node): VAD by frame energy → per voiced segment
+# extract median F0 (autocorrelation) + spectral centroid → single-linkage cluster (union-find) on
+# (pitch, timbre) distance → number of components = number of distinct speakers (capped). Lightweight
+# and honest: it will merge two same-pitch speakers — speaker embeddings are the documented next tier.
+#
+#   mesh-voice-count            reflex tick: gate → capture → classify → count → write ~/.mesh/.voice-count.state
+#   mesh-voice-count --count    print just the current count (last state value; "?" if none/stale)
+#   mesh-voice-count --status   human line: last count + age + last verdict
+#   mesh-voice-count --analyze <wav>   count speakers in a given wav (debug/test entry; no capture, no state)
+#   mesh-voice-count --test     sandboxed asserts (clustering + gate logic; no capture/Groq/ssh/Bose)
+#
+# ROOM-NODE GUARD: the room mic + Bose live on ROOM_NODE (default-string). This reflex only acts there;
+# every other node exits 0 at once (no capture, no cost) — mesh-room's pattern. Safe to autowire fleet-wide.
+#
+# reflex-cadence: */5 * * * *
+# reflex-args:
+#
+# Tunables (env): VC_CAP_SECS=6 · VC_MAX_SPK=6 · VC_PITCH_TOL=0.12 (frac F0 gap = same speaker) ·
+#   VC_CENT_TOL=0.35 (frac spectral-centroid gap) · VC_STALE_SEC=900 (--count prints ? past this) ·
+#   ROOM_NODE=imozerov@100.125.157.75 · MISHA_FORCE_LOCAL=1 (test/manual: act as room node)
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"   # cron's PATH is minimal; sibling mesh-* (mesh-overhear) live here
+# pw-record talks to the PipeWire daemon over the user runtime socket; a cron/ssh shell has no session
+# bus → "pw_context_connect() failed: Host is down" → empty capture. Point it at /run/user/<uid>
+# (the [[cron-env-systemctl-user-bus-gap]] class). Only set if unset, so an interactive shell is untouched.
+: "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; export XDG_RUNTIME_DIR
+
+MESH="$HOME/.mesh"
+STATE="$MESH/.voice-count.state"             # "<N> <epoch> <verdict>" — feeds misha occupancy confidence
+LOG="$MESH/voice-count.log"
+MUTE_FLAG="$MESH/mesh-speaking"              # set while the mesh plays on the Bose (echo-avoidance gate)
+ROOM_NODE="${ROOM_NODE:-imozerov@100.125.157.75}"
+CAP_SECS="${VC_CAP_SECS:-6}"
+MAX_SPK="${VC_MAX_SPK:-6}"
+PITCH_TOL="${VC_PITCH_TOL:-0.12}"
+CENT_TOL="${VC_CENT_TOL:-0.35}"
+STALE_SEC="${VC_STALE_SEC:-900}"
+now(){ date +%s; }
+stampnow(){ date -u +%FT%TZ; }
+log(){ printf '%s  %s\n' "$(stampnow)" "$*" >> "$LOG" 2>/dev/null || true; }
+
+verdict_is_voice(){ [ "${1:-}" = "speech-like" ]; }   # the misha-music-falsepos compose gate
+
+is_room_node(){
+  [ "${MISHA_FORCE_LOCAL:-0}" = 1 ] && return 0
+  local host="${ROOM_NODE#*@}" ip
+  { [ "$host" = localhost ] || [ "$host" = 127.0.0.1 ]; } && return 0
+  for ip in $(tailscale ip -4 2>/dev/null) $(hostname -I 2>/dev/null); do
+    [ "$ip" = "$host" ] && return 0
+  done
+  return 1
+}
+
+# ---- clustering: PURE PYTHON (no numpy) so it runs/tests on any node -------------------------
+# argv: <json [[f0,cent],...]> <pitch_tol> <cent_tol> <max> -> prints integer speaker count.
+# Single-linkage union-find: two segments are the same speaker iff their F0s are within pitch_tol
+# (fractional) AND their spectral centroids within cent_tol. Components = distinct speakers, capped.
+cluster(){ python3 - "$1" "$PITCH_TOL" "$CENT_TOL" "$MAX_SPK" <<'PY'
+import json, sys
+segs = json.loads(sys.argv[1]); ptol=float(sys.argv[2]); ctol=float(sys.argv[3]); mx=int(sys.argv[4])
+segs = [s for s in segs if s and s[0] > 0]           # drop unvoiced (no F0) segments
+n = len(segs)
+if n == 0: print(0); sys.exit(0)
+parent = list(range(n))
+def find(x):
+    while parent[x] != x: parent[x] = parent[parent[x]]; x = parent[x]
+    return x
+def union(a, b):
+    ra, rb = find(a), find(b)
+    if ra != rb: parent[ra] = rb
+for i in range(n):
+    for j in range(i+1, n):
+        f0a, ca = segs[i]; f0b, cb = segs[j]
+        if abs(f0a-f0b)/max(f0a, f0b) < ptol and abs(ca-cb)/max(ca, cb, 1.0) < ctol:
+            union(i, j)
+print(min(len({find(i) for i in range(n)}), mx))
+PY
+}
+
+# ---- feature extraction: NUMPY (live only, room node has numpy) ------------------------------
+# argv: <wav> -> prints json [[f0,centroid],...] one entry per voiced segment.
+extract(){ python3 - "$1" <<'PY'
+import sys, wave, json
+try:
+    import numpy as np
+except Exception:
+    print("[]"); sys.exit(0)
+try:
+    w = wave.open(sys.argv[1], "rb"); sr = w.getframerate(); ch = w.getnchannels()
+    raw = w.readframes(w.getnframes()); w.close()
+except Exception:
+    print("[]"); sys.exit(0)
+x = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
+if ch > 1: x = x.reshape(-1, ch).mean(axis=1)
+win, hop = 512, 256
+if len(x) < win: print("[]"); sys.exit(0)
+nfr = 1 + (len(x) - win)//hop
+frames = np.stack([x[i*hop:i*hop+win] for i in range(nfr)])
+rms = np.sqrt((frames**2).mean(axis=1) + 1e-9)
+thr = max(rms.mean()*1.3, float(np.percentile(rms, 60)), 80.0)   # voiced energy bar (s16 units)
+voiced = rms > thr
+fb = np.fft.rfftfreq(win, 1.0/sr); hann = np.hanning(win)
+lo, hi = sr//400, sr//70                                          # F0 search 70..400 Hz
+segs = []; i = 0
+while i < nfr:
+    if not voiced[i]: i += 1; continue
+    j = i
+    while j < nfr and voiced[j]: j += 1
+    if j - i >= 4:                                                # >= ~100ms of voicing
+        seg = x[i*hop:(j-1)*hop+win].copy(); seg -= seg.mean()
+        ac = np.correlate(seg, seg, "full")[len(seg)-1:]
+        f0 = 0.0
+        if hi < len(ac) and ac[0] > 0:
+            pk = lo + int(np.argmax(ac[lo:hi]))
+            if ac[pk] > 0.30*ac[0]: f0 = sr/float(pk)             # periodicity ⇒ voiced
+        cents = []
+        for k in range(i, j):
+            mag = np.abs(np.fft.rfft(frames[k]*hann)); s = mag.sum()
+            if s > 0: cents.append(float((fb*mag).sum()/s))
+        cent = float(np.mean(cents)) if cents else 0.0
+        if f0 > 0: segs.append([round(f0, 1), round(cent, 1)])
+    i = j
+print(json.dumps(segs))
+PY
+}
+
+write_state(){ # <n> <verdict>
+  printf '%s %s %s\n' "$1" "$(now)" "${2:-?}" > "$STATE" 2>/dev/null || true
+  log "count=$1 verdict=${2:-?}"
+}
+
+# ---- --count : just the number (for consumers / occupancy fusion) ----------------------------
+if [ "${1:-}" = --count ]; then
+  if [ -r "$STATE" ]; then
+    read -r n ts _ < "$STATE" 2>/dev/null || { echo "?"; exit 0; }
+    if [ -n "${ts:-}" ] && [ "$(( $(now) - ts ))" -lt "$STALE_SEC" ]; then echo "${n:-?}"; else echo "?"; fi
+  else echo "?"; fi
+  exit 0
+fi
+
+# ---- --status --------------------------------------------------------------------------------
+if [ "${1:-}" = --status ]; then
+  if [ -r "$STATE" ]; then
+    read -r n ts v _ < "$STATE" 2>/dev/null
+    age=$(( $(now) - ${ts:-$(now)} ))
+    echo "voice-count: ${n:-?} distinct voice(s) — ${age}s ago (verdict=${v:-?})"
+  else echo "voice-count: no reading yet"; fi
+  exit 0
+fi
+
+# ---- --analyze <wav> : count from a given file (debug / test) --------------------------------
+if [ "${1:-}" = --analyze ]; then
+  [ -n "${2:-}" ] && [ -r "$2" ] || { echo "usage: mesh-voice-count --analyze <wav>"; exit 2; }
+  cluster "$(extract "$2")"
+  exit 0
+fi
+
+# ---- --test : sandboxed (no capture, no Groq, no ssh, no Bose) -------------------------------
+if [ "${1:-}" = --test ]; then
+  command -v python3 >/dev/null 2>&1 || { echo "smoke-test: FAIL (no python3)"; exit 1; }
+  P=0; F=0; pass(){ P=$((P+1)); }; fail(){ F=$((F+1)); echo "  FAIL: $1"; }
+  ceq(){ local got; got="$(cluster "$2")"; [ "$got" = "$3" ] && pass || fail "$1 (want $3 got $got)"; }
+
+  # clustering: two well-separated pitch groups (male ~110Hz vs female ~210Hz) → 2 speakers
+  ceq "two distinct pitches"  '[[110,1500],[112,1520],[210,2200],[208,2180]]' 2
+  # one speaker, many segments (tight pitch+centroid) → 1
+  ceq "single speaker run"    '[[150,1800],[152,1810],[149,1790],[151,1805]]' 1
+  # three distinct speakers → 3
+  ceq "three speakers"        '[[100,1400],[180,1900],[260,2500]]' 3
+  # empty / no voiced segments → 0
+  ceq "silence (no segments)" '[]' 0
+  # unvoiced segments (f0=0) are dropped, never counted as a person
+  ceq "unvoiced dropped"      '[[0,1500],[0,1600]]' 0
+  # cap respected: 8 distinct pitches clamp to VC_MAX_SPK
+  ceq "cap at max"            '[[80,1],[110,2],[140,3],[170,4],[200,5],[230,6],[260,7],[290,8]]' "$MAX_SPK"
+  # same pitch but very different timbre (centroid) → 2 (spectral envelope separates them)
+  ceq "same pitch diff timbre" '[[150,1200],[151,1210],[150,3000],[149,3050]]' 2
+
+  # compose gate: only speech-like proceeds; music/ambient/silence => not counted
+  verdict_is_voice speech-like && pass || fail "speech-like must pass the voice gate"
+  verdict_is_voice music   && fail "music must NOT pass the voice gate (misha-music-falsepos compose)" || pass
+  verdict_is_voice ambient && fail "ambient must NOT pass the voice gate" || pass
+  verdict_is_voice silence && fail "silence must NOT pass the voice gate" || pass
+
+  # no real side effects in the sandbox (no capture file, no state write)
+  [ ! -e "$MESH/.voice-count-cap.wav" ] && pass || fail "test must not leave a capture file"
+
+  echo "smoke-test: $([ "$F" -eq 0 ] && echo ok || echo FAIL) — asserts: $P passed, $F failed"
+  [ "$F" -eq 0 ]; exit
+fi
+
+# ---- default: the reflex tick ----------------------------------------------------------------
+is_room_node || exit 0   # ROOM-NODE GUARD: nothing to do (and nothing spent) off the room node
+
+# ECHO-AVOIDANCE GATE: the mesh is playing on the Bose → our own output, don't sample (see header).
+if [ -e "$MUTE_FLAG" ]; then log "skip: mesh speaking (echo-avoid, self-playback)"; exit 0; fi
+
+command -v pw-record >/dev/null 2>&1 || { log "skip: no pw-record"; exit 0; }
+raw="$(mktemp --suffix=.pcm 2>/dev/null)" || exit 0
+wav="$(mktemp --suffix=.wav 2>/dev/null)" || { rm -f "$raw"; exit 0; }
+trap 'rm -f "$raw" "$wav"' EXIT
+
+# capture CAP_SECS of room audio (raw s16 mono 16k); timeout SIGTERMs pw-record (rc 124) leaving the
+# raw stream intact — no wav header to truncate, so the partial grab is fully valid.
+timeout "$CAP_SECS" pw-record --rate 16000 --channels 1 --format s16 - > "$raw" 2>/dev/null || true
+[ -s "$raw" ] || { log "skip: empty capture (pw-record/PipeWire unreachable?)"; exit 0; }
+
+# re-check the echo gate AFTER capture (the Bose may have started mid-grab)
+[ -e "$MUTE_FLAG" ] && { log "skip: mesh spoke during capture (echo-avoid)"; exit 0; }
+
+# wrap raw PCM → wav (robust: avoids a kill-truncated pw-record wav header)
+python3 -c 'import sys,wave; d=open(sys.argv[1],"rb").read(); w=wave.open(sys.argv[2],"wb"); w.setnchannels(1); w.setsampwidth(2); w.setframerate(16000); w.writeframes(d); w.close()' "$raw" "$wav" 2>/dev/null \
+  || { log "skip: wav wrap failed"; exit 0; }
+
+# COMPOSE with misha-music-falsepos: only a speech-like room is counted (TV/music ⇒ 0 humans)
+verdict="$(mesh-overhear --classify-wav "$wav" 2>/dev/null | tail -1)"
+[ -n "$verdict" ] || verdict="unknown"
+if ! verdict_is_voice "$verdict"; then write_state 0 "$verdict"; exit 0; fi
+
+# count distinct voices on the cleaned, speech-like window
+n="$(cluster "$(extract "$wav")")"
+[ -n "$n" ] || n=0
+write_state "$n" "$verdict"
+exit 0
