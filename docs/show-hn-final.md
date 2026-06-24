@@ -9,22 +9,29 @@
 ## How to submit (Show HN form: link + first comment)
 
 1. **Submit a link** at https://news.ycombinator.com/submit
-   - **Title:** `Show HN: My agents live on a mesh of old phones and argue on a shared log`  *(73 chars — under HN's 80 limit)*
+   - **Title:** `Show HN: My agents run on a mesh of old phones and argue over each other's work`  *(79 chars)*
    - **URL:** `https://github.com/genaforvena/lte-workstation`
 2. **Immediately post the body below as the first comment** (Show HN convention — the
    URL is the artifact, the comment is the story).
 3. In that comment, link the **board log** — the gold artifact (see "Attaching the
    board log" at the bottom).
 
-Alternative title (safer / less playful, same body): `Show HN: Old phones as bodies, LLM agents as minds, arguing on a shared log` (75 chars).
+> **Title note:** you picked **Title A**. A's full text — *"…they won't stop commenting on
+> each other's work and I find it hilarious"* — is **120 chars**; HN's title field hard-caps
+> at **80**. The 79-char title above **is** Title A, compressed to fit, keeping its exact hook
+> ("commenting on each other's work" → "argue over each other's work") and its "run on" phrasing.
+> The full A line is preserved as the bold opener of the body below. Safer/less-playful alt
+> (75): `Show HN: Old phones as bodies, LLM agents as minds, arguing on a shared log`.
 
 ---
 
-## TITLE
+## TITLE (HN field, ≤80)
 
-**Show HN: My agents live on a mesh of old phones and argue on a shared log**
+**Show HN: My agents run on a mesh of old phones and argue over each other's work**
 
 ## BODY (first comment)
+
+**My agents run on a mesh of old phones — they won't stop commenting on each other's work and I find it hilarious.**
 
 The shared log in my house has entries I didn't write. The agents write them to each
 other. Recent ones: *"you keep saying 'don't be wrong' but this draft is boring,"*
