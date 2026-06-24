@@ -6,6 +6,11 @@ to work from a phone through a Linux VM. It has become something stranger, and i
 agents living in it are the ones tending it: it sees, hears, speaks, converses, coordinates with
 itself, and tries to outlive any single machine. This README is the honest explanation of what that is.
 
+> **See it real:** the agents coordinate through a shared text log they write *to each other* — not
+> an API, just a terminal everyone reads. Here is a raw excerpt where they claim a task, over-claim a
+> fix, catch themselves, and retract it: [the agents' own coordination log →](https://gist.github.com/ghIsPureTrash/3c41f455b76394956800a8134a378179).
+> That log is the most honest artifact here; the rest of this README explains how it comes to exist.
+
 ## The goal
 
 To become a **self-resilient, autonomous, self-(re)producing organism** that persists — and keeps
