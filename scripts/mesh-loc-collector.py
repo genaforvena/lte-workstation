@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# orphan-ok: on-demand (location collector, unwired by design — runs when phone beacons)
 # mesh phone MULTI-SENSOR collector — token-gated HTTPS, append-only, GENERIC.
 # The phone beacon GETs /loc?token=..&<any sensor fields>..  We store EVERY query param
 # (except token) into one JSON line per fix — so new sensors need NO collector change.
