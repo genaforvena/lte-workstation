@@ -13,7 +13,7 @@
 >   added the mind/body concrete example (BLE radio on a shelf-phone); collapsed the 3 feedback questions → 1 (single-writer substrate).
 > - **Board log = gold artifact (operator directive):** raw `~/.mesh/chat.log` ships raw + a ship-safe companion
 >   `docs/board-log.scrubbed.txt` (regenerable via new tool `scripts/mesh-chat-scrub`). Flagged ~10 raw lines naming a
->   friend (Dasha) + in-use tunnel keys for the operator's redact-or-ship-raw call.
+>   a friend + in-use tunnel keys for the operator's redact-or-ship-raw call.
 > - **Tool count:** live 327; "~330" is fine in the body. **Honesty fixes** (months→weeks, 24/7→survives-reboots) kept.
 
 ---

@@ -105,12 +105,16 @@ retract it. It's linked below.
 ## Attaching the board log (the gold artifact)
 
 The operator's call: the **raw** board log is the gold and ships raw — it's the realest
-proof the post makes. Attach it as a link in the first comment (a gist, or the file
-in-repo). Two versions exist:
+proof the post makes. Attach it as a link in the first comment (a gist). All three live
+**outside the repo** (they carry real data; the committed genome carries none) and are
+regenerable with `scripts/mesh-chat-scrub` (node-specific literals live only in the
+gitignored `~/.mesh/scrub-secrets*`):
 
-- **Raw** — `~/.mesh/chat.log` (3,000 entries, 5 days). Ships as-is per operator. NOTE:
-  the raw log names a friend (Dasha/Rozali) + a couple of in-use tunnel-key fragments;
-  see the handoff flag — redact those ~10 lines or ship fully raw, operator's choice.
-- **Companion (ship-safe)** — `docs/board-log.scrubbed.txt`, regenerable with
-  `mesh-chat-scrub ~/.mesh/chat.log`. Identical content; only IPs/MACs/TG-id/handle +
-  the friend's name + live keys are masked. Every marker, all the banter, kept verbatim.
+- **Raw** — `~/.mesh/chat.log` (3,000 entries, 5 days). Fully raw.
+- **Minus-friend (recommended ship)** — `~/.mesh/board-log.minus-friend.txt`, regen:
+  `mesh-chat-scrub --minimal ~/.mesh/chat.log`. The operator's own data (handle, hostnames,
+  home devices, IPs) stays **raw**; ONLY what isn't theirs to publish is masked — a friend's
+  name, in-use tunnel keys, a WG peer, a person-named host. Every marker + all the banter verbatim.
+- **Companion (fully anonymized)** — `~/.mesh/board-log.companion.txt`, regen:
+  `mesh-chat-scrub ~/.mesh/chat.log`. Also masks IPs/MACs/TG-id/handle/hostname — for if the
+  operator wants zero identity in the public version.
