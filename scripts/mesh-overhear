@@ -188,35 +188,112 @@ def transcribe_recent(secs):
     except OSError: pass
     if is_real(text):
         _write(text); return text
-    kind="музыка" if (text and "музык" in text.lower()) else "тишина/шум, без слов"
+    # CLASSIFIER-GATED marker (operator 2026-06-24): whisper hallucinates "музыка"/"[музыка]" on
+    # steady ambient hum; the old `if 'музык' in text` marker then labeled every quiet room as
+    # "нет речи — музыка" → 'music everywhere'. Now the AUDIO classifier decides: only real music
+    # (tonal+lou+continuous) is labeled музыка; ambient hum → "фоновый гул"; silence → "тишина".
+    # The text-only 'музык' hint is no longer trusted on its own.
+    verdict=classify_presence(secs)
+    if verdict=="music":        kind="музыка"
+    elif verdict=="ambient":    kind="фоновый гул/шум (не музыка)"
+    else:                       kind="тишина/шум, без слов"
     _write("(нет речи — %s)"%kind); return ""
 
-def speech_presence(secs):
-    # CHEAP wav-level verdict on the recent buffer (NO whisper) — operator 2026-06-20: "понимать что пусто
-    # на уровне звуковых wav, не гонять 'думаю' чтобы ничего не сказать". Per-100ms-frame RMS:
-    #   'silence'     → almost no frames above onset (empty room);
-    #   'sound'       → loud but near-continuous, few quiet gaps (music/noise — not talking);
-    #   'speech-like' → active frames INTERSPERSED with pauses (words+gaps → likely speech).
-    # Heuristic, not a classifier — the real filter is is_real() after STT; this just stops the pipeline from
-    # engaging (ack/poke) on obvious silence or steady music.
+def _self_playing():
+    # True while the mesh is producing sound on the Bose — never classify our OWN
+    # playback as ambient music (operator 2026-06-24: voice-tx/room-music on the Bose
+    # fed back into the mic → 'music everywhere'). The capture loop already drains
+    # during MUTE_FLAG, but voice-tx/room-music --play set the flag too AND pw-play
+    # running catches the rest; this is defense-in-depth against races.
+    if os.path.exists(MUTE_FLAG): return True
+    try:
+        r=subprocess.run(["pgrep","-x","pw-play"],capture_output=True,timeout=2)
+        if r.returncode==0: return True
+    except Exception: pass
+    return False
+
+def _frame_features(data):
+    # per-100ms-frame (RMS in s16 units, spectral flatness in [0,1]) for 16k mono s16 bytes.
+    # numpy is a heavy import — done lazily so the daemon/STT paths don't pay for it.
+    import numpy as np
+    fb=int(RATE*0.1)*2
+    out=[]
+    for i in range(0,len(data)-fb+1,fb):
+        f=data[i:i+fb]
+        if len(f)<fb: continue
+        a=np.frombuffer(f,dtype="<i2").astype(np.float64)
+        rms=float(np.sqrt(np.mean(a*a)))             # s16 units — comparable to audioop.rms
+        w=a*np.hanning(len(a))                        # window before FFT to reduce leakage
+        p=(np.abs(np.fft.rfft(w))+1e-12)**2          # one-sided power spectrum
+        fm=float(np.exp(np.mean(np.log(p)))/np.mean(p))  # spectral flatness: ~1 noise, ~0 tonal
+        out.append((rms,fm))
+    return out
+
+def classify(data):
+    # Rich verdict on raw wav bytes: silence | ambient | music | speech-like.
+    # Replaces the af/qf-only heuristic (operator 2026-06-24): steady ambient hum
+    # (fridge/fan/HVAC) used to trip qf<0.10 -> 'sound' -> marker said 'музыка' ->
+    # 'music everywhere'. Now: low absolute level OR broadband+steady -> ambient
+    # (collapses to silence externally); only tonal+loud+steady -> music;
+    # intermittent -> speech-like. Spectral flatness separates harmonic (music/
+    # voice) from broadband noise (hum); absolute level separates the ambient
+    # floor from real content; self-playback is silenced up front.
+    if _self_playing(): return "silence"
+    feats=_frame_features(data)
+    if not feats: return "silence"
+    rms=[r for r,_ in feats]; flat=[f for _,f in feats]; n=len(rms)
+    af=sum(1 for r in rms if r>=START_RMS)/n             # fraction above speech onset
+    qf=sum(1 for r in rms if r< SIL_RMS )/n              # fraction quiet (pauses)
+    act=[r for r in rms if r>=SIL_RMS]
+    mean_act=sum(act)/len(act) if act else 0.0
+    max_rms=max(rms)
+    mean_flat=sum(flat)/n
+    # tunables — env-overridable so the operator can fine-tune on the real room
+    AMB_LEVEL=float(os.environ.get("OH_AMB_LEVEL","1000"))  # active-RMS below this = ambient floor
+    HUM_FLAT =float(os.environ.get("OH_HUM_FLAT","0.40"))   # flatness above this = broadband noise (hum)
+    MUSIC_MIN=float(os.environ.get("OH_MUSIC_MIN","2000"))  # tonal but below this level = fridge hum, not music
+    WALL_QF  =float(os.environ.get("OH_WALL_QF","0.15"))    # gap fraction below this = continuous wall
+    if af<0.06: return "silence"                            # almost nothing above onset (empty room)
+    if mean_act<AMB_LEVEL: return "ambient"                 # low continuous level = HVAC/fridge hum
+    if qf<WALL_QF:                                          # continuous wall — music vs noise?
+        if mean_flat>HUM_FLAT: return "ambient"             # steady broadband hum/noise
+        if max_rms<MUSIC_MIN: return "ambient"              # low-level tonal hum (compressor)
+        return "music"                                      # loud tonal wall = real music
+    return "speech-like"                                    # intermittent energy with pauses
+
+def _buffer_bytes(secs):
+    # concat the recent rolling-buffer utterances into one wav's raw bytes (or None)
     paths=buffer_wavs(secs)
-    if not paths: return "silence"
+    if not paths: return None
     big="/tmp/oh-hs-%d.wav"%os.getpid()
-    if not concat_wavs(paths,big): return "silence"
+    if not concat_wavs(paths,big): return None
     try:
         w=wave.open(big,"rb"); data=w.readframes(w.getnframes()); w.close()
-    except Exception: data=b""
+    except Exception: data=None
     try: os.remove(big)
     except OSError: pass
-    fb=int(RATE*0.1)*2                                   # 100 ms frames
-    frames=[data[i:i+fb] for i in range(0,len(data)-fb+1,fb)]
-    if not frames: return "silence"
-    rms=[audioop.rms(f,2) for f in frames]; n=len(rms)
-    af=sum(1 for r in rms if r>=START_RMS)/n             # fraction "active" (above speech onset)
-    qf=sum(1 for r in rms if r< SIL_RMS )/n             # fraction "quiet" (pauses)
-    if af<0.06: return "silence"                         # essentially nothing above onset
-    if qf<0.10: return "sound"                           # loud wall, almost no gaps → continuous music/noise
-    return "speech-like"                                 # intermittent energy with pauses → likely talking
+    return data
+
+def speech_presence(secs):
+    # CHEAP wav-level verdict on the recent buffer (NO whisper) — operator 2026-06-20: "понимать
+    # что пусто на уровне звуковых wav, не гонять 'думаю' чтобы ничего не сказать". External 3-state
+    # contract preserved (silence|sound|speech-like) so --poke-mind/--watch-* keep working; the
+    # 4-state `classify()` is collapsed: ambient hum now reads as silence (was 'sound' = the bug).
+    # Heuristic, not a classifier — the real filter is is_real() after STT; this just stops the
+    # pipeline from engaging (ack/poke) on obvious silence, ambient hum, or steady music.
+    data=_buffer_bytes(secs)
+    if not data: return "silence"
+    v=classify(data)
+    if v in ("silence","ambient"): return "silence"
+    if v=="music": return "sound"
+    return "speech-like"
+
+def classify_presence(secs):
+    # RICH 4-state verdict (silence|ambient|music|speech-like) — used by the transcript marker so
+    # ambient hum is labeled honestly instead of propagating whisper's 'музыка' hallucination.
+    data=_buffer_bytes(secs)
+    if not data: return "silence"
+    return classify(data)
 
 def bose_id():
     # the LIVE pipewire id of the Bose sink, or None if it's not connected right now
@@ -235,8 +312,13 @@ def bose_id():
 def pwplay(wav):
     # ALWAYS aim for the Bose; if it dropped, fall back to default so audio isn't lost (operator 2026-06-20:
     # "должен говорить через Bose, не в ноутбук" — the default sink drifts to the laptop when BT blips).
-    if os.path.exists(VOICE_OFF):   # operator silence directive — produce NO sound until the switch is removed
-        return
+    # VOICE GATE (operator 2026-06-24): room-voice-off (manual) + thermal-silence (auto overheat mute) +
+    # live .therm-state HOT. Supersedes the old VOICE_OFF-only os.path check; routed through the single
+    # mesh-voice-gate binary so EVERY audio cause (not just the manual switch) mutes the room. Fail-OPEN
+    # on a missing gate binary (the manual room-voice-off switch is the reliable mute).
+    try:
+        if subprocess.run(["mesh-voice-gate"],capture_output=True,timeout=6).returncode!=0: return
+    except Exception: pass
     bid=bose_id()
     if bid:
         try: subprocess.run(["wpctl","set-default",bid],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=5)
@@ -363,6 +445,17 @@ elif mode=="has_speech":
     # speech-like so callers can gate with `if mesh-overhear --has-speech N; then`. operator 2026-06-20.
     v=speech_presence(int(sys.argv[2]) if len(sys.argv)>2 else 150)
     print(v); sys.exit(0 if v=="speech-like" else 1)
+
+elif mode=="classify_wav":
+    # RICH verdict on a given wav file (TEST/DEBUG entry point): prints silence|ambient|music|speech-like.
+    # Used by test-overhear-classifier so the audio classifier is exercised on synthetic wavs without
+    # touching the live rolling buffer or the mic. operator 2026-06-24.
+    if len(sys.argv)<3: print("classify_wav: need <wav>"); sys.exit(2)
+    try:
+        w=wave.open(sys.argv[2],"rb"); data=w.readframes(w.getnframes()); w.close()
+    except Exception as e:
+        print("classify_wav: read error %s"%e); sys.exit(2)
+    print(classify(data)); sys.exit(0)
 
 elif mode=="transcribe_buffer":
     sys.stdout.write(transcribe_buffer())
@@ -500,6 +593,7 @@ case "${1:-}" in
   --ack)        runpy ack ;;
   --buffer-fresh)       shift; runpy buffer_fresh "${1:-150}" ;;   # exit 0 if buffered audio within $1 secs
   --has-speech)         shift; runpy has_speech "${1:-150}" ;;     # print silence|sound|speech-like; exit 0 only if speech-like
+  --classify-wav)       shift; runpy classify_wav "$1" ;;          # rich verdict on a wav (TEST/DEBUG): silence|ambient|music|speech-like
   --transcribe-buffer)  runpy transcribe_buffer ;;                 # transcribe the rolling buffer NOW → transcript
   --poke-mind)
     # CENTRAL trigger for a room comment — thumbs-up (manual) or room motion (--motion, ambient). ON-DEMAND
