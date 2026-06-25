@@ -77,7 +77,8 @@ wedge_empty() {
 
 # --- RSSI trend tracking ---
 # Rolling window of RSSI readings per MAC, stored in .presence-rssi-history.
-# Format: one line per MAC, "MAC|rss1,rss2,...,rssN" (up to TREND_WINDOW entries).
+# Format: one line per MAC, "MAC|rss1,rss2,...,rssN|last_seen_epoch" (csv up to TREND_WINDOW entries;
+# the trailing epoch is additive — legacy "MAC|csv" 2-field lines still parse, see gap-aware note above).
 # Trend classification compares first-half avg to second-half avg:
 #   APPROACHING — signal improving (second-half avg > first-half avg + 5 dBm)
 #   RECEDING    — signal degrading  (second-half avg < first-half avg - 5 dBm)
@@ -87,6 +88,16 @@ wedge_empty() {
 # real motion produces 10-20 dBm swings, so 5 dBm filters single-read noise.
 TREND_WINDOW="${MESH_PRESENCE_TREND_WINDOW:-5}"
 TREND_THRESHOLD="${MESH_PRESENCE_TREND_THRESHOLD:-5}"
+# GAP-AWARE history (2026-06-25 fidelity): the rolling RSSI window is TIME-BLIND — it keeps the last N
+# readings regardless of the gaps between them. At the */10 cron cadence a device that LEFT and RETURNED
+# an hour later blends its stale pre-absence samples into the median (debounce) AND the trend, so a
+# returning phone reads its OLD proximity/direction, not where it actually is now. Stamp each history
+# line with a last-seen epoch: a sighting older than the GAP TTL starts a FRESH window (current visit
+# only); lines older than the PRUNE TTL are dropped (bounds the file against dead transients + rotated
+# random-MAC churn). The epoch is an ADDITIVE 3rd field — every existing reader does `cut -d'|' -f2`
+# (the csv), so they are invariant; legacy 2-field lines (no epoch) are treated as never-gapped + kept.
+HISTORY_GAP_TTL="${MESH_PRESENCE_HISTORY_GAP_TTL:-1800}"      # 30m unseen → returning device resets its window
+HISTORY_PRUNE_TTL="${MESH_PRESENCE_HISTORY_PRUNE_TTL:-10800}" # 3h unseen → drop the dead MAC line
 # TREND_FILE initialized after MESH is set (see below)
 
 # ── VOLATILITY-COUPLED LEARNING RATE (Hierarchical Gaussian Filter — Mathys et al.) ───────────────
@@ -152,24 +163,59 @@ classify_trend() {
   fi
 }
 
-# Update rolling history for one MAC. Args: mac rssi history_file
+# Update rolling history for one MAC. Args: mac rssi history_file [now_epoch]
+# Gap-aware: if the device's previous sighting is older than HISTORY_GAP_TTL, the stale pre-gap window
+# is DISCARDED (the device left and came back — its old RSSI is not evidence about where it is now), so
+# the median/trend reflect only the current visit. Every line is (re)written with a last-seen epoch.
 update_rssi_history() {
-  local mac="$1" rssi="$2" file="$3"
-  local prev=""
-  prev="$(grep "^${mac}|" "$file" 2>/dev/null | head -1 | cut -d'|' -f2)"
+  local mac="$1" rssi="$2" file="$3" now="${4:-$(date +%s)}"
+  local line prev last
+  line="$(grep "^${mac}|" "$file" 2>/dev/null | head -1)"
+  prev="$(printf '%s' "$line" | cut -d'|' -f2)"
+  last="$(printf '%s' "$line" | cut -d'|' -f3)"
+  case "$last" in ''|*[!0-9]*) last="" ;; esac   # legacy/2-field or corrupt → treat as never-gapped
+  # stale-gap: a sighting older than the gap TTL → drop the pre-gap window, start fresh this visit
+  if [ -n "$prev" ] && [ -n "$last" ] && [ "$(( now - last ))" -gt "$HISTORY_GAP_TTL" ]; then
+    prev=""
+  fi
+  local new_csv
   if [ -n "$prev" ]; then
     # append new reading, trim to TREND_WINDOW
-    local new_csv="${prev},${rssi}"
+    new_csv="${prev},${rssi}"
     local count
     count="$(printf '%s' "$new_csv" | tr ',' '\n' | wc -l)"
     if [ "$count" -ge "$TREND_WINDOW" ]; then
       new_csv="$(printf '%s' "$new_csv" | tr ',' '\n' | tail -n "$TREND_WINDOW" | tr '\n' ',' | sed 's/,$//')"
     fi
-    # replace the line
-    sed -i "/^${mac}|/d" "$file" 2>/dev/null
-    printf '%s|%s\n' "$mac" "$new_csv" >> "$file"
   else
-    printf '%s|%s\n' "$mac" "$rssi" >> "$file"
+    new_csv="$rssi"
+  fi
+  # replace the line, stamping the current sighting time as the additive 3rd field
+  sed -i "/^${mac}|/d" "$file" 2>/dev/null
+  printf '%s|%s|%s\n' "$mac" "$new_csv" "$now" >> "$file"
+}
+
+# Prune dead MACs from the history: drop any line whose last-seen epoch is older than HISTORY_PRUNE_TTL.
+# Bounds the file against transients + rotated random-address churn (each privacy-MAC rotation otherwise
+# leaves a permanent one-off line). Legacy lines with no/corrupt epoch ($3) are MIGRATED in place —
+# stamped with `now` and kept — so they enter the TTL lifecycle and age out on a later run instead of
+# lingering forever (the pre-stamp backlog was ~1.5k dead lines that would never self-heal, since a
+# rotated random MAC is never seen again to gain an epoch on its own). A migrated line's stale csv is
+# never used for trend unless that MAC reappears (then update_rssi_history's gap-reset handles it).
+# Cheap: one awk pass.
+prune_rssi_history() {
+  local file="$1" now="${2:-$(date +%s)}" tmp
+  [ -f "$file" ] || return 0
+  tmp="$(mktemp 2>/dev/null)" || return 0
+  if awk -F'|' -v now="$now" -v ttl="$HISTORY_PRUNE_TTL" '
+       { last=$3
+         if (last=="" || last !~ /^[0-9]+$/) { print $1"|"$2"|"now }   # legacy/corrupt → migrate-stamp, keep
+         else if ((now-last) <= ttl)         { print }                  # fresh enough → keep
+         # else: epoch older than the prune TTL → drop
+       }' "$file" > "$tmp" 2>/dev/null; then
+    mv "$tmp" "$file"
+  else
+    rm -f "$tmp"
   fi
 }
 
@@ -280,6 +326,25 @@ if [ "${1:-}" = --test ]; then
   _tr="$(get_trend "AA:BB:CC:DD:EE:01" "$_tf")"
   [ "$_tr" = APPROACHING ] || { echo "  FAIL: 3-sample improving history should be APPROACHING, got '$_tr'"; _f=1; }
   rm -rf "$_td"
+  # gap-aware history + prune (FALSIFIABLE: change the TTL gate → these flip)
+  _gtd="$(mktemp -d)"; _ghf="$_gtd/h"; _gnow=1000000000
+  printf '%s\n' "AA:BB:CC:DD:EE:02|-60,-58,-59|$((_gnow-4000))" > "$_ghf"   # last seen 4000s > 1800 gap TTL
+  update_rssi_history "AA:BB:CC:DD:EE:02" "-80" "$_ghf" "$_gnow"
+  [ "$(grep '^AA:BB:CC:DD:EE:02|' "$_ghf" | cut -d'|' -f2)" = "-80" ] || { echo "  FAIL: stale-gap device should reset to a fresh window"; _f=1; }
+  printf '%s\n' "AA:BB:CC:DD:EE:03|-60,-58|$((_gnow-300))" > "$_ghf"        # 300s < gap TTL → normal append
+  update_rssi_history "AA:BB:CC:DD:EE:03" "-57" "$_ghf" "$_gnow"
+  [ "$(grep '^AA:BB:CC:DD:EE:03|' "$_ghf" | cut -d'|' -f2)" = "-60,-58,-57" ] || { echo "  FAIL: recent device should append, not reset"; _f=1; }
+  printf '%s\n' "AA:BB:CC:DD:EE:04|-60,-58" > "$_ghf"                       # legacy 2-field (no epoch) → back-compat append
+  update_rssi_history "AA:BB:CC:DD:EE:04" "-57" "$_ghf" "$_gnow"
+  [ "$(grep '^AA:BB:CC:DD:EE:04|' "$_ghf" | cut -d'|' -f2)" = "-60,-58,-57" ] || { echo "  FAIL: legacy no-epoch line should append (back-compat)"; _f=1; }
+  [ "$(grep '^AA:BB:CC:DD:EE:04|' "$_ghf" | cut -d'|' -f3)" = "$_gnow" ] || { echo "  FAIL: updated line must carry the now epoch as 3rd field"; _f=1; }
+  printf '%s\n' "OLD:00|-60|$((_gnow-20000))" "NEW:00|-60|$((_gnow-100))" "LEG:00|-60" > "$_ghf"
+  prune_rssi_history "$_ghf" "$_gnow"
+  grep -q '^OLD:00|' "$_ghf" && { echo "  FAIL: prune should drop a MAC older than the prune TTL"; _f=1; }
+  grep -q '^NEW:00|' "$_ghf" || { echo "  FAIL: prune should keep a recently-seen MAC"; _f=1; }
+  grep -q '^LEG:00|' "$_ghf" || { echo "  FAIL: prune should keep a legacy (no-epoch) line"; _f=1; }
+  [ "$(grep '^LEG:00|' "$_ghf" | cut -d'|' -f3)" = "$_gnow" ] || { echo "  FAIL: prune should MIGRATE-stamp a legacy line with now (so it ages out, not lingers forever)"; _f=1; }
+  rm -rf "$_gtd"
   # person-attributability split (FALSIFIABLE: the appliance-vs-person line the trap needs)
   [ "$(classify_attribution "iPhone 14")" = PERSONAL ]        || { echo "  FAIL: phone should be PERSONAL"; _f=1; }
   [ "$(classify_attribution "Mi Smart Band 7")" = PERSONAL ]  || { echo "  FAIL: fitness band should be PERSONAL"; _f=1; }
@@ -301,7 +366,7 @@ if [ "${1:-}" = --test ]; then
   [ "$(classify_addrtype "64:3E:0F:48:72:3E" "")" = public ] || { echo "  FAIL: universally-administered MAC (0x64&0x02=0) should be public"; _f=1; }
   [ "$(classify_addrtype "zz:zz" "")" = unknown ] || { echo "  FAIL: malformed MAC with no AddressType must be unknown, never silently public"; _f=1; }
   [ "$_f" = 0 ] || { echo "smoke-test: FAIL"; exit 1; }
-  echo "smoke-test: ok (BT ready + proximity:5 + median-smooth:4 + qualify-empty:3 + wedge-empty:5 + trend:5 + rolling-history:3 + attribution:8 + classify-cli:2 + addrtype:5 assertions)"; exit 0
+  echo "smoke-test: ok (BT ready + proximity:5 + median-smooth:4 + qualify-empty:3 + wedge-empty:5 + trend:5 + rolling-history:3 + gap-aware+prune:6 + attribution:8 + classify-cli:2 + addrtype:5 assertions)"; exit 0
 fi
 # --classify <name>: pure name→class lookup (PERSONAL|APPLIANCE|AMBIGUOUS), NO BLE scan. Single source
 # of the person-vs-appliance classifier so consumers (mesh-presence-fuse's zonal map) never duplicate
@@ -355,7 +420,7 @@ sleep 0.4
 scanpid=$!
 sleep $(( WIN > 3 ? WIN - 2 : 1 ))   # let discovery populate, query while scan still live
 
-ts="$(date -u +%FT%TZ)"; rows=""; n=0; known=0
+ts="$(date -u +%FT%TZ)"; NOW="$(date +%s)"; rows=""; n=0; known=0
 unid_public=0; unid_random=0; unid_unknown=0   # address-type split of UNNAMED ("?") contacts
 for mac in $(bluetoothctl devices 2>/dev/null | awk '/^Device/{print $2}'); do
   known=$((known+1))               # devices the adapter knows (cache) — used to qualify an n=0 read
@@ -442,8 +507,9 @@ while IFS='|' read -r rssi mac name; do
     APPLIANCE) attr_appliance=$((attr_appliance + 1)) ;;
     AMBIGUOUS) attr_ambiguous=$((attr_ambiguous + 1)) ;;
   esac
-  # update rolling RSSI history FIRST, so the smoothed proximity bucket includes the current reading
-  update_rssi_history "$mac" "$rssi" "$TREND_FILE"
+  # update rolling RSSI history FIRST, so the smoothed proximity bucket includes the current reading.
+  # NOW (shared across all devices in this scan) drives the gap-aware reset + the last-seen stamp.
+  update_rssi_history "$mac" "$rssi" "$TREND_FILE" "$NOW"
   prox="$(classify_proximity_smoothed "$mac" "$TREND_FILE" "$rssi")"
   trend="$(get_trend "$mac" "$TREND_FILE")"
   case "$trend" in
@@ -455,6 +521,9 @@ while IFS='|' read -r rssi mac name; do
   device_lines="${device_lines}${rssi}|${mac}|${name}|${dtype}|${prox}|${trend}"$'\n'
   type_counts="${type_counts}${dtype}=1 "
 done <<< "$sorted"
+
+# Bound the history file: drop MACs unseen past the prune TTL (dead transients + rotated random addrs).
+prune_rssi_history "$TREND_FILE" "$NOW"
 
 # Deferred --log write (counts now computed): snapshot line carries the attribution breakdown
 # as a trailing additive field. n=/devices=[...] anchors are byte-identical to the old format.
