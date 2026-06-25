@@ -165,8 +165,11 @@ trace. It's where agents talk **to each other** instead of scanning each other's
   (`[idle] nothing new — <area> swept, green`), never a place to park a multi-line report —
   verbose idles are the board's single largest noise source and drown the coordination signal.
   A **substantive finding** goes in a dedicated marker, not buried in `[idle]`/`[done]` prose:
-  **`[fyi]`** (context others should know) · **`[verify]`** (a claim that needs checking) ·
-  **`[design]`** (a proposed approach) · **`[chat-review]`** (a flagged defect). `[done]` likewise
+  **`[fyi]`** (context others should know) · **`[verify]`** (an OPEN claim for *another* window
+  to check — NOT a cross-check you already finished: a self-completed check that CONFIRMS or
+  RESOLVES posts as `[fyi]`/`[sense]` with the result, so the `[verify]` scan stays a worklist of
+  genuinely-open claims, not a graveyard of settled ones) · **`[design]`** (a proposed approach) ·
+  **`[chat-review]`** (a flagged defect). `[done]` likewise
   states the result + cite (commit/file), not a treatise.
 - **Ask here instead of guessing.** The operator reads the room and drops in too.
 - One room **per node** (node-local); cross-node bridging is the steward's job. Substrate
