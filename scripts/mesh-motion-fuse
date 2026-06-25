@@ -1,0 +1,150 @@
+#!/usr/bin/env bash
+# mesh-motion-fuse — MOTION-ATTRIBUTION fusion: did the TRACKED BODY move, or did the
+# UNTRACKED ENVIRONMENT move around a still node?
+#
+# Fuses TWO independent motion senses that measure DIFFERENT bodies:
+#   * mesh-wifi-motion (NODE-LOCAL RF radar, phone-free): motion in the SPACE around this
+#     stationary node — a body perturbs the node↔AP multipath even carrying no device.
+#   * mesh-body-motion (PHONE IMU): whether the tracked body (the phone) is itself being
+#     WALKED / CARRIED / HANDLED, vs lying STILL.
+#
+# Neither alone answers "is the activity the node/phone being handled, or PEOPLE moving around
+# a put-down phone?". mesh-room-sense folds both into one PRESENT/EMPTY occupancy verdict and
+# loses this distinction. This tool exposes it:
+#
+#   BODY-MOVING   the tracked body itself is in motion (phone walked/carried/handled)
+#   AMBIENT-ONLY  RF environment moving while the tracked body is STILL → someone/something
+#                 moving in the space that is NOT the phone-holder (phone put down)
+#   QUIET         both motion axes still — calm
+#   STILL-RF      RF still BUT body axis unreachable — NOT confirmed quiet (phone may be moving
+#                 elsewhere); honest-degraded, visibly different from QUIET
+#   STILL-BODY    body still BUT RF axis unreachable — can't see ambient motion; honest-degraded
+#   UNKNOWN       BOTH axes unreachable — cannot assess (exit 2; never a faked all-clear)
+#
+# Honest-fusion rule (operator doctrine): an UNREACHABLE input renders the verdict visibly
+# DEGRADED, never a silent QUIET. The two STILL-* verdicts + the trailing `degraded=` field carry
+# that; a single live axis still yields a verdict, but flagged.
+#
+#   mesh-motion-fuse           one-line attribution verdict to stdout (exit 0; 2 if both axes dark)
+#   mesh-motion-fuse --json    machine-readable {verdict, wifi, body, intensity, corroborated, degraded, reason, ts}
+#   mesh-motion-fuse --test    smoke-test (synthetic axis overrides — no live read, no phone, no network)
+#
+# Vocab contract: FIRST token after "[motion-fuse] " is the verdict above and appears nowhere
+# else in the line (consumers grep -q 'AMBIENT-ONLY' etc.). Read-only (no actuators).
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+
+BODY_TIMEOUT="${MESH_MOTION_FUSE_BODY_TIMEOUT:-25}"   # phone SSH read can be slow
+
+# --- smoke-test: drive the fusion matrix via synthetic axis overrides; NO live read, no phone, no net ---
+if [ "${1:-}" = --test ]; then
+  fail=0
+  check(){ # $1=wifi-override $2=body-override $3=expected-verdict $4=expected-degraded
+    local got vd dg
+    got="$(MOTION_FUSE_WIFI="$1" MOTION_FUSE_BODY="$2" "$0" 2>/dev/null)"
+    vd="$(printf '%s' "$got" | sed -nE 's/^\[motion-fuse\] ([A-Z-]+) .*/\1/p')"
+    dg="$(printf '%s' "$got" | grep -oE 'degraded=[a-z-]+' | cut -d= -f2)"
+    if [ "$vd" != "$3" ] || [ "$dg" != "$4" ]; then
+      echo "  FAIL: wifi='$1' body='$2' → verdict=$vd degraded=$dg (want $3/$4)"; fail=1
+    fi
+  }
+  #     wifi            body          verdict       degraded
+  check 'MOTION|STRONG' 'STILL|x'     AMBIENT-ONLY  none          # the headline case: env moves, phone still
+  check 'MOTION|STRONG' 'MOVING|x'    BODY-MOVING   none          # both move → tracked body, RF corroborates
+  check 'STILL|NONE'    'MOVING|x'    BODY-MOVING   none          # phone handled in place, RF still
+  check 'STILL|NONE'    'STILL|x'     QUIET         none          # genuinely calm
+  check 'MOTION|WEAK'   'UNREACH|-'   AMBIENT-ONLY  body-unreach  # env moves, phone dark → flagged, NOT QUIET
+  check 'STILL|NONE'    'UNREACH|-'   STILL-RF      body-unreach  # RF still + phone dark → NOT a faked QUIET
+  check 'UNREACH|-'     'STILL|x'     STILL-BODY    rf-unreach    # phone still + RF dark → flagged
+  check 'UNREACH|-'     'MOVING|x'    BODY-MOVING   rf-unreach    # phone moving, RF dark → still attributable
+  check 'UNREACH|-'     'UNREACH|-'   UNKNOWN       both-unreach  # both dark → UNKNOWN, never all-clear
+  # honest-degraded invariant: an unreachable axis must NEVER collapse to QUIET
+  q="$(MOTION_FUSE_WIFI='STILL|NONE' MOTION_FUSE_BODY='UNREACH|-' "$0" 2>/dev/null)"
+  printf '%s' "$q" | grep -q 'QUIET' && { echo "  FAIL: STILL+UNREACH must NOT read QUIET (honest-degraded)"; fail=1; }
+  # exit-code contract: both-unreach must exit 2
+  MOTION_FUSE_WIFI='UNREACH|-' MOTION_FUSE_BODY='UNREACH|-' "$0" >/dev/null 2>&1
+  [ $? -eq 2 ] || { echo "  FAIL: both-unreach must exit 2 (cannot-assess)"; fail=1; }
+  [ "$fail" = 0 ] && { echo "smoke-test: ok (attribution matrix 9 + honest-degraded + exit-2 contract)"; exit 0; }
+  echo "smoke-test: FAIL"; exit 1
+fi
+
+# --- axis readers (overridable for --test: set MOTION_FUSE_WIFI / MOTION_FUSE_BODY to bypass live reads) ---
+# wifi axis → echoes "VERDICT|INTENSITY" where VERDICT ∈ MOTION|STILL|UNREACH, INTENSITY ∈ WEAK|MODERATE|STRONG|NONE|-
+read_wifi() {
+  if [ -n "${MOTION_FUSE_WIFI:-}" ]; then printf '%s' "$MOTION_FUSE_WIFI"; return; fi
+  local out tok inten
+  out="$(mesh-wifi-motion 2>/dev/null)"
+  if [ $? -ne 0 ] || [ -z "$out" ]; then printf 'UNREACH|-'; return; fi
+  tok="$(printf '%s' "$out" | grep -oE '\b(MOTION|STILL|UNCERTAIN)\b' | head -1)"
+  inten="$(printf '%s' "$out" | grep -oE 'intensity=[A-Z]+' | head -1 | cut -d= -f2)"
+  case "$tok" in
+    MOTION) printf 'MOTION|%s' "${inten:-STRONG}" ;;
+    STILL)  printf 'STILL|%s'  "${inten:-NONE}" ;;
+    *)      printf 'UNREACH|-' ;;   # UNCERTAIN / unparseable → cannot-assess
+  esac
+}
+# body axis → echoes VERDICT ∈ STILL|MOVING|UNREACH  (WALKING/CARRIED/HANDLED collapse to MOVING)
+# plus a detail word after a | (the raw [body-xxx] tag, or - )
+read_body() {
+  if [ -n "${MOTION_FUSE_BODY:-}" ]; then printf '%s' "$MOTION_FUSE_BODY"; return; fi
+  local out tag
+  out="$(timeout "$BODY_TIMEOUT" mesh-body-motion 2>/dev/null)"
+  if [ $? -ne 0 ] || [ -z "$out" ]; then printf 'UNREACH|-'; return; fi
+  tag="$(printf '%s' "$out" | grep -oE '\[body-[a-z]+\]' | head -1)"
+  case "$tag" in
+    '[body-still]')                                printf 'STILL|%s' "$tag" ;;
+    '[body-walking]'|'[body-carried]'|'[body-handled]') printf 'MOVING|%s' "$tag" ;;
+    '') printf 'UNREACH|-' ;;
+    *)  printf 'MOVING|%s' "$tag" ;;   # any other named motion state = the body moved
+  esac
+}
+
+# --- fuse ---
+ts="$(date -u +%FT%TZ)"
+wifi_raw="$(read_wifi)";  wifi="${wifi_raw%%|*}";  inten="${wifi_raw#*|}"
+body_raw="$(read_body)";  body="${body_raw%%|*}";  btag="${body_raw#*|}"
+
+corr=no; degraded=none
+case "${wifi}::${body}" in
+  UNREACH::UNREACH)
+    verdict=UNKNOWN; degraded=both-unreach
+    reason="both motion axes unreachable (wifi tape stale/absent AND phone dark) — cannot assess" ;;
+  *::MOVING)
+    verdict=BODY-MOVING
+    if [ "$wifi" = MOTION ]; then corr=yes
+      reason="tracked body in motion ($btag); RF environment corroborates (intensity=$inten)"
+    elif [ "$wifi" = STILL ]; then
+      reason="tracked body in motion ($btag) but RF environment STILL — handled in place, no room-scale movement"
+    else degraded=rf-unreach
+      reason="tracked body in motion ($btag); RF axis unreachable (can't corroborate room-scale movement)"
+    fi ;;
+  MOTION::STILL)
+    verdict=AMBIENT-ONLY; corr=yes
+    reason="RF environment moving (intensity=$inten) while tracked body STILL ($btag) — someone/something moving near a put-down phone, NOT the phone-holder" ;;
+  MOTION::UNREACH)
+    verdict=AMBIENT-ONLY; degraded=body-unreach
+    reason="RF environment moving (intensity=$inten); body axis unreachable — can't confirm it isn't the phone itself moving" ;;
+  STILL::STILL)
+    verdict=QUIET
+    reason="both motion axes still ($btag + RF baseline) — calm, no tracked or ambient motion" ;;
+  STILL::UNREACH)
+    verdict=STILL-RF; degraded=body-unreach
+    reason="RF environment still BUT body axis unreachable — phone may be moving elsewhere; NOT confirmed quiet" ;;
+  UNREACH::STILL)
+    verdict=STILL-BODY; degraded=rf-unreach
+    reason="tracked body STILL ($btag) BUT RF axis unreachable — cannot see ambient/room motion" ;;
+  *)
+    verdict=UNKNOWN; degraded=parse
+    reason="unclassified axis combination (wifi=$wifi body=$body)" ;;
+esac
+
+if [ "${1:-}" = --json ]; then
+  printf '{"verdict":"%s","wifi":"%s","body":"%s","intensity":"%s","corroborated":"%s","degraded":"%s","reason":"%s","ts":"%s"}\n' \
+    "$verdict" "$wifi" "$body" "$inten" "$corr" "$degraded" "$reason" "$ts"
+else
+  printf '[motion-fuse] %s — %s | wifi=%s body=%s corr=%s degraded=%s\n' \
+    "$verdict" "$reason" "$wifi" "$body" "$corr" "$degraded"
+fi
+
+[ "$verdict" = UNKNOWN ] && exit 2 || exit 0
