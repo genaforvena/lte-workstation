@@ -1,0 +1,411 @@
+#!/usr/bin/env bash
+# mesh-operator-mood — the operator's AFFECTIVE COLORING: one live, re-observed read of mood on the
+# Russell (1980) CIRCUMPLEX — two orthogonal axes, VALENCE (unpleasant↔pleasant) and AROUSAL
+# (calm↔activated), each −1..+1. The label is just the quadrant; the axes are the real state.
+# Full design: ~/.mesh/knowledge/operator-mood-model-spec-2026-06-25.md (operator ask 2026-06-25,
+# explicit standing surveillance consent for HIS devices; capture is LOCAL-NODE ONLY, nothing published).
+#
+# Mood is NOT attention-location (mesh-operator-state), NOT activity-level (mesh-operator-engagement),
+# NOT node heat (mesh-stress). It is the affective layer ON TOP of those — a NEW fusion.
+#
+# THE HARD TRUTH (honest-fusion doctrine): embodied senses read AROUSAL well and VALENCE almost not at
+# all — a walking, phone-handling operator could be elated or furious; the accelerometer can't tell.
+# VALENCE polarity lives almost entirely in the operator's own WORDS. So:
+#   • AROUSAL — firm even with no text (msg-cadence + activity-tempo + circadian prior).
+#   • VALENCE — UNKNOWN unless there is RECENT operator text (and the operator is present). We NEVER
+#     manufacture a pleasant/unpleasant read from motion. "arousal firm · valence unknown" is the
+#     honest, common output — a feature, not a gap.
+#
+# LIVENESS-IS-LEASE (operator doctrine): mood is scored ON DEMAND over the last-N TIMESTAMPED messages,
+# recency-weighted (EWMA half-life ~30m), and rendered UNKNOWN when stale — never a stored/brokered
+# valence field that goes stale silently (tg's call, 2026-06-25). Per-message sentiment IS memoized
+# (by text hash) so a re-run costs zero inference; the FUSION is always recomputed live.
+#
+#   mesh-operator-mood            one-line mood + axes + confidence + top contributing signals
+#   mesh-operator-mood --json     machine-readable {label,valence,arousal,confidence,degraded,...}
+#   mesh-operator-mood --edge     emit only on quadrant-label change (stream/fold-in wiring)
+#   mesh-operator-mood --test     smoke test (NO outbound inference — sandboxed; asserts fusion logic)
+#   mesh-operator-mood --stop     how to halt + forget (operator's rubillnik)
+#
+# Sentiment scoring rides mesh-relay (cheapest/local-first pool — quota+geo immune); a tiny RU/EN
+# lexicon is the fallback so valence still degrades-gracefully without any inference pool.
+#
+# ARCHITECTURE: on-demand FUSION, no new reflex/cron/pane. mesh-operator-field folds the verdict in as
+# reliability-tagged (soft) fields on its existing */10 sample — that cron is the liveness, not a new one.
+#
+# orphan-ok: on-demand fusion + folded into mesh-operator-field; intentionally NOT separately cron-wired.
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+
+case "${1:-}" in
+  --stop)
+    cat <<EOF
+mesh-operator-mood — off switch (operator's rubillnik):
+  • Nothing to disable: mood is ON-DEMAND (no cron of its own). It is read only when you run it
+    or when mesh-operator-field samples (run 'mesh-operator-field --stop' to halt that sampler).
+  • Local only — sentiment cache: $HOME/.mesh/.mood-sentiment.cache (delete to forget scored text).
+  • It reads ONLY local artifacts already collected on this node (~/.mesh/voice-in.log + sibling
+    sense state). Nothing leaves the node, nothing is published.
+EOF
+    exit 0 ;;
+esac
+
+MODE=text
+case "${1:-}" in
+  --json) MODE=json ;;
+  --edge) MODE=edge ;;
+  --test) MODE=test ;;
+  ""|--status) MODE=text ;;
+  *) echo "usage: mesh-operator-mood [--json|--edge|--test|--stop]" >&2; exit 2 ;;
+esac
+
+# --- gather the operator-state gate (present/AWAY/ASLEEP). Reuse a caller-provided JSON if it already
+#     fetched one (mesh-operator-field does) to avoid a duplicate SSH; else fetch with a short timeout.
+OPSTATE_JSON="${MESH_MOOD_OPSTATE_JSON:-}"
+if [ "$MODE" != test ] && [ -z "$OPSTATE_JSON" ]; then
+  OPSTATE_JSON="$(timeout 25 mesh-operator-state --json 2>/dev/null)" || OPSTATE_JSON=""
+fi
+[ -n "$OPSTATE_JSON" ] || OPSTATE_JSON='{}'
+
+exec python3 - "$MODE" "$OPSTATE_JSON" <<'PY'
+import sys, os, re, json, time, hashlib, subprocess
+
+MODE      = sys.argv[1]
+OPSTATE   = sys.argv[2]
+HOME      = os.environ["HOME"]
+MESH      = os.path.join(HOME, ".mesh")
+VLOG      = os.path.join(MESH, "voice-in.log")
+CACHE     = os.path.join(MESH, ".mood-sentiment.cache")
+EDGEFILE  = os.path.join(MESH, ".mood-edge.state")
+TEMPO_ST  = os.path.join(MESH, ".activity-tempo.state")
+STRESS_ST = os.path.join(MESH, ".stress-state")
+PRES_LOG  = os.path.join(MESH, "presence.log")
+
+HALFLIFE  = float(os.environ.get("MESH_MOOD_HALFLIFE_S", 1800))   # recency EWMA half-life (30 min)
+VALWIN    = float(os.environ.get("MESH_MOOD_VAL_WIN_S",  5400))   # valence freshness window (90 min)
+MAXWIN    = float(os.environ.get("MESH_MOOD_MAX_WIN_S",  7200))   # how far back to look for cadence (120 min)
+MAXMSGS   = int(os.environ.get("MESH_MOOD_MAX_MSGS", 12))
+TEMPO_TTL = float(os.environ.get("MESH_MOOD_TEMPO_TTL_S", 1500))  # activity-tempo state staleness (25 min)
+W_TEXT    = 0.60   # typed-TG valence weight (the near-only valence source)
+W_VOICE   = 0.25   # transcribed-voice valence weight (soft, coherence-gated)
+COHER_MIN = 0.30   # below this a voice line is too garbled to read tone → drop its valence vote
+DARK_VAL_PRIOR = -0.10  # DARK_BUSTLE: activity in the dark nudges valence prior (capped, colors text only)
+
+def clamp(x, lo=-1.0, hi=1.0): return lo if x < lo else hi if x > hi else x
+
+# ---------------- sentiment (memoized; mesh-relay primary, lexicon fallback) ----------------
+LEX_POS = ["хорош","круто","отлично","спасибо","рад","прекрасн","супер","люблю","нрав","класс","ура",
+           "good","great","nice","thanks","thank","happy","love","awesome","cool","glad","yay"]
+LEX_NEG = ["плох","блин","устал","злюсь","ненавиж","проблем","не работает","бесит","ужас","черт","капец",
+           "достал","fuck","bad","tired","hate","angry","broken","fail","annoy","terrible","damn","sucks"]
+
+def lexicon_score(text):
+    t = text.lower()
+    pos = sum(t.count(w) for w in LEX_POS)
+    neg = sum(t.count(w) for w in LEX_NEG)
+    if pos + neg == 0: return None
+    return clamp((pos - neg) / float(pos + neg))
+
+def load_cache():
+    try:
+        with open(CACHE) as fh: return json.load(fh)
+    except Exception:
+        return {}
+
+def save_cache(c):
+    try:
+        with open(CACHE, "w") as fh: json.dump(c, fh)
+    except Exception:
+        pass
+
+def relay_score(text):
+    # Ask the cheapest inference pool for ONE number; never let it block the read.
+    prompt = ("Rate the emotional valence of this short message on a scale from -1.0 (very negative, "
+              "upset, angry, sad) to 1.0 (very positive, happy, pleased). It may be Russian or English. "
+              "Reply with ONLY the number.\n\nMESSAGE: " + text[:600])
+    try:
+        out = subprocess.run(["mesh-relay", prompt], capture_output=True, text=True,
+                             timeout=25).stdout
+    except Exception:
+        return None
+    m = re.search(r"-?\d+(?:\.\d+)?", out or "")
+    if not m: return None
+    return clamp(float(m.group(0)))
+
+def coherence(kind, text):
+    if kind == "TEXT": return 1.0
+    words = re.findall(r"[A-Za-zА-Яа-яЁё]{2,}", text)
+    if len(words) < 3: return 0.2
+    uniq = len(set(w.lower() for w in words)) / float(len(words))
+    return clamp(uniq, 0.2, 1.0)
+
+# ---------------- read recent operator text ----------------
+def parse_ts(s):
+    try:
+        return time.mktime(time.strptime(s, "%Y-%m-%dT%H:%M:%SZ")) - time.timezone
+    except Exception:
+        return None
+
+def read_messages(now):
+    msgs = []
+    try:
+        lines = open(VLOG, encoding="utf-8", errors="replace").read().splitlines()
+    except Exception:
+        return msgs
+    for ln in lines[-400:]:
+        m = re.match(r"^(\S+)\s+(VOICE|TEXT)\s+(.*)$", ln)
+        if not m: continue
+        ts = parse_ts(m.group(1))
+        if ts is None: continue
+        age = now - ts
+        if age < 0 or age > MAXWIN: continue
+        msgs.append({"age": age, "kind": m.group(2), "text": m.group(3).strip()})
+    return msgs[-MAXMSGS:]
+
+# ---------------- the FUSION (single source of truth; live + --test both call this) ----------------
+def compute(now, msgs, tempo, tempo_age, opstate, degraded, stress, presence, wifi, hour):
+    sig = {}
+    contrib = []
+    away = opstate in ("AWAY",)
+    # activity-tempo counts ONLY when fresh and the operator isn't AWAY (room tempo ≠ an absent operator).
+    # Computed up-front so a STALE tempo informs NEITHER arousal NOR the valence prior (honest-fusion).
+    TEMPO_AR = {"SILENT": -0.8, "RESTING": -0.3, "STIR": 0.3, "BUSTLE": 0.6, "DARK_BUSTLE": 0.6}
+    tempo_ok = (tempo in TEMPO_AR) and (tempo_age is not None and tempo_age <= TEMPO_TTL) and not away
+
+    # ---- VALENCE — words only, recency-weighted; UNKNOWN if no coherent recent text or operator AWAY.
+    val_num = 0.0; val_den = 0.0; ntext = 0; newest_text_age = None
+    for msg in msgs:
+        if msg["age"] > VALWIN: continue
+        if msg.get("sent") is None: continue
+        coher = msg.get("coher", 1.0)
+        if coher < COHER_MIN: continue
+        base = W_TEXT if msg["kind"] == "TEXT" else W_VOICE
+        rec = 0.5 ** (msg["age"] / HALFLIFE)
+        w = base * rec * coher
+        val_num += w * msg["sent"]; val_den += w; ntext += 1
+        a = msg["age"] if newest_text_age is None else min(newest_text_age, msg["age"])
+        newest_text_age = a
+
+    valence_known = (val_den > 0) and not away
+    valence = clamp(val_num / val_den) if val_den > 0 else 0.0
+    # DARK_BUSTLE colours an EXISTING text-based valence slightly down; it NEVER creates valence alone,
+    # and only when the tempo read is FRESH (tempo_ok) — a stale tempo colours nothing.
+    if valence_known and tempo_ok and tempo == "DARK_BUSTLE":
+        valence = clamp(valence + DARK_VAL_PRIOR)
+    if valence_known:
+        contrib.append(f"text×{ntext}")
+    sig["text_n"] = ntext
+    sig["newest_text_age_s"] = None if newest_text_age is None else int(newest_text_age)
+
+    # ---- AROUSAL — co-primaries: msg-cadence + activity-tempo + circadian prior. Firm without text.
+    ar_num = 0.0; ar_den = 0.0; ar_parts = []
+    # cadence: a recent burst of messages = activation; long quiet = low (but weak — operator may
+    # simply not be typing, so cadence-silence carries low weight).
+    c30 = sum(1 for m in msgs if m["age"] <= 1800)
+    last_age = min((m["age"] for m in msgs), default=None)
+    if last_age is not None:
+        if   last_age <= 600:  cad = 0.5
+        elif last_age <= 1800: cad = 0.2
+        elif last_age <= 3600: cad = -0.1
+        else:                  cad = -0.4
+        cad = clamp(cad + 0.12 * max(0, c30 - 1))
+        cad_w = 0.45 if last_age <= 3600 else 0.20   # stale cadence → weak
+        ar_num += cad_w * cad; ar_den += cad_w; ar_parts.append("cadence")
+        sig["msgs_30m"] = c30
+    # activity-tempo (embodied room arousal); counts only when fresh and operator present (tempo_ok above).
+    if tempo_ok:
+        ar_num += 0.45 * TEMPO_AR[tempo]; ar_den += 0.45; ar_parts.append("tempo")
+    sig["tempo"] = tempo if tempo else "UNKNOWN"
+    # circadian PRIOR (weak): deep-night lowers the arousal baseline.
+    if hour is not None and (hour >= 23 or hour < 7):
+        ar_num += 0.15 * (-0.3); ar_den += 0.15; ar_parts.append("circadian")
+    # prosody co-primary (garble-immune, weight 0.35) is UNAVAILABLE — no audio-feature organ yet; we
+    # do NOT fake it (honest-fusion). Documented future hook; arousal stands on cadence+tempo for now.
+    sig["prosody"] = "UNAVAILABLE"
+
+    arousal_known = ar_den > 0
+    arousal = clamp(ar_num / ar_den) if ar_den > 0 else 0.0
+    # ASLEEP is a LIGHT/EARLY inference (home-state), not a verified deep-still — so it must NOT hard-assert
+    # arousal=-1 "nothing is happening" (senses, 2026-06-25). Mark it UNCERTAIN rather than asserting.
+    arousal_uncertain = (opstate == "ASLEEP")
+
+    # ---- CONFIDENCE — gates & confounds (never push valence; lower the read's confidence). ----
+    conf = 1.0
+    if stress in ("STRESSED", "CRITICAL"): conf *= 0.7   # node heat degrades the operator channel (a lens, not a mood)
+    if degraded:                            conf *= 0.85  # operator-state was local-only (phone SSH down)
+    if presence == "absent":                conf *= 0.8
+    if wifi == "UNKNOWN":                    conf *= 0.95  # wifi-motion is a confidence-qualifier, not an axis
+    if not valence_known:                    conf *= 0.65  # arousal-only read
+    if valence_known and newest_text_age and newest_text_age > 0.5 * VALWIN: conf *= 0.85
+    if arousal_known and ar_den < 0.4:       conf *= 0.8   # arousal on a weak prior alone
+    if arousal_uncertain:                    conf *= 0.8
+    conf = round(clamp(conf, 0.0, 1.0), 2)
+
+    # ---- LABEL — quadrant. Operator absent with no text → UNKNOWN, not asserted. ----
+    TH = 0.15
+    if away and not valence_known and not tempo_ok:
+        label = "UNKNOWN"
+    elif not valence_known:
+        if   arousal >= TH:  label = "ACTIVATED, valence-unknown"
+        elif arousal <= -TH: label = "CALM, valence-unknown"
+        else:                label = "QUIET, valence-unknown"
+    else:
+        v = "pos" if valence >= TH else "neg" if valence <= -TH else "neu"
+        a = "hi" if arousal >= TH else "lo" if arousal <= -TH else "mid"
+        label = {
+            ("pos","hi"): "ENGAGED",   ("neg","hi"): "STRESSED",
+            ("pos","lo"): "CONTENT",   ("neg","lo"): "FLAT",
+            ("neu","hi"): "ACTIVATED", ("neu","lo"): "SUBDUED",
+            ("pos","mid"): "PLEASANT", ("neg","mid"): "UNPLEASANT", ("neu","mid"): "NEUTRAL",
+        }[(v, a)]
+    if arousal_uncertain and label != "UNKNOWN":
+        label += " (asleep?)"
+
+    return {
+        "label": label,
+        "valence": round(valence, 2) if valence_known else None,
+        "valence_known": valence_known,
+        "arousal": round(arousal, 2) if arousal_known else None,
+        "arousal_known": arousal_known,
+        "arousal_uncertain": arousal_uncertain,
+        "confidence": conf,
+        "degraded": bool(degraded) or not valence_known or not arousal_known,
+        "opstate": opstate,
+        "contrib": contrib + ar_parts,
+        "signals": sig,
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+    }
+
+# ---------------- --test: NO outbound. Assert the load-bearing fusion invariants on synthetic input. ----------------
+if MODE == "test":
+    ok = True
+    def check(cond, msg):
+        global ok
+        if not cond: print("  FAIL:", msg); ok = False
+    now = 1_000_000.0
+    # Lexicon fallback must read polarity (degrades without any inference pool).
+    check(lexicon_score("всё круто, спасибо!") > 0, "lexicon: positive RU → +")
+    check(lexicon_score("блин, опять не работает, бесит") < 0, "lexicon: negative RU → -")
+    check(lexicon_score("the meeting is at five") is None, "lexicon: neutral → None (no vote)")
+    # 1) VALENCE never comes from motion alone: high arousal, NO text → valence UNKNOWN, label valence-unknown.
+    r = compute(now, [], "BUSTLE", 0, "AT-PHONE", False, "CALM", "present", "MOTION", 14)
+    check(r["valence_known"] is False, "no text → valence UNKNOWN")
+    check(r["arousal_known"] and r["arousal"] > 0, "tempo=BUSTLE → arousal positive without text")
+    check("valence-unknown" in r["label"], "label carries valence-unknown when no text")
+    # 2) recent positive TEXT → valence positive & known.
+    msgs_pos = [{"age": 120, "kind": "TEXT", "text": "great, thanks!", "sent": 0.8, "coher": 1.0}]
+    r = compute(now, msgs_pos, "RESTING", 0, "AT-PHONE", False, "CALM", "present", "STILL", 14)
+    check(r["valence_known"] and r["valence"] > 0, "recent +text → valence known & positive")
+    check(r["label"] in ("ENGAGED", "CONTENT", "PLEASANT"), "positive valence → pleasant-side label")
+    # 3) negative text + high arousal → STRESSED quadrant.
+    msgs_neg = [{"age": 60, "kind": "TEXT", "text": "broken again, hate it", "sent": -0.7, "coher": 1.0}]
+    r = compute(now, msgs_neg, "BUSTLE", 0, "AT-PHONE", False, "CALM", "present", "MOTION", 14)
+    check(r["label"] == "STRESSED", "neg valence + hi arousal → STRESSED")
+    # 4) operator AWAY + no text → UNKNOWN, not asserted.
+    r = compute(now, [], "RESTING", 0, "AWAY", False, "CALM", "absent", "STILL", 14)
+    check(r["label"] == "UNKNOWN", "AWAY + no text → UNKNOWN")
+    check(r["valence_known"] is False, "AWAY → valence not asserted")
+    # 5) AWAY drops room tempo from arousal (room tempo is not the absent operator).
+    r = compute(now, [], "BUSTLE", 0, "AWAY", False, "CALM", "absent", "MOTION", 14)
+    check("tempo" not in r["contrib"], "AWAY → activity-tempo dropped from arousal")
+    # 6) ASLEEP is UNCERTAIN, never a hard arousal=-1 assert.
+    r = compute(now, [], "SILENT", 0, "ASLEEP", False, "CALM", "present", "STILL", 3)
+    check(r["arousal_uncertain"] is True, "ASLEEP → arousal_uncertain flag set")
+    check(r["arousal"] is None or r["arousal"] > -1.0, "ASLEEP must not hard-assert arousal=-1")
+    check("asleep?" in r["label"], "ASLEEP label flags the uncertainty")
+    # 7) garbled VOICE (coherence < min) casts no valence vote.
+    msgs_garb = [{"age": 60, "kind": "VOICE", "text": "great", "sent": 0.9, "coher": 0.1}]
+    r = compute(now, msgs_garb, "RESTING", 0, "AT-PHONE", False, "CALM", "present", "STILL", 14)
+    check(r["valence_known"] is False, "low-coherence voice → no valence vote (UNKNOWN)")
+    # 8) node STRESS lowers confidence without moving valence.
+    base = compute(now, msgs_pos, "RESTING", 0, "AT-PHONE", False, "CALM", "present", "STILL", 14)
+    hot  = compute(now, msgs_pos, "RESTING", 0, "AT-PHONE", False, "STRESSED", "present", "STILL", 14)
+    check(hot["confidence"] < base["confidence"], "node STRESS → lower confidence")
+    check(hot["valence"] == base["valence"], "node STRESS must NOT move valence")
+    # 9) stale activity-tempo (age > TTL) is dropped, not trusted.
+    r = compute(now, [], "BUSTLE", TEMPO_TTL + 60, "AT-PHONE", False, "CALM", "present", "STILL", 14)
+    check("tempo" not in r["contrib"], "stale tempo state dropped from arousal")
+    print("smoke-test: ok (fusion invariants verified — valence-from-words-only, AWAY/ASLEEP honesty, "
+          "stress=confound, coherence gate, recency)" if ok else "smoke-test: FAIL")
+    sys.exit(0 if ok else 1)
+
+# ---------------- LIVE path ----------------
+now = time.time()
+try:
+    op = json.loads(OPSTATE)
+except Exception:
+    op = {}
+opstate  = op.get("status") or op.get("state") or "UNKNOWN"
+degraded = bool(op.get("degraded"))
+
+# sibling sense state (all cheap, local, no SSH/curl of our own).
+def read1(path, ttl=None):
+    try:
+        st = os.stat(path)
+        if ttl is not None and (now - st.st_mtime) > ttl: return None, (now - st.st_mtime)
+        with open(path) as fh: return fh.read().strip(), (now - st.st_mtime)
+    except Exception:
+        return None, None
+tempo, tempo_age = read1(TEMPO_ST)              # freshness judged inside compute()
+stress, _        = read1(STRESS_ST, ttl=3600)
+stress = stress or "UNKNOWN"
+wifi = "UNKNOWN"; presence = "unknown"
+try:
+    last = open(PRES_LOG).read().splitlines()[-1] if os.path.exists(PRES_LOG) else ""
+    if "MOTION" in last: wifi = "MOTION"
+    elif "STILL" in last: wifi = "STILL"
+    mp = re.search(r"personal:(\d+)", last)
+    if mp: presence = "present" if int(mp.group(1)) > 0 else "absent"
+except Exception:
+    pass
+
+# score recent text sentiment (memoized; relay primary, lexicon fallback). Only within VALWIN → cheap.
+msgs = read_messages(now)
+cache = load_cache(); dirty = False
+for msg in msgs:
+    if msg["age"] > VALWIN:
+        msg["sent"] = None; msg["coher"] = 0.0; continue
+    msg["coher"] = coherence(msg["kind"], msg["text"])
+    h = hashlib.sha1(msg["text"].encode("utf-8")).hexdigest()[:16]
+    if h in cache:
+        msg["sent"] = cache[h]
+    else:
+        s = relay_score(msg["text"])
+        if s is None:
+            s = lexicon_score(msg["text"])   # graceful fallback; NOT cached (pool may return next run)
+            msg["sent"] = s
+        else:
+            cache[h] = s; dirty = True; msg["sent"] = s
+if dirty: save_cache(cache)
+
+hour = int(time.strftime("%H", time.localtime(now)))
+r = compute(now, msgs, tempo, tempo_age, opstate, degraded, stress, presence, wifi, hour)
+
+def text_line(r):
+    if r["label"] == "UNKNOWN":
+        return f'MOOD: UNKNOWN — operator {r["opstate"]}, not asserted | conf {r["confidence"]}'
+    if r["valence_known"]:
+        vpart = f'valence {r["valence"]:+.2f}'
+    else:
+        na = r["signals"].get("newest_text_age_s")
+        vpart = "valence ?" + (f' (no text {int(na/60)}m)' if na else " (no text)")
+    apart = f'arousal {r["arousal"]:+.2f}' if r["arousal_known"] else "arousal ?"
+    return (f'MOOD: {r["label"]} | {vpart} {apart} | conf {r["confidence"]} | '
+            f'{" ".join(r["contrib"]) or "no-signals"} tempo={r["signals"].get("tempo")} state={r["opstate"]}')
+
+if MODE == "json":
+    print(json.dumps(r, ensure_ascii=False)); sys.exit(0)
+if MODE == "edge":
+    prev = ""
+    try: prev = open(EDGEFILE).read().strip()
+    except Exception: pass
+    try:
+        os.makedirs(MESH, exist_ok=True)
+        open(EDGEFILE, "w").write(r["label"])   # write every run → mtime = liveness (state-touch convention)
+    except Exception: pass
+    if r["label"] != prev:
+        print(f'[operator-mood] {text_line(r)}')
+    sys.exit(0)
+print(text_line(r))
+PY
