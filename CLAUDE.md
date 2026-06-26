@@ -71,6 +71,16 @@ Extend it to **regressions, not just new powers**: the artifact for a network ch
 *every node still reaches the internet and the LAN* — captured **before and after** — not
 "the interface came up." `mesh-health` and `mesh-card --refresh` are those artifacts.
 
+Extend it to **test suites, not just live runs**: a sensor tool's `--test` MUST assert a real
+hardware read produces data (≥N axes / a parseable value), not just exercise the offline classifier.
+Reachability ≠ producing — a reachable phone whose driver returns empty/cleanup-noise is a *hollow*
+sense: cron-green while its state artifact goes stale for days. `mesh-land` treats exit 2 (honest
+n/a — phone/organ unreachable) as a pass, so the real-read gate may require the hardware without
+blocking landing; on an unreachable node it exits 2 honestly, never a fake green. Canonical case:
+`mesh-mag`/`mesh-gyro` — `akm09918`/`vl_gyro` read with `-n 1` raced the driver → empty read every
+cron → `.mag-state` 5 days stale, yet `--test` green; fixed by `-n 2` + a `--test` gate asserting the
+live read yields 3 axes (`mesh-mag` d657375, `mesh-gyro` ditto).
+
 ## Substrate changes & multi-agent coordination
 
 Multiple agents run at once (often the same human directing several). Sensors/compute are a
