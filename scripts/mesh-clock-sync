@@ -1,0 +1,161 @@
+#!/usr/bin/env bash
+# mesh-clock-sync — CLOCK-SYNC sense: is this node's wall clock actually disciplined to NTP,
+#   and by how far is it off? The mesh's ENTIRE liveness model is timestamp-based leases
+#   (memory liveness-is-lease-not-cached-status: a status is a live announce with a TTL, judged
+#   by mtime/now deltas). A node whose clock silently drifts or whose time daemon died poisons
+#   EVERY freshness check, staleness watchdog, and lease it participates in — reading fresh as
+#   stale or stale as fresh — and nothing in the sensorium perceives that. mesh-ambient-clock is
+#   activity-TEMPO, not NTP; this is the real time-discipline signal.
+#   Reads systemd-timesyncd (`timedatectl`) or chrony (`chronyc tracking`) — whichever disciplines
+#   the clock here — for the synchronized flag + the live offset/server/stratum.
+# HONEST: NO-NTP (no time daemon running) is a REAL perceived verdict (this node WILL drift), NOT
+#   an unreachable. exit 2 (BLIND) is reserved for when we cannot even ASK — neither timedatectl nor
+#   chronyc exists — so we never fake a SYNCED from an unreadable signal.
+# reflex-cadence: 19,49 * * * *
+# reflex-args: --edge
+set -u
+
+STATE="${MESH_CLOCKSYNC_STATE:-$HOME/.mesh/clock-sync.state}"
+DRIFT_MS="${MESH_CLOCK_DRIFT_MS:-250}"   # |offset| over this (ms) while synced => DRIFT
+
+# verdict_for <synced:yes|no> <ntp-active:yes|no> <abs_offset_ms|NA> -> SYNCED|DRIFT|UNSYNCED|NO-NTP
+verdict_for() {
+  local synced="$1" ntp="$2" off="$3"
+  if [ "$ntp" != yes ]; then echo NO-NTP; return; fi
+  if [ "$synced" != yes ]; then echo UNSYNCED; return; fi
+  if [ "$off" != NA ] && [ "$off" -gt "$DRIFT_MS" ] 2>/dev/null; then echo DRIFT; return; fi
+  echo SYNCED
+}
+
+# parse a systemd/chrony offset token (e.g. "-1.910ms", "12.3us", "0.000123 seconds") -> ABS whole ms
+abs_ms() {
+  awk -v s="$1" 'BEGIN{
+    if (!match(s,/-?[0-9]+(\.[0-9]+)?/)) { print "NA"; exit }
+    num=substr(s,RSTART,RLENGTH)+0
+    if (index(s,"ms")>0)                    unit="ms"
+    else if (index(s,"us")>0||index(s,"µs")>0) unit="us"
+    else                                    unit="s"   # "seconds" / bare s
+    if (unit=="us") num=num/1000; else if (unit=="s") num=num*1000
+    if (num<0) num=-num
+    printf "%.0f", num
+  }'
+}
+
+# board post — sandbox-gated: MESH_CLOCKSYNC_NOCHAT=1 suppresses real outbound so --edge is testable.
+post() {
+  [ -n "${MESH_CLOCKSYNC_NOCHAT:-}" ] && { echo "[would-post] $*" >&2; return 0; }
+  command -v mesh-chat >/dev/null 2>&1 && mesh-chat "$*" >/dev/null 2>&1
+}
+
+# read_clock: sets VERDICT OFFSET_MS SERVER STRATUM JITTER SRC; returns 0 if perceivable, 2 if BLIND.
+VERDICT=""; OFFSET_MS="NA"; SERVER="?"; STRATUM="?"; JITTER="?"; SRC="?"
+read_clock() {
+  if command -v chronyc >/dev/null 2>&1; then
+    local tr leap sys off_s
+    tr="$(timeout 5 chronyc tracking 2>/dev/null)" || tr=""
+    if [ -n "$tr" ]; then
+      SRC="chrony"
+      leap="$(printf '%s\n' "$tr" | sed -n 's/^Leap status *: *//p')"
+      SERVER="$(printf '%s\n' "$tr" | sed -n 's/^Reference ID *: *//p' | awk '{print $1}')"
+      STRATUM="$(printf '%s\n' "$tr" | sed -n 's/^Stratum *: *//p')"
+      off_s="$(printf '%s\n' "$tr" | sed -n 's/^System time *: *\([0-9.]*\).*/\1/p')"
+      [ -n "$off_s" ] && OFFSET_MS="$(abs_ms "${off_s} s")" || OFFSET_MS="NA"
+      local ntp=yes synced=no
+      case "$leap" in Normal*|"Insert leap second"*|"Delete leap second"*) synced=yes;; *) synced=no;; esac
+      VERDICT="$(verdict_for "$synced" "$ntp" "$OFFSET_MS")"
+      return 0
+    fi
+  fi
+  if command -v timedatectl >/dev/null 2>&1; then
+    SRC="timesyncd"
+    local ntp synced ts off
+    ntp="$(timedatectl show -p NTP --value 2>/dev/null)"
+    synced="$(timedatectl show -p NTPSynchronized --value 2>/dev/null)"
+    ts="$(timeout 5 timedatectl timesync-status 2>/dev/null)"
+    if [ -n "$ts" ]; then
+      SERVER="$(printf '%s\n' "$ts" | sed -n 's/^[[:space:]]*Server: *//p' | head -1)"
+      STRATUM="$(printf '%s\n' "$ts" | sed -n 's/^[[:space:]]*Stratum: *//p' | head -1)"
+      JITTER="$(printf '%s\n' "$ts" | sed -n 's/^[[:space:]]*Jitter: *//p' | head -1)"
+      off="$(printf '%s\n' "$ts" | sed -n 's/^[[:space:]]*Offset: *//p' | head -1)"
+      [ -n "$off" ] && OFFSET_MS="$(abs_ms "$off")" || OFFSET_MS="NA"
+    fi
+    # normalize the systemd yes/no/"" (empty NTP can still be active=synced on some builds)
+    [ "$ntp" = yes ] || { [ "$synced" = yes ] && ntp=yes || ntp=no; }
+    [ "$synced" = yes ] || synced=no
+    VERDICT="$(verdict_for "$synced" "$ntp" "$OFFSET_MS")"
+    return 0
+  fi
+  return 2   # neither chronyc nor timedatectl — cannot ASK -> BLIND
+}
+
+human_line() {
+  local off="$OFFSET_MS"; [ "$off" = NA ] && off="?" || off="${off}ms"
+  echo "clock-sync: ${VERDICT} — offset ${off} (server ${SERVER:-?}, stratum ${STRATUM:-?}, src ${SRC})"
+}
+
+# --- --test: assert a REAL read yields a parseable verdict, OR an honest BLIND exit 2 -----------
+if [ "${1:-}" = "--test" ]; then
+  fail=""
+  [ "$(verdict_for yes yes 5)"    = SYNCED ]   || fail="$fail synced!=SYNCED"
+  [ "$(verdict_for yes yes 9999)" = DRIFT ]    || fail="$fail bigoff!=DRIFT"
+  [ "$(verdict_for no  yes NA)"   = UNSYNCED ] || fail="$fail nosync!=UNSYNCED"
+  [ "$(verdict_for yes no  5)"    = NO-NTP ]   || fail="$fail nontp!=NO-NTP"
+  [ "$(abs_ms "-1.910ms")" = 2 ]  || fail="$fail abs_ms(ms)!=2"
+  [ "$(abs_ms "12300us")"  = 12 ] || fail="$fail abs_ms(us)!=12"
+  [ "$(abs_ms "0.5 s")"    = 500 ]|| fail="$fail abs_ms(s)!=500"
+  [ -n "$fail" ] && { echo "smoke-test: FAIL ($fail )"; exit 1; }
+  # real-read gate (doctrine: --test must assert a live read produces data, not just offline logic)
+  if read_clock; then
+    case "$VERDICT" in
+      SYNCED|DRIFT|UNSYNCED|NO-NTP) echo "smoke-test: ok (logic sound; LIVE read -> $(human_line | sed 's/^clock-sync: //'))"; exit 0;;
+      *) echo "smoke-test: FAIL (live read produced no valid verdict: '$VERDICT')"; exit 1;;
+    esac
+  else
+    echo "smoke-test: ok (logic sound; no timedatectl/chronyc here -> sense reports BLIND/exit2, honest n/a)"
+    exit 0
+  fi
+fi
+
+# --- read the real signal (or honest BLIND) ----------------------------------------------------
+if ! read_clock; then
+  echo "clock-sync: BLIND (no timedatectl/chronyc — cannot perceive time discipline) — not synced, UNKNOWN"
+  exit 2
+fi
+
+# --- --edge: stateful reflex. CHANGE-GATED content + state-touch EVERY run (mtime=ran-live) -----
+if [ "${1:-}" = "--edge" ]; then
+  prev_verdict=NONE
+  [ -r "$STATE" ] && IFS='|' read -r _ prev_verdict _ < "$STATE" 2>/dev/null || true
+  [ -n "$prev_verdict" ] || prev_verdict=NONE
+  mkdir -p "$(dirname "$STATE")" 2>/dev/null
+  # value-changed (content) — owned by this change-gated write
+  if [ "$VERDICT" != "$prev_verdict" ]; then
+    printf '%s|%s|%s|%s\n' "$OFFSET_MS" "$VERDICT" "${SERVER:-?}" "${STRATUM:-?}" > "$STATE"
+  fi
+  # ran-live (mtime) — owned by the shared primitive, refreshed on EVERY successful eval so a
+  # long-stable SYNCED can never decay into a FALSE STALE (memory boot-grace/liveness-touch).
+  if command -v mesh-state-touch >/dev/null 2>&1; then mesh-state-touch --create "$STATE" >/dev/null 2>&1
+  else touch "$STATE"; fi
+  [ "$prev_verdict" = NONE ] && exit 0    # seed silently — no post on first observation
+  if [ "$VERDICT" != "$prev_verdict" ]; then
+    case "$VERDICT" in
+      SYNCED) post "[clock-synced] $(hostname): clock re-disciplined to NTP — offset ${OFFSET_MS}ms (server ${SERVER:-?}). Timestamp leases trustworthy again." ;;
+      *)      post "[clock-drift] $(hostname): clock $VERDICT (was $prev_verdict) — offset ${OFFSET_MS}ms, server ${SERVER:-?}, src ${SRC}. Timestamp-based liveness leases across the mesh are UNRELIABLE on this node until NTP recovers." ;;
+    esac
+  fi
+  exit 0
+fi
+
+# --- --json ------------------------------------------------------------------------------------
+if [ "${1:-}" = "--json" ]; then
+  off="$OFFSET_MS"; [ "$off" = NA ] && off=null
+  printf '{"verdict":"%s","offset_ms":%s,"server":"%s","stratum":"%s","jitter":"%s","source":"%s"}\n' \
+    "$VERDICT" "$off" "${SERVER:-?}" "${STRATUM:-?}" "${JITTER:-?}" "$SRC"
+  exit 0
+fi
+
+# --- one-shot human read -----------------------------------------------------------------------
+human_line
+[ "$VERDICT" = SYNCED ] || echo "  WARN: this node's clock is not cleanly NTP-disciplined — its mesh timestamps may be skewed."
+echo "  (use --edge for the stateful reflex; --json for machines)"
+exit 0
