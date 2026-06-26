@@ -1,0 +1,220 @@
+#!/usr/bin/env bash
+# mesh-loop-baton — the CLOSED METABOLIC LOOP driver (operator 2026-06-26, TG).
+#
+# Replaces the INDEPENDENT per-window heartbeats of the PIPELINE windows with ONE directed, closed
+# cycle. A single driver visits the stages in a fixed RING and advances a "baton" stage→stage:
+#
+#   CYCLE (default):  discover → health → genome → pub → (back to discover)
+#     discover  finds a NEW sense/reach (or honestly reports the frontier dry)
+#     health    verifies the find actually APPEARED + is healthy   (dash role: check)
+#     genome    writes the verified find into the codebase / wires the organ
+#     pub       decides if it is worth writing about (EITHER WAY) → baton returns to discover
+#
+# It is NOT a rigid conveyor (operator refinement 2026-06-26): minds + chat ride ALONGSIDE and OBSERVE
+# the whole loop (chat = standing correction channel); any stage can pass feedback back or forward via
+# the board / mesh-tell. room is OUT of the loop (ambient third-party). health ALSO keeps its OWN
+# independent watchdog heartbeat (mesh-pane-consume) — it both rides the baton AND watches the world.
+#
+# WAKE-GATING — the hard part the operator has fought for (memory consume-diff-gated-wake): a continuous
+# loop must NOT burn a mind turn per stage per lap. So a stage is WOKEN only when there is real reason:
+#   (a) CHARGE — the upstream stage produced a real (non-[idle]/[heartbeat]) board line this lap, so this
+#       stage has fresh upstream output to act on; OR
+#   (b) PANE DIFF — the stage's own data pane changed since last lap (its own input moved).
+# Otherwise the baton just ADVANCES the pointer with no wake (cheap no-op pass-through → zero tokens).
+# Charge dies when a woken stage posts only [idle]/[heartbeat] — so a single discovery flows ONCE around
+# the ring (discover→health→genome→pub) then quiesces; a fully-quiet ring spins cheaply and never deadlocks.
+#
+# Reuses mesh-pane-consume's primitives (idle-gate + chrome-stripped pane signature). The baton message
+# names HOW to read state (mesh-dash --once <role>) + WHAT just happened upstream; the MIND still pulls its
+# own full pane and owns the filter — the driver carries NO stream content (the ephemeral-stream inversion).
+#
+#   mesh-loop-baton            run the closed-loop driver (durable; ONE process for the whole ring)
+#   mesh-loop-baton --once     advance the baton exactly one stage then exit (manual step / test)
+#   mesh-loop-baton --status   show the current baton holder + ring
+#   mesh-loop-baton --reset [stage]  set the baton to <stage> (default = first stage)
+#   mesh-loop-baton --test     smoke test (no side effects)
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+[ -f "$HOME/.mesh/restore.env" ] && . "$HOME/.mesh/restore.env" 2>/dev/null || true
+S="$(hostname)"
+LOG="$HOME/.mesh/loop-baton.log"
+STATE="$HOME/.mesh/.loop-baton"          # current baton holder (stage name)
+CHATLOG="${MESH_DIR:-$HOME/.mesh}/chat.log"
+ts(){ date -u +%FT%TZ; }
+
+# RING — the closed cycle, override node-locally via MESH_LOOP_CYCLE in restore.env.
+RING="${MESH_LOOP_CYCLE:-discover health genome pub}"
+read -r -a STAGES <<< "$RING"
+
+# pacing (seconds) — a quiet lap is ~ N_stages * QUIET_GAP; a working stage is bounded by MAX_STAGE.
+SETTLE="${MESH_LOOP_SETTLE:-20}"      # grace after a wake for the mind to pick up the turn
+POLL="${MESH_LOOP_POLL:-8}"          # idle re-check cadence while waiting for a turn to finish
+MAX_STAGE="${MESH_LOOP_MAX_STAGE:-900}"  # cap per stage so a stuck mind never deadlocks the ring
+QUIET_GAP="${MESH_LOOP_QUIET_GAP:-60}"   # pause after a no-wake pass-through (keeps a quiet ring slow)
+HANDOFF_GAP="${MESH_LOOP_HANDOFF_GAP:-15}" # pause after a real wake before the next stage
+
+# ---- primitives (mirror mesh-pane-consume; kept in sync deliberately) ----
+mind_pane(){ tmux list-panes -t "$S:$1" -F '#{pane_top} #{pane_index}' 2>/dev/null | sort -n | tail -1 | awk '{print $2}'; }
+mind_idle(){ # 0 = idle (safe to wake): double-capture the mind pane, static = idle (engine-agnostic)
+  local ch="$1" p a b; p="$(mind_pane "$ch")"
+  a="$(tmux capture-pane -t "$S:$ch.${p:-1}" -p -S -6 2>/dev/null)"; [ -z "$a" ] && return 1
+  sleep 2.5
+  b="$(tmux capture-pane -t "$S:$ch.${p:-1}" -p -S -6 2>/dev/null)"
+  [ "$a" = "$b" ]
+}
+dash_role(){ case "$1" in health) echo check ;; *) echo "$1" ;; esac; }
+strip_volatile(){ # remove per-frame CHROME so an unchanged pane hashes stably (mirror mesh-pane-consume)
+  sed -E \
+    -e 's/[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z?//g' \
+    -e 's/[0-9]{2}:[0-9]{2}:[0-9]{2}//g' \
+    -e 's/\b[0-9]+[smhd] ago\b//g' \
+    -e 's/\bage [0-9]+[smhd]?\b//g' \
+    -e 's/as of [^|·]*//g' \
+    -e 's/\brefresh [0-9]+s\b//g' \
+    -e 's/cam=LIVE [0-9]+s [0-9]+B/cam=LIVE/g' \
+    -e 's/cache [0-9]+s/cache/g' \
+    -e 's/[0-9]+ utterances/N utterances/g' \
+    -e '/pane live|ticks every frame/d'
+}
+pane_sig(){ tmux capture-pane -t "$S:$1.0" -p 2>/dev/null | strip_volatile | sha1sum | awk '{print $1}' || true; }
+
+# next_stage — closed ring successor (wraps pub→discover). $1 = current stage.
+next_stage(){ local cur="$1" i n=${#STAGES[@]}; for ((i=0;i<n;i++)); do [ "${STAGES[$i]}" = "$cur" ] && { echo "${STAGES[$(((i+1)%n))]}"; return; }; done; echo "${STAGES[0]}"; }
+valid_stage(){ local s; for s in "${STAGES[@]}"; do [ "$s" = "$1" ] && return 0; done; return 1; }
+
+# baton_msg — content-free re: the stream; names the stage's loop DUTY + how to read its state + that the
+# baton advances when it goes idle. Per-stage so each mind knows its place + downstream hand.
+baton_msg(){ # $1=stage  $2=upstream-stage  $3=reason(charge|panediff|prime)
+  local st="$1" up="$2" why="$3" role; role="$(dash_role "$st")"
+  local head="[loop-baton → $st] (from $up; $why). You are a stage of the CLOSED metabolic loop \
+discover→health→genome→pub→discover. Read your live state NOW: mesh-dash --once $role (one-shot — never \
+bare, that hangs your turn). You own the filter; the driver carries no data."
+  local duty
+  case "$st" in
+    discover) duty="DUTY: find ONE new sense/reach/capability (or honestly report the frontier is dry). \
+Your find is the baton — health verifies it next. A real find → post it ([task]/[fyi]/[verify]); nothing new → one terse [idle]." ;;
+    health)   duty="DUTY: VERIFY whether discover's latest find (read the board for its newest non-idle line) \
+actually APPEARED and is healthy — a real read/artifact, not a guess. Real result → [verify]/[done]/[fyi]; nothing to verify → [idle]." ;;
+    genome)   duty="DUTY: take the verified find and WRITE it into the codebase — wire the organ / make the edit, \
+--test it, hand the LANDING to the steward. Real change → [done] with the cite; nothing to write → [idle]." ;;
+    pub)      duty="DUTY: decide if genome's change is worth writing about publicly (EITHER WAY is fine — \
+the baton returns to discover regardless). Worth it → [fyi]/[design] the angle; not worth it → [idle]." ;;
+    *)        duty="DUTY: take your turn, then the baton advances." ;;
+  esac
+  printf '%s %s Then the baton advances when you go idle. Feedback back/forward is allowed (chat observes all).' "$head" "$duty"
+}
+
+# produced_since — did <stage> post a REAL (non-idle/heartbeat) board line after line-count $2? 0 = produced.
+produced_since(){ # $1=stage  $2=chatlog-linecount-before
+  [ -f "$CHATLOG" ] || return 1
+  tail -n +"$(( ${2:-0} + 1 ))" "$CHATLOG" 2>/dev/null \
+    | grep -F "  $1@$S  ::" \
+    | grep -vqE '\[idle\]|\[heartbeat\]'
+}
+
+wait_idle(){ # $1=stage -> 0 when idle (bounded by MAX_STAGE); 1 if still busy at the cap
+  local st="$1" waited=0
+  while ! mind_idle "$st"; do
+    waited=$((waited+POLL)); [ "$waited" -ge "$MAX_STAGE" ] && return 1
+    sleep "$POLL"
+  done
+  return 0
+}
+
+# advance_one — evaluate the current holder, wake-if-charged-or-changed. Sets globals R_NEXT + R_WOKE.
+# MUST be called WITHOUT command substitution — it mutates LAST_SIG/prev_charged which would be lost in a
+# $(...) subshell (memory: carry data via globals, not subshell stdout). Logs go to $LOG (a file, fine).
+declare -A LAST_SIG
+prev_charged=0
+R_NEXT=""; R_WOKE=0
+advance_one(){
+  local holder="$1" role cur_sig pane_changed charged=0 woke=0 before up why
+  role="$(dash_role "$holder")"
+  cur_sig="$(pane_sig "$holder")"
+  pane_changed=0; [ "$cur_sig" != "${LAST_SIG[$holder]:-__init__}" ] && pane_changed=1
+  LAST_SIG[$holder]="$cur_sig"
+  [ "$prev_charged" = 1 ] && charged=1
+  [ "$pane_changed" = 1 ] && charged=1
+
+  if [ "$charged" = 1 ]; then
+    up="$(prev_of "$holder")"
+    if [ "$prev_charged" = 1 ]; then why="charged"; else why="own-pane changed"; fi
+    if wait_idle "$holder"; then
+      before="$(wc -l < "$CHATLOG" 2>/dev/null || echo 0)"
+      mesh-tell "$holder" "$(baton_msg "$holder" "$up" "$why")" >/dev/null 2>&1
+      echo "$(ts) $holder: WOKE ($why) — baton from $up" >> "$LOG"
+      sleep "$SETTLE"
+      wait_idle "$holder" || echo "$(ts) $holder: turn exceeded MAX_STAGE — advancing anyway (no deadlock)" >> "$LOG"
+      if produced_since "$holder" "$before"; then woke=1; echo "$(ts) $holder: PRODUCED real output — charge carries forward" >> "$LOG"
+      else woke=0; echo "$(ts) $holder: only idle/heartbeat — charge dies here" >> "$LOG"; fi
+    else
+      echo "$(ts) $holder: busy past MAX_STAGE — skip wake, advance" >> "$LOG"; woke=0
+    fi
+  else
+    echo "$(ts) $holder: quiet + uncharged — pass-through (no wake)" >> "$LOG"; woke=0
+  fi
+  R_NEXT="$(next_stage "$holder")"; R_WOKE="$woke"
+}
+
+prev_of(){ local cur="$1" i n=${#STAGES[@]}; for ((i=0;i<n;i++)); do [ "${STAGES[$i]}" = "$cur" ] && { echo "${STAGES[$(((i-1+n)%n))]}"; return; }; done; echo "${STAGES[$((n-1))]}"; }
+
+# ---- test ----
+if [ "${1:-}" = --test ]; then
+  command -v tmux >/dev/null 2>&1 || { echo "smoke-test: FAIL (no tmux)"; exit 1; }
+  command -v mesh-tell >/dev/null 2>&1 || { echo "smoke-test: FAIL (no mesh-tell)"; exit 1; }
+  # ring must be closed: next() wraps the last stage back to the first
+  last="${STAGES[$((${#STAGES[@]}-1))]}"; first="${STAGES[0]}"
+  [ "$(next_stage "$last")" = "$first" ] || { echo "smoke-test: FAIL (ring not closed: $last → $(next_stage "$last") ≠ $first)"; exit 1; }
+  [ "$(prev_of "$first")" = "$last" ] || { echo "smoke-test: FAIL (prev of first ≠ last — ring not closed backward)"; exit 1; }
+  # health must map to dash role 'check' (a wrong role renders the wrong pane)
+  [ "$(dash_role health)" = check ] || { echo "smoke-test: FAIL (health dash role must be 'check')"; exit 1; }
+  [ "$(dash_role discover)" = discover ] || { echo "smoke-test: FAIL (discover dash role)"; exit 1; }
+  # every stage's baton message must name its read command + the closed-loop + a real duty + the consumer-filter
+  for st in "${STAGES[@]}"; do
+    m="$(baton_msg "$st" "$(prev_of "$st")" prime)"
+    case "$m" in *"mesh-dash --once $(dash_role "$st")"*) :;; *) echo "smoke-test: FAIL ($st msg missing one-shot read cmd)"; exit 1;; esac
+    case "$m" in *"discover→health→genome→pub→discover"*) :;; *) echo "smoke-test: FAIL ($st msg missing closed-loop)"; exit 1;; esac
+    case "$m" in *"DUTY:"*) :;; *) echo "smoke-test: FAIL ($st msg missing DUTY)"; exit 1;; esac
+    case "$m" in *"own the filter"*) :;; *) echo "smoke-test: FAIL ($st msg lost consumer-filter directive)"; exit 1;; esac
+  done
+  # produced_since: a [done] line from a stage counts as production; an [idle] line does NOT
+  tmp="$(mktemp)"; CHATLOG="$tmp"
+  printf '2026-06-26T00:00:00Z  discover@%s  ::  [idle] nothing new\n' "$S" >> "$tmp"
+  base="$(wc -l < "$tmp")"
+  printf '2026-06-26T00:00:05Z  discover@%s  ::  [idle] still nothing\n' "$S" >> "$tmp"
+  produced_since discover "$base" && { echo "smoke-test: FAIL (an [idle] line counted as production — charge would never die)"; rm -f "$tmp"; exit 1; }
+  printf '2026-06-26T00:00:09Z  discover@%s  ::  [task] discover: real find\n' "$S" >> "$tmp"
+  produced_since discover "$base" || { echo "smoke-test: FAIL (a real [task] line not counted as production — charge would never flow)"; rm -f "$tmp"; exit 1; }
+  rm -f "$tmp"
+  echo "smoke-test: ok (closed ring; per-stage baton duty; charge flows on real output, dies on idle)"; exit 0
+fi
+
+# ---- non-loop subcommands ----
+case "${1:-}" in
+  --status)
+    h="$(cat "$STATE" 2>/dev/null || echo "${STAGES[0]}")"
+    echo "=== loop-baton ($S) ==="
+    echo "  ring:   ${RING// / → } → (closed)"
+    echo "  holder: $h"
+    echo "  pace:   settle=${SETTLE}s poll=${POLL}s max=${MAX_STAGE}s quiet-gap=${QUIET_GAP}s"
+    exit 0 ;;
+  --reset)
+    ns="${2:-${STAGES[0]}}"; valid_stage "$ns" || { echo "mesh-loop-baton: '$ns' not in ring ($RING)" >&2; exit 1; }
+    echo "$ns" > "$STATE"; echo "baton reset to: $ns"; exit 0 ;;
+esac
+
+tmux has-session -t "$S" 2>/dev/null || { echo "mesh-loop-baton: no tmux session '$S'" >&2; exit 1; }
+holder="$(cat "$STATE" 2>/dev/null || echo "${STAGES[0]}")"; valid_stage "$holder" || holder="${STAGES[0]}"
+
+if [ "${1:-}" = --once ]; then
+  advance_one "$holder"
+  echo "$R_NEXT" > "$STATE"
+  echo "advanced: $holder → $R_NEXT (woke=$R_WOKE)"; exit 0
+fi
+
+echo "$(ts) loop-baton START ring=[$RING] holder=$holder" >> "$LOG"
+while :; do
+  advance_one "$holder"
+  prev_charged="$R_WOKE"; holder="$R_NEXT"; echo "$holder" > "$STATE"
+  if [ "$R_WOKE" = 1 ]; then sleep "$HANDOFF_GAP"; else sleep "$QUIET_GAP"; fi
+done
