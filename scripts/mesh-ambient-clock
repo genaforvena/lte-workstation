@@ -23,8 +23,9 @@
 #
 #   mesh-ambient-clock            one-shot label
 #   mesh-ambient-clock --edge     emit only when label changes (for cron/stream wiring)
-#   mesh-ambient-clock --json     machine-readable {label, tv_count, tv_nearby, tv_far, ac_on, data_stale, scan_count, trend, ts, detail}
+#   mesh-ambient-clock --json     machine-readable {label, tv_count, tv_nearby, tv_far, ac_on, data_stale, scan_count, trend, nearby_trend, burst, burst_reason, ts, detail}
 #                                 trend = RISING|FALLING|STABLE (TV count vs ~15 min ago) or INITIAL (not enough data)
+#                                 burst = NONE|ARRIVAL|DEPARTURE|INSUFFICIENT (>=2-TV change in last ~25 min — distinct from `trend` which is unbounded)
 #   mesh-ambient-clock --test     smoke test
 set -uo pipefail
 export PATH="$HOME/.local/bin:$PATH"
@@ -36,6 +37,52 @@ export MESH_WHO="mesh-ambient-clock@$(hostname)"
 PRESENCE_LOG="${MESH_PRESENCE_LOG:-$HOME/.mesh/presence.log}"   # overridable: testability + plantability
 STATE_FILE="${MESH_AMBIENT_STATE:-$HOME/.mesh/.ambient-clock.state}"
 TS="$(date -u +%FT%TZ)"
+
+# ---- BURST classifier: large-magnitude TV-count change in the recent cron window ----
+# Distinct from `trend` (RISING/FALLING/STABLE, 15-min-ago baseline) — burst captures a SUDDEN
+# event in the last ~20 min (the cron cadence is 10 min, so we see 2 prior scans). A burst is:
+#   ARRIVAL   tv_count jumped by >= 2 in the recent window (neighbors just turned on 2+ TVs)
+#   DEPARTURE tv_count dropped by >= 2 in the recent window (neighbors just turned off 2+ TVs)
+#   NONE      no recent change of that magnitude
+#   INSUFFICIENT no recent history yet (the trend state was just initialised)
+#
+# Args: <tv_count_now> <prev_count> <prev2_count> [<prev2_age_s> [<prev_age_s>]]
+# where prev_count = the tv_count from the immediately previous cron run (~10 min ago),
+# prev2_count = the one before that (~20 min ago), and ages are used to gate the burst to
+# the last ~25 min (older than that = not a "recent" event any more).
+#
+# Magnitude gate: |change| >= 2. A 0→1 change is a normal arrival, not a burst. A 0→3 is a burst
+# (multiple TVs just came on — likely an evening arrival, not a flicker). The threshold is
+# FALSIFIABLE: change it → the test cases flip.
+BURST_THRESHOLD=2
+BURST_MAX_AGE_S=1500   # 25 min: the burst is only "recent" if the triggering change is <25 min old
+classify_burst() {
+  local now="$1" prev="$2" prev2="$3" prev_age="${4:-300}" prev2_age="${5:-900}"
+  # INSUFFICIENT: no prior history at all (both 0 is the "initial baseline" — can't differentiate
+  # "no TVs and never had" from "just initialised with 0")
+  if [ -z "$prev" ] && [ -z "$prev2" ]; then echo "INSUFFICIENT|no prior history"; return; fi
+  # Use the most recent prior value (the one closest to "now")
+  local recent="$prev"
+  local recent_age="$prev_age"
+  # If the immediate prev is too old (cron skipped), look at prev2
+  if [ "$recent_age" -gt "$BURST_MAX_AGE_S" ] && [ -n "$prev2" ] && [ "$prev2_age" -le "$BURST_MAX_AGE_S" ]; then
+    recent="$prev2"; recent_age="$prev2_age"
+  fi
+  # If we have NO recent prior (both too old) → INSUFFICIENT
+  if [ "$recent_age" -gt "$BURST_MAX_AGE_S" ] || [ -z "$recent" ]; then
+    echo "NONE|prior too old (most recent prior was ${recent_age}s ago)"
+    return
+  fi
+  local diff=$((now - recent))
+  if [ "$diff" -ge "$BURST_THRESHOLD" ]; then
+    echo "ARRIVAL|${recent}->${now} (+${diff} TVs, ${recent_age}s ago)"
+    return
+  elif [ "$diff" -le "-$BURST_THRESHOLD" ]; then
+    echo "DEPARTURE|${recent}->${now} (${diff} TVs, ${recent_age}s ago)"
+    return
+  fi
+  echo "NONE|change=${diff} (below ${BURST_THRESHOLD}-TV threshold)"
+}
 
 # ---- Smoke test ----
 [ "${1:-}" = --test ] && {
@@ -179,7 +226,38 @@ print("ok (TV+vote+Bose-skip + RSSI-filter + vote-filter + RSSI-bands + rf-silen
   [ -z "$_gn2" ] || { echo "  FAIL nearby legacy-skip: 2-col line matched (got '$_gn2')"; _tf2=1; }
   rm -f "$_trend_f"
   [ "$_tf2" = 0 ] || { echo "smoke-test: FAIL (trend awk assertions failed)"; exit 1; }
-  echo "smoke-test: ok ($result + trend: 5 assertions)"
+  # ---- burst classifier assertions (FALSIFIABLE: change BURST_THRESHOLD → these flip) ----
+  _b2=0
+  # INSUFFICIENT: no prior history
+  r="$(classify_burst 0 '' '' 0 0)"
+  echo "$r" | grep -q '^INSUFFICIENT' || { echo "  FAIL burst INSUFFICIENT: got=$r"; _b2=1; }
+  # ARRIVAL: 0→3 TVs in the last 10 min (neighbors just got home, 3 TVs came on)
+  r="$(classify_burst 3 0 '' 600 0)"
+  echo "$r" | grep -q '^ARRIVAL' || { echo "  FAIL burst ARRIVAL 0->3: got=$r"; _b2=1; }
+  # DEPARTURE: 4→0 TVs in the last 10 min
+  r="$(classify_burst 0 4 '' 600 0)"
+  echo "$r" | grep -q '^DEPARTURE' || { echo "  FAIL burst DEPARTURE 4->0: got=$r"; _b2=1; }
+  # NONE: small change below threshold (1→2 is below the BURST_THRESHOLD=2 gate)
+  r="$(classify_burst 2 1 '' 600 0)"
+  echo "$r" | grep -q '^NONE' || { echo "  FAIL burst NONE 1->2: got=$r"; _b2=1; }
+  # NONE: 0→1 is a normal arrival, not a burst
+  r="$(classify_burst 1 0 '' 600 0)"
+  echo "$r" | grep -q '^NONE' || { echo "  FAIL burst NONE 0->1: got=$r"; _b2=1; }
+  # NONE: 3→2 is below threshold
+  r="$(classify_burst 2 3 '' 600 0)"
+  echo "$r" | grep -q '^NONE' || { echo "  FAIL burst NONE 3->2: got=$r"; _b2=1; }
+  # Stale prev (too old) → falls through to prev2 if it's recent enough
+  # prev=4, age 1800 (>25min, stale); prev2=0, age 600 (recent) → uses prev2 → ARRIVAL 0→4
+  r="$(classify_burst 4 4 0 1800 600)"
+  echo "$r" | grep -q '^ARRIVAL' || { echo "  FAIL burst stale-fallback-to-prev2: got=$r"; _b2=1; }
+  # Both prev too old → NONE (no recent change)
+  r="$(classify_burst 1 1 0 5000 4000)"
+  echo "$r" | grep -q '^NONE' || { echo "  FAIL burst both-stale: got=$r"; _b2=1; }
+  # Exact threshold: 0→2 is at the boundary (>= 2 = burst) → ARRIVAL
+  r="$(classify_burst 2 0 '' 600 0)"
+  echo "$r" | grep -q '^ARRIVAL' || { echo "  FAIL burst boundary 0->2: got=$r"; _b2=1; }
+  [ "$_b2" = 0 ] || { echo "smoke-test: FAIL (burst classifier assertions failed)"; exit 1; }
+  echo "smoke-test: ok ($result + trend: 5 + burst: 9 assertions)"
   exit 0
 }
 
@@ -338,6 +416,34 @@ if [ "$data_stale" = 0 ] && [ -f "$TREND_STATE" ]; then
     fi
   fi
 fi
+# ---- BURST detection: a sudden change in the recent cron window ----
+# Reads the previous 2 entries (BEFORE the current append below) to detect a >= 2 change.
+# The TREND_STATE file holds 3-col lines (epoch|tv_count|tv_nearby_count); the cron cadence is
+# 10 min so the prev 2 entries are roughly 10 and 20 min ago. A burst is "neighbors just got
+# home" / "neighbors just left" — a stronger signal than the 15-min-ago `trend` (which only
+# classifies as RISING/FALLING/STABLE without a magnitude gate).
+burst="NONE"; burst_reason=""
+if [ "$data_stale" = 0 ] && [ -f "$TREND_STATE" ]; then
+  # Read the last 2 entries (the prev and prev2 — BEFORE the current append we do below).
+  # The format is "epoch|tv_count|tv_nearby_count"; we want col1 (epoch) and col2 (tv_count).
+  _prev_line="$(tail -n 2 "$TREND_STATE" 2>/dev/null | head -n 1)"
+  _prev2_line="$(tail -n 3 "$TREND_STATE" 2>/dev/null | head -n 1)"
+  _prev_count=""; _prev_age=""; _prev2_count=""; _prev2_age=""
+  if [ -n "$_prev_line" ]; then
+    _prev_count="$(printf '%s' "$_prev_line" | awk -F'|' '{print $2}')"
+    _prev_epoch="$(printf '%s' "$_prev_line" | awk -F'|' '{print $1}')"
+    _prev_age=$((NOW_EPOCH - _prev_epoch))
+  fi
+  if [ -n "$_prev2_line" ]; then
+    _prev2_count="$(printf '%s' "$_prev2_line" | awk -F'|' '{print $2}')"
+    _prev2_epoch="$(printf '%s' "$_prev2_line" | awk -F'|' '{print $1}')"
+    _prev2_age=$((NOW_EPOCH - _prev2_epoch))
+  fi
+  # call the (already-tested) classifier
+  result="$(classify_burst "$tv_count" "$_prev_count" "$_prev2_count" "${_prev_age:-9999}" "${_prev2_age:-9999}")"
+  burst="${result%%|*}"
+  burst_reason="${result#*|}"
+fi
 if [ "$data_stale" = 0 ]; then
   printf '%d|%d|%d\n' "$NOW_EPOCH" "$tv_count" "$tv_nearby_count" >> "$TREND_STATE"
   { tail -n 20 "$TREND_STATE" > "${TREND_STATE}.tmp" && mv "${TREND_STATE}.tmp" "$TREND_STATE"; } 2>/dev/null || true
@@ -439,12 +545,12 @@ case "${1:-}" in
     [ -e "$STATE_FILE" ] && touch "$STATE_FILE" 2>/dev/null || printf '%s\n' "$label" > "$STATE_FILE"
     ;;
   --json)
-    printf '{"label":"%s","tv_count":%d,"tv_nearby":%d,"tv_far":%d,"ac_on":%s,"data_stale":%s,"silent_field":%s,"scan_count":%d,"nonempty_scans":%d,"trend":"%s","nearby_trend":"%s","ts":"%s","detail":"%s"}\n' \
+    printf '{"label":"%s","tv_count":%d,"tv_nearby":%d,"tv_far":%d,"ac_on":%s,"data_stale":%s,"silent_field":%s,"scan_count":%d,"nonempty_scans":%d,"trend":"%s","nearby_trend":"%s","burst":"%s","burst_reason":"%s","ts":"%s","detail":"%s"}\n' \
       "$label" "$tv_count" "$tv_nearby_count" "$tv_far_count" \
       "$([ "$ac_on" = 1 ] && echo true || echo false)" \
       "$([ "$data_stale" = 1 ] && echo true || echo false)" \
       "$([ "$silent_field" = 1 ] && echo true || echo false)" \
-      "$scan_count" "$nonempty_scans" "$trend" "$nearby_trend" "$TS" "$detail"
+      "$scan_count" "$nonempty_scans" "$trend" "$nearby_trend" "$burst" "$burst_reason" "$TS" "$detail"
     ;;
   *)
     printf 'ambient: %s\n' "$output"
