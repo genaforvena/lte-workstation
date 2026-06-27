@@ -36,7 +36,8 @@ export PATH="$HOME/.local/bin:$PATH"
 [ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
 [ -f "$HOME/.mesh/nodes" ] && . "$HOME/.mesh/nodes"
 
-STATE="$HOME/.mesh/.tamper-state"   # <verdict>|<epoch>|<window> — liveness + cached consumer read
+STATE="$HOME/.mesh/.tamper-state"      # <verdict>|<epoch>|<window>|<recency>|<events_24h> — liveness + cached consumer read
+EVENT_LOG="$HOME/.mesh/.tamper-events"  # one epoch per line (recent moved events); pruned to 24h
 
 # classify_tamper <rc> <raw-output> → echoes moved|quiet|unreachable (pure, offline-testable).
 # Sentinel-gated so a still body (watch ran, nothing fired) is a confident quiet, NOT a fake n/a.
@@ -51,6 +52,85 @@ classify_tamper() {
   else                                                       # ssh session never completed → unreachable
     echo "unreachable"
   fi
+}
+
+# classify_recency <now_epoch> <last_event_epoch> → echoes "LABEL|seconds_since"
+# Captures the "how long since the body was last tampered with?" signal — distinct from
+# the per-watch verdict (moved/quiet) which is just "did anything fire in the last N seconds?".
+# Bands (FALSIFIABLE via --test, 5-min/30-min/2-hour thresholds — change them and the tests flip):
+#   ACTIVE   last event 0–5 min ago       — fresh tampering, room-mind should be alert
+#   RECENT   last event 5–30 min ago      — recent activity, worth a glance
+#   STALE    last event 30 min – 2 hours ago — historical, body has been at rest
+#   COLD     last event > 2 hours ago    — long quiet, no concern
+#   NEVER    no recorded event            — first run, no baseline
+classify_recency() {
+  local now="$1" last="$2"
+  [ -n "$last" ] && [ "$last" -gt 0 ] 2>/dev/null || { echo "NEVER|no recorded event"; return; }
+  local dt=$((now - last))
+  if   [ "$dt" -lt 300 ];  then echo "ACTIVE|${dt}s ago (within 5min)"; return; fi
+  if   [ "$dt" -lt 1800 ]; then echo "RECENT|${dt}s ago (within 30min)"; return; fi
+  if   [ "$dt" -lt 7200 ]; then echo "STALE|${dt}s ago (within 2h)"; return; fi
+  echo "COLD|${dt}s ago (long quiet)"
+}
+
+# count_recent_events <log_file> <now_epoch> <window_sec> → echoes integer count.
+# Reads the rolling event log (one epoch per line) and counts events within the window.
+# Pure, file-bound — easy to test.
+count_recent_events() {
+  local f="$1"
+  local now="$2"
+  local win="$3"
+  local cutoff
+  cutoff=$(( now - win ))
+  local c=0
+  [ -f "$f" ] || { echo 0; return; }
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    [ "$line" -ge "$cutoff" ] 2>/dev/null && c=$((c+1))
+  done < "$f"
+  echo "$c"
+}
+
+# log_event <log_file> <epoch> [now] — appends a tamper event and prunes anything older than
+# 24h relative to `now` (defaults to `epoch` itself when called at the time of a new event).
+# Events older than 24h are NOT appended (already-expired events don't pollute the log).
+# One line per moved event. Pure, file-bound.
+log_event() {
+  local f="$1"
+  local epoch="$2"
+  local now="${3:-$epoch}"   # when called at event-time, now == epoch
+  local cutoff=$(( now - 86400 ))
+  [ -d "$(dirname "$f")" ] || return 1
+  # Prune: keep only lines >= cutoff (last 24h from `now`)
+  if [ -f "$f" ]; then
+    local tmp="${f}.tmp.$$"
+    : > "$tmp"
+    while IFS= read -r line; do
+      [ -z "$line" ] && continue
+      [ "$line" -ge "$cutoff" ] 2>/dev/null && printf '%s\n' "$line" >> "$tmp"
+    done < "$f"
+    mv -f "$tmp" "$f" 2>/dev/null || rm -f "$tmp"
+  fi
+  # Append the new event — but only if it's not already older than the cutoff (already-expired)
+  if [ "$epoch" -ge "$cutoff" ] 2>/dev/null; then
+    printf '%s\n' "$epoch" >> "$f"
+  fi
+}
+
+# write_tamper_state <verdict> <now_epoch> <window> — atomic state write with recency + event count.
+# The new format is additive: <verdict>|<epoch>|<window>|<recency_label>|<events_24h>
+# Old readers (2-field IFS) will gracefully degrade to verdict+epoch (the 3rd field is window,
+# 4th and 5th are extra — an `IFS='|' read -r v t w r e` still works, extra fields ignored).
+write_tamper_state() {
+  local verdict="$1" now="$2" window="$3"
+  local last_event=""
+  [ -f "$EVENT_LOG" ] && last_event="$(tail -n 1 "$EVENT_LOG" 2>/dev/null)"
+  local recency; recency="$(classify_recency "$now" "$last_event")"
+  local events_24h; events_24h="$(count_recent_events "$EVENT_LOG" "$now" 86400)"
+  # Store the recency LABEL ONLY (strip classify_recency's "|description" tail) — otherwise the
+  # embedded '|' makes the line 6 fields and pushes events_24h off field 5, breaking the documented
+  # format AND the --status reader. Matches how the live moved/quiet output already uses ${r%%|*}.
+  printf '%s|%s|%s|%s|%s\n' "$verdict" "$now" "$window" "${recency%%|*}" "$events_24h" > "$STATE"
 }
 
 if [ "${1:-}" = --test ]; then
@@ -81,13 +161,69 @@ if [ "${1:-}" = --test ]; then
   # moved verdict is rc-agnostic too: sentinel+values → moved regardless of rc.
   [ "$(classify_tamper 124 '{"SIGNIFICANT_MOTION":{"values":[1.0]}}TAMPER_EOF=0')" = "moved" ] \
     || { echo "  FAIL: sentinel+values → moved regardless of rc"; _f=1; }
-  [ "$_f" = 0 ] || { echo "smoke-test: FAIL (classify_tamper logic)"; exit 1; }
+  # --- classify_recency() fixtures (FALSIFIABLE: change the band thresholds → these flip) ---
+  _tnow=1000000000
+  # ACTIVE: event just now (0s ago)
+  r="$(classify_recency "$_tnow" "$_tnow")"
+  echo "$r" | grep -q '^ACTIVE' || { echo "  FAIL recency ACTIVE 0s: got=$r"; _f=1; }
+  # ACTIVE: event 4 min 59s ago (just under 5 min threshold)
+  r="$(classify_recency "$_tnow" $((_tnow - 299)))"
+  echo "$r" | grep -q '^ACTIVE' || { echo "  FAIL recency ACTIVE 299s: got=$r"; _f=1; }
+  # RECENT: event 5 min ago (at the boundary)
+  r="$(classify_recency "$_tnow" $((_tnow - 300)))"
+  echo "$r" | grep -q '^RECENT' || { echo "  FAIL recency RECENT 300s: got=$r"; _f=1; }
+  # RECENT: event 29 min ago
+  r="$(classify_recency "$_tnow" $((_tnow - 1740)))"
+  echo "$r" | grep -q '^RECENT' || { echo "  FAIL recency RECENT 1740s: got=$r"; _f=1; }
+  # STALE: event 30 min ago
+  r="$(classify_recency "$_tnow" $((_tnow - 1800)))"
+  echo "$r" | grep -q '^STALE' || { echo "  FAIL recency STALE 1800s: got=$r"; _f=1; }
+  # STALE: event 90 min ago
+  r="$(classify_recency "$_tnow" $((_tnow - 5400)))"
+  echo "$r" | grep -q '^STALE' || { echo "  FAIL recency STALE 5400s: got=$r"; _f=1; }
+  # COLD: event 2 hours ago (at the boundary)
+  r="$(classify_recency "$_tnow" $((_tnow - 7200)))"
+  echo "$r" | grep -q '^COLD' || { echo "  FAIL recency COLD 7200s: got=$r"; _f=1; }
+  # COLD: event 24 hours ago
+  r="$(classify_recency "$_tnow" $((_tnow - 86400)))"
+  echo "$r" | grep -q '^COLD' || { echo "  FAIL recency COLD 86400s: got=$r"; _f=1; }
+  # NEVER: no event (empty)
+  r="$(classify_recency "$_tnow" "")"
+  [ "$r" = "NEVER|no recorded event" ] || { echo "  FAIL recency NEVER: got=$r"; _f=1; }
+  # NEVER: zero event
+  r="$(classify_recency "$_tnow" "0")"
+  [ "$r" = "NEVER|no recorded event" ] || { echo "  FAIL recency NEVER-zero: got=$r"; _f=1; }
+  # --- count_recent_events() + log_event() fixtures (file-bound, no network) ---
+  _etd="$(mktemp -d)"; _ef="$_etd/events"
+  log_event "$_ef" 100
+  log_event "$_ef" 200
+  log_event "$_ef" 300
+  c="$(count_recent_events "$_ef" 350 86400)"
+  [ "$c" = "3" ] || { echo "  FAIL log_event basic count: expected 3 got=$c"; _f=1; }
+  # Pruning: events older than 24h relative to NOW are dropped. Use now=200 so 100/200/300 are
+  # within 24h (cutoff=200-86400=-86200), and the new event at epoch -100000 is way before cutoff → dropped.
+  log_event "$_ef" -100000 200
+  c="$(count_recent_events "$_ef" 200 86400)"
+  [ "$c" = "3" ] || { echo "  FAIL log_event pruning: expected 3 after pruning got=$c"; _f=1; }
+  rm -rf "$_etd"
+  # --- write_tamper_state() field-format guard: recency's "|desc" must be stripped so the line is
+  #     exactly 5 fields and events_24h stays at field 5 (regression for the embedded-pipe bug) ---
+  _wd="$(mktemp -d)"; STATE="$_wd/state"; EVENT_LOG="$_wd/events"
+  log_event "$EVENT_LOG" "$_tnow"
+  write_tamper_state "quiet" "$_tnow" 8
+  _nf="$(awk -F'|' '{print NF}' "$STATE")"
+  [ "$_nf" = 5 ] || { echo "  FAIL write_tamper_state field count: expected 5 got=$_nf ($(cat "$STATE"))"; _f=1; }
+  IFS='|' read -r _wv _wt _ww _wr _we < "$STATE"
+  [ "$_we" = 1 ] || { echo "  FAIL write_tamper_state events_24h@field5: expected 1 got=$_we ($(cat "$STATE"))"; _f=1; }
+  case "$_wr" in *'|'*) echo "  FAIL write_tamper_state recency embeds '|': $_wr"; _f=1;; esac
+  rm -rf "$_wd"; unset STATE EVENT_LOG; STATE="$HOME/.mesh/.tamper-state"; EVENT_LOG="$HOME/.mesh/.tamper-events"
+  [ "$_f" = 0 ] || { echo "smoke-test: FAIL (classify_tamper + classify_recency + log_event + write_state)"; exit 1; }
   # --- phone reachability gate (unchanged): real SSH probe, not mesh-phone-ip's cached IP ---
   pip="$(mesh-phone-ip 2>/dev/null)" || { echo "smoke-test: n/a (phone unreachable — all IPs tried); classify-logic ok"; exit 2; }
   timeout 10 ssh -p "${PHONE_SSH_PORT:-8022}" -o BatchMode=yes -o ConnectTimeout=6 \
     -o StrictHostKeyChecking=accept-new "${PHONE_USER:-u0_a380}@$pip" 'command -v termux-sensor' </dev/null >/dev/null 2>&1 \
     || { echo "smoke-test: n/a (phone unreachable or no termux-sensor); classify-logic ok"; exit 2; }
-  echo "smoke-test: ok (classify: moved/quiet/unreachable + sentinel-gates-over-rc regression guard + reachability)"; exit 0
+  echo "smoke-test: ok (classify: 7 + recency: 9 + log: 2 + write_state: 3 = 21 assertions + reachability)"; exit 0
 fi
 
 window=8; edge=0; status=0
@@ -105,16 +241,26 @@ done
 # or absent state reads as such — never a fabricated "quiet" (the unreachable branch does not write).
 if [ "$status" = 1 ]; then
   if [ -f "$STATE" ]; then
-    IFS='|' read -r _v _t _w < "$STATE" 2>/dev/null
+    IFS='|' read -r _v _t _w _r _e < "$STATE" 2>/dev/null
     _age=$(( $(date +%s) - ${_t:-0} ))
-    echo "tamper: ${_v:-unknown} (${_age}s ago, window=${_w:-?})"
+    echo "tamper: ${_v:-unknown} (${_age}s ago, window=${_w:-?}, recency=${_r:-?}, events_24h=${_e:-?})"
   else
     echo "tamper: no cached state yet (never produced)"
   fi
   exit 0
 fi
 
-pip="$(mesh-phone-ip 2>/dev/null)" || { echo "phone unreachable (all IPs tried) — no tamper sense" >&2; exit 2; }
+pip="$(mesh-phone-ip 2>/dev/null)" || { 
+  # Unreachable: write OFFLINE state (mesh-state-touch) so the dashboard sees a recent mark
+  # rather than an ancient mtime. The previous code's "no state write on unreachable" was the
+  # exact hollow-sense pattern (no false-fail via mtime decay) — the same class of fix applied
+  # to mesh-cooscillate and mesh-correlate. Recency stays whatever it was before the gap.
+  NOW=$(date +%s)
+  printf 'OFFLINE|%s|%s|%s|%s\n' "$NOW" "$window" "OFFLINE" "0" > "$STATE"   # 5 clean fields (no embedded '|')
+  mesh-state-touch "$STATE"
+  echo "phone unreachable (all IPs tried) — no tamper sense" >&2
+  exit 2
+}
 
 # Watch SIGNIFICANT_MOTION for the window. It BLOCKS until the HAL fires the trigger, then returns
 # a values blob; if nothing fires, the inner timeout kills it (rc 124) and we get no values blob.
@@ -127,17 +273,32 @@ out="$(timeout $(( window + 4 )) ssh -p "${PHONE_SSH_PORT:-8022}" -o BatchMode=y
   "timeout $inner termux-sensor -s SIGNIFICANT_MOTION -n 1 2>/dev/null; echo TAMPER_EOF=\$?" </dev/null 2>/dev/null)"; rc=$?
 
 verdict="$(classify_tamper "$rc" "$out")"
+NOW=$(date +%s)
 case "$verdict" in
   moved)
-    printf '%s|%s|%s\n' "moved" "$(date +%s)" "$window" > "$STATE"
-    echo "[body-moved] SIGNIFICANT_MOTION fired in ${window}s window — the body was physically disturbed"
+    log_event "$EVENT_LOG" "$NOW"
+    write_tamper_state "moved" "$NOW" "$window"
+    # Output: include recency band + event count so consumers can read them from the line
+    _r="${_STATE_LINE_R:-ACTIVE}"
+    _e="$(count_recent_events "$EVENT_LOG" "$NOW" 86400)"
+    printf '[body-moved] SIGNIFICANT_MOTION fired in %ss window — body physically disturbed (recency=ACTIVE events_24h=%s)\n' \
+      "$window" "$_e"
     exit 0 ;;
   quiet)
-    printf '%s|%s|%s\n' "quiet" "$(date +%s)" "$window" > "$STATE"   # write BEFORE edge-silent-exit (liveness)
+    write_tamper_state "quiet" "$NOW" "$window"
     [ "$edge" = 1 ] && exit 0   # quiet: silent in edge mode
-    echo "[body-quiet] no significant motion in ${window}s — body undisturbed (watch ran)"
+    # Surface the recency band in the human-readable line so consumers can see "last event was 12m ago"
+    _last_event=""
+    [ -f "$EVENT_LOG" ] && _last_event="$(tail -n 1 "$EVENT_LOG" 2>/dev/null)"
+    _recency="$(classify_recency "$NOW" "$_last_event")"
+    _e="$(count_recent_events "$EVENT_LOG" "$NOW" 86400)"
+    printf '[body-quiet] no significant motion in %ss — body undisturbed (recency=%s events_24h=%s)\n' \
+      "$window" "${_recency%%|*}" "$_e"
     exit 0 ;;
   *)
+    # Unreachable: write OFFLINE state (honest-degraded, never faked) so the dashboard sees a fresh mtime
+    write_tamper_state "OFFLINE" "$NOW" "$window"
+    mesh-state-touch "$STATE"
     echo "phone unreachable / watch did not run — tamper read n/a (NOT 'quiet')" >&2
     exit 2 ;;
 esac
