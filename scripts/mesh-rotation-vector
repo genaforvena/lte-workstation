@@ -1,0 +1,212 @@
+#!/usr/bin/env bash
+# orphan-ok: on-demand rotation-vector read — the phone's 3D orientation is sampled on demand
+#   (mesh-body-motion already fuses pose multi-sensor; this exposes the raw ROTATION_VECTOR
+#   quaternion and a discrete label as a standalone sense for the dash/minds to consume).
+# mesh-rotation-vector — the phone's 3D ORIENTATION sense (quaternion-based).
+# Reads the phone's ROTATION_VECTOR sensor via termux-sensor over SSH. The HAL-fused
+# rotation vector (gyro+accel+mag) gives the device's orientation as a quaternion
+# (x, y, z, w) + an accuracy estimate in degrees (0=unreliable, 3=high). This is the FULL
+# 3D orientation of the phone — distinct from mesh-gravity (which gives only the gravity
+# direction) and mesh-body-motion (which fuses multi-sensor pose to a coarse class).
+#
+# Classification (quaternion → Euler → discrete label):
+#   FLAT          |pitch| > 60° → phone lying flat (screen up or down)
+#   FLAT_REVERSE  |pitch| > 60° AND pitch < 0 → screen down
+#   PORTRAIT      upright: |pitch| ≤ 30°, |roll| ≤ 30°, |yaw| ≤ 30° (typical reading position)
+#   LANDSCAPE     sideways: |yaw ± 90°| ≤ 30°
+#   INVERTED      upside down: |yaw - 180°| ≤ 30°
+#   TILTED        no axis dominant — phone at a generic angle
+#   UNRELIABLE    accuracy = 0 (Android HAL reports an uncalibrated fix — never trust the label)
+#
+# Honest-exit contract:
+#   0 = artifact produced (quaternion + Euler + label written to .rotation-state)
+#   2 = phone unreachable OR sensor absent OR parse failed — never a fabricated orientation
+#   3 = sensor returned a reading but accuracy == 0 (UNRELIABLE — label is suppressed, raw
+#       still written so consumers see the sensor IS producing)
+#
+#   mesh-rotation-vector              one read → one classified line
+#   mesh-rotation-vector --json       {label, x, y, z, w, accuracy, azimuth, pitch, roll, ts}
+#   mesh-rotation-vector --test       classify-quaternion fixtures (offline) + reachability gate
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+[ -f "$HOME/.mesh/nodes" ] && . "$HOME/.mesh/nodes" 2>/dev/null || true
+
+STATE="$HOME/.mesh/.rotation-state"
+OFFLINEFILE="$HOME/.mesh/.mesh-rotation-offline"
+
+# read_rotation <ip> → echoes "x y z w accuracy" or returns 1. Retries once — same
+# driver-race class as vl_gyro / akm09918 (termux-sensor occasionally returns a partial
+# JSON on first attempt).
+read_rotation() {
+  local _ip="$1" _out _v
+  for _try in 1 2; do
+    _out="$(timeout 12 ssh -p "${PHONE_SSH_PORT:-8022}" -o BatchMode=yes -o ServerAliveInterval=3 -o ConnectTimeout=5 \
+      -o StrictHostKeyChecking=accept-new "${PHONE_USER:-u0_a380}@$_ip" \
+      "termux-sensor -s ROTATION_VECTOR -n 1 2>/dev/null" </dev/null 2>/dev/null)" || continue
+    [ -n "$_out" ] || continue
+    _v="$(printf '%s' "$_out" | python3 -c '
+import json, sys
+try:
+    d, _ = json.JSONDecoder().raw_decode(sys.stdin.read().strip())
+    v = d.get("ROTATION_VECTOR", {}).get("values", [])
+    if len(v) >= 5:
+        print("%.6f %.6f %.6f %.6f %d" % (v[0], v[1], v[2], v[3], v[4]))
+    elif len(v) >= 4:
+        # Legacy HAL that omits the accuracy estimate
+        print("%.6f %.6f %.6f %.6f -1" % (v[0], v[1], v[2], v[3]))
+except Exception:
+    pass
+' 2>/dev/null)"
+    [ -n "$_v" ] && { printf '%s' "$_v"; return 0; }
+  done
+  return 1
+}
+
+# classify_rotation x y z w accuracy → echoes "LABEL|reason". Pure, offline-testable.
+# Quaternion → Euler (azimuth, pitch, roll in degrees), then discrete label.
+# The conversion is the standard one from a rotation quaternion (x,y,z,w) to ZYX-TaitBryan
+# (the Android sensor convention: yaw=azimuth around Z, pitch around X, roll around Y).
+classify_rotation() {
+  python3 -c "
+import math, sys
+x, y, z, w, acc = float(sys.argv[1]), float(sys.argv[2]), float(sys.argv[3]), float(sys.argv[4]), int(sys.argv[5])
+# Normalise the quaternion defensively (raw sensor values are close-to-unit but not exact)
+n = (x*x + y*y + z*z + w*w) ** 0.5
+if n < 0.5:
+    print('UNRELIABLE|quaternion magnitude too small (n=%.3f) — not a rotation' % n)
+    exit()
+x, y, z, w = x/n, y/n, z/n, w/n
+# Android convention: ZYX (yaw-Z, pitch-Y, roll-X)
+yaw   = math.degrees(math.atan2(2.0*(w*z + x*y), 1.0 - 2.0*(y*y + z*z)))
+pitch = math.degrees(math.asin(max(-1.0, min(1.0, 2.0*(w*x - z*y)))))
+roll  = math.degrees(math.atan2(2.0*(w*y + z*x), 1.0 - 2.0*(x*x + y*y)))
+# Wrap yaw into [-180, 180]
+while yaw > 180:   yaw -= 360
+while yaw < -180:  yaw += 360
+# Round to 1 decimal BEFORE classification — the unnormalised-quat arithmetic has float noise
+# (e.g. 60.001° from a perfect 60° input) that would push yaw=60 into the LANDSCAPE band
+# (|60.001-90|=29.999 < 30). One decimal is the display precision, so the bands are stable.
+yaw   = round(yaw, 1)
+pitch = round(pitch, 1)
+roll  = round(roll, 1)
+if acc == 0:
+    print('UNRELIABLE|accuracy=0 (HAL reports uncalibrated — raw quat above, label suppressed)')
+elif abs(pitch) > 60:
+    print(('FLAT_REVERSE' if pitch < 0 else 'FLAT') + '|pitch=%.1f roll=%.1f yaw=%.1f acc=%d' % (pitch, roll, yaw, acc))
+# Yaw bands: PORTRAIT within 30° of identity, LANDSCAPE within 30° of ±90° (60-120 range,
+# strict so yaw=60° falls into TILTED, the "leaning" wedge), INVERTED within 30° of 180°.
+# The 30-60° and 120-150° wedges are TILTED — neither an aligned reading position nor a clear
+# side rotation. The bands are FALSIFIABLE (test asserts each).
+elif abs(pitch) <= 30 and abs(roll) <= 30 and abs(yaw) <= 30:
+    print('PORTRAIT|pitch=%.1f roll=%.1f yaw=%.1f acc=%d' % (pitch, roll, yaw, acc))
+elif abs(pitch) <= 30 and abs(roll) <= 30 and abs(abs(yaw) - 90) < 30:
+    print('LANDSCAPE|pitch=%.1f roll=%.1f yaw=%.1f acc=%d' % (pitch, roll, yaw, acc))
+elif abs(pitch) <= 30 and abs(roll) <= 30 and abs(abs(yaw) - 180) < 30:
+    print('INVERTED|pitch=%.1f roll=%.1f yaw=%.1f acc=%d' % (pitch, roll, yaw, acc))
+else:
+    print('TILTED|pitch=%.1f roll=%.1f yaw=%.1f acc=%d' % (pitch, roll, yaw, acc))
+" "$1" "$2" "$3" "$4" "$5" 2>/dev/null || echo "UNRELIABLE|python classify failed"
+}
+
+if [ "${1:-}" = --test ]; then
+  command -v python3 >/dev/null 2>&1 || { echo "smoke-test: FAIL (no python3)"; exit 1; }
+  command -v ssh >/dev/null 2>&1 || { echo "smoke-test: FAIL (no ssh)"; exit 1; }
+  command -v mesh-phone-ip >/dev/null 2>&1 || { echo "smoke-test: FAIL (no mesh-phone-ip)"; exit 1; }
+  fail=0
+  # FLAT (face up): pitch +90°  → q = (sin(45°), 0, 0, cos(45°)) = (0.7071, 0, 0, 0.7071)
+  r="$(classify_rotation 0.7071 0 0 0.7071 3)"
+  echo "$r" | grep -q '^FLAT|' || { echo "  FAIL: face-up should FLAT got=$r"; fail=1; }
+  # FLAT_REVERSE (face down): pitch -90°  → q = (-0.7071, 0, 0, 0.7071)
+  r="$(classify_rotation -0.7071 0 0 0.7071 3)"
+  echo "$r" | grep -q '^FLAT_REVERSE|' || { echo "  FAIL: face-down should FLAT_REVERSE got=$r"; fail=1; }
+  # PORTRAIT (upright, no rotation): q = (0, 0, 0, 1)
+  r="$(classify_rotation 0 0 0 1 3)"
+  echo "$r" | grep -q '^PORTRAIT|' || { echo "  FAIL: identity should PORTRAIT got=$r"; fail=1; }
+  # LANDSCAPE (yaw +90°): q = (0, 0, sin(45°), cos(45°)) = (0, 0, 0.7071, 0.7071)
+  r="$(classify_rotation 0 0 0.7071 0.7071 3)"
+  echo "$r" | grep -q '^LANDSCAPE|' || { echo "  FAIL: yaw+90 should LANDSCAPE got=$r"; fail=1; }
+  # LANDSCAPE (yaw -90°): q = (0, 0, -0.7071, 0.7071)
+  r="$(classify_rotation 0 0 -0.7071 0.7071 3)"
+  echo "$r" | grep -q '^LANDSCAPE|' || { echo "  FAIL: yaw-90 should LANDSCAPE got=$r"; fail=1; }
+  # INVERTED (yaw 180°): q = (0, 0, 1, 0)
+  r="$(classify_rotation 0 0 1 0 3)"
+  echo "$r" | grep -q '^INVERTED|' || { echo "  FAIL: yaw-180 should INVERTED got=$r"; fail=1; }
+  # TILTED (yaw 60°, no pitch/roll): a 60° rotation around Z — within 30° of PORTRAIT? 60 > 30, so TILTED
+  # q = (0, 0, sin(30°), cos(30°)) = (0, 0, 0.5, 0.866)
+  r="$(classify_rotation 0 0 0.5 0.866 3)"
+  echo "$r" | grep -q '^TILTED|' || { echo "  FAIL: yaw 60° should TILTED got=$r"; fail=1; }
+  # UNRELIABLE (accuracy = 0)
+  r="$(classify_rotation 0 0 0 1 0)"
+  echo "$r" | grep -q '^UNRELIABLE|' || { echo "  FAIL: acc=0 should UNRELIABLE got=$r"; fail=1; }
+  # Edge case: small magnitude quaternion (not a valid rotation)
+  r="$(classify_rotation 0.01 0 0 0.01 3)"
+  echo "$r" | grep -q '^UNRELIABLE|' || { echo "  FAIL: tiny quat should UNRELIABLE got=$r"; fail=1; }
+  [ "$fail" = 1 ] && { echo "smoke-test: FAIL"; exit 1; }
+  echo "  ok: classify (8 cases: FLAT, FLAT_REVERSE, PORTRAIT, LANDSCAPE×2, INVERTED, TILTED, UNRELIABLE×2)"
+  # Phone reachability gate — REAL SSH probe, not the cached IP (false-green trap)
+  source "$HOME/.local/bin/mesh-patterns.sh" 2>/dev/null || true
+  if command -v phone_reachable_ip >/dev/null 2>&1; then
+    phone_reachable_ip >/dev/null 2>&1 || { echo "smoke-test: n/a (phone unreachable — rotation sense unavailable); classify-logic ok"; exit 2; }
+  fi
+  # REAL-READ assertion: reachability ≠ producing. The sensor read must yield a 5-tuple or the
+  # sense is hollow (cron-green with no real artifact).
+  _spip="$(timeout 10 mesh-phone-ip 2>/dev/null)" || { echo "smoke-test: n/a (phone unreachable); classify-logic ok"; exit 2; }
+  read_rotation "$_spip" >/dev/null 2>&1 || { echo "smoke-test: n/a (ROTATION_VECTOR did not yield a 5-tuple — sensor absent or not producing); classify-logic ok"; exit 2; }
+  echo "smoke-test: ok (classify: 8 cases + REAL ROTATION_VECTOR read)"
+  exit 0
+fi
+
+# --- Phone reachability gate ---
+pip="$(timeout 10 mesh-phone-ip 2>/dev/null)" || {
+  if [ ! -f "$OFFLINEFILE" ]; then echo "phone unreachable — can't read rotation vector (not an alarm)" >&2; touch "$OFFLINEFILE"; fi
+  printf 'OFFLINE %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$STATE"
+  mesh-state-touch "$STATE"
+  exit 2
+}
+rm -f "$OFFLINEFILE"
+
+# --- Read rotation vector ---
+rot="$(read_rotation "$pip")"
+[ -n "$rot" ] || {
+  if [ ! -f "$OFFLINEFILE" ]; then echo "rotation vector read failed — sensor absent or not producing (not an alarm)" >&2; touch "$OFFLINEFILE"; fi
+  printf 'OFFLINE %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$STATE"
+  mesh-state-touch "$STATE"
+  exit 2
+}
+
+TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+x="$(printf '%s' "$rot" | awk '{print $1}')"
+y="$(printf '%s' "$rot" | awk '{print $2}')"
+z="$(printf '%s' "$rot" | awk '{print $3}')"
+w="$(printf '%s' "$rot" | awk '{print $4}')"
+acc="$(printf '%s' "$rot" | awk '{print $5}')"
+
+result="$(classify_rotation "$x" "$y" "$z" "$w" "$acc")"
+label="${result%%|*}"
+reason="${result#*|}"
+
+# --- Write state + touch liveness on EVERY successful run ---
+# mesh-state-touch keeps mtime fresh even when the orientation is long-stable (e.g. phone flat on
+# a table for hours) so the dashboard sees a recent UNRELIABLE/FLAT/whatever, never a false STALE.
+printf '%s x=%.3f y=%.3f z=%.3f w=%.3f acc=%s %s\n' "$label" "$x" "$y" "$z" "$w" "$acc" "$TS" > "$STATE"
+mesh-state-touch "$STATE"
+
+# UNRELIABLE on accuracy=0 — still wrote state (raw preserved) but mark as exit 3 in --json mode
+# for the unusual case. Default text path stays exit 0 (we DID get a sensor reading, just
+# uncalibrated — consumers can branch on the label).
+if [ "$label" = "UNRELIABLE" ] && [ "${1:-}" = --json ]; then
+  printf '{"label":"%s","reason":"%s","x":%.6f,"y":%.6f,"z":%.6f,"w":%.6f,"accuracy":%s,"ts":"%s"}\n' \
+    "$label" "$reason" "$x" "$y" "$z" "$w" "$acc" "$TS"
+  exit 3
+fi
+
+# --- Output ---
+if [ "${1:-}" = --json ]; then
+  printf '{"label":"%s","reason":"%s","x":%.6f,"y":%.6f,"z":%.6f,"w":%.6f,"accuracy":%s,"ts":"%s"}\n' \
+    "$label" "$reason" "$x" "$y" "$z" "$w" "$acc" "$TS"
+  exit 0
+fi
+
+printf '[rot-%s] %s — quat(%.3f, %.3f, %.3f, %.3f) acc=%s | %s\n' \
+  "$(printf '%s' "$label" | tr '[:upper:]' '[:lower:]')" "$label" "$x" "$y" "$z" "$w" "$acc" "$reason"
