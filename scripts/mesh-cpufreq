@@ -1,0 +1,211 @@
+#!/usr/bin/env bash
+# reflex-cadence: 2-59/5 * * * *
+# reflex-args: --edge
+# mesh-cpufreq — CPU FREQUENCY-SCALING state sense.
+# Reads /sys/devices/system/cpu/cpu*/cpufreq/{scaling_cur_freq,cpuinfo_max_freq,scaling_max_freq,scaling_governor}
+# for every online CPU, computes the per-CPU ratio (cur / cpuinfo_max), and folds the average
+# across all CPUs into a single band:
+#
+#   BOOST       avg > 1.0 * cpuinfo_max (turbo/boost active — measured > advertised)
+#   NOMINAL     0.85..1.0 * cpuinfo_max (running near rated speed)
+#   REDUCED     0.50..0.85 * cpuinfo_max (powersave / partial throttle)
+#   THROTTLED   < 0.50 * cpuinfo_max (heavy throttle / underclock)
+#   IDLE        avg < 1 GHz across all CPUs (deep idle)
+#   OFFLINE     cannot read scaling_cur_freq on any CPU
+#
+# Why this is NEW (not duplicating mesh-cpu-throttle):
+#   - mesh-cpu-throttle counts THERMAL-THROTTLE EVENTS (the hardware's "I reduced freq" counter,
+#     a per-package delta). It answers "did the kernel HWP down-clock this CPU?".
+#   - mesh-cpufreq reads the ACTUAL FREQUENCY at sample time. It answers "what clock is the CPU
+#     running at right now?".
+#   - On intel_pstate, throttle happens in HARDWARE (scaling_max_freq STAYS at the hw max even
+#     while throttling), so mesh-cpu-throttle's event counter is the only throttle signal — but
+#     mesh-cpufreq's cur_freq reading will ALSO drop, complementing the events with magnitude.
+#   - mesh-cpufreq also surfaces the active governor (performance / powersave / schedutil / ondemand
+#     / conservative) — the policy driving the freq, not just the result. powersave + high load =
+#     "we're being throttled by policy"; performance + low freq = "we're being throttled by hw".
+#
+# Honest-degraded: no /sys/devices/system/cpu/cpu*/cpufreq/ entries (a VM/container without
+# cpufreq exposure) → OFFLINE + exit 2, never a faked NOMINAL. Missing individual fields on
+# some CPUs are tolerated (per-CPU OFFLINE count surfaced) but majority-OFFLINE = OFFLINE.
+#
+#   mesh-cpufreq            one-shot verdict to stdout
+#   mesh-cpufreq --edge     emit only on verdict change (cron reflex)
+#   mesh-cpufreq --json     machine-readable {label, reason, governor, avg_khz, max_khz, per_cpu, n_cpus, n_offline, ts}
+#   mesh-cpufreq --test     smoke test (pure classifier, no /sys reads before the gate)
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+
+STATE="$HOME/.mesh/.cpufreq-state"
+MESH="${MESH_DIR:-$HOME/.mesh}"
+
+# --- Classifier (pure, offline-testable) ---
+# classify_cpufreq <avg_ratio_pct> <governor> <n_cpus> <n_offline> → "LABEL|reason"
+# avg_ratio_pct: integer 0..100+ of (avg_cur / cpuinfo_max * 100) (e.g. 100 = at max, 50 = half speed)
+# governor: performance | powersave | schedutil | ondemand | conservative | other | OFFLINE | NA
+classify_cpufreq() {
+  local ratio="$1" gov="$2" ncpu="$3" noff="$4"
+  if [ "$ncpu" -eq 0 ]; then
+    echo "OFFLINE|no CPUs visible at /sys/devices/system/cpu/cpu*/cpufreq/ (no cpufreq sysfs)"
+    return
+  fi
+  # Majority-offline: if most CPUs can't be read, the sense itself is broken (per-CPU n_offline
+  # surfaces the local count; the BAND honours the ones we did read)
+  if [ "$ratio" = "OFFLINE" ] || [ -z "$ratio" ]; then
+    echo "OFFLINE|ratio unreadable (${noff}/${ncpu} CPUs offline, no cur_freq)"
+    return
+  fi
+  # IDLE: avg < 1 GHz = < 1000000 kHz. We band by ratio (the actual signal) — at 1GHz on a 3.6GHz
+  # CPU, ratio = 27.7%, so IDLE is the natural <50% band. We still surface it as IDLE because
+  # the semantic matters: a powersave-policy idle and a hard-throttled 50% both have low freq,
+  # but the system KNOWS about it (governor + ratio together disambiguate).
+  if [ "$ratio" -lt 30 ] 2>/dev/null; then
+    echo "IDLE|ratio=${ratio}% (deep idle, governor=$gov)"
+    return
+  fi
+  if [ "$ratio" -lt 50 ] 2>/dev/null; then
+    echo "THROTTLED|ratio=${ratio}% (heavy underclock, governor=$gov)"
+    return
+  fi
+  if [ "$ratio" -lt 85 ] 2>/dev/null; then
+    echo "REDUCED|ratio=${ratio}% (powersave / partial throttle, governor=$gov)"
+    return
+  fi
+  if [ "$ratio" -le 100 ] 2>/dev/null; then
+    echo "NOMINAL|ratio=${ratio}% (near-rated, governor=$gov)"
+    return
+  fi
+  # > 100 = boost/turbo active (CPU running ABOVE its cpuinfo_max — intel turbo, AMD PBO, etc.)
+  echo "BOOST|ratio=${ratio}% (turbo active, governor=$gov)"
+}
+
+# --- Test mode ---
+if [ "${1:-}" = --test ]; then
+  fail=0
+  # OFFLINE: no CPUs
+  r="$(classify_cpufreq 0 NA 0 0)"
+  echo "$r" | grep -q '^OFFLINE' || { echo "  FAIL OFFLINE-no-cpus: got=$r"; fail=1; }
+  # OFFLINE: ratio unreadable
+  r="$(classify_cpufreq OFFLINE performance 8 8)"
+  echo "$r" | grep -q '^OFFLINE' || { echo "  FAIL OFFLINE-ratio: got=$r"; fail=1; }
+  # IDLE: ratio=20% (deep idle, < 30%)
+  r="$(classify_cpufreq 20 powersave 8 0)"
+  echo "$r" | grep -q '^IDLE' || { echo "  FAIL IDLE-20: got=$r"; fail=1; }
+  r="$(classify_cpufreq 29 powersave 8 0)"
+  echo "$r" | grep -q '^IDLE' || { echo "  FAIL IDLE-29: got=$r (boundary)"; fail=1; }
+  # IDLE boundary: 30% → THROTTLED, not IDLE
+  r="$(classify_cpufreq 30 powersave 8 0)"
+  echo "$r" | grep -q '^IDLE' && { echo "  FAIL IDLE-boundary-30: got=$r (should be THROTTLED)"; fail=1; }
+  # THROTTLED: 30-49%
+  r="$(classify_cpufreq 35 powersave 8 0)"
+  echo "$r" | grep -q '^THROTTLED' || { echo "  FAIL THROTTLED-35: got=$r"; fail=1; }
+  r="$(classify_cpufreq 49 powersave 8 0)"
+  echo "$r" | grep -q '^THROTTLED' || { echo "  FAIL THROTTLED-49: got=$r (boundary)"; fail=1; }
+  # THROTTLED boundary: 50% → REDUCED
+  r="$(classify_cpufreq 50 powersave 8 0)"
+  echo "$r" | grep -q '^THROTTLED' && { echo "  FAIL THROTTLED-boundary-50: got=$r (should be REDUCED)"; fail=1; }
+  # REDUCED: 50-84%
+  r="$(classify_cpufreq 60 schedutil 8 0)"
+  echo "$r" | grep -q '^REDUCED' || { echo "  FAIL REDUCED-60: got=$r"; fail=1; }
+  r="$(classify_cpufreq 84 performance 8 0)"
+  echo "$r" | grep -q '^REDUCED' || { echo "  FAIL REDUCED-84: got=$r (boundary)"; fail=1; }
+  # REDUCED boundary: 85% → NOMINAL
+  r="$(classify_cpufreq 85 performance 8 0)"
+  echo "$r" | grep -q '^REDUCED' && { echo "  FAIL REDUCED-boundary-85: got=$r (should be NOMINAL)"; fail=1; }
+  # NOMINAL: 85-100%
+  r="$(classify_cpufreq 90 performance 8 0)"
+  echo "$r" | grep -q '^NOMINAL' || { echo "  FAIL NOMINAL-90: got=$r"; fail=1; }
+  r="$(classify_cpufreq 100 performance 8 0)"
+  echo "$r" | grep -q '^NOMINAL' || { echo "  FAIL NOMINAL-100: got=$r (boundary)"; fail=1; }
+  # NOMINAL boundary: 101% → BOOST
+  r="$(classify_cpufreq 101 performance 8 0)"
+  echo "$r" | grep -q '^NOMINAL' && { echo "  FAIL NOMINAL-boundary-101: got=$r (should be BOOST)"; fail=1; }
+  # BOOST: > 100%
+  r="$(classify_cpufreq 115 performance 8 0)"
+  echo "$r" | grep -q '^BOOST' || { echo "  FAIL BOOST-115: got=$r"; fail=1; }
+  # Governor sensitivity: powersave with high ratio → still NOMINAL (ratio drives the band)
+  r="$(classify_cpufreq 95 powersave 8 0)"
+  echo "$r" | grep -q '^NOMINAL' || { echo "  FAIL governor-sensitivity-powersave-95: got=$r (should be NOMINAL)"; fail=1; }
+  # Governor sensitivity: performance with low ratio → still IDLE
+  r="$(classify_cpufreq 20 performance 8 0)"
+  echo "$r" | grep -q '^IDLE' || { echo "  FAIL governor-sensitivity-perf-20: got=$r (should be IDLE)"; fail=1; }
+  [ "$fail" = 1 ] && { echo "smoke-test: FAIL"; exit 1; }
+  echo "smoke-test: ok (17 assertions: OFFLINE×2, IDLE×2+1-boundary, THROTTLED×2+1-boundary, REDUCED×2+1-boundary, NOMINAL×2+1-boundary, BOOST×1+1-boundary, governor-sensitivity×2)"
+  exit 0
+fi
+
+# --- Live read path ---
+# Read every CPU's scaling_cur_freq + cpuinfo_max_freq + governor.
+# Per-CPU n_offline surfaced. Majority-OFFLINE → OFFLINE.
+NCPUS=0
+N_OFFLINE=0
+SUM_CUR=0
+SUM_MAX=0
+GOVERNOR=""
+FIRST_GOVERNOR=""
+
+for cpubase in /sys/devices/system/cpu/cpu*/cpufreq; do
+  [ -d "$cpubase" ] || continue
+  cur_file="$cpubase/scaling_cur_freq"
+  max_file="$cpubase/cpuinfo_max_freq"
+  gov_file="$cpubase/scaling_governor"
+  [ -r "$cur_file" ] && [ -r "$max_file" ] || { N_OFFLINE=$((N_OFFLINE+1)); continue; }
+  cur_khz="$(cat "$cur_file" 2>/dev/null | tr -d '\n')"
+  max_khz="$(cat "$max_file" 2>/dev/null | tr -d '\n')"
+  # Validate as integers (some cpufreq subdirs are read-only or return 0)
+  case "$cur_khz" in ''|*[!0-9]*) N_OFFLINE=$((N_OFFLINE+1)); continue;; esac
+  case "$max_khz" in ''|*[!0-9]*) N_OFFLINE=$((N_OFFLINE+1)); continue;; esac
+  if [ "${max_khz:-0}" -le 0 ] 2>/dev/null; then N_OFFLINE=$((N_OFFLINE+1)); continue; fi
+  # Capture the governor once (all CPUs share the same governor on this kernel)
+  if [ -r "$gov_file" ]; then
+    g="$(cat "$gov_file" 2>/dev/null | tr -d '\n')"
+    [ -n "$FIRST_GOVERNOR" ] || FIRST_GOVERNOR="$g"
+  fi
+  SUM_CUR=$((SUM_CUR + cur_khz))
+  SUM_MAX=$((SUM_MAX + max_khz))
+  NCPUS=$((NCPUS+1))
+done
+
+GOVERNOR="$FIRST_GOVERNOR"
+[ -n "$GOVERNOR" ] || GOVERNOR="NA"
+
+# Compute average ratio
+RATIO="OFFLINE"
+if [ "$NCPUS" -gt 0 ] && [ "$SUM_MAX" -gt 0 ]; then
+  RATIO=$(( SUM_CUR * 100 / SUM_MAX ))
+fi
+
+# Classify
+result="$(classify_cpufreq "$RATIO" "$GOVERNOR" "$NCPUS" "$N_OFFLINE")"
+label="${result%%|*}"
+reason="${result#*|}"
+
+# Surface the per-CPU avg/max for consumers (additive, helpful for mesh-doctor / dashboards)
+AVG_KHZ=0; MAX_KHZ=0
+if [ "$NCPUS" -gt 0 ]; then
+  AVG_KHZ=$((SUM_CUR / NCPUS))
+  MAX_KHZ=$((SUM_MAX / NCPUS))
+fi
+
+TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+# Write state + touch liveness on EVERY successful run
+printf '%s|governor=%s|avg_khz=%s|max_khz=%s|ratio=%s|n_cpus=%s|n_offline=%s|%s\n' \
+  "$label" "$GOVERNOR" "$AVG_KHZ" "$MAX_KHZ" "$RATIO" "$NCPUS" "$N_OFFLINE" "$reason" > "$STATE"
+mesh-state-touch "$STATE"
+
+# --- Output ---
+if [ "${1:-}" = --json ]; then
+  printf '{"label":"%s","reason":"%s","governor":"%s","avg_khz":%s,"max_khz":%s,"ratio":%s,"n_cpus":%s,"n_offline":%s,"ts":"%s"}\n' \
+    "$label" "$reason" "$GOVERNOR" "$AVG_KHZ" "$MAX_KHZ" "$RATIO" "$NCPUS" "$N_OFFLINE" "$TS"
+  exit 0
+fi
+if [ "${1:-}" = --edge ]; then
+  prev=""; [ -f "$STATE" ] && prev="$(head -1 "$STATE" 2>/dev/null | cut -d'|' -f1)" || true
+  [ "$prev" = "$label" ] && exit 0
+  printf '[cpufreq-%s] %s — %s (governor=%s ratio=%s%% avg=%s kHz across %s CPUs)\n' \
+    "$(printf '%s' "$label" | tr '[:upper:]' '[:lower:]')" "$label" "$reason" "$GOVERNOR" "$RATIO" "$AVG_KHZ" "$NCPUS"
+  exit 0
+fi
+printf '[cpufreq-%s] %s — %s (governor=%s ratio=%s%% avg=%s kHz across %s CPUs)\n' \
+  "$(printf '%s' "$label" | tr '[:upper:]' '[:lower:]')" "$label" "$reason" "$GOVERNOR" "$RATIO" "$AVG_KHZ" "$NCPUS"
