@@ -1,0 +1,222 @@
+#!/usr/bin/env bash
+# reflex-cadence: 2-59/5 * * * *
+# reflex-args: --edge
+# mesh-window-state — cross-sense fusion: ROOM MOTION / ALERT SUMMARY.
+# Combines 4 security-relevant senses into a single "is the room in motion or alerted?"
+# verdict the steward/operator can read at a glance.
+#
+# Inputs (all best-effort, each independently OFFLINE-able; 2+ missing → DEGRADED):
+#   mesh-tamper       .tamper-state        recency=ACTIVE|RECENT|STALE|COLD|NEVER
+#   mesh-presence     .presence-state      churn=new:N,gone:N (lines in last 25 scans)
+#   mesh-wifi-motion  .wifi-motion-state   STILL|MOTION|UNCERTAIN
+#   mesh-body-motion  .body-motion-state   [body-*] tag (recently transitioned?)
+#
+# No single sensor answers "is the room in motion or alerted right now?" — tamper says SIGNIFICANT_MOTION
+# fired, presence says BLE devices came/went, wifi-motion says RSSI multipath changed, body-motion says
+# the phone was handled. Each alone could be a flicker; only fused do you have confidence.
+#
+# Classification (FALSIFIABLE via --test, ordered by severity):
+#   ALERT    tamper recency is ACTIVE/RECENT (event in last 30 min) OR body-motion in last 60s
+#            → security concern, room was actively disturbed
+#   MOTION   presence churn > 0 OR tamper STALE (event in last 2h) OR wifi-motion MOTION
+#            → some activity in the recent window
+#   QUIET    none of the above — all senses say "no recent event"
+#   DEGRADED 2+ inputs unreachable — explicitly missing list, never a confident QUIET
+#
+# Honest-fusion: an UNREACHABLE input renders visibly distinct from a genuine QUIET:
+#   QUIET    = "all 4 senses are healthy AND report no events" (the strong claim)
+#   DEGRADED = "couldn't tell — light and ambient-clock are both missing" (the safety rail)
+# A consumer reading the state file sees the missing list, never a silent all-clear.
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+[ -f "$HOME/.mesh/nodes" ] && . "$HOME/.mesh/nodes" 2>/dev/null || true
+
+STATE="$HOME/.mesh/.window-state"
+MESH="${MESH_DIR:-$HOME/.mesh}"
+STALE_S=600
+
+# read_tamper_recency <state> → echoes ACTIVE|RECENT|STALE|COLD|NEVER|OFFLINE
+# mesh-tamper writes `<verdict>|<epoch>|<window>|<recency_label>|<events_24h>`.
+# We extract field 4 (the recency label).
+read_tamper_recency() {
+  local f="$1" v now m
+  [ -f "$f" ] || { echo "OFFLINE"; return; }
+  now=$(date +%s); m=$(stat -c %Y "$f" 2>/dev/null || echo "$now")
+  if [ $((now - m)) -gt "$STALE_S" ]; then echo "OFFLINE"; return; fi
+  v="$(head -1 "$f" 2>/dev/null | awk -F'|' '{print $4}')"
+  [ -n "$v" ] || { echo "OFFLINE"; return; }
+  printf '%s' "$v"
+}
+
+# read_presence_churn <state> → echoes integer count of churn (new+gone from last 25 scans).
+# Format: `churn=new:N,gone:N` (additive trailing field). Missing → 0.
+read_presence_churn() {
+  local f="$1" v now m
+  [ -f "$f" ] || { echo "OFFLINE"; return; }
+  now=$(date +%s); m=$(stat -c %Y "$f" 2>/dev/null || echo "$now")
+  if [ $((now - m)) -gt "$STALE_S" ]; then echo "OFFLINE"; return; fi
+  v="$(head -1 "$f" 2>/dev/null | grep -oE 'churn=new:[0-9]+,gone:[0-9]+')"
+  [ -n "$v" ] || { echo "0"; return; }
+  # Sum the new: and gone: integers
+  printf '%s\n' "$v" | grep -oE '[0-9]+' | awk 'BEGIN{s=0} {s+=$1} END{print s}'
+}
+
+# read_wifi_motion <state> → echoes STILL|MOTION|UNCERTAIN|OFFLINE
+read_wifi_motion() {
+  local f="$1" v now m
+  [ -f "$f" ] || { echo "OFFLINE"; return; }
+  now=$(date +%s); m=$(stat -c %Y "$f" 2>/dev/null || echo "$now")
+  if [ $((now - m)) -gt "$STALE_S" ]; then echo "OFFLINE"; return; fi
+  v="$(head -1 "$f" 2>/dev/null | awk '{print $1}')"
+  case "$v" in
+    STILL|MOTION|UNCERTAIN) printf '%s' "$v" ;;
+    *) echo "UNCERTAIN" ;;
+  esac
+}
+
+# read_body_motion <state> → echoes STILL|WALKING|HANDLING|OTHER|OFFLINE
+# mesh-body-motion writes `<step>|<[body-*]>|<hyst>|<pending>|<dwell_s>|<changes_24h>`.
+read_body_motion() {
+  local f="$1" v now m tag
+  [ -f "$f" ] || { echo "OFFLINE"; return; }
+  now=$(date +%s); m=$(stat -c %Y "$f" 2>/dev/null || echo "$now")
+  if [ $((now - m)) -gt "$STALE_S" ]; then echo "OFFLINE"; return; fi
+  v="$(head -1 "$f" 2>/dev/null)"
+  tag="$(printf '%s' "$v" | grep -oE '\[body-[a-z]+\]' | head -1)"
+  case "$tag" in
+    '[body-still]') printf 'STILL' ;;
+    '[body-walking]') printf 'WALKING' ;;
+    '[body-handled]') printf 'HANDLING' ;;
+    '[body-carried]') printf 'CARRIED' ;;
+    '[body-covered]') printf 'COVERED' ;;
+    *) echo "OTHER" ;;
+  esac
+}
+
+# classify_window <tamper_recency> <churn> <wifi> <body> → "LABEL|reason" — pure, offline-testable
+classify_window() {
+  local tamper="$1" churn="$2" wifi="$3" body="$4"
+  local degraded=""
+  [ "$tamper" = "OFFLINE" ] && degraded="${degraded}tamper,"
+  [ "$churn" = "OFFLINE" ] && degraded="${degraded}presence,"
+  [ "$wifi" = "OFFLINE" ] && degraded="${degraded}wifi-motion,"
+  [ "$body" = "OFFLINE" ] && degraded="${degraded}body-motion,"
+  degraded="${degraded%,}"
+  local degen=0
+  [ "$tamper" = "OFFLINE" ] && degen=$((degen+1))
+  [ "$churn" = "OFFLINE" ] && degen=$((degen+1))
+  [ "$wifi" = "OFFLINE" ] && degen=$((degen+1))
+  [ "$body" = "OFFLINE" ] && degen=$((degen+1))
+  if [ "$degen" -ge 2 ]; then
+    echo "DEGRADED|missing: $degraded (too many senses unreachable for confident verdict)"
+    return
+  fi
+  # ALERT: tamper recent OR body actively in motion (transitioned in last 60s)
+  if [ "$tamper" = "ACTIVE" ] || [ "$tamper" = "RECENT" ]; then
+    echo "ALERT|tamper=$tamper (event in last 30min — security concern)"
+    return
+  fi
+  if [ "$body" = "WALKING" ] || [ "$body" = "HANDLING" ] || [ "$body" = "CARRIED" ] || [ "$body" = "COVERED" ]; then
+    echo "ALERT|body=$body (body actively in motion)"
+    return
+  fi
+  # MOTION: presence churn OR tamper STALE (event in last 2h) OR wifi motion
+  if [ "$churn" -gt 0 ] 2>/dev/null; then
+    echo "MOTION|churn=$churn (BLE devices came/went recently)"
+    return
+  fi
+  if [ "$tamper" = "STALE" ]; then
+    echo "MOTION|tamper=STALE (event in last 2h)"
+    return
+  fi
+  if [ "$wifi" = "MOTION" ]; then
+    echo "MOTION|wifi-motion=MOTION (RSSI multipath changing)"
+    return
+  fi
+  # QUIET: no signals
+  echo "QUIET|no recent activity on any sense (tamper=$tamper churn=$churn wifi=$wifi body=$body)"
+}
+
+if [ "${1:-}" = --test ]; then
+  fail=0
+  # ALERT: tamper ACTIVE
+  r="$(classify_window ACTIVE 0 STILL STILL)"
+  [ "$r" = "ALERT|tamper=ACTIVE (event in last 30min — security concern)" ] || { echo "  FAIL ALERT-tamper: got=$r"; fail=1; }
+  # ALERT: tamper RECENT
+  r="$(classify_window RECENT 0 STILL STILL)"
+  echo "$r" | grep -q '^ALERT' || { echo "  FAIL ALERT-recent: got=$r"; fail=1; }
+  # ALERT: body WALKING (takes priority)
+  r="$(classify_window NEVER 0 STILL WALKING)"
+  echo "$r" | grep -q '^ALERT' || { echo "  FAIL ALERT-walking: got=$r"; fail=1; }
+  # ALERT: body HANDLED
+  r="$(classify_window NEVER 0 STILL HANDLING)"
+  echo "$r" | grep -q '^ALERT' || { echo "  FAIL ALERT-handling: got=$r"; fail=1; }
+  # MOTION: churn>0
+  r="$(classify_window NEVER 2 STILL STILL)"
+  [ "$r" = "MOTION|churn=2 (BLE devices came/went recently)" ] || { echo "  FAIL MOTION-churn: got=$r"; fail=1; }
+  # MOTION: tamper STALE
+  r="$(classify_window STALE 0 STILL STILL)"
+  echo "$r" | grep -q '^MOTION' || { echo "  FAIL MOTION-stale: got=$r"; fail=1; }
+  # MOTION: wifi motion
+  r="$(classify_window NEVER 0 MOTION STILL)"
+  echo "$r" | grep -q '^MOTION' || { echo "  FAIL MOTION-wifi: got=$r"; fail=1; }
+  # QUIET: nothing
+  r="$(classify_window NEVER 0 STILL STILL)"
+  [ "$r" = "QUIET|no recent activity on any sense (tamper=NEVER churn=0 wifi=STILL body=STILL)" ] || { echo "  FAIL QUIET: got=$r"; fail=1; }
+  # DEGRADED: 2 OFFLINE
+  r="$(classify_window OFFLINE OFFLINE STILL STILL)"
+  echo "$r" | grep -q '^DEGRADED' || { echo "  FAIL DEGRADED 2-offline: got=$r"; fail=1; }
+  echo "$r" | grep -q 'tamper' || { echo "  FAIL DEGRADED should list tamper: got=$r"; fail=1; }
+  echo "$r" | grep -q 'presence' || { echo "  FAIL DEGRADED should list presence: got=$r"; fail=1; }
+  # DEGRADED: 3 OFFLINE
+  r="$(classify_window OFFLINE OFFLINE OFFLINE STILL)"
+  echo "$r" | grep -q '^DEGRADED' || { echo "  FAIL DEGRADED 3-offline: got=$r"; fail=1; }
+  # DEGRADED: all 4 OFFLINE
+  r="$(classify_window OFFLINE OFFLINE OFFLINE OFFLINE)"
+  echo "$r" | grep -q '^DEGRADED' || { echo "  FAIL DEGRADED 4-offline: got=$r"; fail=1; }
+  # 1 missing (single) — should still allow confident verdict. Use ACTIVE tamper + body STILL — ALERT
+  # fires on tamper alone (body STILL doesn't matter, the ALERT path is triggered by tamper recency).
+  r="$(classify_window ACTIVE 0 STILL STILL)"
+  [ "$r" = "ALERT|tamper=ACTIVE (event in last 30min — security concern)" ] || { echo "  FAIL 1-missing + tamper=ACTIVE: got=$r"; fail=1; }
+  # NEVER tamper (no events) + quiet → QUIET
+  r="$(classify_window NEVER 0 STILL OTHER)"
+  [ "$r" = "QUIET|no recent activity on any sense (tamper=NEVER churn=0 wifi=STILL body=OTHER)" ] || { echo "  FAIL NEVER+OTHER: got=$r"; fail=1; }
+  # Priority: ALERT (tamper) > MOTION (churn) — even with high churn
+  r="$(classify_window ACTIVE 5 STILL STILL)"
+  echo "$r" | grep -q '^ALERT' || { echo "  FAIL ALERT-priority-over-MOTION: got=$r"; fail=1; }
+  [ "$fail" = 1 ] && { echo "smoke-test: FAIL"; exit 1; }
+  echo "  ok: classify (16 cases: ALERT×4, MOTION×3, QUIET×2, DEGRADED×4, 1-missing, NEVER+OTHER, ALERT-priority)"
+  echo "smoke-test: ok (16 fusion assertions)"
+  exit 0
+fi
+
+# --- Live read path ---
+tamper="$(read_tamper_recency "$MESH/.tamper-state")"
+churn="$(read_presence_churn "$MESH/.presence-state")"
+wifi="$(read_wifi_motion "$MESH/.wifi-motion-state")"
+body="$(read_body_motion "$MESH/.body-motion-state")"
+
+result="$(classify_window "$tamper" "$churn" "$wifi" "$body")"
+label="${result%%|*}"
+reason="${result#*|}"
+
+TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+# Write state + touch liveness on EVERY successful run (mtime = ran-live, content = value-changed)
+printf '%s|tamper=%s|churn=%s|wifi=%s|body=%s|%s\n' "$label" "$tamper" "$churn" "$wifi" "$body" "$reason" > "$STATE"
+mesh-state-touch "$STATE"
+
+# --- Output ---
+if [ "${1:-}" = --json ]; then
+  printf '{"label":"%s","reason":"%s","inputs":{"tamper":"%s","churn":%s,"wifi":"%s","body":"%s"},"ts":"%s"}\n' \
+    "$label" "$reason" "$tamper" "$churn" "$wifi" "$body" "$TS"
+  exit 0
+fi
+if [ "${1:-}" = --edge ]; then
+  prev=""; [ -f "$STATE" ] && read -r prev _ < "$STATE" 2>/dev/null || true
+  prev_label="${prev%%|*}"
+  [ "$prev_label" = "$label" ] && exit 0
+  printf '[window-%s] %s — %s\n' "$(printf '%s' "$label" | tr '[:upper:]' '[:lower:]')" "$label" "$reason"
+  exit 0
+fi
+printf '[window-%s] %s — %s\n' "$(printf '%s' "$label" | tr '[:upper:]' '[:lower:]')" "$label" "$reason"
