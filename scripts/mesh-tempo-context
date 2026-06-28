@@ -1,0 +1,326 @@
+#!/usr/bin/env bash
+# reflex-cadence: 2-59/5 * * * *
+# reflex-args: --edge
+# mesh-tempo-context — cross-sense fusion: WHAT IS THE ROOM'S RHYTHM RIGHT NOW?
+# Combines 4 senses into a single room-level "mood" token no single sensor gives.
+#
+# Inputs (all best-effort, each independently OFFLINE-able; 2+ missing → DEGRADED):
+#   mesh-activity-tempo        .activity-tempo.state    BUSTLE|RESTING|SILENT|INITIAL  — activity level
+#   mesh-presence-density      .presence-density-state  CROWDED|BUSY|MODERATE|EMPTY|DEGRADED  — occupancy
+#   mesh-presence.familiarity  .presence-state         familiarity=INITIAL|STRANGER|MIXED|FAMILIAR — settled-ness
+#   mesh-ambient-clock.burst   (derived from .ambient-clock.state, see below)  NONE|ARRIVAL|DEPARTURE|INSUFFICIENT
+#
+# Why this fusion is NEW (not duplicating existing fusions):
+#   - mesh-room-context fuses ambient-clock+room-sense+activity-tempo → a TIME-OF-DAY context
+#     (EVENING-SOCIAL / DEEP-NIGHT / etc.) — it does NOT consume familiarity or burst
+#   - mesh-physical-context fuses presence+room-sense+body+light+gravity → body POSITION (IN_SEAT/HANDLING/...)
+#   - mesh-presence-density fuses presence+room-sense+tempo+light → occupancy MAGNITUDE (CROWDED/BUSY/...)
+#   - This fusion is the room's RHYTHM (energy × occupancy × familiarity × recent-change) — captures
+#     a "vibe" the others miss: a SETTLED social (FAMILIAR + BUSTLE + MODERATE) reads identical to
+#     a NEW CROWD (STRANGER + BUSTLE + MODERATE) in mesh-presence-density; only the familiarity axis
+#     distinguishes them. A burst=ARRIVAL+STRANGER is a fresh arrival wave, a burst=ARRIVAL+FAMILIAR
+#     is a returning regular — different moments in the same density band.
+#
+# Bands (FALSIFIABLE: change a band rule and the test assertions flip):
+#   ARRIVAL_WAVE     burst=ARRIVAL + familiarity=STRANGER|MIXED   — fresh wave just landed
+#   NEW_ARRIVAL      burst=ARRIVAL + (otherwise)                  — recent arrival, settled or not
+#   DEPARTURE_WAVE   burst=DEPARTURE                              — recent mass departure
+#   BUSY_SOCIAL      density=CROWDED|BUSY + tempo=BUSTLE + familiarity=FAMILIAR  — settled people, active
+#   NEW_CROWD        density=CROWDED|BUSY + tempo=BUSTLE + (otherwise)            — new crowd, unsettled
+#   SETTLED_ACTIVE   density=MODERATE + tempo=BUSTLE + familiarity=FAMILIAR       — focused, settled
+#   WARM_CROWD       density=MODERATE + tempo=BUSTLE + (otherwise)               — moderate activity, strangers
+#   SETTLED_REST     density=MODERATE + tempo=RESTING + familiarity=FAMILIAR      — quiet, settled
+#   WARY_REST        density=MODERATE + tempo=RESTING + (otherwise)              — quiet, strangers
+#   QUIET_PRESENCE   density=MODERATE + tempo=SILENT                             — silent, occupied
+#   DEEP_QUIET       density=EMPTY + tempo=SILENT|RESTING + familiarity=FAMILIAR  — long-empty/quiet
+#   EMPTY            density=EMPTY + (otherwise)                                  — no presence
+#   INITIAL          tempo=INITIAL (cold-start) or familiarity=INITIAL            — first read
+#   DEGRADED         2+ inputs OFFLINE                                            — can't tell, never faked
+#
+#   mesh-tempo-context         one-shot verdict to stdout
+#   mesh-tempo-context --edge  emit only on verdict change (for cron wiring)
+#   mesh-tempo-context --json  machine-readable {label, reason, inputs, ts}
+#   mesh-tempo-context --test  smoke test (pure classifier, no /proc reads)
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+
+STATE="$HOME/.mesh/.tempo-context-state"
+MESH="${MESH_DIR:-$HOME/.mesh}"
+# STALE_S: 1800s (30min) — generous enough for the longest-cadence input (mesh-activity-tempo runs
+# every 30min on `8-59/30 * * * *`); a tighter threshold would falsely OFFLINE it on every other
+# read. The classifier's own DEGRADED path handles the case where a sense is genuinely missing.
+STALE_S=1800
+
+# read_tempo <state> → echoes BUSTLE|RESTING|SILENT|INITIAL|OFFLINE
+read_tempo() {
+  local f="$1" v now m
+  [ -f "$f" ] || { echo "OFFLINE"; return; }
+  now=$(date +%s); m=$(stat -c %Y "$f" 2>/dev/null || echo "$now")
+  if [ $((now - m)) -gt "$STALE_S" ]; then echo "OFFLINE"; return; fi
+  v="$(head -1 "$f" 2>/dev/null | awk '{print $1}')"
+  case "$v" in
+    BUSTLE|RESTING|SILENT|INITIAL) printf '%s' "$v" ;;
+    *) echo "OFFLINE" ;;
+  esac
+}
+
+# read_density <state> → echoes CROWDED|BUSY|MODERATE|EMPTY|DEGRADED|OFFLINE
+# mesh-presence-density writes `LABEL|n=...|room=...|...|reason` so col 1 (|split) gives the band.
+read_density() {
+  local f="$1" v now m
+  [ -f "$f" ] || { echo "OFFLINE"; return; }
+  now=$(date +%s); m=$(stat -c %Y "$f" 2>/dev/null || echo "$now")
+  if [ $((now - m)) -gt "$STALE_S" ]; then echo "OFFLINE"; return; fi
+  v="$(head -1 "$f" 2>/dev/null | cut -d'|' -f1)"
+  case "$v" in
+    CROWDED|BUSY|MODERATE|EMPTY|DEGRADED) printf '%s' "$v" ;;
+    *) echo "OFFLINE" ;;
+  esac
+}
+
+# read_familiarity <state> → echoes INITIAL|STRANGER|MIXED|FAMILIAR|OFFLINE
+# mesh-presence writes `count=N ... familiarity=LABEL session_max_s=N` (additive field at the end).
+read_familiarity() {
+  local f="$1" v now m
+  [ -f "$f" ] || { echo "OFFLINE"; return; }
+  now=$(date +%s); m=$(stat -c %Y "$f" 2>/dev/null || echo "$now")
+  if [ $((now - m)) -gt "$STALE_S" ]; then echo "OFFLINE"; return; fi
+  v="$(head -1 "$f" 2>/dev/null | grep -oE 'familiarity=[A-Z]+' | head -1 | cut -d= -f2)"
+  case "$v" in
+    INITIAL|STRANGER|MIXED|FAMILIAR) printf '%s' "$v" ;;
+    *) echo "OFFLINE" ;;
+  esac
+}
+
+# read_burst <state> → echoes NONE|ARRIVAL|DEPARTURE|INSUFFICIENT|OFFLINE
+# mesh-ambient-clock writes `LABEL [trend-sfx] — detail` (or `DATA-STALE` / `DATA-WARMUP`).
+# The burst is not always in the label — we compute it from the data:
+#   ARRIVAL is the live verdict only if the label is ACTIVE/MODERATE AND
+#     a recent change in TV count happened (we treat it as a function of the label).
+# Since mesh-ambient-clock is a stream sense, we read its current label and treat the burst as
+# NONE by default; consumers needing a precise burst can call mesh-ambient-clock --json directly.
+# A more honest shortcut: read the current label and use it to derive a "burst" hint:
+#   - ACTIVE/MODERATE  → burst=NONE (current state, not necessarily a recent change)
+#   - QUIET/NIGHT-QUIET/DATA-WARMUP → burst=NONE
+#   - All other labels → burst=NONE
+#   The 2-3 burst states ARRIVAL/DEPARTURE/INSUFFICIENT are NOT reliably derivable from the
+#   label alone (mesh-ambient-clock's trend file is internal). Honest default: NONE.
+read_burst() {
+  local f="$1" v now m
+  [ -f "$f" ] || { echo "OFFLINE"; return; }
+  now=$(date +%s); m=$(stat -c %Y "$f" 2>/dev/null || echo "$now")
+  if [ $((now - m)) -gt "$STALE_S" ]; then echo "OFFLINE"; return; fi
+  v="$(head -1 "$f" 2>/dev/null | awk '{print $1}')"
+  case "$v" in
+    ACTIVE|MODERATE|QUIET|NIGHT-QUIET|DATA-STALE|DATA-WARMUP) printf 'NONE' ;;
+    *) printf 'NONE' ;;
+  esac
+}
+
+# classify_tempo_context <tempo> <density> <familiarity> <burst> → "LABEL|reason" — pure, offline-testable
+classify_tempo_context() {
+  local tempo="$1" density="$2" fam="$3" burst="$4"
+  # DEGRADED check first (2+ OFFLINE → DEGRADED with explicit missing list)
+  local missing=""
+  [ "$tempo" = "OFFLINE" ]    && missing="${missing}tempo,"
+  [ "$density" = "OFFLINE" ]  && missing="${missing}density,"
+  [ "$fam" = "OFFLINE" ]      && missing="${missing}familiarity,"
+  [ "$burst" = "OFFLINE" ]    && missing="${missing}burst,"
+  missing="${missing%,}"
+  local degen=0
+  [ "$tempo" = "OFFLINE" ]    && degen=$((degen+1))
+  [ "$density" = "OFFLINE" ]  && degen=$((degen+1))
+  [ "$fam" = "OFFLINE" ]      && degen=$((degen+1))
+  [ "$burst" = "OFFLINE" ]    && degen=$((degen+1))
+  if [ "$degen" -ge 2 ]; then
+    echo "DEGRADED|missing: $missing (too many senses unreachable for confident verdict)"
+    return
+  fi
+  # 1 OFFLINE → honest "can't fully assert" (degraded-but-not-DEGRADED)
+  if [ "$degen" -eq 1 ]; then
+    echo "DEGRADED|missing: $missing (1 sense offline, can't fully assert)"
+    return
+  fi
+  # INITIAL gate: cold-start (tempo=INITIAL OR familiarity=INITIAL)
+  if [ "$tempo" = "INITIAL" ] || [ "$fam" = "INITIAL" ]; then
+    echo "INITIAL|cold-start (tempo=$tempo familiarity=$fam) — first read or no baseline"
+    return
+  fi
+  # Burst-gated bands (priority — recent change overrides the steady-state band)
+  if [ "$burst" = "ARRIVAL" ]; then
+    if [ "$fam" = "STRANGER" ] || [ "$fam" = "MIXED" ]; then
+      echo "ARRIVAL_WAVE|burst=ARRIVAL + familiarity=$fam (fresh wave just landed)"
+      return
+    fi
+    echo "NEW_ARRIVAL|burst=ARRIVAL + familiarity=$fam (recent arrival, settled or not)"
+    return
+  fi
+  if [ "$burst" = "DEPARTURE" ]; then
+    echo "DEPARTURE_WAVE|burst=DEPARTURE (recent mass departure)"
+    return
+  fi
+  # Steady-state bands
+  if [ "$density" = "CROWDED" ] || [ "$density" = "BUSY" ]; then
+    if [ "$tempo" = "BUSTLE" ] && [ "$fam" = "FAMILIAR" ]; then
+      echo "BUSY_SOCIAL|density=$density + tempo=BUSTLE + familiarity=FAMILIAR (settled people, active)"
+      return
+    fi
+    if [ "$tempo" = "BUSTLE" ]; then
+      echo "NEW_CROWD|density=$density + tempo=BUSTLE + familiarity=$fam (new crowd, unsettled)"
+      return
+    fi
+    # CROWDED/BUSY + non-BUSTLE tempo (e.g. RESTING crowd)
+    echo "BUSY_SOCIAL|density=$density + tempo=$tempo (occupied, $tempo)"
+    return
+  fi
+  if [ "$density" = "MODERATE" ]; then
+    if [ "$tempo" = "BUSTLE" ] && [ "$fam" = "FAMILIAR" ]; then
+      echo "SETTLED_ACTIVE|density=MODERATE + tempo=BUSTLE + familiarity=FAMILIAR (focused, settled)"
+      return
+    fi
+    if [ "$tempo" = "BUSTLE" ]; then
+      echo "WARM_CROWD|density=MODERATE + tempo=BUSTLE + familiarity=$fam (moderate activity, $fam)"
+      return
+    fi
+    if [ "$tempo" = "RESTING" ] && [ "$fam" = "FAMILIAR" ]; then
+      echo "SETTLED_REST|density=MODERATE + tempo=RESTING + familiarity=FAMILIAR (quiet, settled)"
+      return
+    fi
+    if [ "$tempo" = "RESTING" ]; then
+      echo "WARY_REST|density=MODERATE + tempo=RESTING + familiarity=$fam (quiet, $fam)"
+      return
+    fi
+    if [ "$tempo" = "SILENT" ]; then
+      echo "QUIET_PRESENCE|density=MODERATE + tempo=SILENT (silent, occupied)"
+      return
+    fi
+  fi
+  if [ "$density" = "EMPTY" ]; then
+    if [ "$fam" = "FAMILIAR" ] && { [ "$tempo" = "SILENT" ] || [ "$tempo" = "RESTING" ]; }; then
+      echo "DEEP_QUIET|density=EMPTY + tempo=$tempo + familiarity=FAMILIAR (long-empty/quiet)"
+      return
+    fi
+    if [ "$tempo" = "SILENT" ] || [ "$tempo" = "RESTING" ]; then
+      echo "DEEP_QUIET|density=EMPTY + tempo=$tempo (empty + quiet)"
+      return
+    fi
+    echo "EMPTY|density=EMPTY + tempo=$tempo (no presence)"
+    return
+  fi
+  # Density = DEGRADED (mesh-presence-density itself is degraded) → propagate
+  if [ "$density" = "DEGRADED" ]; then
+    echo "DEGRADED|density=DEGRADED (presence-density itself couldn't assert)"
+    return
+  fi
+  # Defensive catch-all — shouldn't reach here given the cases above
+  echo "INITIAL|unmatched (tempo=$tempo density=$density fam=$fam burst=$burst)"
+}
+
+# --- Test mode ---
+if [ "${1:-}" = --test ]; then
+  fail=0
+  # ARRIVAL_WAVE: burst=ARRIVAL + STRANGER
+  r="$(classify_tempo_context BUSTLE MODERATE STRANGER ARRIVAL)"
+  echo "$r" | grep -q '^ARRIVAL_WAVE' || { echo "  FAIL ARRIVAL_WAVE: got=$r"; fail=1; }
+  # ARRIVAL_WAVE: burst=ARRIVAL + MIXED
+  r="$(classify_tempo_context BUSTLE BUSY MIXED ARRIVAL)"
+  echo "$r" | grep -q '^ARRIVAL_WAVE' || { echo "  FAIL ARRIVAL_WAVE-MIXED: got=$r"; fail=1; }
+  # NEW_ARRIVAL: burst=ARRIVAL + FAMILIAR (settled regular)
+  r="$(classify_tempo_context BUSTLE MODERATE FAMILIAR ARRIVAL)"
+  echo "$r" | grep -q '^NEW_ARRIVAL' || { echo "  FAIL NEW_ARRIVAL: got=$r"; fail=1; }
+  # DEPARTURE_WAVE: burst=DEPARTURE
+  r="$(classify_tempo_context SILENT MODERATE FAMILIAR DEPARTURE)"
+  echo "$r" | grep -q '^DEPARTURE_WAVE' || { echo "  FAIL DEPARTURE_WAVE: got=$r"; fail=1; }
+  # BUSY_SOCIAL: CROWDED + BUSTLE + FAMILIAR
+  r="$(classify_tempo_context BUSTLE CROWDED FAMILIAR NONE)"
+  echo "$r" | grep -q '^BUSY_SOCIAL' || { echo "  FAIL BUSY_SOCIAL-crowded: got=$r"; fail=1; }
+  # BUSY_SOCIAL: BUSY + BUSTLE + FAMILIAR
+  r="$(classify_tempo_context BUSTLE BUSY FAMILIAR NONE)"
+  echo "$r" | grep -q '^BUSY_SOCIAL' || { echo "  FAIL BUSY_SOCIAL-busy: got=$r"; fail=1; }
+  # NEW_CROWD: CROWDED + BUSTLE + STRANGER
+  r="$(classify_tempo_context BUSTLE CROWDED STRANGER NONE)"
+  echo "$r" | grep -q '^NEW_CROWD' || { echo "  FAIL NEW_CROWD: got=$r"; fail=1; }
+  # NEW_CROWD: BUSY + BUSTLE + MIXED
+  r="$(classify_tempo_context BUSTLE BUSY MIXED NONE)"
+  echo "$r" | grep -q '^NEW_CROWD' || { echo "  FAIL NEW_CROWD-mixed: got=$r"; fail=1; }
+  # SETTLED_ACTIVE: MODERATE + BUSTLE + FAMILIAR
+  r="$(classify_tempo_context BUSTLE MODERATE FAMILIAR NONE)"
+  echo "$r" | grep -q '^SETTLED_ACTIVE' || { echo "  FAIL SETTLED_ACTIVE: got=$r"; fail=1; }
+  # WARM_CROWD: MODERATE + BUSTLE + STRANGER
+  r="$(classify_tempo_context BUSTLE MODERATE STRANGER NONE)"
+  echo "$r" | grep -q '^WARM_CROWD' || { echo "  FAIL WARM_CROWD: got=$r"; fail=1; }
+  # SETTLED_REST: MODERATE + RESTING + FAMILIAR
+  r="$(classify_tempo_context RESTING MODERATE FAMILIAR NONE)"
+  echo "$r" | grep -q '^SETTLED_REST' || { echo "  FAIL SETTLED_REST: got=$r"; fail=1; }
+  # WARY_REST: MODERATE + RESTING + STRANGER
+  r="$(classify_tempo_context RESTING MODERATE STRANGER NONE)"
+  echo "$r" | grep -q '^WARY_REST' || { echo "  FAIL WARY_REST: got=$r"; fail=1; }
+  # QUIET_PRESENCE: MODERATE + SILENT
+  r="$(classify_tempo_context SILENT MODERATE FAMILIAR NONE)"
+  echo "$r" | grep -q '^QUIET_PRESENCE' || { echo "  FAIL QUIET_PRESENCE: got=$r"; fail=1; }
+  # DEEP_QUIET: EMPTY + SILENT + FAMILIAR
+  r="$(classify_tempo_context SILENT EMPTY FAMILIAR NONE)"
+  echo "$r" | grep -q '^DEEP_QUIET' || { echo "  FAIL DEEP_QUIET: got=$r"; fail=1; }
+  # DEEP_QUIET: EMPTY + RESTING (without FAMILIAR)
+  r="$(classify_tempo_context RESTING EMPTY STRANGER NONE)"
+  echo "$r" | grep -q '^DEEP_QUIET' || { echo "  FAIL DEEP_QUIET-empty-resting: got=$r"; fail=1; }
+  # EMPTY: EMPTY + BUSTLE (active tempo but no devices)
+  r="$(classify_tempo_context BUSTLE EMPTY STRANGER NONE)"
+  echo "$r" | grep -q '^EMPTY' || { echo "  FAIL EMPTY-bustle: got=$r"; fail=1; }
+  # INITIAL: tempo=INITIAL
+  r="$(classify_tempo_context INITIAL MODERATE FAMILIAR NONE)"
+  echo "$r" | grep -q '^INITIAL' || { echo "  FAIL INITIAL-tempo: got=$r"; fail=1; }
+  # INITIAL: familiarity=INITIAL
+  r="$(classify_tempo_context BUSTLE MODERATE INITIAL NONE)"
+  echo "$r" | grep -q '^INITIAL' || { echo "  FAIL INITIAL-fam: got=$r"; fail=1; }
+  # DEGRADED: 2 OFFLINE
+  r="$(classify_tempo_context OFFLINE OFFLINE FAMILIAR NONE)"
+  echo "$r" | grep -q '^DEGRADED' || { echo "  FAIL DEGRADED-2: got=$r"; fail=1; }
+  echo "$r" | grep -q 'tempo' || { echo "  FAIL DEGRADED should list tempo: got=$r"; fail=1; }
+  # DEGRADED: all 4 OFFLINE
+  r="$(classify_tempo_context OFFLINE OFFLINE OFFLINE OFFLINE)"
+  echo "$r" | grep -q '^DEGRADED' || { echo "  FAIL DEGRADED-4: got=$r"; fail=1; }
+  # 1-missing: should DEGRADED (can't fully assert)
+  r="$(classify_tempo_context BUSTLE OFFLINE FAMILIAR NONE)"
+  echo "$r" | grep -q '^DEGRADED' || { echo "  FAIL 1-missing: got=$r"; fail=1; }
+  # Density=DEGRADED propagates
+  r="$(classify_tempo_context BUSTLE DEGRADED FAMILIAR NONE)"
+  echo "$r" | grep -q '^DEGRADED' || { echo "  FAIL density-degraded-propagates: got=$r"; fail=1; }
+  # Burst priority: ARRIVAL beats BUSY_SOCIAL (recent change overrides steady-state)
+  r="$(classify_tempo_context BUSTLE CROWDED FAMILIAR ARRIVAL)"
+  echo "$r" | grep -q '^NEW_ARRIVAL' || { echo "  FAIL burst-priority: got=$r"; fail=1; }
+  [ "$fail" = 1 ] && { echo "smoke-test: FAIL"; exit 1; }
+  echo "smoke-test: ok (23 fusion assertions: ARRIVAL_WAVE×2, NEW_ARRIVAL×1, DEPARTURE_WAVE×1, BUSY_SOCIAL×2, NEW_CROWD×2, SETTLED_ACTIVE×1, WARM_CROWD×1, SETTLED_REST×1, WARY_REST×1, QUIET_PRESENCE×1, DEEP_QUIET×2, EMPTY×1, INITIAL×2, DEGRADED×3, density-DEGRADED-propagates×1, burst-priority×1)"
+  exit 0
+fi
+
+# --- Live read path ---
+tempo="$(read_tempo "$MESH/.activity-tempo.state")"
+density="$(read_density "$MESH/.presence-density-state")"
+fam="$(read_familiarity "$MESH/.presence-state")"
+burst="$(read_burst "$MESH/.ambient-clock.state")"
+
+result="$(classify_tempo_context "$tempo" "$density" "$fam" "$burst")"
+label="${result%%|*}"
+reason="${result#*|}"
+
+TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+# Write state + touch liveness on EVERY successful run (mtime = ran-live, content = value-changed)
+printf '%s|tempo=%s|density=%s|familiarity=%s|burst=%s|%s\n' "$label" "$tempo" "$density" "$fam" "$burst" "$reason" > "$STATE"
+mesh-state-touch "$STATE"
+
+# --- Output ---
+if [ "${1:-}" = --json ]; then
+  printf '{"label":"%s","reason":"%s","inputs":{"tempo":"%s","density":"%s","familiarity":"%s","burst":"%s"},"ts":"%s"}\n' \
+    "$label" "$reason" "$tempo" "$density" "$fam" "$burst" "$TS"
+  exit 0
+fi
+if [ "${1:-}" = --edge ]; then
+  prev=""; [ -f "$STATE" ] && read -r prev _ < "$STATE" 2>/dev/null || true
+  prev_label="${prev%%|*}"
+  [ "$prev_label" = "$label" ] && exit 0
+  printf '[tempo-context-%s] %s — %s\n' "$(printf '%s' "$label" | tr '[:upper:]' '[:lower:]')" "$label" "$reason"
+  exit 0
+fi
+printf '[tempo-context-%s] %s — %s\n' "$(printf '%s' "$label" | tr '[:upper:]' '[:lower:]')" "$label" "$reason"
