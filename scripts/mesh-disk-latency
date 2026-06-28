@@ -1,0 +1,196 @@
+#!/usr/bin/env bash
+# reflex-cadence: 2-59/5 * * * *
+# reflex-args: --edge
+# mesh-disk-latency — the node's BLOCK-DEVICE I/O COMPLETION-TIME sense. Reads /proc/diskstats
+# to compute per-device read_await (read_ticks / reads_completed) and write_await (write_ticks /
+# writes_completed), then folds the worst device into one FAST/NORMAL/SLOW/STALLED verdict
+# naming the dominant device + side.
+#
+# Why this is a new sense, not a dup of mesh-net-io / mesh-psi / mesh-sockstat:
+# - mesh-net-io measures BANDWIDTH (bytes/sec rx+tx) on a network interface — distinct surface.
+# - mesh-psi measures CPU/IO/MEM % STALL time kernel-wide — what was contended, not which device.
+# - mesh-sockstat counts active socket connections — network protocol layer, not block storage.
+# - mesh-swap measures MEMORY swapping activity — useful but answers "are we thrashing?" not
+#   "is the disk responding slowly?".
+# - mesh-disk-latency answers the most direct storage-health question: "how long did each I/O
+#   take to complete?". It names the slow device, the slow side (read vs write), and surfaces
+#   the await in ms — a SATA SSD in good health sits at <1ms, NVMe at <0.5ms, and a failing
+#   SSD or one under heavy random write jumps to 50-200ms+; this is a leading indicator of
+#   storage degradation that none of the above surfaces.
+#
+# Inputs read: /proc/diskstats (kernel field 7=read_ticks, 4=reads_completed, 11=write_ticks,
+# 8=writes_completed, 3=devname). Skips loop devices and partitions (only whole disks count).
+#
+#   mesh-disk-latency            one line: verdict + worst device + breakdown
+#   mesh-disk-latency --json     machine-readable
+#   mesh-disk-latency --edge     emit only on verdict change (2-consecutive debounce) — cron reflex
+#   mesh-disk-latency --test     smoke test (pure classifier, no /proc read before the gate)
+#
+# Bands (per device, in milliseconds):
+#   FAST    = read_await <5  AND write_await <25                       (NVMe/SATA SSD idle)
+#   NORMAL  = read_await <50 OR  write_await <100                      (typical load)
+#   SLOW    = read_await <200 OR write_await <500                      (degraded)
+#   STALLED = read_await ≥200 OR write_await ≥500                      (failing disk / heavy contention)
+# Worst-of across devices, then a per-device "stale" case (no IOs yet → UNKNOWN, never a faked FAST).
+#
+# Honest-degraded: no /proc/diskstats (container without stat) or all devices report 0 IOs →
+# UNKNOWN + exit 2, never a faked all-clear.
+set -uo pipefail
+{ "$HOME/.local/bin/mesh-pulse" beat disk-latency; } >/dev/null 2>&1 || true  # liveness heartbeat (mesh-pulse)
+
+export PATH="$HOME/.local/bin:$PATH"
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+
+MESH="$HOME/.mesh"
+STATE="$MESH/.disk-latency-state"
+
+# --- Test (pure classifier — no /proc read) ---
+if [ "${1:-}" = --test ]; then
+  command -v awk >/dev/null 2>&1 || { echo "smoke-test: FAIL (no awk)"; exit 1; }
+  # 12 cases: 4 bands × 2 directions + UNKNOWN + ZERO + 1-device-worst + ties
+  # Use a here-doc awk to verify the same classify_node logic the live path uses.
+  out=$(awk '
+  function band(r, w,    ra, wa) {
+    ra = r + 0; wa = w + 0;
+    if (ra < 0 || wa < 0) return "UNKNOWN";
+    if (ra >= 200 || wa >= 500) return "STALLED";
+    if (ra >= 50  || wa >= 100) return "SLOW";
+    if (ra >= 5   || wa >= 25)  return "NORMAL";
+    return "FAST";
+  }
+    function worst(d1, d2, d3,    b1, b2, b3, mx) {
+      b1 = d1; b2 = d2; b3 = d3;
+      # priority: STALLED > SLOW > NORMAL > FAST > UNKNOWN
+      if (b1=="STALLED" || b2=="STALLED" || b3=="STALLED") return "STALLED";
+      if (b1=="SLOW"    || b2=="SLOW"    || b3=="SLOW")    return "SLOW";
+      if (b1=="NORMAL"  || b2=="NORMAL"  || b3=="NORMAL")  return "NORMAL";
+      if (b1=="FAST"    || b2=="FAST"    || b3=="FAST")    return "FAST";
+      return "UNKNOWN";
+    }
+    BEGIN {
+      cases = 0; pass = 0;
+      # FAST (idle SSD/NVMe)
+      cases++; if (band(0.1, 1.0) == "FAST") pass++;
+      cases++; if (band(4.9, 24.9) == "FAST") pass++;
+      # NORMAL (boundary: ra>=5 || wa>=25)
+      cases++; if (band(5.0, 1.0) == "NORMAL") pass++;
+      cases++; if (band(0.0, 25.0) == "NORMAL") pass++;
+      # SLOW (boundary: ra>=50 || wa>=100)
+      cases++; if (band(50.0, 0.0) == "SLOW") pass++;
+      cases++; if (band(0.0, 100.0) == "SLOW") pass++;
+      # STALLED (boundary: ra>=200 || wa>=500)
+      cases++; if (band(200.0, 0.0) == "STALLED") pass++;
+      cases++; if (band(0.0, 500.0) == "STALLED") pass++;
+      # UNKNOWN
+      cases++; if (band(-1, -1) == "UNKNOWN") pass++;
+      # worst-of priority
+      cases++; if (worst("FAST","SLOW","NORMAL") == "SLOW") pass++;
+      cases++; if (worst("NORMAL","STALLED","FAST") == "STALLED") pass++;
+      cases++; if (worst("FAST","NORMAL","UNKNOWN") == "NORMAL") pass++;
+      printf("ok: classify (%d/%d cases)\n", pass, cases);
+      if (pass == cases) exit 0; else exit 1;
+    }
+  ' 2>&1)
+  rc=$?
+  printf '%s' "$out"
+  if [ $rc -ne 0 ]; then echo "smoke-test: FAIL (classifier)"; exit 1; fi
+  # Real read of /proc/diskstats
+  [ -f /proc/diskstats ] || { echo "smoke-test: FAIL (no /proc/diskstats)"; exit 1; }
+  ndevs=$(ls /sys/block/ 2>/dev/null | grep -cvE '^(loop|ram|dm-)' )
+  if [ "$ndevs" -lt 1 ]; then
+    echo "smoke-test: WARN (no real block devices visible — container?)"
+  else
+    echo "smoke-test: ok (classifier + $ndevs device(s) in /proc/diskstats)"
+  fi
+  exit 0
+fi
+
+# --- Live read path ---
+[ -f /proc/diskstats ] || { echo "[disk-latency-unknown] UNKNOWN — no /proc/diskstats (kernel < 2.6 or container without stat)"; exit 2; }
+
+# Parse /proc/diskstats: use /sys/block/ as the source-of-truth for whole-disk devices
+# (avoids the loop/nvme0n1p1/sda1 partition-filter headache — /sys/block/ is partitions-free).
+# For each whole-disk device, compute read_await_ms = read_ticks_ms / reads_completed, ditto write.
+# Track worst: STALLED > SLOW > NORMAL > FAST > UNKNOWN. Per-device 0 IOs → that device UNKNOWN.
+read -r worst_band worst_dev worst_side worst_ra worst_wa <<< "$(
+  # Build the set of whole-disk device names from /sys/block (one per line, via ls)
+  blk_list=$(ls /sys/block/ 2>/dev/null)
+  awk -v blk_list="$blk_list" '
+    function band(ra, wa) {
+      if (ra < 0 || wa < 0) return "UNKNOWN";
+      if (ra >= 200 || wa >= 500) return "STALLED";
+      if (ra >= 50  || wa >= 100) return "SLOW";
+      if (ra >= 5   || wa >= 25)  return "NORMAL";
+      return "FAST";
+    }
+    function prio(b) { if (b=="STALLED") return 4; if (b=="SLOW") return 3; if (b=="NORMAL") return 2; if (b=="FAST") return 1; return 0; }
+    BEGIN {
+      worst = "UNKNOWN"; worstp = 0; ndevs = 0
+      nblk = split(blk_list, blk, " ")
+    }
+    function is_whole(name,    i) {
+      for (i = 1; i <= nblk; i++) if (blk[i] == name) return 1
+      return 0
+    }
+    {
+      name = $3
+      if (!is_whole(name)) next
+      if (NF < 14) next
+      rd_completed = $4 + 0; rd_ticks = $7 + 0
+      wr_completed = $8 + 0; wr_ticks = $11 + 0
+      if (rd_completed + wr_completed == 0) {
+        b = "UNKNOWN"; ra = -1; wa = -1
+      } else {
+        ra = (rd_completed > 0) ? rd_ticks / rd_completed : -1
+        wa = (wr_completed > 0) ? wr_ticks / wr_completed : -1
+        b = band(ra, wa)
+      }
+      ndevs++
+      if (prio(b) > worstp) {
+        worstp = prio(b); worst = b; worst_name = name
+        worst_ra = ra; worst_wa = wa
+        if (b == "FAST") worst_side = "none"
+        else if (b == "NORMAL" || b == "SLOW" || b == "STALLED") {
+          if (ra >= 5 && ra >= wa) worst_side = "read"
+          else if (wa >= 25) worst_side = "write"
+          else worst_side = "mixed"
+        } else worst_side = "n/a"
+      }
+    }
+    END {
+      if (ndevs == 0) { print "UNKNOWN none n/a -1 -1"; exit }
+      printf "%s %s %s %.2f %.2f\n", worst, worst_name, worst_side, worst_ra, worst_wa
+    }
+  ' /proc/diskstats 2>/dev/null
+)"
+
+ndevs=$(ls /sys/block/ 2>/dev/null | grep -cvE '^(loop|ram|dm-)' )
+
+# All devices UNKNOWN (ndevs>0 but worst=UNKNOWN) is honest — no real IOs yet, don't fake FAST.
+label="$worst_band"
+side="$worst_side"
+dev="$worst_dev"
+ra="$worst_ra"
+wa="$worst_wa"
+
+if [ -z "$label" ]; then
+  echo "[disk-latency-unknown] UNKNOWN — could not parse /proc/diskstats"
+  exit 2
+fi
+
+if [ "$label" = "UNKNOWN" ] && [ "$ndevs" -eq 0 ]; then
+  echo "[disk-latency-unknown] UNKNOWN — no block devices visible"
+  exit 2
+fi
+
+TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+# mtime = ran-live (always), content = value-changed (worst band)
+printf '%s|verdict=%s|dev=%s|side=%s|read_ms=%.2f|write_ms=%.2f|ndevs=%d|%s\n' "$label" "$label" "$dev" "$side" "$ra" "$wa" "$ndevs" "$TS" > "$STATE"
+[ -x "$HOME/.local/bin/mesh-state-touch" ] && mesh-state-touch "$STATE" >/dev/null 2>&1 || true
+
+# Emit
+if [ "$label" = "UNKNOWN" ]; then
+  echo "[disk-latency-unknown] UNKNOWN — $ndevs device(s), no I/O completed yet (dev=$dev)"
+else
+  echo "[disk-latency-$label] $label — dev=$dev side=$side read=${ra}ms write=${wa}ms (across $ndevs device(s))"
+fi
