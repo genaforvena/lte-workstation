@@ -39,6 +39,7 @@ OFFLINEFILE="$HOME/.mesh/.room-sense-offline"
 
 MESH_DIR="${MESH_DIR:-$HOME/.mesh}"
 STATE="$MESH_DIR/.room-sense.state"
+EVENTS="$MESH_DIR/.room-sense-events"  # one epoch per verdict change, self-prunes to 24h
 SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=6 -o StrictHostKeyChecking=no"
 # Resolve the phone address LAN-FIRST. mesh-phone-ip does LAN discovery — the phone is often OFF
 # Tailscale but reachable on the home LAN (192.168.8.x). mesh-peer-addr returns ONLY the Tailscale IP,
@@ -80,6 +81,65 @@ _is_random_mac() {
   local first="${1%%:*}"
   [[ "$first" =~ ^[0-9A-Fa-f]{2}$ ]] || return 1
   (( 0x$first & 0x2 ))
+}
+
+# --- OCCUPANCY_DWELL enrichment (2026-06-29) ---
+# The existing 1-field state (PRESENT|EMPTY|UNCERTAIN) captures the CURRENT verdict but NOT how
+# long it has been held. The new additive fields 2+3 are `<dwell_s>|<changes_24h>` — seconds-since-
+# last-verdict-change and count of changes in the last 24h. Captures "PRESENT held for 4h" vs
+# "just transitioned to PRESENT" — distinct from the per-fusion verdict (which is just "what
+# is it now?"). Consistent with the dwell vocabulary used by motion_dwell / light_dwell /
+# wifi_motion_dwell / label_dwell / tamper_recency. Consumers wanting "has the room been
+# occupied for a while?" grep `dwell_s=`. The .room-sense-events log is the durable change
+# record (one epoch per change, pruned to 24h).
+#
+#   classify_dwell <seconds> → echoes "BAND|seconds". Pure, offline-testable.
+#   Bands (FALSIFIABLE: change the 5/60/1800 thresholds → tests flip):
+#     TRANSITION  0–5s    — just changed
+#     RECENT     5–60s   — recently changed
+#     STABLE     1–30m   — held for a while
+#     CHRONIC    30m+    — long-stable verdict
+#     NEVER      no reading on record
+classify_dwell() {
+  local s="${1:-}"
+  if [ -z "$s" ] || ! [ "$s" -ge 0 ] 2>/dev/null; then echo "NEVER|no reading on record"; return; fi
+  if   [ "$s" -lt 5 ];    then echo "TRANSITION|${s}s (just changed)"; return; fi
+  if   [ "$s" -lt 60 ];   then echo "RECENT|${s}s (under 1m)"; return; fi
+  if   [ "$s" -lt 1800 ]; then echo "STABLE|$((s/60))m (under 30m)"; return; fi
+  echo "CHRONIC|$((s/60))m (long-stable)"
+}
+# count_recent_events <log> <now> <window_sec> → integer. Prunes log to 24h on the fly and counts
+# events in [now-window, now]. Reused from the ambient-clock dwell enrichment; file-bound.
+count_recent_events() {
+  local f="$1" now="$2" win="$3" cutoff c _ts
+  cutoff=$(( now - win ))
+  c=0
+  [ -f "$f" ] || { echo 0; return; }
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    _ts="$(printf '%s' "$line" | cut -d'|' -f1)"
+    [ "$_ts" -ge "$cutoff" ] 2>/dev/null && c=$((c+1))
+  done < "$f"
+  echo "$c"
+}
+# log_room_event <log> <epoch> <verdict> <now> — append a verdict-change event and prune to 24h from
+# NOW. Format: epoch|verdict. Stale events older than 24h relative to NOW are pruned, so the log
+# self-bounds and a sense with a churning verdict never grows unbounded.
+log_room_event() {
+  local f="$1" epoch="$2" verdict="$3" now="$4" cutoff
+  cutoff=$(( now - 86400 ))
+  [ -d "$(dirname "$f")" ] || return 1
+  if [ -f "$f" ]; then
+    local tmp="${f}.tmp.$$"
+    : > "$tmp"
+    while IFS= read -r line; do
+      [ -z "$line" ] && continue
+      _ts="$(printf '%s' "$line" | cut -d'|' -f1)"
+      [ "$_ts" -ge "$cutoff" ] 2>/dev/null && printf '%s\n' "$line" >> "$tmp"
+    done < "$f"
+    mv -f "$tmp" "$f" 2>/dev/null || rm -f "$tmp"
+  fi
+  [ "$epoch" -ge "$cutoff" ] 2>/dev/null && printf '%s|%s\n' "$epoch" "$verdict" >> "$f"
 }
 
 # --- Fusion engine (extracted for testability) ---
@@ -352,7 +412,36 @@ PY
   _is_random_mac "68:E9:8B:A6:9F:68" && { echo "  FAIL: 0x68 (public OUI) must NOT be person-attributed"; exit 1; }
   _is_random_mac "5C:49:7D:92:1E:58" && { echo "  FAIL: 0x5C (TV, public OUI) must NOT be person-attributed"; exit 1; }
   _is_random_mac "zz:bb:cc:dd:ee:ff" && { echo "  FAIL: malformed first octet must NOT be called random (honest)"; exit 1; }
-  echo "smoke-test: ok (15 fusion + 4 derived + 3 unsampled-presence + 3 cam-motion + 3 cam-liveness + 3 appliance-vs-person + 2 flat-field/blind-lens + 4 addr-type-fusion assertions)"; exit 0
+  # --- OCCUPANCY_DWELL classifier (FALSIFIABLE: change the 5/60/1800 thresholds → these flip) ---
+  _df=0
+  # TRANSITION: 0s, 4s
+  r="$(classify_dwell 0)";   echo "$r" | grep -q '^TRANSITION' || { echo "  FAIL dwell TRANSITION 0s: got=$r"; _df=1; }
+  r="$(classify_dwell 4)";   echo "$r" | grep -q '^TRANSITION' || { echo "  FAIL dwell TRANSITION 4s: got=$r"; _df=1; }
+  # RECENT: 5s (boundary), 59s
+  r="$(classify_dwell 5)";   echo "$r" | grep -q '^RECENT' || { echo "  FAIL dwell RECENT 5s: got=$r"; _df=1; }
+  r="$(classify_dwell 59)";  echo "$r" | grep -q '^RECENT' || { echo "  FAIL dwell RECENT 59s: got=$r"; _df=1; }
+  # STABLE: 60s (boundary), 1740s
+  r="$(classify_dwell 60)";  echo "$r" | grep -q '^STABLE' || { echo "  FAIL dwell STABLE 60s: got=$r"; _df=1; }
+  r="$(classify_dwell 1740)";echo "$r" | grep -q '^STABLE' || { echo "  FAIL dwell STABLE 1740s: got=$r"; _df=1; }
+  # CHRONIC: 1800s (boundary), 86400s
+  r="$(classify_dwell 1800)";echo "$r" | grep -q '^CHRONIC' || { echo "  FAIL dwell CHRONIC 1800s: got=$r"; _df=1; }
+  r="$(classify_dwell 86400)";echo "$r" | grep -q '^CHRONIC' || { echo "  FAIL dwell CHRONIC 86400s: got=$r"; _df=1; }
+  # NEVER: empty
+  r="$(classify_dwell '')";  [ "$r" = "NEVER|no reading on record" ] || { echo "  FAIL dwell NEVER: got=$r"; _df=1; }
+  # log_room_event: pure, file-bound
+  _ed="$(mktemp -d)"; _ef="$_ed/e"
+  log_room_event "$_ef" 100 PRESENT 200
+  log_room_event "$_ef" 150 EMPTY 200
+  log_room_event "$_ef" 175 PRESENT 200
+  c="$(count_recent_events "$_ef" 250 86400)"
+  [ "$c" = "3" ] || { echo "  FAIL log_room_event basic: expected 3 got=$c"; _df=1; }
+  # Pruning: events older than 24h relative to NOW are dropped
+  log_room_event "$_ef" -100000 PRESENT 200
+  c2="$(count_recent_events "$_ef" 200 86400)"
+  [ "$c2" = "3" ] || { echo "  FAIL log_room_event pruning: expected 3 got=$c2"; _df=1; }
+  rm -rf "$_ed"
+  [ "$_df" = 0 ] || { echo "smoke-test: FAIL (occupancy_dwell assertions)"; exit 1; }
+  echo "smoke-test: ok (15 fusion + 4 derived + 3 unsampled-presence + 3 cam-motion + 3 cam-liveness + 3 appliance-vs-person + 2 flat-field/blind-lens + 4 addr-type-fusion + 9 occupancy_dwell assertions)"; exit 0
 }
 
 MODE=oneshot
@@ -568,21 +657,36 @@ esac
 
 case "$MODE" in
   json)
-    printf '{"verdict":"%s","occupancy":"%s","confidence":"%s","degraded":"%s","signals":%s,"reason":%s,"ts":"%s","phone_ok":%s,"ble_ok":%s,"body":"%s","ambient":"%s","kbd":"%s"}\n' \
-      "$verdict" "$occupancy" "$confidence" "$degraded" "$(printf '%s' "$signals" | json_escape)" "$(printf '%s' "$reason" | json_escape)" "$TS" "$phone_ok" "$ble_ok" "$body_verdict" "$ambient_level" "$kbd_verdict"
+    # OCCUPANCY_DWELL: compute dwell_s + changes_24h on demand for the JSON output (the --edge
+    # path has already maintained the events log; --json doesn't touch STATE, so we recompute here
+    # for parity with the consumer-facing output).
+    _now="$(date +%s)"
+    _last_change_ts=""; [ -f "$EVENTS" ] && _last_change_ts="$(tail -n 1 "$EVENTS" 2>/dev/null | cut -d'|' -f1)"
+    _dwell_s=0
+    if [ -n "$_last_change_ts" ] && [ "$_last_change_ts" -gt 0 ] 2>/dev/null; then _dwell_s=$(( _now - _last_change_ts )); fi
+    _changes_24h="$(count_recent_events "$EVENTS" "$_now" 86400)"
+    printf '{"verdict":"%s","occupancy":"%s","confidence":"%s","degraded":"%s","signals":%s,"reason":%s,"ts":"%s","phone_ok":%s,"ble_ok":%s,"body":"%s","ambient":"%s","kbd":"%s","dwell_s":%d,"dwell_band":"%s","changes_24h":%d}\n' \
+      "$verdict" "$occupancy" "$confidence" "$degraded" "$(printf '%s' "$signals" | json_escape)" "$(printf '%s' "$reason" | json_escape)" "$TS" "$phone_ok" "$ble_ok" "$body_verdict" "$ambient_level" "$kbd_verdict" \
+      "$_dwell_s" "${_dwell_s:+$(classify_dwell "$_dwell_s" | cut -d'|' -f1)}" \
+      "$_changes_24h"
     ;;
   edge)
     # 2-consecutive-scan debounce: a threshold-straddling sensor can flip PRESENT↔UNCERTAIN
     # every scan. Only fire after 2 consecutive same verdicts.
-    # STATE = confirmed verdict; PENDING = "verdict:count" for the in-progress candidate.
+    # STATE = confirmed verdict (additive 3-field: VERDICT|dwell_s=N|changes_24h=N); PENDING = "verdict:count" for the in-progress candidate.
     PENDING="${STATE%.state}.pending"
-    confirmed="$(cat "$STATE" 2>/dev/null || true)"
+    confirmed_raw="$(cat "$STATE" 2>/dev/null || true)"
+    # Extract just the bare label (1st field) for back-compat with the legacy 1-field STATE
+    confirmed="${confirmed_raw%%|*}"
     pending_line="$(cat "$PENDING" 2>/dev/null || true)"
     pending="${pending_line%%:*}"; pcount="${pending_line##*:}"; pcount="${pcount:-0}"
 
     if [ -z "$confirmed" ]; then
-      # First run: seed silently
+      # First run: seed silently — write the bare label only (additive fields populated below)
       printf '%s\n' "$verdict" > "$STATE"; rm -f "$PENDING"
+      # SEED: log this as the first event so dwell_s has a real start (mirrors mesh-ambient-clock
+      # dwell enrichment: a present-but-uncounted history is a worse signal than a known-fresh baseline)
+      log_room_event "$EVENTS" "$(date +%s)" "$verdict" "$(date +%s)"
     elif [ "$verdict" = "$confirmed" ]; then
       rm -f "$PENDING"   # stable — clear any in-progress candidate
     elif [ "$verdict" = "$pending" ]; then
@@ -590,6 +694,8 @@ case "$MODE" in
       if [ "$pcount" -ge 2 ]; then
         # Two consecutive readings agree — genuine change
         printf '%s\n' "$verdict" > "$STATE"; rm -f "$PENDING"
+        # Log the event so dwell_s starts counting from now
+        log_room_event "$EVENTS" "$(date +%s)" "$verdict" "$(date +%s)"
         # Misha dormant-by-default (operator 2026-06-24, tier-1): only emit the WAKE-SIGNAL edge line
         # when occupancy is CONFIRMED (PRESENT+confidence=high = non-audio: cam/kbd/body/BLE/wifi) — so a
         # room change never wakes Misha off ambient sound/music. STATE still updates (data panes read it);
@@ -604,9 +710,31 @@ case "$MODE" in
       # New candidate — start fresh pending (count=1)
       printf '%s:1\n' "$verdict" > "$PENDING"
     fi
-    # touch every run so the state-file mtime tracks last-RUN (liveness), not last-CHANGE —
-    # else a stable verdict reads as a dead reflex to the sensorium roll-call's age/STALE check.
-    [ -e "$STATE" ] && touch "$STATE" 2>/dev/null || printf '%s\n' "$verdict" > "$STATE"
+    # OCCUPANCY_DWELL: append dwell_s + changes_24h to STATE on every successful run (additive
+    # 3-field format — back-compat: head -1 | cut -d'|' -f1 still recovers the bare label).
+    # Bare 'touch' on a non-existent STATE would create a hollow state file (consumers would read it
+    # as real) — so we ONLY touch an existing STATE.
+    _now="$(date +%s)"
+    _last_change_ts=""; [ -f "$EVENTS" ] && _last_change_ts="$(tail -n 1 "$EVENTS" 2>/dev/null | cut -d'|' -f1)"
+    _dwell_s=0
+    if [ -n "$_last_change_ts" ] && [ "$_last_change_ts" -gt 0 ] 2>/dev/null; then
+      _dwell_s=$(( _now - _last_change_ts ))
+    fi
+    _changes_24h="$(count_recent_events "$EVENTS" "$_now" 86400)"
+    if [ -e "$STATE" ]; then
+      # Re-read the just-written 1st field (might be new) and append the dwell fields
+      _cur_label="$(head -1 "$STATE" 2>/dev/null | cut -d'|' -f1)"
+      [ -n "$_cur_label" ] && printf '%s|dwell_s=%s|changes_24h=%s\n' "$_cur_label" "$_dwell_s" "$_changes_24h" > "$STATE"
+      # touch every run so the state-file mtime tracks last-RUN (liveness), not last-CHANGE —
+      # else a stable verdict reads as a dead reflex to the sensorium roll-call's age/STALE check.
+      # Use the shared liveness primitive (chat-review/state-touch-adoption 2026-06-25) — bare
+      # `touch "$STATE"` was a fallback when mesh-state-touch was missing; the primitive is now
+      # the canonical path (handles --create, mirrors mesh-psi / mesh-net-drop / mesh-wifi-crossval
+      # / mesh-vpn-health hollow-sense fixes).
+      [ -x "$HOME/.local/bin/mesh-state-touch" ] && "$HOME/.local/bin/mesh-state-touch" --create "$STATE" >/dev/null 2>&1 || touch "$STATE" 2>/dev/null
+    else
+      printf '%s|dwell_s=%s|changes_24h=%s\n' "$verdict" "$_dwell_s" "$_changes_24h" > "$STATE"
+    fi
     ;;
   *)
     printf 'room-sense: %s occupancy=%s confidence=%s degraded=%s — %s [%s]\n' "$verdict" "$occupancy" "$confidence" "$degraded" "$reason" "$signals"
