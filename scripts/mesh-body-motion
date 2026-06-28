@@ -31,8 +31,82 @@ set -uo pipefail
 export PATH="$HOME/.local/bin:$PATH"
 [ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
 [ -f "$HOME/.mesh/nodes" ] && . "$HOME/.mesh/nodes"
-STATE="$HOME/.mesh/.body-motion-state"   # holds: <step_counter>|<state-tag>|<hyst>|<pending-tag>
+STATE="$HOME/.mesh/.body-motion-state"   # holds: <step_counter>|<state-tag>|<hyst>|<pending_tag>
 OFFLINEFILE="$HOME/.mesh/.mesh-body-motion-offline"
+# motion_dwell enrichment (2026-06-28): the existing 4-field state only captures the CURRENT
+# classification, not how long the body has been in it. The new additive fields 5+6 are
+# `<dwell_s>|<changes_24h>` — seconds-since-last-state-change and count of state changes in
+# the last 24h. Captures "body has been STILL for 2h" vs "just transitioned to STILL" — distinct
+# from the per-classify verdict (which is just "what is it now?"). A user grepping `dwell=`
+# gets the dwell band without breaking a 4-field reader (extra fields ignored).
+MOTION_LOG="$HOME/.mesh/.body-motion-events"  # one line per state change: epoch|state_tag
+
+# classify_dwell <seconds> → echoes "BAND|seconds". Pure, offline-testable.
+# Bands (FALSIFIABLE: change the 5/60/1800 thresholds → tests flip):
+#   TRANSITION  0–5s   — just changed
+#   RECENT     5–60s  — recently changed
+#   STABLE     1–30m  — stable for a while
+#   CHRONIC    30m+   — long-stable, body has been at rest
+#   NEVER      no event on record
+classify_dwell() {
+  local s="${1:-}"
+  if [ -z "$s" ] || ! [ "$s" -ge 0 ] 2>/dev/null; then echo "NEVER|no event on record"; return; fi
+  if   [ "$s" -lt 5 ];    then echo "TRANSITION|${s}s (just changed)"; return; fi
+  if   [ "$s" -lt 60 ];   then echo "RECENT|${s}s (under 1m)"; return; fi
+  if   [ "$s" -lt 1800 ]; then echo "STABLE|$((s/60))m (under 30m)"; return; fi
+  echo "CHRONIC|$((s/60))m (long-stable)"
+}
+
+# log_motion_event <log> <epoch> <state_tag> [now] — appends only if state changed
+# (idempotent on same-state runs). Prunes anything older than 24h relative to `now` (defaults to
+# `epoch` itself when called at the time of a new event). Events older than 24h relative to
+# `now` are NOT appended (already-expired events don't pollute the log).
+# Pure, file-bound.
+log_motion_event() {
+  local f="$1"
+  local epoch="$2"
+  local tag="$3"
+  local now="${4:-$epoch}"
+  local cutoff=$(( now - 86400 ))
+  [ -d "$(dirname "$f")" ] || return 1
+  if [ -f "$f" ]; then
+    local last; last="$(tail -n 1 "$f" 2>/dev/null)"
+    [ -n "$last" ] && {
+      local last_tag; last_tag="$(printf '%s' "$last" | cut -d'|' -f2)"
+      [ "$last_tag" = "$tag" ] && return 0   # same state → no new event
+    }
+    # Prune entries older than 24h relative to now
+    local tmp="${f}.tmp.$$"
+    : > "$tmp"
+    while IFS= read -r line; do
+      [ -z "$line" ] && continue
+      local l_epoch; l_epoch="$(printf '%s' "$line" | cut -d'|' -f1)"
+      [ "$l_epoch" -ge "$cutoff" ] 2>/dev/null && printf '%s\n' "$line" >> "$tmp"
+    done < "$f"
+    mv -f "$tmp" "$f" 2>/dev/null || rm -f "$tmp"
+  fi
+  # Append the new event — but only if it's not already older than the cutoff (already-expired)
+  if [ "$epoch" -ge "$cutoff" ] 2>/dev/null; then
+    printf '%s|%s\n' "$epoch" "$tag" >> "$f"
+  fi
+}
+
+# count_recent_motion_events <log> <now_epoch> <window_sec> → echoes integer count.
+count_recent_motion_events() {
+  local f="$1"
+  local now="$2"
+  local win="$3"
+  local cutoff
+  cutoff=$(( now - win ))
+  local c=0
+  [ -f "$f" ] || { echo 0; return; }
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    local l_epoch; l_epoch="$(printf '%s' "$line" | cut -d'|' -f1)"
+    [ "$l_epoch" -ge "$cutoff" ] 2>/dev/null && c=$((c+1))
+  done < "$f"
+  echo "$c"
+}
 
 if [ "${1:-}" = --test ]; then
   command -v ssh >/dev/null 2>&1 || { echo "smoke-test: FAIL (no ssh)"; exit 1; }
@@ -58,15 +132,66 @@ if [ "${1:-}" = --test ]; then
   # control: steps present (+4) → WALKING, not vehicle
   printf '100||0|\n' > "$_ss"
   printf '%s' '{"bma420":{"values":[0,0,9.8]},"ORIENTATION":{"values":[0]},"LINEARACCEL":{"values":[1.5,0,0]},"STEP_COUNTER":{"values":[104]},"tmd2755_l":{"values":[50]},"tmd2755_p":{"values":[5]}}' > "$_sj"
-  "$0" --simulate="$_sj" 2>/dev/null | grep -q '\[body-walking\] WALKING' || { echo "  FAIL: steps+4 → expected [body-walking] (not vehicle)"; fail=1; }
+   "$0" --simulate="$_sj" 2>/dev/null | grep -q '\[body-walking\] WALKING' || { echo "  FAIL: steps+4 → expected [body-walking] (not vehicle)"; fail=1; }
   rm -f "$_sj" "$_ss"
   [ "$fail" = 0 ] && echo "  ok: classify fixtures (vehicle / honest-degrade / walking)" || { echo "smoke-test: FAIL (classify fixtures)"; exit 1; }
+  # --- motion_dwell enrichment tests (FALSIFIABLE: change the 5/60/1800 thresholds → these flip) ---
+  _df=0
+  # TRANSITION: 0s
+  r="$(classify_dwell 0)"
+  echo "$r" | grep -q '^TRANSITION' || { echo "  FAIL dwell TRANSITION 0s: got=$r"; _df=1; }
+  # TRANSITION: 4s (under 5s)
+  r="$(classify_dwell 4)"
+  echo "$r" | grep -q '^TRANSITION' || { echo "  FAIL dwell TRANSITION 4s: got=$r"; _df=1; }
+  # RECENT: 5s (boundary)
+  r="$(classify_dwell 5)"
+  echo "$r" | grep -q '^RECENT' || { echo "  FAIL dwell RECENT 5s: got=$r"; _df=1; }
+  # RECENT: 59s
+  r="$(classify_dwell 59)"
+  echo "$r" | grep -q '^RECENT' || { echo "  FAIL dwell RECENT 59s: got=$r"; _df=1; }
+  # STABLE: 60s (boundary)
+  r="$(classify_dwell 60)"
+  echo "$r" | grep -q '^STABLE' || { echo "  FAIL dwell STABLE 60s: got=$r"; _df=1; }
+  # STABLE: 29 min
+  r="$(classify_dwell 1740)"
+  echo "$r" | grep -q '^STABLE' || { echo "  FAIL dwell STABLE 1740s: got=$r"; _df=1; }
+  # CHRONIC: 30 min (boundary)
+  r="$(classify_dwell 1800)"
+  echo "$r" | grep -q '^CHRONIC' || { echo "  FAIL dwell CHRONIC 1800s: got=$r"; _df=1; }
+  # CHRONIC: 24h
+  r="$(classify_dwell 86400)"
+  echo "$r" | grep -q '^CHRONIC' || { echo "  FAIL dwell CHRONIC 86400s: got=$r"; _df=1; }
+  # NEVER: empty
+  r="$(classify_dwell '')"
+  [ "$r" = "NEVER|no event on record" ] || { echo "  FAIL dwell NEVER-empty: got=$r"; _df=1; }
+  # log_motion_event + count_recent_motion_events file-bound fixtures
+  _md="$(mktemp -d)"; _ml="$_md/events"
+  # Idempotent on same-state
+  log_motion_event "$_ml" 100 body-still
+  log_motion_event "$_ml" 200 body-still   # same tag → no new event
+  c="$(wc -l < "$_ml")"
+  [ "$c" = "1" ] || { echo "  FAIL log idempotent: expected 1 line, got $c"; _df=1; }
+  # Different state → new event
+  log_motion_event "$_ml" 300 body-walking
+  c="$(wc -l < "$_ml")"
+  [ "$c" = "2" ] || { echo "  FAIL log different-state: expected 2 lines, got $c"; _df=1; }
+  # 24h pruning: events older than 24h relative to NOW are dropped. Use now=200 so 100/200/300
+  # are within 24h (cutoff=200-86400=-86200), and the new event at epoch -100000 is way before cutoff → dropped.
+  log_motion_event "$_ml" -100000 body-still 200
+  c="$(wc -l < "$_ml")"
+  [ "$c" = "2" ] || { echo "  FAIL log old-different-tag-prune: expected 2 (old pruned), got $c"; _df=1; }
+  # count: 2 events within last 24h (at now=200 — both 100 and 300 are within)
+  c="$(count_recent_motion_events "$_ml" 200 86400)"
+  [ "$c" = "2" ] || { echo "  FAIL count 2 events: got=$c"; _df=1; }
+  rm -rf "$_md"
+  [ "$_df" = 0 ] || { echo "smoke-test: FAIL (dwell + log_motion_event)"; exit 1; }
+  echo "  ok: motion_dwell (10 cases: TRANSITION×2, RECENT×2, STABLE×2, CHRONIC×2, NEVER×1, log+count×3)"
   # --- reachability gate (real-read doctrine: classify-logic is offline above; this confirms the phone) ---
   pip="$(mesh-phone-ip 2>/dev/null)" || { echo "smoke-test: n/a (phone unreachable — all IPs tried); classify-logic ok"; exit 2; }
   if ! timeout 10 ssh -p "${PHONE_SSH_PORT:-8022}" -o BatchMode=yes -o ConnectTimeout=6 \
        -o StrictHostKeyChecking=accept-new "${PHONE_USER:-u0_a380}@$pip" 'command -v termux-sensor' </dev/null >/dev/null 2>&2; then
     echo "smoke-test: n/a (phone unreachable or no termux-sensor); classify-logic ok"; exit 2; fi
-  echo "smoke-test: ok (classify fixtures + reachability)"; exit 0
+  echo "smoke-test: ok (classify fixtures + motion_dwell + reachability)"; exit 0
 fi
 
 raw=0; edge=0; json_mode=0; simulate=""
@@ -294,7 +419,20 @@ new_steps="$(printf '%s' "$key" | cut -f2)"; new_tag="$(printf '%s' "$key" | cut
 
 # state file: skip in simulate mode (a test must not poison the real hysteresis state)
 if [ "$SKIP_STATE_WRITE" = 0 ] && [ -n "${new_steps}${new_tag}" ]; then
-  printf '%s|%s|%s|%s\n' "$new_steps" "$new_tag" "$new_hyst" "$new_pending" > "$STATE"
+  # motion_dwell enrichment: log the new state (idempotent on same-state), compute dwell + 24h count
+  NOW_EPOCH="$(date +%s)"
+  log_motion_event "$MOTION_LOG" "$NOW_EPOCH" "$new_tag"
+  last_event_epoch=""
+  [ -f "$MOTION_LOG" ] && last_event_epoch="$(tail -n 1 "$MOTION_LOG" 2>/dev/null | cut -d'|' -f1)"
+  dwell_s=0
+  if [ -n "$last_event_epoch" ] && [ "$last_event_epoch" -gt 0 ] 2>/dev/null; then
+    dwell_s=$(( NOW_EPOCH - last_event_epoch ))
+  fi
+  changes_24h="$(count_recent_motion_events "$MOTION_LOG" "$NOW_EPOCH" 86400)"
+  # 4-field state (existing parsers) + 2 new fields (additive: a 5th and 6th field reader can
+  # extract `dwell_s` and `changes_24h`; an old 4-field reader ignores them).
+  printf '%s|%s|%s|%s|%s|%s\n' "$new_steps" "$new_tag" "$new_hyst" "$new_pending" "$dwell_s" "$changes_24h" > "$STATE"
+  mesh-state-touch "$STATE"
 fi
 
 if [ "$edge" = 1 ]; then
