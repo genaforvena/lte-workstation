@@ -223,18 +223,27 @@ classify_trend() {
 # Update rolling history for one MAC. Args: mac rssi history_file [now_epoch]
 # Gap-aware: if the device's previous sighting is older than HISTORY_GAP_TTL, the stale pre-gap window
 # is DISCARDED (the device left and came back — its old RSSI is not evidence about where it is now), so
-# the median/trend reflect only the current visit. Every line is (re)written with a last-seen epoch.
+# the median/trend reflect only the current visit. Every line is (re)written with a last-seen epoch
+# AND a session_start epoch (additive 4th field, fidelity 2026-06-28) — when this CONTINUOUS session
+# began. A line rewritten without a gap inherits its prev session_start; a gap-reset stamps now. Purely
+# additive — every existing 3-field reader (cut -d'|' -f3 for last-seen) is unchanged.
 update_rssi_history() {
   local mac="$1" rssi="$2" file="$3" now="${4:-$(date +%s)}"
-  local line prev last
+  local line prev last session_start
   line="$(grep "^${mac}|" "$file" 2>/dev/null | head -1)"
   prev="$(printf '%s' "$line" | cut -d'|' -f2)"
   last="$(printf '%s' "$line" | cut -d'|' -f3)"
+  session_start="$(printf '%s' "$line" | cut -d'|' -f4)"
   case "$last" in ''|*[!0-9]*) last="" ;; esac   # legacy/2-field or corrupt → treat as never-gapped
+  case "$session_start" in ''|*[!0-9]*) session_start="" ;; esac   # legacy/3-field → treated below
   # stale-gap: a sighting older than the gap TTL → drop the pre-gap window, start fresh this visit
   if [ -n "$prev" ] && [ -n "$last" ] && [ "$(( now - last ))" -gt "$HISTORY_GAP_TTL" ]; then
     prev=""
+    session_start=""
   fi
+  # session_start inheritance: a continuous-session device keeps its original start; a gap-reset
+  # (or a legacy 3-field line, or a first-seen device) gets a fresh stamp = now.
+  [ -n "$session_start" ] || session_start="$now"
   local new_csv
   if [ -n "$prev" ]; then
     # append new reading, trim to TREND_WINDOW
@@ -248,8 +257,9 @@ update_rssi_history() {
     new_csv="$rssi"
   fi
   # replace the line, stamping the current sighting time as the additive 3rd field
+  # and the current session's start time as the additive 4th field.
   sed -i "/^${mac}|/d" "$file" 2>/dev/null
-  printf '%s|%s|%s\n' "$mac" "$new_csv" "$now" >> "$file"
+  printf '%s|%s|%s|%s\n' "$mac" "$new_csv" "$now" "$session_start" >> "$file"
 }
 
 # Prune dead MACs from the history: drop any line whose last-seen epoch is older than HISTORY_PRUNE_TTL.
@@ -259,17 +269,29 @@ update_rssi_history() {
 # lingering forever (the pre-stamp backlog was ~1.5k dead lines that would never self-heal, since a
 # rotated random MAC is never seen again to gain an epoch on its own). A migrated line's stale csv is
 # never used for trend unless that MAC reappears (then update_rssi_history's gap-reset handles it).
+# The 4th session_start field (fidelity 2026-06-28) is preserved if present; legacy 3-field lines that
+# get migrate-stamped gain a fresh session_start = now (migrated-stamp treats them as never-seen-before,
+# so the familiarity classifier won't read a 4-month-old session as a 4-month-old "current" presence).
 # Cheap: one awk pass.
 prune_rssi_history() {
   local file="$1" now="${2:-$(date +%s)}" tmp
   [ -f "$file" ] || return 0
   tmp="$(mktemp 2>/dev/null)" || return 0
   if awk -F'|' -v now="$now" -v ttl="$HISTORY_PRUNE_TTL" '
-       { last=$3
-         if (last=="" || last !~ /^[0-9]+$/) { print $1"|"$2"|"now }   # legacy/corrupt → migrate-stamp, keep
-         else if ((now-last) <= ttl)         { print }                  # fresh enough → keep
+       { last=$3; ss=$4
+         if (last=="" || last !~ /^[0-9]+$/) { print $1"|"$2"|"now"|"now } # legacy/corrupt → migrate-stamp + fresh session_start
+         else if ((now-last) <= ttl)         { print $1"|"$2"|"last"|"ss }   # fresh enough → keep (preserve session_start)
          # else: epoch older than the prune TTL → drop
        }' "$file" > "$tmp" 2>/dev/null; then
+    # Migration pass for 3-field (legacy 3-field) lines: any line that has a numeric last-seen but no
+    # 4th session_start field. These need a session_start stamp on the next prune so familiarity
+    # doesn't read a 4-month-old continuous presence as 0s (a 3-field line becomes 4-field with
+    # session_start=$now, treating it as a fresh-session device on the very next read). The migrate
+    # runs SEPARATELY so the per-line prune logic above stays clean.
+    awk -F'|' -v now="$now" '
+      NF==3 && $3 ~ /^[0-9]+$/ { print $1"|"$2"|"$3"|"now; next }
+      { print }
+    ' "$tmp" > "$tmp.2" 2>/dev/null && mv "$tmp.2" "$tmp"
     mv "$tmp" "$file"
   else
     rm -f "$tmp"
@@ -282,6 +304,49 @@ get_trend() {
   local csv
   csv="$(grep "^${mac}|" "$file" 2>/dev/null | head -1 | cut -d'|' -f2)"
   [ -n "$csv" ] && classify_trend "$csv" || echo INITIAL
+}
+
+# ROOM FAMILIARITY (fidelity 2026-06-28): the existing 1-field state captures the CURRENT snapshot
+# (count, churn, trend, attribution, personal_presence) but NOT how long the longest-running device
+# has been continuously present. "All devices are <5min old" (STRANGER — could be a new arrival) and
+# "longest device has been here 4h" (FAMILIAR — settled presence) are physically different room
+# rhythms that the existing fields cannot tell apart. Distinct from `churn` (a per-scan Δ) and
+# `trend` (RSSI direction over the rolling window) — FAMILIARITY is a session-AGE aggregator
+# independent of proximity or movement.
+#
+#   classify_familiarity <max_session_age_s> → STRANGER|MIXED|FAMILIAR|INITIAL
+#     INITIAL    no devices in range (no session to classify)
+#     STRANGER   longest session < 5 min          — recent arrival / unfamiliar / first-seen
+#     MIXED      5 min ≤ session < 30 min         — recently-arrived or transient occupancy
+#     FAMILIAR   session ≥ 30 min                  — long-running presence, settled
+# Bands (FALSIFIABLE: change the 300/1800 thresholds → tests flip). The 5/30 boundaries align with
+# the 5/30 dwell bands used by mesh-tamper and mesh-light so cross-sense vocabulary stays consistent.
+classify_familiarity() {
+  local s="${1:-}"
+  # INITIAL: empty / non-numeric / negative (= no devices in range, the honest no-presence case).
+  # A 0s session is a real stranger (arrived in the current second), whereas negative (-1) means no devices.
+  if [ -z "$s" ] || ! [ "$s" -ge 0 ] 2>/dev/null; then echo "INITIAL|no devices in range"; return; fi
+  if [ "$s" -lt 300 ];  then echo "STRANGER|<5min (recent arrival)"; return; fi
+  if [ "$s" -lt 1800 ]; then echo "MIXED|5-30min (transient presence)"; return; fi
+  echo "FAMILIAR|30min+ (settled presence)"
+}
+
+# session_max_age <history_file> <now_epoch> → echoes integer seconds, the maximum session age among
+# devices CURRENTLY seen in this scan (i.e. live within the gap TTL). A device with last-seen older
+# than the gap TTL is in a separate, earlier session — its session_start is preserved in the file but
+# does NOT count toward the "longest running device RIGHT NOW" measure (would manufacture a stale
+# 4h-old "FAMILIAR" from a device that left an hour ago). Pure, file-bound.
+session_max_age() {
+  local f="$1" now="$2"
+  [ -f "$f" ] || { echo -1; return; }
+  awk -F'|' -v now="$now" -v gap="$HISTORY_GAP_TTL" '
+    BEGIN { max = -1 }
+    $4 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ {
+      if ((now - $3) > gap) next         # not currently in a session (left + hasnt returned yet)
+      age = now - $4
+      if (age > max) max = age
+    }
+    END { print max }' "$f"
 }
 
 # Person-attributability split (2026-06-21): the appliance-vs-person trap — a TV/speaker/beacon
@@ -471,7 +536,54 @@ if [ "${1:-}" = --test ]; then
   # No personal + only APPLIANCE-attribution — no person-zone signal
   [ "$(classify_personal_presence 0 0 0 0 0 0 0 3)" = APPLIANCE ]   || { echo "  FAIL: n>0, no personal, no ambiguous should be APPLIANCE"; _f=1; }
   [ "$_f" = 0 ] || { echo "smoke-test: FAIL"; exit 1; }
-  echo "smoke-test: ok (BT ready + proximity:5 + median-smooth:4 + qualify-empty:3 + wedge-empty:5 + trend:5 + rolling-history:3 + gap-aware+prune:6 + attribution:8 + classify-cli:5 + addrtype-cli:3 + addrtype:5 + attr×addrtype-fusion:6 + personal-presence:10 assertions)"; exit 0
+  # --- FAMILIARITY classifier + session_max_age (fidelity 2026-06-28) ---
+  # FALSIFIABLE: change the 300/1800 thresholds → these flip.
+  _ff=0
+  # INITIAL: no devices (s=-1)
+  r="$(classify_familiarity -1)"
+  echo "$r" | grep -q '^INITIAL' || { echo "  FAIL familiarity INITIAL -1s: got=$r"; _ff=1; }
+  # STRANGER: 0s (device arrived this second)
+  r="$(classify_familiarity 0)"
+  echo "$r" | grep -q '^STRANGER' || { echo "  FAIL familiarity STRANGER 0s: got=$r"; _ff=1; }
+  # INITIAL: empty / non-numeric
+  r="$(classify_familiarity '')"
+  echo "$r" | grep -q '^INITIAL' || { echo "  FAIL familiarity INITIAL empty: got=$r"; _ff=1; }
+  # STRANGER: 299s (just under 5min boundary)
+  r="$(classify_familiarity 299)"
+  echo "$r" | grep -q '^STRANGER' || { echo "  FAIL familiarity STRANGER 299s: got=$r"; _ff=1; }
+  # STRANGER: 60s
+  r="$(classify_familiarity 60)"
+  echo "$r" | grep -q '^STRANGER' || { echo "  FAIL familiarity STRANGER 60s: got=$r"; _ff=1; }
+  # MIXED: 300s (boundary)
+  r="$(classify_familiarity 300)"
+  echo "$r" | grep -q '^MIXED' || { echo "  FAIL familiarity MIXED 300s: got=$r"; _ff=1; }
+  # MIXED: 1500s
+  r="$(classify_familiarity 1500)"
+  echo "$r" | grep -q '^MIXED' || { echo "  FAIL familiarity MIXED 1500s: got=$r"; _ff=1; }
+  # FAMILIAR: 1800s (boundary)
+  r="$(classify_familiarity 1800)"
+  echo "$r" | grep -q '^FAMILIAR' || { echo "  FAIL familiarity FAMILIAR 1800s: got=$r"; _ff=1; }
+  # FAMILIAR: 86400s (24h)
+  r="$(classify_familiarity 86400)"
+  echo "$r" | grep -q '^FAMILIAR' || { echo "  FAIL familiarity FAMILIAR 86400s: got=$r"; _ff=1; }
+  # session_max_age: pure, file-bound. Build a synthetic history file.
+  _ftd="$(mktemp -d)"; _fhf="$_ftd/h"; _fnow=1000000000
+  # One device with session_start = now-300, last_seen = now-30 → currently-in-session, age=300
+  printf 'AA:BB:CC:DD:EE:01|-50,-50|%d|%d\n' $((_fnow-30)) $((_fnow-300)) > "$_fhf"
+  # A second device, session_start = now-4000, last_seen = now-5000 (>gap TTL=1800) → NOT current
+  printf 'BB:CC:DD:EE:FF:02|-50|%d|%d\n' $((_fnow-5000)) $((_fnow-4000)) >> "$_fhf"
+  # A third device, session_start = now-200, last_seen = now → current, age=200
+  printf 'CC:DD:EE:FF:00:03|-50|%d|%d\n' "$_fnow" $((_fnow-200)) >> "$_fhf"
+  _mx="$(session_max_age "$_fhf" "$_fnow")"
+  [ "$_mx" = "300" ] || { echo "  FAIL session_max_age: max of (300, 200)=300, got=$_mx"; _ff=1; }
+  rm -rf "$_ftd"
+  # Empty history file → -1
+  _etd="$(mktemp -d)"; _ehf="$_etd/h"
+  _em="$(session_max_age "$_ehf" "$_fnow")"
+  [ "$_em" = "-1" ] || { echo "  FAIL session_max_age: empty file → -1, got=$_em"; _ff=1; }
+  rm -rf "$_etd"
+  [ "$_ff" = 0 ] || { echo "smoke-test: FAIL (familiarity + session_max_age assertions)"; exit 1; }
+  echo "smoke-test: ok (BT ready + proximity:5 + median-smooth:4 + qualify-empty:3 + wedge-empty:5 + trend:5 + rolling-history:3 + gap-aware+prune:6 + attribution:8 + classify-cli:5 + addrtype-cli:3 + addrtype:5 + attr×addrtype-fusion:6 + personal-presence:10 + familiarity:8 + session_max_age:2 assertions)"; exit 0
 fi
 # --classify <name> [addrtype:public|random|unknown]: pure name→class lookup
 # (PERSONAL|APPLIANCE|AMBIGUOUS), NO BLE scan. Single source of the person-vs-appliance classifier so
@@ -694,6 +806,11 @@ fi
 
 DEV_STATE="$MESH/.presence-devices"
 prev_macs="$(cat "$DEV_STATE" 2>/dev/null || true)"
+
+# ROOM FAMILIARITY: compute the longest CURRENT session (devices live within HISTORY_GAP_TTL)
+# AFTER the history update + prune (prune ran above at line ~661), so stale lines are gone.
+# session_max_s=0 is the honest "no devices in range" case → classify_familiarity returns INITIAL.
+session_max_s="$(session_max_age "$TREND_FILE" "$NOW")"
 curr_macs="$(printf '%s' "$sorted" | sed '/^$/d' | cut -d'|' -f2 | sort -u)"
 new_count=0; gone_count=0; stable_count=0
 while IFS= read -r mac; do
@@ -710,7 +827,7 @@ while IFS= read -r mac; do
 done <<< "$prev_macs"
 printf '%s\n' "$curr_macs" > "$DEV_STATE"
 
-printf 'count=%d strongest=%s(%s) types=%s proximity=%s churn=new:%d,gone:%d,stable:%d trend=approaching:%d,receding:%d,stable:%d,initial:%d attribution=personal:%d,appliance:%d,ambiguous:%d unidentified=public:%d,random:%d,unknown:%d personal_presence=%s\n' \
+printf 'count=%d strongest=%s(%s) types=%s proximity=%s churn=new:%d,gone:%d,stable:%d trend=approaching:%d,receding:%d,stable:%d,initial:%d attribution=personal:%d,appliance:%d,ambiguous:%d unidentified=public:%d,random:%d,unknown:%d personal_presence=%s familiarity=%s session_max_s=%d\n' \
   "$n" "${strongest_name:-none}" "${strongest_rssi:-0}" "${summary_types:-none}" \
   "${summary_proximity:-none}" "$new_count" "$gone_count" "$stable_count" \
   "$trend_approaching" "$trend_receding" "$trend_stable" "$trend_initial" \
@@ -718,9 +835,11 @@ printf 'count=%d strongest=%s(%s) types=%s proximity=%s churn=new:%d,gone:%d,sta
   "$unid_public" "$unid_random" "$unid_unknown" \
   "$(classify_personal_presence "$trend_pers_approaching" "$trend_pers_receding" \
      "$trend_pers_stable" "$trend_pers_initial" "$prox_pers_near" "$prox_pers_far" \
-     "$attr_ambiguous" "$n")" > "$MESH/.presence-state"
+     "$attr_ambiguous" "$n")" \
+  "$(classify_familiarity "$session_max_s" | cut -d'|' -f1)" \
+  "$session_max_s" > "$MESH/.presence-state"
 
 echo "---"
-echo "inventory: $n devices | strongest: ${strongest_name:-none} (${strongest_rssi:-0} dBm) | types: ${summary_types:-none} | proximity: ${summary_proximity:-none} | churn: new=${new_count} gone=${gone_count} stable=${stable_count} | trend: approaching=${trend_approaching} receding=${trend_receding} stable=${trend_stable} initial=${trend_initial} | attribution: personal=${attr_personal} appliance=${attr_appliance} ambiguous=${attr_ambiguous} | unidentified: public=${unid_public} random=${unid_random} unknown=${unid_unknown} | personal_presence: $(classify_personal_presence "$trend_pers_approaching" "$trend_pers_receding" "$trend_pers_stable" "$trend_pers_initial" "$prox_pers_near" "$prox_pers_far" "$attr_ambiguous" "$n") (pers-trend: approaching=${trend_pers_approaching} receding=${trend_pers_receding} stable=${trend_pers_stable} initial=${trend_pers_initial}; pers-prox: near=${prox_pers_near} far=${prox_pers_far})"
+echo "inventory: $n devices | strongest: ${strongest_name:-none} (${strongest_rssi:-0} dBm) | types: ${summary_types:-none} | proximity: ${summary_proximity:-none} | churn: new=${new_count} gone=${gone_count} stable=${stable_count} | trend: approaching=${trend_approaching} receding=${trend_receding} stable=${trend_stable} initial=${trend_initial} | attribution: personal=${attr_personal} appliance=${attr_appliance} ambiguous=${attr_ambiguous} | unidentified: public=${unid_public} random=${unid_random} unknown=${unid_unknown} | personal_presence: $(classify_personal_presence "$trend_pers_approaching" "$trend_pers_receding" "$trend_pers_stable" "$trend_pers_initial" "$prox_pers_near" "$prox_pers_far" "$attr_ambiguous" "$n") (pers-trend: approaching=${trend_pers_approaching} receding=${trend_pers_receding} stable=${trend_pers_stable} initial=${trend_pers_initial}; pers-prox: near=${prox_pers_near} far=${prox_pers_far}) | familiarity: $(classify_familiarity "$session_max_s") (session_max_s=$session_max_s)"
 
 exit 0
