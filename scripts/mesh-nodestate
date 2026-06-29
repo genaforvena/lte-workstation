@@ -18,10 +18,19 @@
 # answers, the phone reads `online` — closing the false-negative that read 'body dark' over live sensors.
 # MESH_NODESTATE_CORROBORATE=0 restores pure-parse (flag-only) behavior; MESH_NODESTATE_PING_CMD=<cmd>
 # overrides the corroboration probe (<cmd> <ip>, exit 0=alive) — used by --test and for ssh-corroborate.
+# OTP fault-tolerance study hook (2026-06-29): Erlang-style neighbours need a periodic ping that
+# updates a local status table, not just a transient printed roster. `--ping` performs the same
+# corroborated liveness read as state mode and appends one JSONL row per node to
+# ~/.mesh/node-status.jsonl (override MESH_NODESTATUS_TABLE). This gives other reflexes a durable
+# neighbour table while keeping the existing `mesh-nodestate` stream output unchanged.
 #   mesh-nodestate          print the roster (state)
+#   mesh-nodestate --ping   ping all neighbours and update the local JSONL status table
 #   mesh-nodestate --ghosts list duplicate (ghost) tailnet registrations — a hygiene check
 #   mesh-nodestate --test   smoke
 set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+MESH="${MESH_DIR:-$HOME/.mesh}"
+STATUS_TABLE="${MESH_NODESTATUS_TABLE:-$MESH/node-status.jsonl}"
 [ "${1:-}" = --test ] && {
   command -v tailscale >/dev/null 2>&1 || { echo "smoke-test: FAIL (no tailscale)"; exit 1; }
   command -v python3   >/dev/null 2>&1 || { echo "smoke-test: FAIL (no python3)"; exit 1; }
@@ -74,12 +83,29 @@ set -uo pipefail
   { [ "$ps1" = online ] && [ "$pr1" = 0 ]; } || { echo "smoke-test: FAIL (--state phone LAN-live must be online exit 0 — got '$ps1' rc=$pr1)"; exit 1; }
   ps2="$(MESH_PHONE_LAN_PROBE="$_td/phdark" bash "$0" --state 'Redmi 10' 2>/dev/null)"; pr2=$?
   { [ "$ps2" = offline ] && [ "$pr2" = 1 ]; } || { echo "smoke-test: FAIL (--state phone dark must be offline exit 1 — got '$ps2' rc=$pr2)"; exit 1; }
+  # (e) --ping: periodic neighbour-ping operation writes a durable status table row per node.
+  MESH_NODESTATUS_TABLE="$_td/node-status.jsonl" MESH_NODESTATE_CORROBORATE=1 MESH_NODESTATE_PING_CMD="$_td/pingfail" MESH_PHONE_LAN_PROBE="$_td/phdark" bash "$0" --ping >/tmp/.mesh-nodestate-ping.out 2>/dev/null \
+    || { echo "smoke-test: FAIL (--ping errored)"; exit 1; }
+  STATUS_TABLE="$_td/node-status.jsonl"
+  [ -s "$STATUS_TABLE" ] || { echo "smoke-test: FAIL (--ping did not write status table)"; exit 1; }
+  python3 - "$STATUS_TABLE" <<'PYEOF' || exit 1
+import json,sys
+rows=[json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+states={r["node"]:r["state"] for r in rows}
+assert states.get("my-node")=="online", states
+assert states.get("Redmi 10")=="offline", states
+assert states.get("bob")=="offline", states
+for r in rows:
+    assert "ts" in r and "ip" in r and "ts_online" in r and "self" in r
+PYEOF
   rm -rf "$_td"
   trap '' EXIT
-  echo "smoke-test: ok (online-wins dedup + ghost detection + lease-corroboration + --state query verified)"; exit 0
+  echo "smoke-test: ok (online-wins dedup + ghost detection + lease-corroboration + --state query + --ping status table verified)"; exit 0
 }
 MODE="${1:-state}"
 CORROB="${MESH_NODESTATE_CORROBORATE:-1}"; PINGCMD="${MESH_NODESTATE_PING_CMD:-}"
+
+ts_now(){ date -u +%FT%TZ; }
 
 # Fresh corroboration probe — a LIVE check, never a cached flag. Default = one quick ICMP ping
 # (overridable to an ssh/announce-lease probe via MESH_NODESTATE_PING_CMD).
@@ -102,6 +128,41 @@ phone_lan_live() {  # 0 = phone answers a real SSH probe on TS or LAN (8022/u0_a
     phone_reachable_ip >/dev/null 2>&1 )
 }
 
+emit_rows() {
+  tailscale status --json 2>/dev/null | python3 -c "
+import json,sys
+try: d=json.load(sys.stdin)
+except Exception: sys.exit(0)
+seen={}   # host -> [(online, ip, isself)]
+def add(h,on,ips,me=False):
+    ip=(ips or [None])
+    seen.setdefault(h,[]).append((bool(on), ip[0] if ip else None, me))
+s=d.get('Self',{})
+if s: add(s.get('HostName','self'), s.get('Online'), s.get('TailscaleIPs'), True)
+for p in (d.get('Peer') or {}).values():
+    if 'tag:lte-node' in (p.get('Tags') or []): add(p.get('HostName','?'), p.get('Online'), p.get('TailscaleIPs'))
+for h in sorted(seen):
+    es=seen[h]; online=any(e[0] for e in es); isself=any(e[2] for e in es)
+    ip=next((e[1] for e in es if e[0] and e[1]), None) or next((e[1] for e in es if e[1]), '')
+    print('%s\t%s\t%d\t%d' % (h, ip or '', 1 if online else 0, 1 if isself else 0))
+"
+}
+
+classify_row() {  # host ip tson isself -> echo state
+  local host="$1" ip="$2" tson="$3" isself="$4"
+  if [ "$tson" != 1 ]; then
+    if phone_lan_live "$host"; then echo online; else echo offline; fi
+  elif [ "$isself" = 1 ]; then
+    echo online
+  elif [ "$CORROB" != 1 ]; then
+    echo online
+  elif corrob "$ip"; then
+    echo online
+  else
+    echo stale
+  fi
+}
+
 if [ "$MODE" = --ghosts ]; then
   tailscale status --json 2>/dev/null | python3 -c "
 import json,sys
@@ -116,6 +177,40 @@ for p in (d.get('Peer') or {}).values():
 for h,flags in sorted(seen.items()):
     if len(flags)>1: print('%s: %d registrations %s' % (h, len(flags), flags))
 "
+  exit 0
+fi
+
+if [ "$MODE" = --ping ]; then
+  mkdir -p "$(dirname "$STATUS_TABLE")"
+  tmp="$(mktemp "${STATUS_TABLE}.XXXXXX")" || exit 1
+  now="$(ts_now)"
+  found=0
+  while IFS=$'\t' read -r host ip tson isself; do
+    [ -z "$host" ] && continue
+    state="$(classify_row "$host" "$ip" "$tson" "$isself")"
+    python3 - "$now" "$host" "$ip" "$tson" "$isself" "$state" >> "$tmp" <<'PYEOF'
+import json,sys
+ts,node,ip,tson,isself,state=sys.argv[1:7]
+print(json.dumps({
+  "ts": ts,
+  "node": node,
+  "ip": ip,
+  "ts_online": tson == "1",
+  "self": isself == "1",
+  "state": state,
+}, sort_keys=True))
+PYEOF
+    printf '%s: %s\n' "$host" "$state"
+    found=1
+  done < <(emit_rows)
+  if [ "$found" = 1 ]; then
+    cat "$tmp" >> "$STATUS_TABLE"
+    rm -f "$tmp"
+  else
+    rm -f "$tmp"
+    echo "mesh-nodestate: no nodes to ping" >&2
+    exit 2
+  fi
   exit 0
 fi
 
@@ -153,30 +248,7 @@ fi
 
 # state mode: python emits 'host\tip\ttsonline\tisself' (online-wins; ip from an online entry);
 # bash then CORROBORATES each Tailscale-online peer with a fresh probe before calling it online.
-tailscale status --json 2>/dev/null | python3 -c "
-import json,sys
-try: d=json.load(sys.stdin)
-except Exception: sys.exit(0)
-seen={}   # host -> [(online, ip, isself)]
-def add(h,on,ips,me=False):
-    ip=(ips or [None])
-    seen.setdefault(h,[]).append((bool(on), ip[0] if ip else None, me))
-s=d.get('Self',{})
-if s: add(s.get('HostName','self'), s.get('Online'), s.get('TailscaleIPs'), True)
-for p in (d.get('Peer') or {}).values():
-    if 'tag:lte-node' in (p.get('Tags') or []): add(p.get('HostName','?'), p.get('Online'), p.get('TailscaleIPs'))
-for h in sorted(seen):
-    es=seen[h]; online=any(e[0] for e in es); isself=any(e[2] for e in es)
-    ip=next((e[1] for e in es if e[0] and e[1]), None) or next((e[1] for e in es if e[1]), '')
-    print('%s\t%s\t%d\t%d' % (h, ip or '', 1 if online else 0, 1 if isself else 0))
-" | while IFS=$'\t' read -r host ip tson isself; do
+emit_rows | while IFS=$'\t' read -r host ip tson isself; do
   [ -z "$host" ] && continue
-  if [ "$tson" != 1 ]; then                                               # Tailscale not Online ...
-    if phone_lan_live "$host"; then echo "$host: online"               # ... but the phone is LAN-reachable
-    else echo "$host: offline"; fi
-    continue
-  fi
-  if [ "$isself" = 1 ]; then echo "$host: online"; continue; fi          # we're executing here = alive
-  if [ "$CORROB" != 1 ]; then echo "$host: online"; continue; fi          # pure-parse escape hatch
-  if corrob "$ip"; then echo "$host: online"; else echo "$host: stale"; fi  # corroborate the cached flag
+  echo "$host: $(classify_row "$host" "$ip" "$tson" "$isself")"
 done
