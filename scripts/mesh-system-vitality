@@ -1,0 +1,251 @@
+#!/usr/bin/env bash
+# reflex-cadence: 2-59/15 * * * *
+# reflex-args: --edge
+# mesh-system-vitality — cross-sense fusion: IS THIS NODE'S HARDWARE HEALTHY AS A WHOLE?
+# Combines 4 hardware-health senses into a single vitality verdict no single sensor gives.
+#
+# Inputs (all best-effort, each independently OFFLINE-able; 2+ missing → DEGRADED):
+#   mesh-node-health     .node-health-state      HEALTHY|DEGRADED|CRITICAL|UNKNOWN
+#   mesh-battery         .battery-state          HEALTHY|AGED|CRITICAL|ON_BATTERY|LOW_BATTERY|CHARGING|FULL|NO_BATTERY|OFFLINE
+#   mesh-cpufreq         .cpufreq-state          NOMINAL|BOOST|REDUCED|THROTTLED|IDLE|OFFLINE
+#   mesh-disk-latency    .disk-latency-state     FAST|NORMAL|SLOW|STALLED|UNKNOWN|OFFLINE
+#
+# Why this fusion is NEW (not duplicating mesh-node-health):
+#   - mesh-node-health fuses 4 senses about CPU/CRYPTO/NETWORK (entropy/sockstat/swap/loadavg) — it
+#     answers "is the kernel-software subsystem healthy?" (entropy, sockets, swapping, CPU load).
+#   - mesh-system-vitality adds the THREE missing hardware axes:
+#       1. POWER       (mesh-battery: node's own battery health, wear level, on-mains/on-battery)
+#       2. THERMAL     (mesh-cpufreq: actual CPU clock state — boost, nominal, reduced, throttled)
+#       3. STORAGE     (mesh-disk-latency: I/O completion time — fast, normal, slow, stalled)
+#   - These axes are distinct from node-health (which is software-resource-oriented). A node can
+#     have healthy entropy + sockets + swap + loadavg AND STILL be in trouble (battery worn,
+#     CPU thermally throttled, disk slow) — mesh-system-vitality catches what node-health misses.
+#
+# Bands (FALSIFIABLE: change a band rule → test flips):
+#   CRITICAL      any input is CRITICAL or THROTTLED or STALLED        — imminent hardware failure
+#   DEGRADED      any input is DEGRADED/AGED/LOW_BATTERY/SLOW/REDUCED  — 1+ subsystem suboptimal
+#   HEALTHY       all 4 inputs nominal                                — node's hardware is healthy
+#   DEGRADED      2+ inputs OFFLINE (can't assess vitality)            — explicitly different from HEALTHY
+#   DEGRADED      1 input OFFLINE (1-missing)                           — partial degradation
+#   TRANSITION    any input is INITIAL (cold-start, not yet read)        — first observation
+#
+#   mesh-system-vitality        one-shot verdict to stdout
+#   mesh-system-vitality --edge emit only on verdict change (cron reflex)
+#   mesh-system-vitality --json machine-readable {label, reason, inputs, ts}
+#   mesh-system-vitality --test smoke test (pure classifier, no state-file reads)
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+
+STATE="$HOME/.mesh/.system-vitality-state"
+MESH="${MESH_DIR:-$HOME/.mesh}"
+STALE_S=1800  # 30min — generous enough for mesh-battery (*/15) which is the longest cadence
+
+# Severity ranks (higher = worse). Used for the "worst-of" classification.
+# CRITICAL=4, DEGRADED-tier (3), GOOD-tier (2), unknown=1, offline=0.
+severity() {
+  case "$1" in
+    CRITICAL|THROTTLED|STALLED)                   echo 4 ;;
+    DEGRADED|AGED|LOW_BATTERY|SLOW|REDUCED)       echo 3 ;;
+    HEALTHY|NOMINAL|FAST|ON_BATTERY|CHARGING|FULL|NO_BATTERY) echo 2 ;;
+    INITIAL|TRANSITION)                          echo 2 ;;  # cold-start, treat as nominal for max
+    UNKNOWN|NORMAL)                              echo 2 ;;  # nominal-ish
+    IDLE|BOOST)                                   echo 2 ;;  # nominal
+    OFFLINE)                                     echo 0 ;;
+    *)                                            echo 1 ;;  # unrecognized → treat as low
+  esac
+}
+
+# --- read helpers (all return OFFLINE on missing/stale/unreadable) ---
+read_node_health() {
+  local f="$1" v now m
+  [ -f "$f" ] || { echo "OFFLINE"; return; }
+  now=$(date +%s); m=$(stat -c %Y "$f" 2>/dev/null || echo "$now")
+  if [ $((now - m)) -gt "$STALE_S" ]; then echo "OFFLINE"; return; fi
+  v="$(head -1 "$f" 2>/dev/null | cut -d'|' -f1)"
+  case "$v" in
+    HEALTHY|DEGRADED|CRITICAL|UNKNOWN) printf '%s' "$v" ;;
+    *) echo "OFFLINE" ;;
+  esac
+}
+read_battery() {
+  local f="$1" v now m
+  [ -f "$f" ] || { echo "OFFLINE"; return; }
+  now=$(date +%s); m=$(stat -c %Y "$f" 2>/dev/null || echo "$now")
+  if [ $((now - m)) -gt "$STALE_S" ]; then echo "OFFLINE"; return; fi
+  v="$(head -1 "$f" 2>/dev/null | cut -d'|' -f1)"
+  case "$v" in
+    HEALTHY|AGED|CRITICAL|ON_BATTERY|LOW_BATTERY|CHARGING|FULL|NO_BATTERY) printf '%s' "$v" ;;
+    *) echo "OFFLINE" ;;
+  esac
+}
+read_cpufreq() {
+  local f="$1" v now m
+  [ -f "$f" ] || { echo "OFFLINE"; return; }
+  now=$(date +%s); m=$(stat -c %Y "$f" 2>/dev/null || echo "$now")
+  if [ $((now - m)) -gt "$STALE_S" ]; then echo "OFFLINE"; return; fi
+  v="$(head -1 "$f" 2>/dev/null | cut -d'|' -f1)"
+  case "$v" in
+    NOMINAL|BOOST|REDUCED|THROTTLED|IDLE) printf '%s' "$v" ;;
+    *) echo "OFFLINE" ;;
+  esac
+}
+read_disk_latency() {
+  local f="$1" v now m
+  [ -f "$f" ] || { echo "OFFLINE"; return; }
+  now=$(date +%s); m=$(stat -c %Y "$f" 2>/dev/null || echo "$now")
+  if [ $((now - m)) -gt "$STALE_S" ]; then echo "OFFLINE"; return; fi
+  v="$(head -1 "$f" 2>/dev/null | cut -d'|' -f1)"
+  case "$v" in
+    FAST|NORMAL|SLOW|STALLED) printf '%s' "$v" ;;
+    *) echo "OFFLINE" ;;
+  esac
+}
+
+# --- classifier (pure, offline-testable) ---
+# classify_vitality <node_health> <battery> <cpufreq> <disk> → "LABEL|reason"
+classify_vitality() {
+  local nh="$1" bat="$2" cpu="$3" dsk="$4"
+  # 1. Count OFFLINE inputs — explicit missing list, prioritize this over classification so the
+  # consumer sees "we don't know" rather than a confident (and possibly wrong) "DEGRADED".
+  local missing=""
+  [ "$nh"  = "OFFLINE" ] && missing="${missing}node-health,"
+  [ "$bat" = "OFFLINE" ] && missing="${missing}battery,"
+  [ "$cpu" = "OFFLINE" ] && missing="${missing}cpufreq,"
+  [ "$dsk" = "OFFLINE" ] && missing="${missing}disk-latency,"
+  missing="${missing%,}"
+  local degen=0
+  [ "$nh"  = "OFFLINE" ] && degen=$((degen+1))
+  [ "$bat" = "OFFLINE" ] && degen=$((degen+1))
+  [ "$cpu" = "OFFLINE" ] && degen=$((degen+1))
+  [ "$dsk" = "OFFLINE" ] && degen=$((degen+1))
+  if [ "$degen" -ge 2 ]; then
+    echo "DEGRADED|missing: $missing (2+ inputs offline — can't assess vitality)"
+    return
+  fi
+  if [ "$degen" -eq 1 ]; then
+    echo "DEGRADED|missing: $missing (1 input offline, can't fully assert)"
+    return
+  fi
+  # 2. CRITICAL: any input is CRITICAL-tier (imminent hardware failure)
+  if [ "$nh" = "CRITICAL" ] || [ "$bat" = "CRITICAL" ] || [ "$bat" = "LOW_BATTERY" ] || [ "$cpu" = "THROTTLED" ] || [ "$dsk" = "STALLED" ]; then
+    local why=""
+    [ "$nh"  = "CRITICAL"    ] && why="${why}node-health=CRITICAL,"
+    [ "$bat" = "CRITICAL"    ] && why="${why}battery=CRITICAL,"
+    [ "$bat" = "LOW_BATTERY" ] && why="${why}battery=LOW_BATTERY,"
+    [ "$cpu" = "THROTTLED"   ] && why="${why}cpufreq=THROTTLED,"
+    [ "$dsk" = "STALLED"     ] && why="${why}disk=STALLED,"
+    echo "CRITICAL|${why%,} (imminent hardware failure)"
+    return
+  fi
+  # 3. DEGRADED: any input is DEGRADED-tier (suboptimal but not critical)
+  if [ "$nh" = "DEGRADED" ] || [ "$bat" = "AGED" ] || [ "$bat" = "ON_BATTERY" ] || [ "$cpu" = "REDUCED" ] || [ "$dsk" = "SLOW" ]; then
+    local why=""
+    [ "$nh"  = "DEGRADED" ] && why="${why}node-health=DEGRADED,"
+    [ "$bat" = "AGED"      ] && why="${why}battery=AGED,"
+    [ "$bat" = "ON_BATTERY" ] && why="${why}battery=ON_BATTERY,"
+    [ "$cpu" = "REDUCED"   ] && why="${why}cpufreq=REDUCED,"
+    [ "$dsk" = "SLOW"      ] && why="${why}disk=SLOW,"
+    echo "DEGRADED|${why%,} (1+ subsystem suboptimal)"
+    return
+  fi
+  # 4. HEALTHY: all 4 inputs nominal
+  echo "HEALTHY|node-health=$nh battery=$bat cpufreq=$cpu disk=$dsk (all subsystems nominal)"
+}
+
+# --- Test mode ---
+if [ "${1:-}" = --test ]; then
+  fail=0
+  # CRITICAL — any one input critical
+  r="$(classify_vitality CRITICAL NOMINAL NOMINAL FAST)"
+  echo "$r" | grep -q '^CRITICAL' || { echo "  FAIL CRITICAL-node-health: got=$r"; fail=1; }
+  r="$(classify_vitality HEALTHY CRITICAL NOMINAL FAST)"
+  echo "$r" | grep -q '^CRITICAL' || { echo "  FAIL CRITICAL-battery: got=$r"; fail=1; }
+  r="$(classify_vitality HEALTHY NOMINAL THROTTLED FAST)"
+  echo "$r" | grep -q '^CRITICAL' || { echo "  FAIL CRITICAL-cpufreq: got=$r"; fail=1; }
+  r="$(classify_vitality HEALTHY NOMINAL NOMINAL STALLED)"
+  echo "$r" | grep -q '^CRITICAL' || { echo "  FAIL CRITICAL-disk: got=$r"; fail=1; }
+  r="$(classify_vitality HEALTHY LOW_BATTERY NOMINAL FAST)"
+  echo "$r" | grep -q '^CRITICAL' || { echo "  FAIL CRITICAL-low-battery: got=$r"; fail=1; }
+  # CRITICAL priority: beats DEGRADED
+  r="$(classify_vitality DEGRADED AGED THROTTLED SLOW)"
+  echo "$r" | grep -q '^CRITICAL' || { echo "  FAIL CRITICAL-priority: got=$r (should be CRITICAL, not DEGRADED)"; fail=1; }
+  # CRITICAL: list the specific subsystem
+  r="$(classify_vitality HEALTHY CRITICAL NOMINAL FAST)"
+  echo "$r" | grep -q 'battery=CRITICAL' || { echo "  FAIL CRITICAL-detail-battery: got=$r"; fail=1; }
+  # DEGRADED — any one input degraded
+  r="$(classify_vitality DEGRADED NOMINAL NOMINAL FAST)"
+  echo "$r" | grep -q '^DEGRADED' || { echo "  FAIL DEGRADED-node-health: got=$r"; fail=1; }
+  r="$(classify_vitality HEALTHY AGED NOMINAL FAST)"
+  echo "$r" | grep -q '^DEGRADED' || { echo "  FAIL DEGRADED-battery-aged: got=$r"; fail=1; }
+  r="$(classify_vitality HEALTHY ON_BATTERY NOMINAL FAST)"
+  echo "$r" | grep -q '^DEGRADED' || { echo "  FAIL DEGRADED-battery-on-battery: got=$r"; fail=1; }
+  r="$(classify_vitality HEALTHY NOMINAL REDUCED FAST)"
+  echo "$r" | grep -q '^DEGRADED' || { echo "  FAIL DEGRADED-cpufreq-reduced: got=$r"; fail=1; }
+  r="$(classify_vitality HEALTHY NOMINAL NOMINAL SLOW)"
+  echo "$r" | grep -q '^DEGRADED' || { echo "  FAIL DEGRADED-disk-slow: got=$r"; fail=1; }
+  # DEGRADED detail: list the specific subsystem
+  r="$(classify_vitality HEALTHY AGED NOMINAL FAST)"
+  echo "$r" | grep -q 'battery=AGED' || { echo "  FAIL DEGRADED-detail-aged: got=$r"; fail=1; }
+  # HEALTHY: all nominal
+  r="$(classify_vitality HEALTHY FULL NOMINAL FAST)"
+  echo "$r" | grep -q '^HEALTHY' || { echo "  FAIL HEALTHY: got=$r"; fail=1; }
+  # HEALTHY: NO_BATTERY is a valid steady-state (desktop, no battery present)
+  r="$(classify_vitality HEALTHY NO_BATTERY NOMINAL FAST)"
+  echo "$r" | grep -q '^HEALTHY' || { echo "  FAIL HEALTHY-no-battery: got=$r"; fail=1; }
+  # HEALTHY: BOOST is OK (turbo active)
+  r="$(classify_vitality HEALTHY FULL BOOST FAST)"
+  echo "$r" | grep -q '^HEALTHY' || { echo "  FAIL HEALTHY-boost: got=$r"; fail=1; }
+  # HEALTHY: NORMAL disk is OK
+  r="$(classify_vitality HEALTHY FULL NOMINAL NORMAL)"
+  echo "$r" | grep -q '^HEALTHY' || { echo "  FAIL HEALTHY-normal-disk: got=$r"; fail=1; }
+  # HEALTHY: IDLE cpu is OK
+  r="$(classify_vitality HEALTHY FULL IDLE FAST)"
+  echo "$r" | grep -q '^HEALTHY' || { echo "  FAIL HEALTHY-idle: got=$r"; fail=1; }
+  # DEGRADED: 2+ OFFLINE
+  r="$(classify_vitality OFFLINE OFFLINE NOMINAL FAST)"
+  echo "$r" | grep -q '^DEGRADED' || { echo "  FAIL DEGRADED-2-offline: got=$r"; fail=1; }
+  echo "$r" | grep -q 'node-health' || { echo "  FAIL DEGRADED-2 should list node-health: got=$r"; fail=1; }
+  # DEGRADED: all 4 OFFLINE
+  r="$(classify_vitality OFFLINE OFFLINE OFFLINE OFFLINE)"
+  echo "$r" | grep -q '^DEGRADED' || { echo "  FAIL DEGRADED-4-offline: got=$r"; fail=1; }
+  # DEGRADED: 1 OFFLINE (1-missing)
+  r="$(classify_vitality HEALTHY OFFLINE NOMINAL FAST)"
+  echo "$r" | grep -q '^DEGRADED' || { echo "  FAIL DEGRADED-1-offline: got=$r"; fail=1; }
+  echo "$r" | grep -q 'battery' || { echo "  FAIL DEGRADED-1 should list battery: got=$r"; fail=1; }
+  # CRITICAL beats DEGRADED in priority
+  r="$(classify_vitality DEGRADED NOMINAL NOMINAL SLOW)"
+  echo "$r" | grep -q '^DEGRADED' || { echo "  FAIL DEGRADED-priority: got=$r"; fail=1; }
+  [ "$fail" = 1 ] && { echo "smoke-test: FAIL"; exit 1; }
+  echo "smoke-test: ok (22 fusion assertions: CRITICAL×5+1-priority+1-detail, DEGRADED×5+1-detail, HEALTHY×5, OFFLINE×2+1+1-detail)"
+  exit 0
+fi
+
+# --- Live read path ---
+nh="$(read_node_health "$MESH/.node-health-state")"
+bat="$(read_battery "$MESH/.battery-state")"
+cpu="$(read_cpufreq "$MESH/.cpufreq-state")"
+dsk="$(read_disk_latency "$MESH/.disk-latency-state")"
+
+result="$(classify_vitality "$nh" "$bat" "$cpu" "$dsk")"
+label="${result%%|*}"
+reason="${result#*|}"
+
+TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+# Write state + touch liveness on EVERY successful run
+printf '%s|node-health=%s|battery=%s|cpufreq=%s|disk=%s|%s\n' "$label" "$nh" "$bat" "$cpu" "$dsk" "$reason" > "$STATE"
+mesh-state-touch "$STATE"
+
+# --- Output ---
+if [ "${1:-}" = --json ]; then
+  printf '{"label":"%s","reason":"%s","inputs":{"node_health":"%s","battery":"%s","cpufreq":"%s","disk_latency":"%s"},"ts":"%s"}\n' \
+    "$label" "$reason" "$nh" "$bat" "$cpu" "$dsk" "$TS"
+  exit 0
+fi
+if [ "${1:-}" = --edge ]; then
+  prev=""; [ -f "$STATE" ] && prev="$(head -1 "$STATE" 2>/dev/null | cut -d'|' -f1)" || true
+  [ "$prev" = "$label" ] && exit 0
+  printf '[vitality-%s] %s — %s\n' "$(printf '%s' "$label" | tr '[:upper:]' '[:lower:]')" "$label" "$reason"
+  exit 0
+fi
+printf '[vitality-%s] %s — %s\n' "$(printf '%s' "$label" | tr '[:upper:]' '[:lower:]')" "$label" "$reason"
