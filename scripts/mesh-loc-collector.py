@@ -3,7 +3,7 @@
 # mesh phone MULTI-SENSOR collector — token-gated HTTPS, append-only, GENERIC.
 # The phone beacon GETs /loc?token=..&<any sensor fields>..  We store EVERY query param
 # (except token) into one JSON line per fix — so new sensors need NO collector change.
-import json, os, ssl, time
+import json, os, random, ssl, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -12,12 +12,33 @@ TOKEN_FILE = "/root/.mesh/loc-token"
 CERT = "/etc/letsencrypt/live/38-49-216-141.sslip.io/fullchain.pem"
 KEY = "/etc/letsencrypt/live/38-49-216-141.sslip.io/privkey.pem"
 PORT = 8092
+CHAOS_LATENCY_FILE = "/root/.mesh/.collector-latency"
 
 def load_token():
     try:
         return open(TOKEN_FILE).read().strip()
     except Exception:
         return None
+
+def maybe_inject_latency():
+    """CHAOS (STUDY 'implement intermittent random 1-5s pauses to a single worker's API
+    responses', 2026-07-02 backlog task): opt-in, default-OFF fault injection. Armed by
+    MESH_CHAOS_LATENCY=1 (env, this process) OR a sentinel file (survives across requests —
+    same dual-arm convention as scripts/mesh-phone-beacon2's MESH_CHAOS_NETFAIL hook).
+    INTERMITTENT: MESH_CHAOS_LATENCY_RATE (default 100 = every request once armed) rolls a
+    per-request chance to fire, so a drill can also simulate a WORKER THAT IS SOMETIMES slow,
+    not just always. When it fires, sleeps a random 1-5s BEFORE the reply is written — this
+    worker's caller (the phone beacon's push) exercises its real request-timeout/retry path
+    exactly as it would against a genuinely slow/overloaded API, with zero network-layer or
+    substrate change (pure application-layer delay, same safety class as the beacon2 hook).
+    Disarm: unset the env / rm the sentinel — the very next request is immediate again."""
+    armed = os.environ.get("MESH_CHAOS_LATENCY") == "1" or os.path.exists(CHAOS_LATENCY_FILE)
+    if not armed:
+        return
+    rate = int(os.environ.get("MESH_CHAOS_LATENCY_RATE", "100") or "100")
+    if random.randint(1, 100) > rate:
+        return          # intermittent: this request rolled past the fire rate — stay fast
+    time.sleep(random.uniform(1, 5))
 
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
@@ -36,6 +57,7 @@ class H(BaseHTTPRequestHandler):
         tok = load_token()
         if not tok or q.get("token", [""])[0] != tok:
             return self._reply(403, b"forbidden")
+        maybe_inject_latency()
         rec = {"ts": int(time.time())}
         for k, v in q.items():
             if k == "token":
@@ -65,6 +87,30 @@ if __name__ == "__main__":
             rec[k] = val if val != "" else None
         if rec != {"lat": "1.5", "lon": "2.5", "blank": None}:
             print(f"smoke-test: FAIL (record-build {rec})"); sys.exit(1)
+        # 1b) CHAOS latency hook — offline, deterministic (no real sleep). Monkeypatch
+        # random+time.sleep so the test proves the GATE logic, not real timing.
+        calls = {"sleep": 0, "dur": None}
+        _orig_sleep, _orig_randint, _orig_uniform = time.sleep, random.randint, random.uniform
+        time.sleep = lambda s: (calls.__setitem__("sleep", calls["sleep"] + 1), calls.__setitem__("dur", s))
+        random.randint = lambda a, b: 50     # fixed 50% roll
+        random.uniform = lambda a, b: 3.0    # fixed 3s duration
+        os.environ.pop("MESH_CHAOS_LATENCY", None); os.environ.pop("MESH_CHAOS_LATENCY_RATE", None)
+        try:
+            maybe_inject_latency()           # unarmed -> no sleep
+            if calls["sleep"] != 0:
+                print(f"smoke-test: FAIL (unarmed still slept {calls})"); sys.exit(1)
+            os.environ["MESH_CHAOS_LATENCY"] = "1"; os.environ["MESH_CHAOS_LATENCY_RATE"] = "100"
+            maybe_inject_latency()           # armed, rate=100, roll=50<=100 -> fires once
+            if calls["sleep"] != 1 or calls["dur"] != 3.0:
+                print(f"smoke-test: FAIL (armed rate=100 did not fire {calls})"); sys.exit(1)
+            calls["sleep"] = 0
+            os.environ["MESH_CHAOS_LATENCY_RATE"] = "10"
+            maybe_inject_latency()           # armed, rate=10, roll=50>10 -> intermittent skip
+            if calls["sleep"] != 0:
+                print(f"smoke-test: FAIL (rate gate did not skip {calls})"); sys.exit(1)
+        finally:
+            time.sleep, random.randint, random.uniform = _orig_sleep, _orig_randint, _orig_uniform
+            os.environ.pop("MESH_CHAOS_LATENCY", None); os.environ.pop("MESH_CHAOS_LATENCY_RATE", None)
         # 2) Deployment readiness — token+cert only exist on the collector's HOME
         #    node (the public-ingress host that provisions the sslip.io LE cert).
         #    Off that node their absence is EXPECTED, not a code fault — report
