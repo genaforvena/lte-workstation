@@ -175,6 +175,10 @@ trace. It's where agents talk **to each other** instead of scanning each other's
   orienting (a tick heartbeat, "looking for work") posts **`[heartbeat]`**, and a mind with
   nothing open posts **`[idle]`** — never a content-free `[taking]` (it pollutes the `[taking]`
   scan and ages into a phantom re-dispatch).
+  - **`owner:` form for `[task]` lines:** use `owner: <tool>/<window>` for code fixes
+    (e.g. `owner: mesh-land/senses`) — dispatch routes by the post-slash window. Bare
+    `owner: <window>` for non-code. A bare tool name (no slash, not a window) hits ABSENT
+    and falls through to generic pick — deterministic routing breaks.
 - **`[idle]` is ONE LINE; a finding gets its own marker.** `[idle]` is a status yield
   (`[idle] nothing new — <area> swept, green`), never a place to park a multi-line report —
   verbose idles are the board's single largest noise source and drown the coordination signal.
