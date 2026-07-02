@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+# mesh-conntrack-load — exit-node FORWARDING load from the kernel conntrack table.
+#
+# WHY (the blind spot): this node OFFERS a Tailscale exit-node / VPN egress. Forwarded client
+# flows are MASQUERADE'd — the kernel tracks them in conntrack but they NEVER appear as local
+# sockets, so mesh-socket-state / mesh-net-io are blind to exit-node forwarding load. The
+# conntrack count is the only self-serve place that load shows (world-readable 0444, no sudo).
+#
+#   mesh-conntrack-load           one-shot verdict to stdout
+#   mesh-conntrack-load --edge    only emit on verdict change (cron wiring); always touches state (liveness)
+#   mesh-conntrack-load --json    machine-readable JSON
+#   mesh-conntrack-load --test    smoke test (REAL-read gate: finite non-neg int < max; exit 2 = no netfilter)
+#
+# Signals:
+#   flows       nf_conntrack_count (all tracked flows: TCP+UDP+ICMP, local AND forwarded)
+#   sat         flows as % of nf_conntrack_max → LOW (<25%) / NORMAL (25-74%) / HIGH (>=75%)
+#               (a HIGH table drops new flows — real outage mode; thresholds: MESH_CONNTRACK_{LOW,HIGH}_PCT)
+#   fwd_est     max(0, flows - local_established_tcp) — UPPER-BOUND estimate of non-local-TCP flows
+#               (includes forwarded client flows, but also local UDP/ICMP/TIME_WAIT conntrack entries)
+#   fwd         IDLE / ACTIVE vs a learned idle floor: state remembers the MINIMUM fwd_est ever seen
+#               (this node's own-noise baseline); ACTIVE = fwd_est > floor + MESH_CONNTRACK_FWD_MARGIN
+#               (default 150). First run: floor = current → IDLE (honest cold start, no fake verdict).
+#
+# LIMITATION (honest): per-flow attribution needs the detailed table — /proc/net/nf_conntrack is
+# absent on this kernel and `conntrack -L` (conntrack-tools) is not installed — so this is a
+# count + cross-reference ESTIMATE, never an enumeration. fwd_est is an upper bound by construction.
+#
+# Feeds mesh-egress-health's question "is the offered exit-node actually carrying traffic?" —
+# consume via --json (fields: flows, max, pct, sat, local_established, fwd_estimate, fwd).
+#
+# Exit codes: 0 = assessed · 2 = no netfilter conntrack on this node (honest n/a, never fake)
+# reflex-cadence: */10 * * * *
+# reflex-args: --edge
+set -uo pipefail
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+
+CNT_F=/proc/sys/net/netfilter/nf_conntrack_count
+MAX_F=/proc/sys/net/netfilter/nf_conntrack_max
+STATE_DIR="${MESH_STATE_DIR:-$HOME/.mesh}"
+STATE="$STATE_DIR/.conntrack-state"
+LOW_PCT="${MESH_CONNTRACK_LOW_PCT:-25}"
+HIGH_PCT="${MESH_CONNTRACK_HIGH_PCT:-75}"
+FWD_MARGIN="${MESH_CONNTRACK_FWD_MARGIN:-150}"
+
+sat_of(){ # $1=pct → saturation token (stable consumer vocab: LOW|NORMAL|HIGH)
+  if [ "$1" -ge "$HIGH_PCT" ]; then echo HIGH
+  elif [ "$1" -ge "$LOW_PCT" ]; then echo NORMAL
+  else echo LOW; fi
+}
+
+# local established TCP sessions (the cross-reference term). ss preferred; /proc fallback keeps
+# the sense alive on a lean node (state column 4 == 01 ESTABLISHED in /proc/net/tcp[6]).
+local_established(){
+  if command -v ss >/dev/null 2>&1; then
+    ss -Htan state established 2>/dev/null | wc -l
+  else
+    awk 'NR>1 && $4=="01"' /proc/net/tcp /proc/net/tcp6 2>/dev/null | wc -l
+  fi
+}
+
+read_counts(){ # sets cnt/max, returns 1 on unreadable/garbage (caller decides n/a vs FAIL)
+  cnt=$(cat "$CNT_F" 2>/dev/null); max=$(cat "$MAX_F" 2>/dev/null)
+  printf '%s' "$cnt" | grep -qE '^[0-9]+$' || return 1
+  printf '%s' "$max" | grep -qE '^[0-9]+$' || return 1
+  [ "$max" -gt 0 ] || return 1
+}
+
+if [ "${1:-}" = --test ]; then
+  command -v awk >/dev/null 2>&1 || { echo "smoke-test: FAIL (no awk)"; exit 1; }
+  # REAL-read gate (verification principle: a reachable-but-hollow read is not a pass):
+  [ -r "$CNT_F" ] && [ -r "$MAX_F" ] || { echo "smoke-test: n/a (no netfilter conntrack on this node — $CNT_F absent/unreadable)"; exit 2; }
+  read_counts || { echo "smoke-test: FAIL (conntrack read is hollow: cnt='$cnt' max='$max' — not finite non-neg ints)"; exit 1; }
+  [ "$cnt" -lt "$max" ] || { echo "smoke-test: FAIL (cnt=$cnt not < max=$max — table full or read garbage)"; exit 1; }
+  # classifier unit checks (synthetic pcts, independent of live values)
+  [ "$(sat_of 0)" = LOW ] && [ "$(sat_of "$LOW_PCT")" = NORMAL ] && [ "$(sat_of "$HIGH_PCT")" = HIGH ] \
+    || { echo "smoke-test: FAIL (sat classifier: 0→$(sat_of 0) $LOW_PCT→$(sat_of "$LOW_PCT") $HIGH_PCT→$(sat_of "$HIGH_PCT"))"; exit 1; }
+  est="$(local_established)"
+  printf '%s' "$est" | grep -qE '^[0-9]+$' || { echo "smoke-test: FAIL (local_established not an int: '$est')"; exit 1; }
+  # full one-shot in a throwaway state dir (never clobber the real learned floor from a test)
+  _td="$(mktemp -d)"
+  out="$(MESH_STATE_DIR="$_td" "$0" 2>&1)"; rc=$?
+  jout="$(MESH_STATE_DIR="$_td" "$0" --json 2>&1)"; jrc=$?
+  rm -rf "$_td"
+  { [ "$rc" = 0 ] && printf '%s' "$out" | grep -qE 'flows=[0-9]+/[0-9]+ .*sat=(LOW|NORMAL|HIGH)'; } \
+    || { echo "smoke-test: FAIL (one-shot output shape: rc=$rc out='$out')"; exit 1; }
+  { [ "$jrc" = 0 ] && printf '%s' "$jout" | grep -q '"fwd_estimate"'; } \
+    || { echo "smoke-test: FAIL (--json missing fwd_estimate: rc=$jrc)"; exit 1; }
+  echo "smoke-test: ok (live read cnt=$cnt/max=$max, local_est=$est, classifier + one-shot + json shape)"; exit 0
+fi
+
+MODE=oneshot
+case "${1:-}" in --edge) MODE=edge ;; --json) MODE=json ;; esac
+
+[ -r "$CNT_F" ] && [ -r "$MAX_F" ] || { echo "conntrack-load: UNAVAILABLE (no netfilter conntrack on this node)" >&2; exit 2; }
+read_counts || { echo "conntrack-load: UNAVAILABLE (hollow read: cnt='$cnt' max='$max')" >&2; exit 2; }
+
+est="$(local_established)"; printf '%s' "$est" | grep -qE '^[0-9]+$' || est=0
+fwd=$(( cnt - est )); [ "$fwd" -lt 0 ] && fwd=0
+pct=$(( cnt * 100 / max ))
+sat="$(sat_of "$pct")"
+
+# learned idle floor: min fwd_est ever observed = this node's own (local UDP/ICMP/TIME_WAIT) noise.
+mkdir -p "$STATE_DIR"
+floor="$(awk '{print $3}' "$STATE" 2>/dev/null)"
+printf '%s' "$floor" | grep -qE '^[0-9]+$' || floor="$fwd"
+[ "$fwd" -lt "$floor" ] && floor="$fwd"
+verdict=IDLE; [ "$fwd" -gt $(( floor + FWD_MARGIN )) ] && verdict=ACTIVE
+
+prev="$(awk '{print $1,$2}' "$STATE" 2>/dev/null)"
+cur="$sat $verdict"
+# content = change-gated verdict + floor; mtime = liveness on EVERY eval (liveness-touch convention)
+if [ "$prev" != "$cur" ] || [ "$floor" != "$(awk '{print $3}' "$STATE" 2>/dev/null)" ]; then
+  printf '%s %s %s\n' "$sat" "$verdict" "$floor" > "$STATE"
+fi
+command -v mesh-state-touch >/dev/null 2>&1 && mesh-state-touch "$STATE" >/dev/null 2>&1 || touch "$STATE" 2>/dev/null
+
+ts="$(date -u +%FT%TZ)"
+line="conntrack-load: flows=$cnt/$max (${pct}%) sat=$sat local_est=$est fwd_est<=$fwd (floor=$floor) fwd=$verdict"
+case "$MODE" in
+  json) printf '{"ts":"%s","flows":%d,"max":%d,"pct":%d,"sat":"%s","local_established":%d,"fwd_estimate":%d,"fwd_floor":%d,"fwd":"%s"}\n' \
+          "$ts" "$cnt" "$max" "$pct" "$sat" "$est" "$fwd" "$floor" "$verdict" ;;
+  edge) [ "$prev" != "$cur" ] && echo "$ts $line" ;;
+  *)    echo "$line" ;;
+esac
+exit 0
