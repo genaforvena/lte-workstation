@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+# reflex-cadence: */15 * * * *
+# reflex-args: --edge
+# mesh-nvme-temp — local NVMe controller temperature sense from /sys/class/nvme/*/hwmon*/temp1_input.
+#
+# Why this is new:
+#   The tree already knows chassis / CPU / thermal-zone heat, but not the storage controller's own
+#   temperature. NVMe hwmon is a distinct hardware signal: it can warn about throttling or heat
+#   before generic thermal zones move.
+#
+# Honest contract:
+#   no readable NVMe hwmon temperature -> exit 2, never fabricate a reading
+#
+#   mesh-nvme-temp            one read → one classified line
+#   mesh-nvme-temp --json     machine-readable
+#   mesh-nvme-temp --edge     emit only on band change (state still refreshed every success)
+#   mesh-nvme-temp --test     fixture-backed classifier + real-read gate
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+
+MESH="${MESH_DIR:-$HOME/.mesh}"
+STATE="$MESH/.nvme-temp.state"
+OFFLINEFILE="$MESH/.nvme-temp-offline"
+ROOT="${MESH_NVME_ROOT:-/sys/class/nvme}"
+mkdir -p "$MESH" 2>/dev/null || true
+
+discover_nvme() {
+  local f raw best_raw="" best_max="" best_crit="" best_src=""
+  shopt -s nullglob
+  for f in "$ROOT"/*/hwmon*/temp1_input; do
+    [ -r "$f" ] || continue
+    raw="$(cat "$f" 2>/dev/null)"
+    case "$raw" in ''|*[!0-9]*) continue ;; esac
+    if [ -z "$best_raw" ] || [ "$raw" -gt "$best_raw" ]; then
+      best_raw="$raw"
+      best_src="$f"
+      best_max="$(cat "${f%temp1_input}temp1_max" 2>/dev/null || true)"
+      best_crit="$(cat "${f%temp1_input}temp1_crit" 2>/dev/null || true)"
+    fi
+  done
+  shopt -u nullglob
+  [ -n "$best_src" ] || return 1
+  printf '%s\t%s\t%s\t%s\n' "$best_raw" "${best_max:-}" "${best_crit:-}" "$best_src"
+}
+
+format_c() {
+  awk -v m="${1:-}" 'BEGIN{
+    if (m == "" || m !~ /^[0-9]+$/) exit 1
+    printf "%.1f", m / 1000
+  }'
+}
+
+classify_temp() {
+  local raw="${1:-}" max="${2:-}" crit="${3:-}"
+  case "$raw" in ''|*[!0-9]*) echo UNKNOWN; return ;; esac
+  if [ -n "$crit" ] && [ "$crit" -gt 0 ] 2>/dev/null && [ "$raw" -ge "$crit" ] 2>/dev/null; then
+    echo CRITICAL
+  elif [ -n "$max" ] && [ "$max" -gt 0 ] 2>/dev/null && [ "$raw" -ge "$max" ] 2>/dev/null; then
+    echo HOT
+  elif [ "$raw" -ge 60000 ] 2>/dev/null; then
+    echo HOT
+  elif [ "$raw" -ge 45000 ] 2>/dev/null; then
+    echo WARM
+  else
+    echo COOL
+  fi
+}
+
+if [ "${1:-}" = --test ]; then
+  command -v awk >/dev/null 2>&1 || { echo "smoke-test: FAIL (no awk)"; exit 1; }
+  td="$(mktemp -d)" || { echo "smoke-test: FAIL (mktemp)"; exit 1; }
+  trap 'rm -rf "$td"' EXIT
+  mkdir -p "$td/nvme0/hwmon0"
+  printf '36850\n' > "$td/nvme0/hwmon0/temp1_input"
+  printf '50000\n' > "$td/nvme0/hwmon0/temp1_max"
+  printf '70000\n' > "$td/nvme0/hwmon0/temp1_crit"
+  got="$(MESH_NVME_ROOT="$td" bash "$0" --json 2>/dev/null)" || { echo "smoke-test: FAIL (fixture read)"; exit 1; }
+  printf '%s\n' "$got" | grep -q '"label":"COOL"' || { echo "smoke-test: FAIL (fixture label COOL: $got)"; exit 1; }
+  printf '%s\n' "$got" | grep -q '"temp_c":36.9' || { echo "smoke-test: FAIL (fixture temp 36.9C: $got)"; exit 1; }
+  printf '%s\n' "$got" | grep -q "\"source\":\"$td/nvme0/hwmon0/temp1_input\"" || {
+    echo "smoke-test: FAIL (fixture source missing: $got)"; exit 1;
+  }
+
+  real="$(bash "$0" --json 2>/dev/null)" || { echo "smoke-test: n/a (no live NVMe hwmon source on this node)"; exit 2; }
+  printf '%s\n' "$real" | grep -q '"source":"/sys/class/nvme/' || {
+    echo "smoke-test: FAIL (live read missing sysfs source: $real)"; exit 1;
+  }
+  printf '%s\n' "$real" | grep -q '"temp_c":[0-9]' || {
+    echo "smoke-test: FAIL (live read missing numeric temperature: $real)"; exit 1;
+  }
+  echo "smoke-test: ok (fixture classify + live NVMe hwmon read)"
+  exit 0
+fi
+
+JSON=0
+EDGE=0
+for a in "$@"; do
+  case "$a" in
+    --json) JSON=1 ;;
+    --edge) EDGE=1 ;;
+  esac
+done
+
+readout="$(discover_nvme 2>/dev/null || true)"
+[ -n "$readout" ] || {
+  [ -f "$OFFLINEFILE" ] || { echo "nvme-temp: UNREACHABLE — no readable NVMe hwmon temp1_input" >&2; : > "$OFFLINEFILE"; }
+  exit 2
+}
+rm -f "$OFFLINEFILE" 2>/dev/null || true
+
+IFS=$'\t' read -r RAW MAX CRIT SOURCE <<<"$readout"
+TEMP_C="$(format_c "$RAW")" || { echo "nvme-temp: UNREACHABLE — invalid temperature '$RAW'" >&2; exit 2; }
+LABEL="$(classify_temp "$RAW" "$MAX" "$CRIT")"
+TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+PREV_LABEL=""
+[ -f "$STATE" ] && PREV_LABEL="$(cut -d'|' -f1 "$STATE" 2>/dev/null || true)"
+
+printf '%s|%s|%s|%s|%s|%s|%s\n' "$LABEL" "$RAW" "$TEMP_C" "${MAX:-}" "${CRIT:-}" "$SOURCE" "$TS" > "$STATE"
+mesh-state-touch "$STATE"
+
+if [ "$JSON" = 1 ]; then
+  printf '{"label":"%s","temp_mC":%s,"temp_c":%s,"max_mC":%s,"crit_mC":%s,"source":"%s","ts":"%s"}\n' \
+    "$LABEL" "$RAW" "$TEMP_C" "${MAX:-null}" "${CRIT:-null}" "$SOURCE" "$TS"
+  exit 0
+fi
+
+if [ "$EDGE" = 1 ] && [ "$PREV_LABEL" = "$LABEL" ]; then
+  exit 0
+fi
+
+printf '[nvme-temp] %s — %s°C (max=%s crit=%s source=%s) @ %s %s\n' \
+  "$LABEL" "$TEMP_C" "${MAX:-?}" "${CRIT:-?}" "$SOURCE" "$(hostname)" "$TS"
