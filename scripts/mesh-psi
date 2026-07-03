@@ -23,6 +23,16 @@
 #   STALLED = full ≥ MESH_PSI_FULL_STALL (10) or some ≥ MESH_PSI_SOME_STALL (60) — real stalling
 # Memory `full` pressure is treated as extra-serious (thrashing): any mem full ≥5 → STALLED.
 #
+# PHANTOM-IO QUARANTINE (2026-07-03): kernel io-PSI counts iowait-PARKED sleepers as io-stalled —
+# a thread idling in io_uring's io_cqring_wait accrues "full" io pressure while doing ZERO disk I/O
+# (observed live: ghostty's renderer+io threads pinned /proc/pressure/io full≈68-76% for 2 weeks on
+# an IDLE disk, ios_in_progress=0 → the tape's psi column read STALLED 300/300 rows = zero information).
+# So when the io axis alone would raise the level, corroborate against REAL disk utilization
+# (io_ticks delta over a short window): io-PSI high + disks near-idle = phantom → the io axis is
+# QUARANTINED (excluded, loudly annotated), never trusted into a false STALLED. High io-PSI WITH real
+# disk busy% passes through untouched. Tunables: MESH_PSI_UTIL_MIN (busy% floor, default 10),
+# MESH_PSI_UTIL_WINDOW_MS (sample window, default 500), MESH_PSI_DISKUTIL (test override).
+#
 # Honest-degraded: a kernel built without CONFIG_PSI has no /proc/pressure → UNAVAILABLE + exit 2,
 # never a faked CALM. (VMs/older kernels may lack it; that is reported, not hidden.)
 set -uo pipefail
@@ -33,6 +43,7 @@ SOME_BUSY="${MESH_PSI_SOME_BUSY:-25}"
 SOME_STALL="${MESH_PSI_SOME_STALL:-60}"
 FULL_STALL="${MESH_PSI_FULL_STALL:-10}"
 MEM_FULL_STALL="${MESH_PSI_MEM_FULL_STALL:-5}"
+UTIL_MIN="${MESH_PSI_UTIL_MIN:-10}"
 
 # Pure classifier — no I/O, no /proc read. args: cpu_some cpu_full io_some io_full mem_some mem_full
 # echoes "LEVEL|dominant"
@@ -55,6 +66,25 @@ classify() {
     }'
 }
 
+# Pure quarantine decision — no I/O. args: io_some io_full disk_util_pct
+# true (0) = io axis is PHANTOM (would influence the level, yet disks are near-idle) → quarantine.
+io_phantom() {
+  awk -v ios="$1" -v iof="$2" -v u="$3" -v sb="$SOME_BUSY" -v um="$UTIL_MIN" \
+    'BEGIN { exit !((iof >= 1 || ios >= sb) && u < um) }'
+}
+
+# % of wall time the real disks were busy over a short window (io_ticks delta, /proc/diskstats $13).
+# Summed across physical top-level devices (partitions/loop excluded); can exceed 100 with >1 disk —
+# fine, it is only compared against a floor. MESH_PSI_DISKUTIL overrides for tests (no sleep).
+disk_util_pct() {
+  if [ -n "${MESH_PSI_DISKUTIL:-}" ]; then printf '%s' "$MESH_PSI_DISKUTIL"; return 0; fi
+  local w="${MESH_PSI_UTIL_WINDOW_MS:-500}" a b
+  a=$(awk '$3 ~ /^(nvme[0-9]+n[0-9]+|sd[a-z]+|vd[a-z]+|mmcblk[0-9]+)$/ {s+=$13} END{print s+0}' /proc/diskstats 2>/dev/null)
+  sleep "$(awk -v w="$w" 'BEGIN{printf "%.3f", w/1000}')"
+  b=$(awk '$3 ~ /^(nvme[0-9]+n[0-9]+|sd[a-z]+|vd[a-z]+|mmcblk[0-9]+)$/ {s+=$13} END{print s+0}' /proc/diskstats 2>/dev/null)
+  awk -v a="${a:-0}" -v b="${b:-0}" -v w="$w" 'BEGIN{u=(b-a)*100.0/w; if(u<0)u=0; printf "%.0f", u}'
+}
+
 if [ "${1:-}" = --test ]; then
   command -v awk >/dev/null 2>&1 || { echo "smoke-test: FAIL (no awk)"; exit 1; }
   fail() { echo "smoke-test: FAIL ($1)"; exit 1; }
@@ -68,12 +98,25 @@ if [ "${1:-}" = --test ]; then
   [ "$(classify 24 0 0 0 0 0)"    = "CALM|cpu" ]    || fail "some=24 below BUSY threshold should be CALM"
   [ "$(classify 25 0 0 0 0 0)"    = "BUSY|cpu" ]    || fail "some=25 at BUSY threshold should be BUSY"
   [ "$(classify 0 0 0 0 0 3)"     = "BUSY|memory" ] || fail "mem full=3 (<5) should be BUSY not STALLED"
+  # Phantom-io quarantine — pure decision asserts (the ghostty io_cqring_wait case: psi high, disk idle).
+  io_phantom 76 68 2    || fail "io 76/68 on 2% disk util should be PHANTOM (quarantine)"
+  io_phantom 76 68 50   && fail "io 76/68 on 50% disk util is REAL stall — must NOT quarantine"
+  io_phantom 0.5 0.2 2  && fail "non-influential io (0.5/0.2) must not quarantine"
+  io_phantom 30 0 2     || fail "io some=30 (BUSY-influential) on idle disk should quarantine"
+  [ "$(MESH_PSI_DISKUTIL=42 disk_util_pct)" = 42 ] || fail "disk_util_pct test override broken"
   # State machine: the real-path read is gated below, never before these pure asserts.
   if [ -r /proc/pressure/cpu ]; then
     out="$("$0" --json 2>&1)" || fail "json probe failed: $out"
     printf '%s\n' "$out" | grep -q '"level":"' || fail "json missing level: $out"
     printf '%s\n' "$out" | grep -q '"dominant":"' || fail "json missing dominant: $out"
-    echo "smoke-test: ok"
+    printf '%s\n' "$out" | grep -q '"io_quarantined":' || fail "json missing io_quarantined: $out"
+    # forced-idle disk: an influential io axis is quarantined by construction → io can never be the
+    # claimed driver of a raised level (valid on ANY node, whatever its live psi happens to be).
+    out0="$(MESH_PSI_DISKUTIL=0 "$0" 2>&1)" || fail "forced-idle live run failed: $out0"
+    case "$out0" in *"— io some="*) fail "io claimed as driver despite forced-idle disk: $out0";; esac
+    out9="$(MESH_PSI_DISKUTIL=999 "$0" 2>&1)" || fail "forced-busy live run failed: $out9"
+    case "$out9" in "[psi] "*) :;; *) fail "forced-busy live line malformed: $out9";; esac
+    echo "smoke-test: ok (incl. phantom-io quarantine: 5 pure + 2 forced-util live)"
   else
     echo "smoke-test: ok (no /proc/pressure — kernel without CONFIG_PSI, sense reports UNAVAILABLE)"
   fi
@@ -108,10 +151,21 @@ read cpu_some cpu_full <<<"$(read_psi cpu)"
 read io_some io_full   <<<"$(read_psi io)"
 read mem_some mem_full <<<"$(read_psi memory)"
 
+# Phantom-io quarantine: only pay the disk sample when the io axis would matter at all.
+io_note=""; io_quar=false
+if awk -v ios="$io_some" -v iof="$io_full" -v sb="$SOME_BUSY" 'BEGIN{exit !(iof >= 1 || ios >= sb)}'; then
+  util="$(disk_util_pct)"
+  if io_phantom "$io_some" "$io_full" "$util"; then
+    io_note=" [io QUARANTINED: psi io=${io_some}/${io_full}% but disk util=${util}% — phantom stall (iowait-parked waiters, e.g. io_uring cqring), no real disk contention]"
+    io_quar=true
+    io_some=0; io_full=0
+  fi
+fi
+
 res="$(classify "$cpu_some" "$cpu_full" "$io_some" "$io_full" "$mem_some" "$mem_full")"
 level="${res%%|*}"; dom="${res#*|}"
 
-signals="cpu=${cpu_some}/${cpu_full} io=${io_some}/${io_full} mem=${mem_some}/${mem_full} (some/full %)"
+signals="cpu=${cpu_some}/${cpu_full} io=${io_some}/${io_full} mem=${mem_some}/${mem_full} (some/full %)${io_note}"
 if [ "$level" = CALM ]; then
   reason="all resources calm"
 else
@@ -123,9 +177,13 @@ else
   reason="$dom some=${d_some}% full=${d_full}%"
 fi
 
+if [ "$io_quar" = true ]; then
+  reason="$reason (io axis quarantined: phantom stall, disk util ${util}%)"
+fi
+
 if [ "$MODE" = json ]; then
-  printf '{"level":"%s","dominant":"%s","reason":"%s","cpu_some":%s,"cpu_full":%s,"io_some":%s,"io_full":%s,"mem_some":%s,"mem_full":%s,"ts":"%s"}\n' \
-    "$level" "$dom" "$reason" "$cpu_some" "$cpu_full" "$io_some" "$io_full" "$mem_some" "$mem_full" "$TS"
+  printf '{"level":"%s","dominant":"%s","reason":"%s","cpu_some":%s,"cpu_full":%s,"io_some":%s,"io_full":%s,"mem_some":%s,"mem_full":%s,"io_quarantined":%s,"ts":"%s"}\n' \
+    "$level" "$dom" "$reason" "$cpu_some" "$cpu_full" "$io_some" "$io_full" "$mem_some" "$mem_full" "$io_quar" "$TS"
   exit 0
 fi
 
