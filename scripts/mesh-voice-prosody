@@ -1,0 +1,205 @@
+#!/usr/bin/env bash
+# orphan-ok: event-driven sense — invoked by mesh-voice-rx on each operator voice-note arrival
+#            (not cron-scheduled; there is nothing to poll — it reads the note voice-rx just fetched).
+# mesh-voice-prosody — the mesh HEARS HOW the operator sounds, not just WHAT he says.
+#
+# Wires the DEFERRED prosody co-primary of mesh-operator-mood (mesh-operator-mood:~224 documented it
+# as "UNAVAILABLE — no audio-feature organ yet"). Arousal until now rested on message CADENCE + room
+# TEMPO — neither of which text can reveal: an agitated VOICE reads high-arousal even in calm-worded
+# text. This extracts the acoustic arousal cues (energy / speaking-rate / pitch) from the operator's
+# own Telegram voice note (the .wav mesh-voice-rx already decoded for whisper) and writes a small
+# derived-scalar state file that mesh-operator-mood fuses as the prosody arousal hook.
+#
+# PRIVACY (within the operator's granted mood-from-voice-tone consent, 2026-06-25, local-only):
+#   • operates ONLY on the operator's OWN deliberate voice notes (voice-rx is CHAT_ID-gated);
+#   • the AUDIO is never persisted by this tool — it reads the file it is handed and writes back
+#     ONLY derived scalars (arousal / a weak valence-tilt / a voiced-second count). No transcript,
+#     no room capture (ambient-audio prosody is a SEPARATE, separately-consented axis — held).
+#
+# HONEST-FUSION: no audio / decode failure / NO VOICED SPEECH → exit 2 (honest n/a), and it writes
+#   NOTHING — silence is "no voice signal", NOT a faked "operator is calm". mesh-operator-mood keeps
+#   prosody UNAVAILABLE until a real voiced note lands. (never a fake all-clear.)
+#
+#   mesh-voice-prosody <audio>   extract prosody from an audio file → ~/.mesh/.voice-prosody.state
+#   mesh-voice-prosody --show    print the current state (if fresh) — no extraction
+#   mesh-voice-prosody --test    smoke test (real synthetic decode → asserts features, honest n/a)
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+
+exec python3 - "$@" <<'PY'
+import os, sys, math, shutil, subprocess, tempfile, time
+
+MESH  = os.path.expanduser(os.environ.get("MESH_DIR", "~/.mesh"))
+MESH  = os.path.expanduser("~/.mesh") if MESH.startswith("~") else MESH
+STATE = os.environ.get("MESH_VOICE_PROSODY_STATE", os.path.join(MESH, ".voice-prosody.state"))
+SR    = 16000  # analysis sample rate
+
+def ffmpeg_bin():
+    # Prefer imageio_ffmpeg's full build (libopus) exactly like mesh-voice-rx; fall back to PATH.
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return shutil.which("ffmpeg") or "ffmpeg"
+
+def clamp(x, lo=-1.0, hi=1.0):
+    return lo if x < lo else hi if x > hi else x
+
+def decode_pcm(path):
+    """Decode any audio file → mono float32 samples in [-1,1] at SR, via ffmpeg raw s16le."""
+    ff = ffmpeg_bin()
+    try:
+        out = subprocess.run(
+            [ff, "-v", "quiet", "-i", path, "-ar", str(SR), "-ac", "1", "-f", "s16le", "-"],
+            capture_output=True, timeout=60)
+    except Exception:
+        return None
+    if out.returncode != 0 or not out.stdout:
+        return None
+    import numpy as np
+    x = np.frombuffer(out.stdout, dtype="<i2").astype("float32") / 32768.0
+    return x
+
+def analyze(x):
+    """Return (arousal[-1,1], vtilt[-0.2,0.2], voiced_seconds) or None if NO voiced speech."""
+    import numpy as np
+    if x is None or x.size < SR // 4:          # < 0.25s of audio → nothing to read
+        return None
+    win, hop = 400, 160                          # 25ms frame / 10ms hop
+    n = 1 + max(0, (x.size - win) // hop)
+    if n < 3:
+        return None
+    frames = np.lib.stride_tricks.as_strided(
+        x, shape=(n, win),
+        strides=(x.strides[0] * hop, x.strides[0])).copy()
+    frms = np.sqrt((frames ** 2).mean(axis=1) + 1e-12)
+    rms  = float(np.sqrt((x ** 2).mean() + 1e-12))
+    peak = float(frms.max())
+    # voiced = frames with real energy (above both an absolute floor and a share of the peak).
+    thr    = max(0.02, 0.35 * peak)
+    voiced = frms > thr
+    vr     = float(voiced.mean())
+    voiced_secs = float(voiced.sum()) * hop / SR
+    if vr < 0.05 or rms < 0.01 or voiced_secs < 0.15:
+        return None                              # honest n/a: no voiced speech present
+
+    # speaking-rate proxy: unvoiced→voiced onsets per second (syllable-ish nuclei).
+    onsets = int(np.sum((voiced[1:]) & (~voiced[:-1]))) + int(voiced[0])
+    dur    = x.size / SR
+    rate   = onsets / dur if dur > 0 else 0.0
+    rate_norm = min(1.0, rate / 5.0)             # ~5 syllable-onsets/s ≈ fast speech
+
+    # pitch (F0) via per-voiced-frame autocorrelation, F0 ∈ [75,400] Hz → lag ∈ [40,213].
+    lo, hi = SR // 400, SR // 75
+    f0s = []
+    idx = np.flatnonzero(voiced)
+    for i in idx[:: max(1, len(idx) // 40)]:     # sample up to ~40 voiced frames (cheap)
+        f = frames[i] - frames[i].mean()
+        ac = np.correlate(f, f, mode="full")[win - 1:]
+        if ac[0] <= 0:
+            continue
+        seg = ac[lo:hi]
+        if seg.size == 0:
+            continue
+        lag = lo + int(np.argmax(seg))
+        if ac[lag] > 0.3 * ac[0]:                # require a real periodic peak
+            f0s.append(SR / lag)
+    if f0s:
+        f0 = float(np.median(f0s))
+        pitch_norm = clamp((f0 - 100.0) / 150.0, 0.0, 1.0)   # 100Hz→0 .. 250Hz→1
+        have_pitch = True
+    else:
+        pitch_norm, have_pitch = 0.0, False
+
+    energy_norm = min(1.0, rms / 0.15)
+    # combine → arousal in [0,1]; if pitch is unreliable, redistribute its weight to energy+rate.
+    if have_pitch:
+        a01 = 0.45 * energy_norm + 0.30 * rate_norm + 0.25 * pitch_norm
+    else:
+        a01 = 0.60 * energy_norm + 0.40 * rate_norm
+    arousal = clamp(2.0 * a01 - 1.0)             # 0→-1 (flat) .. 1→+1 (loud/fast/high)
+
+    # weak valence TILT only (tension cue). Kept small and NOT consumed by mood's valence yet — mood
+    # honours "never push valence from an arousal signal"; emitted for a future, separately-verified use.
+    vtilt = 0.0
+    if have_pitch and f0 > 230 and energy_norm > 0.6:
+        vtilt = -0.15                            # harsh + high + loud → tension (negative)
+    return round(arousal, 3), round(vtilt, 3), round(voiced_secs, 2)
+
+def write_state(arousal, vtilt, voiced_secs):
+    tmp = STATE + ".tmp"
+    with open(tmp, "w") as fh:
+        # tab-separated derived scalars only. Field 1 = arousal (what mesh-operator-mood reads).
+        fh.write(f"{arousal}\t{vtilt}\t{voiced_secs}\n")
+    os.replace(tmp, STATE)
+
+def show():
+    try:
+        with open(STATE) as fh:
+            line = fh.read().strip()
+        age = int(time.time() - os.stat(STATE).st_mtime)
+        print(f"prosody: {line}  (age {age}s)")
+        sys.exit(0)
+    except Exception:
+        print("prosody: no state (no voiced note extracted yet)")
+        sys.exit(2)
+
+def run(path):
+    x = decode_pcm(path)
+    res = analyze(x)
+    if res is None:
+        print("prosody: n/a — no voiced speech (nothing written)", file=sys.stderr)
+        sys.exit(2)                              # honest n/a; never a faked neutral
+    arousal, vtilt, vsecs = res
+    write_state(arousal, vtilt, vsecs)
+    print(f"prosody: arousal {arousal:+.2f} vtilt {vtilt:+.2f} voiced {vsecs}s → {STATE}")
+    sys.exit(0)
+
+def smoke_test():
+    ff = ffmpeg_bin()
+    fails = []
+    with tempfile.TemporaryDirectory() as d:
+        os.environ["MESH_VOICE_PROSODY_STATE"] = os.path.join(d, "state")  # sandbox: never touch live
+        global STATE
+        STATE = os.environ["MESH_VOICE_PROSODY_STATE"]
+        loud = os.path.join(d, "loud.wav")
+        quiet = os.path.join(d, "quiet.wav")
+        # REAL decode+extract: a loud 200Hz tone must read as high arousal + write a state file.
+        # (lavfi `sine` emits at ~0.12 amplitude; boost to speech-level so the energy→arousal map bites.)
+        r1 = subprocess.run([ff, "-v", "quiet", "-y", "-f", "lavfi", "-i",
+                             "sine=frequency=200:duration=2", "-af", "volume=8",
+                             "-ar", str(SR), "-ac", "1", loud])
+        if r1.returncode != 0:
+            print("smoke-test: FAIL (ffmpeg lavfi sine unavailable — cannot self-test the decoder)")
+            sys.exit(1)
+        x = decode_pcm(loud)
+        res = analyze(x)
+        if res is None:
+            fails.append("loud tone read as no-speech (real decode/extract failed)")
+        else:
+            ar, vt, vs = res
+            if ar <= 0.0:
+                fails.append(f"loud tone arousal not high ({ar})")
+            write_state(*res)
+            if not os.path.exists(STATE):
+                fails.append("state file not written on a real voiced read")
+        # silence → honest n/a: NO state write, analyze() returns None (not a faked calm reading).
+        subprocess.run([ff, "-v", "quiet", "-y", "-f", "lavfi", "-i",
+                        "anullsrc=r=%d:cl=mono" % SR, "-t", "1", quiet])
+        if analyze(decode_pcm(quiet)) is not None:
+            fails.append("silence produced a reading (should be honest n/a)")
+        # absent input → decode returns None → analyze None (no fake, no crash).
+        if analyze(decode_pcm(os.path.join(d, "nope.wav"))) is not None:
+            fails.append("missing file produced a reading")
+    if fails:
+        print("smoke-test: FAIL — " + "; ".join(fails)); sys.exit(1)
+    print("smoke-test: ok (real decode → arousal; silence/absent → honest n/a)")
+    sys.exit(0)
+
+args = sys.argv[1:]
+if not args:
+    print("usage: mesh-voice-prosody <audio> | --show | --test", file=sys.stderr); sys.exit(2)
+if args[0] == "--test": smoke_test()
+if args[0] == "--show": show()
+run(args[0])
+PY
