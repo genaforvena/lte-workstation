@@ -14,8 +14,9 @@
 #   mesh-land --autoland UNATTENDED cron path: land only candidates that ALSO pass their own
 #                        --test (eyeball-substitute); the rest stay for --apply. Steward-only.
 #   mesh-land --check    quiet; exit 1 + board-alert if settled-stranded work exists (for a cron reflex).
-#                        Alert is FLOOD-GATED: re-posts only when the strand set changes, else once
-#                        per MESH_LAND_REFRESH (1h) — kills the identical-[strand]-every-tick board flood.
+#                        Alert is FLOOD-GATED: re-posts only when the strand set changes, else with
+#                        exponential backoff (1h→2h→4h→8h cap) — kills the identical-[strand]-every-tick
+#                        board flood while keeping long-stale strands visible.
 #   mesh-land --test     smoke test
 #
 # Candidates now include BOTH tracked-modified AND untracked new scripts/mesh-* (a brand-new tool
@@ -26,8 +27,9 @@ REPO="${MESH_REPO:-$HOME/lte-workstation}"
 SETTLE="${MESH_LAND_SETTLE:-600}"   # mtime must be older than this (settled = not in-flight)
 STRAND_TTL="${MESH_LAND_TTL:-7200}" # escalate nagging strands >TTL seconds to [task] (default 2h)
 STRAND_STATE="${MESH_DIR:-$HOME/.mesh}/.mesh-land-strands"
-POSTED_STATE="${MESH_DIR:-$HOME/.mesh}/.mesh-land-posted" # last-posted strand signature + epoch (board-flood gate)
+POSTED_STATE="${MESH_DIR:-$HOME/.mesh}/.mesh-land-posted" # last-posted strand signature + epoch + refresh-interval (board-flood gate)
 REFRESH="${MESH_LAND_REFRESH:-3600}"  # re-post an UNCHANGED strand set at most this often (default 1h reminder)
+MAX_REFRESH="${MESH_LAND_MAX_REFRESH:-28800}"  # backoff cap: double REFRESH each identical re-post, up to this (default 8h)
 # SUBSTRATE EXCLUSION (chat-review/autoland-substrate-guard 2026-06-20): the tools that manage the
 # LIVE substrate (cron/routing/egress/ssh + mesh-land itself) are NEVER auto-landed. A green --test
 # is only an "eyeball substitute" — when it doesn't cover the CHANGED path a regression auto-ships to
@@ -132,6 +134,22 @@ autoland_excuse(){
   _ne="nag_""elig"
   grep -nE '^[[:space:]]*sig="x:' "$0" | head -1 | grep -qF "$_ne" \
     && { echo "smoke-test: FAIL (board-flood gate sig includes the trace-only eligible category — its churn re-posts unchanged board lines)"; exit 1; }
+  # POSTED_STATE anti-repeat gate must be serialized (chat-review/land-posted-state-race): the
+  # read→decide→write of do_post has to sit inside an flock, else two concurrent --check double-post.
+  # FALSIFIABLE: strip the flock guard from the gate → this assert FAILs.
+  grep -qF 'flock -n 9' "$0" && grep -qF '9>"$POSTED_LOCK"' "$0" \
+    || { echo "smoke-test: FAIL (POSTED_STATE gate not flock-serialized — concurrent --check will double-post)"; exit 1; }
+  # behavioral unit: prove flock -n actually serializes two racers on one lock (the mechanism the fix
+  # relies on) — the loser must NOT proceed. Deterministic; degrade-skip if flock is unavailable.
+  if command -v flock >/dev/null 2>&1; then
+    _lk="$(mktemp)"; _out="$(mktemp)"
+    ( flock -n 9 && { printf 'won\n' >> "$_out"; sleep 0.4; } ) 9>"$_lk" &
+    sleep 0.1
+    ( flock -n 9 && printf 'won\n' >> "$_out" ) 9>"$_lk"   # contends while holder sleeps → must lose
+    wait
+    _wins="$(grep -c won "$_out" 2>/dev/null || echo 0)"; rm -f "$_lk" "$_out"
+    [ "$_wins" = 1 ] || { echo "smoke-test: FAIL (flock -n did not serialize racers: $_wins acquired, expected 1)"; exit 1; }
+  fi
   echo "smoke-test: ok"; exit 0; }
 
 # Candidates = uncommitted scripts/ work, BOTH tracked-modified (git diff HEAD) AND untracked
@@ -178,6 +196,13 @@ if [ "$mode" = --autoland ]; then
     else
       echo "$(date -u +%FT%TZ) autoland self-heal: local ${_hl:0:7} DIVERGED from origin ${_ho:0:7} (not fast-forward) — manual reconcile, NOT force-pushing public origin"
     fi
+  fi
+  # PULL-FORWARD (chat-review/autoland-pull-first): ensure local is up-to-date before committing.
+  # Without this, autoland commits on top of a stale base when origin has new commits → divergence.
+  # --ff-only: fast-forward only; diverged trees abort (manual reconcile needed).
+  if ! git pull --ff-only --quiet origin main 2>/dev/null; then
+    echo "$(date -u +%FT%TZ) autoland: git pull --ff-only failed (diverged from origin) — aborting landing, manual reconcile needed"
+    exit 0
   fi
   tested=(); held=()
   for f in "${cands[@]}"; do
@@ -235,22 +260,50 @@ if [ "$mode" = --check ]; then
   done
   # BOARD-FLOOD GATE (chat-review 2026-06-17: land [strand] re-posted identical lines every
   # tick → ~30% of the board, drowning real signal). Post ONLY when the strand SET changed
-  # (all category file lists) OR the unchanged set is older than REFRESH (a periodic
-  # reminder, default 1h). The strands still exist (exit 1) every tick — we just don't re-shout
-  # the same line. Signature is the sorted file lists per category; stored as ts\nsig.
+  # (all category file lists) OR the unchanged set is older than the current refresh interval.
+  # EXPONENTIAL BACKOFF: when the strand set is unchanged, double the refresh interval each
+  # re-post (REFRESH → 2× → 4× → … up to MAX_REFRESH). When the set changes, reset to
+  # REFRESH. The strands still exist (exit 1) every tick — we just space out identical re-posts.
+  # Signature is the sorted file lists per category; stored as ts\nsig\nrefresh.
   # sig keys on BOARD categories ONLY (nag_excl/task/dropped). nag_elig is TRACE-only (line 243 →
   # mesh-trace, never the board), so eligible-set churn (a fix settling→landing→clearing) must NOT
   # flip this sig and re-post the unchanged [strand]/[task]/[escalate] lines — the defeated-gate board
   # flood (7/9 false [strand] re-posts in 5h, chat-review/strand-floodgate-sig 2026-06-26). The nag_elig
   # trace fires outside do_post below so eligible-only changes still leave a durable heads-up.
   sig="x:$(printf '%s,' "${nag_excl[@]+"${nag_excl[@]}"}")|t:$(printf '%s,' "${task[@]+"${task[@]}"}")|d:$(printf '%s,' "${dropped[@]+"${dropped[@]}"}")"
-  last_ts=0; last_sig=""
-  [ -f "$POSTED_STATE" ] && { read -r last_ts; read -r last_sig; } < "$POSTED_STATE" 2>/dev/null
-  [ -n "$last_ts" ] || last_ts=0; case "$last_ts" in *[!0-9]*) last_ts=0;; esac
+  # CONCURRENCY LOCK (chat-review/land-posted-state-race 2026-07-03): the POSTED_STATE
+  # read→decide→write below is a TOCTOU — two concurrent 'mesh-land --check' (cron's dedicated
+  # */45 run + mesh-vitality's own '--check' call at :17 hourly, or an ad-hoc verify run) can both
+  # read the same last_ts/last_sig BEFORE either writes back, both compute do_post=1, and both post
+  # the identical [strand]/[task]/[escalate] line — defeating the very anti-flood gate above.
+  # LIVE-REPRODUCED: byte-identical [task]+[escalate] pair 25s apart 2026-07-03T03:17:02Z/03:17:27Z.
+  # A non-blocking flock serializes it: the loser can't acquire fd 9 → do_post stays 0 → it silently
+  # skips the post (the strands still exist; the exit-1 liveness signal below is OUTSIDE the lock, so
+  # exit code / dash 'unlanded work' is unaffected). flock-absent (non-util-linux) → degrade UNLOCKED
+  # (prior maybe-double behavior) rather than never-post.
   do_post=0
-  if [ "$sig" != "$last_sig" ] || [ $(( now - last_ts )) -ge "$REFRESH" ]; then
-    do_post=1; printf '%s\n%s\n' "$now" "$sig" > "$POSTED_STATE" 2>/dev/null
-  fi
+  POSTED_LOCK="${MESH_DIR:-$HOME/.mesh}/.mesh-land-posted.lock"
+  {
+    if command -v flock >/dev/null 2>&1 && ! flock -n 9; then
+      : # lost the race — another --check holds the lock; skip posting (do_post stays 0)
+    else
+      last_ts=0; last_sig=""; last_refresh="$REFRESH"
+      if [ -f "$POSTED_STATE" ]; then
+        read -r last_ts last_sig last_refresh _ < "$POSTED_STATE" 2>/dev/null || true
+      fi
+      [ -n "$last_ts" ] || last_ts=0; case "$last_ts" in *[!0-9]*) last_ts=0;; esac
+      [ -n "$last_refresh" ] || last_refresh="$REFRESH"; case "$last_refresh" in *[!0-9]*) last_refresh="$REFRESH"; esac
+      if [ "$sig" != "$last_sig" ]; then
+        cur_refresh="$REFRESH"   # strand set changed → reset backoff
+      else
+        cur_refresh=$(( last_refresh * 2 ))
+        [ "$cur_refresh" -gt "$MAX_REFRESH" ] && cur_refresh="$MAX_REFRESH"
+      fi
+      if [ "$sig" != "$last_sig" ] || [ $(( now - last_ts )) -ge "$cur_refresh" ]; then
+        do_post=1; printf '%s\n%s\n%s\n' "$now" "$sig" "$cur_refresh" > "$POSTED_STATE" 2>/dev/null
+      fi
+    fi
+  } 9>"$POSTED_LOCK"
   if [ "$do_post" = 1 ]; then
     # EXCLUDED → board [strand], labeled with the steward-required reason (substrate / no-or-failing --test).
     [ "${#nag_excl[@]}" -gt 0 ] && command -v mesh-chat >/dev/null 2>&1 && MESH_WHO="land@$(hostname)" mesh-chat "[strand] ${#nag_excl[@]} steward-required fix(es) (NOT autoland-eligible): $(printf '%s ' "${nag_excl[@]}")— steward: review (git diff) + 'mesh-land --apply'." >/dev/null 2>&1
