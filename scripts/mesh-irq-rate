@@ -1,9 +1,17 @@
 #!/usr/bin/env python3
 # orphan-ok: on-demand kernel interrupt snapshot; sampled when asked, not scheduled
-"""mesh-irq-rate — interrupt activity sense from /proc/interrupts.
+"""mesh-irq-rate — interrupt activity sense from /proc/interrupts (+ softirq load).
 
 Reads /proc/interrupts twice, computes the per-second interrupt rate, and reports
 the busiest line. Exit 2 if interrupts are unreadable; never fabricates a reading.
+
+Also samples /proc/softirqs (read by NO other mesh tool — discover 2026-07-03) for
+the busiest softirq's per-second delta AND its top-CPU CONCENTRATION share. The
+concentration is the load-bearing signal: NET_RX pinned ~99% to one CPU means RPS
+isn't spreading receive-softirq work → single-CPU network-RX-vs-mind contention the
+per-CPU-summing interrupt view can't see (the middle layer between irq-rate and
+nic-drops). honest-fusion: if /proc/softirqs is unreadable the softirq block reports
+UNAVAILABLE (never a fabricated 0) while the interrupt reading stands on its own.
 """
 import json
 import os
@@ -13,6 +21,8 @@ import time
 
 SNAPSHOT = os.environ.get("MESH_IRQ_PATH", "/proc/interrupts")
 SNAPSHOT2 = os.environ.get("MESH_IRQ_PATH2", SNAPSHOT)
+SOFTIRQ_PATH = os.environ.get("MESH_SOFTIRQ_PATH", "/proc/softirqs")
+SOFTIRQ_PATH2 = os.environ.get("MESH_SOFTIRQ_PATH2", SOFTIRQ_PATH)
 SLEEP_SECS = float(os.environ.get("MESH_IRQ_SAMPLE_SECS", "1"))
 
 
@@ -62,6 +72,70 @@ def delta_top(before, after):
     return best or (0, "-", "")
 
 
+def parse_softirqs(path):
+    """Return {name: [per-CPU counts]} (per-CPU RETAINED, not summed — the skew is
+    the signal) or None if the file is unreadable (→ honest UNAVAILABLE, never 0)."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return None
+    out = {}
+    for line in lines:
+        if not line.strip() or line.lstrip().startswith("CPU"):
+            continue
+        m = re.match(r"^\s*([^:]+):\s+(.*)$", line)
+        if not m:
+            continue
+        name = m.group(1).strip()
+        counts = [int(t) for t in m.group(2).split() if re.fullmatch(r"\d+", t)]
+        if counts:
+            out[name] = counts
+    return out
+
+
+def softirq_hotspot(before, after):
+    """Busiest softirq by total delta (the 'what's hot right now' RATE context).
+    Returns (name, total_delta, top_cpu_index, top_cpu_share) or None if no activity.
+    NOTE: over a short window the busiest is usually SCHED/RCU (kernel background,
+    naturally spread) — so this is rate context, NOT the pinning signal; NET_RX
+    concentration below is the standing pathology (a pinned-but-quiet softirq is
+    invisible here)."""
+    best = None
+    for name in set(before) | set(after):
+        b = before.get(name, [])
+        a = after.get(name, [])
+        n = max(len(a), len(b))
+        deltas = [max(0, (a[i] if i < len(a) else 0) - (b[i] if i < len(b) else 0)) for i in range(n)]
+        tot = sum(deltas)
+        if tot <= 0:
+            continue
+        top_cpu = max(range(len(deltas)), key=lambda i: deltas[i])
+        share = deltas[top_cpu] / tot
+        cand = (tot, name, top_cpu, share)
+        if best is None or cand[0] > best[0] or (cand[0] == best[0] and cand[1] < best[1]):
+            best = cand
+    if best is None:
+        return None
+    return (best[1], best[0], best[2], best[3])
+
+
+def cpu_concentration(snapshot, name):
+    """Top-CPU share of a named softirq from CUMULATIVE per-CPU counts — the standing
+    RPS-spread signal (share≈1.0 = one CPU carries nearly all of it → not spreading).
+    Cumulative (not delta) because RPS/IRQ-affinity is a standing config, so a quiet
+    window doesn't erase the pinning. Returns (top_cpu_index, share) or None if absent
+    or zero-total (→ honest 'no data', never a fabricated 0)."""
+    if snapshot is None or name not in snapshot:
+        return None
+    counts = snapshot[name]
+    tot = sum(counts)
+    if tot <= 0 or not counts:
+        return None
+    top_cpu = max(range(len(counts)), key=lambda i: counts[i])
+    return (top_cpu, counts[top_cpu] / tot)
+
+
 def classify(rate):
     if rate < 500:
         return "QUIET"
@@ -107,7 +181,54 @@ if "--test" in sys.argv[1:]:
         if parse_snapshot("/nonexistent/interrupts") is not None:
             print("smoke-test: FAIL (missing file should not parse)")
             raise SystemExit(1)
-        print("smoke-test: ok")
+        # --- softirq hotspot: per-CPU concentration is the signal ---
+        ss1 = os.path.join(td.name, "soft1")
+        ss2 = os.path.join(td.name, "soft2")
+        with open(ss1, "w", encoding="utf-8") as fh:
+            fh.write(
+                "                    CPU0       CPU1\n"
+                "      NET_RX:       1000         10\n"
+                "       SCHED:        500        500\n"
+            )
+        with open(ss2, "w", encoding="utf-8") as fh:
+            fh.write(
+                # NET_RX +990 on CPU0, +10 on CPU1 → 99% pinned to CPU0 (the real find)
+                "                    CPU0       CPU1\n"
+                "      NET_RX:       1990         20\n"
+                "       SCHED:        600        600\n"
+            )
+        sa = parse_softirqs(ss1)
+        sb = parse_softirqs(ss2)
+        if sa is None or sb is None:
+            print("smoke-test: FAIL (softirq fixture parse failed)")
+            raise SystemExit(1)
+        hs = softirq_hotspot(sa, sb)
+        if hs is None:
+            print("smoke-test: FAIL (softirq hotspot None on active fixture)")
+            raise SystemExit(1)
+        hs_name, hs_delta, hs_cpu, hs_share = hs
+        # NET_RX delta 1000 > SCHED delta 200 → busiest; pinned to CPU0 at 990/1000
+        if hs_name != "NET_RX" or hs_delta != 1000 or hs_cpu != 0 or round(hs_share, 2) != 0.99:
+            print(f"smoke-test: FAIL (softirq hotspot wrong: {hs})")
+            raise SystemExit(1)
+        # honest UNAVAILABLE: unreadable /proc/softirqs → None, never a fabricated 0
+        if parse_softirqs("/nonexistent/softirqs") is not None:
+            print("smoke-test: FAIL (missing softirqs should not parse)")
+            raise SystemExit(1)
+        # no-activity (identical snapshots) → None, not a zero-share hotspot
+        if softirq_hotspot(sa, sa) is not None:
+            print("smoke-test: FAIL (idle softirq should yield no hotspot)")
+            raise SystemExit(1)
+        # NET_RX standing concentration from cumulative counts (the find): 1990/2010≈0.99
+        conc = cpu_concentration(sb, "NET_RX")
+        if conc is None or conc[0] != 0 or round(conc[1], 2) != 0.99:
+            print(f"smoke-test: FAIL (net_rx concentration wrong: {conc})")
+            raise SystemExit(1)
+        # absent softirq → None (honest 'no data', not a fabricated share)
+        if cpu_concentration(sb, "NONEXISTENT_SOFTIRQ") is not None:
+            print("smoke-test: FAIL (absent softirq should give no concentration)")
+            raise SystemExit(1)
+        print("smoke-test: ok (irq parse/delta/classify + softirq hotspot/skew/unavailable/idle + net_rx concentration)")
         raise SystemExit(0)
     finally:
         td.cleanup()
@@ -117,6 +238,7 @@ start = parse_snapshot(SNAPSHOT)
 if start is None:
     print("mesh-irq-rate: /proc/interrupts not readable — UNREACHABLE", file=sys.stderr)
     raise SystemExit(2)
+soft_start = parse_softirqs(SOFTIRQ_PATH)   # None → softirq block UNAVAILABLE, interrupts still stand
 start_ts = time.time()
 if SNAPSHOT2 == SNAPSHOT:
     time.sleep(max(SLEEP_SECS, 0.0))
@@ -124,6 +246,7 @@ end = parse_snapshot(SNAPSHOT2)
 if end is None:
     print("mesh-irq-rate: /proc/interrupts not readable — UNREACHABLE", file=sys.stderr)
     raise SystemExit(2)
+soft_end = parse_softirqs(SOFTIRQ_PATH2)
 end_ts = time.time()
 
 elapsed = max(end_ts - start_ts, 0.001)
@@ -133,6 +256,22 @@ rate = max(0.0, (after - before) / elapsed)
 level = classify(rate)
 top_rate, top_irq, top_desc = delta_top(start, end)
 desc = top_desc or "?"
+
+softirq_ok = soft_start is not None and soft_end is not None
+hotspot = softirq_hotspot(soft_start, soft_end) if softirq_ok else None
+if hotspot is not None:
+    si_name, si_delta, si_cpu, si_share = hotspot
+    si_rate = round(si_delta / elapsed, 1)
+    si_share_r = round(si_share, 3)
+else:
+    si_name = si_rate = si_cpu = si_share_r = None
+
+# NET_RX standing concentration (the find): top-CPU share from cumulative counts
+netrx = cpu_concentration(soft_end, "NET_RX") if softirq_ok else None
+if netrx is not None:
+    nrx_cpu, nrx_share = netrx[0], round(netrx[1], 3)
+else:
+    nrx_cpu = nrx_share = None
 
 if "--json" in sys.argv[1:]:
     print(json.dumps({
@@ -144,8 +283,26 @@ if "--json" in sys.argv[1:]:
         "top_irq": top_irq,
         "top_delta": top_rate,
         "top_desc": desc,
+        # additive softirq keys — None (not 0) when /proc/softirqs is unreadable
+        "softirq_available": softirq_ok,
+        "softirq_top": si_name,
+        "softirq_top_per_s": si_rate,
+        "softirq_top_cpu": si_cpu,
+        "softirq_cpu_share": si_share_r,
+        "net_rx_top_cpu": nrx_cpu,        # standing NET_RX pinning (RPS-spread signal)
+        "net_rx_cpu_share": nrx_share,    # ≈1.0 = receive-softirq pinned to one CPU
         "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }))
     raise SystemExit(0)
 
-print(f"[irq-rate] {level} — {rate:.1f} irq/s over {elapsed:.2f}s | top={top_irq}:{top_rate}/sample {desc} | total={before}->{after}")
+if not softirq_ok:
+    softirq_str = " | softirq=UNAVAILABLE"
+else:
+    top_str = f"softirq-top={si_name}:{si_rate}/s" if hotspot is not None else "softirq-top=idle"
+    if netrx is not None:
+        pin = "PINNED" if nrx_share >= 0.90 else "spread"
+        nrx_str = f" net-rx cpu{nrx_cpu}={nrx_share*100:.0f}%({pin})"
+    else:
+        nrx_str = " net-rx=n/a"
+    softirq_str = f" | {top_str}{nrx_str}"
+print(f"[irq-rate] {level} — {rate:.1f} irq/s over {elapsed:.2f}s | top={top_irq}:{top_rate}/sample {desc} | total={before}->{after}{softirq_str}")
