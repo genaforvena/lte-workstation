@@ -20,8 +20,14 @@
 # frames, assemble them into an animated GIF (PIL, no ffmpeg) and send it as a looping clip to Telegram.
 # CAM_VIDEO_CONFIRM=0 sends on any motion (skip the person gate). Clip: CAM_CLIP_FRAMES=12 · CAM_CLIP_W=480.
 #
+# LIVENESS/BLINDNESS (2026-07-04): ~/.mesh/.cam-watch.state = SEEING/DARK/FLAT/CAPTURE-FAIL|stats,
+# refreshed every CAM_STATE_EVERY (60s) — mtime = the loop ran a real capture, content = what the lens
+# sees; class transitions edge-logged to cam-events.log. Before this, .cam-motion (motion-only stamp)
+# was the sole artifact → a lens dark since 06-29 midday was 4.4 days indistinguishable from a still room.
+#
 # Tunables (env): CAM_DEV=/dev/video0 · CAM_POLL=1.5 · CAM_THRESH=14 · CAM_COOLDOWN=15 · CAM_WARMUP=8
-#   CAM_RES=1280x720 · CAM_CHAT=<override chat_id> · CAM_VIDEO=1 · CAM_PHOTOS=0.  Creds: ~/.config/remote-access/env.
+#   CAM_RES=1280x720 · CAM_CHAT=<override chat_id> · CAM_VIDEO=1 · CAM_PHOTOS=0 · CAM_STATE_EVERY=60.
+#   Creds: ~/.config/remote-access/env.
 set -uo pipefail
 export PATH="$HOME/.local/bin:$PATH"
 
@@ -40,6 +46,8 @@ MESH="${MESH_DIR:-$HOME/.mesh}"
 PREV="$MESH/cam-prev.jpg"
 LASTF="$MESH/cam-last-alert"
 LOG="$MESH/cam-events.log"
+STATE="$MESH/.cam-watch.state"        # liveness+blindness artifact: SEEING/DARK/FLAT/CAPTURE-FAIL
+CAM_STATE_EVERY="${CAM_STATE_EVERY:-60}"  # seconds between state refreshes (poll is ~1.5s; stats hourly-rate)
 mkdir -p "$MESH" 2>/dev/null || true
 
 # ---- diff helper (PIL): prints the mean-abs grayscale difference between two JPEGs ------------------
@@ -150,10 +158,56 @@ PY
 
 log_evt() { printf '%sZ  %s\n' "$(date -u +%Y-%m-%dT%H:%M:%S)" "$1" >> "$LOG" 2>/dev/null || true; }
 
+# ---- liveness+blindness state (2026-07-04, the 4.4-day hollow) --------------------------------------
+# The daemon's only artifact used to be .cam-motion — stamped ON MOTION ONLY — so a covered/dark lens
+# (real case: dark even at midday since 06-29 12:24), a dead camera, or a genuinely still room were all
+# the same eternal silence: systemd green, zero record, nothing alarmed. Per the liveness-touch
+# convention: .cam-watch.state mtime = the loop ran a real capture (refreshed every CAM_STATE_EVERY s),
+# content = what the lens sees. Class TRANSITIONS are edge-logged to cam-events.log so "when did the
+# lens go dark" is answerable after the fact.
+frame_class() {  # <jpg> <diff> -> CLASS|diff=..|mean=..|span=.. (CLASS: SEEING / DARK / FLAT / STAT-FAIL)
+  python3 - "$1" "$2" <<'PY'
+import sys
+from PIL import Image
+try:
+    im=Image.open(sys.argv[1]).convert("L").resize((160,120))
+    px=sorted(im.getdata())
+    mean=sum(px)/len(px)
+    span=px[int(len(px)*0.98)]-px[int(len(px)*0.02)]   # p2-p98 spread: ignores stuck pixels
+    if span<12 and mean<30: cls="DARK"    # uniformly near-black: lens covered / lid closed / unlit room
+    elif span<12: cls="FLAT"              # uniform but lit: lens blocked by a bright obstruction
+    else: cls="SEEING"
+    print(f"{cls}|diff={sys.argv[2]}|mean={mean:.0f}|span={span}")
+except Exception:
+    print("STAT-FAIL|diff=%s"%sys.argv[2])
+PY
+}
+
+state_update() {  # <FRAME|CAPTURE-FAIL> <diff> [jpg]  — throttled; atomic write; touch = ran-live
+  local due=1 prev_class="" new cls
+  if [ -f "$STATE" ]; then
+    prev_class="$(cut -d'|' -f1 "$STATE" 2>/dev/null)"
+    [ $(( $(date +%s) - $(stat -c %Y "$STATE" 2>/dev/null || echo 0) )) -lt "$CAM_STATE_EVERY" ] && due=0
+  fi
+  if [ "$1" = CAPTURE-FAIL ]; then
+    new="CAPTURE-FAIL|dev=$CAM_DEV"
+  else
+    [ "$due" = 1 ] || return 0        # skip the PIL stats pass on off-cycles
+    new="$(frame_class "$3" "$2")" || return 0
+  fi
+  cls="${new%%|*}"
+  if [ "$due" = 1 ] || [ "$cls" != "$prev_class" ]; then
+    printf '%s\n' "$new" > "$STATE.tmp" 2>/dev/null && mv -f "$STATE.tmp" "$STATE" 2>/dev/null
+    mesh-state-touch "$STATE" 2>/dev/null || touch "$STATE" 2>/dev/null || true
+    [ -n "$prev_class" ] && [ "$cls" != "$prev_class" ] && log_evt "cam state $prev_class→$cls (${new#*|})"
+  fi
+  return 0
+}
+
 # one cycle: capture → compare to baseline → maybe alert → update baseline. echoes the diff value.
 cycle() {
   local now; now="$(mktemp /tmp/cam-now-XXXX.jpg)"
-  if ! capture "$now"; then echo "CAPTURE_FAIL"; rm -f "$now"; return 1; fi
+  if ! capture "$now"; then state_update CAPTURE-FAIL "-"; echo "CAPTURE_FAIL"; rm -f "$now"; return 1; fi
   local d="0.00"
   if [ -f "$PREV" ]; then
     d="$(diff_metric "$PREV" "$now")"
@@ -212,6 +266,7 @@ cycle() {
       else log_evt "motion diff=$d (cooldown, not sent)"; fi
     fi
   fi
+  state_update FRAME "$d" "$now"
   cp -f "$now" "$PREV" 2>/dev/null; rm -f "$now"
   echo "$d"
 }
@@ -244,7 +299,29 @@ print(f"  identical-frames diff={same:.2f} (want <1)  changed-frame diff={change
 print(f"  clip-gif frames={nf} (want 3)  size={gsz}b (want >0)")
 sys.exit(0 if ok else 1)
 PY
-    [ $? -eq 0 ] && echo "smoke-test: ok (diff metric + clip-gif assembly)" || { echo "smoke-test: FAIL"; exit 1; }
+    [ $? -eq 0 ] || { echo "smoke-test: FAIL"; exit 1; }
+    # frame_class fixtures (pure PIL, no camera): the blindness classifier behind .cam-watch.state.
+    # Real hollow this catches: lens dark at midday for 4.4d (mean 17 / span ~10) → must read DARK.
+    _fcdir="$(mktemp -d /tmp/cam-fc-XXXXXX)"
+    python3 - "$_fcdir" <<'PY'
+from PIL import Image
+import sys
+d=sys.argv[1]
+Image.new("L",(640,480),15).save(d+"/dark.jpg")     # covered/unlit lens
+Image.new("L",(640,480),200).save(d+"/flat.jpg")    # bright uniform obstruction
+img=Image.new("L",(640,480),60)                      # structured scene
+for y in range(100,380):
+    for x in range(150,490): img.putpixel((x,y),210)
+img.save(d+"/scene.jpg")
+PY
+    _fc_fail=0
+    for _f in dark:DARK flat:FLAT scene:SEEING; do
+      _cls="$(frame_class "$_fcdir/${_f%%:*}.jpg" 0.00 | cut -d'|' -f1)"
+      [ "$_cls" = "${_f##*:}" ] || { echo "  FAIL: frame_class(${_f%%:*}) → $_cls (want ${_f##*:})"; _fc_fail=1; }
+    done
+    rm -rf "$_fcdir"
+    [ "$_fc_fail" = 0 ] || { echo "smoke-test: FAIL"; exit 1; }
+    echo "smoke-test: ok (diff metric + clip-gif assembly + 3 frame_class blindness fixtures)"
     ;;
   --noise)
     command -v fswebcam >/dev/null || { echo "no fswebcam"; exit 1; }
