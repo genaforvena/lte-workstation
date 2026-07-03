@@ -1,0 +1,168 @@
+#!/usr/bin/env bash
+# mesh-swap-rate — the kernel's SWAP-THRASH-RATE sense: pages/sec moving between RAM and disk,
+# read from /proc/vmstat (pswpin/pswpout) + pgmajfault. Distinct from mesh-swap's FULLNESS snapshot.
+#
+# Why a RATE, not a fullness snapshot (mesh-swap already has that):
+#   swap can be FULL-but-STABLE (pages parked on disk, nobody touching them — performance is FINE)
+#   or filling/draining FAST (pages actively shuttling RAM<->disk — performance is degrading NOW).
+#   Only the RATE distinguishes them. A page fetched from swap is ~1000x slower than RAM, so a high
+#   sustained swap-page rate IS the memory-pressure collapse that slows/OOMs minds — and it LEADS
+#   the fullness curve (the rate climbs before the pool fills). On this memory-constrained mind node
+#   (7.3Gi, throttles under multi-mind load; pswpout cumulative already in the millions) that makes
+#   it a leading indicator, complementing mesh-stress (thermal axis) for the throttle picture.
+#
+# The three tools, three layers of the SAME memory-pressure problem:
+#   mesh-swap       → /proc/swaps used/total percentage      — how FULL the swap pool is (snapshot)
+#   mesh-psi        → /proc/pressure/memory                  — kernel wait-STALL on memory (partial)
+#   mesh-swap-rate  → /proc/vmstat pswpin/pswpout pages/sec  — how FAST swap I/O is happening NOW
+#
+# Method: two-sample counter delta over a short window (read, sleep, read) → pages/sec. Self-serve
+# (/proc/vmstat is world-readable 0444, no phone/organ, no SSH). A counter reset (reboot mid-window)
+# reads as 0, never a negative/bogus rate.
+#
+# Classification (FALSIFIABLE via --test; SWAP page rate = pswpin_pps + pswpout_pps, page=4KB):
+#   IDLE       < 20 pg/s   (<80 KB/s)     — negligible swap traffic, not thrashing
+#   LIGHT      20-500 pg/s (80KB-2MB/s)   — some swap I/O, system coping
+#   THRASHING  >= 500 pg/s (>=2MB/s)      — heavy sustained swap I/O, performance degrading NOW
+#   UNKNOWN    /proc/vmstat unreadable or fields absent (defensive; never a faked "IDLE")
+# Thresholds env-overridable: SWAP_RATE_LIGHT_PPS (20) / SWAP_RATE_THRASH_PPS (500), window SWAP_RATE_WINDOW_S (3).
+# pgmajfault rate is reported as CONTEXT only (it includes file-backed faults — noisy as a primary
+# classifier — so it corroborates but does not drive the verdict).
+#
+# Honest-exit contract:
+#   0 = rate produced (IDLE/LIGHT/THRASHING)
+#   2 = /proc/vmstat missing/unreadable or fields absent — never a fabricated rate
+#
+# reflex-cadence: */5 * * * *
+# reflex-args: --edge
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+MESH_DIR="${MESH_DIR:-$HOME/.mesh}"
+STATE="$MESH_DIR/.swap-rate.state"
+
+LIGHT_PPS="${SWAP_RATE_LIGHT_PPS:-20}"
+THRASH_PPS="${SWAP_RATE_THRASH_PPS:-500}"
+WINDOW_S="${SWAP_RATE_WINDOW_S:-3}"
+VMSTAT="${MESH_VMSTAT:-/proc/vmstat}"
+
+# read_counters <file> → echoes "pswpin pswpout pgmajfault" or returns 1 (any field missing).
+# The three fields are cumulative-since-boot counters (monotone non-negative integers).
+read_counters() {
+  local f="$1" pin pout pmf
+  [ -r "$f" ] || return 1
+  pin="$(awk '$1=="pswpin"{print $2; exit}'     "$f" 2>/dev/null)"
+  pout="$(awk '$1=="pswpout"{print $2; exit}'    "$f" 2>/dev/null)"
+  pmf="$(awk '$1=="pgmajfault"{print $2; exit}' "$f" 2>/dev/null)"
+  # every field must be a bare non-negative integer, else the source is not the vmstat we expect
+  for v in "$pin" "$pout" "$pmf"; do
+    [ -n "$v" ] && printf '%s' "$v" | grep -qE '^[0-9]+$' || return 1
+  done
+  printf '%s %s %s\n' "$pin" "$pout" "$pmf"
+}
+
+# rate <cur> <prev> <dt> → pages/sec (integer, floored), never negative.
+# A counter reset (cur<prev, e.g. reboot inside the window) floors to 0 — never a bogus negative.
+rate() {
+  local cur="$1" prev="$2" dt="$3" d
+  [ "$dt" -ge 1 ] 2>/dev/null || dt=1
+  d=$(( cur - prev ))
+  [ "$d" -lt 0 ] && d=0
+  printf '%s' "$(( d / dt ))"
+}
+
+# classify_rate <swap_pps> → echoes "LABEL|reason". Pure/falsifiable, no side effects.
+classify_rate() {
+  local pps="$1"
+  if [ -z "$pps" ] || ! printf '%d' "$pps" >/dev/null 2>&1; then
+    echo "UNKNOWN|non-numeric rate (pps=$pps)"; return
+  fi
+  if   [ "$pps" -lt "$LIGHT_PPS" ];  then echo "IDLE|${pps} pg/s swap I/O — negligible"; return; fi
+  if   [ "$pps" -lt "$THRASH_PPS" ]; then echo "LIGHT|${pps} pg/s swap I/O — system coping"; return; fi
+  echo "THRASHING|${pps} pg/s swap I/O — heavy sustained swap, performance degrading"
+}
+
+if [ "${1:-}" = --test ]; then
+  fail=0
+  # Pin thresholds so asserts are deterministic regardless of env overrides.
+  LIGHT_PPS=20 THRASH_PPS=500
+  # classify bands + boundaries (page rate is the sum pswpin_pps+pswpout_pps)
+  r="$(classify_rate 0)";   echo "$r" | grep -q '^IDLE'      || { echo "  FAIL IDLE-0: $r"; fail=1; }
+  r="$(classify_rate 19)";  echo "$r" | grep -q '^IDLE'      || { echo "  FAIL IDLE-boundary(19): $r"; fail=1; }
+  r="$(classify_rate 20)";  echo "$r" | grep -q '^LIGHT'     || { echo "  FAIL LIGHT-boundary(20): $r"; fail=1; }
+  r="$(classify_rate 250)"; echo "$r" | grep -q '^LIGHT'     || { echo "  FAIL LIGHT-mid(250): $r"; fail=1; }
+  r="$(classify_rate 499)"; echo "$r" | grep -q '^LIGHT'     || { echo "  FAIL LIGHT-boundary(499): $r"; fail=1; }
+  r="$(classify_rate 500)"; echo "$r" | grep -q '^THRASHING' || { echo "  FAIL THRASHING-boundary(500): $r"; fail=1; }
+  r="$(classify_rate 5000)";echo "$r" | grep -q '^THRASHING' || { echo "  FAIL THRASHING-hi(5000): $r"; fail=1; }
+  r="$(classify_rate abc)"; echo "$r" | grep -q '^UNKNOWN'   || { echo "  FAIL UNKNOWN-nonnum: $r"; fail=1; }
+  # rate(): floors, never negative, divides by window
+  [ "$(rate 100 40 3)" = 20 ] || { echo "  FAIL rate(100,40,3)=20 got=$(rate 100 40 3)"; fail=1; }
+  [ "$(rate 40 100 3)" = 0 ]  || { echo "  FAIL rate reset→0 got=$(rate 40 100 3)"; fail=1; }
+  [ "$(rate 100 40 0)" = 60 ] || { echo "  FAIL rate dt<1 floored-to-1 got=$(rate 100 40 0)"; fail=1; }
+  [ "$fail" = 1 ] && { echo "smoke-test: FAIL"; exit 1; }
+  echo "  ok: classify (8 cases: IDLE×2,LIGHT×3,THRASHING×2,UNKNOWN) + rate (floor/reset/dt-guard)"
+  # REAL-READ gate: reachability != producing. /proc/vmstat must be readable AND the three counter
+  # fields must parse, AND a live two-sample must yield a FINITE NON-NEGATIVE integer rate (a hollow
+  # sense would pass classify yet never read real hardware). Short 1s window keeps --test fast.
+  [ -r "$VMSTAT" ] || { echo "smoke-test: n/a (/proc/vmstat unreadable — not Linux? /procfs missing?); classify-logic ok"; exit 2; }
+  c1="$(read_counters "$VMSTAT")" || { echo "smoke-test: n/a (vmstat fields absent); classify-logic ok"; exit 2; }
+  sleep 1
+  c2="$(read_counters "$VMSTAT")" || { echo "smoke-test: n/a (vmstat 2nd read failed); classify-logic ok"; exit 2; }
+  in1="${c1%% *}"; out1="$(printf '%s' "$c1" | awk '{print $2}')"
+  in2="${c2%% *}"; out2="$(printf '%s' "$c2" | awk '{print $2}')"
+  pps=$(( $(rate "$in2" "$in1" 1) + $(rate "$out2" "$out1" 1) ))
+  [ "$pps" -ge 0 ] 2>/dev/null || { echo "smoke-test: FAIL (live rate not a non-negative integer: pps=$pps)"; exit 1; }
+  echo "smoke-test: ok (classify+rate + REAL two-sample vmstat read: ${pps} pg/s over 1s)"
+  exit 0
+fi
+
+# --- Live read path: two-sample counter delta over WINDOW_S ---
+[ -r "$VMSTAT" ] || {
+  printf 'UNKNOWN|reason=vmstat-unreadable\n' > "$STATE"; mesh-state-touch "$STATE" 2>/dev/null || touch "$STATE"
+  echo "mesh-swap-rate: $VMSTAT not readable (not Linux? /procfs missing?) — not an alarm" >&2
+  exit 2
+}
+t1=$(date +%s); c1="$(read_counters "$VMSTAT")" || {
+  printf 'UNKNOWN|reason=vmstat-fields-absent\n' > "$STATE"; mesh-state-touch "$STATE" 2>/dev/null || touch "$STATE"
+  echo "mesh-swap-rate: pswpin/pswpout/pgmajfault absent in $VMSTAT — not an alarm" >&2
+  exit 2
+}
+sleep "$WINDOW_S"
+t2=$(date +%s); c2="$(read_counters "$VMSTAT")" || {
+  printf 'UNKNOWN|reason=vmstat-2nd-read-failed\n' > "$STATE"; mesh-state-touch "$STATE" 2>/dev/null || touch "$STATE"
+  echo "mesh-swap-rate: 2nd vmstat read failed — not an alarm" >&2
+  exit 2
+}
+dt=$(( t2 - t1 )); [ "$dt" -ge 1 ] || dt="$WINDOW_S"
+
+in1="${c1%% *}"; out1="$(printf '%s' "$c1" | awk '{print $2}')"; mf1="$(printf '%s' "$c1" | awk '{print $3}')"
+in2="${c2%% *}"; out2="$(printf '%s' "$c2" | awk '{print $2}')"; mf2="$(printf '%s' "$c2" | awk '{print $3}')"
+in_pps="$(rate "$in2" "$in1" "$dt")"
+out_pps="$(rate "$out2" "$out1" "$dt")"
+mf_pps="$(rate "$mf2" "$mf1" "$dt")"
+swap_pps=$(( in_pps + out_pps ))
+
+result="$(classify_rate "$swap_pps")"
+label="${result%%|*}"; reason="${result#*|}"
+TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+# additive-fields contract: first |-field is the authoritative LABEL (first-token consumers untouched);
+# write + touch liveness on EVERY successful run (mtime=ran-live, content=value-changed).
+printf '%s|swap_pps=%s|in_pps=%s|out_pps=%s|majflt_pps=%s|window=%ss\n' \
+  "$label" "$swap_pps" "$in_pps" "$out_pps" "$mf_pps" "$dt" > "$STATE"
+mesh-state-touch "$STATE" 2>/dev/null || touch "$STATE"
+
+# --edge: only emit to stdout when the LABEL changes (for quiet cron wiring); state always written above.
+if [ "${1:-}" = --edge ]; then
+  prev=""; [ -f "$MESH_DIR/.swap-rate.edge" ] && prev="$(head -1 "$MESH_DIR/.swap-rate.edge")"
+  printf '%s\n' "$label" > "$MESH_DIR/.swap-rate.edge"
+  [ "$label" = "$prev" ] && exit 0
+fi
+
+if [ "${1:-}" = --json ]; then
+  printf '{"label":"%s","swap_pps":%s,"in_pps":%s,"out_pps":%s,"majflt_pps":%s,"window_s":%s,"ts":"%s"}\n' \
+    "$label" "$swap_pps" "$in_pps" "$out_pps" "$mf_pps" "$dt" "$TS"
+  exit 0
+fi
+printf '[swap-rate-%s] %s — swap %s pg/s (in=%s out=%s) majflt=%s/s over %ss | %s\n' \
+  "$(printf '%s' "$label" | tr '[:upper:]' '[:lower:]')" "$label" "$swap_pps" "$in_pps" "$out_pps" "$mf_pps" "$dt" "$reason"
