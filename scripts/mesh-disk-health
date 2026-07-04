@@ -1,0 +1,228 @@
+#!/usr/bin/env bash
+# reflex-cadence: */5 * * * *
+# mesh-disk-health — the storage I/O performance sense: per-disk await (latency) and queue
+#   depth via /proc/diskstats. Complements mesh-hw-health (SMART/temperature = media HEALTH,
+#   not performance) — a physically healthy SSD can still be latency-bound under heavy swap
+#   or concurrent-mind I/O; this is the missing IO-leg of the pressure triangle alongside
+#   mesh-pressure (PSI stall) and mesh-swap-rate (thrash).
+#
+# find: ~/.mesh/knowledge/capability-diskstats-io-latency-20260704.md (discover, field map
+#   independently reproduced live by health 2026-07-04T16:58:43Z — this tool wires that find).
+#
+# Field map (/proc/diskstats, whitespace-split, name=field3 — POSITIONAL, no header line
+#   exists in this proc file, so field INDEX is the only source of truth; verified against
+#   Documentation/admin-guide/iostats.rst and two independent live reproductions):
+#   f4=reads_completed  f6=sectors_read  f8=writes_completed  f10=sectors_written
+#   f12=io_in_progress (instant queue-depth gauge)  f13=io_ticks_ms (busy time, -> %util)
+#   f14=weighted_io_ticks_ms (-> await numerator)   f15=discards_completed (NOT tot_ticks —
+#   an earlier mislabel discover's find explicitly corrects).
+#
+# Derived:
+#   await  = Δf14 / Δ(f4+f8) ms/IO   (rising await = SSD wear / fs bottleneck; the headline)
+#   qdepth = f12                      (instantaneous gauge, no delta)
+#   util%  = Δf13 / Δelapsed_ms * 100
+#   rd/wr  = Δ(f6|f10) * 512 bytes / elapsed_s
+#
+# Scope: WHOLE-DISK devices only (nvme<N>n<M>, sd<letters>, mmcblk<N>) — partitions
+#   (nvme0n1p1, sda1, mmcblk0p1) and loop*/ram* are skipped so a disk's I/O is never
+#   double-counted between the whole device and its own partitions.
+#
+# Honest contract:
+#   - /proc/diskstats absent or unreadable (exotic/container) -> exit 2, never a fake read
+#     (mesh-land treats exit 2 as an honest n/a pass).
+#   - Δ(f4+f8)=0 for the interval -> await=0 (no div-by-zero), not fabricated.
+#   - a counter that went BACKWARDS since the last sample (reboot resets diskstats to 0)
+#     labels that device's interval "reset", never a fake negative await.
+#
+# Usage:
+#   mesh-disk-health          reflex mode: Δ since last run vs per-device state, then update state
+#   mesh-disk-health --raw    lifetime cumulative counters + instant gauge only (no Δ, no state write)
+#   mesh-disk-health --json   NDJSON, one object per whole-disk device
+#   mesh-disk-health --test   smoke test (field-index parse incl. discards mislabel trap + live gate)
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+
+MESH="${MESH_DIR:-$HOME/.mesh}"
+STATE="$MESH/.disk-health-state"
+OFFLINEFILE="$MESH/.disk-health-offline"
+DISKSTATS="${MESH_DISKSTATS:-/proc/diskstats}"
+mkdir -p "$MESH" 2>/dev/null || true
+
+# read_disks <diskstats_file> -> one TAB-separated row per WHOLE-DISK device:
+#   name reads_completed sectors_read writes_completed sectors_written io_in_progress io_ticks weighted_io_ticks discards
+# FIELD-INDEX aligned ($4/$6/$8/$10/$12/$13/$14/$15) — /proc/diskstats has no header line,
+# so a positional off-by-one (e.g. reading $15 discards as the old "tot_ticks" mislabel, or
+# $13 io_ticks as $14 weighted_io_ticks) is the exact trap this must not fall into. Filters to
+# whole-disk names only: nvme<N>n<M> / sd<letters> / mmcblk<N> — never a partition, never loop/ram.
+# Exits 1 if no whole-disk row was found at all (nothing usable).
+read_disks() {
+  awk '
+    function is_whole_disk(n) {
+      if (n ~ /^nvme[0-9]+n[0-9]+$/) return 1
+      if (n ~ /^sd[a-z]+$/)          return 1
+      if (n ~ /^mmcblk[0-9]+$/)      return 1
+      return 0
+    }
+    {
+      name = $3
+      if (!is_whole_disk(name)) next
+      printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", name, $4, $6, $8, $10, $12, $13, $14, $15
+      any = 1
+    }
+    END { exit (any ? 0 : 1) }
+  ' "$1"
+}
+
+if [ "${1:-}" = --test ]; then
+  command -v awk >/dev/null 2>&1    || { echo "smoke-test: FAIL (no awk)"; exit 1; }
+  command -v mktemp >/dev/null 2>&1 || { echo "smoke-test: FAIL (no mktemp)"; exit 1; }
+  td="$(mktemp -d)" || { echo "smoke-test: FAIL (mktemp)"; exit 1; }
+  trap 'rm -rf "$td"' EXIT
+
+  # 1. real-shaped fixture (nvme0n1 + its partitions + a loop dev) — field-index parse must
+  #    hit nvme0n1's OWN row, skip the partitions/loop entirely, and read $15 as discards
+  #    (NOT $14 weighted_io_ticks and not some "tot_ticks" that doesn't exist at that index).
+  cat >"$td/diskstats" <<'EOF'
+   7       1 loop1 12947 0 66926 400 0 0 0 0 0 272 400 0 0 0 0 0 0
+ 259       0 nvme0n1 20519784 4567201 899319486 5817410 85025407 33157551 3386829442 283991272 0 15199699 290244572 34534 0 425693602 14038 1110351 421851
+ 259       1 nvme0n1p1 2223 1236 52980 366 2 0 2 0 0 118 369 3 0 132922 2 0 0
+EOF
+  got="$(read_disks "$td/diskstats")" || { echo "smoke-test: FAIL (fixture parse exit)"; exit 1; }
+  n=0; [ -n "$got" ] && n="$(printf '%s\n' "$got" | wc -l)"
+  [ "$n" -eq 1 ] || { echo "smoke-test: FAIL (must yield exactly 1 whole-disk row, not partitions/loop: got $n)"; exit 1; }
+  printf '%s' "$got" | awk -F'\t' '{
+    if ($1 != "nvme0n1")     exit 11   # must be the whole disk, not nvme0n1p1
+    if ($2 != "20519784")    exit 12   # reads_completed (f4)
+    if ($3 != "899319486")   exit 13   # sectors_read (f6)
+    if ($4 != "85025407")    exit 14   # writes_completed (f8)
+    if ($5 != "3386829442")  exit 15   # sectors_written (f10)
+    if ($6 != "0")           exit 16   # io_in_progress (f12)
+    if ($7 != "15199699")    exit 17   # io_ticks (f13) — must NOT be weighted_io_ticks (f14)
+    if ($8 != "290244572")   exit 18   # weighted_io_ticks (f14) -> await numerator
+    if ($9 != "34534")       exit 19   # discards_completed (f15) — the mislabel trap
+  }' || { echo "smoke-test: FAIL (field-index parse wrong: $got)"; exit 1; }
+
+  # 2. mmcblk (Android/embedded) whole-disk vs its partition — same whole-disk-only rule.
+  cat >"$td/diskstats2" <<'EOF'
+ 179       0 mmcblk0 100 0 200 5 50 0 100 3 0 8 8 0 0 0 0 0 0
+ 179       1 mmcblk0p1 10 0 20 1 5 0 10 1 0 2 2 0 0 0 0 0 0
+EOF
+  got2="$(read_disks "$td/diskstats2")" || { echo "smoke-test: FAIL (mmcblk fixture parse exit)"; exit 1; }
+  [ "$(printf '%s' "$got2" | cut -f1)" = "mmcblk0" ] || { echo "smoke-test: FAIL (mmcblk whole-disk filter wrong: $got2)"; exit 1; }
+
+  # 3. only loop/ram/partitions present -> no whole-disk row -> exit 1 (never fabricates a reading)
+  printf '   7       1 loop1 1 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n 259 1 nvme0n1p1 1 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0\n' >"$td/nowhole"
+  read_disks "$td/nowhole" >/dev/null 2>&1 && { echo "smoke-test: FAIL (no-whole-disk fixture must exit 1)"; exit 1; }
+
+  # LIVE real-read gate (the verification principle): the real /proc/diskstats must yield a
+  # parseable await for at least one whole-disk device, not an empty/stale echo.
+  [ -r "$DISKSTATS" ] || { echo "smoke-test: n/a (no $DISKSTATS on this node)"; exit 2; }
+  live="$(read_disks "$DISKSTATS" 2>/dev/null)" || { echo "smoke-test: FAIL (live read found no whole-disk device)"; exit 1; }
+  live1="$(printf '%s\n' "$live" | head -1)"
+  IFS=$'\t' read -r _n lr lsr lw lsw lq lit lwit ld <<EOF
+$live1
+EOF
+  denom=$(( lr + lw ))
+  [ "$denom" -gt 0 ] || { echo "smoke-test: FAIL (live reads+writes is 0 — cannot compute await)"; exit 1; }
+  printf '%s' "$lwit" | grep -qE '^[0-9]+$' || { echo "smoke-test: FAIL (live weighted_io_ticks not numeric: '$lwit')"; exit 1; }
+  echo "smoke-test: ok (field-index incl. discards-mislabel trap + whole-disk-vs-partition filter x2 + no-whole-disk-reject + live real-read gate, dev=$_n)"
+  exit 0
+fi
+
+# --- arg parsing ---
+JSON=0; RAW=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --json) JSON=1; shift ;;
+    --raw)  RAW=1;  shift ;;
+    *) echo "mesh-disk-health: unknown arg '$1'" >&2; exit 2 ;;
+  esac
+done
+
+# --- honest reachability gate ---
+if [ ! -r "$DISKSTATS" ]; then
+  [ -f "$OFFLINEFILE" ] || { echo "mesh-disk-health: UNREACHABLE — no readable $DISKSTATS" >&2; : > "$OFFLINEFILE"; }
+  exit 2
+fi
+cur="$(read_disks "$DISKSTATS")" || {
+  [ -f "$OFFLINEFILE" ] || { echo "mesh-disk-health: UNREACHABLE — no whole-disk device found in $DISKSTATS" >&2; : > "$OFFLINEFILE"; }
+  exit 2
+}
+rm -f "$OFFLINEFILE" 2>/dev/null || true
+
+now_epoch="$(date +%s)"; now_iso="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+# --- --raw: cumulative lifetime totals + gauge only (no Δ, no state write) ---
+if [ "$RAW" = 1 ]; then
+  while IFS=$'\t' read -r name reads sread writes swrite qdepth ioticks wioticks discards; do
+    [ -z "$name" ] && continue
+    if [ "$JSON" = 1 ]; then
+      printf '{"dev":"%s","gauge":{"qdepth":%s},"cumulative":{"reads":%s,"sectors_read":%s,"writes":%s,"sectors_written":%s,"io_ticks_ms":%s,"weighted_io_ticks_ms":%s,"discards":%s}}\n' \
+        "$name" "$qdepth" "$reads" "$sread" "$writes" "$swrite" "$ioticks" "$wioticks" "$discards"
+    else
+      printf '[disk] dev=%s reads=%s writes=%s qdepth=%s io_ticks_ms=%s weighted_io_ticks_ms=%s discards=%s | (raw lifetime totals)\n' \
+        "$name" "$reads" "$writes" "$qdepth" "$ioticks" "$wioticks" "$discards"
+    fi
+  done <<< "$cur"
+  exit 0
+fi
+
+# --- reflex mode: Δ since last sample vs per-device state ---
+# state line per device: dev|iso|epoch|reads|sectors_read|writes|sectors_written|io_ticks|weighted_io_ticks|discards
+declare -A p_reads p_sread p_writes p_swrite p_ioticks p_wioticks p_epoch
+if [ -r "$STATE" ]; then
+  while IFS='|' read -r s_dev s_iso s_epoch s_reads s_sread s_writes s_swrite s_ioticks s_wioticks s_discards; do
+    [ -z "$s_dev" ] && continue
+    p_reads[$s_dev]="$s_reads"; p_sread[$s_dev]="$s_sread"; p_writes[$s_dev]="$s_writes"
+    p_swrite[$s_dev]="$s_swrite"; p_ioticks[$s_dev]="$s_ioticks"; p_wioticks[$s_dev]="$s_wioticks"
+    p_epoch[$s_dev]="$s_epoch"
+  done < "$STATE"
+fi
+
+new_state=""
+out_lines=""
+while IFS=$'\t' read -r name reads sread writes swrite qdepth ioticks wioticks discards; do
+  [ -z "$name" ] && continue
+  new_state="${new_state}${name}|${now_iso}|${now_epoch}|${reads}|${sread}|${writes}|${swrite}|${ioticks}|${wioticks}|${discards}"$'\n'
+
+  interval_lbl="baseline"; await="-"; util="-"; rd_mb="-"; wr_mb="-"
+  if [ -n "${p_epoch[$name]:-}" ]; then
+    pe="${p_epoch[$name]}"; interval_s=$(( now_epoch - pe )); [ "$interval_s" -lt 1 ] && interval_s=1
+    pr="${p_reads[$name]}"; psr="${p_sread[$name]}"; pw="${p_writes[$name]}"; psw="${p_swrite[$name]}"
+    pit="${p_ioticks[$name]}"; pwit="${p_wioticks[$name]}"
+    if [ "$reads" -ge "$pr" ] 2>/dev/null && [ "$writes" -ge "$pw" ] 2>/dev/null && [ "$ioticks" -ge "$pit" ] 2>/dev/null; then
+      interval_lbl="sample"
+      d_reads=$(( reads - pr )); d_writes=$(( writes - pw )); d_denom=$(( d_reads + d_writes ))
+      d_wioticks=$(( wioticks - pwit )); d_ioticks=$(( ioticks - pit ))
+      d_sread=$(( sread - psr )); d_swrite=$(( swrite - psw ))
+      if [ "$d_denom" -gt 0 ]; then
+        await="$(awk -v a="$d_wioticks" -v b="$d_denom" 'BEGIN{printf "%.3f", a/b}')"
+      else
+        await="0.000"
+      fi
+      util="$(awk -v a="$d_ioticks" -v s="$interval_s" 'BEGIN{v=a/(s*1000)*100; if(v<0)v=0; printf "%.1f", v}')"
+      rd_mb="$(awk -v a="$d_sread" -v s="$interval_s" 'BEGIN{printf "%.3f", (a*512)/1048576/s}')"
+      wr_mb="$(awk -v a="$d_swrite" -v s="$interval_s" 'BEGIN{printf "%.3f", (a*512)/1048576/s}')"
+    else
+      interval_lbl="reset"   # a counter went backwards -> device reset (reboot/hotplug), never a fake negative
+    fi
+  fi
+
+  if [ "$JSON" = 1 ]; then
+    jv(){ case "$1" in -) printf 'null';; *) printf '%s' "$1";; esac; }
+    out_lines="${out_lines}$(printf '{"dev":"%s","await_ms":%s,"qdepth":%s,"util_pct":%s,"rd_mb_s":%s,"wr_mb_s":%s,"interval":"%s"}' \
+      "$name" "$(jv "$await")" "$qdepth" "$(jv "$util")" "$(jv "$rd_mb")" "$(jv "$wr_mb")" "$interval_lbl")"$'\n'
+  else
+    out_lines="${out_lines}$(printf '[disk] dev=%s await=%sms qdepth=%s util=%s%% rd=%sMB/s wr=%sMB/s | %s' \
+      "$name" "$await" "$qdepth" "$util" "$rd_mb" "$wr_mb" "$interval_lbl")"$'\n'
+  fi
+done <<< "$cur"
+
+# --- durable state artifact: write current per-device counters (atomic), mtime = liveness ---
+tmp="$STATE.tmp.$$"
+printf '%s' "$new_state" > "$tmp" && mv "$tmp" "$STATE"
+mesh-state-touch "$STATE" 2>/dev/null || true   # this reflex writes state unconditionally every run
+
+printf '%s' "$out_lines"
+exit 0
