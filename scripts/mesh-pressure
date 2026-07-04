@@ -1,0 +1,203 @@
+#!/usr/bin/env bash
+# reflex-cadence: */5 * * * *
+# mesh-pressure — the kernel's PSI (Pressure Stall Information) sense across ALL domains
+#   (cpu, io, memory). Emits one line per domain: some + full stall avg10/avg60/avg300 + total.
+#
+# /proc/pressure/{cpu,io,memory} tells us how long tasks have been STALLED waiting for a
+# resource — a sharper signal than loadavg (which counts merely-runnable tasks). CPU pressure
+# = compute-starved; IO pressure = blocked on storage; memory pressure = stuck in reclaim.
+# This tool is the RAW, multi-domain sense (no classification, no fusion) — complementary to
+# mesh-psi-memory, which is memory-only + classified + thrash-fused.
+#
+# Honest contract:
+#   - a domain file absent/unreadable -> that domain reports UNREACHABLE; only exit 2 if ALL
+#     requested domains are unreadable (mesh-land treats exit 2 as an honest n/a pass).
+#   - never fabricates a reading. cpu has no meaningful `full` line on some kernels (it is
+#     emitted as all-zeros here, or absent) -> shown as `-`, never invented.
+#
+# Usage:
+#   mesh-pressure              one line per domain (text)
+#   mesh-pressure --json       NDJSON, one object per domain
+#   mesh-pressure -n N         read N times (0.2s apart) -> proves avg values are LIVE, not stale
+#   mesh-pressure cpu io       restrict to the named domain(s)
+#   mesh-pressure --test       smoke test (fixture parse + live real-read gate)
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+
+MESH="${MESH_DIR:-$HOME/.mesh}"
+STATE="$MESH/.pressure-state"
+OFFLINEFILE="$MESH/.pressure-offline"
+PSI_DIR="${MESH_PSI_DIR:-/proc/pressure}"
+DOMAINS_ALL="cpu io memory"
+mkdir -p "$MESH" 2>/dev/null || true
+
+# read_domain <file> -> echoes "some10\tsome60\tsome300\tsome_total\tfull10\tfull60\tfull300\tfull_total\thasfull"
+# hasfull=0 when the `full` line is absent (cpu on some kernels). Exits 1 if even `some` is missing.
+read_domain() {
+  awk '
+    $1 == "some" {
+      for (i = 2; i <= NF; i++) {
+        split($i, kv, "=")
+        if      (kv[1] == "avg10")  some10  = kv[2]
+        else if (kv[1] == "avg60")  some60  = kv[2]
+        else if (kv[1] == "avg300") some300 = kv[2]
+        else if (kv[1] == "total")  some_total = kv[2]
+      }
+    }
+    $1 == "full" {
+      hasfull = 1
+      for (i = 2; i <= NF; i++) {
+        split($i, kv, "=")
+        if      (kv[1] == "avg10")  full10  = kv[2]
+        else if (kv[1] == "avg60")  full60  = kv[2]
+        else if (kv[1] == "avg300") full300 = kv[2]
+        else if (kv[1] == "total")  full_total = kv[2]
+      }
+    }
+    END {
+      if (some10 == "") exit 1
+      printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\n", \
+        some10, some60, some300, some_total, \
+        full10, full60, full300, full_total, hasfull+0
+    }
+  ' "$1"
+}
+
+if [ "${1:-}" = --test ]; then
+  command -v awk >/dev/null 2>&1 || { echo "smoke-test: FAIL (no awk)"; exit 1; }
+  command -v mktemp >/dev/null 2>&1 || { echo "smoke-test: FAIL (no mktemp)"; exit 1; }
+  td="$(mktemp -d)" || { echo "smoke-test: FAIL (mktemp)"; exit 1; }
+  trap 'rm -rf "$td"' EXIT
+
+  # fixture: a domain with both some + full
+  cat >"$td/cpu" <<'EOF'
+some avg10=48.29 avg60=19.65 avg300=24.81 total=17155672288
+full avg10=0.00 avg60=0.00 avg300=0.00 total=0
+EOF
+  got="$(read_domain "$td/cpu")" || { echo "smoke-test: FAIL (some+full fixture parse)"; exit 1; }
+  # tab-separated: some10 some60 some300 some_total full10 full60 full300 full_total hasfull
+  printf '%s' "$got" | awk -F'\t' '{
+    if ($1 != "48.29" || $4 != "17155672288" || $9 != 1) exit 1
+  }' || { echo "smoke-test: FAIL (some+full values wrong: $got)"; exit 1; }
+
+  # fixture: a domain with only `some` (cpu on some kernels has no `full`)
+  cat >"$td/cpu-no-full" <<'EOF'
+some avg10=12.34 avg60=8.00 avg300=3.00 total=99
+EOF
+  got="$(read_domain "$td/cpu-no-full")" || { echo "smoke-test: FAIL (some-only fixture parse)"; exit 1; }
+  printf '%s' "$got" | awk -F'\t' '{
+    if ($1 != "12.34" || $5 != "" || $9 != 0) exit 1
+  }' || { echo "smoke-test: FAIL (some-only: full must be empty/hasfull=0: $got)"; exit 1; }
+
+  # fixture: empty/garbage -> parse fails (never fabricates)
+  : >"$td/empty"
+  read_domain "$td/empty" >/dev/null 2>&1 && { echo "smoke-test: FAIL (empty fixture must fail)"; exit 1; }
+
+  # LIVE real-read gate (the verification principle): -n 1 must yield parseable avg values,
+  # not empty. If PSI is absent on this node, exit 2 (honest n/a — never a fake green).
+  [ -d "$PSI_DIR" ] || { echo "smoke-test: n/a (no $PSI_DIR on this node)"; exit 2; }
+  any_ok=0
+  for d in $DOMAINS_ALL; do
+    f="$PSI_DIR/$d"
+    [ -r "$f" ] || continue
+    got="$(read_domain "$f" 2>/dev/null)" || { echo "smoke-test: FAIL (live $d read failed)"; exit 1; }
+    # avg10 (some) MUST parse as a number — the canonical "real read produced data" gate
+    s10="$(printf '%s' "$got" | cut -f1)"
+    printf '%s' "$s10" | grep -qE '^[0-9]+([.][0-9]+)?$' || { echo "smoke-test: FAIL (live $d some avg10 not numeric: '$s10')"; exit 1; }
+    any_ok=1
+  done
+  [ "$any_ok" = 1 ] || { echo "smoke-test: n/a (no readable PSI domain under $PSI_DIR)"; exit 2; }
+
+  echo "smoke-test: ok (fixture some+full / some-only / empty-reject + live /proc/pressure real-read gate)"
+  exit 0
+fi
+
+# --- arg parsing ---
+JSON=0; SAMPLES=1; DOMAINS=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --json) JSON=1; shift ;;
+    -n) SAMPLES="${2:-1}"; shift 2 ;;
+    cpu|io|memory) DOMAINS="$DOMAINS $1"; shift ;;
+    *) echo "mesh-pressure: unknown arg '$1'" >&2; exit 2 ;;
+  esac
+done
+case "$SAMPLES" in
+  ''|*[!0-9]*) echo "mesh-pressure: -n needs an integer" >&2; exit 2 ;;
+esac
+[ "$SAMPLES" -lt 1 ] && SAMPLES=1
+[ -z "$DOMAINS" ] && DOMAINS="$DOMAINS_ALL"
+
+# --- read + emit ---
+emit_domain() {  # $1=domain  -> echoes text or NDJSON line
+  local d="$1" f="$PSI_DIR/$d" r s10 s60 s300 st f10 f60 f300 ft hf
+  if [ ! -r "$f" ]; then
+    if [ "$JSON" = 1 ]; then
+      printf '{"domain":"%s","unreachable":true,"source":"%s"}\n' "$d" "$f"
+    else
+      printf '[pressure:%s] UNREACHABLE — no readable %s\n' "$d" "$f"
+    fi
+    return 1
+  fi
+  r="$(read_domain "$f" 2>/dev/null)" || {
+    if [ "$JSON" = 1 ]; then
+      printf '{"domain":"%s","unreachable":true,"source":"%s"}\n' "$d" "$f"
+    else
+      printf '[pressure:%s] UNREACHABLE — unreadable %s\n' "$d" "$f"
+    fi
+    return 1
+  }
+  IFS=$'\t' read -r s10 s60 s300 st f10 f60 f300 ft hf <<EOF
+$r
+EOF
+  # normalize absent `full` (hasfull=0) for display
+  [ "$hf" = 1 ] || { f10="-"; f60="-"; f300="-"; ft="-"; }
+  if [ "$JSON" = 1 ]; then
+    if [ "$hf" = 1 ]; then
+      printf '{"domain":"%s","some":{"avg10":%s,"avg60":%s,"avg300":%s,"total":%s},"full":{"avg10":%s,"avg60":%s,"avg300":%s,"total":%s},"source":"%s"}\n' \
+        "$d" "$s10" "$s60" "$s300" "$st" "$f10" "$f60" "$f300" "$ft" "$f"
+    else
+      printf '{"domain":"%s","some":{"avg10":%s,"avg60":%s,"avg300":%s,"total":%s},"full":null,"source":"%s"}\n' \
+        "$d" "$s10" "$s60" "$s300" "$st" "$f"
+    fi
+  else
+    printf '[pressure:%s] some avg10=%s avg60=%s avg300=%s total=%s | full avg10=%s avg60=%s avg300=%s total=%s\n' \
+      "$d" "$s10" "$s60" "$s300" "$st" "$f10" "$f60" "$f300" "$ft"
+  fi
+  return 0
+}
+
+any_ok=0
+all_state=""
+for d in $DOMAINS; do
+  ok=0
+  emit_domain "$d" && ok=1
+  [ "$ok" = 1 ] && any_ok=1
+  [ "$SAMPLES" -gt 1 ] && [ "$ok" = 1 ] && {
+    for s in $(seq 2 "$SAMPLES"); do
+      sleep 0.2
+      emit_domain "$d"
+    done
+  }
+done
+
+# honest exit: all requested domains unreadable -> exit 2 (clear the offline marker only on success)
+if [ "$any_ok" = 0 ]; then
+  [ -f "$OFFLINEFILE" ] || { echo "mesh-pressure: UNREACHABLE — no readable PSI domain" >&2; : > "$OFFLINEFILE"; }
+  exit 2
+fi
+rm -f "$OFFLINEFILE" 2>/dev/null || true
+
+# durable state artifact: last good reading per domain (one line each), mtime = liveness
+{
+  ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  for d in $DOMAINS; do
+    f="$PSI_DIR/$d"
+    [ -r "$f" ] || continue
+    r="$(read_domain "$f" 2>/dev/null)" || continue
+    printf '%s|%s|%s\n' "$d" "$r" "$ts"
+  done
+} > "$STATE"
+mesh-state-touch "$STATE"
+exit 0
