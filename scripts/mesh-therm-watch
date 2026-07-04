@@ -82,6 +82,60 @@ read_snapshot() {
   max="$(printf '%s' "$line" | grep -oE 'max=[0-9]+' | head -1 | cut -d= -f2)"
 }
 
+# THROTTLE GROUND-TRUTH (LITERATURE-adjacent capability find, discover 2026-07-04:
+# knowledge/capability-cpu-throttle-counter-20260704.md). Everything above infers throttling from
+# TEMPERATURE crossing a tuned threshold (88°C WARN / 90°C CRIT + debounce) — an inference: a chip can
+# throttle below 88°C under sustained VRM/power-limit pressure, or sit at 89°C without ever actually
+# throttling. The kernel/microcode PROCHOT counters at
+# /sys/devices/system/cpu/cpu*/thermal_throttle/package_throttle_{count,total_time_ms} are HARDWARE-
+# REPORTED, monotonic since boot, zero-cost (sysfs, no probe) — ground truth: the counter only moves
+# when the CPU itself clamped frequency. Each logical CPU exposes its OWN read of the shared PACKAGE-
+# level counter (verified live: 8 CPUs report package_throttle_total_time_ms within ~250ms of each
+# other, read-time skew only, same underlying event) — MAX across CPUs is the correct aggregate; SUMMING
+# would multiply-count one shared event by the CPU count. A second, ORTHOGONAL signal (spec's own
+# framing): appended to the existing $line/log/alert artifact for a consumer (mesh-stress thermal axis)
+# to cross-check against — does NOT touch therm_decide()'s temp-threshold verdict or the .therm-state
+# HOT/OK consumer contract (unchanged, per the ALERT DEBOUNCE header above). Glob is env-overridable so
+# --test can point it at a fixture directory instead of the real sysfs tree.
+THROTTLE_GLOB="${MESH_THERM_THROTTLE_GLOB:-/sys/devices/system/cpu/cpu*/thermal_throttle/package_throttle_total_time_ms}"
+THROTTLE_STATE="${MESH_THERM_THROTTLE_STATE:-$HOME/.mesh/.therm-throttle-state}"
+throttle_ms=""; throttle_count=""; throttle_ms_delta=""; throttle_events_delta=""
+
+read_throttle() { # sets throttle_ms/throttle_count (current absolute, MAX across CPUs); "" if unreadable
+  local f v cf vc max_ms="" max_ct=""
+  for f in $THROTTLE_GLOB; do
+    [ -r "$f" ] || continue
+    v="$(cat "$f" 2>/dev/null)"; case "$v" in ''|*[!0-9]*) continue ;; esac
+    if [ -z "$max_ms" ] || [ "$v" -gt "$max_ms" ]; then max_ms="$v"; fi
+    cf="${f%_total_time_ms}_count"
+    vc="$(cat "$cf" 2>/dev/null)"; case "$vc" in ''|*[!0-9]*) continue ;; esac
+    if [ -z "$max_ct" ] || [ "$vc" -gt "$max_ct" ]; then max_ct="$vc"; fi
+  done
+  throttle_ms="$max_ms"; throttle_count="$max_ct"
+}
+
+# compute_throttle_delta: diffs the current absolute counters (read_throttle) against the prior sample
+# in THROTTLE_STATE, sets throttle_ms_delta/throttle_events_delta, persists the new absolute baseline.
+# A prior sample HIGHER than the current one means the counter reset (reboot) — treat as a fresh
+# baseline (delta=0) rather than a bogus negative delta. Unreadable sysfs (no throttle_ms) leaves both
+# deltas empty, never a fake 0 (distinct from "read fine, zero events this interval").
+compute_throttle_delta() {
+  [ -n "$throttle_ms" ] || return 0
+  local prev_ms="" prev_ct=""
+  [ -r "$THROTTLE_STATE" ] && read -r prev_ms prev_ct < "$THROTTLE_STATE" 2>/dev/null
+  if [ -n "$prev_ms" ] && [ "$throttle_ms" -ge "$prev_ms" ] 2>/dev/null; then
+    throttle_ms_delta=$((throttle_ms - prev_ms))
+  else
+    throttle_ms_delta=0
+  fi
+  if [ -n "$prev_ct" ] && [ "$throttle_count" -ge "$prev_ct" ] 2>/dev/null; then
+    throttle_events_delta=$((throttle_count - prev_ct))
+  else
+    throttle_events_delta=0
+  fi
+  printf '%s %s\n' "$throttle_ms" "$throttle_count" > "$THROTTLE_STATE" 2>/dev/null
+}
+
 alert(){ # $1 tier(board|trace)  $2 tg-msg  $3 marker-msg.  MESH_ALERT_DRYRUN=1 → print, don't send.
          if [ -n "${MESH_ALERT_DRYRUN:-}" ]; then echo "[dryrun] $1: $3" >&2; return; fi
          if [ "$1" = board ]; then
@@ -226,7 +280,35 @@ if [ "${1:-}" = --test ]; then
     # too few samples → INSUFFICIENT (never a false verdict on a short series)
     chk "csd short→INSUFFICIENT" "$(printf '84 85 84' | csd_assess | cut -d' ' -f1)" INSUFFICIENT
   fi
-  [ "$fail" = 0 ] && { echo "smoke-test: ok (debounce kills single spike; cooldown collapses oscillation storm; escalation still fires; .therm-state contract intact)"; exit 0; } || { echo "smoke-test: FAIL"; exit 1; }
+  # ---- throttle ground-truth counters (capability-cpu-throttle-counter-20260704) ----
+  _tt="$(mktemp -d)"
+  mkdir -p "$_tt/cpu0/thermal_throttle" "$_tt/cpu1/thermal_throttle" "$_tt/cpu2/thermal_throttle"
+  echo 1000 > "$_tt/cpu0/thermal_throttle/package_throttle_total_time_ms"; echo 50 > "$_tt/cpu0/thermal_throttle/package_throttle_count"
+  echo 1200 > "$_tt/cpu1/thermal_throttle/package_throttle_total_time_ms"; echo 60 > "$_tt/cpu1/thermal_throttle/package_throttle_count"
+  echo 900  > "$_tt/cpu2/thermal_throttle/package_throttle_total_time_ms"; echo 40 > "$_tt/cpu2/thermal_throttle/package_throttle_count"
+  THROTTLE_GLOB="$_tt/cpu*/thermal_throttle/package_throttle_total_time_ms"
+  # MAX across CPUs, not SUM (they're read-skewed views of the SAME package-level event)
+  read_throttle
+  chk "throttle MAX-not-sum (ms)"    "$throttle_ms"    1200
+  chk "throttle MAX-not-sum (count)" "$throttle_count" 60
+  THROTTLE_STATE="$_tt/throttle-state"
+  compute_throttle_delta
+  chk "throttle 1st-run baseline (no fake delta)" "$throttle_ms_delta" 0
+  [ "$(cat "$THROTTLE_STATE" 2>/dev/null)" = "1200 60" ] || { echo "  FAIL: throttle baseline not persisted (got '$(cat "$THROTTLE_STATE" 2>/dev/null)')"; fail=1; }
+  echo 1500 > "$_tt/cpu1/thermal_throttle/package_throttle_total_time_ms"; echo 75 > "$_tt/cpu1/thermal_throttle/package_throttle_count"
+  read_throttle; compute_throttle_delta
+  chk "throttle real delta (ms)"     "$throttle_ms_delta"     300
+  chk "throttle real delta (count)"  "$throttle_events_delta" 15
+  echo 200 > "$_tt/cpu1/thermal_throttle/package_throttle_total_time_ms"; echo 5 > "$_tt/cpu1/thermal_throttle/package_throttle_count"
+  echo 100 > "$_tt/cpu0/thermal_throttle/package_throttle_total_time_ms"; echo 2 > "$_tt/cpu0/thermal_throttle/package_throttle_count"
+  echo 150 > "$_tt/cpu2/thermal_throttle/package_throttle_total_time_ms"; echo 3 > "$_tt/cpu2/thermal_throttle/package_throttle_count"
+  read_throttle; compute_throttle_delta
+  chk "throttle counter-reset (reboot) → 0, not negative" "$throttle_ms_delta" 0
+  THROTTLE_GLOB="$_tt/nonexistent-cpu*/thermal_throttle/package_throttle_total_time_ms"
+  read_throttle
+  [ -z "$throttle_ms" ] || { echo "  FAIL: unreadable sysfs should leave throttle_ms empty (not a fake 0), got '$throttle_ms'"; fail=1; }
+  rm -rf "$_tt"
+  [ "$fail" = 0 ] && { echo "smoke-test: ok (debounce kills single spike; cooldown collapses oscillation storm; escalation still fires; .therm-state contract intact; throttle-counter MAX-aggregation + delta + reset-safety + unreadable-fail-open)"; exit 0; } || { echo "smoke-test: FAIL"; exit 1; }
 fi
 
 # --csd: read-only critical-slowing-down assessment over therm.log (no live snapshot needed; advisory only)
@@ -247,7 +329,14 @@ read_snapshot
 [ -n "$line" ] || { echo "mesh-therm produced nothing (not an alarm)"; exit 0; }
 [ -n "$max" ] || { echo "max-temp parse failed (not an alarm): $line"; exit 0; }
 
+# --status stays read-only per its own contract above ("no alarm, no log append"): compute_throttle_delta
+# PERSISTS a new baseline every call, so running it here would let a manual --status between cron ticks
+# silently swallow real throttle events from the next real run's delta. Deferred past the --status
+# early-return; only the actual */5 cron pass (and its log/alert artifact) advances the baseline.
 if [ "${1:-}" = --status ]; then echo "$line"; exit 0; fi
+
+read_throttle; compute_throttle_delta
+[ -n "$throttle_ms" ] && line="$line throttle_ms_delta=${throttle_ms_delta} throttle_events_delta=${throttle_events_delta}"
 
 mkdir -p "$HOME/.mesh"
 printf '%s\n' "$line" >> "$LOG"
