@@ -1,0 +1,210 @@
+#!/usr/bin/env bash
+# mesh-misha-eye-contact — Misha speaks up when the operator LOOKS HIM IN THE EYE (into the camera).
+#
+# Operator design (2026-07-04, Telegram): "пусть миша детектирует смотрит ли ему кто-то в глаза (в
+# камеру), если да - то пусть говорит" + follow-up "когда смотрят в глаза - взять 5 минут что
+# говорилось и вставить своё слово по теме (можно развёрнуто)". This composes with TWO pieces that
+# already exist rather than rebuilding anything:
+#   - mesh-face-recognize's Groq-vision pattern (tier-2 wake, mesh-misha-wake) → reused here for a
+#     SEPARATE gaze judgment (own prompt/output, does NOT touch mesh-face-recognize's Ilya/Rozalia/
+#     Nobody/Stranger contract — cross-sense vocab is a contract, other consumers grep that exact set).
+#   - mesh-overhear --poke-mind already does EXACTLY "read the last ~5-7 min transcript, give a
+#     developed 3-5 sentence opinion, speak it via mesh-room say" (its poke prompt says so verbatim) —
+#     built for the thumbs-up/motion triggers. Eye contact is just a THIRD trigger for the same poke.
+#
+#   mesh-misha-eye-contact            reflex tick: frame → gaze+identity → on operator eye contact,
+#                                      cooldown-gated, call mesh-overhear --poke-mind
+#   mesh-misha-eye-contact --status   print cooldown state
+#   mesh-misha-eye-contact --test     sandboxed test (no camera, no Groq, no poke, no ssh)
+#
+# ROOM-NODE GUARD: mirrors mesh-misha-wake/mesh-room's is_room_node — exits 0 at once off the room node
+# (no capture, no Groq, no cost), so it's safe to autowire fleet-wide.
+#
+# Own COOLDOWN (separate from --poke-mind's internal --motion cooldown): held eye contact must NOT
+# re-trigger the vision call (cost) or the poke (spam) every tick. EYE_COOLDOWN_SEC bounds it — after a
+# trigger, Misha stays quiet on gaze alone until it lapses, but reacts again once cooldown clears.
+#
+# reflex-cadence: * * * * *
+# reflex-args:
+#
+# Tunables (env): EYE_COOLDOWN_SEC=180 · EYE_WAKE_FACE="Ilya" (space-sep, the operator by default) ·
+#   ROOM_NODE=imozerov@100.125.157.75 · MISHA_EYE_FRAME=~/.mesh/cam-prev.jpg (reuse mesh-cam-watch's
+#   already-live frame — no extra capture cost) · MISHA_EYE_FRAME_MAX_AGE=30 (secs; older ⇒ camera not
+#   live this tick ⇒ skip, never a faked verdict) · MISHA_EYE_OVERRIDE=<LOOKING:Ilya|NOT_LOOKING|...>
+#   (skip live capture+Groq — for --test / manual drive)
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"   # cron's PATH is minimal; sibling mesh-* live here
+
+MESH="$HOME/.mesh"
+COOL_FILE="$MESH/misha-eye-last"        # epoch of the last gaze-triggered poke
+LOG="$MESH/misha-eye.log"
+COOLDOWN="${EYE_COOLDOWN_SEC:-180}"
+WAKE_FACE="${EYE_WAKE_FACE:-Ilya}"
+ROOM_NODE="${ROOM_NODE:-imozerov@100.125.157.75}"
+FRAME="${MISHA_EYE_FRAME:-$MESH/cam-prev.jpg}"
+FRAME_MAX_AGE="${MISHA_EYE_FRAME_MAX_AGE:-30}"
+GROQ_ENV="$MESH/groq.env"
+now(){ date +%s; }
+stampnow(){ date -u +%FT%TZ; }
+log(){ printf '%s  %s\n' "$(stampnow)" "$*" >> "$LOG"; }
+
+is_wake_face(){ local f="$1" w; for w in $WAKE_FACE; do [ "${f,,}" = "${w,,}" ] && return 0; done; return 1; }
+
+is_room_node(){
+  [ "${MISHA_FORCE_LOCAL:-0}" = 1 ] && return 0
+  local host="${ROOM_NODE#*@}" ip
+  [ "$host" = localhost ] || [ "$host" = 127.0.0.1 ] && return 0
+  for ip in $(tailscale ip -4 2>/dev/null) $(hostname -I 2>/dev/null); do
+    [ "$ip" = "$host" ] && return 0
+  done
+  return 1
+}
+
+cooldown_active(){ [ -r "$COOL_FILE" ] || return 1; local e; read -r e < "$COOL_FILE" 2>/dev/null || return 1
+                    [ -n "${e:-}" ] || return 1; [ "$(now)" -lt "$e" ]; }
+
+# classify gaze+identity on the current frame -> echoes "LOOKING:<label>" | "NOT_LOOKING" | "NOBODY" | "" (error)
+classify_gaze(){
+  if [ -n "${MISHA_EYE_OVERRIDE:-}" ]; then printf '%s' "$MISHA_EYE_OVERRIDE"; return; fi
+  [ -f "$GROQ_ENV" ] || return 0
+  [ -f "$FRAME" ] || return 0
+  local fnow fmt; fnow=$(date +%s); fmt=$(stat -c %Y "$FRAME" 2>/dev/null || echo 0)
+  [ $(( fnow - fmt )) -le "$FRAME_MAX_AGE" ] || return 0   # stale frame ⇒ can't see this tick, honest-skip
+
+  python3 - "$FRAME" "$GROQ_ENV" <<'PYEOF'
+import sys, os, base64, json, subprocess
+
+img_path, groq_env = sys.argv[1], sys.argv[2]
+
+def load_key(path):
+    with open(path) as f:
+        for line in f:
+            if line.startswith("GROQ_API_KEY="):
+                return line.split("=", 1)[1].strip().strip('"').strip("'")
+    return None
+
+key = load_key(groq_env)
+if not key:
+    sys.exit(0)
+
+with open(img_path, "rb") as f:
+    b64 = base64.b64encode(f.read()).decode("utf-8")
+
+prompt = (
+    "This is a frame from a home webcam. Answer two things about the main person in frame, if any:\n"
+    "1) Are they looking DIRECTLY at the camera lens (real eye contact with the camera, not just facing "
+    "generally toward the desk)?\n"
+    "2) Who are they: a man at the desk = 'Ilya', a woman = 'Rozalia', nobody in frame = 'Nobody', anyone "
+    "else = 'Stranger'.\n"
+    "Output EXACTLY one token: 'LOOKING:<name>' if making eye contact with the camera (name one of Ilya/"
+    "Rozalia/Stranger), 'NOT_LOOKING' if a person is present but not looking at the camera, or 'NOBODY' if "
+    "the frame is empty. No other text."
+)
+
+payload = {
+    "model": "qwen/qwen3.6-27b",
+    "messages": [{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+        ],
+    }],
+    "temperature": 0.0,
+    "max_tokens": 20,
+}
+
+cmd = ["curl", "-s", "-m", "30", "https://api.groq.com/openai/v1/chat/completions",
+       "-H", "Content-Type: application/json", "-H", f"Authorization: Bearer {key}",
+       "-d", json.dumps(payload)]
+try:
+    proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    data = json.loads(proc.stdout)
+    result = data["choices"][0]["message"]["content"].strip().strip('"').strip("'").strip(".")
+    if "</think>" in result:
+        result = result.split("</think>", 1)[1].strip()
+    for tok in ("LOOKING:Ilya", "LOOKING:Rozalia", "LOOKING:Stranger", "NOT_LOOKING", "NOBODY"):
+        if tok.lower() in result.lower():
+            print(tok); sys.exit(0)
+    print("")  # unparseable → honest empty, never a faked verdict
+except Exception:
+    print("")
+PYEOF
+}
+
+# ---- --status ---------------------------------------------------------------------------------
+if [ "${1:-}" = --status ]; then
+  if cooldown_active; then read -r e < "$COOL_FILE"; echo "misha-eye-contact: cooldown active ($(( e - $(now) ))s left)"
+  else echo "misha-eye-contact: ready (no cooldown — a gaze hit will trigger now)"; fi
+  exit 0
+fi
+
+# ---- --test : sandboxed, no camera/Groq/poke/ssh -----------------------------------------------
+if [ "${1:-}" = --test ]; then
+  P=0; F=0; pass(){ P=$((P+1)); }; fail(){ F=$((F+1)); echo "  FAIL: $1"; }
+  tmp="$(mktemp -d)" || { echo "smoke-test: FAIL (mktemp)"; exit 1; }
+  bindir="$tmp/bin"; mkdir -p "$bindir"
+  # mock mesh-overhear so a "trigger" never hits the real network/Bose
+  printf '#!/bin/sh\necho "MOCK-POKE $*" >> "%s/poke.log"\n' "$tmp" > "$bindir/mesh-overhear"
+  chmod +x "$bindir/mesh-overhear"
+  self="$(command -v "$0" 2>/dev/null)"; [ -x "$self" ] || self="$0"
+  mkdir -p "$tmp/.mesh"
+  CL="$tmp/.mesh/misha-eye-last"
+  run(){ PATH="$bindir:$PATH" HOME="$tmp" MISHA_FORCE_LOCAL=1 EYE_COOLDOWN_SEC="${COOL_T:-180}" \
+         MISHA_EYE_OVERRIDE="$1" timeout 10 bash "$self" 2>/dev/null; }
+
+  # 1. nobody in frame -> no cooldown stamp, no poke
+  run NOBODY >/dev/null
+  [ ! -e "$CL" ] && [ ! -s "$tmp/poke.log" ] && pass || fail "NOBODY must not trigger or arm cooldown"
+
+  # 2. present but not looking -> no trigger
+  run NOT_LOOKING >/dev/null
+  [ ! -e "$CL" ] && [ ! -s "$tmp/poke.log" ] && pass || fail "NOT_LOOKING must not trigger"
+
+  # 3. a stranger looking at the camera -> no trigger (operator-only, mirrors mesh-room who's privacy discipline)
+  run LOOKING:Stranger >/dev/null
+  [ ! -e "$CL" ] && [ ! -s "$tmp/poke.log" ] && pass || fail "a Stranger's eye contact must not trigger the operator poke"
+
+  # 4. operator eye contact -> cooldown armed + poke fired exactly once
+  run LOOKING:Ilya >/dev/null
+  [ -e "$CL" ] && pass || fail "operator eye contact must arm the cooldown"
+  [ "$(grep -c MOCK-POKE "$tmp/poke.log" 2>/dev/null || echo 0)" = 1 ] || fail "operator eye contact must poke exactly once"
+  read -r e < "$CL" 2>/dev/null; [ -n "${e:-}" ] && [ "$e" -gt "$(date +%s)" ] && pass || fail "cooldown epoch must be in the future"
+
+  # 5. --status reports the cooldown active
+  PATH="$bindir:$PATH" HOME="$tmp" bash "$self" --status 2>/dev/null | grep -q 'cooldown active' && pass || fail "--status should report cooldown active"
+
+  # 6. still within cooldown -> a second eye-contact hit does NOT re-poke
+  run LOOKING:Ilya >/dev/null
+  [ "$(grep -c MOCK-POKE "$tmp/poke.log" 2>/dev/null || echo 0)" = 1 ] || fail "held eye contact within cooldown must not re-poke"
+
+  # 7. cooldown expired -> a fresh hit pokes again
+  printf '%s\n' "$(( $(date +%s) - 5 ))" > "$CL"
+  run LOOKING:Ilya >/dev/null
+  [ "$(grep -c MOCK-POKE "$tmp/poke.log" 2>/dev/null || echo 0)" = 2 ] || fail "expired cooldown must allow a fresh trigger"
+
+  rm -rf "$tmp"
+  echo "smoke-test: $([ "$F" -eq 0 ] && echo ok || echo FAIL) — asserts: $P passed, $F failed"
+  [ "$F" -eq 0 ]; exit
+fi
+
+# ---- default: the reflex tick -------------------------------------------------------------------
+is_room_node || exit 0   # ROOM-NODE GUARD: nothing to do (and nothing spent) off the room node
+cooldown_active && exit 0   # held gaze / repeat looks within the window: stay quiet, no Groq spend
+
+label="$(classify_gaze)"
+
+case "$label" in
+  LOOKING:*)
+    face="${label#LOOKING:}"
+    if is_wake_face "$face"; then
+      printf '%s\n' "$(( $(now) + COOLDOWN ))" > "$COOL_FILE"
+      log "[misha-eye-contact] eye contact from operator ($face) -> poking room mind to weigh in"
+      mesh-overhear --poke-mind >/dev/null 2>&1 || true
+    fi
+    # a Stranger/Rozalia making eye contact is NOT the standing-task's operator-contact trigger — no poke,
+    # no cooldown burn (so an actual operator look right after still fires promptly).
+    ;;
+  *) : ;;   # NOT_LOOKING / NOBODY / "" (stale frame, no key, parse error) — nothing to do, honest no-op
+esac
+exit 0
