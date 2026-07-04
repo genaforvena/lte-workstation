@@ -1,0 +1,291 @@
+#!/usr/bin/env bash
+# reflex-cadence: 11-59/12 * * * *
+# reflex-args: --edge
+# mesh-interruptibility — CROSS-SENSE FUSION: when may the mesh speak/alert? A coordination primitive
+# no single sensor gives. Fuses 8 distinct senses into one INTERRUPTIBILITY band so the mesh (or any
+# consumer) can decide "is now an OK time to surface a notification / voice line / board post, or should
+# it hold/defer?" — a question none of the inputs answers alone.
+#
+# WHY THIS FUSION (the gap it fills, audited 2026-07-04):
+#   mesh-room-sense      = is someone physically in the room?        (no attention/interrupt info)
+#   mesh-operator-focus  = is the NODE under compute load?           (FOCUSED/WORKING/STRESSED/IDLE)
+#   mesh-operator-state  = WHERE is the operator (phone-body)?       (AT-PHONE/NEARBY/AWAY/ASLEEP)
+#   mesh-room-context    = what is the room's SOCIAL scene?          (ENGAGED-ACTIVE / NIGHT-STILL ...)
+#   mesh-activity-tempo  = how ACTIVE is the room (motion)?          (BUSTLE/RESTING/SILENT)
+#   mesh-ambient-clock   = are neighbor TVs / appliances on?         (QUIET/ACTIVE/MODERATE)
+#   mesh-operator-awake  = is the operator digitally reachable (TG)? (AWAKE/RECENT/IDLE)
+#   NONE of them yields the coordination decision "may I interrupt right now?". TYPING alone could be a
+#   script; FOCUSED alone could be a runaway job; AWAKE alone could be the operator mid-sentence.
+#   Fusing attention (kbd/screen) × occupancy (room) × environment (ambient/tempo/light) × digital
+#   presence (operator-awake) × time-of-day yields the band. That cross-domain product is the signal.
+#
+# Bands (priority order, first match wins; a FRESH STRONG input dominates):
+#   DO-NOT-DISTURB — operator demonstrably composing NOW: kbd=TYPING (the one clean hard gate — a
+#                    30m-old message or a lit screen alone is attention, not active composition).
+#                    Hold non-urgent speaks/alerts.
+#   FOCUSED        — operator at desk, screen engaged, present (screen NORMAL/BRIGHT + present).
+#   RESTING        — night hours + dark + still + idle + screen off + not digitally active → likely
+#                    resting. Defer unless urgent.
+#   AVAILABLE      — operator present & idle, room not loud, screen dim/off. OK to interrupt.
+#   AWAY           — room genuinely EMPTY (fresh) + no recent digital presence. Batch / defer freely.
+#   UNKNOWN        — mixed / unconfirmed signals (e.g. room UNCERTAIN + no digital corroboration).
+#                    Visibly distinct from an all-clear so the mesh never assumes "go ahead".
+#
+# HONEST-DEGRADED CONTRACT (the core rule this fusion exists to honor — empty ≠ failed):
+#   An UNREACHABLE input NEVER collapses to a silent all-clear (AVAILABLE/AWAY). The presence/attention
+#   axes are LOAD-BEARING for those bands, so if room-sense or kbd-activity is STALE/missing, an
+#   AVAILABLE/AWAY result is downgraded to UNKNOWN with the unreachable axis named in `degraded` —
+#   visibly different from a genuine AVAILABLE/AWAY whose `degraded` list is empty. A genuine AWAY
+#   (room EMPTY, fresh, no digital presence) keeps a clean artifact; an UNREACHABLE room does not.
+#   Exit 2 only when EVERY presence/attention axis is unreachable (cannot assess at all).
+#
+# Usage:
+#   mesh-interruptibility            one-line band + signals + reason
+#   mesh-interruptibility --edge     emit only on band change (2-consecutive debounce, for cron)
+#   mesh-interruptibility --json     machine-readable {band, degraded, signals, reason, ts}
+#   mesh-interruptibility --test     smoke test (synthetic _fuse assertions, no live sensors)
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+
+MESH="$HOME/.mesh"
+STATE="$MESH/.interruptibility.state"
+PENDING="${STATE%.state}.pending"
+now="$(date +%s)"
+
+# Staleness budgets = each sense's reflex cadence + grace. --edge reflexes call mesh-state-touch every
+# run (mtime = ran-live), so a STATE older than its budget means the reflex genuinely STOPPED, never
+# merely "value held" (the conditional-write FALSE-STALE class, fixed mesh-activity-tempo f3f84c1).
+KBD_STALE="${MESH_INT_KBD_STALE:-600}"        # mesh-kbd-activity       /5  (3-59/5)  → 10m
+SCREEN_STALE="${MESH_INT_SCREEN_STALE:-700}"  # mesh-screen-state       /9  (2-59/9)  → ~12m
+ROOM_STALE="${MESH_INT_ROOM_STALE:-1200}"     # mesh-room-sense         /15 (2-59/15) → 20m
+AMBIENT_STALE="${MESH_INT_AMBIENT_STALE:-2100}" # mesh-ambient-clock    /30 (6-59/30) → 35m
+TEMPO_STALE="${MESH_INT_TEMPO_STALE:-2100}"   # mesh-activity-tempo     /10 (8-59/10) → 35m (change-gated)
+LIGHT_STALE="${MESH_INT_LIGHT_STALE:-2100}"   # mesh-light              /30 (9-59/30) → 35m
+
+# read_axis <file> <stale_limit_s> → echoes "<VERDICT>|<age>" or "UNREACHABLE|<age>(stale)" or "UNREACHABLE|-"
+# A missing/empty file is UNREACHABLE (sense never ran / organ absent); a stale file is UNREACHABLE(stale).
+# Crucially a REAL reading — even a "negative" one like IDLE / EMPTY / SILENCE — is returned as-is: a
+# genuine empty is NOT the same as an unreachable sense, and this helper keeps them distinct by construction.
+# Takes the first whitespace-delimited token of field 1 (verdicts are single tokens; some state files
+# append prose like light-state's "OFFLINE <ts>" — `tr -d` would MUNGE that into "OFFLINE<ts>").
+read_axis() {
+  local f="$1" lim="$2" m age v
+  [ -f "$f" ] && [ -s "$f" ] || { echo "UNREACHABLE|-"; return; }
+  m="$(stat -c %Y "$f" 2>/dev/null || echo 0)"; [ "$m" -gt 0 ] || { echo "UNREACHABLE|-"; return; }
+  age=$(( now - m ))
+  v="$(head -1 "$f" 2>/dev/null | cut -d'|' -f1 | awk '{print $1}')"
+  [ -n "$v" ] || { echo "UNREACHABLE|${age}s"; return; }
+  if [ "$age" -gt "$lim" ]; then echo "UNREACHABLE|${age}s(stale)"; else echo "$v|${age}s"; fi
+}
+
+# _fuse <kbd> <screen> <room> <ambient> <tempo> <light> <op_awake> <hour>
+# Sets globals: band, reason, degraded, signals. Pure, offline-testable (no I/O).
+# Each axis is either a real verdict or the literal token "UNREACHABLE".
+_fuse() {
+  local kbd="$1" scr="$2" room="$3" amb="$4" tmp="$5" lt="$6" oa="$7" hr="$8"
+  local night quiet_audio still dark
+  band="UNKNOWN"; reason=""; degraded=""
+  local deg=()
+  [ "$kbd"  = UNREACHABLE ] && deg+=("kbd-unreachable")
+  [ "$scr"  = UNREACHABLE ] && deg+=("screen-unreachable")
+  [ "$room" = UNREACHABLE ] && deg+=("room-unreachable")
+  [ "$amb"  = UNREACHABLE ] && deg+=("ambient-unreachable")
+  [ "$tmp"  = UNREACHABLE ] && deg+=("tempo-unreachable")
+  [ "$lt"   = UNREACHABLE ] && deg+=("light-unreachable")
+  [ "$oa"   = UNKNOWN ]     && deg+=("op-awake-unknown")
+  if [ "${#deg[@]}" -gt 0 ]; then local IFS=,; degraded="${deg[*]}"; fi
+
+  # Predicates (UNREACHABLE axes are conservative: not night-gating on a missing clock, etc.)
+  [ "$hr" -ge 22 ] 2>/dev/null || [ "$hr" -le 6 ] 2>/dev/null && night=1 || night=0
+  case "$amb" in QUIET|SILENT) quiet_audio=1;; *) quiet_audio=0;; esac
+  case "$tmp" in SILENT|RESTING|STILL) still=1;; *) still=0;; esac
+  case "$lt"  in DARK|DIM) dark=1;; *) dark=0;; esac
+
+  local present=0
+  { [ "$room" = PRESENT ] || [ "$oa" = AWAKE ] || [ "$oa" = RECENT ]; } && present=1
+
+  # 1. DO-NOT-DISTURB: operator actively composing (fresh TYPING is the one clean hard gate — a recent
+  #    message or a lit screen is attention, not active composition).
+  if [ "$kbd" = TYPING ]; then
+    band="DO-NOT-DISTURB"; reason="keyboard TYPING — operator composing"
+  # 2. FOCUSED: at desk, screen engaged, operator present.
+  elif { [ "$scr" = NORMAL ] || [ "$scr" = BRIGHT ]; } && [ "$present" = 1 ]; then
+    band="FOCUSED"; reason="screen engaged + operator present (room=$room awake=$oa)"
+  # 3. RESTING: night + dark + still + idle + screen off/dim + not digitally active.
+  elif [ "$night" = 1 ] && [ "$dark" = 1 ] && [ "$still" = 1 ] \
+       && { [ "$kbd" = IDLE ] || [ "$kbd" = LIGHT ]; } \
+       && { [ "$scr" = OFF ] || [ "$scr" = DIM ] || [ "$scr" = UNREACHABLE ]; } \
+       && [ "$oa" != AWAKE ]; then
+    band="RESTING"; reason="night + dark + still + idle — likely resting"
+  # 4. AVAILABLE: operator present & idle, room not loud (kbd must be a real read, not unreachable).
+  elif [ "$present" = 1 ] && { [ "$kbd" = IDLE ] || [ "$kbd" = LIGHT ]; } \
+       && [ "$quiet_audio" = 1 ] && [ "$kbd" != UNREACHABLE ]; then
+    band="AVAILABLE"; reason="operator present, idle, room not loud (room=$room awake=$oa)"
+  # 5. AWAY: room genuinely EMPTY (fresh) + no recent digital presence.
+  elif [ "$room" = EMPTY ] && [ "$oa" != AWAKE ] && [ "$oa" != RECENT ]; then
+    band="AWAY"; reason="room empty + no recent digital presence"
+  # 6. fallback.
+  else
+    band="UNKNOWN"; reason="mixed/unconfirmed signals (kbd=$kbd screen=$scr room=$room tempo=$tmp light=$lt awake=$oa)"
+  fi
+
+  # HONEST-DEGRADED OVERRIDE (the no-silent-all-clear rule): an AVAILABLE/AWAY all-clear built on an
+  # UNREACHABLE load-bearing axis is downgraded to UNKNOWN with the axis named in `degraded`. A genuine
+  # all-clear (fresh axes) is untouched — its degraded list is empty, so the two artifacts differ visibly.
+  # This is the explicit guard even though the branches above already gate on real reads: it locks the
+  # contract against future logic drift and makes the rule falsifiable in --test.
+  if [ "$band" = AVAILABLE ] || [ "$band" = AWAY ]; then
+    local _wh=""
+    [ "$room" = UNREACHABLE ] && _wh="room"
+    [ "$kbd"  = UNREACHABLE ] && _wh="${_wh:+$_wh }kbd"
+    if [ -n "$_wh" ]; then
+      band="UNKNOWN"
+      reason="withheld all-clear: ${_wh} unreachable — ${reason}"
+    fi
+  fi
+
+  signals="kbd=${kbd} screen=${scr} room=${room} ambient=${amb} tempo=${tmp} light=${lt} awake=${oa} hour=${hr} night=${night}"
+}
+
+# Exit-code policy: exit 2 only when EVERY presence/attention axis is dark (cannot assess at all).
+# A single reachable axis is enough to produce an honest (if coarse) band.
+_all_dark() {
+  [ "$1" = UNREACHABLE ] || return 1
+  [ "$2" = UNREACHABLE ] || return 1
+  [ "$3" = UNREACHABLE ] || return 1
+  [ "$7" = UNKNOWN ] || return 1
+  return 0
+}
+
+if [ "${1:-}" = --test ]; then
+  _t() {  # _t <desc> <expect_band> <args...>
+    local desc="$1" exp="$2"; shift 2
+    _fuse "$@"; [ "$band" = "$exp" ] || { echo "  FAIL: $desc → expected $exp, got $band ($reason)"; exit 1; }
+  }
+  # 1. TYPING → DO-NOT-DISTURB (dominates everything)
+  _t "kbd TYPING → DND" DO-NOT-DISTURB  TYPING OFF    EMPTY    QUIET  SILENT DARK  IDLE  14
+  # 1b. digitally active + screen engaged → FOCUSED (a recent message is attention, not active composition)
+  _t "awake+BRIGHT → FOCUSED" FOCUSED   IDLE  BRIGHT  PRESENT  QUIET  RESTING LIT AWAKE 14
+  # 2. screen engaged + present → FOCUSED
+  _t "NORMAL+present → FOCUSED" FOCUSED   LIGHT NORMAL  PRESENT  ACTIVE BUSTLE LIT AWAKE 14
+  # 3. RESTING: night + dark + still + idle + screen off + not awake
+  _t "night-dark-still-idle → RESTING" RESTING IDLE OFF PRESENT QUIET SILENT DARK IDLE 2
+  # 3b. not night → not RESTING (falls through; present+idle+quiet → AVAILABLE)
+  _t "daytime dark-still → AVAILABLE" AVAILABLE IDLE OFF PRESENT QUIET SILENT DARK IDLE 14
+  # 4. AVAILABLE: present + idle + quiet
+  _t "present-idle-quiet → AVAILABLE" AVAILABLE IDLE DIM PRESENT QUIET RESTING LIT IDLE 14
+  # 4b. loud ambient → not AVAILABLE (falls to UNKNOWN, no DND/FOCUSED/RESTING match)
+  _t "present-idle-LOUD → UNKNOWN" UNKNOWN IDLE DIM PRESENT ACTIVE RESTING LIT IDLE 14
+  # 5. AWAY: room EMPTY + no digital presence
+  _t "room EMPTY → AWAY" AWAY       IDLE OFF    EMPTY    QUIET  SILENT DARK IDLE 14
+  # 5b. room EMPTY but digitally AWAKE → NOT AWAY (present via digital) → AVAILABLE
+  _t "EMPTY+AWAKE → AVAILABLE" AVAILABLE IDLE OFF EMPTY QUIET SILENT DARK AWAKE 14
+  # 6. HONEST-DEGRADED (the core contract): room UNREACHABLE must NOT yield AWAY/AVAILABLE all-clear.
+  _t "room UNREACHABLE ≠ AWAY" UNKNOWN IDLE OFF UNREACHABLE QUIET SILENT DARK IDLE 14
+  _t "room UNREACHABLE ≠ AVAILABLE(1)" UNKNOWN IDLE DIM UNREACHABLE QUIET RESTING LIT AWAKE 14
+  # 6b. kbd UNREACHABLE must NOT yield an AVAILABLE all-clear (withheld).
+  _t "kbd UNREACHABLE ≠ AVAILABLE" UNKNOWN UNREACHABLE DIM PRESENT QUIET RESTING LIT IDLE 14
+  # 6c. a genuine AWAY keeps a CLEAN (empty) degraded list; an UNREACHABLE-room verdict does not.
+  _fuse IDLE OFF EMPTY QUIET SILENT DARK IDLE 14
+  [ -z "$degraded" ] || { echo "  FAIL: genuine AWAY must have empty degraded (got '$degraded')"; exit 1; }
+  _fuse IDLE OFF UNREACHABLE QUIET SILENT DARK IDLE 14
+  printf '%s' "$degraded" | grep -q 'room-unreachable' || { echo "  FAIL: unreachable room must list room-unreachable (got '$degraded')"; exit 1; }
+  # 6d. visibly distinct artifacts: AWAY vs the withheld-UNKNOWN carry different band AND degraded.
+  _fuse IDLE OFF EMPTY QUIET SILENCE DARK IDLE 14; _b1="$band"; _d1="$degraded"
+  _fuse IDLE OFF UNREACHABLE QUIET SILENCE DARK IDLE 14; _b2="$band"; _d2="$degraded"
+  [ "$_b1" != "$_b2" ] || { echo "  FAIL: AWAY vs unreachable must differ in band"; exit 1; }
+  [ "$_d1" != "$_d2" ] || { echo "  FAIL: AWAY vs unreachable must differ in degraded"; exit 1; }
+  # 7. exit-code policy: all presence/attention dark → _all_dark returns 0
+  _all_dark UNREACHABLE UNREACHABLE UNREACHABLE QUIET SILENT DARK UNKNOWN || { echo "  FAIL: all-dark should assess-unable"; exit 1; }
+  _all_dark IDLE OFF PRESENT QUIET SILENT DARK AWAKE && { echo "  FAIL: reachable axes should not be all-dark"; exit 1; }
+  # 8. night boundary
+  _hr=23; { [ "$_hr" -ge 22 ] || [ "$_hr" -le 6 ]; } || { echo "  FAIL: 23h should be night"; exit 1; }
+  _hr=7;  { [ "$_hr" -ge 22 ] || [ "$_hr" -le 6 ]; } && { echo "  FAIL: 7h should NOT be night"; exit 1; }
+
+  # read_axis staleness: a fresh real reading (incl. a negative one) is NOT UNREACHABLE; a stale/missing
+  # file IS. This is the empty-≠-failed invariant at the I/O layer.
+  _td="$(mktemp -d)"; trap 'rm -rf "$_td"' EXIT
+  printf 'IDLE\n' > "$_td/kbd"; _r="$(read_axis "$_td/kbd" 600)"; case "$_r" in IDLE|*) :;; esac
+  [ "${_r%%|*}" = IDLE ] || { echo "  FAIL: read_axis fresh IDLE must return IDLE (got $_r)"; exit 1; }
+  touch -d '1 hour ago' "$_td/kbd"; _r="$(read_axis "$_td/kbd" 600)"
+  [ "${_r%%|*}" = UNREACHABLE ] || { echo "  FAIL: read_axis stale must return UNREACHABLE (got $_r)"; exit 1; }
+  _r="$(read_axis "$_td/missing" 600)"; [ "${_r%%|*}" = UNREACHABLE ] || { echo "  FAIL: read_axis missing must return UNREACHABLE (got $_r)"; exit 1; }
+  # a genuine EMPTY reading stays EMPTY (empty ≠ failed), not UNREACHABLE
+  printf 'EMPTY\n' > "$_td/room"; _r="$(read_axis "$_td/room" 600)"; [ "${_r%%|*}" = EMPTY ] || { echo "  FAIL: genuine EMPTY must stay EMPTY not UNREACHABLE (got $_r)"; exit 1; }
+  rm -rf "$_td"; trap - EXIT
+
+  echo "smoke-test: ok (18 fusion + honest-degraded + staleness assertions)"; exit 0
+fi
+
+MODE=oneshot; [ "${1:-}" = --edge ] && MODE=edge; [ "${1:-}" = --json ] && MODE=json
+TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"; HOUR="$(date +%H)"
+
+# --- gather axes from cached reflex STATE artifacts (cheap; each carries its own freshness) ---
+kbd="$(read_axis "$MESH/.kbd-activity.state" "$KBD_STALE")";   kbd="${kbd%%|*}"
+scr="$(read_axis "$MESH/.screen-state.state" "$SCREEN_STALE")"; scr="${scr%%|*}"
+room="$(read_axis "$MESH/.room-sense.state" "$ROOM_STALE")";    room="${room%%|*}"
+amb="$(read_axis "$MESH/.ambient-clock.state" "$AMBIENT_STALE")"; amb="${amb%%|*}"
+tmp="$(read_axis "$MESH/.activity-tempo.state" "$TEMPO_STALE")"; tmp="${tmp%%|*}"
+lt="$(read_axis "$MESH/.light-state" "$LIGHT_STALE")";          lt="${lt%%|*}"
+# light-state emits "OFFLINE <ts>" when the phone-light organ is down (and other non-level prose on
+# error) — those are an UNREACHABLE light axis, NOT a brightness level. Collapse anything outside the
+# known level vocabulary to UNREACHABLE so it can never masquerade as a real DARK/LIT reading.
+case "$lt" in DARK|DIM|MODERATE|LIT|BRIGHT) ;; *) lt=UNREACHABLE ;; esac
+
+# --- digital presence (live, cheap — reads a log; ORTHOGONAL to every physical sense) ---
+oa="UNKNOWN"
+if command -v mesh-operator-awake >/dev/null 2>&1; then
+  case "$(timeout 8 mesh-operator-awake 2>/dev/null)" in
+    *AWAKE*)  oa="AWAKE"  ;;
+    *RECENT*) oa="RECENT" ;;
+    *IDLE*)   oa="IDLE"   ;;
+    *)        oa="UNKNOWN" ;;
+  esac
+fi
+
+# --- honest exit 2: every presence/attention axis dark (cannot assess at all) ---
+if _all_dark "$kbd" "$scr" "$room" "$oa"; then
+  echo "interruptibility: all presence/attention axes unreachable (kbd=$kbd screen=$scr room=$room awake=$oa) — cannot assess" >&2
+  exit 2
+fi
+
+_fuse "$kbd" "$scr" "$room" "$amb" "$tmp" "$lt" "$oa" "$HOUR"
+
+emit_text(){ printf '[interruptibility] %s — %s | %s\n' "$band" "$reason" "$signals"; }
+emit_json(){
+  local dgr; [ -z "$degraded" ] && dgr='""' || dgr="\"$degraded\""
+  printf '{"band":"%s","degraded":%s,"reason":"%s","signals":"%s","ts":"%s"}\n' \
+    "$band" "$dgr" "$reason" "$signals" "$TS"
+}
+
+if [ "$MODE" = json ]; then emit_json; exit 0; fi
+
+if [ "$MODE" = edge ]; then
+  # 2-consecutive debounce (mirrors mesh-activity-tempo): a single flapping sample does not flip the
+  # published band. LIVENESS: touch STATE every LIVE run so a long-stable-but-LIVE band (re-confirmed
+  # every cycle) never decays to a FALSE STALE — staleness means "reflex STOPPED", never "value held".
+  confirmed="$(cat "$STATE" 2>/dev/null || true)"
+  pending_line="$(cat "$PENDING" 2>/dev/null || true)"
+  pending="${pending_line%%:*}"; pcount="${pending_line##*:}"; pcount="${pcount:-0}"
+  if [ -z "$confirmed" ]; then
+    printf '%s\n' "$band" > "$STATE"; rm -f "$PENDING"
+  elif [ "$band" = "$confirmed" ]; then
+    rm -f "$PENDING"
+  elif [ "$band" = "$pending" ]; then
+    pcount=$((pcount + 1))
+    if [ "$pcount" -ge 2 ]; then
+      printf '%s\n' "$band" > "$STATE"; rm -f "$PENDING"
+      emit_text
+    else
+      printf '%s:%d\n' "$band" "$pcount" > "$PENDING"
+    fi
+  else
+    printf '%s:1\n' "$band" > "$PENDING"
+  fi
+  # touch-state-every-LIVE-run (shared primitive, never a bare touch — chat-review/state-touch-adoption).
+  mesh-state-touch "$STATE"
+  exit 0
+fi
+
+emit_text
