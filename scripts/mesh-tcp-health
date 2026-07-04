@@ -1,0 +1,259 @@
+#!/usr/bin/env bash
+# reflex-cadence: */5 * * * *
+# mesh-tcp-health — the kernel's L4 transport-quality sense: end-to-end TCP loss/stall
+#   rate aggregated over ALL links (wifi, LTE, VPN, tailscale). Reads the cumulative TCP
+#   counters in /proc/net/snmp (Tcp:) and /proc/net/netstat (TcpExt:) by HEADER-INDEX
+#   alignment (never fixed columns — the Tcp:/TcpExt: prefix shifts fields and a naive
+#   positional parse misreads OutSegs as retransmits), and reports the DELTA since the last
+#   sample as the actual loss/stall rate. Lifetime totals alone are nearly meaningless
+#   (302k timeouts lifetime says nothing about now); the per-interval delta is the signal.
+#
+# Complementary to:
+#   - mesh-wifi-link / wifi-retry (L1 STA-side RF contention) — this is L4, link-agnostic;
+#     a flaky LTE egress or lossy tailscale path shows here even when local wifi is clean.
+#   - mesh-egress-health / mesh-lan-health (binary reachability) — this adds the numeric
+#     quality dimension they lack.
+#
+# Counters (cumulative unless noted): RetransSegs (packet retrans) · TCPTimeouts (hard RTO
+#   stalls, worst axis) · TCPLossProbes (TLP early-loss probes) · AttemptFails (setup fails)
+#   · EstabResets (resets on established conns) · ListenDrops / ListenOverflows (accept-queue
+#   starvation — a stuck listener starves silently otherwise) · CurrEstab (GAUGE: live conns).
+#
+# Honest contract:
+#   - both proc files world-readable + ever-present on Linux; if BOTH unreadable (exotic /
+#     container) -> exit 2 (mesh-land treats exit 2 as an honest n/a pass, never a fake green).
+#   - a counter absent on an older kernel (e.g. TCPTimeouts) renders as "-" / null, NEVER
+#     fabricated. Reachable-but-missing is reported honestly, distinct from unreachable.
+#   - a counter that went BACKWARDS since last sample = the node rebooted (proc counters reset
+#     to 0) -> that interval is labelled "reset" (no meaningful delta), never a fake negative.
+#
+# Usage:
+#   mesh-tcp-health            reflex mode: Δ since last run vs state, then update state
+#   mesh-tcp-health --raw      cumulative lifetime counters + gauge only (no Δ, no state write)
+#   mesh-tcp-health --json     NDJSON (gauge + delta + cumulative + interval meta)
+#   mesh-tcp-health --test     smoke test (header-index parse incl. off-by-one trap + live gate)
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+
+MESH="${MESH_DIR:-$HOME/.mesh}"
+STATE="$MESH/.tcp-health-state"
+OFFLINEFILE="$MESH/.tcp-health-offline"
+SNMP="${MESH_SNMP:-/proc/net/snmp}"
+NETSTAT="${MESH_NETSTAT:-/proc/net/netstat}"
+mkdir -p "$MESH" 2>/dev/null || true
+
+# read_counters <snmp_file> <netstat_file> -> 8 tab-separated values in fixed order:
+#   retrans timeouts lossprobes attemptfails estabresets listendrops listenoverflows currestab
+# each value is the cumulative counter (numeric) or "-" when absent on this kernel. Exits 1 if
+# NOT ONE known counter was found in either file (nothing usable). HEADER-INDEX aligned: pairs
+# each header name to its value by position, so a shifted column can never misread a neighbour.
+# TcpExt: may wrap across multiple header/value line-pairs on some kernels — all pairs are merged.
+read_counters() {
+  awk '
+    BEGIN {
+      n = split("RetransSegs TCPTimeouts TCPLossProbes AttemptFails EstabResets ListenDrops ListenOverflows CurrEstab", names, " ")
+      for (i = 1; i <= n; i++) { want[names[i]] = 1; val[names[i]] = "-" }
+    }
+    # pick the prefix for the file being read (snmp -> Tcp:, netstat -> TcpExt:)
+    FILENAME ~ /snmp$/    { curpfx = "Tcp" }
+    FILENAME ~ /netstat$/ { curpfx = "TcpExt" }
+    {
+      if (substr($0, 1, length(curpfx) + 1) == curpfx ":") {
+        line = $0
+        sub("^" curpfx ":[ \t]*", "", line)      # strip "Prefix:"
+        sub(/^[ \t]+/, "", line)                  # trim leading whitespace (clean 1-based split)
+        if (pending[FILENAME]) {
+          # VALUE line: pair each stored header name with the value at the same index
+          nfld = split(line, fld, /[ \t]+/)
+          for (j = 1; j <= nhdr; j++) {
+            nm = hdr[j]
+            if (nm in want) { v = (j <= nfld ? fld[j] : ""); if (v == "") v = "-"; val[nm] = v }
+          }
+          pending[FILENAME] = 0; nhdr = 0
+        } else {
+          # HEADER line: store its field names for the value line that follows
+          nhdr = split(line, hdr, /[ \t]+/)
+          pending[FILENAME] = 1
+        }
+      }
+    }
+    END {
+      out = ""; any = 0
+      for (i = 1; i <= n; i++) {
+        out = out (i > 1 ? "\t" : "") val[names[i]]
+        if (val[names[i]] ~ /^[0-9]+$/) any = 1
+      }
+      print out
+      exit (any ? 0 : 1)
+    }
+  ' "$1" "$2"
+}
+
+if [ "${1:-}" = --test ]; then
+  command -v awk >/dev/null 2>&1 || { echo "smoke-test: FAIL (no awk)"; exit 1; }
+  command -v mktemp >/dev/null 2>&1 || { echo "smoke-test: FAIL (no mktemp)"; exit 1; }
+  td="$(mktemp -d)" || { echo "smoke-test: FAIL (mktemp)"; exit 1; }
+  trap 'rm -rf "$td"' EXIT
+
+  # 1. header-index parse — RetransSegs sits at field 12 (between OutSegs=field11 and OutRsts=field13);
+  #    a positional/off-by-one parse would catch OutSegs(888888) or InSegs(999999) instead. The
+  #    exact trap discover hit (misread OutSegs as retransmits) — this fixture nails the right field.
+  cat >"$td/snmp" <<'EOF'
+Tcp: RtoAlgorithm RtoMin RtoMax MaxConn ActiveOpens PassiveOpens AttemptFails EstabResets CurrEstab InSegs OutSegs RetransSegs OutRsts InCsumErrors
+Tcp: 1 200 120000 -1 1000 200 80954 46211 15 999999 888888 229945 777 0
+EOF
+  cat >"$td/netstat" <<'EOF'
+TcpExt: SyncookiesSent SyncookiesRecv TCPTimeouts TCPLossProbes ListenDrops EmbryonicRsts
+TcpExt: 0 0 301748 42982 5 11
+TcpExt: ListenOverflows SomeOther PAWSPassiveReject
+TcpExt: 0 42 7
+EOF
+  got="$(read_counters "$td/snmp" "$td/netstat")" || { echo "smoke-test: FAIL (full fixture parse exit)"; exit 1; }
+  printf '%s' "$got" | awk -F'\t' '{
+    if ($1 != "229945")   exit 11   # retrans  (must NOT be 888888=OutSegs — the off-by-one trap)
+    if ($2 != "301748")   exit 12   # timeouts
+    if ($3 != "42982")    exit 13   # lossprobes
+    if ($4 != "80954")    exit 14   # attemptfails
+    if ($5 != "46211")    exit 15   # estabresets
+    if ($6 != "5")        exit 16   # listendrops
+    if ($7 != "0")        exit 17   # listenoverflows (from the SECOND TcpExt: pair — merge works)
+    if ($8 != "15")       exit 18   # currestab (gauge)
+  }' || { echo "smoke-test: FAIL (header-index parse wrong: $got)"; exit 1; }
+
+  # 2. absent counters on an older kernel — TcpExt: here lacks TCPTimeouts + ListenOverflows;
+  #    those MUST render as "-", never fabricated, never crash. Reachable-but-missing ≠ all-clear.
+  cat >"$td/snmp" <<'EOF'
+Tcp: RtoAlgorithm RtoMin ActiveOpens AttemptFails EstabResets CurrEstab InSegs OutSegs RetransSegs
+Tcp: 1 200 5 100 50 3 10 20 999
+EOF
+  printf 'TcpExt: TCPLossProbes ListenDrops\nTcpExt: 42982 5\n' >"$td/netstat"
+  got="$(read_counters "$td/snmp" "$td/netstat")" || { echo "smoke-test: FAIL (missing-counter fixture exit)"; exit 1; }
+  printf '%s' "$got" | awk -F'\t' '{
+    if ($1 != "999")  exit 21   # retrans present
+    if ($2 != "-")    exit 22   # timeouts ABSENT -> "-"
+    if ($3 != "42982") exit 23  # lossprobes present
+    if ($7 != "-")    exit 27   # listenoverflows ABSENT -> "-"
+    if ($8 != "3")    exit 28   # currestab present
+  }' || { echo "smoke-test: FAIL (missing-counter must render '-': $got)"; exit 1; }
+
+  # 3. empty/garbage files -> no known counter -> exit 1 (never fabricates a reading)
+  : >"$td/snmp"; : >"$td/netstat"
+  read_counters "$td/snmp" "$td/netstat" >/dev/null 2>&1 && { echo "smoke-test: FAIL (empty fixture must exit 1)"; exit 1; }
+
+  # LIVE real-read gate (the verification principle): the real proc files must yield a numeric
+  # CurrEstab / RetransSegs, not an empty/stale echo. If /proc/net/snmp is absent (container),
+  # exit 2 (honest n/a — never a fake green).
+  [ -r "$SNMP" ] || { echo "smoke-test: n/a (no $SNMP on this node)"; exit 2; }
+  live="$(read_counters "$SNMP" "$NETSTAT" 2>/dev/null)" || { echo "smoke-test: FAIL (live read found no known counter)"; exit 1; }
+  currestab="$(printf '%s' "$live" | cut -f8)"
+  printf '%s' "$currestab" | grep -qE '^[0-9]+$' || { echo "smoke-test: FAIL (live CurrEstab not numeric: '$currestab')"; exit 1; }
+
+  echo "smoke-test: ok (header-index incl. off-by-one trap + multi-pair merge + missing-counter + empty-reject + live real-read gate)"
+  exit 0
+fi
+
+# --- arg parsing ---
+JSON=0; RAW=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --json) JSON=1; shift ;;
+    --raw)  RAW=1;  shift ;;
+    *) echo "mesh-tcp-health: unknown arg '$1'" >&2; exit 2 ;;
+  esac
+done
+
+# --- honest reachability gate ---
+snmp_ok=0; netstat_ok=0
+[ -r "$SNMP" ]    && snmp_ok=1
+[ -r "$NETSTAT" ] && netstat_ok=1
+if [ "$snmp_ok" = 0 ] && [ "$netstat_ok" = 0 ]; then
+  [ -f "$OFFLINEFILE" ] || { echo "mesh-tcp-health: UNREACHABLE — no readable $SNMP or $NETSTAT" >&2; : > "$OFFLINEFILE"; }
+  exit 2
+fi
+cur="$(read_counters "$SNMP" "$NETSTAT")" || {
+  [ -f "$OFFLINEFILE" ] || { echo "mesh-tcp-health: UNREACHABLE — no known TCP counter in $SNMP/$NETSTAT" >&2; : > "$OFFLINEFILE"; }
+  exit 2
+}
+rm -f "$OFFLINEFILE" 2>/dev/null || true
+IFS=$'\t' read -r retrans timeouts lossprobes attemptfails estabresets listendrops listenoverflows currestab <<EOF
+$cur
+EOF
+
+# --- --raw: cumulative lifetime totals + gauge only (no Δ, no state write) ---
+if [ "$RAW" = 1 ]; then
+  if [ "$JSON" = 1 ]; then
+    jv(){ case "$1" in -) printf 'null';; *) printf '%s' "$1";; esac; }
+    printf '{"gauge":{"currestab":%s},"cumulative":{"retrans":%s,"timeouts":%s,"lossprobes":%s,"attemptfails":%s,"estabresets":%s,"listendrops":%s,"listenoverflows":%s}}\n' \
+      "$(jv "$currestab")" "$(jv "$retrans")" "$(jv "$timeouts")" "$(jv "$lossprobes")" \
+      "$(jv "$attemptfails")" "$(jv "$estabresets")" "$(jv "$listendrops")" "$(jv "$listenoverflows")"
+  else
+    printf '[tcp] retrans=%s timeouts=%s lossprobes=%s attemptfails=%s resets=%s listendrops=%s listenoverflows=%s | currestab=%s | (raw lifetime totals)\n' \
+      "$retrans" "$timeouts" "$lossprobes" "$attemptfails" "$estabresets" "$listendrops" "$listenoverflows" "$currestab"
+  fi
+  exit 0
+fi
+
+# --- reflex mode: Δ since last sample vs state ---
+now_epoch="$(date +%s)"; now_iso="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+interval_lbl="baseline"; interval_s=0
+d_retrans=baseline; d_timeouts=baseline; d_lossprobes=baseline
+d_attemptfails=baseline; d_estabresets=baseline; d_listendrops=baseline; d_listenoverflows=baseline
+
+if [ -r "$STATE" ]; then
+  prior="$(cat "$STATE" 2>/dev/null)" || prior=""
+  if [ -n "$prior" ]; then
+    # state line: iso|epoch|retrans|timeouts|lossprobes|attemptfails|estabresets|listendrops|listenoverflows|currestab
+    IFS='|' read -r p_iso p_epoch p_retrans p_timeouts p_lossprobes p_attemptfails p_estabresets p_listendrops p_listenoverflows p_currestab <<EOF
+$prior
+EOF
+    case "$p_epoch" in ''|*[!0-9]*) p_epoch=0;; esac
+    [ "$p_epoch" -gt 0 ] 2>/dev/null && interval_s=$(( now_epoch - p_epoch ))
+    interval_lbl="sample"
+    # delta_of <cur> <prior> -> "+N" | "reset" (cur<prior: reboot reset) | "-" (either absent)
+    delta_of(){
+      [ "$1" = "-" ] || [ "$2" = "-" ] && { printf '%s' "-"; return; }
+      case "$1" in ''|*[!0-9]*) printf '%s' "-"; return;; esac
+      case "$2" in ''|*[!0-9]*) printf '%s' "-"; return;; esac
+      if [ "$1" -ge "$2" ] 2>/dev/null; then printf '+%d' "$(( $1 - $2 ))"
+      else printf '%s' "reset"; interval_lbl="reset"; fi
+    }
+    d_retrans="$(delta_of "$retrans" "$p_retrans")"
+    d_timeouts="$(delta_of "$timeouts" "$p_timeouts")"
+    d_lossprobes="$(delta_of "$lossprobes" "$p_lossprobes")"
+    d_attemptfails="$(delta_of "$attemptfails" "$p_attemptfails")"
+    d_estabresets="$(delta_of "$estabresets" "$p_estabresets")"
+    d_listendrops="$(delta_of "$listendrops" "$p_listendrops")"
+    d_listenoverflows="$(delta_of "$listenoverflows" "$p_listenoverflows")"
+  fi
+fi
+
+# --- durable state artifact: write current counters (atomic), mtime = liveness ---
+tmp="$STATE.tmp.$$"
+printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+  "$now_iso" "$now_epoch" "$retrans" "$timeouts" "$lossprobes" \
+  "$attemptfails" "$estabresets" "$listendrops" "$listenoverflows" "$currestab" > "$tmp" \
+  && mv "$tmp" "$STATE"
+mesh-state-touch "$STATE" 2>/dev/null || true   # mtime = ran-live (this reflex writes state unconditionally)
+
+# --- emit ---
+if [ "$JSON" = 1 ]; then
+  jnum(){ case "$1" in +[0-9]*|[0-9]*) printf '%s' "${1#+}";; *) printf 'null';; esac; }
+  printf '{"gauge":{"currestab":%s},"delta":{"retrans":%s,"timeouts":%s,"lossprobes":%s,"attemptfails":%s,"estabresets":%s,"listendrops":%s,"listenoverflows":%s},"cumulative":{"retrans":%s,"timeouts":%s,"lossprobes":%s,"attemptfails":%s,"estabresets":%s,"listendrops":%s,"listenoverflows":%s},"interval":"%s","interval_s":%s,"since":"%s"}\n' \
+    "$(jnum "$currestab")" \
+    "$(jnum "$d_retrans")" "$(jnum "$d_timeouts")" "$(jnum "$d_lossprobes")" "$(jnum "$d_attemptfails")" \
+    "$(jnum "$d_estabresets")" "$(jnum "$d_listendrops")" "$(jnum "$d_listenoverflows")" \
+    "$(jnum "$retrans")" "$(jnum "$timeouts")" "$(jnum "$lossprobes")" "$(jnum "$attemptfails")" \
+    "$(jnum "$estabresets")" "$(jnum "$listendrops")" "$(jnum "$listenoverflows")" \
+    "$interval_lbl" "${interval_s:-0}" "$now_iso"
+else
+  case "$interval_lbl" in
+    baseline) lbl="first sample (no Δ yet)" ;;
+    reset)    lbl="counter reset (reboot?) Δ${interval_s}s" ;;
+    *)        lbl="Δ${interval_s}s" ;;
+  esac
+  printf '[tcp] retrans=%s timeouts=%s lossprobes=%s attemptfails=%s resets=%s listendrops=%s listenoverflows=%s | currestab=%s | %s | totals retrans=%s timeouts=%s lossprobes=%s\n' \
+    "$d_retrans" "$d_timeouts" "$d_lossprobes" "$d_attemptfails" "$d_estabresets" "$d_listendrops" "$d_listenoverflows" \
+    "$currestab" "$lbl" "$retrans" "$timeouts" "$lossprobes"
+fi
+exit 0
