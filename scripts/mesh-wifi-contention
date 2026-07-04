@@ -1,0 +1,183 @@
+#!/usr/bin/env bash
+# orphan-ok: on-demand STA-side RF-contention read (iw station dump tx-retry Δ + MCS; node-bound wifi STA, pulled on demand / by a fusion consumer like mesh-airtime / mesh-wifi-congestion)
+# mesh-wifi-contention — STA-side RF contention read from OUR OWN link, not the neighborhood.
+#
+# NEW SIGNAL (no existing sense reads it): `iw dev <iface> station dump` carries per-AP-link
+# counters that /proc/net/wireless (mesh-wifi-link) and nmcli/iwconfig do NOT expose:
+#   - tx retries    — the standard STA-side RF-contention metric. Its DELTA over an interval
+#                     (Δretries / Δtx_packets) rises with channel congestion/interference even
+#                     when signal (dBm) holds steady — a radio "sick but looks fine" (discover
+#                     saw 19% lifetime retry at a GOOD -66 dBm). Lifetime ratio is a poor proxy
+#                     (it averages the whole connected life); the interval delta is the live read.
+#   - beacon loss   — a hard-failure axis: any positive Δ in-window is real link trouble.
+#   - tx/rx MCS     — link adaptation. An MCS downshift senses interference/distance before drops.
+# This is the tx-side complement to the (unbuilt) rx-side discard-rate idea; it deliberately does
+# NOT read `rx drop misc` (that's the rx complement's axis — kept separate to avoid double-count).
+#
+# HOW the delta is taken: two `station dump`s INTERVAL seconds apart (default 3s), in ONE run —
+# self-contained, no cross-run state dependency, no counter-wrap hazard from a stale saved prior.
+# Cheap: one iw read each, NO scan, NO off-channel blip (unlike mesh-airtime/mesh-wifi-congestion).
+# `station dump` needs no privilege here (verified live — regular user reads it).
+#
+# Verdicts (vocab is a contract — consumers grep these tokens); classed on the interval retry %:
+#   CLEAR       retry < 10%
+#   CONTENDED   10–30%
+#   CONGESTED   >= 30%  (or ANY in-window beacon loss — a hard link fault trumps the retry ratio)
+#   IDLE        Δtx_packets < min (link too quiet to rate retries this window) — a REAL read
+#               (associated, link up), retry_pct=n/a, still reports MCS + beaconloss + lifetime; rc 0
+#   UNKNOWN     no radio / not associated to an AP / counters reset (re-assoc between samples) → rc 2
+#
+#   mesh-wifi-contention          two-sample interval read (default 3s), write state, echo
+#   mesh-wifi-contention --state  print the last written verdict (no fresh eval)
+#   mesh-wifi-contention --test   parser + delta + classifier fixtures + a real live-read gate
+#
+# STATE: ~/.mesh/.wifi-contention.state — written unconditionally EVERY run (mtime = liveness).
+# exit: 0 = verdict rendered (incl IDLE) · 2 = honest n/a (no radio / not associated / counters reset)
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+
+STATE="${WIFI_CONTENTION_STATE:-$HOME/.mesh/.wifi-contention.state}"
+INTERVAL="${WIFI_CONTENTION_INTERVAL:-3}"     # seconds between the two station-dump samples
+MIN_PKTS="${WIFI_CONTENTION_MIN_PKTS:-20}"    # below this Δtx_packets the window is too idle to rate retries
+
+classify(){ # <retry_pct_int> → verdict token
+  local r="$1"
+  if   [ "$r" -lt 10 ]; then echo CLEAR
+  elif [ "$r" -lt 30 ]; then echo CONTENDED
+  else echo CONGESTED; fi
+}
+
+# parse ONE `iw station dump` on stdin → "txp txr txf bl txmcs rxmcs sig assoc"
+# (ints; txmcs/rxmcs may be "-" when the rate line carries no MCS; assoc=1 iff a Station block seen)
+parse_dump(){
+  awk '
+    /^[[:space:]]*Station /       { assoc=1 }
+    /^[[:space:]]*tx packets:/    { txp=$3+0 }
+    /^[[:space:]]*tx retries:/    { txr=$3+0 }
+    /^[[:space:]]*tx failed:/     { txf=$3+0 }
+    /^[[:space:]]*beacon loss:/   { bl=$3+0 }
+    /^[[:space:]]*signal:/        { sig=$2+0 }
+    /^[[:space:]]*tx bitrate:/    { for(i=1;i<=NF;i++) if($i ~ /MCS$/){ txmcs=$(i+1)+0; break } }
+    /^[[:space:]]*rx bitrate:/    { for(i=1;i<=NF;i++) if($i ~ /MCS$/){ rxmcs=$(i+1)+0; break } }
+    END {
+      if(!assoc){ print "0 0 0 0 - - 0 0"; exit }
+      printf "%d %d %d %d %s %s %d 1\n", txp, txr, txf, bl, \
+             (txmcs==""?"-":txmcs), (rxmcs==""?"-":rxmcs), sig
+    }'
+}
+
+render_delta(){ # "$d1" "$d2" (each "txp txr txf bl txmcs rxmcs sig assoc") → verdict line + rc
+  local p1 r1 f1 b1 tm1 rm1 s1 as1  p2 r2 f2 b2 tm2 rm2 s2 as2
+  read -r p1 r1 f1 b1 tm1 rm1 s1 as1 <<<"$1"
+  read -r p2 r2 f2 b2 tm2 rm2 s2 as2 <<<"$2"
+  if [ "$as1" != 1 ] || [ "$as2" != 1 ]; then
+    echo "UNKNOWN|assoc=NO(not connected to an AP)"; return 2
+  fi
+  local dpkts=$((p2-p1)) dretr=$((r2-r1)) dbl=$((b2-b1))
+  if [ "$dpkts" -lt 0 ] || [ "$dretr" -lt 0 ] || [ "$dbl" -lt 0 ]; then
+    echo "UNKNOWN|counters=RESET(re-assoc between samples)"; return 2
+  fi
+  local life=0; [ "$p2" -gt 0 ] && life=$(( r2*100/p2 ))
+  if [ "$dpkts" -lt "$MIN_PKTS" ]; then
+    echo "IDLE|retry_pct=n/a|txmcs=$tm2|rxmcs=$rm2|beaconloss=$dbl|retry_life=${life}%|signal=${s2}|dpkts=$dpkts(<$MIN_PKTS)"
+    return 0
+  fi
+  local rp=$(( dretr*100/dpkts )) v
+  v="$(classify "$rp")"
+  [ "$dbl" -gt 0 ] && v=CONGESTED   # beacon loss in-window = hard contention regardless of the retry ratio
+  echo "$v|retry_pct=${rp}%|txmcs=$tm2|rxmcs=$rm2|beaconloss=$dbl|retry_life=${life}%|signal=${s2}|dpkts=$dpkts"
+  return 0
+}
+
+evaluate(){
+  local d1 d2 iface
+  if [ -n "${WIFI_CONTENTION_FIX1:-}" ] && [ -n "${WIFI_CONTENTION_FIX2:-}" ]; then
+    d1="$(parse_dump < "$WIFI_CONTENTION_FIX1")"
+    d2="$(parse_dump < "$WIFI_CONTENTION_FIX2")"
+  else
+    iface="$(iw dev 2>/dev/null | awk '/Interface/{print $2; exit}')"
+    [ -n "$iface" ] || { echo "UNKNOWN|radio=NONE"; return 2; }
+    d1="$(iw dev "$iface" station dump 2>/dev/null | parse_dump)"
+    sleep "$INTERVAL"
+    d2="$(iw dev "$iface" station dump 2>/dev/null | parse_dump)"
+  fi
+  render_delta "$d1" "$d2"
+}
+
+if [ "${1:-}" = --state ]; then cat "$STATE" 2>/dev/null || { echo "no state yet" >&2; exit 1; }; exit 0; fi
+
+if [ "${1:-}" = --test ]; then
+  T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
+  # two snapshots of the same associated link: +1000 tx_pkts, +200 retries = 20% interval retry
+  cat > "$T/s1" <<'EOF'
+Station 1e:63:5a:a3:7d:e7 (on wlp0)
+    tx packets:	100000
+    tx retries:	10000
+    tx failed:	0
+    beacon loss:	0
+    signal:  	-66 [-69, -66] dBm
+    tx bitrate:	195.1 MBit/s VHT-MCS 2 80MHz short GI VHT-NSS 2
+    rx bitrate:	390.0 MBit/s VHT-MCS 4 80MHz short GI VHT-NSS 2
+EOF
+  cat > "$T/s2" <<'EOF'
+Station 1e:63:5a:a3:7d:e7 (on wlp0)
+    tx packets:	101000
+    tx retries:	10200
+    tx failed:	0
+    beacon loss:	0
+    signal:  	-65 [-69, -66] dBm
+    tx bitrate:	195.1 MBit/s VHT-MCS 3 80MHz short GI VHT-NSS 2
+    rx bitrate:	390.0 MBit/s VHT-MCS 5 80MHz short GI VHT-NSS 2
+EOF
+  # (a) parser: one dump → exact field row
+  got="$(parse_dump < "$T/s2")"
+  [ "$got" = "101000 10200 0 0 3 5 -65 1" ] || { echo "smoke-test: FAIL (parse → '$got')"; exit 1; }
+  # (b) delta: Δpkts=1000 Δretr=200 → 20% CONTENDED, txmcs=3 rxmcs=5 beaconloss=0, rc 0
+  out="$(WIFI_CONTENTION_FIX1="$T/s1" WIFI_CONTENTION_FIX2="$T/s2" WIFI_CONTENTION_STATE="$T/st" "$0")"; rc=$?
+  { [ "$rc" = 0 ] && printf '%s' "$out" | grep -q '^CONTENDED|retry_pct=20%|txmcs=3|rxmcs=5|beaconloss=0|'; } \
+    || { echo "smoke-test: FAIL (delta → rc=$rc '$out')"; exit 1; }
+  # (c) state written unconditionally (mtime = liveness)
+  [ -s "$T/st" ] || { echo "smoke-test: FAIL (no state written)"; exit 1; }
+  # (d) idle window: Δpkts=5 (<MIN) → IDLE, retry_pct=n/a, rc 0 (real read, not hollow)
+  sed 's/101000/100005/; s/10200/10001/' "$T/s2" > "$T/s2idle"
+  out="$(WIFI_CONTENTION_FIX1="$T/s1" WIFI_CONTENTION_FIX2="$T/s2idle" WIFI_CONTENTION_STATE="$T/st" "$0")"; rc=$?
+  { [ "$rc" = 0 ] && printf '%s' "$out" | grep -q '^IDLE|retry_pct=n/a|'; } \
+    || { echo "smoke-test: FAIL (idle → rc=$rc '$out')"; exit 1; }
+  # (e) beacon loss in-window forces CONGESTED even at a low retry ratio
+  awk '{ if($0 ~ /beacon loss:/) sub(/0$/,"3"); print }' "$T/s2" > "$T/s2bl"
+  out="$(WIFI_CONTENTION_FIX1="$T/s1" WIFI_CONTENTION_FIX2="$T/s2bl" WIFI_CONTENTION_STATE="$T/st" "$0")"
+  printf '%s' "$out" | grep -q '^CONGESTED|.*beaconloss=3|' \
+    || { echo "smoke-test: FAIL (beacon-loss escalation → '$out')"; exit 1; }
+  # (f) counters reset (samples reversed → negative Δ) → UNKNOWN, rc 2
+  out="$(WIFI_CONTENTION_FIX1="$T/s2" WIFI_CONTENTION_FIX2="$T/s1" WIFI_CONTENTION_STATE="$T/st" "$0")"; rc=$?
+  { [ "$rc" = 2 ] && printf '%s' "$out" | grep -q '^UNKNOWN|counters=RESET'; } \
+    || { echo "smoke-test: FAIL (reset → rc=$rc '$out')"; exit 1; }
+  # (g) not associated (empty dump) → UNKNOWN assoc=NO, rc 2
+  : > "$T/empty"
+  out="$(WIFI_CONTENTION_FIX1="$T/empty" WIFI_CONTENTION_FIX2="$T/empty" WIFI_CONTENTION_STATE="$T/st" "$0")"; rc=$?
+  { [ "$rc" = 2 ] && printf '%s' "$out" | grep -q '^UNKNOWN|assoc=NO'; } \
+    || { echo "smoke-test: FAIL (not-assoc → rc=$rc '$out')"; exit 1; }
+  # (h) classifier boundaries
+  for pair in "9 CLEAR" "10 CONTENDED" "29 CONTENDED" "30 CONGESTED"; do
+    set -- $pair
+    got="$(classify "$1")"; [ "$got" = "$2" ] || { echo "smoke-test: FAIL (classify $1 → $got want $2)"; exit 1; }
+  done
+  # (i) REAL read gate: associated STA present → must render a real verdict token (rc 0/2), never hollow
+  iface="$(iw dev 2>/dev/null | awk '/Interface/{print $2; exit}')"
+  out="$(WIFI_CONTENTION_INTERVAL=1 WIFI_CONTENTION_STATE="$T/st" "$0")"; rc=$?
+  if [ -n "$iface" ] && iw dev "$iface" station dump 2>/dev/null | grep -q '^Station '; then
+    { [ "$rc" = 0 ] || [ "$rc" = 2 ]; } || { echo "smoke-test: FAIL (live rc=$rc)"; exit 1; }
+    printf '%s' "$out" | grep -qE '^(CLEAR|CONTENDED|CONGESTED|IDLE|UNKNOWN)\|' \
+      || { echo "smoke-test: FAIL (STA present but live read gave '$out' — hollow sense)"; exit 1; }
+  else
+    { [ "$rc" = 2 ] && printf '%s' "$out" | grep -q '^UNKNOWN|'; } \
+      || { echo "smoke-test: FAIL (no STA but rc=$rc '$out')"; exit 1; }
+  fi
+  echo "smoke-test: ok"; exit 0
+fi
+
+# --- one read: evaluate, write state unconditionally (mtime = ran-live), echo ---
+v="$(evaluate)"; rc=$?
+printf '%s\n' "$v" > "$STATE.tmp" && mv "$STATE.tmp" "$STATE"
+echo "$v"
+exit "$rc"
