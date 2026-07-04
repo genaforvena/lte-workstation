@@ -1,0 +1,413 @@
+#!/usr/bin/env python3
+# sketch-to-doom — hand-drawn room sketch (photo) -> Doom UDMF map (a working prototype).
+#
+# Operator-ask (2026-07-04): assemble the existing building blocks into a runnable pipeline that
+# turns a photo of a hand-drawn floor plan into a UDMF TEXTMAP a Doom map editor (Doom Builder /
+# Ultimate Doom Builder / SLADE) can open. This is a PROTOTYPE — it produces valid geometry, not a
+# balanced level.
+#
+# Pipeline (each stage is real, no OpenCV — Pillow + numpy only, so it runs on a bare mesh node):
+#   1. load + grayscale + downscale (bounded so the pure-python passes stay fast)
+#   2. binarize:  Otsu threshold  -> dark strokes = WALLS
+#   3. seal:      binary-dilate the walls a little to close small hand-drawn gaps (flag --seal)
+#   4. regions:   flood-fill the EXTERIOR from the image border through non-wall pixels; whatever
+#                 non-wall is NOT reachable from the border is an ENCLOSED ROOM -> one sector each
+#   5. contour:   crack-follow each region's pixel-edge boundary into a closed loop (deterministic,
+#                 no tracing-state-machine infinite loops), keep the longest loop = the outer wall
+#   6. simplify:  Ramer-Douglas-Peucker to drop redundant collinear/near-collinear vertices
+#   7. snap:      quantize vertices to a grid and scale to Doom map units (Y is flipped: Doom Y up)
+#   8. emit:      UDMF vertices / linedefs / sidedefs / sectors + a Player-1 start so the map loads
+#
+# Honest limits (stated, not hidden):
+#   - a wall gap wider than --seal leaks the room to the exterior -> that region is NOT sealed into a
+#     sector (raise --seal or close the gap in the sketch). No sector is ever invented from a leak.
+#   - adjacent rooms get independent one-sided walls (shared borders double up) — fine to open+edit,
+#     not two-sided-optimized. A prototype, flagged as such.
+#   - diagonal hand-drawn walls become short axis-aligned steps; --eps trades vertex count for fidelity.
+#   - no enclosed region found  -> honest error + exit 1 (never a faked empty map).
+#
+#   sketch-to-doom SKETCH.jpg [-o out.udmf]   convert a sketch photo to UDMF (stdout if no -o)
+#   sketch-to-doom --test                     smoke test (synthetic sketch through the real pipeline)
+#
+# Tunables: --max-dim (downscale cap, default 400) · --seal (gap-close dilation px, default 2)
+#           --eps (RDP tolerance px, default 2.0) · --grid (snap grid px, default 2)
+#           --scale (Doom map-units per px, default 16) · --min-area (drop specks, default 40 px)
+import sys, os, argparse
+import numpy as np
+from collections import deque
+
+
+def load_gray(path, max_dim):
+    from PIL import Image
+    im = Image.open(path).convert("L")
+    w, h = im.size
+    s = max_dim / max(w, h)
+    if s < 1.0:
+        im = im.resize((max(1, int(w * s)), max(1, int(h * s))), Image.LANCZOS)
+    return np.asarray(im, dtype=np.uint8)
+
+
+def otsu_walls(gray):
+    """Otsu threshold; return a bool array where True = wall (the DARK strokes)."""
+    hist, _ = np.histogram(gray, bins=256, range=(0, 256))
+    total = gray.size
+    sum_all = np.dot(np.arange(256), hist)
+    wB = 0.0; sumB = 0.0; best = -1.0; thr = 127
+    for t in range(256):
+        wB += hist[t]
+        if wB == 0:
+            continue
+        wF = total - wB
+        if wF == 0:
+            break
+        sumB += t * hist[t]
+        mB = sumB / wB
+        mF = (sum_all - sumB) / wF
+        between = wB * wF * (mB - mF) ** 2
+        if between > best:
+            best = between; thr = t
+    return gray <= thr
+
+
+def dilate(mask, it):
+    """Binary dilation by `it` steps with a 4-neighbour structuring element (numpy shifts)."""
+    m = mask
+    for _ in range(max(0, it)):
+        p = np.pad(m, 1, mode="constant", constant_values=False)
+        m = (p[1:-1, 1:-1] | p[:-2, 1:-1] | p[2:, 1:-1] | p[1:-1, :-2] | p[1:-1, 2:])
+    return m
+
+
+def enclosed_regions(walls, min_area):
+    """Flood-fill exterior from the border through non-wall; return labelled enclosed rooms."""
+    H, W = walls.shape
+    free = ~walls
+    exterior = np.zeros_like(free)
+    dq = deque()
+    for x in range(W):
+        for y in (0, H - 1):
+            if free[y, x] and not exterior[y, x]:
+                exterior[y, x] = True; dq.append((x, y))
+    for y in range(H):
+        for x in (0, W - 1):
+            if free[y, x] and not exterior[y, x]:
+                exterior[y, x] = True; dq.append((x, y))
+    while dq:
+        x, y = dq.popleft()
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            nx, ny = x + dx, y + dy
+            if 0 <= nx < W and 0 <= ny < H and free[ny, nx] and not exterior[ny, nx]:
+                exterior[ny, nx] = True; dq.append((nx, ny))
+    enclosed = free & ~exterior
+    # label 4-connected components, drop specks
+    labels = np.zeros((H, W), dtype=np.int32)
+    regions = []
+    nxt = 0
+    for sy in range(H):
+        for sx in range(W):
+            if enclosed[sy, sx] and labels[sy, sx] == 0:
+                nxt += 1
+                comp = []
+                labels[sy, sx] = nxt; dq.append((sx, sy))
+                while dq:
+                    x, y = dq.popleft(); comp.append((x, y))
+                    for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                        nx, ny = x + dx, y + dy
+                        if 0 <= nx < W and 0 <= ny < H and enclosed[ny, nx] and labels[ny, nx] == 0:
+                            labels[ny, nx] = nxt; dq.append((nx, ny))
+                if len(comp) >= min_area:
+                    regions.append(comp)
+    return regions
+
+
+def region_boundary(comp, shape):
+    """Crack-follow the pixel-edge boundary of a region; return the longest closed loop of corners.
+
+    Each region pixel contributes its edges that face a non-region cell. Corners live on the integer
+    grid (0..W, 0..H). Chaining the undirected edge set by shared corners yields closed loops with no
+    tracing state machine (so no infinite-loop risk); we return the loop with the most edges."""
+    H, W = shape
+    inside = np.zeros((H, W), dtype=bool)
+    for x, y in comp:
+        inside[y, x] = True
+
+    def isin(x, y):
+        return 0 <= x < W and 0 <= y < H and inside[y, x]
+
+    # undirected boundary edges as adjacency corner -> set(corner)
+    adj = {}
+    def add(a, b):
+        adj.setdefault(a, set()).add(b)
+        adj.setdefault(b, set()).add(a)
+    for x, y in comp:
+        if not isin(x, y - 1): add((x, y), (x + 1, y))          # top edge
+        if not isin(x, y + 1): add((x, y + 1), (x + 1, y + 1))  # bottom edge
+        if not isin(x - 1, y): add((x, y), (x, y + 1))          # left edge
+        if not isin(x + 1, y): add((x + 1, y), (x + 1, y + 1))  # right edge
+
+    used = set()
+    loops = []
+    for start in adj:
+        if all((frozenset((start, n)) in used) for n in adj[start]):
+            continue
+        loop = [start]; cur = start; prev = None
+        while True:
+            nxts = [n for n in adj[cur] if frozenset((cur, n)) not in used]
+            if not nxts:
+                break
+            # prefer to keep walking away from where we came (straightest available)
+            nxts.sort(key=lambda n: 0 if n != prev else 1)
+            n = nxts[0]
+            used.add(frozenset((cur, n)))
+            if n == start:
+                break
+            loop.append(n); prev = cur; cur = n
+        if len(loop) >= 4:
+            loops.append(loop)
+    if not loops:
+        return []
+    return max(loops, key=len)
+
+
+def rdp(pts, eps):
+    """Ramer-Douglas-Peucker polyline simplification on a closed loop."""
+    if len(pts) < 3:
+        return pts
+    def d(p, a, b):
+        (px, py), (ax, ay), (bx, by) = p, a, b
+        dx, dy = bx - ax, by - ay
+        L2 = dx * dx + dy * dy
+        if L2 == 0:
+            return ((px - ax) ** 2 + (py - ay) ** 2) ** 0.5
+        t = ((px - ax) * dx + (py - ay) * dy) / L2
+        t = max(0.0, min(1.0, t))
+        cx, cy = ax + t * dx, ay + t * dy
+        return ((px - cx) ** 2 + (py - cy) ** 2) ** 0.5
+    def simp(a, b):
+        dmax, idx = 0.0, -1
+        for i in range(a + 1, b):
+            dd = d(pts[i], pts[a], pts[b])
+            if dd > dmax:
+                dmax, idx = dd, i
+        if dmax > eps:
+            return simp(a, idx)[:-1] + simp(idx, b)
+        return [pts[a], pts[b]]
+    out = simp(0, len(pts) - 1)
+    return out[:-1] if len(out) > 1 else out
+
+
+def poly_area(pts):
+    a = 0.0
+    n = len(pts)
+    for i in range(n):
+        x1, y1 = pts[i]; x2, y2 = pts[(i + 1) % n]
+        a += x1 * y2 - x2 * y1
+    return a / 2.0
+
+
+def centroid(pts):
+    xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
+    return sum(xs) / len(xs), sum(ys) / len(ys)
+
+
+def to_udmf(regions, shape, eps, grid, scale, min_area):
+    H, W = shape
+    verts = []
+    vindex = {}
+    linedefs = []
+    sidedefs = []
+    sectors = []
+    things = []
+
+    def vid(cx, cy):
+        # snap to grid, flip Y (Doom Y is up), scale to map units
+        gx = round(cx / grid) * grid
+        gy = round(cy / grid) * grid
+        mx = float(gx * scale)
+        my = float((H - gy) * scale)
+        key = (mx, my)
+        if key not in vindex:
+            vindex[key] = len(verts); verts.append(key)
+        return vindex[key]
+
+    biggest = None; biggest_area = -1.0
+    for comp in regions:
+        loop = region_boundary(comp, shape)
+        if len(loop) < 4:
+            continue
+        simple = rdp(loop, eps)
+        # drop consecutive duplicates after snapping
+        pts = []
+        for p in simple:
+            if not pts or pts[-1] != p:
+                pts.append(p)
+        if len(pts) < 3:
+            continue
+        # ensure CCW so the sector floor faces up (right-hand rule); reverse if CW
+        if poly_area(pts) < 0:
+            pts = pts[::-1]
+        sec = len(sectors)
+        sectors.append(sec)
+        vids = [vid(x, y) for (x, y) in pts]
+        # dedupe again in map space (snap can collapse two corners)
+        clean = []
+        for v in vids:
+            if not clean or clean[-1] != v:
+                clean.append(v)
+        if len(clean) > 1 and clean[0] == clean[-1]:
+            clean.pop()
+        if len(clean) < 3:
+            sectors.pop()
+            continue
+        for i in range(len(clean)):
+            v1 = clean[i]; v2 = clean[(i + 1) % len(clean)]
+            side = len(sidedefs)
+            sidedefs.append(sec)
+            linedefs.append((v1, v2, side))
+        cx, cy = centroid(comp)
+        area = abs(poly_area([(x, y) for (x, y) in pts]))
+        if area > biggest_area:
+            biggest_area = area
+            biggest = (round(cx / grid) * grid * scale, (H - round(cy / grid) * grid) * scale)
+
+    if not sectors:
+        return None
+    if biggest:
+        things.append((float(biggest[0]), float(biggest[1])))
+
+    out = ['namespace = "zdoom";', '']
+    for (x, y) in verts:
+        out.append("vertex { x = %.3f; y = %.3f; }" % (x, y))
+    out.append('')
+    for (v1, v2, side) in linedefs:
+        out.append("linedef { v1 = %d; v2 = %d; sidefront = %d; blocking = true; }" % (v1, v2, side))
+    out.append('')
+    for sec in sidedefs:
+        out.append('sidedef { sector = %d; texturemiddle = "STONE2"; }' % sec)
+    out.append('')
+    for _sec in sectors:
+        out.append('sector { texturefloor = "FLOOR0_1"; textureceiling = "CEIL1_1"; '
+                   'heightfloor = 0; heightceiling = 128; lightlevel = 160; }')
+    out.append('')
+    for (x, y) in things:
+        out.append("thing { x = %.3f; y = %.3f; angle = 90; type = 1; flags = 7; }" % (x, y))
+    out.append('')
+    return "\n".join(out)
+
+
+def convert(path, args):
+    gray = load_gray(path, args.max_dim)
+    walls = otsu_walls(gray)
+    walls = dilate(walls, args.seal)
+    regions = enclosed_regions(walls, args.min_area)
+    udmf = to_udmf(regions, gray.shape, args.eps, args.grid, args.scale, args.min_area)
+    return udmf, len(regions)
+
+
+def synth_sketch(path):
+    """Draw a synthetic hand-plan: outer room + an interior wall making two chambers."""
+    from PIL import Image, ImageDraw
+    im = Image.new("L", (240, 180), 255)
+    d = ImageDraw.Draw(im)
+    d.rectangle([20, 20, 219, 159], outline=0, width=3)     # outer walls
+    d.line([120, 20, 120, 110], fill=0, width=3)            # interior divider (leaves a doorway gap)
+    im.save(path)
+
+
+def run_test():
+    import tempfile, re
+    fail = 0
+    tmp = tempfile.mkdtemp()
+    sk = os.path.join(tmp, "s.png")
+    synth_sketch(sk)
+
+    class A:  # default tunables
+        max_dim = 400; seal = 2; eps = 2.0; grid = 2; scale = 16; min_area = 40
+    udmf, nreg = convert(sk, A)
+    if udmf is None:
+        print("  FAIL: synthetic room produced NO sectors (pipeline found no enclosed region)"); fail = 1
+    else:
+        nv = udmf.count("vertex {")
+        nl = udmf.count("linedef {")
+        ns = udmf.count("sector {")
+        nt = udmf.count("type = 1;")
+        if 'namespace = "zdoom";' not in udmf:
+            print("  FAIL: UDMF missing namespace declaration"); fail = 1
+        if nv < 4:
+            print(f"  FAIL: too few vertices ({nv}, want >=4 for a room)"); fail = 1
+        if nl < 4:
+            print(f"  FAIL: too few linedefs ({nl}, want >=4)"); fail = 1
+        if ns < 1:
+            print(f"  FAIL: no sector emitted ({ns})"); fail = 1
+        if nt < 1:
+            print("  FAIL: no Player-1 start (type=1) — map would not be playable"); fail = 1
+        # every linedef's sidefront must reference an existing sidedef
+        nsd = udmf.count("sidedef {")
+        for m in re.finditer(r"sidefront = (\d+)", udmf):
+            if int(m.group(1)) >= nsd:
+                print(f"  FAIL: linedef references non-existent sidedef {m.group(1)} (>= {nsd})"); fail = 1
+                break
+        # every sidedef's sector must exist
+        for m in re.finditer(r"sector = (\d+);", udmf):
+            if int(m.group(1)) >= ns:
+                print(f"  FAIL: sidedef references non-existent sector {m.group(1)} (>= {ns})"); fail = 1
+                break
+        if not fail:
+            print(f"  ok: synthetic sketch -> {nv} vertices, {nl} linedefs, {nsd} sidedefs, "
+                  f"{ns} sector(s), {nt} start ({nreg} enclosed region(s) found)")
+
+    # honest-empty: a blank (all-white) image has NO enclosed region -> must return None, not a fake map
+    blank = os.path.join(tmp, "blank.png")
+    from PIL import Image
+    Image.new("L", (120, 90), 255).save(blank)
+    u2, _ = convert(blank, A)
+    if u2 is not None:
+        print("  FAIL: blank image produced a map (should be honest-empty -> None)"); fail = 1
+
+    import shutil; shutil.rmtree(tmp, ignore_errors=True)
+    if fail:
+        print("smoke-test: FAIL"); return 1
+    print("smoke-test: ok (deps + full sketch->UDMF pipeline + honest-empty on blank)"); return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("sketch", nargs="?", help="path to the hand-drawn sketch photo")
+    ap.add_argument("-o", "--out", help="write UDMF here (default: stdout)")
+    ap.add_argument("--test", action="store_true")
+    ap.add_argument("--max-dim", type=int, default=400)
+    ap.add_argument("--seal", type=int, default=2)
+    ap.add_argument("--eps", type=float, default=2.0)
+    ap.add_argument("--grid", type=int, default=2)
+    ap.add_argument("--scale", type=int, default=16)
+    ap.add_argument("--min-area", type=int, default=40)
+    a = ap.parse_args()
+
+    if a.test:
+        sys.exit(run_test())
+    if not a.sketch:
+        ap.print_help(sys.stderr); sys.exit(2)
+    try:
+        import PIL  # noqa
+    except Exception:
+        print("sketch-to-doom: needs Pillow (pip install pillow)", file=sys.stderr); sys.exit(3)
+    if not os.path.exists(a.sketch):
+        print(f"sketch-to-doom: no such file: {a.sketch}", file=sys.stderr); sys.exit(3)
+    udmf, nreg = convert(a.sketch, a)
+    if udmf is None:
+        print(f"sketch-to-doom: no enclosed sector found in {a.sketch} "
+              f"({nreg} region(s)); raise --seal to close wall gaps, or close the loop in the sketch.",
+              file=sys.stderr)
+        sys.exit(1)
+    if a.out:
+        with open(a.out, "w") as f:
+            f.write(udmf)
+        print(f"sketch-to-doom: wrote {a.out} "
+              f"({udmf.count('sector {')} sector(s), {udmf.count('vertex {')} vertices)",
+              file=sys.stderr)
+    else:
+        sys.stdout.write(udmf)
+
+
+if __name__ == "__main__":
+    main()
