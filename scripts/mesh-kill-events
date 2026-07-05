@@ -1,0 +1,206 @@
+#!/usr/bin/env bash
+# mesh-kill-events — kernel KILL-EVENT sense: names WHICH process the kernel murdered and HOW.
+#
+# WHY (spec: ~/.mesh/knowledge/capability-kernel-kill-events-20260705.md, discover 2026-07-05): a
+# kill line is the clock OUTSIDE the victim's own failure domain ([[detect-the-dead-detector]]) —
+# mesh-psi-memory/mesh-swap-thrash sense pressure BEFORE a kill, mesh-supervise/keepalive see a dead
+# pane AFTER, but nobody recorded the kill EVENT itself. mesh-hw-fault-watch ALREADY boards OOM kills
+# (chat-review/oom-kill-no-edge-alert, landed) — this tool is the DELTA on top, not a re-implementation:
+#   1. SEGFAULT kind — hw-fault-watch's FAULT_RE has no segfault pattern at all (verified: grep
+#      empty). A real gap: 2 segfaults (gdbus, bash) seen in the 14-day baseline, zero record anywhere.
+#   2. A structured per-event TAPE (~/.mesh/kill-events.log: 'kill-event victim=<comm> pid=<n>
+#      kind=oom|segv rss=<kB|-> vm=<kB|->') — hw-fault.log stores raw dmesg lines; this is a parsed,
+#      grep/awk-able forensic record for cause-of-death consumers (mesh-supervise, mesh-hw-health).
+#   3. MIND-ENGINE/ORGAN board filter, SEGV ONLY — OOM board-alerting is hw-fault-watch's owned class
+#      already; boarding it again here would double-alert the same kill (e.g. an opencode OOM would
+#      post BOTH [hw-fault] and this tool's marker). So: OOM is TAPED here (new forensic value) but
+#      NOT re-boarded; SEGV is both taped AND boarded, filtered to mind engines/mesh organs (a killed
+#      random helper process is not a mesh event worth an alert, only tape).
+#
+#   mesh-kill-events           one delta pass: read new kernel kill lines since cursor, tape + maybe board
+#   mesh-kill-events --status  last state line, no new read
+#   mesh-kill-events --test    fixture baseline/no-replay/oom/segv/mind-engine-filter/BLIND + REAL-read gate
+#
+# Design constraints:
+#   - OFFSET = last-seen ISO timestamp from `journalctl -k -o short-iso` (same proven pattern as
+#     mesh-hw-fault-watch's dmesg offset — lexically comparable, survives rotation/reboot). Deliberately
+#     NOT journalctl's native --cursor-file: proven live that on an absent cursor-file journalctl dumps
+#     the ENTIRE backlog (19276 lines this node) before the first cursor is ever written — a bigger
+#     replay trap than the offset approach, which baselines cleanly on first run instead
+#     ([[reviving-offset-reflex-replays-backlog]]).
+#   - FIRST RUN = baseline the offset only, zero events emitted — same guard as hw-fault-watch.
+#   - BLIND (journalctl fails / empty / non-ISO) → exit 2, offset UNTOUCHED — never a fake QUIET.
+#   - kind=oom|segv only; every other journal line is out of scope (hw-fault-watch/heartbeat own
+#     their own classes) — no double-coverage.
+#   - liveness-touch every successful pass (mtime = ran), independent of whether anything fired.
+#
+# reflex-cadence: */10 * * * *
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+
+STATE_DIR="${MESH_STATE_DIR:-$HOME/.mesh}"
+STATE="$STATE_DIR/.kill-events-state"
+OFFSET="$STATE_DIR/.kill-events-offset"
+TAPE="${MESH_KILL_EVENTS_TAPE:-$STATE_DIR/kill-events.log}"
+CHAT="${MESH_KILL_EVENTS_CHAT:-1}"
+SRC="${MESH_KILL_EVENTS_SRC:-}"   # test fixture: a file of 'iso-ts hostname kernel: <message>' lines
+
+# Board-worthy victims: mind engines (claude/opencode/codex/gemini/node — the mesh's own runtime
+# processes) or a mesh-* organ/reflex. A killed 'main'/'bash'/random helper is tape-only, no alert.
+MIND_RE="${MESH_KILL_EVENTS_MIND_RE:-^(claude|opencode|codex|gemini|node|mesh-[a-zA-Z0-9_-]+)$}"
+
+mkdir -p "$STATE_DIR"
+
+read_journal(){ # full source in journalctl-k-o-short-iso shape; rc!=0 or empty = BLIND
+  if [ -n "$SRC" ]; then cat "$SRC" 2>/dev/null
+  else journalctl -k -o short-iso --no-pager 2>/dev/null
+  fi
+}
+
+# kind classifiers (case-sensitive kernel message shapes, proven live 2026-07-05):
+#   OOM:  "Out of memory: Killed process <pid> (<comm>) total-vm:<N>kB, anon-rss:<N>kB, ..."
+#   SEGV: "<comm>[<pid>]: segfault at ..."
+OOM_RE='[Oo]ut of memory: [Kk]illed process [0-9]+ \('
+SEGV_RE=': segfault at '
+
+parse_oom(){ # $1=full kernel line (after the ts+host+kernel: prefix) -> "victim pid rss vm"
+  local l="$1" pid comm rss vm
+  pid="$(printf '%s' "$l" | grep -oE 'process [0-9]+' | grep -oE '[0-9]+')"
+  comm="$(printf '%s' "$l" | grep -oE '\([^)]*\)' | head -1 | tr -d '()')"
+  rss="$(printf '%s' "$l" | grep -oE 'anon-rss:[0-9]+kB' | grep -oE '[0-9]+')"
+  vm="$(printf '%s' "$l" | grep -oE 'total-vm:[0-9]+kB' | grep -oE '[0-9]+')"
+  printf '%s %s %s %s\n' "${comm:-unknown}" "${pid:-0}" "${rss:--}" "${vm:--}"
+}
+
+parse_segv(){ # $1=full kernel line -> "victim pid - -" (no rss/vm in a segfault line)
+  local l="$1" comm pid
+  comm="$(printf '%s' "$l" | sed -nE 's/^([A-Za-z0-9._-]+)\[[0-9]+\]: segfault at .*/\1/p')"
+  pid="$(printf '%s' "$l" | sed -nE 's/^[A-Za-z0-9._-]+\[([0-9]+)\]: segfault at .*/\1/p')"
+  printf '%s %s - -\n' "${comm:-unknown}" "${pid:-0}"
+}
+
+pass(){ # one delta pass; sets PASS_TOKEN/PASS_NEW; echoes board lines (if any)
+  local all last new ts line kmsg kind fields victim pid rss vm tapeline boarded=0
+  all="$(read_journal)" || all=""
+  [ -n "$all" ] || return 2
+  ts="$(printf '%s\n' "$all" | tail -1 | awk '{print $1}')"
+  printf '%s' "$ts" | grep -qE '^[0-9]{4}-' || return 2   # hollow read: not ISO-shaped
+  last="$(cat "$OFFSET" 2>/dev/null || true)"
+  mkdir -p "$STATE_DIR"
+  if [ -z "$last" ]; then
+    printf '%s\n' "$ts" > "$OFFSET"
+    PASS_TOKEN=QUIET; PASS_NEW=0
+    return 0
+  fi
+  new="$(printf '%s\n' "$all" | awk -v last="$last" '$1 > last')"
+  printf '%s\n' "$ts" > "$OFFSET"
+  [ -n "$new" ] || { PASS_TOKEN=QUIET; PASS_NEW=0; return 0; }
+  PASS_NEW=0
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    kmsg="$(printf '%s' "$line" | cut -d' ' -f2-)"   # drop leading ISO ts, keep host+kernel:+message
+    if printf '%s' "$kmsg" | grep -qE "$OOM_RE"; then
+      kind=oom
+      # strip through "kernel: " so parse_oom sees just the message body
+      fields="$(parse_oom "$(printf '%s' "$kmsg" | sed -E 's/^.*kernel:[[:space:]]*//')")"
+    elif printf '%s' "$kmsg" | grep -qE "$SEGV_RE"; then
+      kind=segv
+      fields="$(parse_segv "$(printf '%s' "$kmsg" | sed -E 's/^.*kernel:[[:space:]]*//')")"
+    else
+      continue
+    fi
+    read -r victim pid rss vm <<<"$fields"
+    tapeline="$(printf '%s\n' "$line" | awk '{print $1}') kill-event victim=$victim pid=$pid kind=$kind rss=$rss vm=$vm"
+    printf '%s\n' "$tapeline" >> "$TAPE"
+    PASS_NEW=$((PASS_NEW+1))
+    # OOM is hw-fault-watch's owned board class already — tape only here, never re-board (no double-alert).
+    [ "$kind" = oom ] && continue
+    if printf '%s' "$victim" | grep -qE "$MIND_RE"; then
+      echo "[kill-event] $kind victim=$victim pid=$pid — kernel-killed, cause-of-death tape: ~/.mesh/kill-events.log"
+      if [ "$CHAT" = 1 ] && command -v mesh-chat >/dev/null 2>&1; then
+        MESH_WHO="kill-events@$(hostname)" mesh-chat "[fyi] mesh-kill-events: $(hostname) mind-engine SEGFAULT victim=$victim pid=$pid — kernel-killed, cause-of-death tape ~/.mesh/kill-events.log" >/dev/null 2>&1 || true
+      fi
+      boarded=1
+    fi
+  done <<<"$new"
+  PASS_TOKEN=QUIET
+  [ "$PASS_NEW" -gt 0 ] && PASS_TOKEN=EVENT
+  [ "$boarded" = 1 ] || true
+  return 0
+}
+
+write_state(){ printf '%s %s new=%s\n' "$1" "$(date -u +%FT%TZ)" "${2:-0}" > "$STATE"; }
+
+if [ "${1:-}" = --test ]; then
+  command -v awk >/dev/null 2>&1 || { echo "smoke-test: FAIL (no awk)"; exit 1; }
+  # REAL-read gate (verification principle): the actual journalctl source must yield ISO-shaped lines
+  real="$(journalctl -k -o short-iso --no-pager 2>/dev/null | tail -1)"
+  if ! printf '%s' "$real" | grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T'; then
+    echo "smoke-test: n/a (journalctl -k -o short-iso unreadable/hollow on this node)"; exit 2
+  fi
+  _td="$(mktemp -d)"; _fx="$_td/fx"
+  _env="MESH_STATE_DIR=$_td MESH_KILL_EVENTS_SRC=$_fx MESH_KILL_EVENTS_CHAT=0"
+
+  # FIRST RUN must baseline, never replay a backlog OOM/segfault already sitting in the fixture
+  printf '%s\n' \
+    '2026-07-04T18:57:10+03:00 host kernel: Out of memory: Killed process 238044 (opencode) total-vm:76205624kB, anon-rss:393452kB, file-rss:100kB, shmem-rss:0kB, UID:1000 pgtables:2676kB oom_score_adj:200' \
+    > "$_fx"
+  out="$(env $_env "$0" 2>&1)"; rc=$?
+  { [ "$rc" = 0 ] && ! printf '%s' "$out" | grep -qF '[kill-event]' && [ ! -s "$_td/kill-events.log" ]; } \
+    || { rm -rf "$_td"; echo "smoke-test: FAIL (first run must baseline, not replay/tape: rc=$rc out='$out')"; exit 1; }
+
+  # NEW OOM after baseline: taped (forensic value) but NOT boarded (hw-fault-watch already owns OOM board alerts)
+  echo '2026-07-04T18:57:17+03:00 host kernel: Out of memory: Killed process 1598162 (opencode) total-vm:76168080kB, anon-rss:454916kB, file-rss:176kB, shmem-rss:0kB, UID:1000 pgtables:2592kB oom_score_adj:200' >> "$_fx"
+  out="$(env $_env "$0" 2>&1)"; rc=$?
+  { [ "$rc" = 0 ] && ! printf '%s' "$out" | grep -qF '[kill-event]' && grep -qE 'kill-event victim=opencode pid=1598162 kind=oom rss=454916 vm=76168080' "$_td/kill-events.log"; } \
+    || { rm -rf "$_td"; echo "smoke-test: FAIL (new OOM must tape with parsed fields but not board: rc=$rc out='$out')"; exit 1; }
+
+  # unchanged rerun: silent (no replay), tape unchanged
+  tapelines_before="$(wc -l < "$_td/kill-events.log")"
+  out="$(env $_env "$0" 2>&1)"; rc=$?
+  { [ "$rc" = 0 ] && ! printf '%s' "$out" | grep -qF '[kill-event]' && [ "$(wc -l < "$_td/kill-events.log")" = "$tapelines_before" ]; } \
+    || { rm -rf "$_td"; echo "smoke-test: FAIL (rerun replayed: rc=$rc out='$out')"; exit 1; }
+
+  # SEGV on a NON-mind-engine victim (bash): taped, NOT boarded
+  echo '2026-07-05T00:25:32+03:00 host kernel: bash[2023449]: segfault at 7ffca1424ff8 ip 000072f266eab58a sp 00007ffca1424fb0 error 6 in libc.so.6[ab58a,72f266e28000+188000] likely on CPU 2 (core 2, socket 0)' >> "$_fx"
+  out="$(env $_env "$0" 2>&1)"; rc=$?
+  { [ "$rc" = 0 ] && ! printf '%s' "$out" | grep -qF '[kill-event]' && grep -qE 'kill-event victim=bash pid=2023449 kind=segv rss=- vm=-' "$_td/kill-events.log"; } \
+    || { rm -rf "$_td"; echo "smoke-test: FAIL (non-mind-engine segv must tape but not board: rc=$rc out='$out')"; exit 1; }
+
+  # SEGV on a MIND-ENGINE victim (opencode): taped AND boarded
+  echo '2026-07-05T01:00:00+03:00 host kernel: opencode[99999]: segfault at 1234 ip 5678 sp 9abc error 4 in libfoo.so' >> "$_fx"
+  out="$(env $_env "$0" 2>&1)"; rc=$?
+  { [ "$rc" = 0 ] && printf '%s' "$out" | grep -qF '[kill-event] segv victim=opencode pid=99999' \
+      && grep -qE 'kill-event victim=opencode pid=99999 kind=segv rss=- vm=-' "$_td/kill-events.log"; } \
+    || { rm -rf "$_td"; echo "smoke-test: FAIL (mind-engine segv must tape AND board: rc=$rc out='$out')"; exit 1; }
+
+  # BLIND: unreadable source -> exit 2, offset untouched
+  off_before="$(cat "$_td/.kill-events-offset")"
+  env MESH_STATE_DIR="$_td" MESH_KILL_EVENTS_SRC="$_td/nonexistent" MESH_KILL_EVENTS_CHAT=0 "$0" >/dev/null 2>&1; rc=$?
+  { [ "$rc" = 2 ] && [ "$(cat "$_td/.kill-events-offset")" = "$off_before" ]; } \
+    || { rm -rf "$_td"; echo "smoke-test: FAIL (BLIND must exit 2 + not touch offset: rc=$rc)"; exit 1; }
+
+  rm -rf "$_td"
+  echo "smoke-test: ok (real journalctl -k read + baseline/no-replay/oom-tape-not-board/segv-non-mind/segv-mind-engine/BLIND fixtures)"; exit 0
+fi
+
+if [ "${1:-}" = --status ]; then
+  [ -r "$STATE" ] && cat "$STATE" || echo "mesh-kill-events: no state yet"
+  exit 0
+fi
+
+pass; prc=$?
+if [ "$prc" = 2 ]; then
+  write_state BLIND 0
+  echo "mesh-kill-events: BLIND (journalctl -k unreadable/hollow)" >&2
+  exit 2
+fi
+write_state "$PASS_TOKEN" "$PASS_NEW"
+command -v mesh-state-touch >/dev/null 2>&1 && mesh-state-touch "$STATE" >/dev/null 2>&1 || true
+if [ "$PASS_TOKEN" = QUIET ]; then
+  echo "mesh-kill-events: QUIET (no new kill events)"
+else
+  echo "mesh-kill-events: $PASS_NEW new kill event(s) taped this pass"
+fi
+exit 0
