@@ -127,21 +127,25 @@ mitigate() {
 
 # --- node-pressure (memory/swap exhaustion — scans ALL processes) ----------
 # PURE classifier: given mem/swap figures (kB) + pct thresholds, decide pressure.
-# stdout: human reason string when under pressure (empty otherwise). rc 0=pressure, 1=ok.
+# stdout: "class|reason" when under pressure (empty otherwise). rc 0=pressure, 1=ok.
+# class = which axes fired ("mem", "swap", "mem;swap") — the value-free dedupe key for the
+# --alert edge gate: live MB values jitter every pass (SwapFree 139→193→97MB across one
+# sustained episode, 3 [node-hot] posts in 9min live 2026-07-05 20:45-20:54Z), so the edge
+# must key on the CLASS, never the value-carrying reason string. Values stay in reason (text).
 # A zero/absent axis is a safe no-op (MemTotal 0 → ok; SwapTotal 0 → swap axis skipped, no div-by-0).
 node_pressure_classify() { # $1 memavail_kb $2 memtotal_kb $3 swapfree_kb $4 swaptotal_kb $5 mem_pct $6 swap_pct
-  local ma="$1" mt="$2" sf="$3" st="$4" mp="$5" sp="$6" reason=""
+  local ma="$1" mt="$2" sf="$3" st="$4" mp="$5" sp="$6" reason="" cls=""
   [ "${mt:-0}" -gt 0 ] 2>/dev/null || return 1
   # MemAvailable below mem_pct% of MemTotal  (integer-safe: ma*100 < mt*mp)
   if awk "BEGIN{exit !($ma * 100 < $mt * $mp)}"; then
-    reason="MemAvailable $((ma/1024))MB (<${mp}% of $((mt/1024))MB)"
+    reason="MemAvailable $((ma/1024))MB (<${mp}% of $((mt/1024))MB)"; cls="mem"
   fi
   # SwapFree below swap_pct% of SwapTotal — only when swap is configured
   if [ "${st:-0}" -gt 0 ] 2>/dev/null && awk "BEGIN{exit !($sf * 100 < $st * $sp)}"; then
-    reason="${reason:+$reason; }SwapFree $((sf/1024))MB (<${sp}% of $((st/1024))MB)"
+    reason="${reason:+$reason; }SwapFree $((sf/1024))MB (<${sp}% of $((st/1024))MB)"; cls="${cls:+$cls;}swap"
   fi
   [ -n "$reason" ] || return 1
-  echo "$reason"
+  echo "$cls|$reason"
   return 0
 }
 # Read the four figures from $MESH_RG_MEMINFO (test fixture) or /proc/meminfo. Always prints 4 ints.
@@ -159,13 +163,24 @@ top_rss() { # $1 = count (default 3)
   ps -eo rss,comm --no-headers 2>/dev/null | sort -rn | head -"${1:-3}" \
     | awk '{ printf "%s(%dMB) ", $2, $1/1024 }'
 }
-# Evaluate node-pressure now → sets NODE_REASON (empty=ok). Reused by --alert and --status.
+# Evaluate node-pressure now → sets NODE_CLASS (fired axes) + NODE_REASON (both empty=ok).
+# Reused by --alert and --status.
 node_pressure_eval() {
-  local a t sf st
+  local a t sf st out
   read -r a t sf st < <(read_meminfo)
-  NODE_REASON="$(node_pressure_classify "$a" "$t" "$sf" "$st" "$NODE_MEM_PCT" "$NODE_SWAP_PCT")"
+  out="$(node_pressure_classify "$a" "$t" "$sf" "$st" "$NODE_MEM_PCT" "$NODE_SWAP_PCT")" || out=""
+  NODE_CLASS="${out%%|*}"; NODE_REASON="${out#*|}"
   NODE_AVAIL_MB=$(( a / 1024 )); NODE_TOTAL_MB=$(( t / 1024 ))
   NODE_SWAPFREE_MB=$(( sf / 1024 )); NODE_SWAPTOTAL_MB=$(( st / 1024 ))
+}
+# Edge gate for [node-hot]: one post per fired-axis-CLASS episode. Writes the class to the
+# flag file; rc 0 = new episode or class change (mem→mem;swap escalation re-posts), 1 = same
+# episode holding (no post, however much the MB values jitter). Caller clears the flag on recovery.
+node_edge_should_post() { # $1 flagfile $2 class
+  local prev; prev=$(cat "$1" 2>/dev/null || true)
+  [ "$prev" = "$2" ] && return 1
+  echo "$2" > "$1"
+  return 0
 }
 
 # --- commands --------------------------------------------------------------
@@ -218,11 +233,33 @@ case "${1:-}" in
     _eval_node 900000  8388608 4194304 4194304 SILENT   # 900MB avail > 838MB line → falsifiability boundary (just above → silent)
     _eval_node 0       0       0       0       SILENT   # MemTotal 0 (unreadable) → safe no-op, never a false alarm
     [ "$_f" = 0 ] || { echo "smoke-test: FAIL (node_pressure_classify() drifted — pressure logic wrong)"; exit 1; }
+    # EDGE DEDUPE (chat-review/node-pressure-edge-class-key): the [node-hot] gate keys on the
+    # fired-axis CLASS, never the value-carrying reason — live values jitter every pass and a
+    # reason-keyed edge re-posted 3× in 9min for ONE sustained episode (2026-07-05 20:45-20:54Z).
+    # Two passes, different SwapFree values (139MB vs 97MB), both <5% → SAME class → exactly one post.
+    _c1="$(node_pressure_classify 4194304 8388608 142336 4194304 10 5)"  # SwapFree 139MB
+    _c2="$(node_pressure_classify 4194304 8388608 99328  4194304 10 5)"  # SwapFree 97MB
+    [ "${_c1%%|*}" = swap ] || { echo "smoke-test: FAIL (swap-only fire: class '${_c1%%|*}' != swap)"; exit 1; }
+    [ "${_c1%%|*}" = "${_c2%%|*}" ] || { echo "smoke-test: FAIL (class differs across value jitter: '${_c1%%|*}' vs '${_c2%%|*}')"; exit 1; }
+    [ "$_c1" != "$_c2" ] || { echo "smoke-test: FAIL (reasons identical — fixture no longer exercises value jitter)"; exit 1; }
+    _flag="$_td/node-flag"; _posts=0
+    node_edge_should_post "$_flag" "${_c1%%|*}" && _posts=$((_posts+1))
+    node_edge_should_post "$_flag" "${_c2%%|*}" && _posts=$((_posts+1))
+    [ "$_posts" = 1 ] || { echo "smoke-test: FAIL (edge gate posted $_posts times across one same-class episode, want 1)"; exit 1; }
+    # class ESCALATION (swap → mem;swap) is a new state → must re-post
+    _c3="$(node_pressure_classify 716800 8388608 99328 4194304 10 5)"    # mem AND swap starved
+    [ "${_c3%%|*}" = "mem;swap" ] || { echo "smoke-test: FAIL (dual fire: class '${_c3%%|*}' != mem;swap)"; exit 1; }
+    node_edge_should_post "$_flag" "${_c3%%|*}" || { echo "smoke-test: FAIL (class escalation swap→mem;swap did not re-post)"; exit 1; }
+    # recovery clears the flag → next episode posts again
+    rm -f "$_flag"
+    node_edge_should_post "$_flag" swap || { echo "smoke-test: FAIL (post-recovery episode did not post)"; exit 1; }
     # Fixture round-trip: read_meminfo parses a synthetic /proc/meminfo, node_pressure_eval fires on it.
     printf 'MemTotal: 8388608 kB\nMemAvailable: 500000 kB\nSwapTotal: 4194304 kB\nSwapFree: 4194304 kB\n' > "$_td/meminfo"
     MESH_RG_MEMINFO="$_td/meminfo" node_pressure_eval
     [ -n "$NODE_REASON" ] || { echo "smoke-test: FAIL (node_pressure_eval did not fire on a starved fixture — read_meminfo/wiring broke)"; exit 1; }
-    echo "smoke-test: ok (thresholds: RSS>${THRESH_MB}MB CPU>${THRESH_CPU}% ${THRESH_RSS_MB}MB-hard + dual-elevated RSS>${THRESH_MB_ELEV}MB&&CPU>${THRESH_CPU_ELEV}% + node-pressure avail<${NODE_MEM_PCT}%||swap<${NODE_SWAP_PCT}% + 8+6 dry-run assertions + fixture round-trip)"
+    [ "$NODE_CLASS" = mem ] || { echo "smoke-test: FAIL (eval class split broke: NODE_CLASS='$NODE_CLASS' want mem)"; exit 1; }
+    case "$NODE_REASON" in *"|"*) echo "smoke-test: FAIL (class|reason split leaked '|' into NODE_REASON: '$NODE_REASON')"; exit 1;; esac
+    echo "smoke-test: ok (thresholds: RSS>${THRESH_MB}MB CPU>${THRESH_CPU}% ${THRESH_RSS_MB}MB-hard + dual-elevated RSS>${THRESH_MB_ELEV}MB&&CPU>${THRESH_CPU_ELEV}% + node-pressure avail<${NODE_MEM_PCT}%||swap<${NODE_SWAP_PCT}% + 8+6 dry-run assertions + class-keyed edge dedupe + fixture round-trip)"
     exit 0
     ;;
 
@@ -280,10 +317,8 @@ case "${1:-}" in
     node_pressure_eval
     if [ -n "$NODE_REASON" ]; then
       top3="$(top_rss 3)"
-      prevn=$(cat "$FLAG_NODE" 2>/dev/null || true)
-      if [ "$prevn" != "$NODE_REASON" ]; then
-        echo "$NODE_REASON" > "$FLAG_NODE"
-        echo "$(ts) NODE-PRESSURE $NODE_REASON — top RSS: $top3" >> "$MESH/resource-guard.log"
+      if node_edge_should_post "$FLAG_NODE" "$NODE_CLASS"; then
+        echo "$(ts) NODE-PRESSURE [$NODE_CLASS] $NODE_REASON — top RSS: $top3" >> "$MESH/resource-guard.log"
         command -v mesh-chat >/dev/null 2>&1 && MESH_WHO="resguard@$(hostname)" \
           mesh-chat "[node-hot] resource-guard NODE-PRESSURE: $NODE_REASON — top RSS: $top3 (BEFORE-signal for OOM; all processes, no kill — kernel/operator decide)" >/dev/null 2>&1
       fi
