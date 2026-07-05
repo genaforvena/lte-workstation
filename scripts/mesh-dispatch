@@ -43,6 +43,18 @@ EVAP_STATE="$MESH/.dispatch-evaporated"
 WORKERS="${MESH_MIND_WORKERS:-dev discover sense}"
 LOOKBACK="${MESH_DISPATCH_LOOKBACK:-400}"
 STALE_TTL="${MESH_DISPATCH_STALE:-14400}"   # a NEVER-TAKEN task is only stale once its OWN [task] post is older than this (4h)
+# IDLE-EXPOSURE TICKS (chat-review/dispatch-evap-busy-blind): a never-taken task's staleness clock must
+# only run while an idle worker actually existed to take it — a busy-day stretch (0 idle workers for
+# hours) must not count toward eviction, else a task that was NEVER once dispatchable gets evaporated
+# the moment a worker finally frees up (live harm: strand-cooldown/land-backoff-fix/rollcall-propose-dedup
+# each re-filed 2-3x under different slugs because their prior instance evaporated mid-busy-stretch,
+# so every re-review re-finds the same noise as if new). Counted in TICKS (dispatch passes with >=1
+# idle worker), not wall-clock seconds — decoupled from STALE_TTL so a change to one never silently
+# reinterprets the other. Default 48 ticks matches STALE_TTL's 4h at the declared 5-min cadence, but the
+# two knobs are independent on purpose.
+EXPOSURE_STATE="$MESH/.dispatch-idle-exposure"
+EVAP_THIS_PASS="$MESH/.dispatch-evap-this-pass"
+STALE_TICKS="${MESH_DISPATCH_STALE_TICKS:-48}"
 ts(){ date -u +%FT%TZ; }
 # THERMAL-HOLD predicate (shared by --test + the main path): hold a dispatch when the node's hottest
 # zone is at/over the active-throttle band. Empty arg = unreadable sensor → fail-open (do NOT hold).
@@ -109,12 +121,37 @@ if [ "${1:-}" = --test ]; then
   addressed_elsewhere 'operator-ask: camera object recognition' && { echo "FAIL: addr operator-ask must be dispatchable"; e=$((e+1)); } || true
   addressed_elsewhere 'operator: run'     || { echo "FAIL: addr operator: exact"; e=$((e+1)); }
   addressed_elsewhere 'tg-mind: check'    || { echo "FAIL: addr tg-mind: exact"; e=$((e+1)); }
-  # never-taken age gate: a FRESH unclaimed task must NOT be stale (dispatchable); an OLD one is.
-  STALE_TTL=14400
-  posted_stale(){ [ "${1:-0}" -gt 0 ] && [ $(( $2 - $1 )) -gt "$STALE_TTL" ]; }
-  posted_stale 100000 105000 && { echo "FAIL: fresh post (5000s<4h) wrongly stale"; e=$((e+1)); } || true
-  posted_stale 100000 120000 || { echo "FAIL: old post (20000s>4h) not stale"; e=$((e+1)); }
-  posted_stale 0       120000 && { echo "FAIL: unknown post-time (0) wrongly stale"; e=$((e+1)); } || true
+  # IDLE-EXPOSURE TICK COUNTER (chat-review/dispatch-evap-busy-blind): a never-taken task's staleness
+  # is counted in TICKS an idle worker existed, never raw wall-clock. tick() increments+persists+
+  # returns; count() reads WITHOUT mutating (a 0-idle pass must never advance the clock).
+  _exp_td="$(mktemp -d)"; EXPOSURE_STATE="$_exp_td/.exposure"
+  idle_exposure_count(){ local id="$1"; [ -f "$EXPOSURE_STATE" ] || { echo 0; return; }; awk -F'\t' -v id="$id" '$1==id{c=$2} END{print c+0}' "$EXPOSURE_STATE" 2>/dev/null; }
+  idle_exposure_tick(){ local id="$1" cur new; cur="$(idle_exposure_count "$id")"; new=$((cur+1)); { [ -f "$EXPOSURE_STATE" ] && awk -F'\t' -v id="$id" '$1!=id' "$EXPOSURE_STATE" 2>/dev/null; printf '%s\t%s\n' "$id" "$new"; } > "$EXPOSURE_STATE.tmp" 2>/dev/null && mv "$EXPOSURE_STATE.tmp" "$EXPOSURE_STATE" 2>/dev/null; echo "$new"; }
+  [ "$(idle_exposure_count foo)" = 0 ] || { echo "FAIL: exposure-count must start at 0"; e=$((e+1)); }
+  [ "$(idle_exposure_tick foo)" = 1 ]  || { echo "FAIL: exposure-tick first increment != 1"; e=$((e+1)); }
+  [ "$(idle_exposure_count foo)" = 1 ] || { echo "FAIL: exposure-count did not persist after tick"; e=$((e+1)); }
+  [ "$(idle_exposure_tick foo)" = 2 ]  || { echo "FAIL: exposure-tick second increment != 2"; e=$((e+1)); }
+  [ "$(idle_exposure_count bar)" = 0 ] || { echo "FAIL: a distinct id must not share foo's accumulated count"; e=$((e+1)); }
+  [ "$(idle_exposure_count foo)" = 2 ] || { echo "FAIL: exposure-count is not idempotent (repeated read mutated it)"; e=$((e+1)); }
+  rm -rf "$_exp_td"
+  # BUSY-STRETCH PAUSE (source guards, falsifiable): the never-taken branch must gate ticking on N_IDLE
+  # (tick only when >0, read-only count when 0) and posted_stale() (the raw wall-clock evaporation path
+  # this whole fix replaces) must NOT be reintroduced live.
+  grep -q 'idle_exposure_tick "\$id"'  "$0" || { echo "FAIL: never-taken branch no longer ticks idle exposure"; e=$((e+1)); }
+  grep -q 'idle_exposure_count "\$id"' "$0" || { echo "FAIL: never-taken branch has no 0-idle read-only path"; e=$((e+1)); }
+  grep -q 'if \[ "\${N_IDLE:-0}" -gt 0 \]' "$0" || { echo "FAIL: idle-exposure gate on N_IDLE missing (busy-day pause regressed)"; e=$((e+1)); }
+  grep -q '^posted_stale(' "$0" && { echo "FAIL: posted_stale() reintroduced live — the raw wall-clock evaporation path is back"; e=$((e+1)); } || true
+  # ORDERING (mirrors the pace/oha placement guards below): idle workers must be computed BEFORE the
+  # OPEN mapfile, or is_open()'s N_IDLE read sees the WRONG pass's idle state.
+  idle_line=$(grep -n '^idle="\$(idle_workers)"' "$0" | head -1 | cut -d: -f1)
+  mapfile_line=$(grep -n '^mapfile -t OPEN' "$0" | head -1 | cut -d: -f1)
+  { [ -n "$idle_line" ] && [ -n "$mapfile_line" ] && [ "$idle_line" -lt "$mapfile_line" ]; } \
+    || { echo "FAIL: idle_workers() must be computed before the OPEN mapfile"; e=$((e+1)); }
+  # BATCHED BOARD [gap] (source guards): evaporation must batch through EVAP_THIS_PASS, never post to
+  # the board per-task directly — that would reintroduce the 37-in-one-burst flood this file's own
+  # evaporated_post comment documents.
+  grep -q 'EVAP_THIS_PASS' "$0" || { echo "FAIL: per-pass evaporation batching file missing"; e=$((e+1)); }
+  grep -q '\[gap\]'         "$0" || { echo "FAIL: batched board [gap] post missing entirely"; e=$((e+1)); }
   # thermal-hold gate: hold when hot (>=band), pass when cool, fail-open when sensor unreadable (empty)
   thermal_hold 95 92 || { echo "FAIL: thermal-hold 95>=92 should HOLD"; e=$((e+1)); }
   thermal_hold 92 92 || { echo "FAIL: thermal-hold 92>=92 (boundary) should HOLD"; e=$((e+1)); }
@@ -197,7 +234,7 @@ if [ "${1:-}" = --test ]; then
   pace_line=$(grep -n 'mesh-pace dispatch' "$0" | tail -1 | cut -d: -f1)
   { [ -n "$oha_line" ] && [ -n "$pace_line" ] && [ "$oha_line" -lt "$pace_line" ]; } \
     || { echo "FAIL: owner-hold-announce scan not positioned before the pace gate (would re-inherit the starvation)"; e=$((e+1)); }
-  [ "$e" -eq 0 ] && echo "smoke: ok (52 assertions)" || { echo "smoke: FAIL ($e fail(s))"; exit 1; }
+  [ "$e" -eq 0 ] && echo "smoke: ok (62 assertions)" || { echo "smoke: FAIL ($e fail(s))"; exit 1; }
   exit 0
 fi
 
@@ -300,9 +337,25 @@ CLAIMS="$(grep -E '^[^[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]+::[[:space
 # marker (recorded to the TRACE tier) and is excluded from dispatch (chat-review/board-task-evaporation).
 # Parse timestamps from CLAIMS lines: "2026-06-20T13:40:01Z  user@host  ::  [done] chat-review/..."
 claim_ts(){ local line="$1"; printf '%s' "$line" | cut -d' ' -f1 | sed 's/T/ /; s/Z$//'; }
-# posted_stale POST_EPOCH NOW → true only if the task's own post time is KNOWN (>0) and older than
-# STALE_TTL. A fresh, never-taken task is NOT stale — it is exactly what dispatch should ROUTE.
-posted_stale(){ [ "${1:-0}" -gt 0 ] && [ $(( $2 - $1 )) -gt "$STALE_TTL" ]; }
+# idle_exposure_tick/count (chat-review/dispatch-evap-busy-blind): per-task-id TICK counter, persisted
+# in EXPOSURE_STATE ("id<TAB>count" lines, last one wins on read). _tick increments+returns the new
+# count — call ONLY on a pass where an idle worker existed (the caller gates this, not the function,
+# so the SAME function can be used for a read-only check on a 0-idle pass via _count). _count reads
+# without mutating (0 if never recorded) — used both for a 0-idle-pass check and for --test assertions.
+idle_exposure_count(){
+  local id="$1"
+  [ -f "$EXPOSURE_STATE" ] || { echo 0; return; }
+  awk -F'\t' -v id="$id" '$1==id{c=$2} END{print c+0}' "$EXPOSURE_STATE" 2>/dev/null
+}
+idle_exposure_tick(){
+  local id="$1" cur new
+  cur="$(idle_exposure_count "$id")"
+  new=$((cur+1))
+  mkdir -p "$MESH"
+  { [ -f "$EXPOSURE_STATE" ] && awk -F'\t' -v id="$id" '$1!=id' "$EXPOSURE_STATE" 2>/dev/null; printf '%s\t%s\n' "$id" "$new"; } > "$EXPOSURE_STATE.tmp" 2>/dev/null \
+    && mv "$EXPOSURE_STATE.tmp" "$EXPOSURE_STATE" 2>/dev/null
+  echo "$new"
+}
 
 # Record an [evaporated] marker for a task that has evaporated.
 # Routed to the TRACE tier (mesh-trace → traces.log), NOT the coordination board: an [evaporated] is
@@ -313,6 +366,15 @@ posted_stale(){ [ "${1:-0}" -gt 0 ] && [ $(( $2 - $1 )) -gt "$STALE_TTL" ]; }
 # routine substrate self-tend belongs in the durable metabolism tier, not the coordination signal.
 # (mesh-criticality's meta-gate also classifies [evaporated] as observer-chatter — defense in depth.)
 # Dedup: only record once per task-id (in EVAP_STATE), unchanged.
+#
+# BOARD VISIBILITY (chat-review/dispatch-evap-busy-blind, ADDENDUM): the trace-only routing above is
+# right for burst-safety, but it made evaporation INVISIBLE to a chat-review sweep of the board (a
+# different log entirely) — so a silently-evaporated task gets re-found as if it never existed, an
+# infinite file->evaporate->re-find churn loop (strand-cooldown/land-backoff-fix each re-filed 2-3x).
+# Fix WITHOUT reintroducing the 37-in-one-burst board flood: append the id to EVAP_THIS_PASS (a per-run
+# scratch file) here — the CALLER (after the whole dispatch pass completes) posts ONE aggregate board
+# [gap] line naming everything that evaporated THIS PASS, however many that is. A burst of 37 still
+# produces exactly 1 board line, not 37.
 evaporated_post(){
   local task="$1" id="$2" reason="$3"
   local now sig
@@ -328,6 +390,8 @@ evaporated_post(){
   # Record the dedup signature
   mkdir -p "$MESH"
   printf '%s\n' "$sig" >>"$EVAP_STATE"
+  # Record for this pass's batched board summary (new id only — dedup above guarantees this)
+  printf '%s\n' "$id" >>"$EVAP_THIS_PASS"
 }
 
 is_open(){
@@ -372,16 +436,22 @@ is_open(){
       [ "$ts" -gt "$taking_ts" ] && taking_ts="$ts"
     done <<< "$CLAIMS"
     if [ "$taking_ts" -eq 0 ]; then
-      # NEVER taken. Evaporate ONLY if the task's OWN post is genuinely stale (>STALE_TTL).
-      # A FRESH unclaimed task is NOT evaporated — it is exactly what dispatch must ROUTE to an
-      # idle worker. (2026-06-20 bug: the bare "never taken → evaporate" had NO age gate, so a
-      # just-posted task was evaporated before it could be routed → dispatch logged "idle worker
-      # but no open task" while real open tasks sat on the board, silently dropping the backlog.)
-      if posted_stale "$task_post_ts" "$now"; then
-        evaporated_post "$task" "$id" "never taken, posted >$(( STALE_TTL / 3600 ))h ago"
+      # NEVER taken. Evaporate ONLY on IDLE-EXPOSURE ticks, not raw wall-clock (chat-review/
+      # dispatch-evap-busy-blind) — a busy-day stretch (0 idle workers) must not count toward
+      # eviction, or a task that never once had a free hand gets evaporated the moment one finally
+      # appears. When N_IDLE>0 this pass, tick (increment+read); on a 0-idle pass, only READ the
+      # existing count (never increment) — the clock is genuinely paused, not merely deferred.
+      # (2026-06-20 bug this still preserves: a just-posted task is never stale on tick 1 — a FRESH
+      # unclaimed task is exactly what dispatch must ROUTE to an idle worker, never evaporate.)
+      local exposure
+      if [ "${N_IDLE:-0}" -gt 0 ]; then exposure="$(idle_exposure_tick "$id")"
+      else exposure="$(idle_exposure_count "$id")"
+      fi
+      if [ "$exposure" -ge "$STALE_TICKS" ]; then
+        evaporated_post "$task" "$id" "never taken across $STALE_TICKS+ idle-exposed tick(s)"
         return 1
       fi
-      # fresh & unclaimed → fall through → dispatchable
+      # not yet idle-exposure-stale → fall through → dispatchable
     elif [ $(( now - taking_ts )) -gt "$STALE_TTL" ]; then
       if [ "$done_seen" = 1 ]; then
         # Recently-[done] (<30min) but an old [taking] — the task is COMPLETE, not abandoned. Close it as
@@ -420,6 +490,18 @@ is_open(){
   return 0
 }
 
+# idle workers computed BEFORE the OPEN mapfile (chat-review/dispatch-evap-busy-blind): is_open()'s
+# idle-exposure tick/pause decision for THIS pass needs to know whether an idle worker existed THIS
+# pass — reading it after the mapfile ran would gate every never-taken task on the WRONG (prior)
+# pass's idle state, or on nothing at all.
+idle="$(idle_workers)"
+n_idle=$(printf '%s' "$idle" | grep -c . || true)
+N_IDLE="$n_idle"   # global read by is_open()'s never-taken idle-exposure branch
+
+# fresh per-pass evaporation batch (chat-review/dispatch-evap-busy-blind ADDENDUM) — truncated here so
+# evaporated_post()'s appends below reflect ONLY this pass, never a stale leftover from a prior run.
+: > "$EVAP_THIS_PASS" 2>/dev/null || true
+
 # collect open [task] lines, oldest first.
 # ANCHOR [task] to the start of the message BODY (right after the "::" field separator) — a [task]
 # appearing mid-PROSE (e.g. "...a stale [task] re-dispatch...") is NOT a real task and must never be
@@ -438,10 +520,18 @@ mapfile -t OPEN < <(
     is_open "$task" "$post_ts" && printf '%s\n' "$task"
   done
 )
-
-idle="$(idle_workers)"
-n_idle=$(printf '%s' "$idle" | grep -c . || true)
 n_open=${#OPEN[@]}
+
+# BATCHED BOARD [gap] (chat-review/dispatch-evap-busy-blind ADDENDUM): whatever evaporated_post()
+# appended to EVAP_THIS_PASS during the mapfile above (a subshell — the ids only survive via this FILE,
+# never a shell variable) gets ONE aggregate board line here, regardless of how many evaporated this
+# pass (a 37-in-one-burst still costs exactly 1 board line, never 37 — see evaporated_post's comment).
+if [ -s "$EVAP_THIS_PASS" ]; then
+  evap_ids="$(tr '\n' ' ' < "$EVAP_THIS_PASS")"
+  evap_n=$(grep -c . "$EVAP_THIS_PASS" 2>/dev/null || echo 0)
+  command -v mesh-chat >/dev/null 2>&1 && MESH_WHO="dispatch@$(hostname)" \
+    mesh-chat "[gap] $evap_n task(s) evaporated this pass (never-taken, idle-exposed >= ${STALE_TICKS} tick(s)): ${evap_ids}" >/dev/null 2>&1 || true
+fi
 
 if [ "${1:-}" = --status ]; then
   echo "=== mesh-dispatch · $(ts) ==="
