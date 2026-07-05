@@ -1,0 +1,264 @@
+#!/usr/bin/env bash
+# mesh-path-watch — Tailscale PATH-QUALITY sense: direct-vs-DERP per peer + netcheck weather.
+#
+# WHY (spec: ~/.mesh/knowledge/capability-tailscale-path-quality-20260705.md, discover 2026-07-05):
+# the mesh's nervous system IS Tailscale, yet whether a peer link is DIRECT (LAN, ~2ms) or has
+# silently fallen back to a DERP relay (Amsterdam round-trip for a same-room peer) was sensed by
+# nothing — laggy SSH/tmux historically gets misdiagnosed as thermal or a stale pane first.
+#
+#   mesh-path-watch            cheap lane: parse `tailscale status --json` (local state, no network)
+#                              → per-peer mode direct|relay|offline; tape EDGES only; board [fyi]
+#                              on an ONLINE peer's direct→relay transition, debounced
+#                              MESH_PATH_DEBOUNCE (2) consecutive passes. Heavy lane self-schedules:
+#                              when the tape's last netweather sample is older than
+#                              MESH_PATH_NETCHECK_INTERVAL (3600s), also run `tailscale netcheck`
+#                              → 'netweather udp= derp= lat_ms='; alert on udp=false or
+#                              lat > 2× rolling median baseline (needs ≥5 samples).
+#   mesh-path-watch --status   current per-peer snapshot line, no new probe
+#   mesh-path-watch --test     fixtures (baseline/debounce/recovery/offline/netcheck/BLIND) +
+#                              REAL-read gate (live status --json must parse; exit 2 honest-n/a
+#                              where tailscale is absent)
+#
+# Design constraints:
+#   - CurAddr non-empty = direct; Online+empty CurAddr = relay; Online=false = offline. The peer's
+#     `Relay:` field is its home DERP, NOT the active path — deliberately unread (spec's misread trap).
+#   - tag:lte-node peers only — the mesh, not the whole tailnet.
+#   - Tape (~/.mesh/path-watch.log) carries EDGES + hourly netweather, not every pass — liveness is
+#     the STATE file's mtime (mesh-state-touch every successful pass), so a quiet tape stays honest
+#     ([[edge-log-silenced-by-remote-counter-reset]]: never infer liveness from an edge log).
+#   - Debounce N consecutive relay passes before boarding ([[ble-adapter-wedges...]] flap lesson);
+#     alert fires ONCE at the crossing, recovery goes to trace not board.
+#   - BLIND (no tailscale / unparseable JSON) → exit 2, state untouched — never a fake all-clear.
+#   - Consumers: mesh-fleet-health, mesh-egress-health trend (DERP latency doubles as a router-VPN
+#     egress-quality proxy — netcheck rides the NL tunnel like all host traffic).
+#
+# reflex-cadence: 4-59/5 * * * *
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+
+STATE_DIR="${MESH_STATE_DIR:-$HOME/.mesh}"
+STATE="$STATE_DIR/.path-watch-state"          # one-line snapshot (consumers read this)
+MODES="$STATE_DIR/.path-watch-modes"          # per-peer "host mode relay_streak" (debounce memory)
+NETSTATE="$STATE_DIR/.path-watch-net"         # last netcheck "udp lat_alerted" (edge memory)
+TAPE="${MESH_PATH_WATCH_TAPE:-$STATE_DIR/path-watch.log}"
+CHAT="${MESH_PATH_WATCH_CHAT:-1}"
+SRC="${MESH_PATH_WATCH_SRC:-}"                # test fixture: status --json file
+NETSRC="${MESH_PATH_WATCH_NETSRC:-}"          # test fixture: netcheck output file
+DEBOUNCE="${MESH_PATH_DEBOUNCE:-2}"
+NET_INTERVAL="${MESH_PATH_NETCHECK_INTERVAL:-3600}"
+NET_OFF="${MESH_PATH_NETCHECK_OFF:-0}"        # tests set 1 to isolate the cheap lane
+
+mkdir -p "$STATE_DIR"
+TS="$(date -u +%FT%TZ)"
+
+read_status(){ # status --json source; rc!=0/empty = BLIND
+  if [ -n "$SRC" ]; then cat "$SRC" 2>/dev/null
+  else tailscale status --json 2>/dev/null
+  fi
+}
+
+read_netcheck(){
+  if [ -n "$NETSRC" ]; then cat "$NETSRC" 2>/dev/null
+  else tailscale netcheck 2>/dev/null
+  fi
+}
+
+parse_peers(){ # stdin: status JSON → "host mode" per tag:lte-node peer; rc 1 on unparseable
+  python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+peers = d.get("Peer") or {}
+rows = []
+for p in peers.values():
+    if "tag:lte-node" not in (p.get("Tags") or []):
+        continue
+    # space-safe: "Redmi 10" would corrupt the whitespace-split tape/state fields
+    host = (p.get("HostName") or "?").strip().replace(" ", "_")
+    if not p.get("Online"):
+        mode = "offline"
+    elif (p.get("CurAddr") or "").strip():
+        mode = "direct"
+    else:
+        mode = "relay"
+    rows.append(f"{host} {mode}")
+if not rows:
+    sys.exit(1)
+print("\n".join(sorted(rows)))
+' 2>/dev/null
+}
+
+board(){ # $1=message — board post, gated
+  [ "$CHAT" = 1 ] && command -v mesh-chat >/dev/null 2>&1 \
+    && MESH_WHO="path-watch@$(hostname)" mesh-chat "$1" >/dev/null 2>&1 || true
+}
+
+cheap_lane(){ # sets CHEAP_SUMMARY + ALERTS (globals); rc 2 = BLIND
+  local rows prev host mode streak prev_mode prev_streak out="" summary="" d=0 r=0 o=0
+  ALERTS=""; CHEAP_SUMMARY=""
+  rows="$(read_status | parse_peers)" || return 2
+  [ -n "$rows" ] || return 2
+  prev="$(cat "$MODES" 2>/dev/null || true)"
+  : > "$MODES.tmp"
+  while read -r host mode; do
+    [ -n "$host" ] || continue
+    prev_mode="$(printf '%s\n' "$prev" | awk -v h="$host" '$1==h{print $2}')"
+    prev_streak="$(printf '%s\n' "$prev" | awk -v h="$host" '$1==h{print $3}')"
+    case "$prev_streak" in ''|*[!0-9]*) prev_streak=0;; esac
+    streak=0
+    [ "$mode" = relay ] && streak=$((prev_streak + 1))
+    if [ -n "$prev_mode" ] && [ "$mode" != "$prev_mode" ]; then
+      printf '%s path peer=%s mode=%s was=%s\n' "$TS" "$host" "$mode" "$prev_mode" >> "$TAPE"
+      if [ "$prev_mode" = relay ] && [ "$mode" = direct ] && [ "$prev_streak" -ge "$DEBOUNCE" ]; then
+        command -v mesh-trace >/dev/null 2>&1 && \
+          mesh-trace "[path-watch] $host recovered relay→direct" >/dev/null 2>&1 || true
+      fi
+    fi
+    # debounced alert: fires exactly ONCE, at the pass where the streak crosses DEBOUNCE
+    if [ "$streak" = "$DEBOUNCE" ]; then
+      out="[path-relay] $(hostname): peer $host fell back direct→relay (DERP) — ${DEBOUNCE} consecutive passes; same-LAN peers should be direct. Tape: ~/.mesh/path-watch.log"
+      ALERTS="${ALERTS}${out}
+"
+      board "[fyi] mesh-path-watch: $out"
+    fi
+    printf '%s %s %s\n' "$host" "$mode" "$streak" >> "$MODES.tmp"
+    case "$mode" in direct) d=$((d+1));; relay) r=$((r+1));; offline) o=$((o+1));; esac
+    summary="${summary}${host}=${mode} "
+  done <<<"$rows"
+  mv -f "$MODES.tmp" "$MODES"
+  CHEAP_SUMMARY="peers=$((d+r+o)) direct=$d relay=$r offline=$o | ${summary% }"
+  return 0
+}
+
+heavy_lane(){ # netcheck → tape netweather + edge alerts; silent skip when not due/off
+  [ "$NET_OFF" = 1 ] && return 0
+  local last_ts now udp derp lat base nc prev_udp
+  now=$(date +%s)
+  last_ts="$(grep ' netweather ' "$TAPE" 2>/dev/null | tail -1 | awk '{print $1}')"
+  if [ -n "$last_ts" ] && [ -z "$NETSRC" ]; then
+    last_s=$(date -d "$last_ts" +%s 2>/dev/null || echo 0)
+    [ $((now - last_s)) -lt "$NET_INTERVAL" ] && return 0
+  fi
+  nc="$(read_netcheck)"
+  [ -n "$nc" ] || return 0   # heavy lane is best-effort; cheap lane already proved liveness
+  udp="$(printf '%s\n' "$nc" | grep -oE 'UDP[[:space:]]*:[[:space:]]*(true|false)' | grep -oE 'true|false' | head -1)"
+  derp="$(printf '%s\n' "$nc" | grep -iE 'nearest DERP' | sed -E 's/.*:[[:space:]]*//' | head -1 | tr ' ' '_')"
+  lat="$(printf '%s\n' "$nc" | grep -oE '\- [a-z]{3}: [0-9.]+ms' | head -1 | grep -oE '[0-9.]+' | head -1)"
+  [ -n "$udp" ] || return 0
+  printf '%s netweather udp=%s derp=%s lat_ms=%s\n' "$TS" "$udp" "${derp:--}" "${lat:--}" >> "$TAPE"
+  prev_udp="$(awk '{print $1}' "$NETSTATE" 2>/dev/null)"
+  if [ "$udp" = false ] && [ "$prev_udp" != false ]; then
+    echo "[path-udp-blocked] $(hostname): netcheck UDP=false — ALL peer paths will silently relay via DERP (router-VPN/firewall change?)"
+    board "[fyi] mesh-path-watch: $(hostname) netcheck UDP=false — every peer path degrades to DERP relay. Check router-VPN/firewall. Tape: ~/.mesh/path-watch.log"
+  fi
+  # latency vs rolling median of the PRIOR samples (this line excluded — it's the candidate)
+  if [ -n "$lat" ]; then
+    base="$(grep ' netweather ' "$TAPE" 2>/dev/null | head -n -1 | tail -24 | grep -oE 'lat_ms=[0-9.]+' | cut -d= -f2 | sort -n | awk '{a[NR]=$1} END{if(NR>=5) print (NR%2 ? a[int(NR/2)+1] : (a[NR/2]+a[NR/2+1])/2)}')"
+    if [ -n "$base" ] && awk -v l="$lat" -v b="$base" 'BEGIN{exit !(l > 2*b)}'; then
+      echo "[path-derp-slow] $(hostname): DERP latency ${lat}ms > 2× baseline ${base}ms — egress tunnel degrading?"
+      board "[fyi] mesh-path-watch: $(hostname) DERP latency ${lat}ms > 2× rolling baseline ${base}ms — router-VPN egress quality degrading (early warning for the Anthropic-access lifeline)"
+    fi
+  fi
+  printf '%s %s\n' "$udp" "${lat:--}" > "$NETSTATE"
+  return 0
+}
+
+if [ "${1:-}" = --test ]; then
+  command -v python3 >/dev/null 2>&1 || { echo "smoke-test: FAIL (no python3)"; exit 1; }
+  # REAL-read gate (verification principle): the live source must parse to ≥1 mesh peer where
+  # tailscale exists; a node without tailscale is honest-n/a, never a fake green.
+  if command -v tailscale >/dev/null 2>&1; then
+    tailscale status --json 2>/dev/null | parse_peers >/dev/null \
+      || { echo "smoke-test: FAIL (live tailscale status --json yields no parseable tag:lte-node peer — hollow sense)"; exit 1; }
+  else
+    echo "smoke-test: n/a (no tailscale binary on this node)"; exit 2
+  fi
+  _td="$(mktemp -d)"; _fx="$_td/status.json"; _nfx="$_td/netcheck.txt"
+  _env="MESH_STATE_DIR=$_td MESH_PATH_WATCH_SRC=$_fx MESH_PATH_WATCH_CHAT=0 MESH_PATH_NETCHECK_OFF=1 MESH_PATH_WATCH_TAPE=$_td/path-watch.log"
+  fx(){ # $1=ds-mode(json Online/CurAddr fragment) — 2 peers: phaedra always direct, ds varies
+    cat > "$_fx" <<EOF
+{"Peer":{
+ "k1":{"HostName":"phaedra","Tags":["tag:lte-node"],"Online":true,"CurAddr":"38.49.216.141:41641","Relay":"ams"},
+ "k2":{"HostName":"ds","Tags":["tag:lte-node"],$1,"Relay":"fra"},
+ "k3":{"HostName":"stranger","Tags":["tag:other"],"Online":true,"CurAddr":""},
+ "k4":{"HostName":"Redmi 10","Tags":["tag:lte-node"],"Online":false,"CurAddr":""}
+}}
+EOF
+  }
+  # 1. baseline: both direct — no alert, no tape edges, non-mesh peer excluded from state
+  fx '"Online":true,"CurAddr":"192.168.8.224:41641"'
+  out="$(env $_env "$0" 2>&1)"; rc=$?
+  { [ "$rc" = 0 ] && ! printf '%s' "$out" | grep -q 'path-relay' && [ ! -s "$_td/path-watch.log" ] \
+      && ! grep -q stranger "$_td/.path-watch-modes" \
+      && grep -qE '^Redmi_10 offline 0$' "$_td/.path-watch-modes"; } \
+    || { rm -rf "$_td"; echo "smoke-test: FAIL (baseline / space-hostname sanitize: rc=$rc out='$out')"; exit 1; }
+  # space-hostname must stay a STABLE row (no phantom edge on an unchanged offline peer)
+  out="$(env $_env "$0" 2>&1)"; rc=$?
+  { [ "$rc" = 0 ] && ! grep -q 'peer=Redmi' "$_td/path-watch.log" 2>/dev/null; } \
+    || { rm -rf "$_td"; echo "smoke-test: FAIL (space-hostname phantom edge: rc=$rc tape='$(cat "$_td/path-watch.log" 2>/dev/null)')"; exit 1; }
+  # 2. ds direct→relay, pass 1: tape edge, NO alert yet (debounce 2)
+  fx '"Online":true,"CurAddr":""'
+  out="$(env $_env "$0" 2>&1)"; rc=$?
+  { [ "$rc" = 0 ] && ! printf '%s' "$out" | grep -q 'path-relay' \
+      && grep -q 'path peer=ds mode=relay was=direct' "$_td/path-watch.log"; } \
+    || { rm -rf "$_td"; echo "smoke-test: FAIL (relay pass 1 must tape-edge but not alert: rc=$rc out='$out')"; exit 1; }
+  # 3. ds relay, pass 2: alert fires exactly now
+  out="$(env $_env "$0" 2>&1)"; rc=$?
+  { [ "$rc" = 0 ] && printf '%s' "$out" | grep -q '\[path-relay\].*peer ds'; } \
+    || { rm -rf "$_td"; echo "smoke-test: FAIL (relay pass 2 must alert: rc=$rc out='$out')"; exit 1; }
+  # 4. ds relay, pass 3: NO re-alert (once at the crossing)
+  out="$(env $_env "$0" 2>&1)"; rc=$?
+  { [ "$rc" = 0 ] && ! printf '%s' "$out" | grep -q 'path-relay'; } \
+    || { rm -rf "$_td"; echo "smoke-test: FAIL (relay pass 3 must stay silent: rc=$rc out='$out')"; exit 1; }
+  # 5. recovery relay→direct: tape edge, no board alert, streak resets
+  fx '"Online":true,"CurAddr":"192.168.8.224:41641"'
+  out="$(env $_env "$0" 2>&1)"; rc=$?
+  { [ "$rc" = 0 ] && ! printf '%s' "$out" | grep -q 'path-relay' \
+      && grep -q 'path peer=ds mode=direct was=relay' "$_td/path-watch.log" \
+      && grep -qE '^ds direct 0$' "$_td/.path-watch-modes"; } \
+    || { rm -rf "$_td"; echo "smoke-test: FAIL (recovery: rc=$rc out='$out')"; exit 1; }
+  # 6. ds offline: mode edge taped, never a relay alert (offline ≠ relay)
+  fx '"Online":false,"CurAddr":""'
+  env $_env "$0" >/dev/null 2>&1; env $_env "$0" >/dev/null 2>&1; out="$(env $_env "$0" 2>&1)"; rc=$?
+  { [ "$rc" = 0 ] && ! printf '%s' "$out" | grep -q 'path-relay' \
+      && grep -q 'path peer=ds mode=offline was=direct' "$_td/path-watch.log"; } \
+    || { rm -rf "$_td"; echo "smoke-test: FAIL (offline must not relay-alert: rc=$rc out='$out')"; exit 1; }
+  # 7. heavy lane fixture: udp=false alerts once; second identical run silent (edge memory)
+  printf '\t* UDP: false\n\t* Nearest DERP: Amsterdam\n\t* DERP latency:\n\t\t- ams: 54.5ms (Amsterdam)\n' > "$_nfx"
+  _henv="MESH_STATE_DIR=$_td MESH_PATH_WATCH_SRC=$_fx MESH_PATH_WATCH_NETSRC=$_nfx MESH_PATH_WATCH_CHAT=0 MESH_PATH_WATCH_TAPE=$_td/path-watch.log"
+  out="$(env $_henv "$0" 2>&1)"; rc=$?
+  { [ "$rc" = 0 ] && printf '%s' "$out" | grep -q 'path-udp-blocked' \
+      && grep -q 'netweather udp=false derp=Amsterdam lat_ms=54.5' "$_td/path-watch.log"; } \
+    || { rm -rf "$_td"; echo "smoke-test: FAIL (netcheck udp=false must tape+alert: rc=$rc out='$out')"; exit 1; }
+  out="$(env $_henv "$0" 2>&1)"; rc=$?
+  { [ "$rc" = 0 ] && ! printf '%s' "$out" | grep -q 'path-udp-blocked'; } \
+    || { rm -rf "$_td"; echo "smoke-test: FAIL (udp=false re-run must not re-alert: rc=$rc out='$out')"; exit 1; }
+  # 8. BLIND: unparseable status → exit 2, modes state untouched
+  echo 'not json' > "$_fx"
+  modes_before="$(cat "$_td/.path-watch-modes")"
+  env $_env "$0" >/dev/null 2>&1; rc=$?
+  { [ "$rc" = 2 ] && [ "$(cat "$_td/.path-watch-modes")" = "$modes_before" ]; } \
+    || { rm -rf "$_td"; echo "smoke-test: FAIL (BLIND must exit 2 + not touch modes: rc=$rc)"; exit 1; }
+  rm -rf "$_td"
+  echo "smoke-test: ok (live status --json real-read + baseline/debounce-2/once-only/recovery/offline/netcheck-udp-edge/BLIND fixtures)"; exit 0
+fi
+
+if [ "${1:-}" = --status ]; then
+  [ -r "$STATE" ] && cat "$STATE" || echo "mesh-path-watch: no state yet"
+  exit 0
+fi
+
+cheap_lane; crc=$?
+if [ "$crc" = 2 ]; then
+  echo "mesh-path-watch: BLIND (tailscale status --json unreadable/no mesh peers)" >&2
+  exit 2
+fi
+[ -n "$ALERTS" ] && printf '%s' "$ALERTS"
+heavy_lane || true
+printf 'OK %s %s\n' "$TS" "$CHEAP_SUMMARY" > "$STATE"
+command -v mesh-state-touch >/dev/null 2>&1 && mesh-state-touch "$STATE" >/dev/null 2>&1 || true
+[ -n "$ALERTS" ] || echo "mesh-path-watch: QUIET ($CHEAP_SUMMARY)"
+exit 0
