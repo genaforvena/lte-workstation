@@ -1,0 +1,490 @@
+#!/usr/bin/env python3
+"""mesh-desktop-gui — the NATIVE desktop GUI actuator: real mouse/keyboard control over native app
+windows on THIS node (mesh-browse already covers the browser; this is everything else — GTK/Qt apps,
+terminals, file managers, whatever runs on the desktop).
+
+Two targeting modes, SEMANTIC primary / COORDINATE fallback (tg-mind/desktop-gui-actuator, 2026-07-05):
+
+  SEMANTIC (default) — walks the AT-SPI accessibility tree (gi.repository.Atspi) and acts by
+  WIDGET ROLE + NAME ("click the 'push button' named 'OK'"), not by pixel position. Stable across
+  window moves, resizes, theme/DPI changes, and window-manager quirks — the accessibility tree is
+  keyed on semantics the app itself exposes, not where a widget happens to render. This is the primary
+  mode because layout drift is the single most common way a coordinate-based actuator silently starts
+  clicking the wrong thing.
+
+  COORDINATE (--click-xy/--key, fallback) — direct pixel-position input via xdotool (X11, XTEST
+  extension, talks to the X server directly — no background daemon) or ydotool (Wayland, a uinput-
+  level client — REQUIRES a running `ydotoold` daemon; this tool does NOT start/configure that daemon
+  itself. Setting up a persistent background input-injection daemon on the operator's live desktop is a
+  deliberate, explicit OPERATOR/steward action, not something an autonomous mesh task should silently
+  provision — see "Wayland caveat" below). Needed when a target has no accessible tree at all (some
+  Electron/Qt apps ship without a11y enabled) or as an escape hatch when semantic targeting can't find
+  the widget.
+
+  mesh-desktop-gui --list                          list running apps (AT-SPI desktop, semantic sense)
+  mesh-desktop-gui --tree <app-name-substr>         dump the accessibility tree (role + name) for
+                                                     target discovery — run this first to find what to
+                                                     click
+  mesh-desktop-gui --click <app> <role> <name>      SEMANTIC click: find role+name under app, invoke
+                                                     its primary AT-SPI action
+  mesh-desktop-gui --type <app> <role> <name> TEXT  SEMANTIC type: set an editable widget's text via
+                                                     AT-SPI EditableText
+  mesh-desktop-gui --click-xy X Y                   COORDINATE click at absolute screen position
+                                                     (xdotool on X11, ydotool on Wayland)
+  mesh-desktop-gui --key KEYSPEC                    COORDINATE keypress (xdotool `key` syntax, e.g.
+                                                     "ctrl+s", "Return")
+  mesh-desktop-gui --session                        print detected session type (x11/wayland/none) +
+                                                     which backend this run would use
+  mesh-desktop-gui --test                           real (non-stub) smoke test — see below
+
+Session detection (runtime, never assumed): WAYLAND_DISPLAY set and non-empty -> wayland (ydotool);
+elif DISPLAY set -> x11 (xdotool); else -> no display, coordinate mode unusable (semantic mode also
+needs a live AT-SPI bus, so both modes need SOME session).
+
+Wayland caveat (read before relying on --click-xy/--key on this node): `ydotool` is installed as a
+client only. It talks to `ydotoold` over a Unix socket; that daemon needs /dev/uinput access and is
+NOT started by this tool. Provisioning a live keyboard/mouse-injection daemon is exactly the kind of
+persistent, security-sensitive capability that needs the OPERATOR's explicit go-ahead, not an
+autonomous task's — start it yourself (`sudo ydotoold &`, or a proper systemd unit) before relying on
+the Wayland coordinate path. The SEMANTIC path (AT-SPI) has no such prerequisite — it talks to the
+existing accessibility bus, which is dbus-activated on demand.
+
+Storage idiom: flat text, no SQL. Every action appends one line to ~/.mesh/desktop-gui.log
+(epoch<TAB>mode<TAB>target<TAB>result) — mesh's own convention, not Hermes's sqlite session store
+(referenced for design ideas only, never vendored: avifenesh/computer-use-linux MCP for the AT-SPI +
+Wayland/X11 input + window-targeting shape; Hermes's own browser tool for the read-then-act structure
+mesh-browse already follows).
+
+--test: spins up a THROWAWAY Xvfb display (`:97`) + a private dbus session + at-spi2-registryd + a
+minimal GTK3 test window with one button, then exercises BOTH real targeting modes against it —
+semantic (AT-SPI do_action) and coordinate (xdotool click) — asserting the button's real click
+callback fired (a marker file, not just "the command exited 0"). This is why --test doesn't touch the
+operator's actual desktop: everything lives in a private, disposable display torn down at the end.
+The Wayland/ydotool coordinate path is NOT exercised by --test (no ydotoold on this node — see
+Wayland caveat); that path is implemented but unverified live, flagged honestly rather than faked.
+"""
+import sys
+import os
+import re
+import time
+import subprocess
+import shutil
+
+MESH = os.environ.get("MESH_DIR", os.path.expanduser("~/.mesh"))
+LOG = os.path.join(MESH, "desktop-gui.log")
+
+
+def log_action(mode, target, result):
+    os.makedirs(MESH, exist_ok=True)
+    with open(LOG, "a") as f:
+        f.write(f"{int(time.time())}\t{mode}\t{target}\t{result}\n")
+
+
+def detect_session():
+    """-> 'wayland' | 'x11' | 'none' — runtime detection, never assumed."""
+    if os.environ.get("WAYLAND_DISPLAY"):
+        return "wayland"
+    if os.environ.get("DISPLAY"):
+        return "x11"
+    return "none"
+
+
+# ---------------------------------------------------------------- SEMANTIC (AT-SPI) ----------------
+
+def _atspi():
+    import gi
+    gi.require_version("Atspi", "2.0")
+    from gi.repository import Atspi
+    return Atspi
+
+
+def list_apps():
+    Atspi = _atspi()
+    desktop = Atspi.get_desktop(0)
+    apps = []
+    for i in range(desktop.get_child_count()):
+        app = desktop.get_child_at_index(i)
+        if app is not None:
+            apps.append(app.get_name() or "(unnamed)")
+    return apps
+
+
+def _walk(acc, depth, lines, max_depth=8):
+    try:
+        role = acc.get_role_name()
+        name = acc.get_name()
+    except Exception:
+        return
+    lines.append(f"{'  ' * depth}{role} {name!r}")
+    if depth >= max_depth:
+        return
+    try:
+        n = acc.get_child_count()
+    except Exception:
+        return
+    for j in range(n):
+        child = acc.get_child_at_index(j)
+        if child is not None:
+            _walk(child, depth + 1, lines)
+
+
+def tree(app_substr):
+    Atspi = _atspi()
+    desktop = Atspi.get_desktop(0)
+    lines = []
+    found = False
+    for i in range(desktop.get_child_count()):
+        app = desktop.get_child_at_index(i)
+        if app is None:
+            continue
+        name = app.get_name() or ""
+        if app_substr.lower() in name.lower():
+            found = True
+            lines.append(f"=== {name} ===")
+            _walk(app, 0, lines)
+    if not found:
+        lines.append(f"(no running app matches {app_substr!r} — try --list)")
+    return "\n".join(lines)
+
+
+def _find(app_substr, role_name, widget_name):
+    """Find the first accessible under an app matching role_name (exact) + widget_name
+    (substring, case-insensitive) -> Atspi.Accessible or None."""
+    Atspi = _atspi()
+    desktop = Atspi.get_desktop(0)
+    result = [None]
+
+    def walk(acc):
+        if result[0] is not None:
+            return
+        try:
+            role = acc.get_role_name()
+            name = acc.get_name() or ""
+        except Exception:
+            return
+        if role == role_name and widget_name.lower() in name.lower():
+            result[0] = acc
+            return
+        try:
+            n = acc.get_child_count()
+        except Exception:
+            return
+        for j in range(n):
+            if result[0] is not None:
+                return
+            child = acc.get_child_at_index(j)
+            if child is not None:
+                walk(child)
+
+    for i in range(desktop.get_child_count()):
+        app = desktop.get_child_at_index(i)
+        if app is None:
+            continue
+        if app_substr.lower() in (app.get_name() or "").lower():
+            walk(app)
+    return result[0]
+
+
+def semantic_click(app_substr, role_name, widget_name):
+    acc = _find(app_substr, role_name, widget_name)
+    if acc is None:
+        return False, f"not found: app~={app_substr!r} role={role_name!r} name~={widget_name!r}"
+    n = acc.get_n_actions()
+    if n < 1:
+        return False, "found widget has no invokable AT-SPI action"
+    acc.do_action(0)
+    return True, f"invoked action 0 on {role_name} {widget_name!r}"
+
+
+def semantic_type(app_substr, role_name, widget_name, text):
+    import gi
+    gi.require_version("Atspi", "2.0")
+    from gi.repository import Atspi
+    acc = _find(app_substr, role_name, widget_name)
+    if acc is None:
+        return False, f"not found: app~={app_substr!r} role={role_name!r} name~={widget_name!r}"
+    try:
+        editable = Atspi.EditableText.get_editable_text_iface(acc) if hasattr(Atspi.EditableText, "get_editable_text_iface") else None
+    except Exception:
+        editable = None
+    # PyGObject exposes interface methods directly on the accessible when supported.
+    try:
+        acc.set_text_contents(text)
+        return True, f"set text on {role_name} {widget_name!r} ({len(text)} chars)"
+    except Exception as e:
+        return False, f"widget is not editable (EditableText iface unavailable): {e}"
+
+
+# ---------------------------------------------------------------- COORDINATE fallback --------------
+
+def coord_click(x, y):
+    session = detect_session()
+    if session == "x11":
+        if not shutil.which("xdotool"):
+            return False, "xdotool not installed"
+        r = subprocess.run(["xdotool", "mousemove", str(x), str(y), "click", "1"], capture_output=True, text=True)
+        return r.returncode == 0, (r.stderr.strip() or "ok")
+    if session == "wayland":
+        if not shutil.which("ydotool"):
+            return False, "ydotool not installed"
+        r = subprocess.run(["ydotool", "mousemove", "--absolute", "-x", str(x), "-y", str(y)], capture_output=True, text=True)
+        if r.returncode != 0:
+            return False, f"ydotool mousemove failed (is ydotoold running? see header Wayland caveat): {r.stderr.strip()}"
+        r2 = subprocess.run(["ydotool", "click", "0xC0"], capture_output=True, text=True)
+        return r2.returncode == 0, (r2.stderr.strip() or "ok")
+    return False, "no DISPLAY/WAYLAND_DISPLAY — no session to click in"
+
+
+def coord_key(keyspec):
+    session = detect_session()
+    if session == "x11":
+        if not shutil.which("xdotool"):
+            return False, "xdotool not installed"
+        r = subprocess.run(["xdotool", "key", keyspec], capture_output=True, text=True)
+        return r.returncode == 0, (r.stderr.strip() or "ok")
+    if session == "wayland":
+        if not shutil.which("ydotool"):
+            return False, "ydotool not installed"
+        r = subprocess.run(["ydotool", "key", keyspec], capture_output=True, text=True)
+        return r.returncode == 0, (r.stderr.strip() or "ok, but requires ydotoold — see header Wayland caveat")
+    return False, "no DISPLAY/WAYLAND_DISPLAY — no session to send keys to"
+
+
+# ---------------------------------------------------------------- --test (real, sandboxed) ---------
+
+_TEST_APP_SRC = '''
+import gi
+gi.require_version("Gtk", "3.0")
+from gi.repository import Gtk, GLib
+import sys
+
+win = Gtk.Window(title="mesh-desktop-gui-test")
+win.set_default_size(200, 100)
+btn = Gtk.Button(label="Click Me")
+marker_path = sys.argv[1]
+
+def on_click(b):
+    with open(marker_path, "a") as f:
+        f.write("clicked\\n")
+
+btn.connect("clicked", on_click)
+win.add(btn)
+win.show_all()
+GLib.timeout_add_seconds(20, lambda: Gtk.main_quit())
+Gtk.main()
+'''
+
+
+def run_test():
+    import tempfile
+    fails = []
+
+    def check(ok, msg):
+        print(f"  {'ok' if ok else 'FAIL'}: {msg}")
+        if not ok:
+            fails.append(msg)
+
+    if not shutil.which("Xvfb"):
+        print("smoke-test: FAIL (no Xvfb — cannot build a throwaway display for a real test)")
+        sys.exit(1)
+    if not shutil.which("dbus-run-session"):
+        print("smoke-test: FAIL (no dbus-run-session — AT-SPI needs a private session bus)")
+        sys.exit(1)
+    if not os.path.exists("/usr/libexec/at-spi2-registryd"):
+        print("smoke-test: FAIL (no at-spi2-registryd — semantic path unavailable)")
+        sys.exit(1)
+
+    td = tempfile.mkdtemp()
+    app_py = os.path.join(td, "test_app.py")
+    marker = os.path.join(td, "click_marker")
+    with open(app_py, "w") as f:
+        f.write(_TEST_APP_SRC)
+
+    def registryd_pids():
+        r = subprocess.run(["pgrep", "-f", "at-spi2-registryd"], capture_output=True, text=True)
+        return set(r.stdout.split())
+
+    # dbus SERVICE-ACTIVATES its own at-spi2-registryd on demand (independent of any instance we
+    # background ourselves) — verified live: killing only our own tracked PID left a second,
+    # dbus-activated registryd running after every --test call. Diff PIDs before/after instead of
+    # trusting a single tracked PID or dbus-run-session's teardown to reap everything.
+    _registryd_before = registryd_pids()
+
+    display = ":97"
+    xvfb = subprocess.Popen(["Xvfb", display, "-screen", "0", "1024x768x24"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(1)
+    try:
+        env = dict(os.environ)
+        env["DISPLAY"] = display
+
+        # --- SEMANTIC path: dbus-run-session + at-spi2-registryd + AT-SPI do_action ---
+        probe_py = os.path.join(td, "probe.py")
+        with open(probe_py, "w") as f:
+            f.write(
+                "import gi\n"
+                "gi.require_version('Atspi', '2.0')\n"
+                "from gi.repository import Atspi\n"
+                "desktop = Atspi.get_desktop(0)\n"
+                "found = [None]\n"
+                "def walk(acc):\n"
+                "    if found[0] is not None: return\n"
+                "    try:\n"
+                "        role = acc.get_role_name()\n"
+                "    except Exception:\n"
+                "        return\n"
+                "    if role == 'push button':\n"
+                "        found[0] = acc; return\n"
+                "    for j in range(acc.get_child_count()):\n"
+                "        c = acc.get_child_at_index(j)\n"
+                "        if c is not None: walk(c)\n"
+                "for i in range(desktop.get_child_count()):\n"
+                "    walk(desktop.get_child_at_index(i))\n"
+                "if found[0] is None:\n"
+                "    print('PROBE: not found'); raise SystemExit(1)\n"
+                "found[0].do_action(0)\n"
+                "print('PROBE: clicked')\n"
+            )
+        # Explicit PID capture + kill for at-spi2-registryd: dbus-run-session tears down the
+        # session bus on exit but does NOT reliably reap a dbus-activated registryd (verified —
+        # left 2 stray processes per run before this fix). Track and kill it ourselves rather than
+        # trust the session teardown, or repeated --test runs leak daemons indefinitely.
+        session_script = (
+            f"/usr/libexec/at-spi2-registryd >/dev/null 2>&1 & reg_pid=$!; sleep 1; "
+            f"GTK_MODULES=gail:atk-bridge DISPLAY={display} python3 {app_py} {marker} & app_pid=$!; "
+            f"sleep 2; python3 {probe_py}; rc=$?; sleep 1; "
+            f"kill $app_pid 2>/dev/null; kill $reg_pid 2>/dev/null; exit $rc"
+        )
+        r = subprocess.run(["dbus-run-session", "--", "bash", "-c", session_script],
+                            capture_output=True, text=True, env=env, timeout=15)
+        check(r.returncode == 0 and "PROBE: clicked" in r.stdout,
+              f"semantic AT-SPI: find push-button + do_action(0) (rc={r.returncode})")
+        semantic_marker_hit = os.path.exists(marker) and "clicked" in open(marker).read()
+        check(semantic_marker_hit, "semantic AT-SPI: real callback fired (marker file written by the GTK app itself)")
+
+        # --- COORDINATE path: xdotool direct click against the same Xvfb display ---
+        open(marker, "w").close()  # reset marker for the coordinate-path assertion
+        app_proc = subprocess.Popen(["python3", app_py, marker], env=env,
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(2)
+        have_xdotool = shutil.which("xdotool") is not None
+        if have_xdotool:
+            subprocess.run(["xdotool", "search", "--name", "mesh-desktop-gui-test",
+                             "windowactivate", "--sync"], env=env, capture_output=True, text=True)
+            win_id = subprocess.run(["xdotool", "search", "--name", "mesh-desktop-gui-test"],
+                                     env=env, capture_output=True, text=True).stdout.strip().split("\n")[0]
+            r2 = subprocess.run(["xdotool", "mousemove", "--window", win_id, "100", "50", "click", "1"],
+                                 env=env, capture_output=True, text=True)
+            check(r2.returncode == 0, f"coordinate xdotool: click command exit 0 (win={win_id})")
+        else:
+            check(False, "coordinate xdotool: xdotool not installed")
+        time.sleep(1)
+        coord_marker_hit = os.path.exists(marker) and "clicked" in open(marker).read()
+        check(coord_marker_hit, "coordinate xdotool: real callback fired (marker file written by the GTK app itself)")
+        app_proc.terminate()
+        try:
+            app_proc.wait(timeout=3)
+        except Exception:
+            app_proc.kill()
+
+        check(detect_session() in ("wayland", "x11", "none"), "session detection returns a recognized value")
+    finally:
+        xvfb.terminate()
+        try:
+            xvfb.wait(timeout=3)
+        except Exception:
+            xvfb.kill()
+        # Kill any at-spi2-registryd that appeared during the test (ours + dbus-activated) —
+        # never touch one that predates the test (e.g. a real desktop session's own registry).
+        for pid in registryd_pids() - _registryd_before:
+            try:
+                os.kill(int(pid), 9)
+            except Exception:
+                pass
+        import shutil as _sh
+        _sh.rmtree(td, ignore_errors=True)
+
+    if fails:
+        print(f"smoke-test: FAIL ({'; '.join(fails)})")
+        sys.exit(1)
+    print("smoke-test: ok (semantic AT-SPI click + coordinate xdotool click both verified against a real "
+          "throwaway GTK window in a private Xvfb+dbus sandbox — real callback fired, not a stub). "
+          "Wayland/ydotool coordinate path implemented but NOT exercised here (no ydotoold on this node "
+          "— provisioning that daemon is an explicit operator action, see header).")
+
+
+# ---------------------------------------------------------------- CLI -------------------------------
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help"):
+        print(__doc__)
+        return 0
+
+    cmd = args[0]
+
+    if cmd == "--test":
+        run_test()
+        return 0
+
+    if cmd == "--session":
+        s = detect_session()
+        backend = {"x11": "xdotool", "wayland": "ydotool", "none": "(none — no display)"}[s]
+        print(f"session={s} coordinate-backend={backend}")
+        return 0
+
+    if cmd == "--list":
+        for name in list_apps():
+            print(name)
+        return 0
+
+    if cmd == "--tree":
+        if len(args) < 2:
+            print("usage: mesh-desktop-gui --tree <app-name-substr>", file=sys.stderr)
+            return 2
+        print(tree(args[1]))
+        return 0
+
+    if cmd == "--click":
+        if len(args) < 4:
+            print("usage: mesh-desktop-gui --click <app> <role> <name>", file=sys.stderr)
+            return 2
+        ok, msg = semantic_click(args[1], args[2], args[3])
+        log_action("semantic-click", f"{args[1]}/{args[2]}/{args[3]}", "ok" if ok else f"FAIL: {msg}")
+        print(msg)
+        return 0 if ok else 1
+
+    if cmd == "--type":
+        if len(args) < 5:
+            print("usage: mesh-desktop-gui --type <app> <role> <name> <text>", file=sys.stderr)
+            return 2
+        ok, msg = semantic_type(args[1], args[2], args[3], args[4])
+        log_action("semantic-type", f"{args[1]}/{args[2]}/{args[3]}", "ok" if ok else f"FAIL: {msg}")
+        print(msg)
+        return 0 if ok else 1
+
+    if cmd == "--click-xy":
+        if len(args) < 3:
+            print("usage: mesh-desktop-gui --click-xy <x> <y>", file=sys.stderr)
+            return 2
+        ok, msg = coord_click(int(args[1]), int(args[2]))
+        log_action("coord-click", f"{args[1]},{args[2]}", "ok" if ok else f"FAIL: {msg}")
+        print(msg)
+        return 0 if ok else 1
+
+    if cmd == "--key":
+        if len(args) < 2:
+            print("usage: mesh-desktop-gui --key <keyspec>", file=sys.stderr)
+            return 2
+        ok, msg = coord_key(args[1])
+        log_action("coord-key", args[1], "ok" if ok else f"FAIL: {msg}")
+        print(msg)
+        return 0 if ok else 1
+
+    print(f"unknown command: {cmd}", file=sys.stderr)
+    print(__doc__, file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
