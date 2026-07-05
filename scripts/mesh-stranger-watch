@@ -1,0 +1,274 @@
+#!/usr/bin/env bash
+# reflex-cadence: 3-59/5 * * * *
+# mesh-stranger-watch — voice-announce ONLY a confidently-new person in the room.
+#
+# Operator directive (2026-07-05 TG, task room-announce-only-strangers): routine spoken
+# checks are noise (removed in e9fb6d2); the mesh's voice speaks about people ONLY when a
+# STRANGER is confidently in the room while the known household composition is home.
+# FALSE-POSITIVE IS WORSE THAN SILENCE — every gate below fails CLOSED (silent).
+#
+# Gate chain (all must pass, in cheap→expensive order; any failure = silent exit):
+#   1. cam daemon live      — ~/.mesh/cam-prev.jpg mtime < CAM_FRESH s (cam-watch rewrites ~1.5s);
+#                             stale/missing frame = no eye = honest exit 2, never a guess
+#   2. room occupied        — mesh-room-trace verdict OCCUPIED (a Stranger verdict in a room the
+#                             occupancy sense calls empty is a conflict → silence, not alarm)
+#   2.5 vision budget       — EDGE-triggered, not level: vision runs only on an occupancy
+#                             TRANSITION (e.g. VACANT→OCCUPIED = someone just entered) or when the
+#                             last vision attempt is older than VISION_KEEPALIVE (default 30 min).
+#                             Level-triggered */5 polling costs ~3.5k Groq tokens/call → ~1M/day on
+#                             an occupied room — more than the ENTIRE 500k scout TPD bucket alone
+#                             (hit live 2026-07-05: both org buckets drained). The stamp is written
+#                             on ATTEMPT, so a rate-limited call backs off a full keepalive instead
+#                             of re-burning every cycle. Trade-off accepted: a stranger entering an
+#                             ALREADY-occupied room is caught by keepalive (≤30 min latency) — the
+#                             classic entry into an empty home still triggers immediately.
+#   3. vision says Stranger — mesh-face-recognize (Groq vision) on a fresh frame copy
+#   4. CONFIRMATION         — a SECOND, LATER frame (>=CONFIRM_GAP s apart, mtime must advance)
+#                             must ALSO classify Stranger (2-of-2; one hallucinated frame stays silent)
+#   5. cooldown             — at most one announce per COOLDOWN s (default 1h; the same stranger
+#                             standing in the room does not re-announce every cycle)
+#
+# Known-composition context: face-recognize already separates the household (Ilya/Rozalia) from
+# Stranger, so a known face never reaches the announce. Honest limitation (model prompt bias):
+# an unknown WOMAN classifies as Rozalia, so female strangers are largely invisible to this sense —
+# silence-biased by construction, documented, not fixable here without a face-embedding DB.
+#
+# State: ~/.mesh/.stranger-watch.state written EVERY run (liveness-touch convention:
+# mtime = ran-live, content = last verdict) — an unreachable eye records DARK, never a fake all-clear.
+#
+# Exit codes: 0 = evaluated (announced or correctly silent) · 2 = eye dark (no fresh frame /
+# no vision path) — honest n/a, never a faked verdict.
+#
+# Usage:
+#   mesh-stranger-watch          one evaluation cycle (the cron entry)
+#   mesh-stranger-watch --status last verdict + cooldown state
+#   mesh-stranger-watch --test   smoke test (stubbed vision/occupancy/say fixtures + real-eye gate)
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+
+MESHD="${MESH_STRANGER_MESHD:-$HOME/.mesh}"
+FRAME="${MESH_STRANGER_FRAME:-$MESHD/cam-prev.jpg}"
+STATE="${MESH_STRANGER_STATE:-$MESHD/.stranger-watch.state}"
+CDFILE="${MESH_STRANGER_CD:-$MESHD/.stranger-watch.cd}"
+VISFILE="${MESH_STRANGER_VIS:-$MESHD/.stranger-watch.vis}"   # mtime = last vision ATTEMPT
+OCCFILE="${MESH_STRANGER_OCC:-$MESHD/.stranger-watch.occ}"   # content = previous occupancy verdict
+CAM_FRESH="${MESH_STRANGER_CAM_FRESH:-30}"      # frame older than this = eye dark
+CONFIRM_GAP="${MESH_STRANGER_CONFIRM_GAP:-8}"   # seconds between the two frames
+COOLDOWN="${MESH_STRANGER_COOLDOWN:-3600}"      # min seconds between announces
+VISION_KEEPALIVE="${MESH_STRANGER_VISION_KEEPALIVE:-1800}"  # max s between vision calls while occupied
+SAY_LINE="${MESH_STRANGER_SAY:-Внимание: в комнате незнакомый человек.}"
+# Polling vision rides llama-4-scout (non-reasoning, own Groq TPD bucket) — the default qwen
+# reasoning model at this cadence would exhaust the whole shared 200k TPD by itself.
+export MESH_FACE_MODEL="${MESH_FACE_MODEL:-meta-llama/llama-4-scout-17b-16e-instruct}"
+
+write_state() {  # $1 = verdict line; unconditional every run (mtime = liveness), atomic
+  mkdir -p "$(dirname "$STATE")" 2>/dev/null
+  printf '%s ts=%s\n' "$1" "$(date -u +%FT%TZ)" > "$STATE.tmp" && mv "$STATE.tmp" "$STATE"
+}
+
+frame_age() {  # → seconds since cam-prev.jpg mtime, or empty if missing
+  [ -s "$FRAME" ] || return 1
+  echo $(( $(date +%s) - $(stat -c %Y "$FRAME" 2>/dev/null || echo 0) ))
+}
+
+occupancy() {  # → OCCUPIED|RECENT|VACANT|UNKNOWN (honest: parse-fail = UNKNOWN)
+  command -v mesh-room-trace >/dev/null 2>&1 || { echo UNKNOWN; return; }
+  local v
+  v="$(mesh-room-trace --json 2>/dev/null | sed -n 's/.*"verdict": *"\([^"]*\)".*/\1/p')"
+  case "$v" in OCCUPIED|RECENT|VACANT|UNKNOWN) echo "$v" ;; *) echo UNKNOWN ;; esac
+}
+
+classify_frame() {  # <dst-copy-path> → prints label; rc 1 = no fresh frame / empty read
+  local age dst="$1"
+  age="$(frame_age)" || return 1
+  [ "$age" -le "$CAM_FRESH" ] || return 1
+  cp -f "$FRAME" "$dst" 2>/dev/null && [ -s "$dst" ] || return 1
+  local who
+  who="$(mesh-face-recognize "$dst" 2>/dev/null | tr -d '\r' | tail -n1)"
+  case "$who" in Ilya|Rozalia|Nobody|Stranger) echo "$who"; return 0 ;; *) return 1 ;; esac
+}
+
+in_cooldown() {
+  [ -f "$CDFILE" ] || return 1
+  [ $(( $(date +%s) - $(stat -c %Y "$CDFILE" 2>/dev/null || echo 0) )) -lt "$COOLDOWN" ]
+}
+
+run() {
+  local td occ who1 who2 m1 m2
+  # Gate 1: live eye
+  if ! frame_age >/dev/null || [ "$(frame_age)" -gt "$CAM_FRESH" ]; then
+    write_state "[stranger-watch] DARK no-fresh-frame"
+    echo "stranger-watch: cam frame stale/missing — eye dark, silent (honest n/a)" >&2
+    return 2
+  fi
+  # Gate 2: occupancy corroboration (record the verdict every run — transitions drive gate 2.5)
+  occ="$(occupancy)"
+  prev_occ="$(cat "$OCCFILE" 2>/dev/null || echo NONE)"
+  printf '%s\n' "$occ" > "$OCCFILE" 2>/dev/null
+  if [ "$occ" != OCCUPIED ]; then
+    write_state "[stranger-watch] SILENT occupancy=$occ"
+    return 0
+  fi
+  # Gate 2.5: vision budget — edge-triggered (occupancy transition) or keepalive-due only
+  local vis_age=$(( $(date +%s) - $(stat -c %Y "$VISFILE" 2>/dev/null || echo 0) ))
+  if [ "$occ" = "$prev_occ" ] && [ "$vis_age" -lt "$VISION_KEEPALIVE" ]; then
+    write_state "[stranger-watch] SILENT vision-held budget next=$((VISION_KEEPALIVE - vis_age))s"
+    return 0
+  fi
+  touch "$VISFILE" 2>/dev/null   # stamp on ATTEMPT: a rate-limited call backs off a full keepalive
+  td="$(mktemp -d)" || return 2
+  trap 'rm -rf "$td"' RETURN
+  # Gate 3: first vision read
+  who1="$(classify_frame "$td/f1.jpg")" || { write_state "[stranger-watch] DARK vision-fail"; return 2; }
+  if [ "$who1" != Stranger ]; then
+    write_state "[stranger-watch] SILENT who=$who1 occupancy=$occ"
+    return 0
+  fi
+  # Gate 4: confirmation on a LATER frame (content must CHANGE — the same frozen frame re-scored
+  # proves nothing; md5, not mtime: mtime has 1s granularity and cam-watch rewrites ~1.5s)
+  m1="$(md5sum < "$FRAME" 2>/dev/null | cut -d' ' -f1)"
+  sleep "$CONFIRM_GAP"
+  m2="$(md5sum < "$FRAME" 2>/dev/null | cut -d' ' -f1)"
+  if [ -z "$m2" ] || [ "$m2" = "$m1" ]; then
+    write_state "[stranger-watch] SILENT unconfirmed=frame-frozen"
+    return 0
+  fi
+  who2="$(classify_frame "$td/f2.jpg")" || { write_state "[stranger-watch] SILENT unconfirmed=vision-fail"; return 0; }
+  if [ "$who2" != Stranger ]; then
+    write_state "[stranger-watch] SILENT unconfirmed who2=$who2"
+    return 0
+  fi
+  # Gate 5: cooldown
+  if in_cooldown; then
+    write_state "[stranger-watch] STRANGER-HELD cooldown"
+    return 0
+  fi
+  # Announce (mesh-say carries the MESH_TEST_SANDBOX suppress gate itself)
+  mesh-say "$SAY_LINE" >/dev/null 2>&1
+  touch "$CDFILE" 2>/dev/null
+  write_state "[stranger-watch] ANNOUNCED stranger 2-of-2 occupancy=$occ"
+  command -v mesh-chat >/dev/null 2>&1 && \
+    mesh-chat "[sense] stranger-watch ANNOUNCED: confident stranger in room (2-of-2 vision, occupancy=OCCUPIED) — spoke: $SAY_LINE" >/dev/null 2>&1
+  echo "[stranger-watch] ANNOUNCED"
+  return 0
+}
+
+[ "${1:-}" = --status ] && {
+  cat "$STATE" 2>/dev/null || echo "(no state yet)"
+  if in_cooldown; then echo "cooldown: ACTIVE"; else echo "cooldown: clear"; fi
+  exit 0
+}
+
+# ---- Smoke test ----
+[ "${1:-}" = --test ] && {
+  fail=0
+  _td="$(mktemp -d)" || { echo "smoke-test: FAIL (mktemp failed)"; exit 1; }
+  trap 'rm -rf "$_td"' EXIT
+  _scr="${BASH_SOURCE[0]}"
+  export MESH_TEST_SANDBOX=1                       # belt: never let a leak reach the real speaker
+  export MESH_STRANGER_MESHD="$_td/mesh"
+  export MESH_STRANGER_STATE="$_td/mesh/.state"
+  export MESH_STRANGER_CD="$_td/mesh/.cd"
+  export MESH_STRANGER_FRAME="$_td/mesh/cam-prev.jpg"
+  export MESH_STRANGER_CONFIRM_GAP=1
+  export MESH_STRANGER_VISION_KEEPALIVE=0   # fixtures exercise vision every run; case 7 re-enables
+  mkdir -p "$_td/mesh" "$_td/bin" "$_td/home"
+  _realhome="$HOME"
+  # HOME points at an empty stand-in so the tool's own ~/.local/bin PATH-prepend can't shadow the stubs
+  _run(){ PATH="$_td/bin:/usr/bin:/bin" HOME="$_td/home" bash "$_scr"; }
+
+  # Stub actuators/senses; the say stub RECORDS instead of speaking
+  cat > "$_td/bin/mesh-say"  <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$_td/said.log"
+EOF
+  cat > "$_td/bin/mesh-chat" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+  cat > "$_td/bin/mesh-room-trace" <<'EOF'
+#!/usr/bin/env bash
+printf '{"verdict": "OCCUPIED"}\n'
+EOF
+  # face stub: emits labels from a queue file, one per call (simulates per-frame verdicts)
+  cat > "$_td/bin/mesh-face-recognize" <<EOF
+#!/usr/bin/env bash
+q="$_td/queue"
+head -1 "\$q" 2>/dev/null || echo Nobody
+sed -i '1d' "\$q" 2>/dev/null
+EOF
+  chmod +x "$_td/bin/"*
+
+  # Case 1: no frame at all → exit 2, state DARK
+  out="$(_run 2>/dev/null)"; rc=$?
+  { [ "$rc" = 2 ] && grep -q 'DARK no-fresh-frame' "$_td/mesh/.state"; } || { echo "FAIL: dark-eye (rc=$rc)"; fail=1; }
+
+  # helper: freshen the fake frame
+  _frame(){ printf 'jpegdata-%s' "$RANDOM" > "$_td/mesh/cam-prev.jpg"; }
+
+  # Case 2: occupied + Ilya → silent, no announce
+  _frame; printf 'Ilya\n' > "$_td/queue"
+  _run >/dev/null 2>&1; rc=$?
+  { [ "$rc" = 0 ] && grep -q 'SILENT who=Ilya' "$_td/mesh/.state" && [ ! -e "$_td/said.log" ]; } || { echo "FAIL: known-face must be silent"; fail=1; }
+
+  # Case 3: stranger once, then Rozalia on confirm → unconfirmed, silent
+  _frame; printf 'Stranger\nRozalia\n' > "$_td/queue"
+  ( sleep 0.3; printf 'newframe-%s' "$RANDOM" > "$_td/mesh/cam-prev.jpg" ) &
+  _run >/dev/null 2>&1
+  wait
+  { grep -q 'SILENT unconfirmed who2=Rozalia' "$_td/mesh/.state" && [ ! -e "$_td/said.log" ]; } || { echo "FAIL: 1-of-2 must stay silent"; fail=1; }
+
+  # Case 4: stranger 2-of-2 + occupied → ANNOUNCED via say stub
+  _frame; printf 'Stranger\nStranger\n' > "$_td/queue"
+  ( sleep 0.3; printf 'newframe-%s' "$RANDOM" > "$_td/mesh/cam-prev.jpg" ) &
+  out="$(_run 2>/dev/null)"; rc=$?
+  wait
+  { [ "$rc" = 0 ] && grep -q 'ANNOUNCED' "$_td/mesh/.state" && grep -q 'незнакомый' "$_td/said.log"; } || { echo "FAIL: confirmed stranger must announce (rc=$rc)"; fail=1; }
+
+  # Case 5: immediate repeat → cooldown holds, no second say line
+  _frame; printf 'Stranger\nStranger\n' > "$_td/queue"
+  ( sleep 0.3; printf 'newframe-%s' "$RANDOM" > "$_td/mesh/cam-prev.jpg" ) &
+  _run >/dev/null 2>&1
+  wait
+  { grep -q 'STRANGER-HELD cooldown' "$_td/mesh/.state" && [ "$(wc -l < "$_td/said.log")" = 1 ]; } || { echo "FAIL: cooldown must hold repeat announce"; fail=1; }
+
+  # Case 6: stranger but room NOT occupied → silent conflict
+  rm -f "$_td/mesh/.cd"
+  cat > "$_td/bin/mesh-room-trace" <<'EOF'
+#!/usr/bin/env bash
+printf '{"verdict": "VACANT"}\n'
+EOF
+  chmod +x "$_td/bin/mesh-room-trace"
+  _frame; printf 'Stranger\nStranger\n' > "$_td/queue"
+  _run >/dev/null 2>&1
+  { grep -q 'SILENT occupancy=VACANT' "$_td/mesh/.state" && [ "$(wc -l < "$_td/said.log")" = 1 ]; } || { echo "FAIL: vacant room must gate to silence"; fail=1; }
+
+  # Case 7: vision-budget hold — same occupancy, fresh vision stamp → NO vision call (queue untouched)
+  cat > "$_td/bin/mesh-room-trace" <<'EOF'
+#!/usr/bin/env bash
+printf '{"verdict": "OCCUPIED"}\n'
+EOF
+  chmod +x "$_td/bin/mesh-room-trace"
+  _frame; printf 'Ilya\n' > "$_td/queue"
+  MESH_STRANGER_VISION_KEEPALIVE=9999 _run >/dev/null 2>&1     # prev occ VACANT→OCCUPIED: vision runs
+  _frame; printf 'Stranger\n' > "$_td/queue"
+  MESH_STRANGER_VISION_KEEPALIVE=9999 _run >/dev/null 2>&1     # no transition + fresh stamp: held
+  { grep -q 'SILENT vision-held budget' "$_td/mesh/.state" && grep -q '^Stranger$' "$_td/queue"; } || { echo "FAIL: budget hold must skip vision on unchanged occupancy"; fail=1; }
+
+  [ "$fail" = 0 ] || { echo "smoke-test: FAIL (fixtures)"; exit 1; }
+
+  # Real-eye gate (verification principle): the LIVE eye must either be present (fresh cam-prev.jpg
+  # written by the cam-watch daemon) or this node honestly has no eye → n/a exit 2. Never fake green.
+  unset MESH_STRANGER_MESHD MESH_STRANGER_STATE MESH_STRANGER_CD MESH_STRANGER_FRAME
+  _age="$(( $(date +%s) - $(stat -c %Y "$_realhome/.mesh/cam-prev.jpg" 2>/dev/null || echo 0) ))"
+  if [ -s "$_realhome/.mesh/cam-prev.jpg" ] && [ "$_age" -le 60 ]; then
+    echo "smoke-test: ok (7 gate fixtures + live eye: cam-prev.jpg ${_age}s fresh)"
+    exit 0
+  else
+    echo "smoke-test: n/a — fixtures ok but no live cam frame on this node (eye dark, honest exit 2)"
+    exit 2
+  fi
+}
+
+run
