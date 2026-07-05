@@ -18,7 +18,35 @@ set -uo pipefail
 export PATH="$HOME/.local/bin:$PATH"
 LIST="${MESH_BEACON_WATCH_LIST:-$HOME/.mesh/beacon-watch.list}"
 LOG="$HOME/.mesh/beacon-watch.log"
+CHAT_LOG="${MESH_CHAT_LOG:-$HOME/.mesh/chat.log}"
 stamp(){ date -u +%FT%TZ; }
+
+# CORROBORATION primitive (chat-review/beacon-kill-needs-corroboration 2026-07-05): a stale beat
+# proves the beacon WRITER may be dead — NEVER that the node is. On 2026-07-05 11:00Z this watcher
+# ran `tmux kill-server` against a LIVE IdeaPad steward (it had authored ~30 board lines in the
+# prior hour, visible in this watcher's OWN gossiped chat.log), killing every mind pane mid-work +
+# violating tmux-append-only from inside the mesh. Before any destructive kill, corroborate deadness:
+# a peer that AUTHORED a board line AFTER its beat went stale is provably alive. Returns 0 (peer
+# proven LIVE) if any '<who>@<host>  ::' chat.log line carries an ISO ts newer than the beat epoch.
+# Pure + testable (takes host, beat_epoch, log path — no globals, no side effects).
+peer_authored_after(){ # $1 peer_host  $2 beat_epoch  $3 chat_log  -> 0 = peer authored after beat (LIVE)
+  local host="$1" beat="$2" log="$3" isots ep
+  [ -n "$host" ] && [ -f "$log" ] || return 1
+  [[ "$beat" =~ ^[0-9]+$ ]] || return 1
+  while IFS= read -r isots; do
+    [ -n "$isots" ] || continue
+    ep=$(date -d "$isots" +%s 2>/dev/null) || continue
+    [ "$ep" -gt "$beat" ] && return 0
+  done < <(grep -F "@${host}  ::" "$log" 2>/dev/null | tail -60 | awk '{print $1}')
+  return 1
+}
+
+# secondary corroboration: a live tmux server on the peer means killing it destroys REAL sessions.
+peer_tmux_alive(){ # $1 ssh_target -> 0 if peer answers with ≥1 tmux session
+  local s; s="$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$1" \
+    'tmux list-sessions 2>/dev/null | head -1' </dev/null 2>/dev/null)"
+  [ -n "$s" ]
+}
 
 [ "${1:-}" = --test ] && {
   command -v tailscale >/dev/null 2>&1 || { echo "smoke-test: FAIL (no tailscale)"; exit 1; }
@@ -70,7 +98,30 @@ EOF
     && { echo "smoke-test: FAIL (--alive stale-node should exit 1 — lease expired)"; exit 1; }
   MESH_BEACON_WATCH_LIST="$t/list" "$0" --alive missing-node >/dev/null 2>&1 \
     && { echo "smoke-test: FAIL (--alive missing-node should exit 1 — never announced)"; exit 1; }
-  echo "smoke-test: ok (status + lease-read cover fresh/stale/missing beacons)"; exit 0
+  # --- corroboration gate (chat-review/beacon-kill-needs-corroboration) ---
+  # A peer-authored board line NEWER than the beat MUST read as LIVE (guards against killing a live
+  # node); an OLDER line must NOT (else the kill is wrongly skipped for a genuinely dead node).
+  clog="$t/chat.log"; beat_ep=$((now - 3600))   # beat went stale an hour ago
+  {
+    printf '%s  guardian@peer-alpha  ::  [heartbeat] alive\n' "$(date -u -d "@$((now-120))" +%FT%TZ)"   # 58min AFTER beat
+    printf '%s  minds@other-node  ::  [idle] unrelated host\n' "$(date -u -d "@$((now-60))" +%FT%TZ)"
+  } > "$clog"
+  peer_authored_after "peer-alpha" "$beat_ep" "$clog" \
+    || { echo "smoke-test: FAIL (corroborate: peer authored AFTER beat must read LIVE — a live node would be killed)"; exit 1; }
+  # FALSIFIABILITY: same peer but its only line is OLDER than the beat → must NOT read live
+  printf '%s  guardian@peer-beta  ::  [heartbeat] old\n' "$(date -u -d "@$((now-7200))" +%FT%TZ)" > "$clog"   # 1h BEFORE beat
+  peer_authored_after "peer-beta" "$beat_ep" "$clog" \
+    && { echo "smoke-test: FAIL (corroborate: a line OLDER than the beat must NOT read LIVE — dead node would never be recovered)"; exit 1; }
+  # a DIFFERENT host authoring recently must not vouch for our peer
+  printf '%s  minds@somebody-else  ::  [done] recent\n' "$(date -u -d "@$((now-1))" +%FT%TZ)" > "$clog"
+  peer_authored_after "peer-gamma" "$beat_ep" "$clog" \
+    && { echo "smoke-test: FAIL (corroborate: another host's line must not vouch for this peer)"; exit 1; }
+  # missing log / non-numeric beat → safe negative (never a false LIVE that skips a needed kill)
+  peer_authored_after "peer-alpha" "$beat_ep" "$t/nope.log" \
+    && { echo "smoke-test: FAIL (corroborate: missing chat.log must read NOT-live)"; exit 1; }
+  peer_authored_after "peer-alpha" "notanumber" "$clog" \
+    && { echo "smoke-test: FAIL (corroborate: non-numeric beat epoch must read NOT-live)"; exit 1; }
+  echo "smoke-test: ok (status + lease-read cover fresh/stale/missing beacons; corroboration gate: newer=LIVE, older/other-host/missing=NOT-live, both falsifiable)"; exit 0
 }
 
 mkdir -p "$HOME/.mesh"
@@ -135,6 +186,11 @@ while IFS='|' read -r beat_file ssh_target max_age label; do
 
   # expand ~
   beat_file="${beat_file/#\~/$HOME}"
+
+  # peer host for the corroboration gate: canonical from the beat filename (heartbeat-<host>.beat),
+  # falling back to the friendly label. Used to find peer-authored chat.log lines newer than the beat.
+  peer_host="$(basename "$beat_file" 2>/dev/null | sed -n 's/^heartbeat-\(.*\)\.beat$/\1/p')"
+  [ -n "$peer_host" ] || peer_host="$label"
 
   if [ ! -f "$beat_file" ]; then
     [ "$STATUS" = 1 ] && echo "  MISSING  $label  ($beat_file)" && continue
@@ -221,10 +277,26 @@ while IFS='|' read -r beat_file ssh_target max_age label; do
           >> "$LOG" 2>&1 || echo "$(stamp) WARN ssh restore to $ssh_target failed" >> "$LOG"
         ;;
       2)
-        alert "🔄 mesh-beacon-watch: $label beacon stale (${age}s > ${max_age}s) — attempt 2: killing stale tmux then mesh-restore on $ssh_target"
-        ssh -o BatchMode=yes -o ConnectTimeout=15 "$ssh_target" \
-          'tmux kill-server 2>/dev/null; bash -lc "~/.local/bin/mesh-restore >> ~/.mesh/restore.log 2>&1 && echo restored"' \
-          >> "$LOG" 2>&1 || echo "$(stamp) WARN ssh restore to $ssh_target failed" >> "$LOG"
+        # CORROBORATE before the destructive kill-server (chat-review/beacon-kill-needs-corroboration
+        # 2026-07-05): a stale beat = dead WRITER, not a dead node. Only kill if the peer is NOT
+        # authoring after the beat AND its tmux server does not answer — else the kill nukes live
+        # mind panes (the 11:00Z live-IdeaPad incident) and breaks tmux-append-only from inside the mesh.
+        beat_epoch=$(date -r "$beat_file" +%s 2>/dev/null || echo 0)
+        if peer_authored_after "$peer_host" "$beat_epoch" "$CHAT_LOG"; then live_via="chat.log author newer than beat"
+        elif peer_tmux_alive "$ssh_target"; then live_via="tmux server answering"
+        else live_via=""; fi
+        if [ -n "$live_via" ]; then
+          echo "$(stamp) SKIP-KILL $label — peer LIVE ($live_via) — beacon WRITER dead, not node; gentle restore only" >> "$LOG"
+          alert "[fyi] beacon-writer-dead: $label beacon stale (${age}s) but the NODE is LIVE ($live_via) — NOT killing its tmux (would nuke live panes). Restart mesh-heartbeat on $ssh_target; gentle mesh-restore fired."
+          ssh -o BatchMode=yes -o ConnectTimeout=15 "$ssh_target" \
+            '~/.local/bin/mesh-restore >> ~/.mesh/restore.log 2>&1 && echo restored' \
+            >> "$LOG" 2>&1 || echo "$(stamp) WARN ssh gentle-restore to $ssh_target failed" >> "$LOG"
+        else
+          alert "🔄 mesh-beacon-watch: $label beacon stale (${age}s > ${max_age}s), peer NOT authoring + tmux silent — attempt 2: killing stale tmux then mesh-restore on $ssh_target"
+          ssh -o BatchMode=yes -o ConnectTimeout=15 "$ssh_target" \
+            'tmux kill-server 2>/dev/null; bash -lc "~/.local/bin/mesh-restore >> ~/.mesh/restore.log 2>&1 && echo restored"' \
+            >> "$LOG" 2>&1 || echo "$(stamp) WARN ssh restore to $ssh_target failed" >> "$LOG"
+        fi
         ;;
       3)
         alert "🛑 mesh-beacon-watch: $label still offline after 2 restore attempts — STOPPING further recovery, alerting operator (may need physical intervention)"
