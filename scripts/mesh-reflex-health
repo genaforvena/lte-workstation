@@ -144,6 +144,28 @@ eff_maxage(){ # <intent-token> <tool> → max_age seconds, or "skip" (conditiona
 # flips DOWN. A SINGLE transient fail (torn read, momentary SSH timeout, a daemon mid-restart — e.g. an
 # overhear restart) stays UP, killing the false-DOWN alarm. The consecutive-fail counter is persisted
 # per-target across runs in ~/.mesh/.debounce/<key>; the FIRST success resets it (flip back UP at once).
+# ── WAKE age (boot OR resume — suspend-grace 2026-07-06) ────────────────────────────────────────
+# /proc/uptime counts SUSPENDED time (CLOCK_BOOTTIME), so uptime alone treats a laptop that slept
+# 6h as "up 6h" — after resume EVERY per-run artifact is hours-stale until its next cron slot, and
+# boot-grace (keyed on uptime) never engages. Worse, a --check sampled in that window peeks the
+# debounce counter at n+1 (2026-07-05: the 21:00:01 scheduled run ticked fail #1, mesh-needs'
+# 21:00:11 peek saw 1+1=2=DOWN) → phantom "ambient-clock DEAD" REFLEX REPAIR for a reflex that was
+# fine and self-recovered at its next slot. Grace must key on the last WAKE, whichever is later:
+# min(uptime, now − last-resume). Last resume comes from the journal (systemd-sleep "returned from
+# sleep", this boot only); no journal access / never suspended → empty → plain uptime (server
+# behavior unchanged). MESH_RESUME_TS overrides the journal read (test-only: simulate just-resumed).
+wake_age_s(){ # <now-epoch> → seconds since the node last woke (boot or resume from suspend)
+  local now="$1" up rts sr
+  up="${MESH_BOOT_UPTIME_S:-$(awk '{print int($1)}' /proc/uptime 2>/dev/null || echo 999999999)}"
+  rts="${MESH_RESUME_TS-$(journalctl -b -t systemd-sleep -o short-unix --no-pager 2>/dev/null \
+        | grep -F 'returned from sleep' | tail -1 | awk '{print int($1)}')}"
+  if [ -n "${rts:-}" ] && [ "$rts" -gt 0 ] 2>/dev/null; then
+    sr=$(( now - rts ))
+    if [ "$sr" -ge 0 ] && [ "$sr" -lt "$up" ]; then echo "$sr"; return; fi
+  fi
+  echo "$up"
+}
+
 DEBOUNCE_DIR="${MESH_DEBOUNCE_DIR:-$M/.debounce}"
 DEBOUNCE_N="${MESH_DEBOUNCE_N:-2}"
 debounce(){ # <key> <ok|fail> [peek] → effective verdict UP|DOWN; mutates the counter UNLESS peek (read-only)
@@ -203,6 +225,23 @@ EOF
   [ "$(_db t2 fail peek)" = UP ] || { echo "smoke-test: FAIL (debounce peek: 1st fail UP)"; failures=1; }
   [ "$(_db t2 fail peek)" = UP ] || { echo "smoke-test: FAIL (debounce peek must NOT mutate — still UP, not DOWN)"; failures=1; }
   rm -rf "$_dbd"
+  # WAKE-GRACE asserts (suspend-grace 2026-07-06): wake age = min(uptime, now − last-resume).
+  _wnow=$(date +%s)
+  [ "$(MESH_BOOT_UPTIME_S=999999 MESH_RESUME_TS=$((_wnow-100)) wake_age_s "$_wnow")" = 100 ] \
+    || { echo "smoke-test: FAIL (wake_age_s: recent resume must beat huge uptime)"; failures=1; }
+  [ "$(MESH_BOOT_UPTIME_S=555 MESH_RESUME_TS=0 wake_age_s "$_wnow")" = 555 ] \
+    || { echo "smoke-test: FAIL (wake_age_s: no resume (0) must fall back to uptime)"; failures=1; }
+  [ "$(MESH_BOOT_UPTIME_S=555 MESH_RESUME_TS=$((_wnow+50)) wake_age_s "$_wnow")" = 555 ] \
+    || { echo "smoke-test: FAIL (wake_age_s: future resume ts (clock skew) must fall back to uptime)"; failures=1; }
+  [ "$(MESH_BOOT_UPTIME_S=50 MESH_RESUME_TS=$((_wnow-100)) wake_age_s "$_wnow")" = 50 ] \
+    || { echo "smoke-test: FAIL (wake_age_s: fresher boot must beat older resume)"; failures=1; }
+  # graced-format guard: the graced label must NEVER read "(stale" — mesh-needs scrapes
+  # `[a-z-]+\(stale` from --check output, and the old `${name}($detail)` graced format matched it
+  # (a suppressed entry still injected a phantom REFLEX REPAIR). Reverting the format trips this.
+  grep -qF 'graced="$graced ${name}(grace: $detail)"' "$0" \
+    || { echo "smoke-test: FAIL (graced entries must be formatted '(grace: ...' — bare '(stale' leaks to the needs scrape)"; failures=1; }
+  printf '%s' 'foo(grace: stale 9s>3s)' | grep -qE '[a-z-]+\(stale' \
+    && { echo "smoke-test: FAIL (graced format still matches the needs stale-scrape regex)"; failures=1; }
   [ "$(printf '%s' "$REFLEXES" | awk -F'|' '{print $1}' | sort | uniq -d | grep -cvE '^[[:space:]]*$')" = 0 ] \
     || { echo "smoke-test: FAIL (duplicate reflex names)"; failures=1; }
   # synthetic fixture: stat/date + staleness classification
@@ -297,13 +336,13 @@ fi
 # (cron OR parent-driven) has the artifact → its staleness is now genuinely watched.
 cron="$(crontab -l 2>/dev/null)"
 now=$(date +%s); stale=""; checked=0; graced=""
-# BOOT-GRACE (reboot-grace 2026-06-25): a freshly-rebooted node has not had time to repopulate its
-# per-run artifacts — a missing/stale artifact within a reflex's (cron stride×2)s of boot is EXPECTED
-# repopulation, NOT a dead reflex. Within that window we route the finding to the trace and NEVER fire
-# [reflex-stale]. Uptime is read from /proc/uptime (seconds); the grace window is DERIVED per-reflex
-# from the LIVE cron stride (cron_stride_s, the same single source of truth as max_age) — no literal.
-# MESH_BOOT_UPTIME_S overrides uptime (test-only: simulate a just-booted node without rebooting).
-UPTIME_S="${MESH_BOOT_UPTIME_S:-$(awk '{print int($1)}' /proc/uptime 2>/dev/null || echo 999999999)}"
+# WAKE-GRACE (reboot-grace 2026-06-25, extended to resume-from-suspend 2026-07-06): a freshly-woken
+# node has not had time to repopulate its per-run artifacts — a missing/stale artifact within a
+# reflex's (cron stride×2)s of the last WAKE (boot OR resume; see wake_age_s) is EXPECTED
+# repopulation, NOT a dead reflex. Within that window we route the finding to the trace and NEVER
+# fire [reflex-stale]. The grace window is DERIVED per-reflex from the LIVE cron stride
+# (cron_stride_s, the same single source of truth as max_age) — no literal.
+WAKE_AGE_S="$(wake_age_s "$now")"
 # --check is a read-only probe → PEEK the debounce counter (don't mutate); only the scheduled (no-arg)
 # run advances/resets it, so a manual --check can't accelerate a target toward DOWN.
 _dbmode=""; [ "${1:-}" = --check ] && _dbmode=peek
@@ -320,13 +359,17 @@ while IFS='|' read -r name art maxage tool; do
     mt=$(stat -c %Y "$art" 2>/dev/null || echo 0); age=$(( now - mt ))
     if [ "$age" -gt "$eff" ]; then raw=fail; detail="stale ${age}s>${eff}s"; else raw=ok; detail=""; fi
   fi
-  # BOOT-GRACE: within (this reflex's cron stride×2)s of boot, a missing/stale artifact is post-reboot
-  # repopulation, not death → collect for a single trace line and skip (never reaches the stale list /
-  # debounce / alert). Grace window derived from the live cron; eff (already = stride×2 for @auto) is the
-  # fallback when the stride is un-derivable (parent-driven reflex with no own cron line).
+  # WAKE-GRACE: within (this reflex's cron stride×2)s of the last wake (boot OR resume), a missing/
+  # stale artifact is post-wake repopulation, not death → collect for a single trace line and skip
+  # (never reaches the stale list / debounce / alert). Grace window derived from the live cron; eff
+  # (already = stride×2 for @auto) is the fallback when the stride is un-derivable (parent-driven
+  # reflex with no own cron line). The graced label says "grace:" — NEVER bare "(stale" — so a
+  # consumer scraping the stale vocabulary (mesh-needs `[a-z-]+\(stale`) can't misread a graced
+  # entry as a dead reflex (that scrape DID match the old graced format — grace never actually
+  # protected the needs path).
   if [ "$raw" = fail ]; then
     _gstride="$(cron_stride_s "$tool")"; [ "${_gstride:-0}" -gt 0 ] && _grace=$((_gstride*2)) || _grace="$eff"
-    if [ "$UPTIME_S" -lt "$_grace" ]; then graced="$graced ${name}($detail)"; continue; fi
+    if [ "$WAKE_AGE_S" -lt "$_grace" ]; then graced="$graced ${name}(grace: $detail)"; continue; fi
   fi
   # DEBOUNCE: declare stale only after N>=2 CONSECUTIVE fails; a single transient (torn read / mid-restart) stays quiet
   if [ "$raw" = fail ]; then
@@ -342,12 +385,12 @@ stale="${stale# }"; graced="${graced# }"
 if [ "${1:-}" = --check ]; then
   if [ -n "$stale" ]; then echo "reflex-health: STALE →$stale"; exit 1
   elif [ "$checked" -eq 0 ]; then echo "reflex-health: n/a (no per-run reflexes scheduled on this node)"; exit 0
-  else echo "reflex-health: ok ($checked per-run reflex(es) fresh${graced:+ · boot-grace suppressed: $graced})"; exit 0; fi
+  else echo "reflex-health: ok ($checked per-run reflex(es) fresh${graced:+ · wake-grace suppressed: $graced})"; exit 0; fi
 fi
 
-# boot-grace findings go to the TRACE, never the board alert (scheduled runs only — keep --check read-only)
+# wake-grace findings go to the TRACE, never the board alert (scheduled runs only — keep --check read-only)
 [ -n "$graced" ] && command -v mesh-trace >/dev/null 2>&1 && \
-  mesh-trace "[reflex-grace] post-reboot suppression (uptime ${UPTIME_S}s < stride×2): $graced — repopulating, not dead" >/dev/null 2>&1 || true
+  mesh-trace "[reflex-grace] post-wake suppression (woke ${WAKE_AGE_S}s ago < stride×2): $graced — repopulating, not dead" >/dev/null 2>&1 || true
 
 # edge-trigger against last state
 prev="$(cat "$STATE" 2>/dev/null || echo OK)"
