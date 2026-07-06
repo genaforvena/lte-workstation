@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+# mesh-heavy-run — the ONE admission-controlled entry point for a MEMORY-HEAVY job.
+#
+#   mesh-heavy-run <budget-mb> -- <cmd> [args...]     # run <cmd> niced + serialized + admission-gated
+#   mesh-heavy-run --test
+#
+# WHY (chat-review/heavy-job-admission, 2026-07-05): mesh-whisper-run solved ONE heavy binary
+# (whisper.cpp) but the CLASS stayed unguarded — mesh-room-music's grainneukeln venv python runs
+# UNNICED with no admission check, and a 02:04Z run OOM-killed a 2.5GB-RSS python while the 20:05Z
+# batch-kill took ~8 procs. The fix belongs at the heavy-CALL-SITE class, not per-tool: this shim
+#   (a) renices to 19 + ionice idle (same as whisper-run),
+#   (b) holds a SHARED flock so heavy jobs serialize instead of stacking RAM, and
+#   (c) PRE-FLIGHT gates admission: the declared budget must fit in MemAvailable+SwapFree AND the node
+#       must not already be under resource-guard NODE-PRESSURE. If it can't be admitted it DEFERS
+#       (polls) then REFUSES with EX_TEMPFAIL (75) — the caller decides to skip or retry — rather than
+#       launching into a swap-exhaustion OOM.
+# The NODE-PRESSURE verdict is REUSED from mesh-resource-guard (its --status prints "NODE-PRESSURE:"
+# when hot) — the classifier/thresholds are NOT forked here, only consulted.
+#
+# reflex-cadence: none  # a call-site shim, invoked by heavy jobs — never scheduled
+# orphan-ok: wrapper invoked by heavy consumers (room-music/grainneukeln/whisper), not a cron reflex.
+set -uo pipefail
+MESH="${MESH_DIR:-$HOME/.mesh}"
+LOCK="${MESH_HEAVY_LOCK:-$MESH/.heavy.lock}"
+NICE="${MESH_HEAVY_NICE:-19}"
+LOCK_WAIT="${MESH_HEAVY_LOCK_WAIT:-300}"     # sec to wait for the serialization slot, then degrade (still niced)
+ADMIT_WAIT="${MESH_HEAVY_ADMIT_WAIT:-120}"   # sec to poll for admission (mem/pressure) before refusing
+ADMIT_STEP="${MESH_HEAVY_ADMIT_STEP:-5}"     # poll interval while deferring
+FORCE="${MESH_HEAVY_FORCE:-0}"               # 1 = bypass the admission gate (still niced + serialized)
+MEMINFO="${MESH_HEAVY_MEMINFO:-/proc/meminfo}"
+# read-only node-pressure probe; overridable so --test can inject a hot/clear verdict without real load
+NODEPRESSURE_CMD="${MESH_HEAVY_NODEPRESSURE_CMD:-mesh-resource-guard --status}"
+
+EX_USAGE=64; EX_TEMPFAIL=75
+
+# MemAvailable + SwapFree in MB from MEMINFO (the total headroom a heavy job can draw on).
+read_headroom_mb() {
+  awk '/^MemAvailable:/{a=$2} /^SwapFree:/{s=$2} END{printf "%d", int((a+s)/1024)}' "$MEMINFO" 2>/dev/null
+}
+# true (0) when the node is NOT under resource-guard NODE-PRESSURE. A probe that errors/empties is
+# treated as CLEAR (fail-open on the pressure axis) — the budget gate below is the hard floor, and a
+# missing resource-guard must not wedge every heavy job forever.
+node_clear() {
+  local out
+  out="$($NODEPRESSURE_CMD 2>/dev/null)" || out=""
+  printf '%s\n' "$out" | grep -qE '^NODE-PRESSURE:' && return 1
+  return 0
+}
+# admitted when the declared budget fits headroom AND the node is not already pressured
+admit_ok() { # $1 = budget MB
+  local head; head="$(read_headroom_mb)"; head="${head:-0}"
+  [ "$head" -ge "$1" ] 2>/dev/null || return 1
+  node_clear || return 1
+  return 0
+}
+
+nice_prefix() {
+  PRE=()
+  command -v nice   >/dev/null 2>&1 && PRE+=(nice -n "$NICE")
+  command -v ionice >/dev/null 2>&1 && PRE+=(ionice -c3)
+}
+
+if [ "${1:-}" = --test ]; then
+  command -v flock >/dev/null 2>&1 || { echo "smoke-test: FAIL (flock missing — serialization impossible)"; exit 1; }
+  command -v nice  >/dev/null 2>&1 || { echo "smoke-test: FAIL (nice missing — cannot renice)"; exit 1; }
+  _td="$(mktemp -d)" || { echo "smoke-test: FAIL (mktemp)"; exit 1; }
+  trap 'rm -rf "$_td"' EXIT
+  _lk="$_td/lock"
+  _ample="$_td/mem-ample"; _tight="$_td/mem-tight"
+  printf 'MemTotal: 8388608 kB\nMemAvailable: 6000000 kB\nSwapTotal: 4194304 kB\nSwapFree: 4000000 kB\n' > "$_ample"  # ~9.7GB headroom
+  printf 'MemTotal: 8388608 kB\nMemAvailable: 200000 kB\nSwapTotal: 4194304 kB\nSwapFree: 100000 kB\n'  > "$_tight"   # ~293MB headroom
+  _clear='printf node:\040avail\040OK\n'      # node_clear → CLEAR
+  _hot='printf NODE-PRESSURE:\040swap\040low\n' # node_clear → HOT
+  _base="MESH_HEAVY_LOCK=$_lk MESH_HEAVY_ADMIT_WAIT=1 MESH_HEAVY_ADMIT_STEP=1"
+
+  # 1) ARG VALIDATION: a missing '--' separator or a non-integer budget is EX_USAGE (64), never a silent run.
+  env $_base MESH_HEAVY_FORCE=1 "$0" 2000 echo hi >/dev/null 2>&1; [ "$?" = "$EX_USAGE" ] \
+    || { echo "smoke-test: FAIL (missing -- separator must be EX_USAGE 64)"; exit 1; }
+  env $_base MESH_HEAVY_FORCE=1 "$0" notanumber -- echo hi >/dev/null 2>&1; [ "$?" = "$EX_USAGE" ] \
+    || { echo "smoke-test: FAIL (non-integer budget must be EX_USAGE 64)"; exit 1; }
+
+  # 2) PASSTHROUGH: forwards args + returns the command's own exit code (gate forced open, mem ample).
+  _out="$(env $_base MESH_HEAVY_FORCE=1 MESH_HEAVY_MEMINFO="$_ample" "$0" 500 -- printf 'tok-%s' 42 2>/dev/null)"
+  [ "$_out" = "tok-42" ] || { echo "smoke-test: FAIL (arg passthrough — expected 'tok-42', got '$_out')"; exit 1; }
+  env $_base MESH_HEAVY_FORCE=1 MESH_HEAVY_MEMINFO="$_ample" "$0" 500 -- sh -c 'exit 7' >/dev/null 2>&1
+  [ "$?" = 7 ] || { echo "smoke-test: FAIL (command exit code not propagated — expected 7)"; exit 1; }
+
+  # 2b) STDERR PASSTHROUGH: the command's stderr must not be swallowed by the lock/gate plumbing.
+  _err="$(env $_base MESH_HEAVY_FORCE=1 MESH_HEAVY_MEMINFO="$_ample" "$0" 500 -- sh -c 'printf on-stderr >&2' 2>&1 >/dev/null)"
+  [ "$_err" = on-stderr ] || { echo "smoke-test: FAIL (command STDERR swallowed — expected 'on-stderr', got '$_err')"; exit 1; }
+
+  # 3) BUDGET GATE — REFUSE: budget 2000MB > 293MB tight headroom, node clear → EX_TEMPFAIL (75), no run.
+  _marker="$_td/ran"; rm -f "$_marker"
+  env $_base MESH_HEAVY_MEMINFO="$_tight" MESH_HEAVY_NODEPRESSURE_CMD="$_clear" "$0" 2000 -- touch "$_marker" >/dev/null 2>&1
+  { [ "$?" = "$EX_TEMPFAIL" ] && [ ! -e "$_marker" ]; } \
+    || { echo "smoke-test: FAIL (over-budget must refuse EX_TEMPFAIL 75 and NOT run the command)"; exit 1; }
+
+  # 3b) BUDGET GATE — ADMIT: budget 2000MB <= 9.7GB ample headroom, node clear → runs.
+  rm -f "$_marker"
+  env $_base MESH_HEAVY_MEMINFO="$_ample" MESH_HEAVY_NODEPRESSURE_CMD="$_clear" "$0" 2000 -- touch "$_marker" >/dev/null 2>&1
+  { [ "$?" = 0 ] && [ -e "$_marker" ]; } \
+    || { echo "smoke-test: FAIL (within-budget + clear node must admit and run)"; exit 1; }
+
+  # 4) NODE-PRESSURE GATE (reused resource-guard verdict): ample mem BUT node hot → refuse, don't run.
+  rm -f "$_marker"
+  env $_base MESH_HEAVY_MEMINFO="$_ample" MESH_HEAVY_NODEPRESSURE_CMD="$_hot" "$0" 500 -- touch "$_marker" >/dev/null 2>&1
+  { [ "$?" = "$EX_TEMPFAIL" ] && [ ! -e "$_marker" ]; } \
+    || { echo "smoke-test: FAIL (NODE-PRESSURE hot must refuse even with ample budget headroom)"; exit 1; }
+
+  # 4b) FORCE bypasses BOTH gates: tight mem + hot node, but FORCE=1 → runs anyway (still niced).
+  rm -f "$_marker"
+  env $_base MESH_HEAVY_FORCE=1 MESH_HEAVY_MEMINFO="$_tight" MESH_HEAVY_NODEPRESSURE_CMD="$_hot" "$0" 9999 -- touch "$_marker" >/dev/null 2>&1
+  { [ "$?" = 0 ] && [ -e "$_marker" ]; } \
+    || { echo "smoke-test: FAIL (MESH_HEAVY_FORCE=1 must bypass the admission gate)"; exit 1; }
+
+  # 5) SERIALIZATION: two concurrent 1s runs must NOT overlap → elapsed >= ~1.8s (falsify: drop the flock
+  #    → ~1s). Gate forced open + ample mem so only the flock governs timing.
+  _sleep="$(command -v sleep)"; _start="$(date +%s.%N)"
+  ( env $_base MESH_HEAVY_FORCE=1 MESH_HEAVY_LOCK_WAIT=15 "$0" 1 -- "$_sleep" 1 >/dev/null 2>&1 ) &
+  ( env $_base MESH_HEAVY_FORCE=1 MESH_HEAVY_LOCK_WAIT=15 "$0" 1 -- "$_sleep" 1 >/dev/null 2>&1 ) &
+  wait
+  _el="$(awk -v a="$_start" -v b="$(date +%s.%N)" 'BEGIN{printf "%.2f", b-a}')"
+  awk -v e="$_el" 'BEGIN{exit !(e >= 1.8)}' \
+    || { echo "smoke-test: FAIL (serialization broken — two 1s runs took ${_el}s, expected >=1.8s: flock not holding)"; exit 1; }
+
+  echo "smoke-test: ok (arg-validate + passthrough/exit + stderr + budget-gate both ways + node-pressure-gate + FORCE-bypass + 2×1s-serialize=${_el}s)"
+  exit 0
+fi
+
+# ---- parse: <budget-mb> -- <cmd...> ----
+budget="${1:-}"; sep="${2:-}"
+case "$budget" in ''|*[!0-9]*) echo "usage: mesh-heavy-run <budget-mb> -- <cmd> [args...]" >&2; exit "$EX_USAGE";; esac
+[ "$sep" = "--" ] || { echo "usage: mesh-heavy-run <budget-mb> -- <cmd> [args...]" >&2; exit "$EX_USAGE"; }
+shift 2
+[ "$#" -ge 1 ] || { echo "usage: mesh-heavy-run <budget-mb> -- <cmd> [args...]" >&2; exit "$EX_USAGE"; }
+
+# ---- admission: defer-poll then refuse (unless forced) ----
+if [ "$FORCE" != 1 ]; then
+  waited=0
+  until admit_ok "$budget"; do
+    if [ "$waited" -ge "$ADMIT_WAIT" ]; then
+      echo "mesh-heavy-run: REFUSED — node cannot admit ${budget}MB (headroom $(read_headroom_mb)MB / pressure) after ${ADMIT_WAIT}s; caller should skip or retry" >&2
+      exit "$EX_TEMPFAIL"
+    fi
+    sleep "$ADMIT_STEP"; waited=$((waited + ADMIT_STEP))
+  done
+fi
+
+# ---- serialize + renice, then exec ----
+nice_prefix
+# Shared advisory lock on fd 9 (no O_CLOEXEC → survives exec into the command, released on its exit).
+# Degrade to unserialized-but-niced if the lock can't open or isn't acquired within LOCK_WAIT. The
+# fd-9 open's 2>/dev/null is SCOPED to the group so it never leaks onto the final exec (which would
+# swallow the command's own stderr).
+if command -v flock >/dev/null 2>&1 && { exec 9>"$LOCK"; } 2>/dev/null; then
+  flock -w "$LOCK_WAIT" 9 2>/dev/null || true
+fi
+exec ${PRE[@]+"${PRE[@]}"} "$@"
