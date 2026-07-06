@@ -1,0 +1,249 @@
+#!/usr/bin/env bash
+# mesh-mind-snapshot — SOFT-STATE RECOVERY for mind workers (OTP gen_server-style state recovery).
+#
+# WHY (study 'fault-tolerance-otp' brief 2026-07-06): the mesh is already an OTP-style SUPERVISED
+# system — mesh-supervise/mesh-channel-keepalive/mesh-mind-keepalive restart a dead mind with a
+# restart-intensity breaker (documented 2026-06-21). But OTP fault-tolerance is TWO halves: the
+# supervisor restarts the worker, AND a gen_server recovers its STATE on restart (init from persisted
+# soft state, not from zero). We had only the first half: mesh-channel-keepalive:204 relaunches a dead
+# mind with a COLD `claude` launch — the reborn worker has no memory of the task it was mid-flight on
+# when it was OOM-killed (the exact failure mode oom-pane-attribution names). The pane scrollback
+# survives (tmux append-only) but a fresh engine process never reads it → the worker's soft state is
+# effectively lost. This adds the missing half: periodically SNAPSHOT a small subset of each mind's
+# soft state (its active board claim + a bounded pane tail), and on a supervisor-detected relaunch,
+# REPLAY that snapshot into the reborn worker so it resumes instead of cold-restarting.
+#
+# DECOUPLED from the supervisor by design (single-writer substrate — never edit a live supervisor for a
+# study experiment): the failure SIGNAL is the `site=keepalive` line channel-keepalive already writes to
+# ~/.mesh/.mind-spawn-audit.log on every relaunch. This tool consumes that signal; the supervisor is
+# untouched. Same shape as OTP: the supervisor and the state-recovery are separate concerns.
+#
+# SAFE BY DEFAULT — replay is DRY unless MESH_MIND_RECOVER_SEND=1 (node-local opt-in, mirrors the
+# opencode --auto / bypassPermissions "default OFF" precedent, [[auto-mode-is-not-no-gate]]): typing a
+# recovery prompt into a live mind is an actuator, so shipping it without operator opt-in prints the
+# prime instead of sending. The full mechanism is testable and demonstrable with zero live-mind risk.
+#
+#   mesh-mind-snapshot              one pass: RECOVER pending relaunches, THEN CAPTURE fresh snapshots
+#   mesh-mind-snapshot --capture    snapshot each live mind's soft-state subset (skips pending-recovery wins)
+#   mesh-mind-snapshot --recover    replay pre-crash snapshots into freshly-relaunched minds (DRY default)
+#   mesh-mind-snapshot --show <win> print a window's current snapshot
+#   mesh-mind-snapshot --test       fixtures: capture-bounds/recover/idempotent/re-fire/no-state/skip-pending
+#
+# Ordering (one-pass): RECOVER before CAPTURE — capture must not clobber the pre-crash snapshot before
+# recovery has replayed it. recover stamps <win>.recovered; capture then sees recovered≥relaunch and
+# writes fresh state. A pending (unrecovered) relaunch makes capture SKIP that window (preserve the snap).
+#
+# reflex-cadence: */10 * * * *
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+
+STATE_DIR="${MESH_STATE_DIR:-$HOME/.mesh}"
+SNAP_DIR="$STATE_DIR/mind-snapshots"
+AUDIT="${MESH_MIND_SNAP_AUDIT:-$STATE_DIR/.mind-spawn-audit.log}"
+CHAT_LOG="${MESH_MIND_SNAP_CHAT:-$STATE_DIR/chat.log}"
+SESSION="${MESH_MIND_SNAP_SESSION:-$(hostname)}"
+TAIL_N="${MESH_MIND_SNAP_TAIL:-14}"        # bounded soft-state: last N non-empty pane lines (a SUBSET, not the scrollback)
+SEND="${MESH_MIND_RECOVER_SEND:-0}"        # 0 = DRY (print prime) · 1 = actually mesh-tell the reborn mind
+CHAT="${MESH_MIND_SNAP_CHAT_POST:-1}"      # board a [mind-recovered] line on a real (sent) replay
+# mind windows to track: explicit override (test) → restore.env MESH_MIND_CHANNELS → built-in default.
+if [ -n "${MESH_MIND_SNAP_WINS:-}" ]; then MIND_WINS="$MESH_MIND_SNAP_WINS"
+elif [ -n "${MESH_MIND_CHANNELS:-}" ];  then MIND_WINS="$MESH_MIND_CHANNELS"
+else
+  MIND_WINS="minds genome tg senses health chat sound"
+  [ -f "$HOME/.mesh/restore.env" ] && MIND_WINS="$(. "$HOME/.mesh/restore.env" 2>/dev/null; echo "${MESH_MIND_CHANNELS:-$MIND_WINS}")"
+fi
+mkdir -p "$SNAP_DIR" 2>/dev/null || true
+
+epoch_of(){ date -d "$1" +%s 2>/dev/null || echo 0; }   # ISO-8601 → epoch (0 on unparseable)
+
+last_relaunch_ts(){ # $1=win → epoch of the most recent keepalive RELAUNCH of that window (0 = none seen)
+  local line iso
+  line="$(grep -E "win=$1( |\b).*site=keepalive" "$AUDIT" 2>/dev/null | tail -1)"
+  [ -n "$line" ] || { echo 0; return; }
+  iso="$(printf '%s' "$line" | awk '{print $1}')"
+  epoch_of "$iso"
+}
+
+claim_for(){ # $1=win → the task text of this window's latest board [taking]/[task] claim (soft state: what it owns)
+  # board author field is '<win>@<host>'; the claim body is '[taking] <who>: <task>' or '[task] <slug>: …'.
+  awk -v w="$1" '
+    $0 ~ ("[[:space:]]" w "@") && /\[(taking|task)\]/ { last=$0 }
+    END{ if (last!="") { sub(/^.*::[[:space:]]+/, "", last); print last } }
+  ' "$CHAT_LOG" 2>/dev/null
+}
+
+pane_tail(){ # $1=win → last TAIL_N non-empty lines of the mind pane (bounded subset of working context)
+  local raw
+  if [ -n "${MESH_MIND_SNAP_PANE_SRC:-}" ]; then
+    raw="$(cat "$MESH_MIND_SNAP_PANE_SRC" 2>/dev/null)"          # test / offline: file stands in for the pane
+  elif command -v tmux >/dev/null 2>&1; then
+    raw="$(tmux capture-pane -p -t "$SESSION:$1" 2>/dev/null)"   # active pane of the window
+  else
+    raw=""
+  fi
+  printf '%s\n' "$raw" | grep -vE '^[[:space:]]*$' | tail -n "$TAIL_N"
+}
+
+write_snap(){ # $1=win → atomically write the soft-state snapshot (header + claim + bounded tail)
+  local win="$1" f="$SNAP_DIR/$1.snap" tmp claim tail
+  claim="$(claim_for "$win")"
+  tail="$(pane_tail "$win")"
+  tmp="$f.$$"
+  {
+    printf 'snapshot win=%s ts=%s\n' "$win" "$(date +%s)"
+    printf 'claim=%s\n' "${claim:-<none>}"
+    printf -- '--- tail ---\n'
+    printf '%s\n' "$tail"
+  } > "$tmp" 2>/dev/null && mv "$tmp" "$f" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
+}
+
+snap_ts(){ awk -F'ts=' 'NR==1{print $2+0; exit}' "$1" 2>/dev/null || echo 0; }
+snap_claim(){ awk -F'claim=' '/^claim=/{print substr($0,7); exit}' "$1" 2>/dev/null; }
+
+build_prime(){ # $1=win $2=snapfile → the recovery prompt replayed into the reborn worker
+  local win="$1" f="$2" claim digest
+  claim="$(snap_claim "$f")"
+  digest="$(awk '/^--- tail ---$/{p=1;next} p' "$f" 2>/dev/null | tail -6 | tr '\n' '§' | sed 's/§/ | /g')"
+  printf '[soft-state recovery] you (%s) were relaunched after a failure (OOM/crash/shed). Pre-crash soft state — you had claimed: %s. Recent working context: %s. Re-verify against the live board (the claim may already be [done] or re-dispatched, [[verify-state-before-executing-handoffs]]); resume it if still open, else post [idle].' \
+    "$win" "${claim:-<no active claim>}" "${digest:-<none captured>}"
+}
+
+do_recover(){ # replay pre-crash snapshots into windows the supervisor just relaunched (idempotent, DRY default)
+  local win f rts rects sts prime fired=0
+  for win in $MIND_WINS; do
+    f="$SNAP_DIR/$win.snap"; [ -f "$f" ] || continue
+    rts="$(last_relaunch_ts "$win")"
+    rects="$(cat "$SNAP_DIR/$win.recovered" 2>/dev/null || echo 0)"
+    sts="$(snap_ts "$f")"
+    # replay iff a relaunch happened AFTER this snapshot (genuine pre-crash state) AND after our last
+    # recovery for it (replay-once per failure — never a replay storm).
+    [ "$rts" -gt "$rects" ] 2>/dev/null && [ "$rts" -gt "$sts" ] 2>/dev/null || continue
+    prime="$(build_prime "$win" "$f")"
+    if [ "$SEND" = 1 ] && command -v mesh-tell >/dev/null 2>&1; then
+      mesh-tell "$win" "$prime" >/dev/null 2>&1 || true
+      [ "$CHAT" = 1 ] && command -v mesh-chat >/dev/null 2>&1 \
+        && MESH_WHO="mind-snapshot@$SESSION" mesh-chat "[mind-recovered] $win: replayed pre-crash soft state after keepalive relaunch (claim: $(snap_claim "$f"))" >/dev/null 2>&1 || true
+      echo "[recovered] $win: replayed soft state (SENT) — $prime"
+    else
+      echo "[dry] $win: would recover (set MESH_MIND_RECOVER_SEND=1 to send) — $prime"
+    fi
+    echo "$rts" > "$SNAP_DIR/$win.recovered"   # stamp AFTER emit → idempotent per relaunch
+    fired=$((fired+1))
+  done
+  return 0
+}
+
+do_capture(){ # snapshot each live mind's soft-state subset; SKIP a window with a pending (unrecovered) relaunch
+  local win rts rects recf
+  for win in $MIND_WINS; do
+    rts="$(last_relaunch_ts "$win")"
+    recf="$SNAP_DIR/$win.recovered"
+    # FIRST SIGHTING (no snap, no recovered marker) = baseline, never replay backlog: the relaunches
+    # already in the audit log are HISTORY, not fresh crashes to recover ([[reviving-offset-reflex-replays-backlog]],
+    # same discipline as mesh-hw-fault-watch's first-run baseline). Stamp .recovered to the current
+    # relaunch so only relaunches AFTER now count as crashes; write the first snapshot.
+    if [ ! -f "$recf" ] && [ ! -f "$SNAP_DIR/$win.snap" ]; then
+      echo "$rts" > "$recf"
+      write_snap "$win" && echo "[baseline] $win: first snapshot, relaunch history baselined at $rts"
+      continue
+    fi
+    rects="$(cat "$recf" 2>/dev/null || echo 0)"
+    # a relaunch newer than our last recovery = pending recovery → do NOT clobber the pre-crash snap
+    if [ "$rts" -gt "$rects" ] 2>/dev/null; then
+      echo "[skip] $win: pending recovery (relaunch $rts > recovered $rects) — preserving pre-crash snapshot"
+      continue
+    fi
+    if write_snap "$win"; then echo "[capture] $win: $SNAP_DIR/$win.snap"; fi
+  done
+  return 0
+}
+
+case "${1:-}" in
+  --show)
+    f="$SNAP_DIR/${2:-}.snap"
+    [ -f "$f" ] && cat "$f" || { echo "mind-snapshot: no snapshot for '${2:-}'"; exit 1; }
+    exit 0 ;;
+  --capture) do_capture; exit 0 ;;
+  --recover) do_recover; exit 0 ;;
+  --test) : ;;   # fall through
+  ""|--run|pass) do_recover; do_capture; exit 0 ;;
+  *) echo "usage: mesh-mind-snapshot [--capture|--recover|--show <win>|--test]"; exit 64 ;;
+esac
+
+# ───────────────────────────── --test (hermetic; no tmux, no live minds, DRY replay) ─────────────────────────────
+_td="$(mktemp -d)"
+_penv() { printf 'MESH_STATE_DIR=%s MESH_MIND_SNAP_WINS=tg MESH_MIND_SNAP_PANE_SRC=%s/pane.txt MESH_MIND_SNAP_CHAT=%s/chat.log MESH_MIND_SNAP_AUDIT=%s/audit.log' "$_td" "$_td" "$_td" "$_td"; }
+E="$(_penv)"
+mkdir -p "$_td"
+# fixtures: a board claim by the tg window + a pane tail (its working context) + a HISTORICAL relaunch
+# already in the audit log (must be baselined on first sight, NOT replayed as a fresh crash).
+printf '%s\n' '2026-07-06T04:00:00Z  tg@host  ::  [taking] tg: oom-pane-attribution wire the recovery prime' > "$_td/chat.log"
+printf '%s\n' 'thinking about the fix' 'ran the --test, green' 'about to post [done]' '' '  ' > "$_td/pane.txt"
+printf '%s\n' '2026-07-06T03:00:00Z win=tg who=tg@host engine=claude site=keepalive' > "$_td/audit.log"
+
+# 1) FIRST CAPTURE = BASELINE: writes a BOUNDED soft-state subset (claim + tail, not the whole scrollback)
+#    AND baselines the historical relaunch (stamps .recovered) so it is never replayed as a fresh crash.
+out="$(env $E "$0" --capture 2>&1)"; rc=$?
+{ [ "$rc" = 0 ] && printf '%s' "$out" | grep -qF '[baseline] tg:' && [ -f "$_td/mind-snapshots/tg.snap" ] \
+    && [ -f "$_td/mind-snapshots/tg.recovered" ] \
+    && grep -q 'claim=\[taking\] tg: oom-pane-attribution' "$_td/mind-snapshots/tg.snap" \
+    && grep -q 'about to post \[done\]' "$_td/mind-snapshots/tg.snap" \
+    && [ "$(grep -c . "$_td/mind-snapshots/tg.snap")" -le "$(( TAIL_N + 4 ))" ]; } \
+  || { rm -rf "$_td"; echo "smoke-test: FAIL (first capture must baseline + write a bounded claim+tail snapshot: rc=$rc out='$out')"; exit 1; }
+
+# 2) historical relaunch already in the log → RECOVER is silent (baselined, not replayed as a fresh crash)
+out="$(env $E "$0" --recover 2>&1)"; rc=$?
+{ [ "$rc" = 0 ] && ! printf '%s' "$out" | grep -qE '\[(dry|recovered)\]'; } \
+  || { rm -rf "$_td"; echo "smoke-test: FAIL (a baselined historical relaunch must not replay: rc=$rc out='$out')"; exit 1; }
+
+# 3) a keepalive RELAUNCH newer than the snapshot → RECOVER replays the pre-crash claim (DRY), stamps .recovered
+printf '%s win=tg who=tg@host engine=claude site=keepalive\n' "$(date -u -d '+1 min' +%FT%TZ 2>/dev/null || date -u +%FT%TZ)" >> "$_td/audit.log"
+out="$(env $E "$0" --recover 2>&1)"; rc=$?
+{ [ "$rc" = 0 ] && printf '%s' "$out" | grep -qF '[dry] tg:' \
+    && printf '%s' "$out" | grep -qF 'oom-pane-attribution' \
+    && printf '%s' "$out" | grep -qF 'soft-state recovery' \
+    && [ -f "$_td/mind-snapshots/tg.recovered" ]; } \
+  || { rm -rf "$_td"; echo "smoke-test: FAIL (relaunch-after-snap must replay pre-crash claim: rc=$rc out='$out')"; exit 1; }
+
+# 4) IDEMPOTENT: a second recover with no NEW relaunch is silent (replay-once per failure, no storm)
+out="$(env $E "$0" --recover 2>&1)"; rc=$?
+{ [ "$rc" = 0 ] && ! printf '%s' "$out" | grep -qE '\[(dry|recovered)\]'; } \
+  || { rm -rf "$_td"; echo "smoke-test: FAIL (recover must be idempotent per relaunch: rc=$rc out='$out')"; exit 1; }
+
+# 5) capture SKIPS a window whose relaunch is still unrecovered — but here it's recovered, so a fresh snap writes.
+#    First prove the skip: forge a NEWER relaunch (pending, unrecovered) and confirm capture preserves the old snap.
+old_ts="$(awk -F'ts=' 'NR==1{print $2+0}' "$_td/mind-snapshots/tg.snap")"
+printf '%s win=tg who=tg@host engine=claude site=keepalive\n' "$(date -u -d '+2 min' +%FT%TZ 2>/dev/null || date -u +%FT%TZ)" >> "$_td/audit.log"
+out="$(env $E "$0" --capture 2>&1)"; rc=$?
+new_ts="$(awk -F'ts=' 'NR==1{print $2+0}' "$_td/mind-snapshots/tg.snap")"
+{ [ "$rc" = 0 ] && printf '%s' "$out" | grep -qF '[skip] tg: pending recovery' && [ "$old_ts" = "$new_ts" ]; } \
+  || { rm -rf "$_td"; echo "smoke-test: FAIL (capture must skip+preserve snap on a pending relaunch: rc=$rc out='$out' old=$old_ts new=$new_ts)"; exit 1; }
+
+# 6) RE-FIRE: the new (pending) relaunch is a fresh failure → recover replays again (a later crash still recovers)
+out="$(env $E "$0" --recover 2>&1)"; rc=$?
+{ [ "$rc" = 0 ] && printf '%s' "$out" | grep -qF '[dry] tg:'; } \
+  || { rm -rf "$_td"; echo "smoke-test: FAIL (a later relaunch must re-fire recovery: rc=$rc out='$out')"; exit 1; }
+
+# 7) no snapshot at all → recover silent (honest: nothing to replay, not a fabricated prime)
+_e2="$(mktemp -d)"
+out="$(env MESH_STATE_DIR=$_e2 MESH_MIND_SNAP_WINS=ghost MESH_MIND_SNAP_AUDIT=$_td/audit.log "$0" --recover 2>&1)"; rc=$?
+{ [ "$rc" = 0 ] && ! printf '%s' "$out" | grep -qE '\[(dry|recovered)\]'; } \
+  || { rm -rf "$_td" "$_e2"; echo "smoke-test: FAIL (no snapshot must yield no recovery: rc=$rc out='$out')"; exit 1; }
+rm -rf "$_e2"
+
+# 8) PRE-CRASH ORDERING guard (isolates rts>sts): a relaunch OLDER than the current snapshot is not a
+#    fresh crash → recover stays silent. Without the rts>sts guard, recover would spuriously replay the
+#    post-relaunch snapshot as if it were pre-crash state. Craft the state directly: snap far in the
+#    future, an ancient unrecovered relaunch (rts>rects but rts<sts).
+_gd="$(mktemp -d)"; mkdir -p "$_gd/mind-snapshots"
+printf 'snapshot win=tg ts=9999999999\nclaim=<none>\n--- tail ---\nx\n' > "$_gd/mind-snapshots/tg.snap"
+echo 0 > "$_gd/mind-snapshots/tg.recovered"
+printf '2001-01-01T00:00:00Z win=tg who=tg@host engine=claude site=keepalive\n' > "$_gd/audit.log"
+out="$(env MESH_STATE_DIR=$_gd MESH_MIND_SNAP_WINS=tg MESH_MIND_SNAP_AUDIT=$_gd/audit.log "$0" --recover 2>&1)"; rc=$?
+{ [ "$rc" = 0 ] && ! printf '%s' "$out" | grep -qE '\[(dry|recovered)\]'; } \
+  || { rm -rf "$_td" "$_gd"; echo "smoke-test: FAIL (a relaunch older than the snapshot must not replay: rc=$rc out='$out')"; exit 1; }
+rm -rf "$_gd"
+
+rm -rf "$_td"
+echo "smoke-test: ok (baseline/no-fake-recover/replay/idempotent/skip-pending/re-fire/no-state/pre-crash-order fixtures)"; exit 0

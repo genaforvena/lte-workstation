@@ -1,0 +1,221 @@
+#!/usr/bin/env bash
+# orphan-ok: on-demand directional-approach fusion query, not a scheduled sense. Both axes
+#            (mesh-presence BLE trend, mesh-wifi-motion RF) are independently cached/produced by
+#            their own reflexes; this folds them on demand like mesh-motion-fuse.
+# mesh-approach — DIRECTIONAL life-event fusion: is a KNOWN person approaching or leaving this
+# node right now, or is the motion UNATTRIBUTED?
+#
+# Fuses TWO independent senses that answer DIFFERENT halves of the question:
+#   * mesh-presence (BLE): per-device RSSI TREND (APPROACHING/RECEDING/STABLE) + trend_conf
+#     (FIRM|TENTATIVE — the per-MAC volatility qualifier shipped 2026-07-06). This is WHO + which
+#     DIRECTION relative to the node — but a rising RSSI on a NAMED FIXED appliance (a TV/speaker)
+#     is multipath noise, not a person, so fixed appliances (MESH_FIXED_RE) are EXCLUDED. Only a
+#     named, MOBILE personal device (phone/watch/Quest) carries a real "person moving" trend.
+#   * mesh-wifi-motion (RF): device-free node-local motion in the SPACE (MOTION/STILL). Corroborates
+#     that a body is ACTUALLY moving — and, when it fires with NO tracked device approaching, reveals
+#     motion that belongs to NOBODY the mesh can name (a device-free mover / stranger).
+#
+# Neither alone answers "is a known person incoming?": BLE trend alone can't tell an approaching
+# phone from RSSI jitter (that's what trend_conf grades) and can't see a device-free body; RF alone
+# sees motion but not WHO or which direction. The fusion distinguishes:
+#
+#   INBOUND            a named mobile device APPROACHING (FIRM) AND RF MOTION → confirmed: someone
+#                      known is coming toward the node, corroborated by room motion
+#   INBOUND-WEAK       APPROACHING but TENTATIVE, or FIRM with no RF corroboration (RF STILL/UNCERTAIN)
+#   OUTBOUND           a named mobile device RECEDING (FIRM) → someone known leaving
+#   OUTBOUND-WEAK      RECEDING but TENTATIVE (noise-grade — could be jitter, not a real departure)
+#   UNATTRIBUTED-MOTION named device(s) present but all STABLE, while RF says MOTION → motion in the
+#                      space that is NOT a tracked person approaching (device-free mover, or present
+#                      people fidgeting) — richer than "someone's here"
+#   SETTLED            named device(s) present, all STABLE, RF STILL → known people here, calm
+#   AMBIENT-MOTION     NO named mobile device present but RF MOTION → motion with nobody the mesh can
+#                      name (device-free / stranger) — the "unknown mover" edge
+#   QUIET              no named mobile device + RF STILL → genuinely calm
+#
+# Honest-fusion rule (operator doctrine): an UNREACHABLE input renders the verdict visibly DEGRADED
+# via the trailing `degraded=` field, never a silent QUIET. A BLE-blind QUIET (RF still, can't see
+# who's around) is degraded=ble-unreach — distinct from a clean QUIET (degraded=none). One live axis
+# still yields a verdict, flagged; BOTH dark → UNKNOWN (exit 2, never a faked all-clear).
+#
+# Vocab contract: the FIRST token after "[approach] " is one of the verdicts above and appears
+# NOWHERE ELSE in the line (consumers grep -q the verdict). exit 2 = cannot assess.
+#
+# Usage:
+#   mesh-approach            one-line directional verdict to stdout (exit 0; 2 if both axes dark)
+#   mesh-approach --json     machine-readable {verdict, dir, dir_dev, dir_conf, rf, degraded, reason, ts}
+#   mesh-approach --test     sandboxed falsifiable smoke test (no real scan; axes injected via env)
+#
+# Test/sandbox hooks (also usable to reproduce a cell): MESH_APPROACH_BLE / MESH_APPROACH_RF
+# override the two axis reads with fixture strings, so --test fires NO real BLE scan or RF read and
+# NO outbound side-effect (this tool has none — it is a pure stdout query).
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+[ -f "$HOME/.mesh/nodes" ] && . "$HOME/.mesh/nodes"
+
+# Shared BLE classifier (DRY with mesh-arrivals/mesh-ambient-clock): MESH_FIXED_RE = fixed
+# appliances whose BLE cycling is ambient-clock signal, NOT a person moving. Inline fallback so a
+# missing lib never SILENTLY disables the fixed-appliance exclusion (fail-safe = still exclude TVs).
+for _p in "$HOME/.local/bin/mesh-patterns.sh" "$(command -v mesh-patterns.sh 2>/dev/null)"; do
+  [ -n "$_p" ] && [ -f "$_p" ] && { . "$_p"; break; }
+done
+: "${MESH_FIXED_RE:=\[TV\]|MiTV-|Mi Box|Bluedroid TV|GR-AC_|MI SCALE|LYWSD|Vega BLE|GEELY_BT|CAR-BT|Bose Revolve|Bose SoundLink|DRG[0-9]| [Тт][Вв]$|LED_BLE_}"
+
+ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+# ── BLE axis: strongest DIRECTIONAL named-mobile device → "DIR|DEV|CONF" or "NONE|..|.." or "UNREACH"
+# DIR ∈ APPROACHING|RECEDING|STABLE|NONE ; STABLE = named-mobile present but none directional ;
+# NONE = no named-mobile device present at all. UNREACH = the presence scan itself failed.
+read_ble() {
+  if [ -n "${MESH_APPROACH_BLE:-}" ]; then printf '%s' "$MESH_APPROACH_BLE"; return; fi
+  local js
+  js="$(timeout 45 mesh-presence --json 2>/dev/null)" || { printf 'UNREACH||'; return; }
+  [ -n "$js" ] || { printf 'UNREACH||'; return; }
+  FIXED_RE="$MESH_FIXED_RE" python3 - "$js" <<'PY' 2>/dev/null || printf 'UNREACH||'
+import json, os, re, sys
+try:
+    d = json.loads(sys.argv[1])
+except Exception:
+    print("UNREACH||"); raise SystemExit
+fixed = re.compile(os.environ.get("FIXED_RE", ""))
+best = None  # (rank, rssi, dir, name, conf)
+DIR_RANK = {"APPROACHING": 2, "RECEDING": 2, "STABLE": 0, "INITIAL": 0}
+CONF_RANK = {"FIRM": 2, "TENTATIVE": 1, "NA": 0}
+have_named_mobile = False
+for dev in d.get("devices", []):
+    name = (dev.get("name") or "").strip()
+    if not name or name == "?":          # unnamed / privacy-MAC churn → not a known person
+        continue
+    if fixed.search(name):               # fixed appliance (TV/speaker) → multipath, not a person
+        continue
+    have_named_mobile = True
+    trend = (dev.get("trend") or "STABLE").upper()
+    conf = (dev.get("trend_conf") or "NA").upper()
+    try:
+        rssi = int(dev.get("rssi"))
+    except Exception:
+        rssi = -999
+    directional = trend in ("APPROACHING", "RECEDING")
+    # rank: directional-firm > directional-tentative > non-directional; tie-break on closeness (rssi)
+    rank = (DIR_RANK.get(trend, 0), CONF_RANK.get(conf, 0))
+    key = (rank, rssi)
+    if best is None or key > best[0]:
+        best = (key, trend if directional else "STABLE", name, conf if directional else "NA")
+if best is None:
+    print("NONE||" if not have_named_mobile else "STABLE||")
+    raise SystemExit
+_, dirn, name, conf = best
+print("%s|%s|%s" % (dirn, name, conf))
+PY
+}
+
+# ── RF axis: mesh-wifi-motion first token → MOTION|STILL|UNCERTAIN|UNREACH
+read_rf() {
+  if [ -n "${MESH_APPROACH_RF:-}" ]; then printf '%s' "$MESH_APPROACH_RF"; return; fi
+  local out tok
+  out="$(timeout 20 mesh-wifi-motion 2>/dev/null)" || { printf 'UNREACH'; return; }
+  [ -n "$out" ] || { printf 'UNREACH'; return; }
+  tok="$(printf '%s' "$out" | sed -n 's/^\[wifi-motion\] \([A-Z]*\).*/\1/p')"
+  case "$tok" in MOTION|STILL|UNCERTAIN) printf '%s' "$tok" ;; *) printf 'UNREACH' ;; esac
+}
+
+ble="$(read_ble)"; rf="$(read_rf)"
+dir="${ble%%|*}"; rest="${ble#*|}"; dir_dev="${rest%%|*}"; dir_conf="${rest#*|}"
+[ "$dir_conf" = "$rest" ] && dir_conf=""   # guard when rest had no second '|'
+
+verdict=""; degraded=none; reason=""
+
+if [ "$dir" = UNREACH ] && { [ "$rf" = UNREACH ] || [ "$rf" = UNCERTAIN ]; }; then
+  verdict=UNKNOWN; degraded=both-unreach
+  reason="both axes dark (ble=$ble rf=$rf) — cannot assess direction or motion"
+elif [ "$dir" = UNREACH ]; then
+  # RF-only: can see motion but not who/which direction — honest-degraded, never a directional verdict
+  degraded=ble-unreach
+  case "$rf" in
+    MOTION) verdict=AMBIENT-MOTION; reason="RF motion but BLE scan failed — mover unattributable" ;;
+    STILL)  verdict=QUIET;          reason="RF still; BLE blind (scan failed) — who's-around unknown" ;;
+  esac
+elif [ "$dir" = APPROACHING ]; then
+  if [ "$dir_conf" = FIRM ] && [ "$rf" = MOTION ]; then
+    verdict=INBOUND; reason="$dir_dev approaching (FIRM) + RF motion — confirmed known-person inbound"
+  else
+    verdict=INBOUND-WEAK
+    [ "$rf" = UNREACH ] || [ "$rf" = UNCERTAIN ] && degraded=rf-unreach
+    reason="$dir_dev approaching (conf=$dir_conf, rf=$rf) — rising RSSI not corroborated as a firm approach"
+  fi
+elif [ "$dir" = RECEDING ]; then
+  if [ "$dir_conf" = FIRM ]; then
+    verdict=OUTBOUND; reason="$dir_dev receding (FIRM) — known device leaving"
+  else
+    verdict=OUTBOUND-WEAK; reason="$dir_dev receding (conf=$dir_conf) — noise-grade, may be RSSI jitter not a departure"
+  fi
+  [ "$rf" = UNREACH ] && degraded=rf-unreach
+elif [ "$dir" = STABLE ]; then
+  case "$rf" in
+    MOTION)          verdict=UNATTRIBUTED-MOTION; reason="named device(s) present but STABLE while RF moves — motion not a tracked approach (device-free mover / fidget)" ;;
+    STILL)           verdict=SETTLED; reason="named device(s) present + all STABLE + RF still — known people here, calm" ;;
+    *)               verdict=SETTLED; degraded=rf-unreach; reason="named device(s) present + STABLE; RF axis unavailable ($rf)" ;;
+  esac
+else  # dir = NONE — no named mobile device present
+  case "$rf" in
+    MOTION)          verdict=AMBIENT-MOTION; reason="RF motion with NO named mobile device present — device-free mover / stranger" ;;
+    STILL)           verdict=QUIET; reason="no named mobile device + RF still — calm" ;;
+    UNCERTAIN)       verdict=QUIET; degraded=rf-uncertain; reason="no named mobile device; RF can't assess motion (uncertain)" ;;
+    UNREACH)         verdict=QUIET; degraded=rf-unreach; reason="no named mobile device; RF axis unavailable" ;;
+  esac
+fi
+
+if [ "${1:-}" = --json ]; then
+  printf '{"verdict":"%s","dir":"%s","dir_dev":"%s","dir_conf":"%s","rf":"%s","degraded":"%s","reason":"%s","ts":"%s"}\n' \
+    "$verdict" "$dir" "$dir_dev" "$dir_conf" "$rf" "$degraded" "$reason" "$ts"
+elif [ "${1:-}" = --test ]; then
+  :  # handled below
+else
+  printf '[approach] %s :: %s (ble=%s/%s/%s rf=%s degraded=%s)\n' \
+    "$verdict" "$reason" "$dir" "$dir_dev" "$dir_conf" "$rf" "$degraded"
+fi
+
+[ "${1:-}" = --test ] && {
+  fail=0
+  # Inject both axes via env; assert the fused verdict + degraded flag. Falsifiable BOTH ways
+  # (each cell also has a near-neighbour that must NOT collapse to it).
+  chk() { # $1=ble  $2=rf  $3=want-verdict  $4=want-degraded
+    local out vd dg
+    out="$(MESH_APPROACH_BLE="$1" MESH_APPROACH_RF="$2" bash "$0" --json)"
+    vd="$(printf '%s' "$out" | sed -n 's/.*"verdict":"\([^"]*\)".*/\1/p')"
+    dg="$(printf '%s' "$out" | sed -n 's/.*"degraded":"\([^"]*\)".*/\1/p')"
+    if [ "$vd" != "$3" ] || [ "$dg" != "$4" ]; then
+      echo "  FAIL: ble='$1' rf='$2' → verdict=$vd degraded=$dg (want $3/$4)"; fail=1
+    fi
+  }
+  #    ble (DIR|DEV|CONF)          rf          verdict               degraded
+  chk "APPROACHING|Pixel|FIRM"     MOTION      INBOUND               none        # confirmed inbound
+  chk "APPROACHING|Pixel|FIRM"     STILL       INBOUND-WEAK          none        # FIRM but uncorroborated → NOT INBOUND
+  chk "APPROACHING|Pixel|TENTATIVE" MOTION     INBOUND-WEAK          none        # tentative can't be INBOUND even w/ motion
+  chk "APPROACHING|Pixel|FIRM"     UNREACH     INBOUND-WEAK          rf-unreach  # RF dark degrades the corroboration
+  chk "RECEDING|Watch|FIRM"        STILL       OUTBOUND              none        # firm departure
+  chk "RECEDING|Watch|TENTATIVE"   STILL       OUTBOUND-WEAK         none        # tentative recede ≠ OUTBOUND (jitter)
+  chk "STABLE||"                   MOTION      UNATTRIBUTED-MOTION   none        # present+still-trend but room moves
+  chk "STABLE||"                   STILL       SETTLED               none        # present + calm
+  chk "NONE||"                     MOTION      AMBIENT-MOTION        none        # motion, nobody named → stranger/device-free
+  chk "NONE||"                     STILL       QUIET                 none        # genuine calm
+  chk "NONE||"                     UNCERTAIN   QUIET                 rf-uncertain # RF can't assess → flagged, not clean QUIET
+  # Honest-degraded: UNREACHABLE must render VISIBLY different from a genuine empty.
+  chk "UNREACH||"                  STILL       QUIET                 ble-unreach # BLE-blind QUIET ≠ clean QUIET (degraded set)
+  chk "UNREACH||"                  MOTION      AMBIENT-MOTION        ble-unreach # RF-only motion, mover unattributable
+  chk "UNREACH||"                  UNREACH     UNKNOWN               both-unreach # both dark → UNKNOWN
+  chk "UNREACH||"                  UNCERTAIN   UNKNOWN               both-unreach # BLE dark + RF can't-assess = still UNKNOWN
+  # exit-code contract: UNKNOWN must exit 2, an assessed verdict exit 0.
+  MESH_APPROACH_BLE="UNREACH||" MESH_APPROACH_RF="UNREACH" bash "$0" >/dev/null 2>&1
+  [ "$?" = 2 ] || { echo "  FAIL: both-unreach did not exit 2"; fail=1; }
+  MESH_APPROACH_BLE="NONE||" MESH_APPROACH_RF="STILL" bash "$0" >/dev/null 2>&1
+  [ "$?" = 0 ] || { echo "  FAIL: assessed QUIET did not exit 0"; fail=1; }
+  # Falsify the fixed-appliance exclusion is wired: a TV name in the raw path is excluded (unit-level
+  # here via the classifier — a fixed name must NOT count as a named-mobile device).
+  printf '%s' "[TV] Samsung" | grep -qE "$MESH_FIXED_RE" || { echo "  FAIL: MESH_FIXED_RE didn't match a TV"; fail=1; }
+  printf '%s' "Pixel 7" | grep -qE "$MESH_FIXED_RE" && { echo "  FAIL: MESH_FIXED_RE wrongly matched a phone"; fail=1; }
+  [ "$fail" = 0 ] && echo "mesh-approach --test PASS (14 fusion cells + 2 exit-codes + 2 fixed-RE both-way)" || { echo "mesh-approach --test FAIL"; exit 1; }
+  exit 0
+}
+
+[ "$verdict" = UNKNOWN ] && exit 2 || exit 0
