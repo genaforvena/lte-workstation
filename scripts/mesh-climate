@@ -1,0 +1,167 @@
+#!/usr/bin/env bash
+# reflex-cadence: 9-59/15 * * * *
+# doctor-artifact: $HOME/.mesh/.climate-state 2700
+# mesh-climate — CROSS-SENSE CLIMATE FUSION: indoor barometer × outdoor forecast × indoor light.
+#
+# WHY (senses 2026-07-06): three climate-adjacent senses now run but nobody fuses them —
+#   • mesh-baro (Note 3 LPS25H via ds, ~/.mesh/.baro-state, 5-min): REAL indoor pressure + trend
+#   • mesh-weather (open-meteo, ~/.mesh/.weather-state, hourly): outdoor temp / thermal_day
+#   • mesh-light (~/.mesh/.light-state): indoor luminance class
+# No single sensor gives the DERIVED signal: is a weather front incoming / clearing / a thermal
+# day building — and does an independent modality corroborate it? A falling barometer alone is a
+# hypothesis; falling barometer + DIM indoor light in DAYTIME hours = two independent physical
+# sensors agreeing on "overcast rolling in". thermal_day from the API + a stable/rising barometer
+# = the heat forecast is weather (not a front), so mind-offload planning can trust it.
+#
+# Classes: FRONT-INCOMING (falling, Δ≤-1.5 hPa from baseline) · CLEARING (rising, Δ≥+1.5) ·
+#          THERMAL-DAY (API thermal_day=1, pressure not falling) · STABLE · UNKNOWN (no inputs)
+#
+# HONESTY (hard rule): every input renders its OWN visible status — an unreachable baro node
+# prints pressure=UNREACHABLE, an unseeded config prints pressure=UNCONFIGURED, a stale weather
+# state prints outdoor=STALE. inputs=k/3 counts live ones. Never a silent all-clear.
+#
+#   mesh-climate           fuse cached states → write ~/.mesh/.climate-state (EVERY run, so
+#                          mtime = liveness) + [climate] board edge on CLASS change only
+#   mesh-climate --status  print last state line, no fusion
+#   mesh-climate --test    classifier/render fixtures + live real-read gate (exit 2 honest n/a
+#                          when NO input is live — never a fake green)
+#
+# Config (node-local ~/.mesh/nodes, never hardcoded here): MESH_CLIMATE_BARO_NODE=user@ip — the
+# node whose ~/.mesh/.baro-state carries the barometer (unset + no local state → UNCONFIGURED).
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+
+MESH="$HOME/.mesh"
+STATE="${MESH_CLIMATE_STATE:-$MESH/.climate-state}"
+BARO_TTL=1800     # mesh-baro cadence 5min → stale past 30min
+WEATHER_TTL=9000  # mesh-weather hourly → stale past 2.5h
+LIGHT_TTL=2400    # mesh-light's own doctor bound
+
+[ -f "$MESH/nodes" ] && { set +u; . "$MESH/nodes" 2>/dev/null; set -u; }
+BARO_NODE="${MESH_CLIMATE_BARO_NODE:-}"
+
+# ---------- input readers (each returns "STATUS<TAB>payload") ----------
+
+read_baro() {  # → "OK\thpa trend baseline age_s" | UNREACHABLE | STALE | UNCONFIGURED
+  local out now mtime content age
+  if [ -f "$MESH/.baro-state" ]; then                       # local body first
+    content=$(cat "$MESH/.baro-state"); mtime=$(stat -c %Y "$MESH/.baro-state"); now=$(date +%s)
+  elif [ -n "$BARO_NODE" ]; then
+    out=$(ssh -o ConnectTimeout=6 -o BatchMode=yes -o StrictHostKeyChecking=no "$BARO_NODE" \
+      'cat ~/.mesh/.baro-state 2>/dev/null && stat -c %Y ~/.mesh/.baro-state 2>/dev/null && date +%s' 2>/dev/null) || { printf 'UNREACHABLE\t'; return; }
+    content=$(sed -n 1p <<<"$out"); mtime=$(sed -n 2p <<<"$out"); now=$(sed -n 3p <<<"$out")
+    [ -n "$content" ] && [ -n "$mtime" ] || { printf 'UNREACHABLE\t'; return; }
+  else
+    printf 'UNCONFIGURED\t'; return
+  fi
+  age=$(( now - mtime ))
+  [ "$age" -le "$BARO_TTL" ] || { printf 'STALE\t'; return; }
+  # content: "984.90 STABLE 984.58" (hpa trend baseline)
+  awk -v a="$age" 'NF>=3 && $1+0>800 && $1+0<1100 {printf "OK\t%s %s %s %d", $1, $2, $3, a; ok=1}
+                   END {if (!ok) printf "UNREACHABLE\t"}' <<<"$content"
+}
+
+read_weather() {  # → "OK\tnow_c max_c thermal_day" | STALE | MISSING
+  local f="$MESH/.weather-state" age line
+  [ -f "$f" ] || { printf 'MISSING\t'; return; }
+  age=$(( $(date +%s) - $(stat -c %Y "$f") ))
+  [ "$age" -le "$WEATHER_TTL" ] || { printf 'STALE\t'; return; }
+  line=$(cat "$f")
+  grep -q '^OK ' <<<"$line" || { printf 'MISSING\t'; return; }
+  awk '{ for(i=1;i<=NF;i++){ if($i~/^now_c=/)n=substr($i,7); if($i~/^today_max_c=/)m=substr($i,13); if($i~/^thermal_day=/)t=substr($i,13)} }
+       END{ if(n!=""&&t!="") printf "OK\t%s %s %s", n, m, t; else printf "MISSING\t" }' <<<"$line"
+}
+
+read_light() {  # → "OK\tCLASS" | STALE | MISSING
+  local f="$MESH/.light-state" age
+  [ -f "$f" ] || { printf 'MISSING\t'; return; }
+  age=$(( $(date +%s) - $(stat -c %Y "$f") ))
+  [ "$age" -le "$LIGHT_TTL" ] || { printf 'STALE\t'; return; }
+  # OFFLINE is mesh-light's OWN degrade class — a dark input here, never a live reading
+  cut -d'|' -f1 "$f" | awk 'NF{if($1=="OFFLINE") printf "OFFLINE\t"; else printf "OK\t%s", $1; ok=1} END{if(!ok) printf "MISSING\t"}'
+}
+
+# ---------- pure classifier (fixture-testable, no I/O) ----------
+# classify baro_st hpa trend baseline  wx_st thermal_day  light_st light  hour
+#   → "CLASS overcast d_hpa"
+classify() {
+  local baro_st="$1" hpa="$2" trend="$3" base="$4" wx_st="$5" tday="$6" light_st="$7" light="$8" hour="$9"
+  local d="n/a" class overcast="no"
+  [ "$baro_st" = OK ] && d=$(awk -v h="$hpa" -v b="$base" 'BEGIN{printf "%+.2f", h-b}')
+  if [ "$baro_st" = OK ] && [ "$trend" = FALLING ] && awk -v d="$d" 'BEGIN{exit !(d<=-1.5)}'; then
+    class=FRONT-INCOMING
+  elif [ "$baro_st" = OK ] && [ "$trend" = RISING ] && awk -v d="$d" 'BEGIN{exit !(d>=1.5)}'; then
+    class=CLEARING
+  elif [ "$wx_st" = OK ] && [ "$tday" = 1 ]; then
+    class=THERMAL-DAY
+  elif [ "$baro_st" = OK ] || [ "$wx_st" = OK ]; then
+    class=STABLE
+  else
+    class=UNKNOWN
+  fi
+  if [ "$light_st" != OK ]; then overcast="n/a"
+  elif [ "$hour" -ge 6 ] && [ "$hour" -le 20 ] && [ "$baro_st" = OK ] && [ "$trend" = FALLING ] \
+       && { [ "$light" = DIM ] || [ "$light" = DARK ]; }; then overcast="corroborated"
+  fi
+  printf '%s %s %s' "$class" "$overcast" "$d"
+}
+
+# render baro_st hpa trend d  wx_st now_c max_c tday  light_st light  class overcast → state line
+render() {
+  local baro_st="$1" hpa="$2" trend="$3" d="$4" wx_st="$5" nc="$6" mc="$7" td="$8" light_st="$9" light="${10}" class="${11}" oc="${12}"
+  local p w l n=0
+  if [ "$baro_st" = OK ]; then p="in_hpa=$hpa trend=$trend d_hpa=$d"; n=$((n+1)); else p="pressure=$baro_st"; fi
+  if [ "$wx_st"  = OK ]; then w="out_c=$nc max_c=$mc thermal_day=$td"; n=$((n+1)); else w="outdoor=$wx_st"; fi
+  if [ "$light_st" = OK ]; then l="light=$light"; n=$((n+1)); else l="light=$light_st"; fi
+  printf '%s | %s | %s | %s overcast=%s | inputs=%d/3 %s' "$class" "$p" "$w" "$l" "$oc" "$n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+
+# ---------- modes ----------
+
+fuse() {
+  local b bs hpa="" trend="" base="" w ws nc="" mc="" td="" lg ls light="" cls_out class oc d prev_class new
+  b=$(read_baro);    bs=${b%%$'\t'*}; [ "$bs" = OK ] && read -r hpa trend base _ <<<"${b#*$'\t'}"
+  w=$(read_weather); ws=${w%%$'\t'*}; [ "$ws" = OK ] && read -r nc mc td <<<"${w#*$'\t'}"
+  lg=$(read_light);  ls=${lg%%$'\t'*}; [ "$ls" = OK ] && light=${lg#*$'\t'}
+  cls_out=$(classify "$bs" "$hpa" "$trend" "$base" "$ws" "$td" "$ls" "$light" "$(date +%-H)")
+  read -r class oc d <<<"$cls_out"
+  prev_class=$(awk '{print $1}' "$STATE" 2>/dev/null || true)
+  new=$(render "$bs" "$hpa" "$trend" "$d" "$ws" "$nc" "$mc" "$td" "$ls" "$light" "$class" "$oc")
+  printf '%s\n' "$new" > "$STATE"     # unconditional write: mtime = ran-live
+  echo "$new"
+  if [ -n "$prev_class" ] && [ "$prev_class" != "$class" ] && [ -z "${MESH_CLIMATE_NO_POST:-}" ]; then
+    MESH_WHO="senses@$(hostname)" mesh-chat "[climate] $prev_class -> $class ($new)" >/dev/null 2>&1 || true
+  fi
+  # honest exit: nothing live at all → 2
+  grep -q 'inputs=0/3' <<<"$new" && return 2 || return 0
+}
+
+case "${1:-}" in
+  --status) cat "$STATE" 2>/dev/null || { echo "no state yet"; exit 1; } ;;
+  --test)
+    fail=0; t(){ local want="$1"; shift; got=$(classify "$@"); [ "${got%% *}" = "$want" ] || { echo "FAIL: want $want got '$got' ($*)"; fail=1; }; }
+    t FRONT-INCOMING OK 982.0 FALLING 984.5  OK 0  OK BRIGHT 12
+    t CLEARING       OK 987.0 RISING  984.5  OK 0  OK BRIGHT 12
+    t THERMAL-DAY    OK 984.6 STABLE  984.5  OK 1  OK BRIGHT 12
+    t STABLE         OK 984.6 STABLE  984.5  OK 0  OK BRIGHT 12
+    t STABLE         UNREACHABLE "" "" ""    OK 0  OK DIM 12          # baro dark ≠ front
+    t UNKNOWN        UNREACHABLE "" "" ""    STALE "" MISSING "" 12   # all dark → UNKNOWN
+    got=$(classify OK 982.0 FALLING 984.5 OK 0 OK DIM 12)
+    [ "$(awk '{print $2}' <<<"$got")" = corroborated ] || { echo "FAIL: overcast corroboration ($got)"; fail=1; }
+    got=$(classify OK 982.0 FALLING 984.5 OK 0 OK DIM 23)
+    [ "$(awk '{print $2}' <<<"$got")" = no ] || { echo "FAIL: night must not corroborate ($got)"; fail=1; }
+    # honest render: dark input must be VISIBLE, never silent
+    r=$(render UNREACHABLE "" "" "" OK 20.5 22.6 0 OK DIM STABLE no)
+    grep -q 'pressure=UNREACHABLE' <<<"$r" || { echo "FAIL: render hides dead baro ($r)"; fail=1; }
+    grep -q 'inputs=2/3' <<<"$r" || { echo "FAIL: render inputs count ($r)"; fail=1; }
+    [ "$fail" = 0 ] || exit 1
+    echo "fixtures OK"
+    # live real-read gate: the fusion must parse ≥1 REAL input right now (sandboxed state + no board post)
+    live=$(MESH_CLIMATE_STATE=$(mktemp) MESH_CLIMATE_NO_POST=1 "$0") || { echo "live: no input reachable (honest n/a)"; exit 2; }
+    grep -qE 'in_hpa=[0-9]|out_c=[0-9-]' <<<"$live" || { echo "live: no numeric reading parsed: $live"; exit 2; }
+    echo "live OK: $live"
+    ;;
+  ""|--edge) fuse ;;
+  *) echo "usage: mesh-climate [--status|--test]"; exit 1 ;;
+esac
