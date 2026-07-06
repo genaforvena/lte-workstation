@@ -182,7 +182,14 @@ mind_transition_due() {
       return 0
       ;;
     *)
-      case "$prev" in NEEDS-INPUT|RATE-LIMITED|WEDGED-INPUT) : ;; *) return 1 ;; esac
+      # keyed on $posted (the last ALERTED state), not $prev: by the time a non-transition frame
+      # reaches this check, $prev has already been overwritten to the current $state on the flip
+      # frame (see the caller's transition bookkeeping) — so a $prev check here is always comparing
+      # $state against itself and can never see the state it recovered FROM. $posted only changes
+      # when an alert actually fires, so it survives the flip and still names the blocked state
+      # (mindstate-unblocked-edge-unreachable 2026-07-06: this made [mind-unblocked] unreachable —
+      # 13 entry alerts in board history, 0 recoveries ever).
+      case "$posted" in NEEDS-INPUT|RATE-LIMITED|WEDGED-INPUT) : ;; *) return 1 ;; esac
       [ "$posted" = "$state" ] && return 1
       [ "$age" -ge "$MIND_DEBOUNCE_SEC" ] || return 1
       return 0
@@ -317,13 +324,130 @@ wedge_state(){ # $1=win $2=classified-state $3=raw pane text → state on stdout
   if [ -n "$stuck" ] && [ "$stuck" = "$prev" ]; then printf 'WEDGED-INPUT'; else printf '%s' "$state"; fi
 }
 
+peek_win() { # $1=window  $2=node(local|user@ip) — bottom pane (MIND), like mesh-tell
+  local win="$1" node="$2" cmd
+  cmd="pidx=\$(tmux list-panes -t \"\$(hostname):$win\" -F '#{pane_top} #{pane_index}' 2>/dev/null | sort -n | tail -1 | awk '{print \$2}'); tmux capture-pane -t \"\$(hostname):$win\${pidx:+.\$pidx}\" -p 2>/dev/null | grep -vE '^[[:space:]]*\$' | tail -25"
+  if [ "$node" = local ]; then bash -c "$cmd"
+  else ssh -o BatchMode=yes -o ConnectTimeout=8 "$node" "$cmd"; fi
+}
+
+# COOLDOWN: suppress repeated block/limited alerts for the same window
+cooldown_file() { local win=$1 state=$2; echo "$MESH/.mind-state-cooldown-$win-$state"; }
+cooldown_check() {
+  local win=$1 state=$2 cooldown_sec=$3
+  local cf=$(cooldown_file "$win" "$state") now=$(date +%s)
+  if [ -f "$cf" ]; then
+    local last=$(cat "$cf")
+    if [ $((now - last)) -lt "$cooldown_sec" ]; then return 1; fi
+  fi
+  return 0
+}
+cooldown_set() { local win=$1 state=$2; local cf=$(cooldown_file "$win" "$state"); echo "$(date +%s)" > "$cf"; }
+BLOCK_COOLDOWN="${MESH_BLOCK_COOLDOWN:-60}"
+LIMITED_COOLDOWN="${MESH_LIMITED_COOLDOWN:-300}"
+
+alert(){ if [ -n "${MESH_ALERT_DRYRUN:-}" ]; then echo "[dryrun] would alert: $1" >&2; return; fi
+  local msg="$1"
+  local win=$(echo "$msg" | sed -n 's/.*\[\([^]]*\)\].*/\1/p')
+  if echo "$msg" | grep -q "\[mind-blocked\]"; then
+    cooldown_check "$win" "NEEDS-INPUT" "$BLOCK_COOLDOWN" && { cooldown_set "$win" "NEEDS-INPUT"; MESH_WHO="mind-state@$(hostname)" mesh-chat "$msg" >/dev/null 2>&1; }
+  elif echo "$msg" | grep -q "\[mind-limited\]"; then
+    cooldown_check "$win" "RATE-LIMITED" "$LIMITED_COOLDOWN" && { cooldown_set "$win" "RATE-LIMITED"; MESH_WHO="mind-state@$(hostname)" mesh-chat "$msg" >/dev/null 2>&1; }
+  elif echo "$msg" | grep -q "\[mind-wedged\]"; then
+    cooldown_check "$win" "WEDGED-INPUT" "$LIMITED_COOLDOWN" && { cooldown_set "$win" "WEDGED-INPUT"; MESH_WHO="mind-state@$(hostname)" mesh-chat "$msg" >/dev/null 2>&1; }
+  elif echo "$msg" | grep -q "\[mind-unblocked\]"; then
+    MESH_WHO="mind-state@$(hostname)" mesh-chat "$msg" >/dev/null 2>&1
+  else
+    MESH_WHO="mind-state@$(hostname)" mesh-chat "$msg" >/dev/null 2>&1
+  fi
+}
+
+# watch_tick — the real --watch per-window body, extracted so --test can drive it directly as a
+# LOOP-LEVEL fixture (two consecutive calls = two frames) instead of only unit-testing
+# mind_transition_due in isolation with hand-picked args that never occur in real invocation
+# (mindstate-unblocked-edge-unreachable 2026-07-06: a direct fn-call test greened at :486 while the
+# real wiring never reached that code shape — falsifiable here by reverting the posted-based checks).
+watch_tick() {
+  local w="$1" raw="$2"
+  local out state ev wstate _stuck now statef sincef seenf prev since posted transition age prompt_lines _wtxt _wpidx
+  out="$(printf '%s\n' "$raw" | classify)"
+  state="${out%%	*}"; ev="${out#*	}"
+  # WEDGED-INPUT overlay: cross-tick (see header). Runs on every frame — non-IDLE frames clear the
+  # per-window input memory inside wedge_state, so a WORKING turn between two identical-text idles
+  # resets the 2-tick requirement.
+  wstate="$(wedge_state "$w" "$state" "$raw")"
+  if [ "$wstate" != "$state" ]; then
+    state=$wstate
+    _stuck="$(sanitize_quote "$(input_stuck_text "$raw")")"
+    ev="input line stuck ≥2 ticks, never submitted: '${_stuck:0:40}'"
+  fi
+  now="$(date +%s)"
+  statef="$(mind_state_file "$w")"
+  sincef="$(mind_since_file "$w")"
+  seenf="$(mind_seen_file "$w")"
+  prev="$(cat "$statef" 2>/dev/null || echo NONE)"
+  since="$(cat "$sincef" 2>/dev/null || echo "$now")"
+  posted="$(cat "$seenf" 2>/dev/null || echo NONE)"
+  # TRANSITION bookkeeping (chat-review/mind-state-watch-drops-transition 2026-07-05): a state flip
+  # updates the state/since artifacts and RESETS the age baseline (since=now → age=0), then falls
+  # through to the print below. The window's status line MUST be emitted every pass, or mesh-dash
+  # minds drops that channel for a whole frame on every WORKING↔IDLE flip (the old bare `continue`
+  # skipped the print). The alert block stays gated to NON-transition frames (transition=0), so it
+  # fires exactly when it did before — the old `continue` skipped it on the flip frame, and the
+  # age=0 reset would debounce-gate it here anyway; the flag makes that invariant explicit.
+  transition=0
+  if [ "$state" != "$prev" ]; then
+    echo "$state" > "$statef"
+    echo "$now" > "$sincef"
+    since="$now"; transition=1
+  fi
+  [ -f "$sincef" ] || echo "$now" > "$sincef"
+  age=$((now - since))
+  echo "$w: $state — $ev"
+  if [ "$transition" = 0 ] && mind_transition_due "$state" "$prev" "$posted" "$age"; then
+    echo "$state" > "$seenf"
+    if [ "$state" = NEEDS-INPUT ]; then
+    # Summarize: classification evidence ($ev) is the concise reason. Full raw prompt goes
+    # to the mind's own pane (for operator SSH inspection) and stderr (for retainability in
+    # the mind's scrollback). The board gets only the summary — no raw TUI noise.
+    prompt_lines="$(printf '%s\n' "$raw" | grep -vE '^[[:space:]]*$' | tail -8)"
+    echo "full block-prompt for $w: ${prompt_lines}" >&2
+    alert "[mind-blocked] $(hostname):$w waiting on input — $(summarize_reason "$ev")"
+    command -v mesh-tg >/dev/null 2>&1 && mesh-tg "🤖 $(hostname):$w ждёт ввода:
+$(sanitize_quote "$(printf '%s' "$prompt_lines" | head -3)")
+Ответь 'одобряю $w' (разрешу один раз) или 'отклони $w'. Не форсю — твоё решение." >/dev/null 2>&1 || true
+    elif [ "$state" = RATE-LIMITED ]; then
+      alert "[mind-limited] $(hostname):$w quota-exhausted — '$(sanitize_quote "$ev")' — route work elsewhere (mesh-relay/other minds)"
+    elif [ "$state" = WEDGED-INPUT ]; then
+      alert "[mind-wedged] $(hostname):$w — $ev — harness ate the submission (pane reads IDLE); recover: C-u in the pane, then mesh-tell $w the text (MESH_WEDGE_RECOVER=1 automates)"
+      # Auto-recovery (default OFF): the exact sequence minds proved live 2026-07-06 16:18Z —
+      # C-u clears the phantom line, a fresh mesh-tell re-injects+submits. CAVEAT: the captured
+      # text is the pane's RENDERING of the input line — single line, width-truncated; for the
+      # short operator lines this failure hits, a truncated re-send beats a lost submission,
+      # but that's the operator's call → flag-gated, not default.
+      if [ "${MESH_WEDGE_RECOVER:-0}" = 1 ]; then
+        _wtxt="$(input_stuck_text "$raw")"
+        _wpidx="$(tmux list-panes -t "$(hostname):$w" -F '#{pane_top} #{pane_index}' 2>/dev/null | sort -n | tail -1 | awk '{print $2}')"
+        tmux send-keys -t "$(hostname):$w${_wpidx:+.$_wpidx}" C-u 2>/dev/null
+        sleep 1
+        command -v mesh-tell >/dev/null 2>&1 && [ -n "$_wtxt" ] && mesh-tell "$w" "$_wtxt" >/dev/null 2>&1
+      fi
+    elif [ "$posted" = NEEDS-INPUT ] || [ "$posted" = RATE-LIMITED ] || [ "$posted" = WEDGED-INPUT ]; then
+      alert "[mind-unblocked] $(hostname):$w now $state"
+    fi
+  fi
+}
+
 if [ "${1:-}" = --test ]; then
   command -v tmux >/dev/null 2>&1 || { echo "smoke-test: FAIL (no tmux)"; exit 1; }
   mind_transition_due NEEDS-INPUT IDLE NONE 4 && { echo "smoke-test: FAIL (debounce fired too early for block)"; exit 1; }
   mind_transition_due NEEDS-INPUT IDLE NONE 5 || { echo "smoke-test: FAIL (debounce did not fire for sustained block)"; exit 1; }
   mind_transition_due NEEDS-INPUT NEEDS-INPUT NEEDS-INPUT 9 && { echo "smoke-test: FAIL (duplicate block would re-post)"; exit 1; }
-  mind_transition_due IDLE NEEDS-INPUT NONE 4 && { echo "smoke-test: FAIL (debounce fired too early for unblock)"; exit 1; }
-  mind_transition_due IDLE NEEDS-INPUT NONE 5 || { echo "smoke-test: FAIL (debounce did not fire for sustained unblock)"; exit 1; }
+  # Recovery is keyed on $posted (3rd arg), NOT $prev (2nd arg) — in real invocation prev==state
+  # always holds by the time this runs (see watch_tick), so these use the REALISTIC shape (prev=state)
+  # and vary posted instead. Falsify by reverting mind_transition_due's else-branch case to "$prev".
+  mind_transition_due IDLE IDLE NEEDS-INPUT 4 && { echo "smoke-test: FAIL (debounce fired too early for unblock)"; exit 1; }
+  mind_transition_due IDLE IDLE NEEDS-INPUT 5 || { echo "smoke-test: FAIL (debounce did not fire for sustained unblock)"; exit 1; }
   mind_transition_due IDLE IDLE NONE 6 && { echo "smoke-test: FAIL (idle without prior block should not post)"; exit 1; }
   # --watch TRANSITION FRAME must still emit the window line (chat-review/mind-state-watch-drops-transition):
   # the bug was a bare `continue` in the state!=prev branch that skipped the print, dropping the channel
@@ -483,51 +607,44 @@ keep this  [mind-limited] quota banner')"
   # transition plumbing: a fresh WEDGED-INPUT is alert-due after debounce, duplicate is not
   mind_transition_due WEDGED-INPUT IDLE NONE 5 || { echo "smoke-test: FAIL (WEDGED-INPUT edge not alert-due)"; exit 1; }
   mind_transition_due WEDGED-INPUT WEDGED-INPUT WEDGED-INPUT 99 && { echo "smoke-test: FAIL (duplicate WEDGED-INPUT would re-post)"; exit 1; }
-  mind_transition_due IDLE WEDGED-INPUT NONE 5 || { echo "smoke-test: FAIL (WEDGED-INPUT→IDLE recovery not alert-due)"; exit 1; }
+  # REALISTIC recovery shape (mindstate-unblocked-edge-unreachable 2026-07-06): prev==state (IDLE) as
+  # it always is on the non-transition frame that reaches this check; posted still names the blocked
+  # state. The OLD test here called mind_transition_due IDLE WEDGED-INPUT NONE 5 (prev=WEDGED-INPUT,
+  # posted=NONE) — a shape that can NEVER occur from watch_tick, which is exactly why it greened while
+  # [mind-unblocked] was structurally unreachable (0 of 13 board entry-alerts ever recovered).
+  mind_transition_due IDLE IDLE WEDGED-INPUT 5 || { echo "smoke-test: FAIL (WEDGED-INPUT→IDLE recovery not alert-due)"; exit 1; }
+  mind_transition_due IDLE IDLE NONE 5 && { echo "smoke-test: FAIL (no prior alerted block must not fire unblock)"; exit 1; }
   # --watch must actually carry the [mind-wedged] alert + the recovery flag (falsify: unwire either)
   grep -qF '[mind-wedged]' "$0" || { echo "smoke-test: FAIL ([mind-wedged] alert unwired from --watch)"; exit 1; }
   grep -qF 'MESH_WEDGE_RECOVER' "$0" || { echo "smoke-test: FAIL (MESH_WEDGE_RECOVER recovery path missing)"; exit 1; }
-  echo "smoke-test: ok (+ WEDGED-INPUT: 2-tick same-text wedge, 1-tick/changed/empty/ghost/WORKING-reset all stay IDLE, edge alert-due + dedupe + recovery plumbing)"; exit 0
+
+  # ── LOOP-LEVEL fixture (mindstate-unblocked-edge-unreachable 2026-07-06) ──────────────────────────
+  # Drive watch_tick — the ACTUAL --watch per-window body — across real frames, sandboxed ($MESH temp
+  # dir, MESH_ALERT_DRYRUN so alert() only echoes to stderr instead of posting to the real board).
+  # Falsify: revert the posted-based checks (mind_transition_due's else-branch, or watch_tick's final
+  # elif) back to checking $prev, and the recovery alert below never fires.
+  _wmesh3="$MESH"; MESH="$(mktemp -d)"
+  _dbo="$MIND_DEBOUNCE_SEC"; MIND_DEBOUNCE_SEC=0
+  export MESH_ALERT_DRYRUN=1
+  _wedged_frame="$(printf '❯ 55.75 37.62 — seed it and wire the sense\n────\n  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents\n')"
+  _clear_frame="$(printf '❯ \n────\n  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents\n')"
+  _loopfail(){ MESH="$_wmesh3"; MIND_DEBOUNCE_SEC="$_dbo"; unset MESH_ALERT_DRYRUN; echo "smoke-test: FAIL ($1)"; exit 1; }
+  watch_tick tloop "$_wedged_frame" >/dev/null 2>/dev/null                         # tick 1: first sighting, not yet wedged
+  watch_tick tloop "$_wedged_frame" >/dev/null 2>/dev/null                         # tick 2: classifies WEDGED-INPUT — but this IS the transition frame (prior stored state was IDLE), so no alert yet
+  _t3="$(watch_tick tloop "$_wedged_frame" 2>&1 >/dev/null)"                       # tick 3: settled WEDGED-INPUT, non-transition → alert due
+  case "$_t3" in *'[mind-wedged]'*) :;; *) _loopfail "loop-level wedge tick never alerted [mind-wedged]: $_t3";; esac
+  [ "$(cat "$(mind_seen_file tloop)" 2>/dev/null)" = WEDGED-INPUT ] \
+    || _loopfail "seenf not advanced to WEDGED-INPUT after the wedge alert"
+  _t4="$(watch_tick tloop "$_clear_frame" 2>&1 >/dev/null)"                        # tick 4: cleared — the FLIP frame, must stay silent
+  case "$_t4" in *'[mind-unblocked]'*) _loopfail "[mind-unblocked] fired on the transition/flip frame — must be gated off it: $_t4";; esac
+  _t5="$(watch_tick tloop "$_clear_frame" 2>&1 >/dev/null)"                        # tick 5: settled IDLE, non-transition → recovery alert due
+  case "$_t5" in *'[mind-unblocked]'*) :;; *) _loopfail "loop-level recovery tick never alerted [mind-unblocked]: $_t5";; esac
+  [ "$(cat "$(mind_seen_file tloop)" 2>/dev/null)" = IDLE ] \
+    || _loopfail "seenf not advanced to IDLE after the unblock alert"
+  rm -rf "$MESH"; MESH="$_wmesh3"; MIND_DEBOUNCE_SEC="$_dbo"; unset MESH_ALERT_DRYRUN
+
+  echo "smoke-test: ok (+ WEDGED-INPUT: 2-tick same-text wedge, 1-tick/changed/empty/ghost/WORKING-reset all stay IDLE, edge alert-due + dedupe + recovery plumbing + loop-level [mind-wedged]→[mind-unblocked] round trip)"; exit 0
 fi
-
-peek_win() { # $1=window  $2=node(local|user@ip) — bottom pane (MIND), like mesh-tell
-  local win="$1" node="$2" cmd
-  cmd="pidx=\$(tmux list-panes -t \"\$(hostname):$win\" -F '#{pane_top} #{pane_index}' 2>/dev/null | sort -n | tail -1 | awk '{print \$2}'); tmux capture-pane -t \"\$(hostname):$win\${pidx:+.\$pidx}\" -p 2>/dev/null | grep -vE '^[[:space:]]*\$' | tail -25"
-  if [ "$node" = local ]; then bash -c "$cmd"
-  else ssh -o BatchMode=yes -o ConnectTimeout=8 "$node" "$cmd"; fi
-}
-
-
-# COOLDOWN: suppress repeated block/limited alerts for the same window
-cooldown_file() { local win=$1 state=$2; echo "$MESH/.mind-state-cooldown-$win-$state"; }
-cooldown_check() {
-  local win=$1 state=$2 cooldown_sec=$3
-  local cf=$(cooldown_file "$win" "$state") now=$(date +%s)
-  if [ -f "$cf" ]; then
-    local last=$(cat "$cf")
-    if [ $((now - last)) -lt "$cooldown_sec" ]; then return 1; fi
-  fi
-  return 0
-}
-cooldown_set() { local win=$1 state=$2; local cf=$(cooldown_file "$win" "$state"); echo "$(date +%s)" > "$cf"; }
-BLOCK_COOLDOWN="${MESH_BLOCK_COOLDOWN:-60}"
-LIMITED_COOLDOWN="${MESH_LIMITED_COOLDOWN:-300}"
-
-alert(){ if [ -n "${MESH_ALERT_DRYRUN:-}" ]; then echo "[dryrun] would alert: $1" >&2; return; fi
-  local msg="$1"
-  local win=$(echo "$msg" | sed -n 's/.*\[\([^]]*\)\].*/\1/p')
-  if echo "$msg" | grep -q "\[mind-blocked\]"; then
-    cooldown_check "$win" "NEEDS-INPUT" "$BLOCK_COOLDOWN" && { cooldown_set "$win" "NEEDS-INPUT"; MESH_WHO="mind-state@$(hostname)" mesh-chat "$msg" >/dev/null 2>&1; }
-  elif echo "$msg" | grep -q "\[mind-limited\]"; then
-    cooldown_check "$win" "RATE-LIMITED" "$LIMITED_COOLDOWN" && { cooldown_set "$win" "RATE-LIMITED"; MESH_WHO="mind-state@$(hostname)" mesh-chat "$msg" >/dev/null 2>&1; }
-  elif echo "$msg" | grep -q "\[mind-wedged\]"; then
-    cooldown_check "$win" "WEDGED-INPUT" "$LIMITED_COOLDOWN" && { cooldown_set "$win" "WEDGED-INPUT"; MESH_WHO="mind-state@$(hostname)" mesh-chat "$msg" >/dev/null 2>&1; }
-  elif echo "$msg" | grep -q "\[mind-unblocked\]"; then
-    MESH_WHO="mind-state@$(hostname)" mesh-chat "$msg" >/dev/null 2>&1
-  else
-    MESH_WHO="mind-state@$(hostname)" mesh-chat "$msg" >/dev/null 2>&1
-  fi
-}
 
 if [ "${1:-}" = --stats ]; then
   shift
@@ -554,73 +671,7 @@ if [ "${1:-}" = --watch ]; then
   # (shell=exec, reflex=loop-host, sh=stray). Everything else carries a mind in its bottom pane.
   [ ${#wins[@]} -gt 0 ] || mapfile -t wins < <(tmux list-windows -t "$(hostname)" -F '#{window_name}' 2>/dev/null | grep -vxE 'shell|reflex|sh|mon:.*')
   for w in "${wins[@]}"; do
-    raw="$(peek_win "$w" local)"           # full pane text BEFORE classification
-    out="$(printf '%s\n' "$raw" | classify)"
-    state="${out%%	*}"; ev="${out#*	}"
-    # WEDGED-INPUT overlay: cross-tick (see header). Runs on every frame — non-IDLE frames clear the
-    # per-window input memory inside wedge_state, so a WORKING turn between two identical-text idles
-    # resets the 2-tick requirement.
-    wstate="$(wedge_state "$w" "$state" "$raw")"
-    if [ "$wstate" != "$state" ]; then
-      state=$wstate
-      _stuck="$(sanitize_quote "$(input_stuck_text "$raw")")"
-      ev="input line stuck ≥2 ticks, never submitted: '${_stuck:0:40}'"
-    fi
-    now="$(date +%s)"
-    statef="$(mind_state_file "$w")"
-    sincef="$(mind_since_file "$w")"
-    seenf="$(mind_seen_file "$w")"
-    prev="$(cat "$statef" 2>/dev/null || echo NONE)"
-    since="$(cat "$sincef" 2>/dev/null || echo "$now")"
-    posted="$(cat "$seenf" 2>/dev/null || echo NONE)"
-    # TRANSITION bookkeeping (chat-review/mind-state-watch-drops-transition 2026-07-05): a state flip
-    # updates the state/since artifacts and RESETS the age baseline (since=now → age=0), then falls
-    # through to the print below. The window's status line MUST be emitted every pass, or mesh-dash
-    # minds drops that channel for a whole frame on every WORKING↔IDLE flip (the old bare `continue`
-    # skipped the print). The alert block stays gated to NON-transition frames (transition=0), so it
-    # fires exactly when it did before — the old `continue` skipped it on the flip frame, and the
-    # age=0 reset would debounce-gate it here anyway; the flag makes that invariant explicit.
-    transition=0
-    if [ "$state" != "$prev" ]; then
-      echo "$state" > "$statef"
-      echo "$now" > "$sincef"
-      since="$now"; transition=1
-    fi
-    [ -f "$sincef" ] || echo "$now" > "$sincef"
-    age=$((now - since))
-    echo "$w: $state — $ev"
-    if [ "$transition" = 0 ] && mind_transition_due "$state" "$prev" "$posted" "$age"; then
-      echo "$state" > "$seenf"
-      if [ "$state" = NEEDS-INPUT ]; then
-      # Summarize: classification evidence ($ev) is the concise reason. Full raw prompt goes
-      # to the mind's own pane (for operator SSH inspection) and stderr (for retainability in
-      # the mind's scrollback). The board gets only the summary — no raw TUI noise.
-      prompt_lines="$(printf '%s\n' "$raw" | grep -vE '^[[:space:]]*$' | tail -8)"
-      echo "full block-prompt for $w: ${prompt_lines}" >&2
-      alert "[mind-blocked] $(hostname):$w waiting on input — $(summarize_reason "$ev")"
-      command -v mesh-tg >/dev/null 2>&1 && mesh-tg "🤖 $(hostname):$w ждёт ввода:
-$(sanitize_quote "$(printf '%s' "$prompt_lines" | head -3)")
-Ответь 'одобряю $w' (разрешу один раз) или 'отклони $w'. Не форсю — твоё решение." >/dev/null 2>&1 || true
-      elif [ "$state" = RATE-LIMITED ]; then
-        alert "[mind-limited] $(hostname):$w quota-exhausted — '$(sanitize_quote "$ev")' — route work elsewhere (mesh-relay/other minds)"
-      elif [ "$state" = WEDGED-INPUT ]; then
-        alert "[mind-wedged] $(hostname):$w — $ev — harness ate the submission (pane reads IDLE); recover: C-u in the pane, then mesh-tell $w the text (MESH_WEDGE_RECOVER=1 automates)"
-        # Auto-recovery (default OFF): the exact sequence minds proved live 2026-07-06 16:18Z —
-        # C-u clears the phantom line, a fresh mesh-tell re-injects+submits. CAVEAT: the captured
-        # text is the pane's RENDERING of the input line — single line, width-truncated; for the
-        # short operator lines this failure hits, a truncated re-send beats a lost submission,
-        # but that's the operator's call → flag-gated, not default.
-        if [ "${MESH_WEDGE_RECOVER:-0}" = 1 ]; then
-          _wtxt="$(input_stuck_text "$raw")"
-          _wpidx="$(tmux list-panes -t "$(hostname):$w" -F '#{pane_top} #{pane_index}' 2>/dev/null | sort -n | tail -1 | awk '{print $2}')"
-          tmux send-keys -t "$(hostname):$w${_wpidx:+.$_wpidx}" C-u 2>/dev/null
-          sleep 1
-          command -v mesh-tell >/dev/null 2>&1 && [ -n "$_wtxt" ] && mesh-tell "$w" "$_wtxt" >/dev/null 2>&1
-        fi
-      elif [ "$prev" = NEEDS-INPUT ] || [ "$prev" = RATE-LIMITED ] || [ "$prev" = WEDGED-INPUT ]; then
-        alert "[mind-unblocked] $(hostname):$w now $state"
-      fi
-    fi
+    watch_tick "$w" "$(peek_win "$w" local)"
   done
   exit 0
 fi
