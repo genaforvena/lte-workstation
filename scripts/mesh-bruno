@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+# mesh-bruno — the BRUNO cross-section: a single perspective fusing every signal we
+# have about the operator's cat into ONE coarse ACTIVITY read (sleep / active / eat /
+# resting), NOT a location. This is the "разрез" the operator asked for (2026-07-06):
+# the bruno channel's data pane is not "data in general" but the angle from which we
+# look at Bruno. Scope is deliberately activity-not-geometry ([[cat-tracking-scope-is-activity-not-location]]).
+#
+# Three existing signals, no new capture infra:
+#   1. VISION  — mesh-imac-cam-watch's ~/.mesh/imac-cat-log.tsv (Groq vision on the iMac
+#                cam near the bed): "Cat visible on the bed" vs "No cat visible".
+#   2. ACTIVITY— mesh-wifi-motion --json (device-free RSSI-variance MOTION/STILL axis).
+#   3. TRUTH   — operator's own TG labels in ~/.mesh/voice-in.log ("Бруно спит/ест/активен"):
+#                the ground-truth override when fresh.
+#
+# Honest fusion: an absent/stale input renders its axis UNKNOWN, never a faked all-clear
+# ([[fusion-tools-distinguish-empty-from-failed]]). All inputs cold -> STATE=UNKNOWN.
+#
+# Usage:
+#   mesh-bruno            one-shot fused read (human, for the dash)
+#   mesh-bruno --json     machine-readable {state, driver, seen, activity, label, ts}
+#   mesh-bruno --test     smoke-test (fixtures, no live cam/wifi)
+#
+# reflex-cadence: */5 * * * *
+# Cheap (local file parse + one wifi-motion tape classify) — safe at 5-min cadence to keep
+# the bruno dash's cached state fresh; --test is sandboxed (fixtures, no real read).
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+
+MESH="$HOME/.mesh"; mkdir -p "$MESH"
+CAMLOG="${MESH_BRUNO_CAMLOG:-$MESH/imac-cat-log.tsv}"
+VOICELOG="${MESH_BRUNO_VOICELOG:-$MESH/voice-in.log}"
+STATE="${MESH_BRUNO_STATE:-$MESH/bruno.state}"
+NOWIFI="${MESH_BRUNO_NOWIFI:-}"   # test hermeticity: skip the mesh-wifi-motion call
+
+# ---- --test: hermetic, fixture-driven (no live cam/wifi/network) ----
+if [ "${1:-}" = "--test" ]; then
+  f=0
+  for d in date grep awk sed; do command -v "$d" >/dev/null 2>&1 || { echo "  FAIL: $d missing"; f=1; }; done
+  tmp="$(mktemp -d)"
+  # voice fixture: a SHORT real label (older) + the operator's LONG walk-design paragraph (newer).
+  # The paragraph mentions 'бруно' AND is full of 'то есть' — the exact input that first FALSELY read
+  # EATING (bare 'ест' substring). It must be REJECTED (>80 chars + no cat-eating token) so the newest
+  # MATCHING label is the short 'спит' → SLEEPING.
+  { echo "2026-07-06T10:00:00Z  VOICE  Бруно спит на кровати";
+    echo "2026-07-06T17:48:48Z  VOICE  Да, и кстати на прогулке, то есть вот про обруно, то есть если появляется фокус, то есть надо смотреть за бруны в контексте"; } > "$tmp/voice.log"
+  echo "2026-07-06T17:00:00Z	Bed and printer. Cat visible on the bed." > "$tmp/cam.log"
+  out="$(MESH_BRUNO_VOICELOG="$tmp/voice.log" MESH_BRUNO_CAMLOG="$tmp/cam.log" \
+         MESH_BRUNO_STATE="$tmp/state" MESH_BRUNO_NOWIFI=1 "$0" --json 2>/dev/null)"
+  case "$out" in *'"label":"SLEEPING"'*) : ;; *) echo "  FAIL: short 'Бруно спит' not classified SLEEPING (got: $out)"; f=1 ;; esac
+  case "$out" in *'"label":"EATING"'*) echo "  FAIL: walk-paragraph 'то есть' falsely read as EATING (regression)"; f=1 ;; esac
+  case "$out" in *'"seen":"SEEN"'*) : ;; *) echo "  FAIL: cat-visible cam fixture not read as SEEN (real-read gate)"; f=1 ;; esac
+  rm -rf "$tmp"
+  [ "$f" = 0 ] && { echo "smoke-test: ok (label gate + EATING-regression + cam real-read)"; exit 0; } || { echo "smoke-test: FAIL"; exit 1; }
+fi
+
+now=$(date +%s)
+iso_to_epoch(){ date -u -d "$1" +%s 2>/dev/null || echo 0; }
+age_fmt(){ local s=$1; if [ "$s" -lt 0 ]; then echo "?"; elif [ "$s" -lt 90 ]; then echo "${s}s"; \
+  elif [ "$s" -lt 5400 ]; then echo "$((s/60))m"; elif [ "$s" -lt 172800 ]; then echo "$((s/3600))h"; \
+  else echo "$((s/86400))d"; fi; }
+
+# --- 1. VISION axis: last cat-visible sighting from the cam log ---------------------
+# tsv rows are "<iso>\t<description...>" possibly wrapping onto the next physical line;
+# we scan for the newest row whose text says the cat IS visible (and not "no cat").
+seen_state="UNKNOWN"; seen_age=-1; seen_desc=""
+if [ -s "$CAMLOG" ]; then
+  # newest timestamped row overall (freshness of the cam itself)
+  last_cam_ts=$(grep -oE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]+Z' "$CAMLOG" | tail -1)
+  # newest row that AFFIRMS a cat (visible/on the bed/…) and is not a "no cat"/failed line
+  vis_line=$(grep -iE '^[0-9]{4}-.*(cat|кот|bruno|бруно)' "$CAMLOG" \
+             | grep -ivE 'no cat|not visible|no.*visible|classification failed' | tail -1)
+  if [ -n "$vis_line" ]; then
+    vts=$(echo "$vis_line" | grep -oE '^[0-9-]+T[0-9:]+Z')
+    seen_age=$(( now - $(iso_to_epoch "$vts") ))
+    seen_desc=$(echo "$vis_line" | sed -E 's/^[0-9T:Z-]+\t?//' | cut -c1-70)
+    seen_state="SEEN"
+  elif [ -n "$last_cam_ts" ]; then
+    # cam is live but reports no cat -> honest "not in frame", with the cam's own freshness
+    seen_age=$(( now - $(iso_to_epoch "$last_cam_ts") ))
+    seen_state="NOT-IN-FRAME"
+  fi
+fi
+
+# --- 2. ACTIVITY axis: wifi-motion device-free RSSI ---------------------------------
+act_verdict="UNKNOWN"; act_age=-1
+if [ -z "$NOWIFI" ] && command -v mesh-wifi-motion >/dev/null 2>&1; then
+  wj=$(timeout 15 mesh-wifi-motion --json 2>/dev/null)
+  if [ -n "$wj" ]; then
+    act_verdict=$(echo "$wj" | grep -oE '"verdict":"[A-Z]+"' | cut -d'"' -f4)
+    am=$(echo "$wj" | grep -oE '"age_s":[0-9]+' | cut -d: -f2)
+    [ -n "$am" ] && act_age=$am
+    [ -z "$act_verdict" ] && act_verdict="UNKNOWN"
+  fi
+fi
+
+# --- 3. GROUND-TRUTH axis: operator's own TG labels ---------------------------------
+# A real ground-truth label is a SHORT, deliberate line ("Бруно спит" / "ест" / "активен"),
+# NOT a rambling design paragraph that merely happens to mention the cat. Gate #1: line length
+# < 80 chars. This is what killed the first cut — the operator's long windows-design message
+# said "обруно"/"бруны" AND contained "то есть" ×N, so a bare `ест` substring falsely read
+# EATING. Gate #2: eating tokens must be cat-eating words, never a substring of "то есть"/"есть".
+lbl_state=""; lbl_age=-1; lbl_raw=""
+if [ -s "$VOICELOG" ]; then
+  lline=$(awk 'length($0) < 80' "$VOICELOG" | grep -iE 'бруно|bruno' \
+          | grep -iE 'спит|сон|засыпа|sleep|проснул|awake|кушает|поел|жр[ёе]т|покорм|у миски|корм|eat|актив|игра|бегает|active|play' \
+          | tail -1)
+  if [ -n "$lline" ]; then
+    lts=$(echo "$lline" | grep -oE '^[0-9-]+T[0-9:]+Z')
+    [ -n "$lts" ] && lbl_age=$(( now - $(iso_to_epoch "$lts") ))
+    lbl_raw=$(echo "$lline" | sed -E 's/^[0-9T:Z-]+ +VOICE +//' | cut -c1-60)
+    case "$lline" in
+      *спит*|*сон*|*засыпа*|*[Ss]leep*|*проснул*|*awake*)              lbl_state="SLEEPING" ;;
+      *кушает*|*поел*|*жр[ёе]т*|*покорм*|*"у миски"*|*корм*|*[Ee]at*)  lbl_state="EATING" ;;
+      *актив*|*игра*|*[Aa]ctive*|*play*|*бегает*)                      lbl_state="ACTIVE" ;;
+    esac
+  fi
+fi
+
+# --- FUSE -> one coarse STATE + the signal that drove it ----------------------------
+# Priority: a FRESH operator label (<45m) is authoritative ground truth; else derive
+# from vision+activity; else UNKNOWN. We never assert a state no signal supports.
+state="UNKNOWN"; driver="no live signal"
+if [ -n "$lbl_state" ] && [ "$lbl_age" -ge 0 ] && [ "$lbl_age" -lt 2700 ]; then
+  state="$lbl_state"; driver="operator label ${lbl_age}s ago"
+elif [ "$seen_state" = "SEEN" ] && [ "$seen_age" -lt 1800 ]; then
+  # seen recently: motion axis splits active vs resting
+  case "$act_verdict" in
+    MOTION) state="ACTIVE";  driver="cam-seen + wifi MOTION" ;;
+    STILL)  state="RESTING"; driver="cam-seen + wifi STILL" ;;
+    *)      state="PRESENT"; driver="cam-seen ${seen_age}s ago" ;;
+  esac
+elif [ "$act_verdict" = "MOTION" ]; then
+  state="ACTIVE"; driver="wifi MOTION (cam: $seen_state)"
+elif [ "$act_verdict" = "STILL" ]; then
+  state="RESTING"; driver="wifi STILL (cam: $seen_state)"
+fi
+
+ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+if [ "${1:-}" = "--json" ]; then
+  printf '{"state":"%s","driver":"%s","seen":"%s","seen_age_s":%d,"activity":"%s","activity_age_s":%d,"label":"%s","label_age_s":%d,"ts":"%s"}\n' \
+    "$state" "$driver" "$seen_state" "$seen_age" "$act_verdict" "$act_age" "${lbl_state:-none}" "$lbl_age" "$ts"
+else
+  echo "Bruno — $state   ($driver)"
+  if [ "$seen_state" = "SEEN" ]; then echo "  seen:     $(age_fmt $seen_age) ago — $seen_desc"
+  elif [ "$seen_state" = "NOT-IN-FRAME" ]; then echo "  seen:     not in frame (cam live $(age_fmt $seen_age) ago)"
+  else echo "  seen:     UNKNOWN (cam log cold)"; fi
+  if [ "$act_verdict" != "UNKNOWN" ]; then echo "  activity: wifi $act_verdict ($(age_fmt $act_age) ago)"
+  else echo "  activity: UNKNOWN (no wifi tape)"; fi
+  if [ -n "$lbl_state" ]; then echo "  operator: '$lbl_raw' -> $lbl_state ($(age_fmt $lbl_age) ago)"
+  else echo "  operator: no Bruno label logged"; fi
+fi
+
+# liveness-touch: mtime = ran-live (always), content = the change-gated state
+# ([[reflex-cadence-prose-and-cron-glob]] / state-touch convention).
+{ echo "$state|$driver|$ts"; } > "$STATE" 2>/dev/null || true
+command -v mesh-state-touch >/dev/null 2>&1 && mesh-state-touch "$STATE" >/dev/null 2>&1 || touch "$STATE" 2>/dev/null || true
+exit 0
