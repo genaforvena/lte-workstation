@@ -46,6 +46,9 @@ MAX_PCT="$PSTATE/max_perf_pct"
 MESH="${MESH_HOME:-$HOME/.mesh}"
 STATE="${MESH_TURBO_LID_STATE:-$MESH/.turbo-lid.state}"
 TTL_DEFAULT="${MESH_LID_TTL:-600}"
+LID_TTL_MAX="${MESH_LID_TTL_MAX:-3600}"                       # adaptive-hold ceiling (flap dampener)
+DROPLOG="${MESH_TURBO_LID_DROPLOG:-$MESH/.turbo-lid-drops.log}"     # swallowed board edges land here (detectable)
+LASTREL="${MESH_TURBO_LID_LASTREL:-$MESH/.turbo-lid-lastrelease}"   # last auto-release "<epoch> <hold>" (flap detect)
 CLAIM_KEY="turbo-lid"
 
 ts(){ date -u +%Y-%m-%dT%H:%M:%SZ; }
@@ -67,14 +70,24 @@ state_get(){ # $1 field → value ('' if absent)
   [ -f "$STATE" ] || { echo ""; return; }
   awk -v k="$1" '{for(i=1;i<=NF;i++){n=index($i,"="); if(n>0 && substr($i,1,n-1)==k){print substr($i,n+1); exit}}}' "$STATE"
 }
-state_write(){ # LID pct since deadline reason pid
-  printf 'LID=%s pct=%s since=%s deadline=%s reason=%s pid=%s\n' "$1" "$2" "$3" "$4" "$5" "$6" > "$STATE"
+state_write(){ # LID pct since deadline reason pid [announced] [ttl]
+  # announced = did the [lid-on] board post SUCCEED (0 → owes a catch-up on release); ttl = the hold in
+  # effect (armed into LASTREL on auto-release so a fast re-lid can escalate). Keyed state_get keeps
+  # old 6-field state files readable (missing keys → "").
+  printf 'LID=%s pct=%s since=%s deadline=%s reason=%s pid=%s announced=%s ttl=%s\n' \
+    "$1" "$2" "$3" "$4" "$5" "$6" "${7:-0}" "${8:-0}" > "$STATE"
   command -v mesh-state-touch >/dev/null 2>&1 && mesh-state-touch "$STATE" >/dev/null 2>&1 || touch "$STATE"
 }
 
-board(){ # $1 marker-line — edge posts only
-  command -v mesh-chat >/dev/null 2>&1 || return 0
-  MESH_WHO="turbo-lid@$(hostname)" mesh-chat "$1" >/dev/null 2>&1 || true
+board(){ # $1 marker-line — edge posts only. Returns 0 IFF the board actually took it; a SWALLOWED post
+         # (mesh-chat absent OR the post fails) is appended to a durable drops-log so a silent drop is
+         # DETECTABLE + self-healable — health 2026-07-06: a dropped [lid-on] reads as "still lidded" with
+         # ZERO trace (the misdirected "cron PATH hole" was a red herring; PATH is already exported :41).
+  if command -v mesh-chat >/dev/null 2>&1 && MESH_WHO="turbo-lid@$(hostname)" mesh-chat "$1" >/dev/null 2>&1; then
+    return 0
+  fi
+  { printf '%s DROPPED %s\n' "$(ts)" "$1" >> "$DROPLOG"; } 2>/dev/null || true
+  return 1
 }
 
 cur_mhz(){ # best-effort all-core avg scaling freq in MHz (advisory, for --status)
@@ -93,16 +106,48 @@ lid_expired(){ # $1 lid_state  $2 deadline  $3 now  → 0 = release, 1 = hold/na
   [ "$3" -ge "$2" ]
 }
 
+# --- adaptive hold (flap dampener): a re-lid within 2× the last auto-release's hold DOUBLES the ttl
+#     (cap LID_TTL_MAX), so a node that reheats ~20min after each release stops thrashing the clock; a
+#     quiet gap (> 2× the last hold) decays straight back to base. node-care's Schmitt precedent applied
+#     to hold-TIME. PURE except reading the LASTREL sidecar; --test drives it via MESH_TURBO_LID_LASTREL.
+adaptive_ttl(){ # $1 base_ttl → escalated-or-base ttl
+  local base="$1" lr_ts lr_ttl gap ne bigger esc
+  [ -r "$LASTREL" ] || { echo "$base"; return; }
+  read -r lr_ts lr_ttl _ < "$LASTREL" 2>/dev/null || true
+  { [[ "${lr_ts:-}" =~ ^[0-9]+$ ]] && [[ "${lr_ttl:-}" =~ ^[0-9]+$ ]]; } || { echo "$base"; return; }
+  ne="$(now)"; gap=$(( ne - lr_ts ))
+  if [ "$gap" -ge 0 ] && [ "$gap" -le $(( 2 * lr_ttl )) ]; then    # re-lid inside 2× the last hold = flap
+    bigger="$base"; [ "$lr_ttl" -gt "$bigger" ] && bigger="$lr_ttl"
+    esc=$(( bigger * 2 )); [ "$esc" -gt "$LID_TTL_MAX" ] && esc="$LID_TTL_MAX"
+    echo "$esc"
+  else
+    echo "$base"
+  fi
+}
+
 do_off(){ # $1 reason
-  local prev pid; prev="$(state_get LID)"; pid="$(state_get pid)"
+  local prev pid ann on_reason on_ttl; prev="$(state_get LID)"; pid="$(state_get pid)"
+  ann="$(state_get announced)"; on_reason="$(state_get reason)"; on_ttl="$(state_get ttl)"
   write_knob "$NO_TURBO" 0
   write_knob "$MAX_PCT" 100
   # persist OFF *before* cancelling the releaser: when the releaser ITSELF calls do_off (dead-man
   # path), killing its own pid is a suicide — state must already be written or it strands at LID=on.
-  state_write off 100 "$(state_get since)" "" "${1:-off}" ""
+  state_write off 100 "$(state_get since)" "" "${1:-off}" "" 0 0
   [[ "$pid" =~ ^[0-9]+$ ]] && [ "$pid" != "$$" ] && kill "$pid" 2>/dev/null || true
   command -v mesh-claim >/dev/null 2>&1 && MESH_WHO="turbo-lid@$(hostname)" mesh-claim --done "$CLAIM_KEY" >/dev/null 2>&1 || true
-  [ "$prev" = on ] && board "[lid-off] $(hostname) turbo restored (no_turbo=0, max_perf_pct=100) — reason=${1:-off}"
+  if [ "$prev" = on ]; then
+    # SELF-HEAL: if this episode's [lid-on] board post was DROPPED (announced!=1), reconstruct a catch-up
+    # [lid-on] before the [lid-off] so the board's on/off pairing is restored — else a silent on reads as
+    # "still lidded" forever (health 2026-07-06). The catch-up is itself drop-logged by board() if it fails.
+    [ "$ann" != 1 ] && board "[lid-on] $(hostname) (CATCH-UP: on-edge post was dropped — reconstructing pairing) reason=${on_reason:-?}"
+    board "[lid-off] $(hostname) turbo restored (no_turbo=0, max_perf_pct=100) — reason=${1:-off}"
+  fi
+  # FLAP DAMPENER: record the auto-release instant + the hold that just expired so a fast re-lid escalates
+  # (adaptive_ttl). ONLY the dead-man auto path arms it — a manual --off must not make the node flap-escalate.
+  if [ "${1:-off}" = auto-release-ttl ]; then
+    [[ "${on_ttl:-}" =~ ^[0-9]+$ ]] && [ "$on_ttl" -gt 0 ] || on_ttl="$TTL_DEFAULT"
+    { printf '%s %s\n' "$(now)" "$on_ttl" > "$LASTREL"; } 2>/dev/null || true
+  fi
   echo "turbo-lid: OFF (restored)"
 }
 
@@ -117,6 +162,7 @@ do_on(){
     esac
   done
   [[ "$ttl" =~ ^[0-9]+$ ]] || ttl="$TTL_DEFAULT"
+  local base_ttl="$ttl"; ttl="$(adaptive_ttl "$ttl")"   # flap dampener: fast re-lid → doubled hold (capped)
   # single-writer: refuse if another mind holds a LIVE claim (exit 2 == theirs-live)
   if command -v mesh-claim >/dev/null 2>&1 && [ "${MESH_TURBO_LID_DRYRUN:-0}" != 1 ]; then
     # MESH_WHO on EVERY claim verb (as board() does): cron leaves USER unset, so a bare mesh-claim
@@ -142,9 +188,14 @@ do_on(){
     setsid bash -c "sleep $ttl; exec '$0' --release-if-expired" </dev/null >/dev/null 2>&1 &
     rpid=$!
   fi
-  state_write on "$pct" "$(ts)" "$deadline" "$reason" "$rpid"
-  [ "$prev" != on ] && board "[lid-on] $(hostname) CPU lid CLOSED (pct=$pct, ttl=${ttl}s) — reason=$reason"
-  echo "turbo-lid: ON (pct=$pct ttl=${ttl}s deadline=$deadline reason=$reason releaser=$rpid)"
+  # announced tracks whether the [lid-on] edge post actually landed; on a re-assert (prev==on, no new
+  # edge) carry the prior value forward so an earlier drop still owes its catch-up on release.
+  local ann; ann="$(state_get announced)"; [[ "$ann" =~ ^[01]$ ]] || ann=0
+  if [ "$prev" != on ]; then
+    if board "[lid-on] $(hostname) CPU lid CLOSED (pct=$pct, ttl=${ttl}s$( [ "$ttl" != "$base_ttl" ] && printf ' [adaptive↑ from %ss — flap]' "$base_ttl" )) — reason=$reason"; then ann=1; else ann=0; fi
+  fi
+  state_write on "$pct" "$(ts)" "$deadline" "$reason" "$rpid" "$ann" "$ttl"
+  echo "turbo-lid: ON (pct=$pct ttl=${ttl}s deadline=$deadline reason=$reason releaser=$rpid announced=$ann)"
 }
 
 do_status(){
@@ -175,11 +226,13 @@ case "${1:---status}" in
     lid_expired on '' 9999   || fail "expired: on with no deadline must release (never strand closed)"
     # ---- state round-trip parse ----
     STATE="$(mktemp)"; trap 'rm -f "$STATE"' EXIT
-    state_write on 70 T1 12345 therm-hot 4242
+    state_write on 70 T1 12345 therm-hot 4242 1 900
     [ "$(state_get LID)" = on ]        || fail "state LID parse"
     [ "$(state_get pct)" = 70 ]        || fail "state pct parse"
     [ "$(state_get deadline)" = 12345 ]|| fail "state deadline parse"
     [ "$(state_get pid)" = 4242 ]      || fail "state pid parse"
+    [ "$(state_get announced)" = 1 ]   || fail "state announced parse"
+    [ "$(state_get ttl)" = 900 ]       || fail "state ttl parse"
     [ -z "$(state_get nope)" ]         || fail "absent field must be empty"
     # ---- knob writes are DRYRUN in test (no real fire / no sudo) ----
     MESH_TURBO_LID_DRYRUN=1
@@ -187,6 +240,52 @@ case "${1:---status}" in
     # ---- FALSIFIABILITY: reverting lid_expired's boundary to a strict '>' would let now==deadline HOLD ----
     _fx(){ [ "$1" = on ] || return 1; [ "$3" -gt "$2" ]; }   # the WRONG (strict) variant
     _fx on 1000 1000 && fail "falsify: strict-> variant should NOT release at now==deadline (guards the >= boundary)"
+
+    # ==== turbo-lid-silent-actuation+flap (health-corrected fixes: drops-log + catch-up + adaptive hold) ====
+    # (1) board() drops-log: a SWALLOWED post lands in the durable drops-log + board() returns non-zero.
+    DROPLOG="$(mktemp)"; mesh-chat(){ return 1; }   # stub: force the post-fails branch deterministically
+    board "[lid-on] test drop" && fail "board must return non-zero when the post is swallowed"
+    grep -q 'DROPPED .*\[lid-on\] test drop' "$DROPLOG" || fail "board must append a swallowed post to the drops-log (detectable)"
+    mesh-chat(){ return 0; }; : > "$DROPLOG"
+    board "[lid-off] test ok" || fail "board must return 0 on a successful post"
+    [ -s "$DROPLOG" ] && fail "a successful post must NOT write to the drops-log"
+    unset -f mesh-chat; rm -f "$DROPLOG"
+    # (2) adaptive hold (flap dampener): re-lid within 2× the last hold DOUBLES ttl (capped); quiet gap decays.
+    LASTREL="$(mktemp)"; LID_TTL_MAX=3600
+    printf '%s %s\n' "$(now)" 600 > "$LASTREL"                    # released now, held 600 → flap → 1200
+    [ "$(adaptive_ttl 600)" = 1200 ] || fail "adaptive: re-lid within 2× last hold must double the ttl (600→1200)"
+    printf '%s %s\n' "$(( $(now) - 800 ))" 600 > "$LASTREL"       # gap 800 ≤ 2×600=1200 → still a flap
+    [ "$(adaptive_ttl 600)" = 1200 ] || fail "adaptive: gap 800 ≤ 2×600 must flap (guards the 2× window, not 1×)"
+    printf '%s %s\n' "$(( $(now) - 5000 ))" 600 > "$LASTREL"      # gap 5000 > 1200 → decay to base
+    [ "$(adaptive_ttl 600)" = 600 ]  || fail "adaptive: a quiet gap (> 2× last hold) must decay to base ttl"
+    printf '%s %s\n' "$(now)" 2000 > "$LASTREL"                   # held 2000 → 4000 capped at 3600
+    [ "$(adaptive_ttl 600)" = 3600 ] || fail "adaptive: escalation must cap at LID_TTL_MAX (3600)"
+    rm -f "$LASTREL"; LASTREL="$(mktemp -u)"                      # absent sidecar → never escalate blind
+    [ "$(adaptive_ttl 600)" = 600 ]  || fail "adaptive: absent LASTREL must return base ttl"
+    # (3) SELF-HEAL catch-up (via the REAL do_off path, DRYRUN + stubbed board/claim): a dropped on-edge
+    #     (announced!=1) reconstructs a catch-up [lid-on] on release; an announced=1 lid must NOT double-post.
+    MESH_TURBO_LID_DRYRUN=1
+    cap="$(mktemp)"; mesh-chat(){ printf '%s\n' "$*" >> "$cap"; return 0; }; mesh-claim(){ return 0; }
+    STATE="$(mktemp)"; LASTREL="$(mktemp)"
+    state_write on turbo-off T1 12345 therm-hot '' 0 600         # announced=0 → on-edge was dropped
+    do_off auto-release-ttl >/dev/null 2>&1
+    grep -q 'CATCH-UP.*\[lid-on\]\|\[lid-on\].*CATCH-UP' "$cap" || fail "self-heal: a dropped on-edge (announced=0) must reconstruct a catch-up [lid-on] on release"
+    grep -q '\[lid-off\]' "$cap" || fail "self-heal: [lid-off] must still post after the catch-up"
+    read -r _lrt _lrh _ < "$LASTREL" 2>/dev/null; [ "${_lrh:-}" = 600 ] || fail "auto-release must ARM the flap dampener (LASTREL holds the expired hold=600)"
+    : > "$cap"
+    state_write on turbo-off T1 12345 therm-hot '' 1 600         # announced=1 → NO catch-up
+    do_off auto-release-ttl >/dev/null 2>&1
+    grep -q 'CATCH-UP' "$cap" && fail "self-heal: an announced=1 lid must NOT emit a catch-up (no double post)"
+    grep -q '\[lid-off\]' "$cap" || fail "self-heal: [lid-off] must post for announced=1 too"
+    # a MANUAL --off must NOT arm the dampener (only the dead-man auto path flaps)
+    rm -f "$LASTREL"
+    state_write on turbo-off T1 12345 manual '' 1 600
+    do_off manual >/dev/null 2>&1
+    [ -e "$LASTREL" ] && fail "manual --off must NOT arm the flap dampener (LASTREL must stay absent)"
+    unset -f mesh-chat mesh-claim; rm -f "$cap" "$STATE" "$LASTREL"
+    MESH_TURBO_LID_DRYRUN=1   # (re-affirm for the real-read gate below; unchanged)
+    # ==== end silent-actuation+flap cells ====
+
     # ---- REAL-READ GATE: intel_pstate knobs present+readable → assert; else honest n/a exit 2 ----
     if have_pstate; then
       read -r _nt < "$NO_TURBO"; read -r _mp < "$MAX_PCT"
