@@ -17,7 +17,14 @@
 #   routing recent recoveries to trace only; (2) THROTTLING-side dwell: require
 #   MESH_THROTTLE_DWELL (default 2) consecutive positive deltas before posting
 #   [cpu-throttling] to the board, routing sub-threshold events to trace only.
-#   State file format: "<pkg> <state> <ms> <dwell>" (4 fields).
+#   ALARM-PAIRING: an 'announced' flag (5th field) records whether THIS episode was
+#   board-alarmed; the NOMINAL recovery posts [cpu-nominal] ONLY for an announced
+#   episode (a sub-dwell, board-silent throttle recovers to trace — never an unpaired
+#   'headroom recovered' with no preceding alarm). The alarm fires ONCE per episode,
+#   when dwell first reaches the threshold — NOT on the entry edge alone (entry is
+#   always dwell=1 since any positive delta is THROTTLING, so the old entry-only guard
+#   never fired for a SUSTAINED throttle → [cpu-throttling] was silently dead).
+#   State file format: "<pkg> <state> <ms> <dwell> <announced>" (5 fields).
 # reflex-cadence: 1-59/5 * * * *
 # reflex-args: --edge
 set -u
@@ -36,6 +43,12 @@ post() {
   command -v mesh-chat >/dev/null 2>&1 && mesh-chat "$*" >/dev/null 2>&1
 }
 
+# trace — the sub-threshold / suppressed sink; honors NOCHAT so --test stays hermetic
+trace() {
+  [ -n "${MESH_THROTTLE_NOCHAT:-}" ] && return 0
+  command -v mesh-trace >/dev/null 2>&1 && mesh-trace "$*" >/dev/null 2>&1 || true
+}
+
 read_int() { local f="$1"; [ -r "$f" ] && cat "$f" 2>/dev/null || echo ""; }
 
 # --- portable logic self-test (runs on ANY node, no sysfs needed) -------------
@@ -45,6 +58,36 @@ if [ "${1:-}" = "--test" ]; then
   [ "$(verdict_for_delta 7)"  = THROTTLING ] || fail="$fail delta7!=THROTTLING"
   [ "$(verdict_for_delta "")" = NOMINAL ]    || fail="$fail empty!=NOMINAL"
   if [ -n "$fail" ]; then echo "smoke-test: FAIL ($fail )"; exit 1; fi
+
+  # --- edge state-machine: announced-flag alarm/recovery pairing (hermetic) ------
+  # Re-execs the SAME --edge code path against a fixture counter dir; post() emits
+  # "[would-post] …" on stderr under NOCHAT, trace() is silenced — so we assert on
+  # exactly the BOARD posts, with zero real side-effects.
+  et=$(mktemp -d); ett="$et/tt"; mkdir -p "$ett"
+  edge() {  # $1=package_throttle_count value -> echoes any [would-post] board lines
+    printf '%s\n' "$1" > "$ett/package_throttle_count"
+    printf '0\n'      > "$ett/package_throttle_total_time_ms"
+    MESH_TT_DIR="$ett" MESH_THROTTLE_STATE="$et/state" \
+    MESH_NOM_COOLDOWN_FILE="$et/cooldown" MESH_THROTTLE_NOCHAT=1 \
+      "$0" --edge 2>&1 1>/dev/null
+  }
+  efail=""
+  edge 100 >/dev/null           # seed (prev_state NONE — no post)
+  s1=$(edge 101)                # delta1 -> THROTTLING dwell1 (sub-threshold)
+  s2=$(edge 101)                # delta0 -> NOMINAL: recovery of an UNannounced episode
+  # A (the core fix): a sub-dwell throttle→recover cycle yields ZERO board posts
+  [ -z "$s1$s2" ] || efail="$efail subdwell-posted:[$s1|$s2]"
+  edge 103 >/dev/null           # delta2 -> THROTTLING dwell1
+  s3=$(edge 105)                # delta2 -> THROTTLING dwell2 -> ALARM (revived)
+  # B: a sustained throttle (dwell>=THROTTLE_DWELL) alarms exactly once
+  case "$s3" in *'[cpu-throttling]'*) : ;; *) efail="$efail dwell2-no-alarm:[$s3]";; esac
+  s3b=$(edge 107)               # delta2 -> still THROTTLING, already announced -> silent
+  case "$s3b" in *'[cpu-'*) efail="$efail double-alarm:[$s3b]";; esac
+  s4=$(edge 107)                # delta0 -> NOMINAL: recovery of an ANNOUNCED episode
+  # C: recovery of an announced episode still posts [cpu-nominal] (no over-suppression)
+  case "$s4" in *'[cpu-nominal]'*) : ;; *) efail="$efail announced-recovery-silent:[$s4]";; esac
+  rm -rf "$et"
+  if [ -n "$efail" ]; then echo "edge-test: FAIL ($efail )"; exit 1; fi
   if [ -r "$TT/package_throttle_count" ]; then
     echo "smoke-test: ok (logic sound; counters present — sense LIVE here)"
   else
@@ -80,9 +123,9 @@ avg_mhz=0; pct=0
 
 # --- edge / stream mode: stateful delta, post on transition -------------------
 if [ "${1:-}" = "--edge" ]; then
-  prev_pkg=""; prev_state="NONE"; prev_dwell=0
-  if [ -r "$STATE" ]; then read -r prev_pkg prev_state _ prev_dwell _ < "$STATE" 2>/dev/null || true; fi
-  prev_dwell="${prev_dwell:-0}"
+  prev_pkg=""; prev_state="NONE"; prev_dwell=0; prev_announced=0
+  if [ -r "$STATE" ]; then read -r prev_pkg prev_state _ prev_dwell prev_announced < "$STATE" 2>/dev/null || true; fi
+  prev_dwell="${prev_dwell:-0}"; prev_announced="${prev_announced:-0}"
   delta=0
   if [ -n "$prev_pkg" ] && [ "$pkg" -ge "$prev_pkg" ] 2>/dev/null; then delta=$((pkg - prev_pkg)); fi
   state=$(verdict_for_delta "$delta")
@@ -92,31 +135,45 @@ if [ "${1:-}" = "--edge" ]; then
   else
     dwell=0
   fi
+  THROTTLE_DWELL="${MESH_THROTTLE_DWELL:-2}"
+  # 'announced': 1 once this THROTTLING episode has been board-alarmed. Alarm ONCE
+  # per episode, the first cycle dwell reaches THROTTLE_DWELL (carry the flag through
+  # the rest of the episode; reset on recovery so the next episode re-arms). This
+  # replaces the old entry-edge-only guard, which never fired for a sustained throttle.
+  announced="$prev_announced"; do_throttle_post=0
+  if [ "$state" = THROTTLING ]; then
+    if [ "$prev_announced" != 1 ] && [ "$dwell" -ge "$THROTTLE_DWELL" ]; then
+      do_throttle_post=1; announced=1
+    fi
+  else
+    announced=0
+  fi
   mkdir -p "$(dirname "$STATE")" 2>/dev/null
-  printf '%s %s %s %s\n' "$pkg" "$state" "$pkg_ms" "$dwell" > "$STATE"
+  printf '%s %s %s %s %s\n' "$pkg" "$state" "$pkg_ms" "$dwell" "$announced" > "$STATE"
   # seed silently on first run (no prior baseline)
   if [ "$prev_state" = "NONE" ]; then exit 0; fi
-  THROTTLE_DWELL="${MESH_THROTTLE_DWELL:-2}"
-  if [ "$state" = THROTTLING ] && [ "$prev_state" != THROTTLING ]; then
-    if [ "$dwell" -ge "$THROTTLE_DWELL" ]; then
-      post "[cpu-throttling] $(hostname): CPU actively thermal-throttling — +$delta pkg throttle event(s) since last check (total ${pkg}, ${pkg_ms}ms). Freq ${avg_mhz}MHz (${pct}% of max). The operator channel is at risk — shed a mind / cool the box."
-    else
-      command -v mesh-trace >/dev/null 2>&1 && \
-        mesh-trace "[cpu-throttling-suppressed] $(hostname): +$delta pkg throttle event(s) (dwell $dwell/$THROTTLE_DWELL) — sub-threshold, trace only." >/dev/null 2>&1 || true
-    fi
+  if [ "$do_throttle_post" = 1 ]; then
+    post "[cpu-throttling] $(hostname): CPU actively thermal-throttling — +$delta pkg throttle event(s) since last check (total ${pkg}, ${pkg_ms}ms). Freq ${avg_mhz}MHz (${pct}% of max). The operator channel is at risk — shed a mind / cool the box."
+  elif [ "$state" = THROTTLING ] && [ "$prev_state" != THROTTLING ]; then
+    trace "[cpu-throttling-suppressed] $(hostname): +$delta pkg throttle event(s) (dwell $dwell/$THROTTLE_DWELL) — sub-threshold, trace only."
   elif [ "$state" = NOMINAL ] && [ "$prev_state" = THROTTLING ]; then
-    # cpu-nominal cooldown: suppress board post within 30 min of last nominal post.
-    # Throttle→nominal→throttle cycles produce 2 board lines each; this cuts the noise
-    # in half by routing recent nominal recoveries to trace only.
-    NOM_COOLDOWN="$HOME/.mesh/.cpu-nominal-cooldown"
-    _nom_now=$(date +%s)
-    _nom_last=$(cat "$NOM_COOLDOWN" 2>/dev/null || echo 0)
-    if [ $((_nom_now - _nom_last)) -lt 1800 ]; then
-      command -v mesh-trace >/dev/null 2>&1 && \
-        mesh-trace "[cpu-nominal-suppressed] $(hostname): CPU throttling stopped — no new throttle events. Freq ${avg_mhz}MHz (${pct}% of max)." >/dev/null 2>&1 || true
+    # cpu-nominal recovery. Two gates so a recovery only reaches the board when it
+    # PAIRS a real alarm and isn't oscillation noise:
+    #  (1) announced gate: a sub-dwell (board-silent) episode recovers to trace only —
+    #      never an unpaired '[cpu-nominal] headroom recovered' with no preceding alarm.
+    #  (2) 30-min cooldown: halve throttle↔nominal oscillation on announced episodes.
+    if [ "$prev_announced" != 1 ]; then
+      trace "[cpu-nominal-suppressed] $(hostname): CPU throttling stopped (episode was sub-threshold — never board-alarmed). Freq ${avg_mhz}MHz (${pct}% of max)."
     else
-      post "[cpu-nominal] $(hostname): CPU throttling stopped — no new throttle events. Freq ${avg_mhz}MHz (${pct}% of max). Thermal headroom recovered."
-      printf '%s\n' "$_nom_now" > "$NOM_COOLDOWN"
+      NOM_COOLDOWN="${MESH_NOM_COOLDOWN_FILE:-$HOME/.mesh/.cpu-nominal-cooldown}"
+      _nom_now=$(date +%s)
+      _nom_last=$(cat "$NOM_COOLDOWN" 2>/dev/null || echo 0)
+      if [ $((_nom_now - _nom_last)) -lt 1800 ]; then
+        trace "[cpu-nominal-suppressed] $(hostname): CPU throttling stopped — no new throttle events. Freq ${avg_mhz}MHz (${pct}% of max)."
+      else
+        post "[cpu-nominal] $(hostname): CPU throttling stopped — no new throttle events. Freq ${avg_mhz}MHz (${pct}% of max). Thermal headroom recovered."
+        printf '%s\n' "$_nom_now" > "$NOM_COOLDOWN"
+      fi
     fi
   fi
   exit 0
