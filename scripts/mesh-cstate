@@ -1,0 +1,182 @@
+#!/usr/bin/env bash
+# mesh-cstate — the CPU's DEEP-SLEEP residency sense: how deeply the silicon is actually resting.
+# The CPU sibling of mesh-gpu-activity (which reads i915 RC6 = the GPU's deep-sleep). Reads the
+# per-CPU hardware idle counters at /sys/devices/system/cpu/cpu*/cpuidle/state*/time (µs cumulative,
+# world-readable 0444, NO sudo) — two snapshots over a ~2s wall window give the fraction of core-time
+# spent idle, and of that, the fraction spent in DEEP C-states (C2/C3+) vs shallow (POLL/C1).
+#
+# WHY THIS IS A NEW SIGNAL (verified uncovered 2026-07-06 — no tool reads cpuidle; the grep hits were
+# MAC-address fragments + GPU RC6, not CPU C-states):
+#   - Load average / CPU-util count RUNNABLE tasks — they say the machine is "idle" at load 0. They are
+#     BLIND to WHY it's idle: a core at load 0 can be in deep C3 (truly at rest, cool, ~0W) OR bouncing
+#     in and out of shallow C1 on a wakeup storm (a chatty timer/IRQ/poller) — idle by the scheduler yet
+#     never actually RESTING, burning power and heat. This sense sees that difference; load average can't.
+#   - mesh-package-power (RAPL) reads the WATTS but not the sleep DEPTH; mesh-cpufreq reads clock when
+#     AWAKE but says nothing about sleep; mesh-cooling-load reads the cooler's response. None reads how
+#     deeply the cores sleep. This is the missing "quiescence" axis.
+#
+# CLASSIFICATION (the value-add is distinguishing the two flavours of "idle"):
+#   BUSY          idle% < BUSY_LO — cores active, doing real work.
+#   DEEP-REST     idle% >= IDLE_HI AND deep-of-idle ratio >= DEEP_RATIO — truly quiescent (cool, low power).
+#   SHALLOW-REST  idle% >= IDLE_HI BUT deep ratio < DEEP_RATIO — "restless idle": idle by load but kept
+#                 out of deep sleep by frequent wakeups. Invisible to every other sense. (retune from LOG)
+#   LIGHT         in between.
+#
+# HONEST n/a: no readable cpuidle state*/time on this node (a VM/container with cpuidle hidden) → exit 2
+#   (UNREACHABLE), never a fabricated residency. reflex-health/mesh-land treat exit 2 as an honest pass.
+#
+# State artifact ~/.mesh/.cstate-state is written EVERY run (UNCONDITIONAL → mtime = liveness, so no
+# false-STALE; not change-gated, so no mesh-state-touch needed — same convention as mesh-gpu-activity).
+# Per-run telemetry accumulates in ~/.mesh/cstate.log (thresholds below are PROVISIONAL — retune from it).
+#
+#   mesh-cstate           one ~2s sample: idle%/deep% + BUSY/LIGHT/SHALLOW-REST/DEEP-REST, writes state+log
+#   mesh-cstate --json    same sample, JSON
+#   mesh-cstate --status  last state-file reading, no new sample (READ-ONLY, no mutation)
+#   mesh-cstate --test    fixture math (delta/clamp/classify) + REAL-READ GATE (live sample 0-100 or exit 2)
+#
+# reflex-cadence: */5 * * * *
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+
+CPUDIR="${MESH_CSTATE_CPUDIR:-/sys/devices/system/cpu}"
+DEEP_IDX="${MESH_CSTATE_DEEP_IDX:-2}"          # cpuidle state index >= this = a DEEP C-state (state0=POLL,1=C1 shallow)
+SECS="${MESH_CSTATE_SAMPLE_SECS:-2}"
+IDLE_HI="${MESH_CSTATE_IDLE_HI:-80}"           # idle% at/above this = "resting" (provisional)
+BUSY_LO="${MESH_CSTATE_BUSY_LO:-40}"           # idle% below this = BUSY (provisional)
+DEEP_RATIO="${MESH_CSTATE_DEEP_RATIO:-0.50}"   # deep/total-idle at/above this = DEEP vs SHALLOW rest (provisional)
+STATE="${MESH_CSTATE_STATE:-$HOME/.mesh/.cstate-state}"
+LOG="${MESH_CSTATE_LOG:-$HOME/.mesh/cstate.log}"
+
+# snapshot: sum idle µs across ALL cpus → "all_us deep_us ncpu". Deep = state index >= DEEP_IDX.
+# Returns 1 (fail) if no readable cpuidle counters exist (honest n/a, never a fabricated 0).
+snapshot() {
+  local all=0 deep=0 ncpu=0 cpu st idx t
+  for cpu in "$CPUDIR"/cpu[0-9]*/cpuidle; do
+    [ -d "$cpu" ] || continue
+    ncpu=$((ncpu + 1))
+    for st in "$cpu"/state[0-9]*; do
+      [ -r "$st/time" ] || continue
+      idx="${st##*/state}"
+      case "$idx" in (''|*[!0-9]*) continue;; esac
+      t=$(cat "$st/time" 2>/dev/null)
+      case "$t" in (''|*[!0-9]*) continue;; esac
+      all=$((all + t))
+      [ "$idx" -ge "$DEEP_IDX" ] && deep=$((deep + t))
+    done
+  done
+  [ "$ncpu" -gt 0 ] || return 1
+  printf '%s %s %s' "$all" "$deep" "$ncpu"
+}
+
+# compute: all1 all2 deep1 deep2 ncpu dt_us → "idle_pct deep_pct deep_ratio" (clamped 0-100; monotonic
+# counters so a negative delta = error). avail = ncpu × dt_us (each core has dt_us of wall to spend).
+compute() {
+  awk -v a1="$1" -v a2="$2" -v d1="$3" -v d2="$4" -v n="$5" -v dt="$6" 'BEGIN{
+    da=a2-a1; dd=d2-d1; avail=n*dt;
+    if (dt<=0 || n<=0 || da<0 || dd<0 || avail<=0) exit 1;
+    idle=da/avail*100; deep=dd/avail*100;
+    if (idle>100) idle=100; if (deep>100) deep=100; if (idle<0) idle=0; if (deep<0) deep=0;
+    dr=(da>0)?dd/da:0;
+    printf "%.1f %.1f %.2f", idle, deep, dr;
+  }'
+}
+
+# classify: idle_pct deep_ratio → BUSY | DEEP-REST | SHALLOW-REST | LIGHT
+classify() {
+  awk -v i="$1" -v dr="$2" -v ihi="$IDLE_HI" -v blo="$BUSY_LO" -v drhi="$DEEP_RATIO" 'BEGIN{
+    if (i < blo) print "BUSY";
+    else if (i >= ihi && dr >= drhi) print "DEEP-REST";
+    else if (i >= ihi) print "SHALLOW-REST";
+    else print "LIGHT";
+  }'
+}
+
+# ============================== --test (sandboxed: no state/log write) ==============================
+if [ "${1:-}" = "--test" ]; then
+  fail=0
+  # (a) plain delta: over a 2s window (2000000µs) on 4 cpus (avail=8000000), cores idle 6000000µs of which
+  #     4000000µs deep → idle 75.0%, deep 50.0%, ratio 0.67
+  read -r ip dp dr <<<"$(compute 0 6000000 0 4000000 4 2000000)"
+  [ "$ip" = 75.0 ] && [ "$dp" = 50.0 ] && [ "$dr" = 0.67 ] || { echo "  FAIL: delta → idle=$ip deep=$dp dr=$dr (want 75.0 50.0 0.67)"; fail=1; }
+  # (b) fully idle + all deep → 100/100/1.00
+  read -r ip dp dr <<<"$(compute 0 8000000 0 8000000 4 2000000)"
+  [ "$ip" = 100.0 ] && [ "$dp" = 100.0 ] && [ "$dr" = 1.00 ] || { echo "  FAIL: full-deep → $ip $dp $dr (want 100.0 100.0 1.00)"; fail=1; }
+  # (c) slight timing overshoot must CLAMP to 100, never exceed
+  read -r ip dp dr <<<"$(compute 0 8100000 0 0 4 2000000)"
+  [ "$ip" = 100.0 ] || { echo "  FAIL: idle overshoot must clamp to 100.0, got $ip"; fail=1; }
+  # (d) fully busy: no idle delta → 0/0/0
+  read -r ip dp dr <<<"$(compute 5000 5000 5000 5000 4 2000000)"
+  [ "$ip" = 0.0 ] || { echo "  FAIL: fully-busy idle → $ip (want 0.0)"; fail=1; }
+  # (e) error guards: zero interval + negative delta must fail
+  compute 0 100 0 0 4 0 >/dev/null 2>&1 && { echo "  FAIL: zero interval must error"; fail=1; }
+  compute 100 0 0 0 4 2000000 >/dev/null 2>&1 && { echo "  FAIL: negative idle delta must error"; fail=1; }
+  # (f) classify: the four regimes + the SHALLOW-vs-DEEP distinction (the whole point)
+  [ "$(classify 20.0 0.9)" = BUSY ]         || { echo "  FAIL: classify(20,.9) != BUSY"; fail=1; }
+  [ "$(classify 90.0 0.8)" = DEEP-REST ]    || { echo "  FAIL: classify(90,.8) != DEEP-REST"; fail=1; }
+  [ "$(classify 90.0 0.2)" = SHALLOW-REST ] || { echo "  FAIL: classify(90,.2) != SHALLOW-REST (restless idle)"; fail=1; }
+  [ "$(classify 60.0 0.9)" = LIGHT ]        || { echo "  FAIL: classify(60,.9) != LIGHT"; fail=1; }
+  [ "$(classify 80.0 0.50)" = DEEP-REST ]   || { echo "  FAIL: boundary classify(80,.50) != DEEP-REST"; fail=1; }
+  [ "$(classify 40.0 0.9)" = LIGHT ]        || { echo "  FAIL: boundary classify(40,.9) != LIGHT (not BUSY)"; fail=1; }
+  # (g) snapshot honest-fail on an empty fixture dir (no cpuidle → return 1, never a fake 0)
+  _td=$(mktemp -d); trap 'rm -rf "$_td"' EXIT
+  if CPUDIR="$_td" snapshot >/dev/null 2>&1; then echo "  FAIL: snapshot on empty dir must fail (no fabricated 0)"; fail=1; fi
+  # (h) snapshot fixture: 2 cpus, states 0..3, deep=state>=2
+  for c in 0 1; do for s in 0 1 2 3; do mkdir -p "$_td/cpu$c/cpuidle/state$s"; printf '%s\n' "$(( (s+1)*1000 ))" >"$_td/cpu$c/cpuidle/state$s/time"; done; done
+  read -r sa sd sn <<<"$(CPUDIR="$_td" snapshot)"
+  # per cpu: all=1000+2000+3000+4000=10000, deep(s2+s3)=3000+4000=7000; ×2 cpus
+  [ "$sa" = 20000 ] && [ "$sd" = 14000 ] && [ "$sn" = 2 ] || { echo "  FAIL: snapshot fixture → all=$sa deep=$sd n=$sn (want 20000 14000 2)"; fail=1; }
+  # ---- REAL-READ GATE: a live sample must yield finite 0-100 idle% or honestly exit 2 (no fake green) ----
+  if ! s1=$(snapshot); then
+    echo "smoke-test: n/a — no readable cpuidle state*/time on this node (cpuidle hidden — VM/container)"
+    exit 2
+  fi
+  t1=$(date +%s%N); sleep 1; s2=$(snapshot) || { echo "  FAIL: second live snapshot failed after first succeeded"; fail=1; s2=$s1; }
+  t2=$(date +%s%N)
+  set -- $s1; a1=$1 d1=$2 n1=$3; set -- $s2; a2=$1 d2=$2
+  live=$(compute "$a1" "$a2" "$d1" "$d2" "$n1" $(( (t2 - t1) / 1000 ))) || live=""
+  case "$live" in
+    ('') echo "  FAIL: live-read gate — idle% not finite (hollow sense)"; fail=1;;
+    (*)  set -- $live; echo "  live read: idle=$1% deep=$2% ratio=$3 ($(classify "$1" "$3")) — real hardware produced data";;
+  esac
+  [ "$fail" = 0 ] && { echo "smoke-test: ok"; exit 0; } || { echo "smoke-test: FAIL"; exit 1; }
+fi
+
+# ---- --status : READ-ONLY, no new sample, no mutation ----
+if [ "${1:-}" = "--status" ]; then
+  if [ -s "$STATE" ]; then
+    printf '[cstate] %s (as of %s)\n' "$(cat "$STATE")" "$(date -u -r "$STATE" +%FT%TZ 2>/dev/null || echo '?')"
+    exit 0
+  fi
+  echo "[cstate] no state yet — run mesh-cstate for a sample"; exit 2
+fi
+
+# ============================== live sample ==============================
+s1=$(snapshot) || { echo "mesh-cstate: no readable cpuidle state*/time (cpuidle hidden — VM/container) — UNREACHABLE" >&2; exit 2; }
+t1=$(date +%s%N)
+sleep "$SECS"
+s2=$(snapshot) || { echo "mesh-cstate: second cpuidle snapshot failed — UNREACHABLE" >&2; exit 2; }
+t2=$(date +%s%N)
+set -- $s1; A1=$1 D1=$2 N=$3
+set -- $s2; A2=$1 D2=$2
+dt_us=$(( (t2 - t1) / 1000 ))
+res=$(compute "$A1" "$A2" "$D1" "$D2" "$N" "$dt_us") \
+  || { echo "mesh-cstate: bad sample (dt=${dt_us}us n=$N) — UNREACHABLE" >&2; exit 2; }
+set -- $res; IDLE=$1 DEEP=$2 DR=$3
+level=$(classify "$IDLE" "$DR")
+ts=$(date -u +%FT%TZ)
+
+mkdir -p "$(dirname "$STATE")" 2>/dev/null
+printf '%s idle=%s%% deep=%s%% ratio=%s\n' "$level" "$IDLE" "$DEEP" "$DR" >"$STATE"   # unconditional: mtime = liveness
+printf '%s %s %s %s %s %s\n' "$ts" "$level" "$IDLE" "$DEEP" "$DR" "$N" >>"$LOG"
+if [ "$(wc -l <"$LOG" 2>/dev/null || echo 0)" -gt 10000 ]; then
+  tail -n 5000 "$LOG" >"$LOG.tmp" && mv "$LOG.tmp" "$LOG"
+fi
+
+if [ "${1:-}" = "--json" ]; then
+  printf '{"level":"%s","idle_pct":%s,"deep_pct":%s,"deep_ratio":%s,"ncpu":%s,"elapsed_ms":%s,"ts":"%s"}\n' \
+    "$level" "$IDLE" "$DEEP" "$DR" "$N" "$(( dt_us / 1000 ))" "$ts"
+else
+  printf '[cstate] %s — idle=%s%% (deep=%s%%, deep-of-idle=%s) over %ss across %s cpus | thresholds idle>=%s busy<%s deep>=%s\n' \
+    "$level" "$IDLE" "$DEEP" "$DR" "$(awk -v u="$dt_us" 'BEGIN{printf "%.1f", u/1000000}')" "$N" "$IDLE_HI" "$BUSY_LO" "$DEEP_RATIO"
+fi

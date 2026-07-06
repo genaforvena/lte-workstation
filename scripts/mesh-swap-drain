@@ -1,0 +1,259 @@
+#!/usr/bin/env bash
+# mesh-swap-drain — the post-storm swap-RESIDUE ACTUATOR: repatriate parked swap pages back to RAM
+# (swapoff -a && swapon -a) so the NEXT memory spike meets a full swap buffer, not a cliff.
+#
+# WHY (discover/health task swap-drain-actuator, 2026-07-06): after a memory storm the kernel leaves
+# swap FULL long after RAM recovers — nobody resets it. Live at 13:02Z: MemAvailable 3.4GB, psi 0.00,
+# node healthy, yet swap parked 3.8G/4G (residue of the 02:04/03:45 storms) → the next spike hit a
+# 168MB swap cliff instead of a 4GB buffer (why 12:04 ran so close to OOM). mesh-swap / mesh-swap-rate
+# are SENSES only (0 swapoff refs in the genome; swap-rate's header even calls FULL-but-STABLE "fine" —
+# true for THROUGHPUT, false for RESILIENCE). This is the missing ACTUATOR that resets the buffer.
+#
+#   mesh-swap-drain               read-only verdict (DRAIN/REFUSE/NA) — NO actuation (safe to run bare)
+#   mesh-swap-drain --status      alias for the read-only verdict + state metadata
+#   mesh-swap-drain --drain       the GATED actuate: swapoff -a && swapon -a IFF every safety gate holds
+#   mesh-swap-drain --sweep       cron backstop == --drain (the reflex entry point)
+#   mesh-swap-drain --test        pure gate logic (falsified both ways) + real-read gate; exit 2 if no swap
+#
+# SAFETY — the GATE is the safety. swapoff -a pulls ALL swapped pages back into RAM at once; firing it
+# blind is an OOM trigger. Actuate ONLY when EVERY condition holds (checked in decide_drain, falsifiable):
+#   1. swap is heavily USED   (SwapFree < FREE_PCT_MAX% of total)   — else there's no residue to reclaim.
+#   2. memory NOT under stall  (psi memory `full` avg300 <= PSI_MAX ≈ 0) — never fight the kernel mid-stall.
+#   3. REPATRIATION MARGIN     (MemAvailable > SwapUsed + MARGIN_MB) — the LOAD-BEARING gate (health
+#      2026-07-06): swapoff -a moves SwapUsed into RAM; if it doesn't fit, INSTANT OOM. RIGHT NOW this
+#      gate correctly REFUSES (MemAvail 3.1GB !> SwapUsed 4.0GB + 1.5GB) — the actuator's window only
+#      opens once the minds quiesce and headroom exists. Narrow but honest.
+#   4. no heavy job in flight  (mesh-heavy-run / mesh-whisper-run flock free) — a job about to allocate
+#      isn't yet visible in psi/MemAvail; don't drain out from under it.
+# When any gate fails it REFUSES trace-only (state file + stderr, NO board alarm — a safe wait is not an
+# incident). Only an actual drain posts the [swap-drained] edge + a mesh-trace substrate mark.
+#
+# NOT mesh-dms: dms schedules a rollback for a HELD change (turbo-lid's open lid). This op is ATOMIC —
+# swapon -a restores swap in the SAME invocation, nothing stays "held" to roll back. The only failure of
+# concern is swapoff-ok-but-swapon-FAILS (node left with no swap); handled inline (retry + loud alarm),
+# which is a better fit than a detached dead-man for a self-completing op.
+#
+# HONEST DEGRADE: no swap configured → exit 2 (n/a, never a fake "drained"); passwordless sudo absent →
+# exit 2 (n/a — other nodes can't actuate, they don't pretend to). state-touch every run (no false-STALE).
+#
+# reflex-cadence: 17 * * * *
+# reflex-args: --drain
+set -uo pipefail
+# cron's minimal PATH lacks ~/.local/bin — without it the [swap-drained] post + mesh-trace mark silently
+# drop while the actuation fires fine (a drain with no board record). Export it (mesh-turbo-lid precedent).
+export PATH="$HOME/.local/bin:$PATH"
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+
+MESH="${MESH_DIR:-$HOME/.mesh}"
+STATE="${MESH_SWAPDRAIN_STATE:-$MESH/.swap-drain.state}"
+LOCK="${MESH_SWAPDRAIN_LOCK:-$MESH/.swap-drain.lock}"
+MEMINFO="${MESH_SWAPDRAIN_MEMINFO:-/proc/meminfo}"
+PSI="${MESH_SWAPDRAIN_PSI:-/proc/pressure/memory}"
+HEAVY_LOCK="${MESH_SWAPDRAIN_HEAVY_LOCK:-$MESH/.heavy.lock}"
+WHISPER_LOCK="${MESH_SWAPDRAIN_WHISPER_LOCK:-$MESH/.whisper.lock}"
+FREE_PCT_MAX="${MESH_SWAPDRAIN_FREE_PCT:-15}"   # drain only when SwapFree < this % of total (swap full)
+PSI_MAX="${MESH_SWAPDRAIN_PSI_MAX:-1.0}"        # memory `full` avg300 must be <= this (≈ no stall)
+MARGIN_MB="${MESH_SWAPDRAIN_MARGIN_MB:-1536}"   # repatriation headroom over SwapUsed (1.5GB) — LOAD-BEARING
+NICE="${MESH_SWAPDRAIN_NICE:-19}"
+DRYRUN="${MESH_SWAPDRAIN_DRYRUN:-0}"            # 1 = never fire a real swapoff/swapon (used by --test)
+
+ts(){ date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+# --- readers (inject-overridable so --test drives them with fixtures) ----------------------
+read_meminfo_kb(){ # $1 key → value in kB ('' if absent)
+  awk -v k="$1:" '$1==k{print $2; exit}' "$MEMINFO" 2>/dev/null
+}
+read_psi_full300(){ # memory `full` avg300 (float; '0' if unreadable — treated as no-stall only if file present)
+  awk '/^full /{for(i=1;i<=NF;i++){n=index($i,"="); if(n>0 && substr($i,1,n-1)=="avg300"){print substr($i,n+1); exit}}}' "$PSI" 2>/dev/null
+}
+
+# heavy_busy → 0 (busy) if a heavy-run/whisper flock is HELD by another proc. Injectable for --test via
+# MESH_SWAPDRAIN_HEAVY_BUSY=0|1; else a real non-blocking flock probe (append-open so we never truncate
+# the lock file; the subshell releases the fd on exit).
+heavy_busy(){
+  if [ -n "${MESH_SWAPDRAIN_HEAVY_BUSY:-}" ]; then
+    [ "$MESH_SWAPDRAIN_HEAVY_BUSY" = 1 ] && return 0 || return 1
+  fi
+  command -v flock >/dev/null 2>&1 || return 1
+  local p
+  for p in "$HEAVY_LOCK" "$WHISPER_LOCK"; do
+    [ -e "$p" ] || continue
+    ( exec 9>>"$p" 2>/dev/null || exit 0; flock -n 9 ) || return 0   # couldn't acquire = held = busy
+  done
+  return 1
+}
+
+# --- decide_drain — the PURE gate (falsifiable via --test). Echoes "VERDICT|reason".
+#     Args: swaptotal_kb swapfree_kb memavail_kb psi_full300 heavy_busy(0|1)
+#     VERDICT ∈ NA (no swap) | REFUSE (unsafe/nothing to do) | DRAIN (all gates pass).
+decide_drain(){
+  local st="$1" sf="$2" ma="$3" psi="$4" busy="$5"
+  { [ -n "$st" ] && printf '%d' "$st" >/dev/null 2>&1 && [ "$st" -gt 0 ] 2>/dev/null; } \
+    || { echo "NA|no swap configured (SwapTotal=${st:-?}) — actuator not applicable"; return; }
+  local su=$(( st - sf ))                          # SwapUsed kB
+  local free_pct=$(( sf * 100 / st ))
+  local su_mb=$(( su / 1024 )) ma_mb=$(( ma / 1024 )) margin_kb=$(( MARGIN_MB * 1024 ))
+  # 2. never drain under an active memory stall
+  if awk -v p="${psi:-0}" -v m="$PSI_MAX" 'BEGIN{exit !(p+0 > m+0)}'; then
+    echo "REFUSE|memory under active stall (psi full avg300=${psi} > ${PSI_MAX}) — will not fight the kernel"; return
+  fi
+  # 1. only worth draining when swap is heavily used
+  if [ "$free_pct" -ge "$FREE_PCT_MAX" ]; then
+    echo "REFUSE|swap not full (SwapFree ${free_pct}% >= ${FREE_PCT_MAX}%) — no residue to reclaim"; return
+  fi
+  # 3. LOAD-BEARING: SwapUsed must fit in RAM with margin, or swapoff -a OOMs
+  if [ "$ma" -le $(( su + margin_kb )) ]; then
+    echo "REFUSE|insufficient repatriation margin (MemAvail ${ma_mb}MB <= SwapUsed ${su_mb}MB + ${MARGIN_MB}MB) — swapoff would OOM"; return
+  fi
+  # 4. don't drain out from under an in-flight heavy job
+  if [ "$busy" = 1 ]; then
+    echo "REFUSE|a heavy-run/whisper job holds the lock — defer until it completes"; return
+  fi
+  echo "DRAIN|safe: SwapFree ${free_pct}% (SwapUsed ${su_mb}MB), psi ${psi}, MemAvail ${ma_mb}MB > SwapUsed+${MARGIN_MB}MB"
+}
+
+board(){ # edge posts only; a swallowed post is non-fatal (drain still happened, state records it)
+  command -v mesh-chat >/dev/null 2>&1 && MESH_WHO="swap-drain@$(hostname)" mesh-chat "$1" >/dev/null 2>&1 || true
+}
+write_state(){ # $1 verdict-line
+  printf '%s | %s\n' "$(ts)" "$1" > "$STATE" 2>/dev/null || true
+  command -v mesh-state-touch >/dev/null 2>&1 && mesh-state-touch "$STATE" >/dev/null 2>&1 || touch "$STATE" 2>/dev/null || true
+}
+
+# do_swap <swapoff|swapon> -a … : niced/ioniced sudo, DRYRUN-gated so --test never fires / needs sudo.
+do_swap(){
+  if [ "$DRYRUN" = 1 ]; then echo "DRYRUN sudo $*"; return 0; fi
+  local pre=(); command -v nice >/dev/null 2>&1 && pre+=(nice -n "$NICE")
+  command -v ionice >/dev/null 2>&1 && pre+=(ionice -c3)
+  "${pre[@]}" sudo -n "$@"
+}
+
+swap_used_mb(){ # current SwapUsed in MB from live MEMINFO
+  local st sf; st="$(read_meminfo_kb SwapTotal)"; sf="$(read_meminfo_kb SwapFree)"
+  [ -n "$st" ] && [ -n "$sf" ] || { echo "?"; return; }
+  echo $(( (st - sf) / 1024 ))
+}
+
+live_verdict(){ # echoes the decide_drain verdict from live /proc
+  local st sf ma psi busy
+  st="$(read_meminfo_kb SwapTotal)"; sf="$(read_meminfo_kb SwapFree)"; ma="$(read_meminfo_kb MemAvailable)"
+  psi="$(read_psi_full300)"; [ -n "$psi" ] || psi=0
+  st="${st:-0}"; sf="${sf:-0}"; ma="${ma:-0}"
+  if heavy_busy; then busy=1; else busy=0; fi
+  decide_drain "$st" "$sf" "$ma" "$psi" "$busy"
+}
+
+do_drain(){ # the gated actuate
+  local verdict label reason; verdict="$(live_verdict)"; label="${verdict%%|*}"; reason="${verdict#*|}"
+  write_state "$verdict"
+  case "$label" in
+    NA)     echo "swap-drain: n/a — $reason" >&2; return 2 ;;
+    REFUSE) echo "swap-drain: REFUSE — $reason" >&2; return 0 ;;   # trace-only (state file), safe wait, NOT an alarm
+  esac
+  # DRAIN. Passwordless sudo is required to actuate (unless DRYRUN); a node without it is honest-n/a.
+  if [ "$DRYRUN" != 1 ] && ! sudo -n true 2>/dev/null; then
+    write_state "NA|passwordless sudo unavailable — cannot actuate swapoff (sense-only on this node)"
+    echo "swap-drain: n/a — no passwordless sudo (cannot swapoff on this node)" >&2; return 2
+  fi
+  # single-writer: two drains must never interleave swapoff/swapon
+  exec 8>>"$LOCK" 2>/dev/null || true
+  if command -v flock >/dev/null 2>&1; then flock -n 8 2>/dev/null || { echo "swap-drain: another drain in progress — skip" >&2; return 0; }; fi
+  local before after; before="$(swap_used_mb)"
+  command -v mesh-trace >/dev/null 2>&1 && mesh-trace "swap-drain: swapoff -a && swapon -a (repatriate ${before}MB residue; margin verified $reason)" >/dev/null 2>&1 || true
+  if ! do_swap swapoff -a; then
+    echo "swap-drain: swapoff -a failed — swap UNCHANGED (safe no-op)" >&2
+    write_state "REFUSE|swapoff -a failed (busy pages?) — swap unchanged, no harm"; return 0
+  fi
+  if ! do_swap swapon -a; then
+    # CRITICAL: swap is OFF and did not come back. Retry once, then escalate loudly.
+    do_swap swapon -a || true
+    board "[swap-drain-FAILED] $(hostname) swapon -a FAILED after swapoff — swap may be OFF; MANUAL 'sudo swapon -a' NEEDED"
+    write_state "FAILED|swapon -a failed after swapoff — swap may be OFF, operator action needed"
+    echo "swap-drain: CRITICAL — swapon -a failed after swapoff; escalated" >&2; return 1
+  fi
+  after="$(swap_used_mb)"
+  board "[swap-drained] $(hostname) swap residue reclaimed: SwapUsed ${before}→${after}MB — buffer reset ($reason)"
+  write_state "DRAINED|SwapUsed ${before}→${after}MB reclaimed ($reason)"
+  echo "swap-drain: DRAINED (SwapUsed ${before}→${after}MB)"
+}
+
+do_status(){
+  local verdict; verdict="$(live_verdict)"; write_state "$verdict"
+  echo "swap-drain status @ $(hostname) $(ts)"
+  echo "  verdict: $verdict"
+  echo "  live:    $(free -m 2>/dev/null | awk '/Swap:/{printf "Swap used=%sMB free=%sMB total=%sMB",$3,$4,$2} /Mem:/{printf "  MemAvail~%sMB  ",$7}')"
+  case "${verdict%%|*}" in NA) return 2 ;; *) return 0 ;; esac
+}
+
+case "${1:---status}" in
+  --status|"") do_status ;;
+  --drain|--sweep) do_drain ;;
+  --test)
+    fail(){ echo "smoke-test: FAIL ($1)"; exit 1; }
+    # ---- decide_drain: PURE gate logic, every branch falsified both ways ----
+    # ST=4194304 kB (4GB) swap. Fixtures in kB. psi 0 = no stall. busy 0 = free.
+    _ST=4194304
+    # NA: no swap
+    case "$(decide_drain 0 0 8000000 0 0)"        in NA\|*) : ;; *) fail "SwapTotal=0 must be NA";; esac
+    case "$(decide_drain '' '' 8000000 0 0)"      in NA\|*) : ;; *) fail "empty SwapTotal must be NA";; esac
+    # DRAIN: swap 98% used (SwapFree 80000kB≈2%), MemAvail 7GB >> SwapUsed ~4GB+1.5GB, psi 0, not busy
+    case "$(decide_drain $_ST 80000 7340032 0 0)" in DRAIN\|*) : ;; *) fail "full swap + ample RAM + calm + free must DRAIN";; esac
+    # REFUSE(stall): same DRAIN inputs but psi full avg300 = 5.0 > 1.0
+    case "$(decide_drain $_ST 80000 7340032 5.0 0)" in REFUSE\|memory\ under*) : ;; *) fail "psi stall must REFUSE (never drain under stall)";; esac
+    # falsify the stall gate: psi exactly at PSI_MAX (1.0) is NOT a stall → must still DRAIN
+    case "$(decide_drain $_ST 80000 7340032 1.0 0)" in DRAIN\|*) : ;; *) fail "psi==PSI_MAX must NOT trip the stall gate (guards the > boundary)";; esac
+    # REFUSE(not full): SwapFree 20% (838860kB) >= FREE_PCT_MAX 15 → nothing to reclaim
+    case "$(decide_drain $_ST 838860 7340032 0 0)" in REFUSE\|swap\ not\ full*) : ;; *) fail "swap only 20% used must REFUSE (no residue)";; esac
+    # REFUSE(margin) — THE LOAD-BEARING gate: full swap, calm, free, but MemAvail 4GB !> SwapUsed ~4GB+1.5GB
+    case "$(decide_drain $_ST 80000 4194304 0 0)" in REFUSE\|insufficient\ repatriation*) : ;; *) fail "MemAvail<=SwapUsed+margin must REFUSE (else swapoff OOMs)";; esac
+    # falsify the margin gate: give exactly +1kB over (SwapUsed+margin) → must flip to DRAIN
+    #   SwapUsed = 4194304-80000 = 4114304 kB; +margin(1572864) = 5687168; MemAvail 5687169 > that → DRAIN
+    case "$(decide_drain $_ST 80000 5687169 0 0)" in DRAIN\|*) : ;; *) fail "MemAvail just over SwapUsed+margin must DRAIN (guards the <= boundary)";; esac
+    case "$(decide_drain $_ST 80000 5687168 0 0)" in REFUSE\|insufficient*) : ;; *) fail "MemAvail == SwapUsed+margin must still REFUSE (boundary is strict >)";; esac
+    # REFUSE(heavy): all gates pass but a heavy job holds the lock
+    case "$(decide_drain $_ST 80000 7340032 0 1)" in REFUSE\|a\ heavy*) : ;; *) fail "heavy job in flight must REFUSE";; esac
+
+    # ---- heavy_busy: real non-blocking flock probe (not just the env inject) ----
+    _lk="$(mktemp)"; ( exec 9>>"$_lk"; flock 9; sleep 3 ) &   # hold the lock 3s in the background
+    _bgpid=$!; sleep 0.4
+    # override the GLOBALS heavy_busy reads (the top-level MESH_SWAPDRAIN_* assignment already ran)
+    HEAVY_LOCK="$_lk" WHISPER_LOCK="$_lk" heavy_busy \
+      || { kill "$_bgpid" 2>/dev/null; rm -f "$_lk"; fail "heavy_busy must see a HELD flock as busy"; }
+    wait "$_bgpid" 2>/dev/null
+    HEAVY_LOCK="$_lk" WHISPER_LOCK="$_lk" heavy_busy \
+      && { rm -f "$_lk"; fail "heavy_busy must see a FREE flock as not-busy"; }
+    rm -f "$_lk"
+
+    # ---- do_drain actuation path (DRYRUN — never a real swapoff): a DRAIN verdict must call
+    #      swapoff+swapon (dry) and post [swap-drained]; a REFUSE must NOT actuate. Inject via fixtures.
+    _td="$(mktemp -d)"; trap 'rm -rf "$_td"' EXIT
+    _cap="$_td/board"; mesh-chat(){ printf '%s\n' "$*" >> "$_cap"; return 0; }
+    _drainmi="$_td/mi-drain"; _refusemi="$_td/mi-refuse"
+    printf 'MemAvailable: 7340032 kB\nSwapTotal: 4194304 kB\nSwapFree: 80000 kB\n' > "$_drainmi"   # DRAIN inputs
+    printf 'MemAvailable: 4194304 kB\nSwapTotal: 4194304 kB\nSwapFree: 80000 kB\n' > "$_refusemi"  # margin REFUSE
+    printf 'full avg10=0.00 avg60=0.00 avg300=0.00 total=1\n' > "$_td/psi"
+    _stf="$_td/state"
+    # DRAIN: DRYRUN so do_swap only echoes; heavy free; must post [swap-drained] + write DRAINED state
+    ( DRYRUN=1 MEMINFO="$_drainmi" PSI="$_td/psi" STATE="$_stf" LOCK="$_td/lk" \
+      MESH_SWAPDRAIN_HEAVY_BUSY=0 do_drain >/dev/null 2>&1 )
+    grep -q '\[swap-drained\]' "$_cap" || fail "a DRAIN verdict must post [swap-drained] (DRYRUN)"
+    grep -q '^[0-9T:Z-]* | DRAINED' "$_stf" || fail "a DRAIN must record DRAINED in the state file"
+    : > "$_cap"
+    # REFUSE(margin): must NOT actuate, must NOT post, state records REFUSE
+    ( DRYRUN=1 MEMINFO="$_refusemi" PSI="$_td/psi" STATE="$_stf" LOCK="$_td/lk2" \
+      MESH_SWAPDRAIN_HEAVY_BUSY=0 do_drain >/dev/null 2>&1 )
+    [ -s "$_cap" ] && fail "a REFUSE verdict must NOT post any board edge"
+    grep -q 'REFUSE|insufficient' "$_stf" || fail "a REFUSE must record the refusal reason in the state file"
+    unset -f mesh-chat
+
+    # ---- REAL-READ GATE: live /proc must yield a real verdict, or honest n/a exit 2 if no swap ----
+    _st="$(read_meminfo_kb SwapTotal)"
+    if [ -z "$_st" ] || [ "$_st" = 0 ]; then
+      echo "smoke-test: n/a (no swap configured on this host — actuator not applicable); gate logic ok"; exit 2
+    fi
+    _lv="$(live_verdict)"
+    case "$_lv" in DRAIN\|*|REFUSE\|*|NA\|*) : ;; *) fail "live verdict malformed: '$_lv'";; esac
+    echo "smoke-test: ok (decide gate 10 cases both-ways + real flock heavy_busy + do_drain DRYRUN drain/refuse asserts + live verdict: $_lv)"
+    exit 0 ;;
+  *) echo "usage: mesh-swap-drain [--status] | --drain | --sweep | --test" >&2; exit 64 ;;
+esac
