@@ -18,6 +18,14 @@ BIN="${MESH_WHISPER_BIN:-$MESH/whispercpp/main}"
 LOCK="${MESH_WHISPER_LOCK:-$MESH/.whisper.lock}"
 NICE="${MESH_WHISPER_NICE:-19}"
 WAIT="${MESH_WHISPER_LOCK_WAIT:-300}"   # sec to wait for the serialization lock, then degrade (still niced)
+# ADMISSION (chat-review/whisper-run-fold-heavy-gate): whisper.cpp is the highest-frequency heavy path
+# (room STT, overhear, tg transcriptions) yet had ZERO pre-flight admission — a launch onto an already
+# near-OOM node tipped swap over (12:04Z/06:24Z/08:14Z near-OOMs, main=whisper.cpp). Delegate the
+# memory/pressure decision to mesh-heavy-run --admit (single source of truth); we keep our OWN whisper
+# flock below (whisper-vs-whisper serialization) so the two locks never compound — only the mem gate is
+# shared. A whisper launch while the node is pressured then DEFERS (polls) then REFUSES instead of OOMing.
+BUDGET="${MESH_WHISPER_BUDGET_MB:-2000}"   # whisper.cpp is ~1.5-2GB RSS; declared admission budget
+FORCE="${MESH_WHISPER_FORCE:-0}"           # 1 = bypass the admission gate (still niced + serialized)
 
 # Build the best-available nice/ionice prefix — both are optional (a minimal env may lack ionice).
 nice_prefix() {
@@ -35,28 +43,73 @@ if [ "${1:-}" = --test ]; then
   # 1) ARG PASSTHROUGH: the shim must forward its args to the real binary unchanged. Use a stub binary
   #    (echo is a shell builtin, not an -x path, so it can't stand in for the real binary here).
   printf '#!/bin/sh\nprintf "%%s" "$1"\n' > "$_td/echobin"; chmod +x "$_td/echobin"
-  _out="$(MESH_WHISPER_BIN="$_td/echobin" MESH_WHISPER_LOCK="$_lk" "$0" passthru-token 2>/dev/null || true)"
+  # MESH_WHISPER_FORCE=1 on the sub-invocations below so they bypass the live admission gate — these
+  # cells assert passthrough/serialization, NOT admission (that has its own stub-driven cells at 3).
+  _out="$(MESH_WHISPER_FORCE=1 MESH_WHISPER_BIN="$_td/echobin" MESH_WHISPER_LOCK="$_lk" "$0" passthru-token 2>/dev/null || true)"
   [ "$_out" = passthru-token ] || { echo "smoke-test: FAIL (arg passthrough broke — expected 'passthru-token', got '$_out')"; exit 1; }
   # 1b) STDERR PASSTHROUGH: whisper.cpp prints progress + --help to STDERR; the lock plumbing must NOT
   #     swallow it. Falsify: an `exec N>… 2>/dev/null` that leaks onto the final exec makes this empty.
   printf '#!/bin/sh\nprintf "on-stderr" >&2\n' > "$_td/errbin"; chmod +x "$_td/errbin"
-  _err="$(MESH_WHISPER_BIN="$_td/errbin" MESH_WHISPER_LOCK="$_lk" "$0" x 2>&1 >/dev/null || true)"
+  _err="$(MESH_WHISPER_FORCE=1 MESH_WHISPER_BIN="$_td/errbin" MESH_WHISPER_LOCK="$_lk" "$0" x 2>&1 >/dev/null || true)"
   [ "$_err" = on-stderr ] || { echo "smoke-test: FAIL (whisper STDERR swallowed by the lock plumbing — expected 'on-stderr', got '$_err')"; exit 1; }
   # 2) SERIALIZATION: two concurrent 1s runs must NOT overlap → elapsed >= ~2s (falsify: drop the flock
   #    and elapsed collapses to ~1s). Uses /bin/sleep as a stand-in whisper binary.
   _sleep="$(command -v sleep)"
   _start="$(date +%s.%N)"
-  ( MESH_WHISPER_BIN="$_sleep" MESH_WHISPER_LOCK="$_lk" MESH_WHISPER_LOCK_WAIT=15 "$0" 1 >/dev/null 2>&1 ) &
-  ( MESH_WHISPER_BIN="$_sleep" MESH_WHISPER_LOCK="$_lk" MESH_WHISPER_LOCK_WAIT=15 "$0" 1 >/dev/null 2>&1 ) &
+  ( MESH_WHISPER_FORCE=1 MESH_WHISPER_BIN="$_sleep" MESH_WHISPER_LOCK="$_lk" MESH_WHISPER_LOCK_WAIT=15 "$0" 1 >/dev/null 2>&1 ) &
+  ( MESH_WHISPER_FORCE=1 MESH_WHISPER_BIN="$_sleep" MESH_WHISPER_LOCK="$_lk" MESH_WHISPER_LOCK_WAIT=15 "$0" 1 >/dev/null 2>&1 ) &
   wait
   _el="$(awk -v a="$_start" -v b="$(date +%s.%N)" 'BEGIN{printf "%.2f", b-a}')"
   awk -v e="$_el" 'BEGIN{exit !(e >= 1.8)}' \
     || { echo "smoke-test: FAIL (serialization broken — two 1s runs took ${_el}s, expected >=1.8s: the flock isn't holding)"; exit 1; }
-  echo "smoke-test: ok (nice -n $NICE + ionice + flock-serialized; arg-passthrough + 2×1s-serialize=${_el}s asserts pass)"
+
+  # 3) ADMISSION DELEGATION (chat-review/whisper-run-fold-heavy-gate): whisper-run must call
+  #    `mesh-heavy-run --admit <BUDGET>` and honor its verdict. Stub mesh-heavy-run on PATH so the
+  #    decision is deterministic (STUB_ADMIT = its exit code), and record the budget it was handed.
+  _stubdir="$_td/bin"; mkdir -p "$_stubdir"
+  printf '#!/bin/sh\n[ "$1" = --admit ] || exit 64\nprintf "%%s" "$2" > "%s/asked"\nexit "${STUB_ADMIT:-0}"\n' "$_td" > "$_stubdir/mesh-heavy-run"
+  chmod +x "$_stubdir/mesh-heavy-run"
+  printf '#!/bin/sh\ntouch "%s/ran-marker"\n' "$_td" > "$_td/ranbin"; chmod +x "$_td/ranbin"
+  # 3a) ADMITTED (stub exits 0) → whisper runs + passthrough works + the declared BUDGET was delegated.
+  rm -f "$_td/asked"
+  _out="$(PATH="$_stubdir:$PATH" MESH_WHISPER_BUDGET_MB=1234 MESH_WHISPER_BIN="$_td/echobin" MESH_WHISPER_LOCK="$_lk" "$0" admitted-token 2>/dev/null || true)"
+  [ "$_out" = admitted-token ] || { echo "smoke-test: FAIL (admitted whisper must run — expected 'admitted-token', got '$_out')"; exit 1; }
+  [ "$(cat "$_td/asked" 2>/dev/null)" = 1234 ] || { echo "smoke-test: FAIL (whisper must delegate MESH_WHISPER_BUDGET_MB to mesh-heavy-run --admit — expected 1234, got '$(cat "$_td/asked" 2>/dev/null)')"; exit 1; }
+  # 3b) REFUSED (stub exits 75) → whisper must NOT run the binary and must propagate EX_TEMPFAIL 75.
+  rm -f "$_td/ran-marker"
+  PATH="$_stubdir:$PATH" STUB_ADMIT=75 MESH_WHISPER_BIN="$_td/ranbin" MESH_WHISPER_LOCK="$_lk" "$0" x >/dev/null 2>&1
+  _rc=$?
+  [ "$_rc" = 75 ] || { echo "smoke-test: FAIL (refused admission must propagate EX_TEMPFAIL 75, got $_rc)"; exit 1; }
+  [ ! -e "$_td/ran-marker" ] || { echo "smoke-test: FAIL (refused whisper must NOT run the binary)"; exit 1; }
+  # 3c) FORCE bypasses the gate: even with a refusing stub, MESH_WHISPER_FORCE=1 runs whisper anyway.
+  _out="$(PATH="$_stubdir:$PATH" STUB_ADMIT=75 MESH_WHISPER_FORCE=1 MESH_WHISPER_BIN="$_td/echobin" MESH_WHISPER_LOCK="$_lk" "$0" forced-token 2>/dev/null || true)"
+  [ "$_out" = forced-token ] || { echo "smoke-test: FAIL (MESH_WHISPER_FORCE=1 must bypass admission — expected 'forced-token', got '$_out')"; exit 1; }
+  # 3d) VERSION-SKEW FAIL-OPEN: an OLD heavy-run without --admit EX_USAGEs (64) on the flag — whisper
+  #     must NOT propagate that; it treats any non-75 as fail-open and RUNS (deployment-order-independent).
+  _out="$(PATH="$_stubdir:$PATH" STUB_ADMIT=64 MESH_WHISPER_BIN="$_td/echobin" MESH_WHISPER_LOCK="$_lk" "$0" skew-token 2>/dev/null || true)"
+  [ "$_out" = skew-token ] || { echo "smoke-test: FAIL (non-75 admit code must fail-open and run whisper — expected 'skew-token', got '$_out')"; exit 1; }
+
+  echo "smoke-test: ok (nice -n $NICE + ionice + flock-serialized + heavy-run admission-delegate; arg-passthrough + 2×1s-serialize=${_el}s + admit/refuse/force asserts pass)"
   exit 0
 fi
 
 [ -x "$BIN" ] || { echo "mesh-whisper-run: whisper binary not executable: $BIN" >&2; exit 127; }
+
+# ADMISSION FIRST, before taking the whisper flock — so we DEFER on memory without holding the
+# serialization lock (which would block other whisper runs while we wait on headroom). Delegate to
+# mesh-heavy-run --admit; on refusal propagate its EX_TEMPFAIL (75) so the caller skips/retries rather
+# than the kernel OOM-killing a batch. Fail-open if mesh-heavy-run is absent (minimal node) or FORCE=1:
+# admission is best-effort, the nice+flock path below still applies.
+if [ "$FORCE" != 1 ] && command -v mesh-heavy-run >/dev/null 2>&1; then
+  mesh-heavy-run --admit "$BUDGET"; _adm=$?
+  # Gate ONLY on EX_TEMPFAIL (75 = honest "node cannot admit") → propagate so the caller skips/retries.
+  # ANY other non-zero (e.g. an OLD heavy-run without --admit → EX_USAGE 64, or a probe error) is
+  # fail-open: proceed unguarded, exactly as before the fold. This makes the rollout deployment-order-
+  # independent — a node that gets the new whisper-run before the new heavy-run degrades to no-gate, it
+  # never breaks whisper (the gate simply doesn't engage until heavy-run catches up).
+  [ "$_adm" = 75 ] && exit 75
+fi
+
 nice_prefix
 # Serialize: hold a shared advisory lock (fd 9, no O_CLOEXEC → survives the exec into whisper, released
 # when whisper exits). Degrade to unserialized-but-niced if the lock can't be opened or isn't acquired
