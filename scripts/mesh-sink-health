@@ -1,0 +1,220 @@
+#!/usr/bin/env bash
+# mesh-sink-health — the room MOUTH's LIVENESS sense + self-heal. NODE-BOUND to the node that holds
+# the Bose sink (the room speaker). Detects the PipeWire/ALSA "wedge" — the Broken-pipe / snd_pcm_recover
+# loop that silently kills ALL playback out of the Bose (media, room-say, and the operator's own Firefox)
+# yet leaves the substream in state RUNNING — and self-heals it with a scoped user-service restart.
+#
+# WHY it is a NEW sense (nothing else covers it — verified against the audio set 2026-07-06):
+#   - mesh-audio        = STATIC device inventory (how many cards / playback devices).
+#   - mesh-audio-active = is a stream RUNNING now — but a WEDGED sink KEEPS its substream RUNNING (the
+#                         ALSA recover loop never closes it), so a wedge reads HEALTHY there. Blind to it.
+#   - mesh-audio-energy = mic RMS (the EAR), not the mouth.
+#   None sense the MOUTH's health. This one does: it reads the wedge SIGNATURE, not the sound.
+#
+# DETECTION — by SIGNATURE ONLY, never by absence-of-sound (the never-touch-a-working-audio rule):
+#   Silence is normal (the Bose is quiet ~always — Misha is dormant). We must NOT restart because it's
+#   quiet. We restart ONLY on the confirmed failure SIGNATURE: N ALSA "Broken pipe" / "snd_pcm_recover"
+#   recover-loop lines within M minutes in `journalctl --user` (pipewire/wireplumber/pipewire-pulse).
+#   The 2026-07-06 02:27-02:40 incident was exactly this loop (healed only by a human pipewire restart).
+#   `wpctl` gives sink CONTEXT + post-heal VERIFICATION, never the trigger. (Task named `pactl`, but the
+#   Bose node ships wpctl/pw-dump, NOT pactl — verified live 2026-07-06; SINK_TOOL prefers pactl if it
+#   ever appears, else wpctl. A pactl-only tool would be dead-on-target = a false green.)
+#
+# SELF-HEAL (debounced, edge-triggered):
+#   On the OK->WEDGED edge: post [room-mouth-wedged], then `systemctl --user restart wireplumber pipewire
+#   pipewire-pulse` (CRON GOTCHA: XDG_RUNTIME_DIR + DBUS_SESSION_BUS_ADDRESS must be exported or the
+#   --user call no-ops silently). Re-verify the sink returns. HEAL_COOLDOWN debounces repeat restarts so a
+#   still-settling stack is not restart-stormed. If the sink does NOT return -> escalate to the operator
+#   (mesh-tg), because the room MOUTH is down and needs a human — heal-failed is operator-worthy.
+#
+# HONEST degradation (no faked all-clear):
+#   - No Bose sink on THIS node (not the room MOUTH node) -> EXIT 2 "n/a here". Not the room node reads
+#     visibly different from HEALTHY. mesh-land/reflex-health treat exit 2 as an honest n/a (pass).
+#   - Sink-query tool unreadable on the room node -> DEGRADED (can't assess), never a fake HEALTHY.
+#
+# reflex-cadence: */5 * * * *
+# (matches the sibling edge reflexes — therm-watch */5. A wedge kills the operator's own audio too, so a
+#  5-min catch beats the 13+min human-noticed latency of the incident. Restart is heavy but debounced.)
+#
+#   mesh-sink-health            one poll: edge-trigger [room-mouth-wedged] + self-heal on confirmed wedge
+#   mesh-sink-health --status   print current assessment only — NO heal, NO post, NO mutation
+#   mesh-sink-health --json     machine form {ts,host,state,sig_count,sink_present,healed}
+#   mesh-sink-health --test     sandboxed smoke test (classifier fixtures + live dep gate; no restart/post)
+#   exit 0 = real reading · exit 2 = no Bose sink here (not the room MOUTH — n/a)
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"
+HOST="$(hostname)"
+MESH="${MESH_DIR:-$HOME/.mesh}"
+STATE="${MESH_SINK_HEALTH_STATE:-$MESH/.sink-health-state}"        # bare OK|WEDGED|DEGRADED — consumer contract
+HEAL_STATE="${MESH_SINK_HEAL_STATE:-$MESH/.sink-health-heal}"      # last-heal epoch — debounce bookkeeping (this tool only)
+
+WINDOW_MIN="${MESH_SINK_WINDOW_MIN:-5}"      # M — journal look-back for the recover-loop
+WEDGE_MIN="${MESH_SINK_WEDGE_MIN:-5}"        # N — >= this many signature lines in the window = WEDGED
+HEAL_COOLDOWN_S="${MESH_SINK_HEAL_COOLDOWN_S:-1200}"   # don't re-restart within 20min (avoid restart storm)
+BOSE_MATCH="${MESH_SINK_BOSE_MATCH:-Bose}"   # sink-description substring that marks the room MOUTH node
+SIG_RE="${MESH_SINK_SIG_RE:-broken pipe|snd_pcm_recover}"   # the WEDGE signature (NOT xrun — xruns are benign)
+
+# ---- SINK_TOOL: prefer pactl (task's named tool) if present, else wpctl (what the Bose node ships) ----
+if command -v pactl >/dev/null 2>&1; then SINK_TOOL=pactl
+elif command -v wpctl >/dev/null 2>&1; then SINK_TOOL=wpctl
+else SINK_TOOL=""; fi
+
+# sink_list: one line per sink description (portable across pactl/wpctl). Empty = no sink / tool broken.
+sink_list() {
+  case "$SINK_TOOL" in
+    pactl) pactl list short sinks 2>/dev/null ;;
+    wpctl) wpctl status 2>/dev/null | sed -n '/Sinks:/,/Sink endpoints:/p' ;;
+    *) return 1 ;;
+  esac
+}
+# bose_present: is a sink whose description contains $BOSE_MATCH visible on THIS node? (the node-bind test)
+bose_present() { sink_list | grep -qiF "$BOSE_MATCH"; }
+# sink_present: does the default/room sink exist AND is the query readable (post-heal verification)?
+sink_present() { local o; o="$(sink_list)" || return 1; [ -n "$o" ] && printf '%s' "$o" | grep -qiF "$BOSE_MATCH"; }
+
+# ---- count_signature <blob>: number of recover-loop signature lines in the journal blob. FALSIFIABLE:
+# flip SIG_RE and the --test fixtures fail. xrun deliberately EXCLUDED (benign, would cry-wolf). ----
+count_signature() { printf '%s\n' "$1" | grep -icE "$SIG_RE" || true; }
+
+# ---- classify_wedge <sig_count> <sink_present:yes|no|unknown> -> echoes STATE|reason ----
+# SIGNATURE is the trigger; sink-state is context. A wedge with the sink still listed is the canonical
+# case (RUNNING-but-broken). Sink-query unreadable on the room node = DEGRADED, never a fake OK.
+classify_wedge() {
+  local n="$1" sink="$2"
+  if [ "$sink" = unknown ]; then echo "DEGRADED|sink-query unreadable — cannot assess (not a fake OK)"; return; fi
+  if [ "$n" -ge "$WEDGE_MIN" ]; then
+    echo "WEDGED|$n recover-loop lines in ${WINDOW_MIN}min (>=${WEDGE_MIN}) — Bose sink wedged"; return
+  fi
+  echo "OK|no wedge signature ($n/${WEDGE_MIN} recover lines in ${WINDOW_MIN}min), sink present"
+}
+
+# ---- journal_signature_count: live read of the recover-loop signature over the last WINDOW_MIN ----
+journal_signature_count() {
+  local blob
+  blob="$(journalctl --user -u pipewire -u wireplumber -u pipewire-pulse \
+            --since "-${WINDOW_MIN}min" -o cat 2>/dev/null)" || { echo 0; return; }
+  count_signature "$blob"
+}
+
+# =========================== --test (sandboxed: no restart, no post, no mutation) ===========================
+if [ "${1:-}" = --test ]; then
+  _f=0
+  # (a) classifier: 6 signature lines -> WEDGED
+  blob6=$'spa.alsa: snd_pcm_recover: Broken pipe\nsnd_pcm_recover: Broken pipe\nBroken pipe\nsnd_pcm_recover\nBroken pipe\nsnd_pcm_recover'
+  [ "$(count_signature "$blob6")" -eq 6 ] || { echo "  FAIL: 6 sig lines should count 6, got $(count_signature "$blob6")"; _f=1; }
+  # (b) empty journal -> 0
+  [ "$(count_signature "")" -eq 0 ] || { echo "  FAIL: empty blob must count 0"; _f=1; }
+  # (c) benign lines (info + xrun) must NOT count — silence/xrun is normal, only the recover loop wedges
+  benign=$'pipewire: server started\npw.node: xrun!\nwireplumber: linking ports\npw.node: xrun!'
+  [ "$(count_signature "$benign")" -eq 0 ] || { echo "  FAIL: benign+xrun lines must count 0 (no cry-wolf)"; _f=1; }
+  # (d) exactly-at-threshold (5) -> WEDGED ; (e) below (4) -> OK
+  five=$'Broken pipe\nBroken pipe\nBroken pipe\nBroken pipe\nBroken pipe'
+  four=$'Broken pipe\nBroken pipe\nBroken pipe\nBroken pipe'
+  case "$(classify_wedge 5 yes)" in WEDGED\|*) : ;; *) echo "  FAIL: 5 sig should classify WEDGED"; _f=1;; esac
+  case "$(classify_wedge 4 yes)" in OK\|*) : ;; *) echo "  FAIL: 4 sig should classify OK"; _f=1;; esac
+  case "$(classify_wedge 9 yes)" in WEDGED\|*) : ;; *) echo "  FAIL: 9 sig should classify WEDGED"; _f=1;; esac
+  case "$(classify_wedge 0 yes)" in OK\|*) : ;; *) echo "  FAIL: 0 sig should classify OK"; _f=1;; esac
+  # (f) sink-query unreadable -> DEGRADED (never a fake OK, even with 0 signature)
+  case "$(classify_wedge 0 unknown)" in DEGRADED\|*) : ;; *) echo "  FAIL: unknown sink must be DEGRADED not OK"; _f=1;; esac
+  case "$(classify_wedge 9 unknown)" in DEGRADED\|*) : ;; *) echo "  FAIL: unknown sink must be DEGRADED even w/ signature"; _f=1;; esac
+  # (g) fixture blobs actually cross the count threshold end-to-end
+  [ "$(count_signature "$five")" -ge "$WEDGE_MIN" ] || { echo "  FAIL: five-line fixture must reach threshold"; _f=1; }
+  [ "$(count_signature "$four")" -lt "$WEDGE_MIN" ] || { echo "  FAIL: four-line fixture must stay below threshold"; _f=1; }
+  # (h) node-bind: an empty sink list must NOT read as the room node (bose_present false)
+  if SINK_TOOL="" bose_present 2>/dev/null; then echo "  FAIL: no sink tool must not claim room node"; _f=1; fi
+  # ---- LIVE dependency gate: the sink-query + journal must be usable (else the sense can't run) ----
+  if [ -z "$SINK_TOOL" ]; then
+    echo "  note: no pactl/wpctl on this node — sink query impossible (would DEGRADE on the room node)"
+  else
+    if sink_list >/dev/null 2>&1; then echo "  ok: SINK_TOOL=$SINK_TOOL readable (live sink query works)"
+    else echo "  note: $SINK_TOOL present but sink query returned non-zero (no audio session here)"; fi
+  fi
+  command -v journalctl >/dev/null 2>&1 || { echo "  FAIL: journalctl missing — signature source unreadable"; _f=1; }
+  command -v systemctl  >/dev/null 2>&1 || { echo "  FAIL: systemctl missing — cannot self-heal"; _f=1; }
+  # (i) a real, side-effect-free live read of the signature count must be an integer >=0
+  _lc="$(journal_signature_count)"; case "$_lc" in ''|*[!0-9]*) echo "  FAIL: live signature count not an int: '$_lc'"; _f=1;; *) echo "  ok: live signature count = $_lc (real journal read, no side effect)";; esac
+  if [ "$_f" = 0 ]; then echo "smoke-test: ok (signature classifier + node-bind + honest-degrade + live dep gate; no restart/post/mutation)"; exit 0
+  else echo "smoke-test: FAIL"; exit 1; fi
+fi
+
+# =========================== NODE-BIND GATE: only the room MOUTH node acts ===========================
+if [ -z "$SINK_TOOL" ] || ! bose_present; then
+  # Not the Bose node (or no audio session here) — honest n/a, NOT a fake HEALTHY. exit 2 = pass for land.
+  [ "${1:-}" = --json ] && printf '{"ts":"%s","host":"%s","state":"NA","reason":"no Bose sink here (not the room MOUTH)"}\n' \
+    "$(date -u +%FT%TZ)" "$HOST"
+  echo "[sink-health] n/a — no '$BOSE_MATCH' sink on $HOST (not the room MOUTH node)" >&2
+  exit 2
+fi
+
+# ---- assess ----
+sig_count="$(journal_signature_count)"
+if sink_present; then sink_flag=yes; else sink_flag=unknown; fi
+decision="$(classify_wedge "$sig_count" "$sink_flag")"
+state="${decision%%|*}"; reason="${decision#*|}"
+prev="$(cut -d' ' -f1 "$STATE" 2>/dev/null || echo OK)"
+
+# --------- --status / --json : READ-ONLY, never heals, never posts, never mutates STATE ---------
+if [ "${1:-}" = --status ] || [ "${1:-}" = --json ]; then
+  if [ "${1:-}" = --json ]; then
+    printf '{"ts":"%s","host":"%s","state":"%s","sig_count":%s,"sink_present":"%s","reason":"%s"}\n' \
+      "$(date -u +%FT%TZ)" "$HOST" "$state" "$sig_count" "$sink_flag" "$reason"
+  else
+    echo "[sink-health] $state — $reason (sink_tool=$SINK_TOOL, prev=$prev)"
+  fi
+  exit 0
+fi
+
+# ==================================== live reflex: edge + self-heal ====================================
+post_board() { command -v mesh-chat  >/dev/null 2>&1 && MESH_WHO="sink-health@$HOST" mesh-chat "$1" >/dev/null 2>&1; }
+post_trace() { command -v mesh-trace >/dev/null 2>&1 && MESH_WHO="sink-health@$HOST" mesh-trace "$1" >/dev/null 2>&1; }
+post_op()    { command -v mesh-tg    >/dev/null 2>&1 && mesh-tg "$1" >/dev/null 2>&1; }
+
+heal_and_verify() {  # returns 0 if the sink came back, 1 if heal failed
+  local now last=0
+  now="$(date +%s)"
+  [ -f "$HEAL_STATE" ] && last="$(cat "$HEAL_STATE" 2>/dev/null || echo 0)"
+  if [ $((now - last)) -lt "$HEAL_COOLDOWN_S" ]; then
+    post_trace "[room-mouth-wedged] signature persists but within heal cooldown ($((now-last))s < ${HEAL_COOLDOWN_S}s) — NOT restarting (avoid storm)"
+    sink_present && return 0 || return 1
+  fi
+  echo "$now" > "$HEAL_STATE"
+  # scoped user-service restart (XDG/DBUS already exported at top — the cron gotcha)
+  systemctl --user restart wireplumber pipewire pipewire-pulse 2>/dev/null || true
+  # give the stack a moment to re-enumerate the USB sink, then verify
+  local i
+  for i in 1 2 3 4 5 6; do sink_present && return 0; sleep 1; done
+  return 1
+}
+
+if [ "$state" = WEDGED ]; then
+  if [ "$prev" != WEDGED ]; then
+    post_board "[room-mouth-wedged] Bose sink wedged on $HOST — $reason. self-healing (restart wireplumber/pipewire)…"
+  fi
+  echo "WEDGED $(date -u +%FT%TZ) sig=$sig_count" > "$STATE"
+  if heal_and_verify; then
+    post_board "[room-mouth-healed] Bose sink recovered on $HOST after user-service restart (sig was $sig_count)"
+    echo "OK $(date -u +%FT%TZ) healed sig=$sig_count" > "$STATE"
+  else
+    # heal FAILED — the room MOUTH is down and needs a human. Operator-worthy escalation.
+    post_board "[room-mouth-wedged] HEAL FAILED on $HOST — Bose sink did NOT return after restart. NEEDS OPERATOR."
+    post_op "🔇 Room MOUTH down: Bose sink on $HOST wedged (ALSA recover loop) and auto-restart of pipewire/wireplumber did NOT recover it. All room audio is dead — needs a manual look."
+    echo "WEDGED $(date -u +%FT%TZ) heal-failed sig=$sig_count" > "$STATE"
+  fi
+elif [ "$state" = DEGRADED ]; then
+  [ "$prev" != DEGRADED ] && post_trace "[sink-health] DEGRADED on $HOST — $reason"
+  echo "DEGRADED $(date -u +%FT%TZ)" > "$STATE"
+else
+  # OK — recovery edge if we were wedged/degraded
+  if [ "$prev" = WEDGED ] || [ "$prev" = DEGRADED ]; then
+    post_trace "[room-mouth-recovered] Bose sink healthy again on $HOST (was $prev)"
+  fi
+  echo "OK $(date -u +%FT%TZ) sig=$sig_count" > "$STATE"
+fi
+
+# Liveness-touch: mtime = ran-live (always), content = value-changed (above). Decouples the two so a
+# long-stable OK cannot decay to a FALSE STALE in reflex-health/pulse. (conditional-write-liveness-touch)
+command -v mesh-state-touch >/dev/null 2>&1 && mesh-state-touch "$STATE" >/dev/null 2>&1 || touch "$STATE"
+
+echo "[sink-health] $state — $reason"
