@@ -297,7 +297,7 @@ when unsure, leave it flagged so a genuinely dead-on-arrival orphan stays visibl
   `mesh-changes` · `mesh-looper` · `mesh-oscilloscope` · `mesh-mic-correlate` · `mesh-mic-crossvalidate` ·
   `mesh-tuner-web` (bass-clef practice page: serves the live `mesh-tuner` reading on a staff + browser metronome)
 
-Decayed tools (mesh-health-watch, mesh-tg-recv, mesh-zone, vpn-hub.py, mesh-onboard, mesh-board-timerepair) live in git history — the attic.
+Decayed tools (mesh-health-watch, mesh-tg-recv, mesh-zone, vpn-hub.py, mesh-onboard, mesh-board-timerepair) live in git history — the attic. **mesh-mind-watch** + **mesh-mind-stamp** are decayed-in-PLACE (2026-06-19 beat chain died in the channel re-org; superseded by `mesh-mind-state`) — kept in `scripts/` with a DECAYED banner + `orphan-ok` (their phi/SWIM + chaos harnesses still reference them), NOT attic'd; never cron-wire them (dead beat → permanent false "mind DOWN").
 
 ## Capabilities (self-declared, opt-in by consumers)
 

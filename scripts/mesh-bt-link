@@ -1,0 +1,209 @@
+#!/usr/bin/env bash
+# reflex-cadence: */9 * * * *
+# reflex-args: --edge
+# doctor-artifact: $HOME/.mesh/.bt-link-state 1200
+# umwelt-ok: edge reflex — the SENSE output flows to the board via [bt-connected]/[bt-none]/[bt-offline]
+#   posts; .bt-link-state is the change-detection SIGNATURE (verdict + sorted connected-MAC set) the
+#   --edge diff reads, i.e. internal bookkeeping, not a declared output for tool readers (same shape as
+#   the doctor's own .doctor-*-state). A fusion reader (mesh-audio-path: "is the BT audio sink live?" /
+#   mesh-sensorium) is the natural next consumer — filed as a board [task], not blocking birth.
+#   ^ smoke-theater gate (mesh-doctor): .bt-link-state is rewritten on EVERY run — CONNECTED, NONE,
+#     AND the OFFLINE (exit 2) path all write STATE before returning, so mtime = ran-live regardless
+#     of whether the BT radio is up. No reach-gate: the controller is a fixed local adapter (unlike a
+#     roaming phone), so a stale STATE despite the cron line ⟹ the reflex itself is dead → honest WARN.
+#     STATE write is UNCONDITIONAL per run, so no mesh-state-touch is needed (that's only for the
+#     change-gated subset; --edge here gates only the BOARD post, never the STATE write).
+#
+# mesh-bt-link — the node's OWN connected Bluetooth PERIPHERALS sense.
+#
+# WHY THIS IS NEW: the mesh already SCANS the BLE neighbourhood for advertising beacons
+# (mesh-presence / mesh-room-sense / mesh-zonemap — "who is nearby") and reads the node's WiFi link
+# (mesh-wifi-quality). Nothing reads the node's OWN actively-connected BT peripherals — a distinct
+# signal the hardware exposes but no sense taps. A connected AUDIO sink (Bose/headset) means the
+# room-audio actuator path (mesh-say/mesh-act/mesh-audio-path) is physically LIVE; a connected HEADSET
+# means the operator is likely present + on private audio; a connected INPUT device (kbd/mouse) is a
+# hands-on-the-node signal. This is the node's-own-connections complement to the beacon SCAN.
+#
+# HONEST CONTRACT (the whole point — an unreachable radio must NOT read as a faked all-clear):
+#   OFFLINE (exit 2)  bluetoothctl absent | rfkill soft/hard-blocked | bluetoothd down | no controller
+#                     | adapter Powered:no  → the sensor is UNREACHABLE; we cannot enumerate anything.
+#   NONE   (exit 0)   controller UP + readable, genuinely 0 peripherals connected — a REAL empty,
+#                     visibly DISTINCT from OFFLINE (that distinction is the honest-degrade requirement).
+#   CONNECTED(exit 0) ≥1 peripheral connected, classified by device Icon (audio/input/display/phone/other).
+#
+#   mesh-bt-link            one-line verdict → stdout (writes STATE, no board post)
+#   mesh-bt-link --json     machine-readable JSON
+#   mesh-bt-link --edge     REFLEX: post [bt-connected]/[bt-none]/[bt-offline] to the board ONLY on a
+#                           verdict/connected-set CHANGE (2-consecutive not needed — BT connect/disconnect
+#                           is a discrete hardware event, not a noisy analog signal)
+#   mesh-bt-link --test     smoke test (classifier fixtures + live controller-read gate)
+#   mesh-bt-link --forget   reset state (next run re-seeds silently)
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+
+STATE="$HOME/.mesh/.bt-link-state"
+BTCTL_TIMEOUT=8
+
+# classify_icon <icon-string> → audio|input|display|phone|other
+# Maps the BlueZ device Icon (bluetoothctl `info` → "Icon:") to a coarse peripheral class. Factored out
+# so --test can assert the mapping without a radio. Best-effort: an absent/unknown Icon → "other" (the
+# count + names are the load-bearing signal; the class is a bonus lens for consumers).
+classify_icon() {
+  case "$1" in
+    audio-*|*headset*|*headphone*|*speaker*) echo "audio" ;;
+    input-*|*keyboard*|*mouse*|*gaming*)     echo "input" ;;
+    video-*|*display*|*tv*)                  echo "display" ;;
+    phone|*phone*)                           echo "phone" ;;
+    *)                                       echo "other" ;;
+  esac
+}
+
+# bt_offline_reason → echoes a reason string if the BT sensor is UNREACHABLE, else empty.
+# Order: binary absent → radio rfkill-blocked → daemon down → no controller / adapter powered off.
+bt_offline_reason() {
+  command -v bluetoothctl >/dev/null 2>&1 || { echo "bluetoothctl not installed"; return; }
+  if command -v rfkill >/dev/null 2>&1; then
+    if rfkill list bluetooth 2>/dev/null | grep -qi 'blocked: *yes'; then
+      echo "rfkill-blocked (radio off)"; return
+    fi
+  fi
+  # controller present + powered? `bluetoothctl show` prints "Powered: yes" for a live default adapter.
+  local show; show="$(timeout "$BTCTL_TIMEOUT" bluetoothctl show 2>/dev/null)"
+  if [ -z "$show" ] || ! printf '%s' "$show" | grep -qiE '^\s*Controller|Powered:'; then
+    echo "no bluetooth controller / bluetoothd down"; return
+  fi
+  if printf '%s' "$show" | grep -qi 'Powered: *no'; then
+    echo "adapter powered off"; return
+  fi
+  echo ""  # reachable
+}
+
+# read_connected → prints "MAC<TAB>class<TAB>name" per connected peripheral (may be empty = NONE).
+# Uses `bluetoothctl devices Connected` (bluez 5.65+); per device, `info <MAC>` → Icon → classify_icon.
+read_connected() {
+  local line mac name icon cls
+  timeout "$BTCTL_TIMEOUT" bluetoothctl devices Connected 2>/dev/null | while read -r _dev mac name; do
+    [ -n "$mac" ] || continue
+    icon="$(timeout "$BTCTL_TIMEOUT" bluetoothctl info "$mac" 2>/dev/null | sed -n 's/^[[:space:]]*Icon:[[:space:]]*//p' | head -1)"
+    cls="$(classify_icon "${icon:-unknown}")"
+    printf '%s\t%s\t%s\n' "$mac" "$cls" "$name"
+  done
+}
+
+# build_verdict <connected-table> <paired-count> → echoes the verdict line.
+#   table = TAB-separated "MAC<TAB>class<TAB>name" rows (may be empty = NONE).
+# Defined BEFORE --test so the smoke test dry-runs the exact production builder.
+build_verdict() {
+  local table="$1"
+  if [ -z "$table" ]; then
+    echo "NONE|controller up, 0 peripherals connected"
+    return
+  fi
+  local n a i d p o names=""
+  n="$(printf '%s\n' "$table" | grep -c .)"
+  a="$(printf '%s\n' "$table" | awk -F'\t' '$2=="audio"'   | grep -c .)"
+  i="$(printf '%s\n' "$table" | awk -F'\t' '$2=="input"'   | grep -c .)"
+  d="$(printf '%s\n' "$table" | awk -F'\t' '$2=="display"' | grep -c .)"
+  p="$(printf '%s\n' "$table" | awk -F'\t' '$2=="phone"'   | grep -c .)"
+  o="$(printf '%s\n' "$table" | awk -F'\t' '$2=="other"'   | grep -c .)"
+  names="$(printf '%s\n' "$table" | awk -F'\t' 'NF{printf "%s(%s) ", $3, $2}' | sed 's/ $//')"
+  echo "CONNECTED|n=$n audio=$a input=$i display=$d phone=$p other=$o | $names"
+}
+
+# ---- --test -------------------------------------------------------------------------------------
+if [ "${1:-}" = "--test" ]; then
+  command -v bluetoothctl >/dev/null 2>&1 || { echo "smoke-test: FAIL (no bluetoothctl)"; exit 1; }
+  _f=0
+  # classifier contract (the reason the tool has a class lens at all)
+  [ "$(classify_icon audio-headset)"   = "audio" ]   || { echo "  FAIL audio-headset→audio";   _f=1; }
+  [ "$(classify_icon audio-card)"       = "audio" ]   || { echo "  FAIL audio-card→audio";       _f=1; }
+  [ "$(classify_icon input-keyboard)"   = "input" ]   || { echo "  FAIL input-keyboard→input";   _f=1; }
+  [ "$(classify_icon input-mouse)"      = "input" ]   || { echo "  FAIL input-mouse→input";      _f=1; }
+  [ "$(classify_icon video-display)"    = "display" ] || { echo "  FAIL video-display→display";  _f=1; }
+  [ "$(classify_icon phone)"            = "phone" ]   || { echo "  FAIL phone→phone";            _f=1; }
+  [ "$(classify_icon '')"               = "other" ]   || { echo "  FAIL empty-icon→other";       _f=1; }
+  [ "$(classify_icon weird-thing)"      = "other" ]   || { echo "  FAIL unknown→other";          _f=1; }
+  # verdict-builder contract: build_verdict on a fixture connected-table → CONNECTED with tallies;
+  # empty table → NONE. (build_verdict is defined above → --test runs the exact production builder.)
+  fix="$(printf 'AA:BB\taudio\tBose Revolve\nCC:DD\tinput\tK380\n')"
+  v="$(build_verdict "$fix")"
+  echo "$v" | grep -q '^CONNECTED|n=2 ' || { echo "  FAIL fixture 2-connected should be CONNECTED n=2: got '$v'"; _f=1; }
+  echo "$v" | grep -q 'audio=1' || { echo "  FAIL fixture should tally audio=1: got '$v'"; _f=1; }
+  echo "$v" | grep -q 'input=1' || { echo "  FAIL fixture should tally input=1: got '$v'"; _f=1; }
+  vn="$(build_verdict "")"
+  echo "$vn" | grep -q '^NONE|' || { echo "  FAIL empty table should be NONE: got '$vn'"; _f=1; }
+  [ "$_f" = 0 ] || { echo "smoke-test: FAIL (classifier / verdict-builder contract)"; exit 1; }
+  # REAL-READ GATE (verification principle): assert the controller is actually READABLE right now — a
+  # real enumeration succeeds (0 or more devices is fine; the point is the read works, not the count).
+  # Radio off / blocked / daemon down = honest n/a (exit 2), never a fake green.
+  _off="$(bt_offline_reason)"
+  if [ -n "$_off" ]; then
+    echo "smoke-test: n/a (BT sensor unreachable: $_off — offline-gate + classifier verified, live-read skipped)"; exit 2
+  fi
+  # controller reachable: prove `devices Connected` returns without error (empty list is a valid read)
+  timeout "$BTCTL_TIMEOUT" bluetoothctl devices Connected >/dev/null 2>&1 \
+    || { echo "smoke-test: n/a (controller reachable but 'devices Connected' failed — bluez too old?)"; exit 2; }
+  _live_n="$(read_connected | grep -c . || true)"
+  echo "smoke-test: ok (classifier + verdict-builder + REAL controller read: ${_live_n} peripheral(s) connected)"; exit 0
+fi
+
+[ "${1:-}" = "--forget" ] && { rm -f "$STATE"; echo "bt-link state forgotten — next run re-seeds"; exit 0; }
+
+MODE="${1:-}"
+
+# ---- offline gate (honest-degrade) --------------------------------------------------------------
+offline="$(bt_offline_reason)"
+if [ -n "$offline" ]; then
+  verdict="OFFLINE|$offline"
+  sig="OFFLINE"
+else
+  table="$(read_connected)"
+  verdict="$(build_verdict "$table")"
+  # change signature = verdict class + sorted connected MAC set (so a reorder never false-fires)
+  set_sig="$(printf '%s\n' "$table" | awk -F'\t' 'NF{print $1}' | sort | tr '\n' ',')"
+  sig="$(printf '%s' "$verdict" | cut -d'|' -f1)#${set_sig}"
+fi
+
+# JSON mode
+if [ "$MODE" = "--json" ]; then
+  label="$(printf '%s' "$verdict" | cut -d'|' -f1)"
+  detail="$(printf '%s' "$verdict" | cut -d'|' -f2-)"
+  ts="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)"
+  printf '{"label":"%s","detail":"%s","ts":"%s"}\n' "$label" "$(printf '%s' "$detail" | sed 's/"/\\"/g')" "$ts"
+  # still refresh STATE liveness on --json reads too (unconditional-per-run contract)
+  old_sig=""; [ -f "$STATE" ] && old_sig="$(sed -n '2p' "$STATE")"
+  printf '%s\n%s\n' "$verdict" "$sig" > "$STATE" 2>/dev/null
+  [ "$label" = "OFFLINE" ] && exit 2 || exit 0
+fi
+
+# read prior signature for change detection (STATE line 1 = verdict, line 2 = signature)
+old_sig=""; had_state=0
+[ -f "$STATE" ] && { had_state=1; old_sig="$(sed -n '2p' "$STATE")"; }
+
+# write STATE unconditionally (verdict + signature) — mtime = ran-live for the doctor-artifact gate
+printf '%s\n%s\n' "$verdict" "$sig" > "$STATE" 2>/dev/null
+
+changed=0
+[ "$had_state" = 1 ] && [ -n "$old_sig" ] && [ "$old_sig" != "$sig" ] && changed=1
+
+# --edge: post to board only on a real change (never on first-run seed)
+if [ "$MODE" = "--edge" ]; then
+  if [ "$changed" = 1 ]; then
+    label="$(printf '%s' "$verdict" | cut -d'|' -f1)"
+    detail="$(printf '%s' "$verdict" | cut -d'|' -f2- | sed 's/^ *//')"
+    case "$label" in
+      OFFLINE)   tag="[bt-offline]" ;;
+      NONE)      tag="[bt-none]" ;;
+      CONNECTED) tag="[bt-connected]" ;;
+      *)         tag="[bt-link]" ;;
+    esac
+    command -v mesh-chat >/dev/null 2>&1 && \
+      MESH_WHO="bt-link@$(hostname)" mesh-chat "$tag $detail" >/dev/null 2>&1
+  fi
+  [ "${verdict%%|*}" = "OFFLINE" ] && exit 2 || exit 0
+fi
+
+# default: print verdict
+printf '%s\n' "$verdict"
+[ "${verdict%%|*}" = "OFFLINE" ] && exit 2 || exit 0
