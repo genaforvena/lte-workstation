@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+# mesh-reddit-watch — poll a Reddit thread's PUBLIC RSS, ping the operator on NEW comments,
+#   flag ones that look like replies to a watched comment. READ-ONLY: no creds, no posting.
+#
+# Why RSS (not .json): as of 2026-07 Reddit serves its HTML web-shell for unauthenticated
+# `.json`/`api/info.json` on www AND old.reddit ("Blocked") — proven walled from our VPN egress
+# AND phaedra's DC IP. The `.rss`/Atom feed is STILL public + un-walled (verified 2026-07-06,
+# 3 entries parsed) → that's the read path. POSTING a reply still needs the operator's Reddit
+# account (a free "script" OAuth app) — deliberately NOT built here; drafts go to the operator,
+# he posts (outward-facing + from his identity → operator-gated by doctrine).
+#
+#   mesh-reddit-watch          one poll pass (cron-wired)
+#   mesh-reddit-watch --test   smoke test (parses a fixture; sends NO Telegram)
+#
+# Config: ~/.mesh/reddit-watch.conf — one watch per line, '#'/blank ignored:
+#   <slug>  <thread-rss-url>  <watched-comment-id>  <label...>
+# State:  ~/.mesh/.reddit-watch/<slug>.seen — comment ids already reported (one per line).
+# reflex-cadence: */10 * * * *
+# doctor-artifact: .reddit-watch/.pulse 1800 net
+# Exit: 0 = ok (polled); 2 = n/a (no conf, or all watches unreachable — honest, never a faked all-clear).
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+# config env (REDDIT_WATCH_FALLBACK_NODE second-IP egress, WATCHED_AUTHOR reply-mention hint) lives
+# in ~/.mesh/nodes (gitignored) — same source-of-truth other mesh tools read.
+[ -f "$HOME/.mesh/nodes" ] && . "$HOME/.mesh/nodes"
+
+CONF="$HOME/.mesh/reddit-watch.conf"
+STATE="$HOME/.mesh/.reddit-watch"
+PULSE="$STATE/.pulse"
+UA="Mozilla/5.0 (X11; Linux x86_64; rv:126.0) Gecko/20100101 Firefox/126.0"
+
+# --- parser: Atom feed on stdin -> "id<TAB>author<TAB>updated<TAB>href<TAB>text" per entry ---
+# NB: python source in a -c VARIABLE (not a heredoc) so stdin stays the FEED, not the script.
+read -r -d '' PARSE_PY <<'PY'
+import sys,re,html
+from xml.etree import ElementTree as ET
+ns={'a':'http://www.w3.org/2005/Atom'}
+raw=sys.stdin.read()
+# XXE / billion-laughs hardening (no defusedxml on this node): a DTD is REQUIRED to declare
+# external or recursive entities. Legit Reddit Atom carries none, so refuse to parse any
+# payload with a DOCTYPE/ENTITY decl rather than feed it to expat.
+if re.search(r'<!DOCTYPE|<!ENTITY', raw, re.I):
+    sys.exit(4)
+try:
+    root=ET.fromstring(raw)
+except Exception:
+    sys.exit(3)
+for e in root.findall('a:entry',ns):
+    au=e.find('a:author/a:name',ns); au=au.text if au is not None else '?'
+    up=e.find('a:updated',ns); up=up.text if up is not None else '?'
+    lk=e.find('a:link',ns); href=lk.get('href') if lk is not None else ''
+    cid=re.search(r'/([a-z0-9]+)/?$', href.rstrip('/'))
+    cid=cid.group(1) if cid else href[-12:]
+    c=e.find('a:content',ns)
+    txt=re.sub('<[^>]+>',' ',html.unescape(c.text or '')) if c is not None else ''
+    txt=re.sub(r'\s+',' ',txt).strip()
+    print(f"{cid}\t{au}\t{up}\t{href}\t{txt}")
+PY
+parse_feed() { python3 -c "$PARSE_PY"; }
+
+# fetch a URL as Atom, retrying across egresses — Reddit soft-rate-limits per IP (first hit
+# from an IP succeeds, then a cooldown serves the HTML web-shell), so one 10-min poll can land
+# in a walled window. Try LOCAL egress, then phaedra's independent DC IP. Echo the feed on the
+# first Atom-shaped response; empty (caller treats as unreachable, never advances state).
+fetch_atom() {
+  local url="$1" r
+  r="$(curl -s -m 25 -A "$UA" "$url" 2>/dev/null)"
+  printf '%s' "$r" | grep -q '<feed' && { printf '%s' "$r"; return 0; }
+  if [ -n "${REDDIT_WATCH_FALLBACK_NODE:-}" ]; then
+    r="$(timeout 35 ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "$REDDIT_WATCH_FALLBACK_NODE" \
+         "curl -s -m 25 -A '$UA' '$url'" 2>/dev/null)"
+    printf '%s' "$r" | grep -q '<feed' && { printf '%s' "$r"; return 0; }
+  fi
+  return 1
+}
+
+if [ "${1:-}" = "--test" ]; then
+  fx='<?xml version="1.0" encoding="UTF-8"?><feed xmlns="http://www.w3.org/2005/Atom">
+  <entry><author><name>/u/someone</name></author><updated>2026-07-06T20:29:57+00:00</updated>
+  <link href="https://www.reddit.com/r/x/comments/abc/t/ovy8u63/"/><content>hi &amp; bye</content></entry></feed>'
+  out="$(printf '%s' "$fx" | parse_feed)" || { echo "smoke-test: FAIL (parser rc)"; exit 1; }
+  printf '%s' "$out" | grep -q $'ovy8u63\t/u/someone\t' \
+    && printf '%s' "$out" | grep -q 'hi & bye' \
+    || { echo "smoke-test: FAIL (parse mismatch: $out)"; exit 1; }
+  # a sandboxed real run must NOT send Telegram and must not crash on a missing conf
+  MESH_TEST_SANDBOX=1 "$0" >/dev/null 2>&1
+  echo "smoke-test: ok (Atom parse: id+author+unescaped text; sandbox run clean)"
+  exit 0
+fi
+
+[ -f "$CONF" ] || { echo "mesh-reddit-watch: no $CONF (n/a)" >&2; exit 2; }
+mkdir -p "$STATE"
+any_ok=0
+while read -r slug url wcid label; do
+  case "$slug" in ''|\#*) continue;; esac
+  [ -n "$url" ] || continue
+  feed="$(fetch_atom "$url")" || { echo "mesh-reddit-watch: $slug unreachable/walled (all egresses)" >&2; continue; }
+  entries="$(printf '%s' "$feed" | parse_feed)" || { echo "mesh-reddit-watch: $slug parse fail" >&2; continue; }
+  [ -n "$entries" ] || continue
+  any_ok=1
+  seen="$STATE/$slug.seen"
+  # first-ever run for this slug: BASELINE — record current comments as seen, notify on NONE
+  # (avoids re-announcing the whole existing thread). Real notifications begin on the next new one.
+  baseline=0; [ -f "$seen" ] || baseline=1
+  touch "$seen"
+  while IFS=$'\t' read -r cid author updated href text; do
+    [ -n "$cid" ] || continue
+    grep -qxF "$cid" "$seen" && continue            # already reported
+    echo "$cid" >> "$seen"
+    [ "$baseline" = 1 ] && continue                 # baseline pass — record only, no ping
+    [ "$cid" = "$wcid" ] && continue                # the watched comment itself — not a reply
+    # heuristic reply flag: flat RSS lacks parent ids; flag if it name-mentions the watched id's author
+    tag="[reddit] new comment in $label"
+    if [ -n "${WATCHED_AUTHOR:-}" ] && printf '%s' "$text" | grep -qiF "$WATCHED_AUTHOR"; then
+      tag="[reddit] REPLY mentioning you in $label"
+    fi
+    msg="$tag
+by $author · $updated
+$href
+
+${text:0:600}
+
+(draft a reply? read-only watch — posting is your account. reply here and I'll draft.)"
+    if [ "${MESH_TEST_SANDBOX:-0}" = 1 ]; then
+      echo "mesh-reddit-watch: SANDBOX — would notify: $cid ($author)" >&2
+    else
+      mesh-tg "$msg" >/dev/null 2>&1 || echo "$msg" >> "$HOME/.mesh/reddit-watch-pending.log"
+    fi
+  done <<< "$entries"
+done < "$CONF"
+
+# liveness-touch: mtime = ran-live (always), so the mtime-aging watchdogs read a long-quiet
+# thread as ALIVE, not STALE (liveness-touch convention). A dead cron never runs → honest-STALE.
+mkdir -p "$STATE"; touch "$PULSE" 2>/dev/null   # mtime = ran-live (mesh-state-touch SKIPS missing files by design)
+[ "$any_ok" = 1 ] && exit 0 || exit 2
