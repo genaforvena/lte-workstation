@@ -192,10 +192,77 @@ def load_groq_key():
     except Exception: pass
     return None
 
+# Groq STT outcome sentinel (chat-review/groq-stt-blind-error+no-backoff, 2026-07-06): transcribe_groq
+# used to read only .get("text") and DISCARD the error body, so a 429 rate-limit (HTTP-200-shaped JSON
+# with an 'error' field, NO 'text') was indistinguishable from a genuine empty transcription — logged as
+# 'empty' and RE-HIT every single utterance, falling to the SSH→IdeaPad whisper offload each time (the
+# 1.9GB main-relaunch swap/[node-hot]/100C storm). _GROQ_ERR carries WHY the last call yielded no text so
+# the caller logs the real code (part 1) and stays silent while the rate-limit cooldown holds (part 2).
+_GROQ_ERR=None
+
+def _groq_cooldown_file():
+    return os.path.join(os.path.dirname(LOGF),"groq-stt-cooldown")
+
+def _groq_cooldown_active():
+    # Fresh flag → still cooling (skip Groq). Expired → clear it so the NEXT call probes Groq afresh (a
+    # new 429 then opens a NEW episode = exactly one [groq-cooldown] line per rate-limit spell).
+    try:
+        secs=int(os.environ.get("OH_GROQ_COOLDOWN","300"))
+        if time.time()-os.path.getmtime(_groq_cooldown_file()) < secs:
+            return True
+        os.remove(_groq_cooldown_file())
+    except OSError: pass
+    return False
+
+def _groq_enter_cooldown(code):
+    # Arm the skip-Groq flag AND write the single episode line. Called only on an actual 429 (during the
+    # active window _groq_cooldown_active short-circuits BEFORE the curl, so we never re-hit → one line).
+    p=_groq_cooldown_file()
+    try:
+        with open(p,"w") as f: f.write(str(code))
+    except OSError: pass
+    try:
+        secs=os.environ.get("OH_GROQ_COOLDOWN","300")
+        with open(LOGF,"a") as f:
+            f.write("%s  [groq-cooldown] rate_limit (%s) -> skip Groq %ss, local fallback\n"%(time.strftime("%H:%M:%S"),code,secs))
+    except OSError: pass
+
+def _groq_classify(body_str):
+    # Single source of truth (live + --test) for reading a Groq STT response. Returns (text, code, is_rate):
+    #   success   -> ("<text>", None, False)   text may be "" for a genuine empty transcription
+    #   error     -> ("",       "<code>", <bool rate_limit>)   429/rate → is_rate True
+    #   unparsable-> ("",       "parse-error", False)
+    import json
+    try:
+        body=json.loads(body_str)
+    except Exception:
+        return ("","parse-error",False)
+    if not isinstance(body,dict):
+        return ("","parse-error",False)
+    if "text" in body:
+        return (str(body.get("text") or "").strip(),None,False)
+    err=body.get("error")
+    if isinstance(err,dict):
+        code=err.get("code") or err.get("type") or "unknown"
+    elif err:
+        code=str(err)
+    else:
+        code="unknown"
+    code=str(code)
+    is_rate=("rate" in code.lower()) or ("429" in code) or (str(body.get("code"))=="429")
+    return ("",code,is_rate)
+
 def transcribe_groq(wav):
-    import tempfile, base64, json
+    import tempfile, json
+    global _GROQ_ERR
+    _GROQ_ERR=None
+    # BACKOFF FIRST (before key/curl): while a rate-limit cooldown is fresh, skip Groq entirely and go
+    # straight to the local/offload fallback — no curl, no per-utterance log spam.
+    if _groq_cooldown_active():
+        _GROQ_ERR="cooldown"; return ""
     key=load_groq_key()
-    if not key: return ""
+    if not key:
+        _GROQ_ERR="no-key"; return ""
     try:
         model=os.environ.get("OH_GROQ_MODEL","whisper-large-v3-turbo")
         # Pass language explicitly (operator 2026-07-04: without it Groq auto-detects and hallucinates
@@ -217,13 +284,21 @@ def transcribe_groq(wav):
             if lang and lang != "auto":
                 curl_args+=["-F","language="+lang]
             proc=subprocess.run(curl_args,capture_output=True,timeout=120,check=True)
-            t=json.loads(proc.stdout).get("text","").strip()
-            return t
+            text,code,is_rate=_groq_classify(proc.stdout.decode("utf-8","ignore"))
+            if code is None:
+                return text            # success (text may be a genuine empty "")
+            if is_rate:
+                _groq_enter_cooldown(code)     # logs the ONE [groq-cooldown] line + arms the skip flag
+                _GROQ_ERR="rate_limit:"+code   # caller stays silent (already logged here)
+            else:
+                _GROQ_ERR=code                 # caller logs [groq-stt-fail] <code>
+            return ""
         finally:
             try: os.remove(tmp_path)
             except OSError: pass
     except Exception as e:
         sys.stderr.write("groq-stt failed: %s\n"%(e,))
+        _GROQ_ERR="exception:%s"%e
         return ""
 
 def transcribe(wav):
@@ -234,7 +309,16 @@ def transcribe(wav):
         try:
             t=transcribe_groq(wav)
             if t: return t
-            with open(LOGF,"a") as f: f.write("%s  [groq-stt-fail] empty response -> local fallback\n"%(time.strftime("%H:%M:%S"),))
+            # Distinguish the no-text cases (chat-review/groq-stt-blind-error+no-backoff): a rate-limit
+            # ('rate_limit:*') and its cooldown-skip ('cooldown') already logged/handled inside
+            # transcribe_groq — stay silent. A missing key ('no-key') is a config state, not a transient —
+            # silent too. A real Groq error code → log it verbatim (part 1). A genuine empty transcription
+            # (_GROQ_ERR is None) → the old 'empty response' line.
+            err=_GROQ_ERR
+            if err in (None,):
+                with open(LOGF,"a") as f: f.write("%s  [groq-stt-fail] empty response -> local fallback\n"%(time.strftime("%H:%M:%S"),))
+            elif not (err=="cooldown" or err=="no-key" or err.startswith("rate_limit")):
+                with open(LOGF,"a") as f: f.write("%s  [groq-stt-fail] %s -> local fallback\n"%(time.strftime("%H:%M:%S"),err))
         except Exception as e:
             try:
                 with open(LOGF,"a") as f: f.write("%s  [groq-stt-fail] exception: %s -> local fallback\n"%(time.strftime("%H:%M:%S"),e))
@@ -917,6 +1001,23 @@ elif mode=="say_verify":
     _rms=int(sys.argv[5]) if len(sys.argv)>5 else None
     print(_say_verify(_said, _heard, _muted, amb_rms=_rms)); sys.exit(0)
 
+elif mode=="groq_classify":
+    # TEST hook (chat-review/groq-stt-blind-error+no-backoff): classify a Groq STT response body without
+    # any network. Prints text=<t>|code=<c>|rate=<0|1> — the exact branch transcribe_groq keys on.
+    _t,_c,_r=_groq_classify(sys.argv[2] if len(sys.argv)>2 else "")
+    print("text=%s|code=%s|rate=%d"%(_t,_c,1 if _r else 0)); sys.exit(0)
+
+elif mode=="groq_cooldown_active":
+    # TEST hook: report whether the rate-limit cooldown flag is currently fresh (skip-Groq) — also clears
+    # it when expired. Lets --test prove the flag arms/expires without hitting Groq.
+    print("1" if _groq_cooldown_active() else "0"); sys.exit(0)
+
+elif mode=="groq_stt_err":
+    # TEST hook: run transcribe_groq(wav) and print the _GROQ_ERR sentinel (not the text). With a fresh
+    # cooldown flag this must return 'cooldown' BEFORE any curl — proving the backoff short-circuits.
+    transcribe_groq(sys.argv[2] if len(sys.argv)>2 else "/nonexistent.wav")
+    print(_GROQ_ERR if _GROQ_ERR is not None else "none"); sys.exit(0)
+
 elif mode=="classify_wav":
     # RICH verdict on a given wav file (TEST/DEBUG entry point): prints silence|ambient|music|speech-like.
     # Used by test-overhear-classifier so the audio classifier is exercised on synthetic wavs without
@@ -1358,6 +1459,27 @@ case "${1:-}" in
     grep -qF "${_ng_a}${_ng_b}" "$0" \
       || { echo "smoke-test: FAIL (transcribe_local whisper invocation lost its nice wrapper)"; exit 1; }
     echo "  burst-niceness ok (local whisper runs at nice 19 — minds preempt transcription bursts)"
+    # groq STT error-classification + backoff (chat-review/groq-stt-blind-error+no-backoff, 2026-07-06):
+    # a 429 rate-limit is HTTP-200-shaped JSON with an 'error' field and NO 'text'. The old code read only
+    # .get('text') → logged as generic 'empty' → re-hit Groq every utterance → SSH→IdeaPad whisper storm.
+    # Assert the four branches transcribe_groq now distinguishes, each falsifiable.
+    case "$(runpy groq_classify '{"text":" Белый."}')" in *'text=Белый.|code=None|rate=0'*) : ;; *) echo "smoke-test: FAIL (groq_classify: text body must passthrough, got: $(runpy groq_classify '{"text":" Белый."}'))"; exit 1;; esac
+    _grl='{"error":{"message":"rate limit reached","type":"rate_limit_exceeded","code":"rate_limit_exceeded"}}'
+    case "$(runpy groq_classify "$_grl")" in *'code=rate_limit_exceeded|rate=1'*) : ;; *) echo "smoke-test: FAIL (groq_classify: 429 body must parse code + is_rate, got: $(runpy groq_classify "$_grl"))"; exit 1;; esac
+    _goe='{"error":{"message":"bad request","type":"invalid_request_error","code":"model_not_found"}}'
+    case "$(runpy groq_classify "$_goe")" in *'code=model_not_found|rate=0'*) : ;; *) echo "smoke-test: FAIL (groq_classify: non-rate error must parse code, rate=0, got: $(runpy groq_classify "$_goe"))"; exit 1;; esac
+    case "$(runpy groq_classify '{"text":""}')" in *'text=|code=None|rate=0'*) : ;; *) echo "smoke-test: FAIL (groq_classify: genuine empty text is code=None, not an error)"; exit 1;; esac
+    # backoff short-circuits the curl: a FRESH cooldown flag → transcribe_groq returns 'cooldown' before
+    # any network; an EXPIRED flag → inactive + auto-removed (so the next 429 opens a fresh episode).
+    _gcd="$(mktemp -d /tmp/oh-groq-XXXXXX)"; : > "$_gcd/groq-stt-cooldown"
+    [ "$(OH_LOG="$_gcd/overhear.log" OH_GROQ_COOLDOWN=300 runpy groq_stt_err /nonexistent.wav)" = cooldown ] \
+      || { echo "smoke-test: FAIL (fresh cooldown flag must skip Groq with 'cooldown' sentinel — no curl)"; rm -rf "$_gcd"; exit 1; }
+    touch -d '10 minutes ago' "$_gcd/groq-stt-cooldown"
+    [ "$(OH_LOG="$_gcd/overhear.log" OH_GROQ_COOLDOWN=60 runpy groq_cooldown_active)" = 0 ] \
+      || { echo "smoke-test: FAIL (expired cooldown flag must read inactive)"; rm -rf "$_gcd"; exit 1; }
+    [ -e "$_gcd/groq-stt-cooldown" ] && { echo "smoke-test: FAIL (expired cooldown flag must be auto-removed)"; rm -rf "$_gcd"; exit 1; }
+    rm -rf "$_gcd"
+    echo "  groq STT error-classification + backoff ok (text passthrough; 429→cooldown skips curl; non-rate→code logged; empty distinct)"
     echo "smoke-test: ok (whisper+model+piper+voice present, TTS rendered)"
     ;;
   # usage goes to STDERR: callers capture stdout as TRANSCRIPT TEXT (ssh offload rcmd → $txt), and the
