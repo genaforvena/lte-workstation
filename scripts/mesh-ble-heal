@@ -1,0 +1,184 @@
+#!/usr/bin/env bash
+# mesh-ble-heal — BLE hollow-wedge SELF-HEAL reflex (detect scan-empty → power-cycle → daemon restart).
+# reflex-cadence: 6-59/15 * * * *
+# doctor-artifact: $HOME/.mesh/.ble-heal-state 3600
+#
+# THE WEDGE (memory ble-adapter-wedges-hollow-presence-n0, live case 2026-07-06): the adapter reports
+# Powered=yes yet a scan perceives NOTHING while peers see a busy room — a hollow sense that reads
+# identical to an empty room. Two observed modes:
+#   • radio wedge — Powered+Discovering stuck-on, device cache blanked (mesh-presence's wedge_empty
+#     fingerprint: n=0 ∧ known=0 ∧ discovering=yes). Heals with an adapter power-cycle.
+#   • daemon sick — bluetoothd damaged (2026-07-06: bluetoothctl GPFs in dmesg after an OOM event;
+#     `bluetoothctl show` errors / D-Bus dead). Power-cycle can't reach it; needs
+#     `systemctl restart bluetooth` (sudo -n; skipped honestly where passwordless sudo is absent).
+#
+# DOCTRINE:
+#   • Debounce 2 CONSECUTIVE wedge reads before healing (one blip never actuates) + a heal cooldown
+#     so a genuinely-dead radio doesn't get flapped every cadence.
+#   • Cooperates with mesh-presence via the SAME presence.scan.lock (flock -n; lock held → exit 0
+#     quiet, next cadence retries) — never two scanners contending on one adapter.
+#   • STATE (~/.mesh/.ble-heal-state) is written EVERY run (mtime = liveness, content = counter +
+#     last outcome) — the liveness-touch convention.
+#   • Posts [sense] to the board ONLY on a heal attempt (healed or FAILED, with before/after counts)
+#     — routine all-clear runs stay silent (board-noise rule).
+#   • Honest n/a: no bluetoothctl / no adapter → exit 2, never a fake green.
+#
+# Usage:
+#   mesh-ble-heal          scheduled run: detect → (debounced) heal → verify → post
+#   mesh-ble-heal --status one-line state (read-only — does NOT share the run path, no mutation)
+#   mesh-ble-heal --test   smoke test (classifier truth table + debounce ladder; actuation SANDBOXED)
+#
+# Exit: 0 ok (incl. healthy / lock-busy / debouncing) · 1 heal FAILED (still hollow after ladder) ·
+#       2 honest n/a (no adapter/bluetoothctl).
+
+set -u
+MESH="$HOME/.mesh"
+STATE="$MESH/.ble-heal-state"
+LOCK="$MESH/presence.scan.lock"
+SCAN_S="${MESH_BLE_HEAL_SCAN_S:-12}"
+COOLDOWN_S="${MESH_BLE_HEAL_COOLDOWN_S:-5400}"
+SANDBOX="${MESH_BLE_HEAL_SANDBOX:-0}"   # 1 = never actuate / never post (test harness)
+
+say() { printf '[ble-heal] %s\n' "$*"; }
+
+board() { # post [sense] to the room (skipped in sandbox)
+  [ "$SANDBOX" = 1 ] && { say "SANDBOX board-post suppressed: $*"; return 0; }
+  command -v mesh-chat >/dev/null 2>&1 && MESH_WHO="ble-heal@$(hostname)" mesh-chat "[sense] $*" >/dev/null 2>&1
+  return 0
+}
+
+# --- pure classifier -------------------------------------------------------------------------------
+# classify <show_rc> <powered> <fresh_rssi_count> → WEDGE | DAEMON-SICK | OK | OFF
+# The wedge signal is SCAN-EMPTY: zero devices yielding a FRESH RSSI during a HELD scan window —
+# mesh-presence's proven read on this bluez. Two rejected signals, both field-tested wrong:
+#   • device CACHE count — bluetoothd expires it between runs (healthy quiet moment reads known=0),
+#     and the 2026-07-06 daemon-sick wedge sat behind a POPULATED stale cache while the radio heard
+#     nothing — a cache check misses exactly the case this reflex exists for.
+#   • piped `scan on` event lines — non-interactive bluetoothctl on this bluez emits NO per-device
+#     events (verified 2026-07-07: 0 events over 20s while presence read n=6) → permanent false WEDGE.
+# Deaf-radio false-positives in a genuinely BLE-empty home are absorbed by the 2-consecutive debounce
+# + cooldown (a power-cycle there is harmless); this home baseline is 5-7 devices, never 0.
+classify() {
+  local rc="$1" pow="$2" evts="$3"
+  if [ "$rc" -ne 0 ]; then echo DAEMON-SICK; return; fi   # show itself failing = D-Bus/bluetoothd sick
+  [ "$pow" = yes ] || { echo OFF; return; }               # operator turned it off — not ours to force on
+  if [ "${evts:-0}" -eq 0 ]; then echo WEDGE; else echo OK; fi
+}
+
+# --- probes (real hardware) ------------------------------------------------------------------------
+probe() { # → sets P_RC P_POW P_EVTS P_KNOWN (held scan + fresh-RSSI count, mesh-presence's method)
+  local show mac scanpid
+  show="$(timeout 10 bluetoothctl show 2>&1)"; P_RC=$?
+  P_POW="$(printf '%s' "$show" | awk -F': ' '/Powered:/{print $2; exit}')"
+  P_EVTS=0; P_KNOWN=0
+  if [ "$P_RC" -eq 0 ] && [ "$P_POW" = yes ]; then
+    sleep 0.4   # settle: let a prior holder's async StopDiscovery drain (the spurious-zero race)
+    { echo "scan on"; sleep "$SCAN_S"; } | bluetoothctl >/dev/null 2>&1 &
+    scanpid=$!
+    sleep $(( SCAN_S > 3 ? SCAN_S - 2 : 1 ))   # query while the scan is still live
+    for mac in $(timeout 10 bluetoothctl devices 2>/dev/null | awk '/^Device/{print $2}'); do
+      P_KNOWN=$((P_KNOWN+1))
+      timeout 5 bluetoothctl info "$mac" 2>/dev/null | grep -q 'RSSI: ' && P_EVTS=$((P_EVTS+1))
+    done
+    wait "$scanpid" 2>/dev/null || true
+  fi
+}
+
+heal_power_cycle()   { [ "$SANDBOX" = 1 ] && { HEAL_CALLS+="power-cycle "; return 0; }
+                       bluetoothctl power off >/dev/null 2>&1; sleep 2; bluetoothctl power on >/dev/null 2>&1; sleep 3; }
+heal_daemon_restart(){ [ "$SANDBOX" = 1 ] && { HEAL_CALLS+="daemon-restart "; return 0; }
+                       sudo -n systemctl restart bluetooth >/dev/null 2>&1 && sleep 3; }
+
+# --- --status (read-only; deliberately does NOT touch the run path — no read-mutates) --------------
+if [ "${1:-}" = --status ]; then
+  cat "$STATE" 2>/dev/null || echo "no state yet"
+  exit 0
+fi
+
+# --- --test (sandboxed: classifier truth table + debounce ladder + live parse gate) ----------------
+if [ "${1:-}" = --test ]; then
+  _f=0
+  [ "$(classify 0 yes 0)" = WEDGE ]        || { echo "  FAIL: powered + scan-empty (0 events) → WEDGE"; _f=1; }
+  [ "$(classify 0 yes 14)" = OK ]          || { echo "  FAIL: live scan events → OK"; _f=1; }
+  [ "$(classify 1 yes 0)" = DAEMON-SICK ]  || { echo "  FAIL: show rc!=0 → DAEMON-SICK"; _f=1; }
+  [ "$(classify 0 no  0)" = OFF ]          || { echo "  FAIL: Powered=no is operator intent → OFF, hands off"; _f=1; }
+  [ "$(classify 0 '' 0)" = OFF ]           || { echo "  FAIL: unparseable Powered must read OFF (hands off), not wedge"; _f=1; }
+  # debounce ladder against a sandbox state file: 1st WEDGE arms, only the 2nd heals
+  _td="$(mktemp -d)"
+  _step() { # <statefile> → ARM|HEAL (the exact counter arithmetic the run path uses)
+    local prev=0
+    [ -f "$1" ] && prev="$(awk -F'wedges=' 'NF>1{split($2,a," ");print a[1]+0}' "$1")"
+    [ $((prev + 1)) -ge 2 ] && echo HEAL || echo ARM
+  }
+  [ "$(_step "$_td/s")" = ARM ] || { echo "  FAIL: first WEDGE must ARM, not heal"; _f=1; }
+  printf 'ts verdict=WEDGE wedges=1 last_heal=0 last_outcome=armed\n' > "$_td/s"
+  [ "$(_step "$_td/s")" = HEAL ] || { echo "  FAIL: second consecutive WEDGE must HEAL"; _f=1; }
+  rm -rf "$_td"
+  # live-hardware gate (verification principle: a --test must prove a REAL read parses, or exit 2 honest)
+  if ! command -v bluetoothctl >/dev/null 2>&1; then echo "smoke-test: n/a — no bluetoothctl (exit 2, honest)"; exit 2; fi
+  _pow="$(timeout 10 bluetoothctl show 2>/dev/null | awk -F': ' '/Powered:/{print $2; exit}')"
+  case "$_pow" in yes|no) ;; *) echo "  FAIL: live 'bluetoothctl show' yields no parseable Powered flag"; _f=1 ;; esac
+  [ "$_f" -eq 0 ] && { echo "smoke-test: ok (5 classifier + 2 debounce asserts + live Powered parse '$_pow'; actuation sandboxed)"; exit 0; }
+  echo "smoke-test: FAIL"; exit 1
+fi
+
+# --- scheduled run ---------------------------------------------------------------------------------
+command -v bluetoothctl >/dev/null 2>&1 || { say "no bluetoothctl — n/a"; exit 2; }
+
+# cooperate with mesh-presence: same lock, non-blocking (a held lock = a scanner is working — fine)
+if command -v flock >/dev/null 2>&1; then
+  exec 9>"$LOCK"
+  flock -n 9 || { say "adapter scan-locked by another scanner — skipping (not a wedge signal)"; exit 0; }
+fi
+
+HEAL_CALLS=""
+probe
+verdict="$(classify "$P_RC" "${P_POW:-}" "${P_EVTS:-0}")"
+now=$(date +%s); ts="$(date -u +%FT%TZ)"
+prev_wedges=0; last_heal=0
+[ -f "$STATE" ] && { prev_wedges="$(awk -F'wedges=' 'NF>1{split($2,a," ");print a[1]+0}' "$STATE")"
+                     last_heal="$(awk -F'last_heal=' 'NF>1{split($2,a," ");print a[1]+0}' "$STATE")"; }
+
+write_state() { printf '%s verdict=%s wedges=%s last_heal=%s last_outcome=%s\n' \
+                  "$ts" "$verdict" "$1" "$2" "$3" > "$STATE"; }
+
+case "$verdict" in
+  OK)  write_state 0 "$last_heal" ok; say "ok — evts=${P_EVTS:-0} known=$P_KNOWN powered=$P_POW"; exit 0 ;;
+  OFF) write_state 0 "$last_heal" off; say "adapter Powered=no (operator intent) — hands off"; exit 0 ;;
+esac
+
+# WEDGE or DAEMON-SICK
+wedges=$((prev_wedges + 1))
+if [ "$wedges" -lt 2 ]; then
+  write_state "$wedges" "$last_heal" armed
+  say "$verdict observed (1st) — armed, will heal on a 2nd consecutive read"; exit 0
+fi
+if [ $((now - last_heal)) -lt "$COOLDOWN_S" ]; then
+  write_state "$wedges" "$last_heal" cooldown
+  say "$verdict persists but heal cooldown active ($(( (now-last_heal)/60 ))m/$((COOLDOWN_S/60))m) — holding"; exit 0
+fi
+
+before="evts=${P_EVTS:-0} known=$P_KNOWN rc=$P_RC"
+rung="power-cycle"
+[ "$verdict" = DAEMON-SICK ] || heal_power_cycle
+if [ "$verdict" = DAEMON-SICK ] || { probe; [ "$(classify "$P_RC" "${P_POW:-}" "${P_EVTS:-0}")" != OK ]; }; then
+  rung="daemon-restart"
+  if sudo -n true 2>/dev/null || [ "$SANDBOX" = 1 ]; then
+    heal_daemon_restart
+    probe
+  else
+    write_state "$wedges" "$now" "failed-no-sudo"
+    board "BLE $verdict on $(hostname): power-cycle did not heal and passwordless sudo absent — bluetoothd restart needs operator hands (before: $before)"
+    say "heal FAILED — daemon rung needs sudo"; exit 1
+  fi
+fi
+final="$(classify "$P_RC" "${P_POW:-}" "${P_EVTS:-0}")"
+if [ "$final" = OK ]; then
+  write_state 0 "$now" "healed-$rung"
+  board "BLE hollow wedge self-healed on $(hostname) via $rung: before[$before] after[evts=${P_EVTS:-0} known=$P_KNOWN] ($verdict, 2-consecutive debounce)"
+  say "healed via $rung — evts=${P_EVTS:-0} known=$P_KNOWN"; exit 0
+else
+  write_state "$wedges" "$now" "failed-$rung"
+  board "BLE $verdict on $(hostname): self-heal FAILED after $rung — adapter still hollow (before[$before] after[known=${P_KNOWN:-?} rc=$P_RC]); needs hands"
+  say "heal FAILED after $rung"; exit 1
+fi

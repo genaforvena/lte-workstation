@@ -3,7 +3,7 @@
 This mesh is not just an architecture; it is a **stance on knowledge** — a bet about how a
 system of unreliable minds, none of them authoritative, can hold something worth calling truth.
 The stance is old in its parts and, as far as we can find, unoccupied in its conjunction. This
-doc states the five commitments, names their pedigree honestly, and shows where each one is
+doc states the six commitments, names their pedigree honestly, and shows where each one is
 already load-bearing in the running code — so the doctrine lives in the genome, not only in a
 conversation that decays on reboot.
 
@@ -12,7 +12,7 @@ inquiry whose consensus is fallible, revisable, and constitutively plural.
 
 ---
 
-## The five commitments
+## The six commitments
 
 ### 1. Failure in prediction drives the map; the circularity is intended
 
@@ -95,6 +95,48 @@ trace not each other. The board and the trace do not *resemble* stigmergy; they 
 the mechanism that fuses commitments 4 and 5 into one: the inscription is where friction is
 deposited and spent.
 
+### 6. Provenance over correspondence — the arbiter is a known procedure, not a window onto reality
+
+A sensor reading earns trust not because it sits "closer to reality" — no mind can step outside
+its own maps to check that — and not because two minds happen to agree on it, which is mere
+solidarity dressed up as truth. It earns trust because the **procedure that produced the
+inscription is known, fixed, and closed to opinion**: no mind, however persuasive, has write
+access to the tape. Secondness — Peirce's "that which resists" — is realized here not as brute
+contact with an unmediated world but as **a generative algorithm transparent and independent of
+the reader**. The mesh never asks the unanswerable "does this match reality?"; it asks the
+answerable "was this produced by the known procedure, running uncorrupted?" — and that
+answerability is the whole trick.
+
+This is why [[sensorfault]] is not a bug fix living quietly inside `mesh-tamper` — it is the
+**keystone** the other five commitments quietly assume and never themselves check. Commitments
+1–5 all describe minds correcting each other against inscriptions in the pane — the board, the
+trace, a sensor's reading. But the loop only optimizes distance-to-*truth* insofar as it is
+optimizing distance-to-*pane*, and those two distances coincide **only while the capture algorithm
+producing the pane is intact** (Hohwy's line, turned into an engineering requirement: a
+self-evidencing system converges honestly to whatever its Markov blanket hands it — a crack in the
+sensing reflex itself is invisible from inside, because every gate, however diverse, reads the
+same corrupted pane). `mesh-tamper`'s `classify_tamper` — built, then rebuilt (2026-06-25) to be
+**sentinel-gated**, not exit-code-gated — is the concrete, load-bearing answer: a
+`SIGNIFICANT_MOTION` watch that times out looks IDENTICAL, by raw exit code, to an SSH session that
+died before the watch ever ran (both return 124). The fix does not ask "what value came back?" —
+it asks "did the capture procedure run to completion at all?", via a completion sentinel the
+watched procedure itself emits only if it executed in full. That is the mesh checking its own
+imprint-*algorithm*, not its imprint — the single place the bet that "readings are provenance, not
+opinion" is actually insured rather than assumed. The same discipline recurs wherever the mesh
+catches a **hollow sense** — a reachable sensor whose driver silently returns empty (`mesh-mag` /
+`mesh-gyro`'s race-condition fix) or a stale frame passed off as live (`mesh-note3-cam`'s
+newer-than-pre-capture poll) — but `mesh-tamper`'s sentinel is the founding instance: the first
+place the mesh stopped trusting a return code and started verifying the procedure behind it.
+
+*Pedigree.* **Ian Hacking**'s experimental realism grounds belief in an entity not in
+theory-to-world correspondence but in a **known, manipulable apparatus** — "if you can spray them,
+they are real" (*Representing and Intervening*, 1983); **Allan Franklin**'s epistemology of
+experiment gives the operational form we actually run — a result is trusted once the apparatus's
+own correct functioning has been independently checked (calibration against a known effect), never
+merely because the reading looks plausible. Distinct from **Rorty**: "truth is what your peers let
+you get away with saying" is solidarity requiring no procedure at all — exactly the false friend
+this commitment exists to exclude, the same role Habermas plays for commitment 2.
+
 ---
 
 ## The honest part: who holds the conjunction?
@@ -138,4 +180,4 @@ the operator's gate. Explaining the mesh **to humans** is a standing part of pub
 one-off — the doctrine, not just the diff.
 
 See also: [[no-fixed-mind-stigmergic-skeleton]] · [[desire-is-production-not-lack]] ·
-`docs/telos.md` · `docs/self-organization.md`.
+[[sensorfault]] · `docs/telos.md` · `docs/self-organization.md`.
