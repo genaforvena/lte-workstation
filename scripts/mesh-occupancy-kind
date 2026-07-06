@@ -1,0 +1,208 @@
+#!/usr/bin/env bash
+# orphan-ok: on-demand occupancy-KIND disambiguation (person vs appliances-powered-on); read on
+#            request or by a mind, not scheduled — a cheap cached fold, no state artifact of its own.
+# mesh-occupancy-kind — cross-sense fusion: IS THE OCCUPANCY A PERSON, OR JUST APPLIANCES ON?
+#
+# The gap no single sensor fills: raw presence (n=5 devices) and room-sense (PRESENT/UNCERTAIN)
+# both read "occupied" when the truth is the Bose + a TV are simply powered on in an EMPTY room.
+# Count-based occupancy mislabels that as a person. This fold cross-checks the DEVICE POPULATION
+# (presence attribution + OUI hardware vendors) against PHYSICAL HUMAN ACTIVITY (body-motion +
+# recent light changes + room-sense) to separate "a human is here" from "devices are on, nobody home".
+#
+# Inputs (all CACHED reads — cheap, no BLE scan; each independently OFFLINE-able):
+#   mesh-presence     .presence-state    attribution=personal:P,appliance:A,ambiguous:M
+#                                         personal_presence=ACTIVE_NEAR/FAR/ARRIVING/... + vendors=...
+#   mesh-body-motion  .body-motion-state  [body-still]/[body-walking]/[body-handled]/... /OFFLINE
+#   mesh-light        .light-state        LABEL|dwell_s=N|changes_24h=N  (dwell_s small = just changed)
+#   mesh-room-sense   .room-sense.state   PRESENT/EMPTY/UNCERTAIN
+#
+# presence is the LOAD-BEARING input: without the device population there is no verdict, so a
+# stale/missing .presence-state renders DEGRADED and exits 2 (honest n/a — never a faked all-clear).
+# The corroboration inputs (motion/light/room) degrade GRACEFULLY: a verdict still forms, but every
+# unreachable one is named in a visible "[degraded: ...]" note so a consumer never mistakes a
+# best-effort read for a fully-corroborated one.
+#
+# Labels (FALSIFIABLE via --test):
+#   PERSON         — a personal-class device (a phone = a person) is present, or personal_presence
+#                    is ACTIVE_NEAR/FAR/ARRIVING → a human is here.
+#   PERSON-LIKELY  — no personal device, BUT room PRESENT + physical human activity (body moving /
+#                    a recent light change) → someone here without a tracked phone (visitor).
+#   APPLIANCE-ONLY — appliance device(s) powered on, NO personal device, NO human activity, room not
+#                    PRESENT → devices on, nobody home. THE false-positive count-occupancy misreads.
+#   AMBIGUOUS      — signals insufficient/conflicting; notably room PRESENT but only non-personal
+#                    devices + no human activity → likely appliance RF, not a person (honest, not a guess).
+#   EMPTY          — no devices + room empty.
+#   DEGRADED       — presence input unreachable → exit 2 (the core sense is dark).
+#
+#   mesh-occupancy-kind          one-shot label + reason
+#   mesh-occupancy-kind --json   machine-readable {label, reason, inputs, ts}
+#   mesh-occupancy-kind --test   smoke test (pure classifier + a real cached read, no network)
+#
+# Read-only sense — writes NO state file (pure stdout fold), so it adds no umwelt-gap and needs no
+# liveness-touch; the live stdout IS the artifact. Exit 0 = verdict, 2 = presence dark (honest n/a).
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+
+MESH="${MESH_DIR:-$HOME/.mesh}"
+STALE_S="${MESH_OCCKIND_STALE_S:-600}"     # an input older than 2× the 5-min sense stride = OFFLINE
+LIGHT_ACTIVE_S="${MESH_OCCKIND_LIGHT_ACTIVE_S:-300}"  # light changed within 5 min = human activity
+
+# _fresh <file> → 0 if file exists and mtime within STALE_S, else 1 (missing OR stale = not fresh)
+_fresh() {
+  local f="$1" now m
+  [ -f "$f" ] || return 1
+  now=$(date +%s); m=$(stat -c %Y "$f" 2>/dev/null || echo 0)
+  [ $((now - m)) -le "$STALE_S" ]
+}
+
+# read_room <file> → PRESENT/EMPTY/UNCERTAIN or OFFLINE (first token before '|', staleness-gated)
+read_room() {
+  local f="$1" v
+  _fresh "$f" || { echo OFFLINE; return; }
+  v="$(head -1 "$f" 2>/dev/null | awk '{print $1}' | cut -d'|' -f1)"
+  [ -n "$v" ] && printf '%s' "$v" || echo OFFLINE
+}
+
+# read_motion <file> → yes (human activity) / no (still) / OFFLINE.  mesh-body-motion stores the
+# bracketed tag "[body-*]"; the ACTIVE tags are walking/handled/carried/covered — still = no activity.
+read_motion() {
+  local f="$1" tag
+  _fresh "$f" || { echo OFFLINE; return; }
+  tag="$(head -1 "$f" 2>/dev/null | grep -oE '\[body-[a-z]+\]' | head -1)"
+  case "$tag" in
+    '[body-walking]'|'[body-handled]'|'[body-carried]'|'[body-covered]') echo yes ;;
+    '[body-still]') echo no ;;
+    *) echo OFFLINE ;;   # unrecognised / OFFLINE line
+  esac
+}
+
+# read_light_active <file> → yes (light changed within LIGHT_ACTIVE_S = someone toggling/moving) /
+# no / OFFLINE.  Format LABEL|dwell_s=N|changes_24h=N ; a leading "OFFLINE" token = organ dark.
+read_light_active() {
+  local f="$1" line dwell
+  _fresh "$f" || { echo OFFLINE; return; }
+  line="$(head -1 "$f" 2>/dev/null)"
+  case "$line" in OFFLINE*) echo OFFLINE; return ;; esac
+  dwell="$(printf '%s' "$line" | grep -oE 'dwell_s=[0-9]+' | head -1 | cut -d= -f2)"
+  [ -n "$dwell" ] || { echo OFFLINE; return; }
+  [ "$dwell" -lt "$LIGHT_ACTIVE_S" ] && echo yes || echo no
+}
+
+# classify_occupancy_kind <p> <a> <m> <pp> <motion> <light> <room> → "LABEL|reason"
+#   p/a/m = personal/appliance/ambiguous device counts ; pp = personal_presence token
+#   motion,light ∈ yes|no|OFFLINE ; room ∈ PRESENT|EMPTY|UNCERTAIN|OFFLINE
+# Pure function, no I/O — the falsifiable core.
+classify_occupancy_kind() {
+  local p="$1" a="$2" m="$3" pp="$4" motion="$5" light="$6" room="$7"
+  local total=$((p + a + m)) active=no deg=""
+  [ "$motion" = yes ] && active=yes
+  [ "$light"  = yes ] && active=yes
+  [ "$motion" = OFFLINE ] && deg="${deg}motion,"
+  [ "$light"  = OFFLINE ] && deg="${deg}light,"
+  [ "$room"   = OFFLINE ] && deg="${deg}room,"
+  deg="${deg%,}"
+  local note=""; [ -n "$deg" ] && note=" [degraded: $deg]"
+
+  # PERSON — a personal device (own phone) present, or direct personal presence
+  if [ "$p" -ge 1 ] || [ "$pp" = ACTIVE_NEAR ] || [ "$pp" = ACTIVE_FAR ] || [ "$pp" = ARRIVING ]; then
+    echo "PERSON|personal device present (personal=$p pp=$pp)$note"; return
+  fi
+  # PERSON-LIKELY — no personal device, but room occupied + physical human activity
+  if [ "$room" = PRESENT ] && [ "$active" = yes ]; then
+    echo "PERSON-LIKELY|room present + human activity, no personal device — visitor/untracked phone (appliance=$a ambiguous=$m)$note"; return
+  fi
+  # EMPTY — nothing present, room empty/dark
+  if [ "$total" -eq 0 ] && { [ "$room" = EMPTY ] || [ "$room" = OFFLINE ]; }; then
+    echo "EMPTY|no devices, room empty$note"; return
+  fi
+  # APPLIANCE-ONLY — appliance(s) on, no personal, no activity, room not asserting a person
+  if [ "$a" -ge 1 ] && [ "$p" -eq 0 ] && [ "$active" = no ] && [ "$room" != PRESENT ]; then
+    echo "APPLIANCE-ONLY|$a appliance device(s) powered on, no person signal (room=$room, no motion/light activity)$note"; return
+  fi
+  # AMBIGUOUS — insufficient/conflicting; call out the room-PRESENT-but-appliance-RF case explicitly
+  local why="signals insufficient/conflicting"
+  if [ "$room" = PRESENT ] && [ "$p" -eq 0 ] && [ "$active" = no ]; then
+    why="room PRESENT but only non-personal devices + no human activity — likely appliance RF, not a person"
+  fi
+  echo "AMBIGUOUS|$why (personal=$p appliance=$a ambiguous=$m pp=$pp room=$room active=$active)$note"
+}
+
+# ---- --test: pure classifier + a real cached read ----
+if [ "${1:-}" = --test ]; then
+  fail=0
+  chk() { [ "$2" = "$3" ] || { echo "  FAIL: $1 got=$2 want=$3"; fail=1; }; }
+  has() { echo "$2" | grep -q "$3" || { echo "  FAIL: $1 got=$2 (missing /$3/)"; fail=1; }; }
+  # PERSON — personal device present
+  r="$(classify_occupancy_kind 1 0 0 EMPTY no no PRESENT)";      has PERSON-count "$r" '^PERSON|'
+  # PERSON — via personal_presence ACTIVE_FAR even with 0 personal-count
+  r="$(classify_occupancy_kind 0 1 2 ACTIVE_FAR no no UNCERTAIN)"; has PERSON-pp "$r" '^PERSON|'
+  # PERSON-LIKELY — no personal device but room PRESENT + motion active
+  r="$(classify_occupancy_kind 0 1 0 AMBIGUOUS yes no PRESENT)";  has PERSON-LIKELY "$r" '^PERSON-LIKELY|'
+  # APPLIANCE-ONLY — the live case: appliances on, no personal, no activity, room UNCERTAIN
+  r="$(classify_occupancy_kind 0 2 3 AMBIGUOUS no no UNCERTAIN)"; has APPLIANCE-live "$r" '^APPLIANCE-ONLY|'
+  # APPLIANCE-ONLY — room EMPTY variant
+  r="$(classify_occupancy_kind 0 1 0 APPLIANCE no no EMPTY)";     has APPLIANCE-empty "$r" '^APPLIANCE-ONLY|'
+  # EMPTY — no devices at all
+  r="$(classify_occupancy_kind 0 0 0 EMPTY no no EMPTY)";         has EMPTY "$r" '^EMPTY|'
+  # AMBIGUOUS — room PRESENT but appliance-only + no activity → likely appliance RF (honest, not a guess)
+  r="$(classify_occupancy_kind 0 1 0 AMBIGUOUS no no PRESENT)";   has AMBIG-rf "$r" '^AMBIGUOUS|'
+  has AMBIG-rf-reason "$r" 'appliance RF'
+  # AMBIGUOUS — only ambiguous-class devices, uncertain room
+  r="$(classify_occupancy_kind 0 0 2 AMBIGUOUS no no UNCERTAIN)"; has AMBIG-only "$r" '^AMBIGUOUS|'
+  # HONEST-DEGRADE — an OFFLINE corroboration input is NAMED, never silently all-clear
+  r="$(classify_occupancy_kind 0 2 0 AMBIGUOUS OFFLINE OFFLINE UNCERTAIN)"
+  has DEGRADE-label "$r" '^APPLIANCE-ONLY|'
+  has DEGRADE-note  "$r" '\[degraded: motion,light\]'
+  # A personal device must OUTRANK an appliance-only classification
+  r="$(classify_occupancy_kind 1 2 0 ACTIVE_NEAR no no UNCERTAIN)"; has PERSON-outranks "$r" '^PERSON|'
+  # Real cached read: the live path must yield a known label OR exit 2 (presence dark) — never crash.
+  out="$("$0" 2>/dev/null)"; rc=$?
+  if [ "$rc" = 2 ]; then
+    echo "$out" | grep -q '^DEGRADED' || { echo "  FAIL: exit 2 must print DEGRADED, got=$out"; fail=1; }
+  elif [ "$rc" = 0 ]; then
+    echo "$out" | grep -qE '\] (PERSON|PERSON-LIKELY|APPLIANCE-ONLY|AMBIGUOUS|EMPTY) ' \
+      || { echo "  FAIL: real read produced no known label: $out"; fail=1; }
+  else
+    echo "  FAIL: real read exited $rc (expected 0 or 2)"; fail=1
+  fi
+  [ "$fail" = 1 ] && { echo "smoke-test: FAIL"; exit 1; }
+  echo "smoke-test: ok (12 fusion assertions: PERSON×3, PERSON-LIKELY, APPLIANCE-ONLY×2, EMPTY, AMBIGUOUS×2, honest-degrade×2 + a real cached read)"
+  exit 0
+fi
+
+# ---- Live read path (cached folds only — no scan) ----
+PSTATE="$MESH/.presence-state"
+if ! _fresh "$PSTATE"; then
+  msg="DEGRADED — presence dark (.presence-state missing/stale >${STALE_S}s); no device population → no verdict (not an alarm)"
+  if [ "${1:-}" = --json ]; then
+    printf '{"label":"DEGRADED","reason":"presence dark","inputs":{"presence":"OFFLINE"},"ts":"%s"}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  else
+    echo "[occ-degraded] $msg"
+  fi
+  exit 2
+fi
+
+attr="$(grep -oE 'attribution=personal:[0-9]+,appliance:[0-9]+,ambiguous:[0-9]+' "$PSTATE" | head -1)"
+p="${attr#*personal:}";  p="${p%%,*}"
+a="${attr#*appliance:}"; a="${a%%,*}"
+m="${attr##*ambiguous:}"
+[ -n "$p" ] || p=0; [ -n "$a" ] || a=0; [ -n "$m" ] || m=0
+pp="$(grep -oE 'personal_presence=[A-Z_]+' "$PSTATE" | head -1 | cut -d= -f2)"; [ -n "$pp" ] || pp=UNKNOWN
+vendors="$(grep -oE 'vendors=[A-Za-z0-9:,]+' "$PSTATE" | head -1 | cut -d= -f2)"; [ -n "$vendors" ] || vendors=none
+
+motion="$(read_motion "$MESH/.body-motion-state")"
+light="$(read_light_active "$MESH/.light-state")"
+room="$(read_room "$MESH/.room-sense.state")"
+
+result="$(classify_occupancy_kind "$p" "$a" "$m" "$pp" "$motion" "$light" "$room")"
+label="${result%%|*}"
+reason="${result#*|}"
+TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+if [ "${1:-}" = --json ]; then
+  printf '{"label":"%s","reason":"%s","inputs":{"personal":%s,"appliance":%s,"ambiguous":%s,"personal_presence":"%s","vendors":"%s","motion":"%s","light":"%s","room":"%s"},"ts":"%s"}\n' \
+    "$label" "$reason" "$p" "$a" "$m" "$pp" "$vendors" "$motion" "$light" "$room" "$TS"
+  exit 0
+fi
+printf '[occ-%s] %s — %s | vendors: %s\n' "$(printf '%s' "$label" | tr '[:upper:]' '[:lower:]')" "$label" "$reason" "$vendors"
