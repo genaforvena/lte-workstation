@@ -148,6 +148,30 @@ phone_reachable_ip() {
   return 2
 }
 
+# ---- outdoor-weather honest-fusion (shared by mesh-therm-watch / mesh-mind-control / mesh-node-care) ----
+#
+# weather-consumers-phase2 (2026-07-07): mesh-weather (hourly cadence) writes 'OK <ts> now_c=..
+# today_max_c=.. peak_hour=<h> thermal_day=<0|1> thresh_c=..' to .weather-state; a BLIND fetch
+# failure leaves the file UNTOUCHED (offline is not the same claim as a mild day), so staleness is
+# judged by MTIME, not by content. Every consumer of this sense goes through weather_field (never
+# greps the state file directly) so an absent/stale sense degrades HONESTLY: UNKNOWN, never a
+# silently-fabricated "not a thermal day" or a stale outdoor reading passed off as current — the
+# same discipline as every other honest-fusion sense in this mesh (an unreachable input renders
+# UNKNOWN, it never assumes the calm case).
+WEATHER_STATE_TTL="${MESH_WEATHER_STATE_TTL:-10800}"   # 3h: tolerates one missed hourly mesh-weather cycle
+export WEATHER_STATE_TTL
+#
+# weather_field <field> [state-file] → prints the field's value, or UNKNOWN if the state file is
+# missing/unreadable/stale. <field> is one of thermal_day|peak_hour|now_c|today_max_c|thresh_c.
+weather_field() {
+  local field="$1" f="${2:-$HOME/.mesh/.weather-state}" age v
+  [ -r "$f" ] || { echo UNKNOWN; return; }
+  age=$(( $(date +%s) - $(stat -c %Y "$f" 2>/dev/null || echo 0) ))
+  [ "$age" -lt "$WEATHER_STATE_TTL" ] 2>/dev/null || { echo UNKNOWN; return; }
+  v="$(grep -oE "${field}=[^ ]+" "$f" 2>/dev/null | head -1 | cut -d= -f2)"
+  printf '%s\n' "${v:-UNKNOWN}"
+}
+
 # Guard: run the test block ONLY when this file is EXECUTED directly — never when SOURCED.
 # (A sourced lib inherits the caller's $1, so without this guard `consumer --test` would trip the
 # lib's own test+exit and hijack the consumer's self-check.)
@@ -214,5 +238,18 @@ if [ "${1:-}" = --test ] && [ "${BASH_SOURCE[0]}" = "${0}" ]; then
   ckw clear  "input-box quota draft"  "❯ should we retry after we hit the usage limit?"
   ckw clear  "STALE banner + idle footer" "$(printf '⎿  You'"'"'ve hit your session limit · resets 2:20pm (Europe/Moscow)\n   /upgrade to increase your usage limit.\n✻ Worked for 1s\n❯ \n  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents')"
   ckw clear  "STALE banner + spinner"     "$(printf '⎿  You'"'"'ve hit your session limit · resets 2:20pm\n✻ Cogitating… (12s · esc to interrupt)')"
+  echo "weather_field — honest-fusion: fresh state parses, stale/absent/malformed renders UNKNOWN:"
+  _wtd="$(mktemp -d)"
+  printf 'OK 2026-07-07T10:00:00Z now_c=25.1 today_max_c=31.5 peak_hour=15 thermal_day=1 thresh_c=28\n' > "$_wtd/fresh"
+  ck2(){ local got="$1" want="$2" label="$3"; if [ "$got" = "$want" ]; then echo "  ok: $label"; else echo "  FAIL: $label (got '$got' want '$want')"; fail=1; fi; }
+  ck2 "$(weather_field thermal_day "$_wtd/fresh")"  1    "fresh state, thermal_day"
+  ck2 "$(weather_field peak_hour   "$_wtd/fresh")"  15   "fresh state, peak_hour"
+  ck2 "$(weather_field today_max_c "$_wtd/fresh")"  31.5 "fresh state, today_max_c"
+  touch -d '-4 hours' "$_wtd/fresh"   # older than WEATHER_STATE_TTL (default 3h) → stale
+  ck2 "$(weather_field thermal_day "$_wtd/fresh")"  UNKNOWN "stale state (>TTL) → UNKNOWN, never the last-good value"
+  ck2 "$(weather_field thermal_day "$_wtd/no-such-file")" UNKNOWN "absent state → UNKNOWN"
+  printf 'mesh-weather: BLIND (open-meteo fetch/parse failed)\n' > "$_wtd/blind"
+  ck2 "$(weather_field thermal_day "$_wtd/blind")" UNKNOWN "BLIND/malformed content → UNKNOWN, never a fabricated 0"
+  rm -rf "$_wtd"
   [ "$fail" = 0 ] && { echo "smoke-test: ok"; exit 0; } || { echo "smoke-test: FAIL"; exit 1; }
 fi

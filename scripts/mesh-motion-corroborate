@@ -1,0 +1,263 @@
+#!/usr/bin/env bash
+# orphan-ok: on-demand cross-modal fusion — a mind/operator PULLS it live when it needs to know "is this
+#   motion REAL?"; not a scheduled reflex. It derives from two senses that ARE scheduled (wifi-motion's RF
+#   tape + the ambient-db tape) so it adds no new sampling — only a fold — and keeps NO persistent state of
+#   its own (its artifact is the live stdout/--json verdict; nothing to age, no liveness to watchdog).
+#
+# mesh-motion-corroborate — CROSS-MODAL motion confidence: fuse RF (WiFi passive-radar) + ACOUSTIC
+# (ambient mic dB variance) into one "is the motion REAL?" read that neither sensor gives alone.
+#
+# Why this is more than either input:
+#   * WiFi-motion (RF multipath) false-fires on a lone neighbour-AP swing (interference, not a body);
+#     it also can't hear a stationary talker.
+#   * Ambient dB variance (acoustic) false-fires on an EXTERNAL sound (a TV next door, a car) and on the
+#     node's OWN speakers (the nightly room-music grind); it can't see a silent walk-through.
+#   Their failure modes are INDEPENDENT (different physics: 2.4/5GHz multipath vs air-pressure waves), so
+#   AGREEMENT between them is a corroboration confidence no single modality can produce. This is the
+#   classic cross-modal-sensor-fusion trick: two blind spots that don't overlap.
+#
+# Modality axes (each resolves to a token, and a BLIND axis is NEVER silently treated as "calm"):
+#   RF        from `mesh-wifi-motion --json` verdict: MOTION | STILL | UNCERTAIN ; unreachable/exit-2 or a
+#             STALE tape (age > RF_FRESH_S) → BLIND.
+#   ACOUSTIC  from the ambient-dB tape (mesh-ambient-tape): rms_db variance over the recent window.
+#             ACTIVE = the room's sound level is CHANGING (someone/something moving-talking); QUIET =
+#             STEADY (whether steadily silent OR steadily loud — a constant hum is not motion). A tape
+#             that is missing / all-NA / stale → BLIND. And if this node's OWN speakers are PLAYING
+#             (mesh-audio-active) the mic is contaminated by self-noise → acoustic axis is BLIND
+#             (contaminated), never a fake ACTIVE — self-playback can't corroborate room motion.
+#
+# Fused verdict (FIRST token; each token is unique so a consumer greps one):
+#   CONFIRMED-MOTION  RF=MOTION AND ACOUSTIC=ACTIVE — both modalities agree → high-confidence real motion
+#   RF-MOTION         RF=MOTION, acoustic quiet/blind — RF only (quiet movement OR an RF-flicker; unconfirmed)
+#   ACOUSTIC-ACTIVITY acoustic=ACTIVE, RF still/uncertain — sound only (external/TV OR a stationary talker)
+#   QUIET             RF=STILL AND ACOUSTIC=QUIET — both agree the space is calm  (conf=firm|weak)
+#   PARTIAL           exactly ONE modality BLIND — names the blind side + the readable side's read
+#   INCONCLUSIVE      both readable but neither asserts (RF=UNCERTAIN AND acoustic=QUIET with thin RF)
+#   UNKNOWN           BOTH modalities BLIND → nothing to fuse (exit 2, never a faked all-clear)
+#
+# The honest-unreachable contract in one line: QUIET (both axes READ, both still) is a DIFFERENT token
+# from PARTIAL/UNKNOWN (an axis could not be read). A blind sensor can never render as a calm room.
+#
+#   mesh-motion-corroborate            one-shot fused verdict
+#   mesh-motion-corroborate --edge     emit only when the verdict token changes (cron/stream-friendly)
+#   mesh-motion-corroborate --json     {verdict, rf, acoustic, conf, rf_reason, ac_reason, ac_stddev,
+#                                       ac_window_n, self_playback, degraded, ts}
+#   mesh-motion-corroborate --test     offline fixtures: the full fuse matrix + acoustic classifier +
+#                                       honest BLIND/UNKNOWN paths (no mic, no wifi scan, no network)
+#
+# Exit codes (honest-exit contract):
+#   0 = fused (verdict may be PARTIAL/INCONCLUSIVE when a modality is blind/inconclusive — still a real read)
+#   2 = UNKNOWN — BOTH modalities blind (cannot fuse); never emitted as a faked QUIET.
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+[ -f "$HOME/.mesh/nodes" ] && . "$HOME/.mesh/nodes" 2>/dev/null || true
+
+# On-demand: NO persistent .state producer (that would be a reader-less umwelt-gap — mesh-doctor). The
+# only file kept is a change-cache for --edge, deliberately NOT named `*.state` so it declares no
+# unread state artifact. The live verdict IS the artifact.
+EDGE_CACHE="${MESH_MC_EDGE:-$HOME/.mesh/.motion-corroborate.edge}"
+TAPE="${MESH_AMBIENT_TAPE:-$HOME/.mesh/ambient-db-tape.tsv}"
+WINDOW_MIN="${MESH_MC_WINDOW_MIN:-20}"          # acoustic look-back window (minutes)
+RF_FRESH_S="${MESH_MC_RF_FRESH_S:-1500}"        # wifi-motion read older than this → RF BLIND (stale tape)
+AC_FRESH_S="${MESH_MC_AC_FRESH_S:-900}"         # newest tape row older than this → ACOUSTIC BLIND (stale)
+AC_STD="${MESH_MC_AC_STD:-3.0}"                 # rms_db stddev >= this over the window → ACTIVE (sound changing)
+AC_JUMP="${MESH_MC_AC_JUMP:-6.0}"               # a row deviating >= this dB from the window median = a spike
+AC_MIN_SPIKES="${MESH_MC_AC_MIN_SPIKES:-2}"     # >= this many spikes → ACTIVE even if stddev is under floor (corroboration, not a lone blip)
+TS="$(date -u +%FT%TZ)"
+
+# ---- ACOUSTIC axis: classify the recent dB tape into ACTIVE|QUIET|BLIND (pure, offline-testable) ------
+# Args: <tape_file> <self_playback: PLAYING|SILENT|UNKNOWN> <now_epoch>
+# Echoes: "<ACTIVE|QUIET|BLIND>|<reason>|<stddev>|<n>"  (stddev/n = "" when BLIND before stats)
+classify_acoustic() {
+  local tape="$1" selfplay="$2" now="$3"
+  if [ "$selfplay" = "PLAYING" ]; then
+    echo "BLIND|self-playback (own speakers emitting — mic contaminated, cannot judge room sound)||0"; return
+  fi
+  if [ ! -f "$tape" ]; then
+    echo "BLIND|no-tape (ambient-db tape absent — acoustic sense never ran)||0"; return
+  fi
+  MC_WIN="$WINDOW_MIN" MC_FRESH="$AC_FRESH_S" MC_STD="$AC_STD" MC_JUMP="$AC_JUMP" MC_SPK="$AC_MIN_SPIKES" \
+  MC_NOW="$now" python3 - "$tape" <<'PY'
+import sys, os, statistics, calendar, time
+tape=sys.argv[1]
+WIN=float(os.environ["MC_WIN"])*60; FRESH=float(os.environ["MC_FRESH"]); STD=float(os.environ["MC_STD"])
+JUMP=float(os.environ["MC_JUMP"]); SPK=int(os.environ["MC_SPK"]); NOW=float(os.environ["MC_NOW"])
+def parse_ts(s):
+    try: return calendar.timegm(time.strptime(s, "%Y-%m-%dT%H:%M:%SZ"))
+    except Exception: return None
+rows=[]  # (epoch, rms_db)
+newest=None
+try:
+    with open(tape) as f:
+        for line in f:
+            line=line.rstrip("\n")
+            if not line or line.startswith("#") or line.startswith("ts\t"): continue
+            p=line.split("\t")
+            if len(p)<2: continue
+            e=parse_ts(p[0])
+            if e is None: continue
+            if newest is None or e>newest: newest=e
+            try: db=float(p[1])
+            except ValueError: continue          # NA / UNREACHABLE row → not a real sample
+            rows.append((e, db))
+except Exception as ex:
+    print("BLIND|unreadable-tape (%s)||0" % ex); sys.exit(0)
+if newest is None:
+    print("BLIND|empty-tape (no timestamped rows)||0"); sys.exit(0)
+if NOW-newest > FRESH:
+    print("BLIND|stale (newest row %.0fs old > %.0fs — acoustic sense not producing)|%d|0" % (NOW-newest, FRESH, 0)); sys.exit(0)
+win=[db for (e,db) in rows if NOW-e <= WIN]
+if len(win) < 2:
+    print("BLIND|thin (%d real dB sample(s) in the last %.0fmin — need >=2)||%d" % (len(win), WIN/60, len(win))); sys.exit(0)
+sd=statistics.pstdev(win)
+med=statistics.median(win)
+spikes=sum(1 for db in win if abs(db-med) >= JUMP)
+if sd >= STD or spikes >= SPK:
+    why="stddev=%.1f>=%.1f" % (sd, STD) if sd>=STD else "%d spike(s)>=%.0fdB (corroborated)" % (spikes, JUMP)
+    print("ACTIVE|%s (sound level changing over %d samples)|%.1f|%d" % (why, len(win), sd, len(win))); sys.exit(0)
+print("QUIET|steady (stddev=%.1f<%.1f, %d spike(s)<%d — level not changing)|%.1f|%d" % (sd, STD, spikes, SPK, sd, len(win)))
+PY
+}
+
+# ---- RF axis: resolve mesh-wifi-motion into MOTION|STILL|UNCERTAIN|BLIND (pure over the JSON) ----------
+# Arg: the wifi-motion --json blob (or "" / non-JSON when the tool exited 2 / was unavailable). Echoes
+# "<token>|<reason>". A stale read (age_s > RF_FRESH_S) is BLIND (a body could have moved since).
+classify_rf() {
+  local blob="$1"
+  MC_FRESH="$RF_FRESH_S" python3 - <<'PY' "$blob"
+import sys, os, json
+blob=sys.argv[1] if len(sys.argv)>1 else ""
+FRESH=float(os.environ["MC_FRESH"])
+try:
+    d=json.loads(blob)
+except Exception:
+    print("BLIND|unavailable (wifi-motion gave no JSON — RF tape unreadable/exit-2)"); sys.exit(0)
+if not isinstance(d, dict) or "verdict" not in d:
+    print("BLIND|unavailable (wifi-motion JSON had no verdict)"); sys.exit(0)
+v=str(d.get("verdict","")).upper()
+age=d.get("age_s")
+try: age=float(age)
+except (TypeError, ValueError): age=None
+if age is not None and age > FRESH:
+    print("BLIND|stale (RF read %.0fs old > %.0fs — a body could have moved since)" % (age, FRESH)); sys.exit(0)
+if v in ("MOTION","STILL","UNCERTAIN"):
+    r=d.get("reason") or d.get("coverage") or ""
+    print("%s|%s" % (v, r)); sys.exit(0)
+print("BLIND|unavailable (wifi-motion verdict '%s' not recognised)" % v)
+PY
+}
+
+# ---- FUSE: (rf_token, ac_token) -> fused verdict token + confidence (pure, the whole matrix testable) --
+# Echoes "<VERDICT>|<conf>". conf = firm|weak|na. This is the ONLY place the cross-modal logic lives, so
+# --test asserts the SAME function the live path runs (no drift between a tested duplicate and reality).
+fuse_motion() {
+  local rf="$1" ac="$2"
+  case "$rf|$ac" in
+    BLIND\|BLIND)          echo "UNKNOWN|na" ;;                         # both blind → cannot fuse (exit 2)
+    MOTION\|ACTIVE)        echo "CONFIRMED-MOTION|firm" ;;              # cross-modal agreement
+    MOTION\|QUIET)         echo "RF-MOTION|weak" ;;                     # RF only, acoustically silent
+    MOTION\|BLIND)         echo "PARTIAL|na" ;;                         # RF motion but acoustic blind
+    STILL\|ACTIVE)         echo "ACOUSTIC-ACTIVITY|weak" ;;            # sound but RF still (external/stationary)
+    UNCERTAIN\|ACTIVE)     echo "ACOUSTIC-ACTIVITY|weak" ;;            # RF inconclusive, acoustic asserts
+    STILL\|QUIET)          echo "QUIET|firm" ;;                         # both agree calm — strongest calm
+    UNCERTAIN\|QUIET)      echo "INCONCLUSIVE|weak" ;;                  # RF can't assess, acoustic quiet — soft
+    STILL\|BLIND)          echo "PARTIAL|na" ;;                         # RF still, acoustic blind
+    UNCERTAIN\|BLIND)      echo "PARTIAL|na" ;;                         # RF inconclusive, acoustic blind
+    BLIND\|ACTIVE)         echo "PARTIAL|na" ;;                         # acoustic active, RF blind
+    BLIND\|QUIET)          echo "PARTIAL|na" ;;                         # acoustic quiet, RF blind
+    *)                     echo "UNKNOWN|na" ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------------------------------------
+if [ "${1:-}" = "--test" ]; then
+  f=0
+  # (1) fuse matrix — the whole cross-modal truth table, offline. FALSIFIABLE: change a cell → flips.
+  [ "$(fuse_motion MOTION ACTIVE   | cut -d'|' -f1)" = CONFIRMED-MOTION  ] || { echo "  FAIL: MOTION+ACTIVE must be CONFIRMED-MOTION"; f=1; }
+  [ "$(fuse_motion MOTION QUIET    | cut -d'|' -f1)" = RF-MOTION         ] || { echo "  FAIL: MOTION+QUIET must be RF-MOTION"; f=1; }
+  [ "$(fuse_motion STILL ACTIVE    | cut -d'|' -f1)" = ACOUSTIC-ACTIVITY ] || { echo "  FAIL: STILL+ACTIVE must be ACOUSTIC-ACTIVITY"; f=1; }
+  [ "$(fuse_motion STILL QUIET     | cut -d'|' -f1)" = QUIET             ] || { echo "  FAIL: STILL+QUIET must be QUIET"; f=1; }
+  [ "$(fuse_motion STILL QUIET     | cut -d'|' -f2)" = firm              ] || { echo "  FAIL: STILL+QUIET must be conf=firm"; f=1; }
+  [ "$(fuse_motion UNCERTAIN QUIET | cut -d'|' -f1)" = INCONCLUSIVE      ] || { echo "  FAIL: UNCERTAIN+QUIET must be INCONCLUSIVE"; f=1; }
+  # honest unreachable: QUIET (both read) MUST differ from every BLIND case — no silent all-clear.
+  [ "$(fuse_motion BLIND QUIET     | cut -d'|' -f1)" = PARTIAL           ] || { echo "  FAIL: BLIND+QUIET must be PARTIAL, NOT a QUIET all-clear"; f=1; }
+  [ "$(fuse_motion STILL BLIND     | cut -d'|' -f1)" = PARTIAL           ] || { echo "  FAIL: STILL+BLIND must be PARTIAL, not QUIET"; f=1; }
+  [ "$(fuse_motion BLIND BLIND     | cut -d'|' -f1)" = UNKNOWN           ] || { echo "  FAIL: BLIND+BLIND must be UNKNOWN (both blind)"; f=1; }
+  [ "$(fuse_motion QUIET STILL)" != "$(fuse_motion BLIND QUIET)" ] || { echo "  FAIL: a blind axis must never equal a genuine read"; f=1; }
+  echo "  fuse matrix ok (cross-modal truth table; BLIND != QUIET — no faked all-clear)"
+  # (2) acoustic classifier over synthetic tapes (no mic). NOW pinned so 'stale' is deterministic.
+  _now=1000000000
+  _td="$(mktemp -d)"
+  # steady tape (all ~-30 dB, low variance) → QUIET
+  { echo "# hdr"; echo -e "ts\trms_db\tpeak_db\tlabel";
+    for i in 0 2 4 6 8 10; do printf '%s\t-30.%d\t-20\tQUIET\n' "$(date -u -d @$((_now-i*60)) +%FT%TZ)" "$i"; done; } > "$_td/steady.tsv"
+  [ "$(classify_acoustic "$_td/steady.tsv" SILENT "$_now" | cut -d'|' -f1)" = QUIET ] || { echo "  FAIL: steady dB tape must be acoustic QUIET"; f=1; }
+  # swinging tape (values span ~20 dB → high stddev) → ACTIVE
+  { echo -e "ts\trms_db\tpeak_db\tlabel";
+    for pair in "0 -12" "2 -34" "4 -14" "6 -33" "8 -11" "10 -30"; do set -- $pair; printf '%s\t%s\t-5\tX\n' "$(date -u -d @$((_now-$1*60)) +%FT%TZ)" "$2"; done; } > "$_td/swing.tsv"
+  [ "$(classify_acoustic "$_td/swing.tsv" SILENT "$_now" | cut -d'|' -f1)" = ACTIVE ] || { echo "  FAIL: high-variance dB tape must be acoustic ACTIVE (got $(classify_acoustic "$_td/swing.tsv" SILENT "$_now"))"; f=1; }
+  # self-playback → BLIND (contaminated), even over the ACTIVE tape — self-noise cannot corroborate.
+  [ "$(classify_acoustic "$_td/swing.tsv" PLAYING "$_now" | cut -d'|' -f1)" = BLIND ] || { echo "  FAIL: self-playback must render acoustic BLIND, not ACTIVE"; f=1; }
+  # stale tape (all rows an hour old, FRESH default 900s) → BLIND, distinct from QUIET.
+  { echo -e "ts\trms_db\tpeak_db\tlabel"; printf '%s\t-30\t-20\tX\n' "$(date -u -d @$((_now-3600)) +%FT%TZ)"; printf '%s\t-30\t-20\tX\n' "$(date -u -d @$((_now-3660)) +%FT%TZ)"; } > "$_td/stale.tsv"
+  [ "$(classify_acoustic "$_td/stale.tsv" SILENT "$_now" | cut -d'|' -f1)" = BLIND ] || { echo "  FAIL: stale tape must be acoustic BLIND, not a faked QUIET"; f=1; }
+  # missing tape → BLIND
+  [ "$(classify_acoustic "$_td/nope.tsv" SILENT "$_now" | cut -d'|' -f1)" = BLIND ] || { echo "  FAIL: missing tape must be acoustic BLIND"; f=1; }
+  # all-NA tape → BLIND (rows present but no real dB)
+  { echo -e "ts\trms_db\tpeak_db\tlabel"; printf '%s\tNA\tNA\tUNREACHABLE\n' "$(date -u -d @$_now +%FT%TZ)"; } > "$_td/na.tsv"
+  [ "$(classify_acoustic "$_td/na.tsv" SILENT "$_now" | cut -d'|' -f1)" = BLIND ] || { echo "  FAIL: all-NA tape must be acoustic BLIND"; f=1; }
+  rm -rf "$_td"
+  echo "  acoustic classifier ok (steady->QUIET, swing->ACTIVE, self-play/stale/missing/NA->BLIND)"
+  # (3) RF classifier over synthetic wifi-motion JSON (no scan).
+  [ "$(classify_rf '{"verdict":"MOTION","age_s":60}'    | cut -d'|' -f1)" = MOTION    ] || { echo "  FAIL: RF MOTION json -> MOTION"; f=1; }
+  [ "$(classify_rf '{"verdict":"STILL","age_s":60}'     | cut -d'|' -f1)" = STILL     ] || { echo "  FAIL: RF STILL json -> STILL"; f=1; }
+  [ "$(classify_rf '{"verdict":"UNCERTAIN","age_s":60}' | cut -d'|' -f1)" = UNCERTAIN ] || { echo "  FAIL: RF UNCERTAIN json -> UNCERTAIN"; f=1; }
+  [ "$(classify_rf '{"verdict":"MOTION","age_s":9999}'  | cut -d'|' -f1)" = BLIND     ] || { echo "  FAIL: STALE RF read must be BLIND (a body could have moved since)"; f=1; }
+  [ "$(classify_rf ''                                   | cut -d'|' -f1)" = BLIND     ] || { echo "  FAIL: empty/exit-2 wifi-motion must be RF BLIND"; f=1; }
+  [ "$(classify_rf 'not json'                           | cut -d'|' -f1)" = BLIND     ] || { echo "  FAIL: non-JSON wifi-motion must be RF BLIND"; f=1; }
+  echo "  RF classifier ok (MOTION/STILL/UNCERTAIN passthrough; stale/empty/non-json -> BLIND)"
+  [ "$f" = 0 ] && echo "smoke-test: ok (cross-modal fuse + acoustic + RF, honest BLIND/UNKNOWN)" || { echo "smoke-test: FAIL"; exit 1; }
+  exit 0
+fi
+
+# ---- LIVE read -----------------------------------------------------------------------------------------
+NOW="$(date +%s)"
+# RF axis (test-injectable so --test never scans; live path calls wifi-motion --json)
+RF_JSON="${MESH_MC_RF_JSON:-$(mesh-wifi-motion --json 2>/dev/null || true)}"
+RF_RES="$(classify_rf "$RF_JSON")"; RF="${RF_RES%%|*}"; RF_REASON="${RF_RES#*|}"
+# self-playback gate (test-injectable). UNKNOWN (no tool/card) cannot contaminate → treated as not-PLAYING.
+if [ -n "${MESH_MC_AUDIO_ACTIVE:-}" ]; then SELFPLAY="$MESH_MC_AUDIO_ACTIVE"
+else
+  _aa="$(mesh-audio-active 2>/dev/null || true)"
+  case "$_aa" in *PLAYING*) SELFPLAY=PLAYING ;; *SILENT*) SELFPLAY=SILENT ;; *) SELFPLAY=UNKNOWN ;; esac
+fi
+AC_RES="$(classify_acoustic "$TAPE" "$SELFPLAY" "$NOW")"
+AC="${AC_RES%%|*}"; _rest="${AC_RES#*|}"; AC_REASON="${_rest%%|*}"; _r2="${_rest#*|}"; AC_STDDEV="${_r2%%|*}"; AC_N="${_r2##*|}"
+FUSED="$(fuse_motion "$RF" "$AC")"; VERDICT="${FUSED%%|*}"; CONF="${FUSED##*|}"
+DEGRADED=false; [ "$RF" = BLIND ] || [ "$AC" = BLIND ] && DEGRADED=true
+
+emit_json() {
+  printf '{"verdict":"%s","rf":"%s","acoustic":"%s","conf":"%s","rf_reason":"%s","ac_reason":"%s","ac_stddev":"%s","ac_window_n":"%s","self_playback":"%s","degraded":%s,"ts":"%s"}\n' \
+    "$VERDICT" "$RF" "$AC" "$CONF" "${RF_REASON//\"/}" "${AC_REASON//\"/}" "$AC_STDDEV" "$AC_N" "$SELFPLAY" "$DEGRADED" "$TS"
+}
+
+case "${1:-}" in
+  --json) emit_json ;;
+  --edge)
+    PREV=""; [ -f "$EDGE_CACHE" ] && PREV="$(cat "$EDGE_CACHE" 2>/dev/null)"
+    if [ "$VERDICT" != "$PREV" ]; then
+      printf '%s\n' "$VERDICT" > "$EDGE_CACHE" 2>/dev/null || true
+      echo "[motion-corroborate] $VERDICT (rf=$RF acoustic=$AC conf=$CONF)"
+    fi
+    ;;
+  *)
+    LINE="[motion-corroborate] $VERDICT — rf=$RF ($RF_REASON) · acoustic=$AC ($AC_REASON)"
+    [ "$AC" != BLIND ] && [ -n "$AC_STDDEV" ] && LINE="$LINE · ac_stddev=${AC_STDDEV}dB/n=${AC_N}"
+    LINE="$LINE · conf=$CONF · self_playback=$SELFPLAY"
+    echo "$LINE"
+    ;;
+esac
+
+# exit 2 = UNKNOWN (both modalities blind); every other verdict (incl PARTIAL) is a real fused read.
+[ "$VERDICT" = UNKNOWN ] && exit 2 || exit 0
