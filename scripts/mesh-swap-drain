@@ -36,6 +36,20 @@
 # HONEST DEGRADE: no swap configured → exit 2 (n/a, never a fake "drained"); passwordless sudo absent →
 # exit 2 (n/a — other nodes can't actuate, they don't pretend to). state-touch every run (no false-STALE).
 #
+# FIX (chat-review/swapdrain-unsatisfiable-post-swap2, 2026-07-06): after swap2.img raised SwapTotal
+# 4095→8191MB, gate 1's percentage trigger (SwapFree < FREE_PCT_MAX%) only fires past SwapUsed>6962MB,
+# but gate 3's margin then demands MemAvail > SwapUsed+MARGIN_MB > 8498MB — impossible on this 7496MB-
+# RAM node, so DRAIN was unreachable for EVERY input since 17:50Z (residue sat at 6890MB, unreclaimed,
+# while the reflex kept reporting a healthy no-op REFUSE). Two independent fixes:
+#   (a) MIN_RESIDUE_MB — an absolute floor, independent of SwapTotal, that ALSO marks swap "worth
+#       draining" (gate 1 now fires on pct-full OR absolute-residue). Gate 3's margin math is
+#       UNCHANGED (still the real safety limiter) — this only widens WHEN a drain is considered,
+#       never loosens WHETHER one is safe.
+#   (b) warn_if_unsatisfiable() — boards ONE [swap-drain-unreachable] line (rate-limited per
+#       SwapTotal:MemTotal pair, not every cron tick) whenever the pure percentage trigger is
+#       structurally impossible on this node's MemTotal, so the next SwapTotal bump can't silently
+#       re-kill the actuator without anyone noticing for hours.
+#
 # reflex-cadence: 17 * * * *
 # reflex-args: --drain
 set -uo pipefail
@@ -54,8 +68,13 @@ WHISPER_LOCK="${MESH_SWAPDRAIN_WHISPER_LOCK:-$MESH/.whisper.lock}"
 FREE_PCT_MAX="${MESH_SWAPDRAIN_FREE_PCT:-15}"   # drain only when SwapFree < this % of total (swap full)
 PSI_MAX="${MESH_SWAPDRAIN_PSI_MAX:-1.0}"        # memory `full` avg300 must be <= this (≈ no stall)
 MARGIN_MB="${MESH_SWAPDRAIN_MARGIN_MB:-1536}"   # repatriation headroom over SwapUsed (1.5GB) — LOAD-BEARING
+# Absolute residue floor (independent of SwapTotal) — swap is ALSO "worth draining" once SwapUsed
+# crosses this, even if SwapFree% hasn't crossed FREE_PCT_MAX. Keeps the actuator reachable when
+# SwapTotal grows (swap2.img etc) faster than MemTotal — see FIX note above.
+MIN_RESIDUE_MB="${MESH_SWAPDRAIN_MIN_RESIDUE_MB:-2048}"
 NICE="${MESH_SWAPDRAIN_NICE:-19}"
 DRYRUN="${MESH_SWAPDRAIN_DRYRUN:-0}"            # 1 = never fire a real swapoff/swapon (used by --test)
+CONFIG_WARN_STATE="${MESH_SWAPDRAIN_CONFIG_WARN_STATE:-$MESH/.swap-drain-config-warn}"
 
 ts(){ date -u +%Y-%m-%dT%H:%M:%SZ; }
 
@@ -97,9 +116,14 @@ decide_drain(){
   if awk -v p="${psi:-0}" -v m="$PSI_MAX" 'BEGIN{exit !(p+0 > m+0)}'; then
     echo "REFUSE|memory under active stall (psi full avg300=${psi} > ${PSI_MAX}) — will not fight the kernel"; return
   fi
-  # 1. only worth draining when swap is heavily used
-  if [ "$free_pct" -ge "$FREE_PCT_MAX" ]; then
-    echo "REFUSE|swap not full (SwapFree ${free_pct}% >= ${FREE_PCT_MAX}%) — no residue to reclaim"; return
+  # 1. only worth draining when swap is heavily used BY PERCENTAGE, OR carries an absolute residue
+  #    over MIN_RESIDUE_MB. The pct-only gate was dead-by-config after swap2.img (see FIX note above):
+  #    its own crossing point (SwapUsed at (100-FREE_PCT_MAX)% of SwapTotal) plus MARGIN_MB can exceed
+  #    MemTotal, so it could structurally never co-fire with gate 3 below. The absolute floor is
+  #    independent of SwapTotal and stays reachable as long as MemTotal comfortably exceeds
+  #    MIN_RESIDUE_MB+MARGIN_MB (true for any node sized to run this actuator).
+  if [ "$free_pct" -ge "$FREE_PCT_MAX" ] && [ "$su_mb" -lt "$MIN_RESIDUE_MB" ]; then
+    echo "REFUSE|swap not full (SwapFree ${free_pct}% >= ${FREE_PCT_MAX}%, SwapUsed ${su_mb}MB < ${MIN_RESIDUE_MB}MB floor) — no residue to reclaim"; return
   fi
   # 3. LOAD-BEARING: SwapUsed must fit in RAM with margin, or swapoff -a OOMs
   if [ "$ma" -le $(( su + margin_kb )) ]; then
@@ -110,6 +134,38 @@ decide_drain(){
     echo "REFUSE|a heavy-run/whisper job holds the lock — defer until it completes"; return
   fi
   echo "DRAIN|safe: SwapFree ${free_pct}% (SwapUsed ${su_mb}MB), psi ${psi}, MemAvail ${ma_mb}MB > SwapUsed+${MARGIN_MB}MB"
+}
+
+# --- config-satisfiability assert: is the PURE PERCENTAGE trigger even reachable on this MemTotal? ---
+# Independent of MIN_RESIDUE_MB above — this names the ORIGINAL defect explicitly so a future
+# SwapTotal bump (another swap*.img) can't silently re-kill the pct trigger without anyone noticing.
+check_pct_satisfiable(){ # $1=swaptotal_kb $2=memtotal_kb -> "OK" or "UNREACHABLE|reason"
+  local st="$1" mt="$2"
+  { [ -n "$st" ] && [ "$st" -gt 0 ]; } 2>/dev/null || { echo "OK"; return; }   # no swap — n/a
+  { [ -n "$mt" ] && [ "$mt" -gt 0 ]; } 2>/dev/null || { echo "OK"; return; }   # MemTotal unreadable — can't assert
+  local trig_su_kb=$(( st * (100 - FREE_PCT_MAX) / 100 ))   # SwapUsed at which the pct gate first trips
+  local need_kb=$(( trig_su_kb + MARGIN_MB * 1024 ))
+  if [ "$need_kb" -gt "$mt" ]; then
+    echo "UNREACHABLE|pct-trigger (SwapFree<${FREE_PCT_MAX}%) needs MemAvail>$(( need_kb/1024 ))MB but MemTotal=$(( mt/1024 ))MB — structurally impossible regardless of load"
+  else
+    echo "OK"
+  fi
+}
+
+# warn_if_unsatisfiable: boards ONE [swap-drain-unreachable] line per distinct (SwapTotal,MemTotal)
+# pair — not every cron tick — so a structural misconfig is loud exactly once, not spam.
+warn_if_unsatisfiable(){ # $1=swaptotal_kb $2=memtotal_kb
+  local st="$1" mt="$2" res marker
+  res="$(check_pct_satisfiable "$st" "$mt")"
+  case "$res" in
+    UNREACHABLE\|*)
+      marker="${st}:${mt}"
+      if [ "$(cat "$CONFIG_WARN_STATE" 2>/dev/null || echo '')" != "$marker" ]; then
+        board "[swap-drain-unreachable] $(hostname) ${res#*|} (MIN_RESIDUE_MB=${MIN_RESIDUE_MB} floor covers this gap)"
+        printf '%s\n' "$marker" > "$CONFIG_WARN_STATE" 2>/dev/null || true
+      fi
+      ;;
+  esac
 }
 
 board(){ # edge posts only; a swallowed post is non-fatal (drain still happened, state records it)
@@ -135,10 +191,12 @@ swap_used_mb(){ # current SwapUsed in MB from live MEMINFO
 }
 
 live_verdict(){ # echoes the decide_drain verdict from live /proc
-  local st sf ma psi busy
+  local st sf ma mt psi busy
   st="$(read_meminfo_kb SwapTotal)"; sf="$(read_meminfo_kb SwapFree)"; ma="$(read_meminfo_kb MemAvailable)"
+  mt="$(read_meminfo_kb MemTotal)"
   psi="$(read_psi_full300)"; [ -n "$psi" ] || psi=0
   st="${st:-0}"; sf="${sf:-0}"; ma="${ma:-0}"
+  warn_if_unsatisfiable "$st" "${mt:-0}"
   if heavy_busy; then busy=1; else busy=0; fi
   decide_drain "$st" "$sf" "$ma" "$psi" "$busy"
 }
@@ -202,8 +260,9 @@ case "${1:---status}" in
     case "$(decide_drain $_ST 80000 7340032 5.0 0)" in REFUSE\|memory\ under*) : ;; *) fail "psi stall must REFUSE (never drain under stall)";; esac
     # falsify the stall gate: psi exactly at PSI_MAX (1.0) is NOT a stall → must still DRAIN
     case "$(decide_drain $_ST 80000 7340032 1.0 0)" in DRAIN\|*) : ;; *) fail "psi==PSI_MAX must NOT trip the stall gate (guards the > boundary)";; esac
-    # REFUSE(not full): SwapFree 20% (838860kB) >= FREE_PCT_MAX 15 → nothing to reclaim
-    case "$(decide_drain $_ST 838860 7340032 0 0)" in REFUSE\|swap\ not\ full*) : ;; *) fail "swap only 20% used must REFUSE (no residue)";; esac
+    # REFUSE(not full): SwapFree 71% (3000000kB) >= FREE_PCT_MAX 15 AND SwapUsed 1166MB < MIN_RESIDUE_MB
+    # floor (2048MB) → truly nothing worth reclaiming by EITHER trigger
+    case "$(decide_drain $_ST 3000000 7340032 0 0)" in REFUSE\|swap\ not\ full*) : ;; *) fail "swap lightly used (below both pct and floor) must REFUSE (no residue)";; esac
     # REFUSE(margin) — THE LOAD-BEARING gate: full swap, calm, free, but MemAvail 4GB !> SwapUsed ~4GB+1.5GB
     case "$(decide_drain $_ST 80000 4194304 0 0)" in REFUSE\|insufficient\ repatriation*) : ;; *) fail "MemAvail<=SwapUsed+margin must REFUSE (else swapoff OOMs)";; esac
     # falsify the margin gate: give exactly +1kB over (SwapUsed+margin) → must flip to DRAIN
@@ -212,6 +271,47 @@ case "${1:---status}" in
     case "$(decide_drain $_ST 80000 5687168 0 0)" in REFUSE\|insufficient*) : ;; *) fail "MemAvail == SwapUsed+margin must still REFUSE (boundary is strict >)";; esac
     # REFUSE(heavy): all gates pass but a heavy job holds the lock
     case "$(decide_drain $_ST 80000 7340032 0 1)" in REFUSE\|a\ heavy*) : ;; *) fail "heavy job in flight must REFUSE";; esac
+
+    # ---- MIN_RESIDUE_MB absolute-floor gate: swapdrain-unsatisfiable-post-swap2 fix ----
+    # Not full BY PERCENTAGE (SwapFree 1122304kB ≈ 27% >= 15%) but SwapUsed 3000MB >= floor(2048MB),
+    # with a repatriable margin (ma 5000000kB=4883MB > su_kb 3072000+margin_kb 1572864=4644864kB) →
+    # the floor alone must make this DRAIN, proving the fix: the OLD pct-only gate would have REFUSEd
+    # "not full" here and left a real 3GB residue unreclaimed forever.
+    case "$(decide_drain $_ST 1122304 5000000 0 0)" in DRAIN\|*) : ;; *) fail "SwapUsed>=MIN_RESIDUE_MB floor with repatriable margin must DRAIN even when not full by pct";; esac
+    # falsify the floor's own boundary: 1MB below it (SwapUsed 2047MB, SwapFree 2098176kB≈50%) must
+    # still REFUSE not-full (worth-it is false on BOTH triggers)
+    case "$(decide_drain $_ST 2098176 8000000 0 0)" in REFUSE\|swap\ not\ full*) : ;; *) fail "SwapUsed 1MB under MIN_RESIDUE_MB must still REFUSE (floor is a strict < boundary)";; esac
+    # exactly AT the floor (SwapUsed 2048MB, SwapFree 2097152kB=50%) must DRAIN (floor is inclusive)
+    case "$(decide_drain $_ST 2097152 8000000 0 0)" in DRAIN\|*) : ;; *) fail "SwapUsed == MIN_RESIDUE_MB must DRAIN (floor boundary inclusive)";; esac
+
+    # ---- config-satisfiability assert: check_pct_satisfiable + warn_if_unsatisfiable ----
+    # Reproduce the live post-swap2.img config: SwapTotal 8191MB, MemTotal 7496MB. The pct trigger's
+    # own crossing point (85% of SwapTotal) plus MARGIN_MB structurally exceeds MemTotal — no live
+    # value of MemAvailable (bounded by MemTotal) could ever satisfy gate 3 once gate 1 fires by pct
+    # alone. This is the ORIGINAL defect, independent of the MIN_RESIDUE_MB floor added above.
+    _ST8191=8387584; _MT7496=7675904   # 8191MB, 7496MB in kB
+    case "$(check_pct_satisfiable $_ST8191 $_MT7496)" in UNREACHABLE\|*) : ;; *) fail "post-swap2.img config (8191MB swap / 7496MB RAM) must assert UNREACHABLE";; esac
+    # falsify: a modest SwapTotal (4GB) on the same 7496MB RAM stays satisfiable → OK
+    case "$(check_pct_satisfiable $_ST $_MT7496)" in OK) : ;; *) fail "4GB swap on 7496MB RAM must be satisfiable (OK)";; esac
+    # sweep proof — old %-only trigger (floor disabled) provably NEVER drains under this config, for
+    # every SwapUsed at/above its own crossing point, because MemAvailable is capped at MemTotal:
+    # su+margin_kb always exceeds MT once su crosses the pct threshold, so the maximal possible
+    # MemAvail (== MemTotal) still can't clear gate 3.
+    _fl=0
+    for _su_mb in 6963 7000 7500 8000 8191; do
+      _su_kb=$(( _su_mb * 1024 )); _sf_kb=$(( _ST8191 - _su_kb ))
+      [ "$_sf_kb" -lt 0 ] && _sf_kb=0
+      _v="$(MIN_RESIDUE_MB=999999 decide_drain $_ST8191 $_sf_kb $_MT7496 0 0)"
+      case "$_v" in DRAIN\|*) _fl=1; echo "  (sweep leak: su=${_su_mb}MB unexpectedly DRAINed with floor disabled)";; esac
+    done
+    [ "$_fl" = 0 ] || fail "pct-only trigger (floor disabled) must NEVER drain on the 8191MB-swap/7496MB-RAM config"
+    # warn_if_unsatisfiable rate-limiting: first call for a config boards once, second call (same
+    # config) must NOT board again — proves "ONE loud line", not spam every tick.
+    _wtd="$(mktemp -d)"; _wcap="$_wtd/board"; mesh-chat(){ printf '%s\n' "$*" >> "$_wcap"; return 0; }
+    ( CONFIG_WARN_STATE="$_wtd/warn" warn_if_unsatisfiable "$_ST8191" "$_MT7496" )
+    ( CONFIG_WARN_STATE="$_wtd/warn" warn_if_unsatisfiable "$_ST8191" "$_MT7496" )
+    [ "$(grep -c '\[swap-drain-unreachable\]' "$_wcap" 2>/dev/null || echo 0)" = 1 ] || fail "warn_if_unsatisfiable must board exactly ONCE per (SwapTotal,MemTotal) pair, not every call"
+    unset -f mesh-chat; rm -rf "$_wtd"
 
     # ---- heavy_busy: real non-blocking flock probe (not just the env inject) ----
     _lk="$(mktemp)"; ( exec 9>>"$_lk"; flock 9; sleep 3 ) &   # hold the lock 3s in the background
