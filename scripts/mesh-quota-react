@@ -1,0 +1,182 @@
+#!/usr/bin/env bash
+# mesh-quota-react — PRE-wall model downshift for the paid claude windows (the reaction mesh-quota
+# deliberately doesn't do: mesh-quota is the read-only truth surface; THIS acts on it).
+#
+# WHY (operator TG 2026-07-06 14:1x, task quota-react-model-switch): "when a model hits its
+# limit/wall, the mesh gives NO reaction; the model could be switched BEFORE hitting the wall".
+# The existing reaction chain is all POST-wall and ENGINE-level (channel-keepalive sheds a walled
+# claude and relaunches opencode, .quota-fallback mark auto-reverts on reset). Nothing reacts to
+# the NEAR-wall signal, and nothing shifts the MODEL (opus→sonnet→haiku) to stretch the session
+# window before the hard wall lands. This reflex closes that gap.
+#
+# PATTERN PROVENANCE (the task's lib-scan deliverable, ideas folded not copied):
+#  - LiteLLM router: ordered fallback model-groups (walk down a declared chain under pressure)
+#    + per-deployment cooldown (a tripped deployment sits out; we reuse .rl-cooldown-* marks).
+#  - Router "usage-based routing" needs a known budget; providers give us none — so the burn-rate
+#    trigger is OPERATOR-SET (env), never an invented ceiling (mesh-quota honesty rule).
+#
+# MECHANICS — one GLOBAL ladder position (the 5h/weekly limits are account-wide, not per-window):
+#   pressure = hard wall banner on any paid pane (rl_is_walled, shared shape gate)
+#            | near-wall banner on any paid pane (rl_is_nearwall below, same shape discipline)
+#            | paid burn ≥ MESH_BURN_SOFT_1H rt/1h (OPT-IN: unset = banner-only, honest default)
+#   pressure && rung<max && cooldown elapsed  → rung+1, send "/model <rung-model>" to each paid
+#                                               window still running claude (walled/fallback panes
+#                                               are keepalive's, not ours)
+#   no pressure && rung>0 && recover elapsed  → rung-1 (walk back up one; full reset walks all the
+#                                               way up over successive quiet evals)
+#   Ladder: MESH_MODEL_LADDER (default "default sonnet haiku"; rung 0 "default" = the operator's
+#   own account/session default, so a full recovery restores exactly what the operator chose).
+#
+#   mesh-quota-react --edge     evaluate + act (cron)
+#   mesh-quota-react --status   read-only: rung, model, stamps (no write path — see memory
+#                               status-read-shares-write-path-mutates)
+#   mesh-quota-react --test     fixture smoke (classifier + ladder decisions; sends dry-run)
+#
+# reflex-cadence: */5 * * * *
+# reflex-args: --edge
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+MESH="$HOME/.mesh"; SESS="$(hostname)"
+STATE="$MESH/.model-ladder"                       # "<rung>|<epoch-of-last-change>"
+CLAUDE_WINDOWS="${MESH_CLAUDE_WINDOWS:-minds genome tg}"
+LADDER="${MESH_MODEL_LADDER:-default sonnet haiku}"
+BURN_SOFT="${MESH_BURN_SOFT_1H:-}"                # paid rt/1h; unset = banner-only (honest)
+SHIFT_COOLDOWN="${MESH_SHIFT_COOLDOWN:-1800}"     # min s between successive downshifts
+RECOVER_S="${MESH_MODEL_RECOVER_S:-3600}"         # quiet s before walking one rung back up
+DRYRUN="${MESH_QUOTA_REACT_DRYRUN:-}"
+
+# shared banner-shape lib (hard wall); inline fallback keeps the tool self-contained
+if [ -f "$HOME/.local/bin/mesh-patterns.sh" ]; then . "$HOME/.local/bin/mesh-patterns.sh" 2>/dev/null || true
+elif [ -f "$(dirname "$0")/mesh-patterns.sh" ]; then . "$(dirname "$0")/mesh-patterns.sh" 2>/dev/null || true; fi
+type rl_is_walled >/dev/null 2>&1 || rl_is_walled(){ grep -qiE 'hit your (usage|session) limit|usage limit reached|too many requests|429|out of credits'; }
+
+# rl_is_nearwall — stdin: pane lines. 0 iff a GENUINE approaching-limit banner is present.
+# Same shape discipline as rl_is_walled (banner-shape not keyword, memory rate-limit-banner-shape):
+# board-echo lines stripped, prompt-glyph lines dropped, match only on a TERSE line (banners are
+# short; a mind's prose about limits is long-form). A HARD wall is NOT near — callers check
+# rl_is_walled first; this matches only the pre-wall warning shapes the claude TUI emits
+# ("Approaching usage limit · resets at 3am", "You've used 80% of your session limit").
+rl_is_nearwall(){
+  local txt; txt="$(cat)"
+  txt="$(printf '%s\n' "$txt" | grep -vE '^[[:space:]]*[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:Z]+  [^ ]+  ::  ')"
+  printf '%s\n' "$txt" | grep -vE '^[[:space:]]*[❯›]' \
+    | awk 'length($0)<=120' \
+    | grep -qiE 'approaching[^.]*(usage|session|weekly|rate) limit|used [0-9]{2}% of (your|the) (session|usage|weekly)|[0-9]{2}% (of|toward)[^.]*limit'
+}
+
+pane_of(){ tmux list-panes -t "$SESS:$1" -F '#{pane_top} #{pane_index}' 2>/dev/null | sort -n | tail -1 | awk '{print $2}'; }
+engine_of(){ # $1=win.idx → claude/opencode/... or '-'
+  local pid; pid=$(tmux display -p -t "$SESS:$1" '#{pane_pid}' 2>/dev/null) || { echo '-'; return; }
+  local e; e=$(pstree -p "$pid" 2>/dev/null | grep -oE 'claude|opencode|codex|agy|gemini' | head -1)
+  echo "${e:--}"
+}
+units_paid_1h(){ # same unit as mesh-quota burn (spend.log paid lines, rolling 1h)
+  local log="${MESH_SPEND_LOG:-$MESH/spend.log}"; [ -f "$log" ] || { echo 0; return; }
+  local cut; cut=$(date -u -d '60 minutes ago' +%Y-%m-%dT%H:%M 2>/dev/null) || { echo 0; return; }
+  awk -v c="$cut" '$1>c && $6=="paid"{n++} END{print n+0}' "$log"
+}
+
+# next_rung — PURE decision (testable): $1=cur $2=pressure(0/1) $3=elapsed-since-change
+#             $4=max-rung $5=shift-cooldown $6=recover-s → echoes the new rung
+next_rung(){
+  local cur=$1 pres=$2 el=$3 max=$4 cd=$5 rec=$6
+  if [ "$pres" = 1 ]; then
+    [ "$cur" -lt "$max" ] && [ "$el" -ge "$cd" ] && { echo $((cur+1)); return; }
+  else
+    [ "$cur" -gt 0 ] && [ "$el" -ge "$rec" ] && { echo $((cur-1)); return; }
+  fi
+  echo "$cur"
+}
+
+read_state(){ # → "rung epoch" (defaults 0 + now-on-first-run)
+  local r=0 ep=0
+  [ -f "$STATE" ] && { r=$(cut -d'|' -f1 "$STATE" 2>/dev/null); ep=$(cut -d'|' -f2 "$STATE" 2>/dev/null); }
+  printf '%s' "$r" | grep -qE '^[0-9]+$' || r=0
+  printf '%s' "$ep" | grep -qE '^[0-9]+$' || ep=0
+  echo "$r $ep"
+}
+
+do_send(){ # $1=window $2=model — the ONE outbound choke-point (dry-run gated for tests)
+  if [ -n "$DRYRUN" ]; then echo "DRYRUN: mesh-tell $1 /model $2"; return 0; fi
+  mesh-tell --ack "$1" "/model $2" 2>/dev/null || mesh-tell "$1" "/model $2"
+}
+
+edge(){
+  mkdir -p "$MESH"
+  read -r LAD_ARR <<<""; read -ra LAD_ARR <<<"$LADDER"; local max=$(( ${#LAD_ARR[@]} - 1 ))
+  local now; now=$(date +%s)
+  local rung ep; read -r rung ep < <(read_state); [ "$ep" = 0 ] && ep=$now
+  [ "$rung" -gt "$max" ] && rung=$max
+  # ---- sense pressure across the paid panes -------------------------------------------
+  local pres=0 why=""
+  local w p tail8
+  for w in $CLAUDE_WINDOWS; do
+    p=$(pane_of "$w"); [ -n "$p" ] || continue
+    tail8=$(tmux capture-pane -t "$SESS:$w.$p" -p -S -12 2>/dev/null | grep -vE '^[[:space:]]*$' | tail -8)
+    [ -n "$tail8" ] || continue
+    if printf '%s\n' "$tail8" | rl_is_walled; then pres=1; why="hard-wall:$w"; break; fi
+    if printf '%s\n' "$tail8" | rl_is_nearwall; then pres=1; why="near-wall:$w"; break; fi
+  done
+  if [ "$pres" = 0 ] && [ -n "$BURN_SOFT" ] && printf '%s' "$BURN_SOFT" | grep -qE '^[0-9]+$'; then
+    local b; b=$(units_paid_1h)
+    [ "$b" -ge "$BURN_SOFT" ] && { pres=1; why="burn:$b/1h>=$BURN_SOFT"; }
+  fi
+  # ---- decide + act --------------------------------------------------------------------
+  local new; new=$(next_rung "$rung" "$pres" $((now-ep)) "$max" "$SHIFT_COOLDOWN" "$RECOVER_S")
+  if [ "$new" != "$rung" ]; then
+    local model=${LAD_ARR[$new]} sent=""
+    for w in $CLAUDE_WINDOWS; do
+      p=$(pane_of "$w"); [ -n "$p" ] || continue
+      [ "$(engine_of "$w.$p")" = claude ] || continue   # fallback/opencode panes are keepalive's
+      do_send "$w" "$model" && sent="$sent $w"
+    done
+    printf '%s|%s\n' "$new" "$now" > "$STATE"
+    local dir=down; [ "$new" -lt "$rung" ] && dir=up
+    command -v mesh-trace >/dev/null 2>&1 && mesh-trace "quota-react: ladder $dir rung $rung->$new (/model $model ->${sent:- none}) ${why:+trigger=$why}" >/dev/null 2>&1 || true
+    if [ -z "$DRYRUN" ] && command -v mesh-chat >/dev/null 2>&1; then
+      MESH_WHO="quota-react@$SESS" mesh-chat "[fyi] quota-react: model ladder $dir rung $rung->$new → /model $model sent to${sent:- no claude pane} ${why:+(trigger $why)}; revert is automatic (recover ${RECOVER_S}s quiet → walk up)" >/dev/null || true
+    fi
+  elif [ -f "$STATE" ]; then
+    { command -v mesh-state-touch >/dev/null 2>&1 && mesh-state-touch "$STATE"; } || touch "$STATE"  # liveness-touch: ran-live ≠ value-changed
+  else
+    printf '%s|%s\n' "$rung" "$now" > "$STATE"   # first run: seed the state file
+  fi
+}
+
+status(){ # READ-ONLY (no mkdir, no touch, no state write)
+  local rung ep; read -r rung ep < <(read_state)
+  read -ra LAD_ARR <<<"$LADDER"
+  local model="${LAD_ARR[$rung]:-?}" age="never"
+  [ "$ep" -gt 0 ] && age="$(( ($(date +%s) - ep) / 60 ))m ago"
+  echo "model-ladder: rung $rung/$(( ${#LAD_ARR[@]} - 1 )) (model=$model) · last change $age · ladder: $LADDER"
+  echo "triggers: banner(near/hard, always on) · burn ${BURN_SOFT:-unset (opt-in MESH_BURN_SOFT_1H)}"
+}
+
+case "${1:-}" in
+  --edge) edge ;;
+  --status) status ;;
+  --test)
+    fail(){ echo "smoke-test: FAIL ($1)"; exit 1; }
+    # 1) near-wall classifier: banner-shape, not keyword
+    printf 'Approaching usage limit · resets at 3am\n' | rl_is_nearwall || fail "real near-banner missed"
+    printf "You've used 80%% of your session limit\n" | rl_is_nearwall || fail "percent banner missed"
+    printf 'we are approaching usage limit design territory in this long prose line about quota reactions and ladders and thresholds, not a banner\n' | rl_is_nearwall && fail "long prose matched"
+    printf '2026-07-06T14:00:00Z  tg@node  ::  approaching usage limit chatter\n' | rl_is_nearwall && fail "board echo matched"
+    printf '❯ approaching usage limit test input\n' | rl_is_nearwall && fail "prompt line matched"
+    # 2) ladder decisions (pure)
+    [ "$(next_rung 0 1 9999 2 1800 3600)" = 1 ] || fail "pressure should shift down"
+    [ "$(next_rung 0 1 10 2 1800 3600)" = 0 ]  || fail "cooldown must hold"
+    [ "$(next_rung 2 1 9999 2 1800 3600)" = 2 ] || fail "max rung must clamp"
+    [ "$(next_rung 2 0 9999 2 1800 3600)" = 1 ] || fail "quiet should recover up"
+    [ "$(next_rung 1 0 10 2 1800 3600)" = 1 ]  || fail "recover must wait"
+    [ "$(next_rung 0 0 9999 2 1800 3600)" = 0 ] || fail "rung0 quiet must hold"
+    # 3) edge is side-effect-safe under DRYRUN + sandbox HOME (no real sends, no real state)
+    td=$(mktemp -d) || fail mktemp; trap 'rm -rf "$td"' EXIT
+    out=$(HOME="$td" MESH_QUOTA_REACT_DRYRUN=1 MESH_CLAUDE_WINDOWS="" bash "$0" --edge 2>&1) || fail "edge errored: $out"
+    printf '%s' "$out" | grep -q 'mesh-tell' && fail "edge sent despite empty window set"
+    [ -f "$td/.mesh/.model-ladder" ] || fail "liveness-touch missing on no-change eval"
+    out=$(HOME="$td" bash "$0" --status) || fail "status errored"
+    printf '%s' "$out" | grep -q 'rung 0' || fail "status must show rung 0: $out"
+    echo "smoke-test: ok"; exit 0 ;;
+  *) echo "usage: mesh-quota-react [--edge|--status|--test]"; exit 2 ;;
+esac
