@@ -50,6 +50,20 @@ read_label() {
   printf '%s' "$v"
 }
 
+# read_psi_band <state> → echoes CALM|BUSY|STALLED|UNAVAILABLE|OFFLINE (chat-review/
+# node-health-swap-psi-gate 2026-07-07). mesh-psi's .psi.state is a BARE single-token label (its
+# confirmed worst-of verdict, no pipe fields — unlike the other 4 inputs here), so this reads the
+# whole first line, not a cut -d'|' -f1 split.
+read_psi_band() {
+  local f="$1" v now m
+  [ -f "$f" ] || { echo "OFFLINE"; return; }
+  now=$(date +%s); m=$(stat -c %Y "$f" 2>/dev/null || echo "$now")
+  if [ $((now - m)) -gt "$STALE_S" ]; then echo "OFFLINE"; return; fi
+  v="$(head -1 "$f" 2>/dev/null | tr -d '[:space:]')"
+  [ -n "$v" ] || { echo "OFFLINE"; return; }
+  printf '%s' "$v"
+}
+
 # band_severity <label> → echoes CRITICAL|DEGRADED|HEALTHY|UNKNOWN. The "how bad is this
 # input's verdict" mapping (priority order: CRITICAL > DEGRADED > HEALTHY > UNKNOWN).
 band_severity() {
@@ -64,16 +78,31 @@ band_severity() {
   esac
 }
 
-# classify_node_health <entropy_band> <sockstat_band> <swap_band> <loadavg_band> →
-# "LABEL|reason" — pure, offline-testable (worst-of priority).
+# classify_node_health <entropy_band> <sockstat_band> <swap_band> <loadavg_band> [psi_band] →
+# "LABEL|reason" — pure, offline-testable (worst-of priority). psi_band (optional, mesh-psi's
+# CALM/BUSY/STALLED/UNAVAILABLE — omitted means a legacy 4-arg caller) corroborates swap alone;
+# see the swap-severity gate below.
 classify_node_health() {
-  local e="$1" sk="$2" sw="$3" ld="$4"
+  local e="$1" sk="$2" sw="$3" ld="$4" psi="${5:-}"
   # Compute severities for each input
   local e_sev sk_sev sw_sev ld_sev missing=""
   e_sev="$(band_severity "$e")"
   sk_sev="$(band_severity "$sk")"
   sw_sev="$(band_severity "$sw")"
   ld_sev="$(band_severity "$ld")"
+  # chat-review/node-health-swap-psi-gate: raw swap% pins CRITICAL on COLD evicted pages that
+  # won't drain on their own (verified live 2026-07-07: swap 96% + mesh-psi memory some/full=0.00
+  # across avg10/60/300 + MemAvailable 2360MB healthy — genuinely fine, not exhausted). Corroborate
+  # against mesh-psi (the ACTUAL-stall sense, /proc/pressure) before trusting swap alone: only its
+  # own CALM verdict (no resource stalling at all, memory included — psi's classify() is itself
+  # worst-of across cpu/io/mem) downgrades swap's contribution from CRITICAL to DEGRADED. Anything
+  # else — BUSY/STALLED (a real stall corroborates it), UNAVAILABLE/OFFLINE (unreadable), or a
+  # missing 5th arg (legacy caller) — keeps swap's raw severity: fail-suspicious, never let an
+  # unconfirmed psi silently downgrade a real exhaustion.
+  local sw_downgraded=0
+  if [ "$sw_sev" = "CRITICAL" ] && [ "$psi" = "CALM" ]; then
+    sw_sev="DEGRADED"; sw_downgraded=1
+  fi
   # Count UNKNOWN inputs (missing/degraded)
   local unk=0
   [ "$e_sev" = "UNKNOWN" ]  && unk=$((unk+1)) && missing="${missing}entropy,"
@@ -98,7 +127,10 @@ classify_node_health() {
     local which=""
     [ "$e_sev" = "DEGRADED" ] && which="${which}entropy=$e,"
     [ "$sk_sev" = "DEGRADED" ] && which="${which}sockstat=$sk,"
-    [ "$sw_sev" = "DEGRADED" ] && which="${which}swap=$sw,"
+    if [ "$sw_sev" = "DEGRADED" ]; then
+      if [ "$sw_downgraded" = 1 ]; then which="${which}swap=$sw(psi=CALM→no real stall),"
+      else which="${which}swap=$sw,"; fi
+    fi
     [ "$ld_sev" = "DEGRADED" ] && which="${which}loadavg=$ld,"
     which="${which%,}"
     echo "DEGRADED|$which"
@@ -132,6 +164,32 @@ if [ "${1:-}" = --test ]; then
   r="$(classify_node_health GOOD BUSY CRITICAL STABLE)"
   echo "$r" | grep -q '^CRITICAL' || { echo "  FAIL CRITICAL swap: got=$r"; fail=1; }
   echo "$r" | grep -q 'swap' || { echo "  FAIL CRITICAL-swap should list swap: got=$r"; fail=1; }
+  # --- chat-review/node-health-swap-psi-gate (2026-07-07): swap=CRITICAL raw-% pins on cold
+  # evicted pages that won't drain themselves. Corroborate against mesh-psi before trusting it
+  # alone. Falsify: drop the psi gate in classify_node_health and the CALM case flips to CRITICAL.
+  # (1) swap=CRITICAL + psi=CALM (no real stall anywhere) → downgrades to DEGRADED
+  r="$(classify_node_health GOOD HEALTHY CRITICAL STABLE CALM)"
+  echo "$r" | grep -q '^DEGRADED' || { echo "  FAIL swap=CRITICAL+psi=CALM should downgrade to DEGRADED: got=$r"; fail=1; }
+  echo "$r" | grep -q 'swap=CRITICAL' || { echo "  FAIL downgraded reason should still name swap=CRITICAL: got=$r"; fail=1; }
+  echo "$r" | grep -q 'psi=CALM' || { echo "  FAIL downgraded reason should cite psi=CALM: got=$r"; fail=1; }
+  # (2) swap=CRITICAL + psi=STALLED (a real stall corroborates it) → stays CRITICAL, unchanged
+  r="$(classify_node_health GOOD HEALTHY CRITICAL STABLE STALLED)"
+  echo "$r" | grep -q '^CRITICAL' || { echo "  FAIL swap=CRITICAL+psi=STALLED must stay CRITICAL: got=$r"; fail=1; }
+  # (3) swap=CRITICAL + psi=BUSY (some contention, not calm) → stays CRITICAL too, not just STALLED
+  r="$(classify_node_health GOOD HEALTHY CRITICAL STABLE BUSY)"
+  echo "$r" | grep -q '^CRITICAL' || { echo "  FAIL swap=CRITICAL+psi=BUSY must stay CRITICAL: got=$r"; fail=1; }
+  # (4) swap=CRITICAL + psi=UNAVAILABLE (unreadable — no kernel PSI support) → fail-suspicious,
+  # stays CRITICAL. An unconfirmed corroboration must never quietly downgrade a real exhaustion.
+  r="$(classify_node_health GOOD HEALTHY CRITICAL STABLE UNAVAILABLE)"
+  echo "$r" | grep -q '^CRITICAL' || { echo "  FAIL swap=CRITICAL+psi=UNAVAILABLE must stay CRITICAL (fail-suspicious): got=$r"; fail=1; }
+  # (5) legacy 4-arg call (no psi arg at all) → unchanged CRITICAL, exactly today's behavior
+  r="$(classify_node_health GOOD HEALTHY CRITICAL STABLE)"
+  echo "$r" | grep -q '^CRITICAL' || { echo "  FAIL legacy 4-arg swap=CRITICAL must stay CRITICAL: got=$r"; fail=1; }
+  # (6) the psi gate must be swap-SPECIFIC — a genuinely critical OTHER input alongside a
+  # psi=CALM swap must still surface CRITICAL overall (psi only exempts swap, nothing else)
+  r="$(classify_node_health CRITICAL HEALTHY CRITICAL STABLE CALM)"
+  echo "$r" | grep -q '^CRITICAL' || { echo "  FAIL entropy=CRITICAL alongside psi-exempted swap must stay CRITICAL: got=$r"; fail=1; }
+  echo "$r" | grep -q 'entropy' || { echo "  FAIL should still name entropy as the critical input: got=$r"; fail=1; }
   # CRITICAL: loadavg OVERLOADED
   r="$(classify_node_health GOOD HEALTHY LIGHT OVERLOADED)"
   echo "$r" | grep -q '^CRITICAL' || { echo "  FAIL CRITICAL loadavg: got=$r"; fail=1; }
@@ -181,6 +239,7 @@ if [ "${1:-}" = --test ]; then
   echo "$r" | grep -q '^UNKNOWN' || { echo "  FAIL unrecognized: got=$r"; fail=1; }
   [ "$fail" = 1 ] && { echo "smoke-test: FAIL"; exit 1; }
   echo "  ok: classify (16 cases: HEALTHY×2, CRITICAL×3, DEGRADED×5, priority×1, 1-UNKNOWN, 2/3/4-UNKNOWN×3, NONE-swap, unrecognized)"
+  echo "  ok: swap-psi gate (6 cases: CALM-downgrade, STALLED/BUSY/UNAVAILABLE/legacy-4arg stay CRITICAL, swap-specific-only)"
   # REAL-READ gate: reachability ≠ producing. All 4 /proc files must be readable AND parseable
   # or the sense is hollow (green test with no real artifact).
   for _p in /proc/sys/kernel/random/entropy_avail /proc/net/sockstat /proc/swaps /proc/loadavg; do
@@ -198,7 +257,7 @@ if [ "${1:-}" = --test ]; then
     if grep -q 'missing: entropy,sockstat,swap,loadavg' "$STATE" 2>/dev/null; then
       echo "smoke-test: FAIL (live run still reads ALL inputs OFFLINE — input refresh not firing, fusion is hollow)"; exit 1
     fi
-    echo "  ok: live fusion non-hollow ($(cut -d'|' -f1-5 "$STATE" 2>/dev/null))"
+    echo "  ok: live fusion non-hollow ($(cut -d'|' -f1-6 "$STATE" 2>/dev/null))"
   fi
   echo "smoke-test: ok (classify: 16 cases + REAL reads: entropy=$_e, sockstat=$_sk, swap=$_sw, loadavg=$_ld)"
   exit 0
@@ -220,20 +279,23 @@ entropy="$(read_label "$MESH/.entropy-state")"
 sockstat="$(read_label "$MESH/.sockstat-state")"
 swap="$(read_label "$MESH/.swap-state")"
 loadavg="$(read_label "$MESH/.loadavg-state")"
+# psi is independently cron-wired (its own reflex-cadence), unlike the 4 on-demand inputs above —
+# no force-refresh needed here, just read its existing state (stale/missing → OFFLINE, honest).
+psi="$(read_psi_band "$MESH/.psi.state")"
 
-result="$(classify_node_health "$entropy" "$sockstat" "$swap" "$loadavg")"
+result="$(classify_node_health "$entropy" "$sockstat" "$swap" "$loadavg" "$psi")"
 label="${result%%|*}"
 reason="${result#*|}"
 
 TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 # Write state + touch liveness on EVERY successful run (mtime = ran-live, content = value-changed)
-printf '%s|entropy=%s|sockstat=%s|swap=%s|loadavg=%s|%s\n' "$label" "$entropy" "$sockstat" "$swap" "$loadavg" "$reason" > "$STATE"
+printf '%s|entropy=%s|sockstat=%s|swap=%s|loadavg=%s|psi=%s|%s\n' "$label" "$entropy" "$sockstat" "$swap" "$loadavg" "$psi" "$reason" > "$STATE"
 mesh-state-touch "$STATE"
 
 # --- Output ---
 if [ "${1:-}" = --json ]; then
-  printf '{"label":"%s","reason":"%s","inputs":{"entropy":"%s","sockstat":"%s","swap":"%s","loadavg":"%s"},"ts":"%s"}\n' \
-    "$label" "$reason" "$entropy" "$sockstat" "$swap" "$loadavg" "$TS"
+  printf '{"label":"%s","reason":"%s","inputs":{"entropy":"%s","sockstat":"%s","swap":"%s","loadavg":"%s","psi":"%s"},"ts":"%s"}\n' \
+    "$label" "$reason" "$entropy" "$sockstat" "$swap" "$loadavg" "$psi" "$TS"
   exit 0
 fi
 if [ "${1:-}" = --edge ]; then
