@@ -1,0 +1,213 @@
+#!/usr/bin/env bash
+# reflex-cadence: 4-59/15 * * * *
+# reflex-args: --edge
+# mesh-storage-health — cross-sense fusion: WHY is this node's storage degraded, not just IS it?
+# Combines 3 storage senses into one ATTRIBUTED verdict no single sensor gives.
+#
+# Inputs (disk-space + disk-latency REQUIRED, best-effort OFFLINE-able; nvme-temp OPTIONAL —
+# absent on any non-NVMe node, never penalized as "missing"):
+#   mesh-disk-space     .disk-space.state    NORMAL|WARNING|CRITICAL|OFFLINE   (capacity: use%/inode%)
+#   mesh-disk-latency   .disk-latency-state  FAST|NORMAL|SLOW|STALLED|UNKNOWN|OFFLINE  (perf: await ms)
+#   mesh-nvme-temp      .nvme-temp.state     COOL|WARM|HOT|CRITICAL|OFFLINE    (controller heat)
+#
+# Why this is NEW (not a dup of mesh-system-vitality):
+#   mesh-system-vitality folds disk-latency in as ONE of 4 hardware axes (CPU/battery/thermal/disk)
+#   — a worst-of aggregate that answers "is the hardware healthy?". It never asks WHY latency
+#   degraded, and never looks at capacity or NVMe controller temperature at all.
+#   This tool answers the storage-specific follow-up question a sysadmin actually asks when disk
+#   is slow: is it explained by something else we already see (near-full capacity triggering SSD
+#   garbage-collection slowdown, or a hot NVMe controller throttling), or is it UNATTRIBUTED —
+#   which is the most actionable case, because it means neither obvious cause corroborates and the
+#   media itself may be failing. Two real, independent physical mechanisms make this a genuine
+#   cross-check, not just three numbers glued together:
+#     - a near-full SSD loses overprovisioning headroom -> garbage collection stalls -> latency rises
+#     - an overheating NVMe controller thermal-throttles reads/writes -> latency rises
+#   Latency alone can't tell you which (if either) is the cause; capacity+thermal alone don't know
+#   latency degraded at all. Fusing the three gives an ATTRIBUTED verdict, not just a worse number.
+#
+# Bands (FALSIFIABLE: change a band rule -> test flips):
+#   CRITICAL   capacity=CRITICAL (exhausted/read-only) OR latency=STALLED OR thermal=CRITICAL
+#              — imminent storage failure regardless of attribution
+#   DEGRADED   capacity=WARNING OR latency=SLOW OR thermal=HOT
+#              — reason names the ATTRIBUTION: thermal-attributed / capacity-attributed / BOTH /
+#                UNATTRIBUTED (latency degraded, neither capacity nor thermal corroborates —
+#                flagged as the highest-priority case: investigate media health directly)
+#   HEALTHY    capacity=NORMAL AND latency in {FAST,NORMAL} AND thermal in {COOL,WARM,n/a}
+#   DEGRADED   both required inputs OFFLINE (can't assess at all)
+#   DEGRADED   1 required input OFFLINE (partial — names which)
+#   (thermal OFFLINE is NEVER counted as missing — a SATA-only node has no NVMe controller to
+#   read, that is a legitimate permanent state, not a sensor failure; reported as thermal=n/a)
+#
+#   mesh-storage-health          one-shot verdict to stdout
+#   mesh-storage-health --edge   emit only on verdict change (cron reflex)
+#   mesh-storage-health --json   machine-readable {label, reason, inputs, ts}
+#   mesh-storage-health --test   smoke test (pure classifier, no state-file reads)
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+
+MESH="${MESH_DIR:-$HOME/.mesh}"
+STATE="$MESH/.storage-health-state"
+STALE_S=1800  # 30min — generous vs the slowest input cadence (disk-space/nvme-temp */15)
+
+# --- read helpers (required axes return OFFLINE on missing/stale/unreadable) ---
+read_capacity() {
+  local f="$1" v now m
+  [ -f "$f" ] || { echo "OFFLINE"; return; }
+  now=$(date +%s); m=$(stat -c %Y "$f" 2>/dev/null || echo "$now")
+  if [ $((now - m)) -gt "$STALE_S" ]; then echo "OFFLINE"; return; fi
+  v="$(head -1 "$f" 2>/dev/null | cut -d'|' -f1)"
+  case "$v" in
+    NORMAL|WARNING|CRITICAL) printf '%s' "$v" ;;
+    *) echo "OFFLINE" ;;
+  esac
+}
+read_latency() {
+  local f="$1" v now m
+  [ -f "$f" ] || { echo "OFFLINE"; return; }
+  now=$(date +%s); m=$(stat -c %Y "$f" 2>/dev/null || echo "$now")
+  if [ $((now - m)) -gt "$STALE_S" ]; then echo "OFFLINE"; return; fi
+  v="$(head -1 "$f" 2>/dev/null | cut -d'|' -f1)"
+  case "$v" in
+    FAST|NORMAL|SLOW|STALLED|UNKNOWN) printf '%s' "$v" ;;
+    *) echo "OFFLINE" ;;
+  esac
+}
+# thermal is OPTIONAL: no readable state -> "n/a" (never "OFFLINE"/missing — no NVMe is legitimate)
+read_thermal() {
+  local f="$1" v now m
+  [ -f "$f" ] || { echo "n/a"; return; }
+  now=$(date +%s); m=$(stat -c %Y "$f" 2>/dev/null || echo "$now")
+  if [ $((now - m)) -gt "$STALE_S" ]; then echo "n/a"; return; fi
+  v="$(head -1 "$f" 2>/dev/null | cut -d'|' -f1)"
+  case "$v" in
+    COOL|WARM|HOT|CRITICAL) printf '%s' "$v" ;;
+    *) echo "n/a" ;;
+  esac
+}
+
+# --- classifier (pure, offline-testable) ---
+# classify_storage <capacity> <latency> <thermal> -> "LABEL|reason"
+classify_storage() {
+  local cap="$1" lat="$2" therm="$3"
+  # 1. Missing-required tally (thermal excluded — optional axis)
+  local missing="" degen=0
+  [ "$cap" = "OFFLINE" ] && { missing="${missing}disk-space," ; degen=$((degen+1)); }
+  [ "$lat" = "OFFLINE" ] && { missing="${missing}disk-latency," ; degen=$((degen+1)); }
+  missing="${missing%,}"
+  if [ "$degen" -ge 2 ]; then
+    echo "DEGRADED|missing: $missing (both required inputs offline — can't assess storage)"
+    return
+  fi
+  if [ "$degen" -eq 1 ]; then
+    echo "DEGRADED|missing: $missing (1 required input offline, can't fully assert) | capacity=$cap latency=$lat thermal=$therm"
+    return
+  fi
+  # 2. CRITICAL: capacity exhausted, latency stalled, or thermal at/past crit — regardless of attribution
+  if [ "$cap" = "CRITICAL" ] || [ "$lat" = "STALLED" ] || [ "$therm" = "CRITICAL" ]; then
+    local why=""
+    [ "$cap" = "CRITICAL" ] && why="${why}capacity=CRITICAL,"
+    [ "$lat" = "STALLED" ] && why="${why}latency=STALLED,"
+    [ "$therm" = "CRITICAL" ] && why="${why}thermal=CRITICAL,"
+    echo "CRITICAL|${why%,} (imminent storage failure) | capacity=$cap latency=$lat thermal=$therm"
+    return
+  fi
+  # 3. DEGRADED: capacity warning, latency slow, or thermal hot — ATTRIBUTE if latency is the trigger
+  if [ "$cap" = "WARNING" ] || [ "$lat" = "SLOW" ] || [ "$therm" = "HOT" ]; then
+    local attrib=""
+    if [ "$lat" = "SLOW" ]; then
+      local cause=""
+      [ "$therm" = "HOT" ] && cause="${cause}thermal,"
+      [ "$cap" = "WARNING" ] && cause="${cause}capacity,"
+      if [ -z "$cause" ]; then
+        attrib="latency=SLOW UNATTRIBUTED (no thermal/capacity correlate — investigate media health directly)"
+      else
+        attrib="latency=SLOW attributed=${cause%,} (corroborated cause found)"
+      fi
+    elif [ "$therm" = "HOT" ]; then
+      attrib="thermal=HOT (leading indicator — latency not yet degraded)"
+    else
+      attrib="capacity=WARNING (latency not yet degraded)"
+    fi
+    echo "DEGRADED|$attrib | capacity=$cap latency=$lat thermal=$therm"
+    return
+  fi
+  # 4. HEALTHY: capacity NORMAL, latency FAST/NORMAL, thermal COOL/WARM/n/a
+  echo "HEALTHY|capacity=$cap latency=$lat thermal=$therm (storage nominal)"
+}
+
+# --- Test mode (pure classifier, no state-file reads) ---
+if [ "${1:-}" = --test ]; then
+  fail=0
+  # CRITICAL — each trigger alone
+  r="$(classify_storage CRITICAL FAST COOL)"; echo "$r" | grep -q '^CRITICAL' || { echo "  FAIL CRITICAL-capacity: got=$r"; fail=1; }
+  r="$(classify_storage NORMAL STALLED COOL)"; echo "$r" | grep -q '^CRITICAL' || { echo "  FAIL CRITICAL-latency: got=$r"; fail=1; }
+  r="$(classify_storage NORMAL FAST CRITICAL)"; echo "$r" | grep -q '^CRITICAL' || { echo "  FAIL CRITICAL-thermal: got=$r"; fail=1; }
+  # DEGRADED with attribution: thermal corroborates slow latency
+  r="$(classify_storage NORMAL SLOW HOT)"; echo "$r" | grep -q '^DEGRADED' || { echo "  FAIL DEGRADED-thermal-attrib label: got=$r"; fail=1; }
+  echo "$r" | grep -q 'attributed=thermal' || { echo "  FAIL DEGRADED-thermal-attrib reason: got=$r"; fail=1; }
+  # DEGRADED with attribution: capacity corroborates slow latency
+  r="$(classify_storage WARNING SLOW COOL)"; echo "$r" | grep -q '^DEGRADED' || { echo "  FAIL DEGRADED-capacity-attrib label: got=$r"; fail=1; }
+  echo "$r" | grep -q 'attributed=capacity' || { echo "  FAIL DEGRADED-capacity-attrib reason: got=$r"; fail=1; }
+  # DEGRADED with attribution: BOTH corroborate
+  r="$(classify_storage WARNING SLOW HOT)"; echo "$r" | grep -q 'attributed=thermal,capacity\|attributed=capacity,thermal' || { echo "  FAIL DEGRADED-both-attrib: got=$r"; fail=1; }
+  # DEGRADED UNATTRIBUTED: slow latency, nothing corroborates — the actionable case
+  r="$(classify_storage NORMAL SLOW COOL)"; echo "$r" | grep -q 'UNATTRIBUTED' || { echo "  FAIL DEGRADED-unattributed: got=$r"; fail=1; }
+  # DEGRADED: thermal HOT alone (latency not yet degraded) — leading indicator
+  r="$(classify_storage NORMAL FAST HOT)"; echo "$r" | grep -q '^DEGRADED' || { echo "  FAIL DEGRADED-thermal-leading label: got=$r"; fail=1; }
+  echo "$r" | grep -q 'leading indicator' || { echo "  FAIL DEGRADED-thermal-leading reason: got=$r"; fail=1; }
+  # DEGRADED: capacity WARNING alone
+  r="$(classify_storage WARNING FAST COOL)"; echo "$r" | grep -q '^DEGRADED' || { echo "  FAIL DEGRADED-capacity-alone: got=$r"; fail=1; }
+  # HEALTHY: all nominal
+  r="$(classify_storage NORMAL FAST COOL)"; echo "$r" | grep -q '^HEALTHY' || { echo "  FAIL HEALTHY: got=$r"; fail=1; }
+  # HEALTHY: thermal n/a (no NVMe hardware) is a valid steady-state, never penalized
+  r="$(classify_storage NORMAL NORMAL n/a)"; echo "$r" | grep -q '^HEALTHY' || { echo "  FAIL HEALTHY-no-nvme: got=$r"; fail=1; }
+  # HEALTHY: latency UNKNOWN (no IO yet) treated as non-degraded (never falls into SLOW/STALLED branch)
+  r="$(classify_storage NORMAL UNKNOWN COOL)"; echo "$r" | grep -q '^HEALTHY' || { echo "  FAIL HEALTHY-latency-unknown: got=$r"; fail=1; }
+  # CRITICAL beats DEGRADED in priority
+  r="$(classify_storage WARNING STALLED HOT)"; echo "$r" | grep -q '^CRITICAL' || { echo "  FAIL CRITICAL-priority: got=$r"; fail=1; }
+  # DEGRADED: both required OFFLINE
+  r="$(classify_storage OFFLINE OFFLINE COOL)"; echo "$r" | grep -q '^DEGRADED' || { echo "  FAIL DEGRADED-2-offline: got=$r"; fail=1; }
+  echo "$r" | grep -q 'disk-space' || { echo "  FAIL DEGRADED-2-offline detail: got=$r"; fail=1; }
+  # DEGRADED: 1 required OFFLINE (thermal n/a doesn't count, only 1 total missing)
+  r="$(classify_storage NORMAL OFFLINE n/a)"; echo "$r" | grep -q '^DEGRADED' || { echo "  FAIL DEGRADED-1-offline: got=$r"; fail=1; }
+  echo "$r" | grep -q 'disk-latency' || { echo "  FAIL DEGRADED-1-offline detail: got=$r"; fail=1; }
+  # thermal n/a (missing) never counts toward the required-offline tally even combined with a real offline
+  r="$(classify_storage OFFLINE NORMAL n/a)"; echo "$r" | grep -q '^DEGRADED' || { echo "  FAIL thermal-not-counted label: got=$r"; fail=1; }
+  echo "$r" | grep -q 'disk-latency' && { echo "  FAIL thermal-not-counted: should only list disk-space, got=$r"; fail=1; }
+  [ "$fail" = 1 ] && { echo "smoke-test: FAIL"; exit 1; }
+  echo "smoke-test: ok (18 fusion assertions: CRITICAL x3+priority, DEGRADED attribution x5+alone x2, HEALTHY x3, OFFLINE x3)"
+  exit 0
+fi
+
+# --- Live read path ---
+cap="$(read_capacity "$MESH/.disk-space.state")"
+lat="$(read_latency "$MESH/.disk-latency-state")"
+therm="$(read_thermal "$MESH/.nvme-temp.state")"
+
+result="$(classify_storage "$cap" "$lat" "$therm")"
+label="${result%%|*}"
+reason="${result#*|}"
+
+# capture prev BEFORE overwriting STATE — reading it after the write would always see the label
+# we just wrote (a real latent bug in the sibling mesh-system-vitality, which does exactly that
+# and so its --edge is a permanent no-op); do the read/write in the right order here.
+prev=""; [ -f "$STATE" ] && prev="$(head -1 "$STATE" 2>/dev/null | cut -d'|' -f1)" || true
+
+TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+mkdir -p "$MESH" 2>/dev/null || true
+printf '%s|capacity=%s|latency=%s|thermal=%s|%s\n' "$label" "$cap" "$lat" "$therm" "$reason" > "$STATE"
+[ -x "$HOME/.local/bin/mesh-state-touch" ] && mesh-state-touch "$STATE" >/dev/null 2>&1 || touch "$STATE" 2>/dev/null || true
+
+# --- Output ---
+if [ "${1:-}" = --json ]; then
+  printf '{"label":"%s","reason":"%s","inputs":{"capacity":"%s","latency":"%s","thermal":"%s"},"ts":"%s"}\n' \
+    "$label" "$reason" "$cap" "$lat" "$therm" "$TS"
+  exit 0
+fi
+if [ "${1:-}" = --edge ]; then
+  [ "$prev" = "$label" ] && exit 0
+  printf '[storage-health-%s] %s — %s\n' "$(printf '%s' "$label" | tr '[:upper:]' '[:lower:]')" "$label" "$reason"
+  exit 0
+fi
+printf '[storage-health-%s] %s — %s\n' "$(printf '%s' "$label" | tr '[:upper:]' '[:lower:]')" "$label" "$reason"
