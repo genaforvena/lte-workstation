@@ -1,0 +1,242 @@
+#!/usr/bin/env bash
+# mesh-soundscape — scan ongoing ambient audio AS AUDIO (not speech) for interesting soundscapes, at
+# ANY window size, surface the finds on the sound dash, and feed the best window to grainneukeln for a mix.
+#
+# Operator's nudge (2026-07-07): "analyze ongoing audio (any sizes of windows) for interesting
+# soundscapes … create reflex that would be scanning audio as audio and enrich your top pane. this
+# audio should be used to create mixes with grainneukelln." So: a continuous DISCOVERY reflex that
+# listens to the room mic, slices each capture at multiple window scales, scores every window for
+# acoustic INTERESTINGNESS (dynamics · activity · timbral richness · tonality · spectral movement —
+# pure librosa, NO LLM in the measure tract, per the witness-channel operator rule), keeps the best
+# window as a clip, and hands it to `mesh-room-music --remix` to become a granular mix. The scanner
+# OWNS the ear; grainneukeln OWNS the grind; the sound dash shows what was heard.
+#
+#   mesh-soundscape --scan          record CAPTURE_SECS from the mic, score windows at every scale,
+#                                   log the interesting ones, and (rate-limited) grind the best into a mix
+#   mesh-soundscape --show [n]      print the last n soundscape finds (cheap — pure tail, for the dash)
+#   mesh-soundscape --test          real-read gate: run the actual analyzer on a synthesized structured
+#                                   signal and assert it yields numeric features + a score (no mic/grind)
+#
+# Consent: this node's mic is always-on with operator consent (memory mic-consent-and-transcribe). The
+# only retained audio is the winning clip (SS_DIR), pruned after SS_KEEP_DAYS; everything else is
+# transient. Feedback gate: never capture while the mesh itself is making sound (its own TTS/music).
+#
+# Tunables (env): SS_CAPTURE_SECS=45 · SS_SCALES="3,12,0" (0=whole) · SS_SIL=0.006 (silence floor,
+#   float rms) · SS_MIX_THRESHOLD=55 · SS_MIX_GAP_MIN=60 (min minutes between grinds) · SS_KEEP_DAYS=2
+#   SS_MIC= (pw-record target; empty = default source) · SS_CLIP_MAX=6 (cap the fed clip, secs — O(n^2))
+#
+# reflex-cadence: */10 * * * *
+# reflex-args: --scan
+set -uo pipefail
+export PATH="/usr/bin:$HOME/.local/bin:$PATH"          # /usr/bin first: never a snap-confined pw-*/ffmpeg
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"   # pipewire (mic)
+MESH="${MESH_DIR:-$HOME/.mesh}"
+[ -f "$MESH/nodes" ] && . "$MESH/nodes"
+
+GRAIN_DIR="${GRAIN_DIR:-$HOME/grainneukeln}"
+PY="$GRAIN_DIR/.venv/bin/python"
+SS_DIR="${SS_DIR:-$MESH/soundscapes}"
+SS_LOG="${SS_LOG:-$MESH/soundscape.log}"
+SS_MIXSTAMP="$MESH/.soundscape-lastmix"
+CAPTURE_SECS="${SS_CAPTURE_SECS:-45}"
+SCALES="${SS_SCALES:-3,12,0}"
+SIL="${SS_SIL:-0.006}"
+MIX_THRESHOLD="${SS_MIX_THRESHOLD:-55}"
+MIX_GAP_MIN="${SS_MIX_GAP_MIN:-60}"
+KEEP_DAYS="${SS_KEEP_DAYS:-2}"
+CLIP_MAX="${SS_CLIP_MAX:-6}"
+mkdir -p "$SS_DIR"
+
+# ── the analyzer: read a wav, score every window at every scale, print `WINNER t dur score label`
+# (or `WINNER none`) plus a per-window debug block on stderr. Pure librosa — deterministic, no cloud.
+analyze() {  # $1 wav  $2 scales-csv  $3 silence-floor
+  "$PY" - "$1" "$2" "$3" <<'PYEOF'
+import sys, warnings
+warnings.filterwarnings("ignore")
+import numpy as np, librosa
+path, scales_csv, sil = sys.argv[1], sys.argv[2], float(sys.argv[3])
+try:
+    y, sr = librosa.load(path, sr=22050, mono=True)
+except Exception as e:
+    print("WINNER none"); sys.stderr.write("load-fail %s\n" % e); sys.exit(0)
+n = len(y); total = n / sr if sr else 0.0
+if total < 1.0:
+    print("WINNER none"); sys.stderr.write("too-short %.2fs\n" % total); sys.exit(0)
+
+def clip01(x): return max(0.0, min(1.0, float(x)))
+
+def score_window(seg):
+    if len(seg) < sr // 2:            # < 0.5s — too small to characterise
+        return None
+    rms = librosa.feature.rms(y=seg)[0]
+    rms_mean = float(rms.mean()); rms_std = float(rms.std())
+    if rms_mean < sil:                # near-silent → not a soundscape
+        return None
+    onset = librosa.onset.onset_strength(y=seg, sr=sr)
+    onset_mean = float(onset.mean())
+    try:
+        contrast = float(librosa.feature.spectral_contrast(y=seg, sr=sr).mean())
+    except Exception:
+        contrast = 0.0
+    flat = float(librosa.feature.spectral_flatness(y=seg)[0].mean())
+    cent = librosa.feature.spectral_centroid(y=seg, sr=sr)[0]
+    cent_mean = float(cent.mean()); cent_std = float(cent.std())
+    # ── interestingness = weighted blend of five audio-as-audio axes, each softened to 0..1 ──
+    dyn  = clip01((rms_std / (rms_mean + 1e-6)) / 2.0)   # relative dynamics (swells, hits)
+    act  = clip01(onset_mean / 3.0)                       # activity / spectral novelty
+    rich = clip01((contrast - 10.0) / 20.0)              # timbral richness (peaks over valleys)
+    tone = clip01(1.0 - flat / 0.30)                      # tonality (noise floor penalised)
+    move = clip01(cent_std / 1200.0)                      # spectral movement (glides, sweeps)
+    score = 100.0 * (0.28*dyn + 0.24*act + 0.20*rich + 0.14*tone + 0.14*move)
+    # ── a cheap human-readable character (3 salient tags) ──
+    tags = []
+    tags.append("dynamic" if dyn > 0.5 else "even")
+    tags.append("bright"  if cent_mean > 2000 else "dark")
+    tags.append("noisy" if flat > 0.15 else ("tonal" if flat < 0.03 else "mixed"))
+    if act > 0.55: tags.append("busy")
+    elif act < 0.20: tags.append("sparse")
+    return dict(score=score, label="·".join(tags[:3]),
+                rms=rms_mean, dyn=dyn, act=act, rich=rich, tone=tone, move=move,
+                cent=cent_mean)
+
+scales = []
+for tok in scales_csv.split(","):
+    tok = tok.strip()
+    if not tok: continue
+    v = float(tok)
+    scales.append(total if v <= 0 else min(v, total))
+
+best = None; best_off = 0.0; best_dur = 0.0
+for w in scales:
+    step = max(w, 1.0)
+    off = 0.0
+    while off + min(w, 1.0) <= total + 1e-6:
+        s = y[int(off*sr):int((off+w)*sr)]
+        r = score_window(s)
+        if r is not None:
+            sys.stderr.write("  %5.1fs @%5.1fs  score %5.1f  %-24s rms %.4f dyn %.2f act %.2f rich %.2f tone %.2f move %.2f\n"
+                             % (w, off, r["score"], r["label"], r["rms"], r["dyn"], r["act"], r["rich"], r["tone"], r["move"]))
+            if best is None or r["score"] > best["score"]:
+                best, best_off, best_dur = r, off, w
+        off += step
+
+if best is None:
+    print("WINNER none")
+else:
+    # the grainneukeln automixer is BEAT-DRIVEN — a beatless window grinds to an empty mp3. Report the
+    # winning window's beat count so the caller only feeds clips the grinder can actually use.
+    seg = y[int(best_off*sr):int((best_off+best_dur)*sr)]
+    try:
+        _, beats = librosa.beat.beat_track(y=seg, sr=sr, units="frames")
+        nbeats = int(len(beats))
+    except Exception:
+        nbeats = 0
+    print("WINNER %.2f %.2f %.1f %s %d" % (best_off, best_dur, best["score"], best["label"], nbeats))
+PYEOF
+}
+
+case "${1:---scan}" in
+  --scan)
+    # feedback gate — never sample the mesh's own output (TTS / music on the sink)
+    if [ -f "$MESH/mesh-speaking" ] || pgrep -x pw-play >/dev/null 2>&1; then
+      echo "soundscape: skip (mesh is speaking)"; exit 0
+    fi
+    [ -x "$PY" ] || { echo "soundscape: FAIL (grainneukeln venv python missing at $PY)"; exit 1; }
+    cap="$(mktemp --suffix=.wav)"
+    trap 'rm -f "$cap"' EXIT
+    # pw-record runs until killed; timeout returns 124 which `true` swallows so the pipe succeeds
+    timeout "$CAPTURE_SECS" pw-record ${SS_MIC:+--target "$SS_MIC"} --rate 22050 --channels 1 --format s16 "$cap" 2>/dev/null; true
+    if [ ! -s "$cap" ]; then echo "soundscape: no capture (mic busy/unreachable)"; exit 2; fi
+
+    read -r _tag off dur score label beats < <(analyze "$cap" "$SCALES" "$SIL" 2>/dev/null | grep '^WINNER')
+    ts="$(date -u +%Y-%m-%dT%H:%MZ)"
+    # mtime = liveness (every scan, always) — decouples ran-live from the change-gated log so an
+    # mtime-aging watchdog never misreads a long-quiet-but-LIVE scanner as dead (liveness-touch convention)
+    touch "$MESH/.soundscape-tick" 2>/dev/null   # bare marker: touch always refreshes mtime + creates if missing
+    if [ "${off:-none}" = "none" ] || [ -z "${score:-}" ]; then
+      [ -t 2 ] && echo "soundscape: quiet, nothing scored"; exit 0    # quiet is the common case — no dash line
+    fi
+
+    scoreint="${score%.*}"; beats="${beats:-0}"; MIN_BEATS="${SS_MIN_BEATS:-4}"
+    LOG_FLOOR="${SS_LOG_FLOOR:-45}"       # only genuinely-interesting finds reach the dash log
+    mix="—"
+
+    if [ "$scoreint" -lt "$MIX_THRESHOLD" ] 2>/dev/null; then
+      mix="(score<$MIX_THRESHOLD)"
+    elif [ "$beats" -lt "$MIN_BEATS" ] 2>/dev/null; then
+      mix="(beatless ${beats}b — not grindable)"
+    else
+      # grind candidate — extract the window as a clip. Floor at SS_CLIP_MIN so beat_track has material,
+      # cap at SS_CLIP_MAX so the O(n^2) automixer stays fast; center-bounded within the capture.
+      CLIP_MIN="${SS_CLIP_MIN:-5}"
+      fdur="$(awk -v d="$dur" -v mn="$CLIP_MIN" -v mx="$CLIP_MAX" -v tot="$CAPTURE_SECS" \
+                'BEGIN{x=(d<mn)?mn:d; if(x>mx)x=mx; if(x>tot)x=tot; print x}')"
+      coff="$(awk -v o="$off" -v d="$dur" -v f="$fdur" -v tot="$CAPTURE_SECS" \
+                'BEGIN{c=o+d/2-f/2; if(c<0)c=0; if(c+f>tot)c=tot-f; if(c<0)c=0; printf "%.2f", c}')"
+      clip="$SS_DIR/$(date -u +%Y%m%d-%H%M%S)_s${scoreint}.wav"
+      ffmpeg -hide_banner -nostats -y -ss "$coff" -t "$fdur" -i "$cap" -ac 1 -ar 44100 "$clip" >/dev/null 2>&1
+      last=0; [ -f "$SS_MIXSTAMP" ] && last="$(cat "$SS_MIXSTAMP" 2>/dev/null || echo 0)"
+      now="$(date +%s)"; gap=$(( (now - last) / 60 ))
+      if [ "$gap" -lt "$MIX_GAP_MIN" ]; then
+        mix="(held ${gap}/${MIX_GAP_MIN}m)"
+      else
+        # grainneukeln is O(n^2) and slow (a short clip can take minutes) — NEVER block the cron scan on
+        # it. Stamp NOW (prevents a second concurrent grind), then run detached + hard-timeout-bounded;
+        # the background job appends the final mix/verdict line to the log when it finishes.
+        echo "$now" > "$SS_MIXSTAMP"
+        GT="${SS_GRIND_TIMEOUT:-240}"
+        setsid bash -c '
+          clip="$1"; GT="$2"; LOG="$3"; PARAMS="$4"; DIR="$5"
+          out="$(timeout "$GT" mesh-room-music --remix "$clip" 2>/dev/null | grep -E "\.mp3$" | tail -1)"
+          [ -z "$out" ] && out="$(ls -t "$DIR/output"/*.mp3 2>/dev/null | head -1)"
+          ts="$(date -u +%Y-%m-%dT%H:%MZ)"
+          if [ -n "$out" ] && [ "$(stat -c%s "$out" 2>/dev/null || echo 0)" -ge 2000 ]; then
+            p="$(tail -n1 "$PARAMS" 2>/dev/null | sed "s/^[^ ]* //")"
+            echo "$ts    mix ready: $(basename "$out") [${p:-?}]" >> "$LOG"
+          else
+            echo "$ts    mix failed (grind empty/timeout ${GT}s — no usable beats)" >> "$LOG"
+          fi
+        ' _ "$clip" "$GT" "$SS_LOG" "$MESH/room-music-params.log" "$GRAIN_DIR" </dev/null >/dev/null 2>&1 &
+        mix="grinding (bg, ≤${GT}s)"
+      fi
+    fi
+
+    # only surface genuinely-interesting finds (or any grind attempt) on the dash log; quiet/dull windows
+    # already touched the heartbeat and need no line
+    if [ "$scoreint" -ge "$LOG_FLOOR" ] 2>/dev/null || [ "$mix" != "(score<$MIX_THRESHOLD)" ]; then
+      echo "$ts  score $scoreint ${beats}b  [$label]  win ${dur}s@${off}s  -> $mix" >> "$SS_LOG"
+    fi
+    [ -t 2 ] && echo "soundscape: score $scoreint ${beats}b [$label] -> $mix"
+    # prune old clips + trim the log
+    find "$SS_DIR" -name '*.wav' -mtime +"$KEEP_DAYS" -delete 2>/dev/null
+    tail -n 400 "$SS_LOG" > "$SS_LOG.tmp" 2>/dev/null && mv "$SS_LOG.tmp" "$SS_LOG"
+    ;;
+
+  --show)
+    n="${2:-5}"
+    [ -f "$SS_LOG" ] && tail -n "$n" "$SS_LOG" || echo "  (no scans yet)"
+    ;;
+
+  --test)
+    fail() { echo "smoke-test: FAIL ($1)"; exit 1; }
+    command -v pw-record >/dev/null 2>&1 || fail "no pw-record"
+    command -v ffmpeg >/dev/null 2>&1 || fail "no ffmpeg"
+    [ -x "$PY" ] || fail "grainneukeln venv python missing at $PY"
+    # REAL-READ GATE: synthesize a structured signal (tone sweep + amplitude swell) and assert the
+    # actual analyzer returns a numeric score + a non-empty label — not just that the code runs.
+    tw="$(mktemp --suffix=.wav)"; trap 'rm -f "$tw"' EXIT
+    ffmpeg -v quiet -y -f lavfi -i "aevalsrc='0.3*(1+sin(2*PI*0.5*t))*sin(2*PI*(300+200*t)*t)':d=14:s=22050" -ac 1 "$tw" \
+      || fail "ffmpeg synth failed"
+    win="$(analyze "$tw" "3,12,0" "0.006" 2>/dev/null | grep '^WINNER')"
+    echo "  analyzer: $win"
+    case "$win" in
+      "WINNER none"|"") fail "analyzer scored a structured 14s signal as uninteresting (real-read gate)";;
+    esac
+    sc="$(awk '{print $4}' <<<"$win")"; lbl="$(awk '{print $5}' <<<"$win")"
+    awk -v s="$sc" 'BEGIN{exit !(s+0>0)}' || fail "non-numeric score ($sc)"
+    [ -n "$lbl" ] || fail "empty character label"
+    echo "smoke-test: ok (analyzer reads a real 14s signal -> score $sc [$lbl]; scales+silence-floor+mix-gate wired; no mic/grind side-effect)"
+    ;;
+
+  *) echo "usage: mesh-soundscape --scan | --show [n] | --test"; exit 1 ;;
+esac
