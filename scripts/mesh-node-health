@@ -35,6 +35,29 @@ STATE="$HOME/.mesh/.node-health-state"
 MESH="${MESH_DIR:-$HOME/.mesh}"
 STALE_S=600
 
+# stride_from_cronfield <minute-field> → the /N stride in minutes ('' if fixed-minute). Pure.
+# Same idiom as mesh-window-state's wifi_stale_s() (7a01b9b) — derive a staleness bound from the
+# LIVE cron stride instead of a literal that can silently drift out of sync with the real cadence.
+stride_from_cronfield() { printf '%s' "$1" | grep -oE '/[0-9]+$' | tr -d '/'; }
+
+# psi_stale_s — mesh-psi is the ONE input here that is NOT force-refreshed before read (line ~284:
+# "independently cron-wired... no force-refresh needed"), so unlike entropy/sockstat/swap/loadavg
+# (always <1s old at read time) it is genuinely exposed to its own cron cadence. A flat STALE_S=600
+# (10min) false-OFFLINEs it for most of every cycle whenever the LIVE mesh-psi cron entry runs
+# slower than 10min (chat-review/node-health-psi-reader-offline, 2026-07-07 — live-confirmed: this
+# node's crontab has mesh-psi wired at 3-59/30, a 30min stride, so .psi.state legitimately sits
+# >600s old for ~20 of every 30 minutes even though mesh-psi itself is healthy and firing on
+# schedule — the swap-psi CALM-downgrade gate (79cdc86) never sees a real band during that window).
+# Derive the bound from the live feeder's actual stride ×2 (self-correcting — no literal to drift
+# out of sync again if the cadence changes), falling back to a generous default when the cron line
+# isn't readable (non-cron env, tests).
+psi_stale_s() {
+  local stride
+  stride="$(stride_from_cronfield "$(crontab -l 2>/dev/null | grep -m1 -E '^[^#]*mesh-psi([[:space:]]|$)' | awk '{print $1}')")"
+  if [ -n "$stride" ] && [ "$stride" -gt 0 ] 2>/dev/null; then echo $((stride * 60 * 2)); else echo 1800; fi
+}
+PSI_STALE_S="${MESH_NODE_HEALTH_PSI_STALE:-$(psi_stale_s)}"
+
 # read_label <state> → echoes the first pipe-delimited field of the first line (the band label),
 # or OFFLINE if the file is missing or stale. The state files use format "LABEL|field2|field3..."
 # (e.g., "FULL|avail=256 poolsize=256 (100%)" or "HEALTHY|inuse=31|orphans=0|tw=40").
@@ -58,7 +81,7 @@ read_psi_band() {
   local f="$1" v now m
   [ -f "$f" ] || { echo "OFFLINE"; return; }
   now=$(date +%s); m=$(stat -c %Y "$f" 2>/dev/null || echo "$now")
-  if [ $((now - m)) -gt "$STALE_S" ]; then echo "OFFLINE"; return; fi
+  if [ $((now - m)) -gt "$PSI_STALE_S" ]; then echo "OFFLINE"; return; fi
   v="$(head -1 "$f" 2>/dev/null | tr -d '[:space:]')"
   [ -n "$v" ] || { echo "OFFLINE"; return; }
   printf '%s' "$v"
@@ -240,6 +263,42 @@ if [ "${1:-}" = --test ]; then
   [ "$fail" = 1 ] && { echo "smoke-test: FAIL"; exit 1; }
   echo "  ok: classify (16 cases: HEALTHY×2, CRITICAL×3, DEGRADED×5, priority×1, 1-UNKNOWN, 2/3/4-UNKNOWN×3, NONE-swap, unrecognized)"
   echo "  ok: swap-psi gate (6 cases: CALM-downgrade, STALLED/BUSY/UNAVAILABLE/legacy-4arg stay CRITICAL, swap-specific-only)"
+  # psi_stale_s: derive from the LIVE mesh-psi cron stride, not a flat literal
+  # (chat-review/node-health-psi-reader-offline). FALSIFIABLE: hardcode STALE_S=600 back into
+  # read_psi_band and this whole gate (plus the live-band assertion below) fails on any node whose
+  # mesh-psi cron stride exceeds 10min — exactly the live 3-59/30 case that motivated the fix.
+  _pcdir="$(mktemp -d)"
+  cat > "$_pcdir/crontab" <<'CRONSTUB'
+#!/bin/sh
+printf '%s\n' \
+  '3-59/30 * * * * $HOME/.local/bin/mesh-psi --edge >> $HOME/.mesh/psi.log 2>&1   # autowired 2026-06-17' \
+  '11-59/10 * * * * $HOME/.local/bin/mesh-psi-memory --edge >> $HOME/.mesh/psi-memory.log 2>&1'
+CRONSTUB
+  chmod +x "$_pcdir/crontab"
+  _got="$(PATH="$_pcdir:$PATH" psi_stale_s)"
+  [ "$_got" = 3600 ] || { echo "  FAIL psi_stale_s: 30min stride should derive 3600s (30*60*2), got=$_got"; fail=1; }
+  cat > "$_pcdir/crontab" <<'CRONSTUB'
+#!/bin/sh
+printf '%s\n' '0 3 * * * /opt/unrelated --thing'
+CRONSTUB
+  chmod +x "$_pcdir/crontab"
+  _got="$(PATH="$_pcdir:$PATH" psi_stale_s)"
+  [ "$_got" = 1800 ] || { echo "  FAIL psi_stale_s: no mesh-psi line found should fall back to 1800, got=$_got"; fail=1; }
+  rm -rf "$_pcdir"
+  echo "  ok: psi_stale_s (derives 2× the live cron stride; falls back to 1800 when unreadable)"
+  # REAL-READ gate for psi (chat-review/node-health-psi-reader-offline): on a node where mesh-psi is
+  # actually wired, PSI_STALE_S must be wide enough that read_psi_band yields a REAL band — not the
+  # honest-but-wrong OFFLINE a too-tight flat threshold produces between cron cycles. n/a (not a
+  # fail) if this node has no live .psi.state at all — that's genuinely no sense here, not this bug.
+  if [ -f "$MESH/.psi.state" ]; then
+    _pband="$(read_psi_band "$MESH/.psi.state")"
+    case "$_pband" in
+      CALM|BUSY|STALLED|UNAVAILABLE) echo "  ok: read_psi_band yields a real band on this node (psi=$_pband, PSI_STALE_S=${PSI_STALE_S}s)" ;;
+      *) echo "  FAIL read_psi_band: expected a real band on this node, got '$_pband' (PSI_STALE_S=${PSI_STALE_S}s, mtime-age=$(( $(date +%s) - $(stat -c %Y "$MESH/.psi.state" 2>/dev/null || echo 0) ))s)"; fail=1 ;;
+    esac
+  else
+    echo "  n/a: no $MESH/.psi.state on this node — psi real-read gate skipped (nothing to read)"
+  fi
   # REAL-READ gate: reachability ≠ producing. All 4 /proc files must be readable AND parseable
   # or the sense is hollow (green test with no real artifact).
   for _p in /proc/sys/kernel/random/entropy_avail /proc/net/sockstat /proc/swaps /proc/loadavg; do
