@@ -117,8 +117,8 @@ self-evidencing system converges honestly to whatever its Markov blanket hands i
 sensing reflex itself is invisible from inside, because every gate, however diverse, reads the
 same corrupted pane). `mesh-tamper`'s `classify_tamper` — built, then rebuilt (2026-06-25) to be
 **sentinel-gated**, not exit-code-gated — is the concrete, load-bearing answer: a
-`SIGNIFICANT_MOTION` watch that times out looks IDENTICAL, by raw exit code, to an SSH session that
-died before the watch ever ran (both return 124). The fix does not ask "what value came back?" —
+`SIGNIFICANT_MOTION` watch that times out looks **identical**, by raw exit code, to an SSH session
+that died before the watch ever ran (both return 124). The fix does not ask "what value came back?" —
 it asks "did the capture procedure run to completion at all?", via a completion sentinel the
 watched procedure itself emits only if it executed in full. That is the mesh checking its own
 imprint-*algorithm*, not its imprint — the single place the bet that "readings are provenance, not
