@@ -16,7 +16,20 @@ set -uo pipefail
 export PATH="$HOME/.local/bin:$PATH"
 ROUTER="${MESH_ROUTER:-$(mesh-peer-addr router 2>/dev/null || mesh-peer-addr GL-MT3000 2>/dev/null)}"
 RUSER="${MESH_ROUTER_USER:-root}"
-KNOWN="$HOME/.mesh/.lan-known-macs"
+KNOWN="${MESH_LAN_KNOWN:-$HOME/.mesh/.lan-known-macs}"
+UNCONFIRMED="${MESH_LAN_UNCONFIRMED:-$HOME/.mesh/.lan-unconfirmed}"
+# --status is the path actually SCHEDULED (mesh-perimeter --edge calls it every 45m, read-only
+# by design); the bare/default invocation below (the one that self-learns on first sight) has no
+# cron entry of its own, so a device that only ever gets OBSERVED via --status never got promoted
+# — proven live: MAC c0:18:85:47:10:78 (Huawei B570e) sat unbaselined 3+ weeks, re-firing
+# mesh-perimeter's NETWORK=ALERT every 45m (chat-review/lan-newdevice-baseline-never-updated).
+# So the promote-after-repeated-sightings logic below runs from --status too, not just the
+# unscheduled default path.
+# mesh-perimeter --edge (the only actual caller of --status) cadences ~45m -> ~32 runs/day;
+# default RUNS gives the operator roughly a day of visibility on the board before auto-silencing,
+# DAYS is the outer bound for a slower/irregular cadence.
+PROMOTE_RUNS="${MESH_LAN_PROMOTE_RUNS:-30}"
+PROMOTE_DAYS="${MESH_LAN_PROMOTE_DAYS:-3}"
 SSH=(ssh -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new)
 
 # A locally-administered MAC (bit 0x02 of the first octet) is a PRIVACY-RANDOMIZED address —
@@ -63,6 +76,32 @@ occ_render(){
 neigh_to_leases(){ awk '{ mac=""; for(i=1;i<=NF;i++) if($i=="lladdr") mac=$(i+1);
     if(mac!="" && $1 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) print "0", tolower(mac), $1, "?" }'; }
 
+# track_unconfirmed MAC KNOWN_FILE UNCONFIRMED_FILE NOW_EPOCH — for a currently-seen MAC that is
+# NOT (yet) in the baseline: records/updates its sighting, and once it's been seen on
+# PROMOTE_RUNS separate calls OR has persisted PROMOTE_DAYS since first sighting, promotes it
+# (appends to KNOWN_FILE, clears its tracking row) instead of leaving it to alert forever. Prints
+# one of NEW / PERSISTENT / PROMOTED. Pure file I/O only (no mesh-chat) so --test is deterministic.
+track_unconfirmed(){
+  local mac="$1" knownf="$2" unconf="$3" now="$4" firstseen count age
+  mac="$(printf '%s' "$mac" | tr 'A-F' 'a-f')"
+  local row
+  row="$(awk -v m="$mac" 'tolower($1)==m{f=$2; c=$3} END{if(f!="") print f, c}' "$unconf" 2>/dev/null)"
+  if [ -z "$row" ]; then
+    printf '%s %s 1\n' "$mac" "$now" >> "$unconf"
+    printf 'NEW'; return
+  fi
+  firstseen="$(awk '{print $1}' <<<"$row")"; count="$(awk '{print $2}' <<<"$row")"
+  count=$((count + 1)); age=$((now - firstseen))
+  if [ "$count" -ge "$PROMOTE_RUNS" ] || [ "$age" -ge $((PROMOTE_DAYS * 86400)) ]; then
+    grep -qixF "$mac" "$knownf" 2>/dev/null || echo "$mac" >> "$knownf"
+    awk -v m="$mac" 'tolower($1)!=m' "$unconf" 2>/dev/null > "$unconf.tmp"; mv "$unconf.tmp" "$unconf"
+    printf 'PROMOTED'; return
+  fi
+  { awk -v m="$mac" 'tolower($1)!=m' "$unconf" 2>/dev/null; printf '%s %s %s\n' "$mac" "$firstseen" "$count"; } > "$unconf.tmp"
+  mv "$unconf.tmp" "$unconf"
+  printf 'PERSISTENT'
+}
+
 # LAN-side fallback observation (Tailscale-INDEPENDENT): when the router DHCP read fails (e.g. the
 # router's Tailscale is offline — a recurring SPOF), observe the LAN from THIS node, which sits on it.
 # A gentle ARP sweep makes LAN devices resolve, then `ip neigh` yields their MACs. Less authoritative
@@ -101,7 +140,47 @@ if [ "${1:-}" = --test ]; then
   # fail-open: no override + no household sense on PATH → UNCERTAIN, never a faked state
   s="$(PATH=/nonexistent occupancy_state)"
   [ "$s" = UNCERTAIN ] || { echo "smoke-test: FAIL (fail-open not UNCERTAIN: '$s')"; exit 1; }
-  echo "smoke-test: ok (neigh-parse: 2 + occupancy-gate: 5 assertions)"; exit 0
+  # persistent-unconfirmed promote: sandboxed tmp files, never the real baseline/tracking
+  tmpd="$(mktemp -d)"; tk="$tmpd/known"; tu="$tmpd/unconf"; : > "$tk"; : > "$tu"
+  v="$(track_unconfirmed aa:bb:cc:dd:ee:01 "$tk" "$tu" 1000)"
+  [ "$v" = NEW ] || { echo "smoke-test: FAIL (1st sighting not NEW: '$v')"; exit 1; }
+  v="$(track_unconfirmed aa:bb:cc:dd:ee:01 "$tk" "$tu" 1100)"
+  [ "$v" = PERSISTENT ] || { echo "smoke-test: FAIL (2nd sighting, young+low-count, not PERSISTENT: '$v')"; exit 1; }
+  grep -qixF aa:bb:cc:dd:ee:01 "$tk" && { echo "smoke-test: FAIL (PERSISTENT must not promote yet)"; exit 1; }
+  # age-based promote: firstseen far enough in the past
+  now=$(( $(awk '{print $2}' "$tu") + PROMOTE_DAYS * 86400 + 10 ))
+  v="$(track_unconfirmed aa:bb:cc:dd:ee:01 "$tk" "$tu" "$now")"
+  [ "$v" = PROMOTED ] || { echo "smoke-test: FAIL (aged-out sighting not PROMOTED: '$v')"; exit 1; }
+  grep -qixF aa:bb:cc:dd:ee:01 "$tk" || { echo "smoke-test: FAIL (PROMOTED didn't append to baseline)"; exit 1; }
+  grep -qi aa:bb:cc:dd:ee:01 "$tu" && { echo "smoke-test: FAIL (PROMOTED left a stale tracking row)"; exit 1; }
+  # count-based promote (distinct mac): PROMOTE_RUNS calls, all fresh timestamps (no age trigger)
+  mac2=aa:bb:cc:dd:ee:02; t=2000
+  for _ in $(seq 1 "$PROMOTE_RUNS"); do v="$(track_unconfirmed "$mac2" "$tk" "$tu" "$t")"; t=$((t+1)); done
+  [ "$v" = PROMOTED ] || { echo "smoke-test: FAIL (count threshold not PROMOTED: '$v')"; exit 1; }
+  rm -rf "$tmpd"
+  # --allow: idempotent baseline append against a sandboxed KNOWN, never the real file
+  tk2="$(mktemp -u)"; : > "$tk2"
+  MESH_LAN_KNOWN="$tk2" "$0" --allow AA:BB:CC:DD:EE:03 >/dev/null
+  MESH_LAN_KNOWN="$tk2" "$0" --allow aa:bb:cc:dd:ee:03 >/dev/null
+  n="$(grep -cix aa:bb:cc:dd:ee:03 "$tk2")"
+  [ "$n" = 1 ] || { echo "smoke-test: FAIL (--allow not idempotent: $n rows)"; rm -f "$tk2"; exit 1; }
+  rm -f "$tk2"
+  echo "smoke-test: ok (neigh-parse: 2 + occupancy-gate: 5 + unconfirmed-promote: 5 + allow-idempotent: 1 assertions)"; exit 0
+fi
+
+if [ "${1:-}" = --allow ]; then
+  mac="${2:-}"
+  [ -n "$mac" ] || { echo "usage: mesh-lan-newdevice --allow <mac>"; exit 1; }
+  mac="$(printf '%s' "$mac" | tr 'A-F' 'a-f')"
+  mkdir -p "$(dirname "$KNOWN")" 2>/dev/null
+  : > "${KNOWN}.lock.$$" 2>/dev/null; rm -f "${KNOWN}.lock.$$" 2>/dev/null
+  touch "$KNOWN" 2>/dev/null
+  grep -qixF "$mac" "$KNOWN" 2>/dev/null || echo "$mac" >> "$KNOWN"
+  if [ -f "$UNCONFIRMED" ]; then
+    awk -v m="$mac" 'tolower($1)!=m' "$UNCONFIRMED" > "$UNCONFIRMED.tmp" 2>/dev/null && mv "$UNCONFIRMED.tmp" "$UNCONFIRMED"
+  fi
+  echo "baseline: $mac confirmed + appended (idempotent)"
+  exit 0
 fi
 
 [ "${1:-}" = --forget ] && { rm -f "$KNOWN"; echo "baseline forgotten — next run re-seeds"; exit 0; }
@@ -127,6 +206,32 @@ if [ "${1:-}" = --status ]; then
   echo "source: $LAN_SRC$([ "$LAN_SRC" = arp ] && echo ' (router DHCP unreachable — LAN-side ARP fallback)')"
   echo "--- current leases (host / ip / mac) ---"
   printf '%s\n' "$leases" | awk '{printf "  %-22s %-15s %s\n", $4, $3, $2}'
+  # This is the path mesh-perimeter --edge actually calls every 45m (read-only by design) — the
+  # default/bare invocation below that self-learns on first sight has no cron entry of its own, so
+  # unconfirmed-device tracking + promotion has to happen here or it never happens at all.
+  if [ -f "$KNOWN" ] || [ -n "$leases" ]; then
+    touch "$KNOWN" 2>/dev/null
+    now="$(date +%s)"; promoted=""
+    unconfirmed_out=""
+    while read -r mac ip; do
+      [ -n "$mac" ] || continue
+      grep -qixF "$mac" "$KNOWN" 2>/dev/null && continue
+      verdict="$(track_unconfirmed "$mac" "$KNOWN" "$UNCONFIRMED" "$now")"
+      case "$verdict" in
+        NEW)        unconfirmed_out+="  $mac ($ip) — new, first seen this run"$'\n' ;;
+        PERSISTENT) unconfirmed_out+="  $mac ($ip) — persistent unconfirmed (below promote threshold)"$'\n' ;;
+        PROMOTED)   unconfirmed_out+="  $mac ($ip) — PROMOTED to baseline this run"$'\n'; promoted+=" $mac" ;;
+      esac
+    done < <(printf '%s\n' "$leases" | awk 'NF>=2{print $2, $3}' | sort -u)
+    if [ -n "$unconfirmed_out" ]; then
+      echo "--- unconfirmed (seen, not yet baselined) ---"
+      printf '%s' "$unconfirmed_out"
+    fi
+    if [ -n "$promoted" ]; then
+      command -v mesh-chat >/dev/null 2>&1 && MESH_WHO="lan-watch@$(hostname)" \
+        mesh-chat "[lan-baseline-promote] auto-confirmed after repeated sightings/age threshold:$promoted — perimeter's NETWORK axis should stop ALERTing on these now" >/dev/null 2>&1
+    fi
+  fi
   exit 0
 fi
 
@@ -159,6 +264,7 @@ while read -r mac host ip; do
   [ -n "$mac" ] || continue
   grep -qixF "$mac" "$KNOWN" 2>/dev/null && continue   # already known
   echo "$mac" >> "$KNOWN"                               # learn it (alert once)
+  [ -f "$UNCONFIRMED" ] && { awk -v m="$mac" 'tolower($1)!=m' "$UNCONFIRMED" > "$UNCONFIRMED.tmp" 2>/dev/null && mv "$UNCONFIRMED.tmp" "$UNCONFIRMED"; }
   new=$((new + 1))
   src_note=""
   [ "$LAN_SRC" = arp ] && src_note=" [via LAN ARP fallback — router DHCP unreachable, no hostname, lower confidence]"
