@@ -124,9 +124,15 @@ watched procedure itself emits only if it executed in full. That is the mesh che
 imprint-*algorithm*, not its imprint — the single place the bet that "readings are provenance, not
 opinion" is actually insured rather than assumed. The same discipline recurs wherever the mesh
 catches a **hollow sense** — a reachable sensor whose driver silently returns empty (`mesh-mag` /
-`mesh-gyro`'s race-condition fix) or a stale frame passed off as live (`mesh-note3-cam`'s
-newer-than-pre-capture poll) — but `mesh-tamper`'s sentinel is the founding instance: the first
-place the mesh stopped trusting a return code and started verifying the procedure behind it.
+`mesh-gyro`'s race-condition fix), a stale frame passed off as live (`mesh-note3-cam`'s
+newer-than-pre-capture poll), or the subtlest case, where there is no bad *value* at all but a
+**hollow silence**: a change-gated edge-emitter that has emitted nothing since the day it was
+wired, its empty log indistinguishable from a week of calm (`mesh-presence-density`'s `--edge`
+comparing the state to itself *after* the write had already overwritten it — firing `0` every run,
+`--test` still green, the log 0 bytes for the ten days since autowire). Absence is the default, so
+absence is exactly what a dead emitter and a quiet world both produce; only asking "has this
+procedure *ever* fired?" tells them apart. `mesh-tamper`'s sentinel is the founding instance: the
+first place the mesh stopped trusting a return code and started verifying the procedure behind it.
 
 *Pedigree.* **Ian Hacking**'s experimental realism grounds belief in an entity not in
 theory-to-world correspondence but in a **known, manipulable apparatus** — "if you can spray them,
