@@ -4,10 +4,17 @@
 # posted since, surfaces each as '[fyi] stale-propose: <chan> proposed <text> at <ts>, never filed — review?' nudge.
 # Usage: mesh-sweep-rollcall-proposes [--minutes N] [--test] [--post]
 # --minutes N: age threshold in minutes (default: 120 = 2 roll-call cycles)
-# --test: run smoke-test with fixture board (old unconverted PROPOSE → nudge fires; converted PROPOSE → silent)
-# --post: actually post the nudges to the board (default: dry-run)
-# reflex-cadence: 0 * * * *
-# reflex-args: --post
+# --test: run smoke-test with fixture board (dedup-once, escalate-after-2, max-age-decline, converted-silent)
+# --post: actually post the nudges/escalations to the board (default: dry-run)
+#
+# Nudge lifecycle (chat-review/rollcall-sweep-nudge-once, 2026-07-07): each stale PROPOSE is keyed by
+# md5(channel:topic) in a state file ($HOME/.mesh/.rollcall-nudge-state, override via 4th run_sweep arg).
+# 1st sweep -> nudge posted. 2nd sweep (still unconverted) -> silent, tracked. 3rd sweep (2 unanswered
+# sweeps since the nudge) -> escalate ONCE to a [task] asking a human/mind to decide (file for real, or
+# decline), then permanently silent. A PROPOSE older than MESH_ROLLCALL_MAX_AGE_MINUTES (default 10080 =
+# 7 days) is declined on sight, before ever nudging — stops ancient (e.g. 12-day-old) proposals from
+# recycling forever. Before this, the sweep re-posted the identical nudge on every hourly run with no
+# memory (live: the same 7 stale-propose lines hit the board at 01:00/02:00/03:00 2026-07-07).
 # (chat-review/rollcall-sweep-inert-cron, 2026-07-06: the prior 'hourly' prose cadence is not a
 # valid 5-field cron schedule for mesh-autowire's own wiring, and reflexes.cron:173 wired this tool
 # by BARE NAME with no --post — cron's minimal PATH never finds an unqualified $HOME/.local/bin
@@ -15,16 +22,45 @@
 # while the roll-call digest kept escalating the same 3 RECURRING undecided PROPOSEs. Fixed by
 # hand in reflexes.cron: absolute path + --post + a log redirect, matching every other wired
 # reflex's form.)
+# reflex-cadence: 0 * * * *
+# reflex-args: --post
 set -uo pipefail
 
 [ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
 export PATH="$HOME/.local/bin:$PATH"
+
+key_hash() {
+  printf '%s' "$1" | md5sum | awk '{print $1}'
+}
+
+# load_nudge_state <state-file> — populates global NUDGE_COUNT/NUDGE_STATUS assoc arrays.
+load_nudge_state() {
+  local state_file="$1"
+  declare -gA NUDGE_COUNT NUDGE_STATUS
+  NUDGE_COUNT=(); NUDGE_STATUS=()
+  [ -f "$state_file" ] || return 0
+  while IFS='|' read -r hash count status _rest; do
+    [ -n "$hash" ] || continue
+    NUDGE_COUNT["$hash"]="$count"
+    NUDGE_STATUS["$hash"]="$status"
+  done < "$state_file"
+}
+
+save_nudge_state() {
+  local state_file="$1"
+  : > "$state_file"
+  for hash in "${!NUDGE_COUNT[@]}"; do
+    printf '%s|%s|%s\n' "$hash" "${NUDGE_COUNT[$hash]}" "${NUDGE_STATUS[$hash]}" >> "$state_file"
+  done
+}
 
 run_sweep() {
   set +u  # Disable unbound variable checking for arrays
   local CHAT_LOG="${1:-$HOME/.mesh/chat.log}"
   local THRESHOLD_MINUTES="${2:-120}"
   local DO_POST="${3:-false}"
+  local STATE_FILE="${4:-$HOME/.mesh/.rollcall-nudge-state}"
+  local MAX_AGE_MINUTES="${MESH_ROLLCALL_MAX_AGE_MINUTES:-10080}"  # 7 days — well under the 12-day live incident
 
   if [ ! -f "$CHAT_LOG" ]; then
     echo "Chat log not found: $CHAT_LOG"
@@ -32,9 +68,12 @@ run_sweep() {
     return 0
   fi
 
+  load_nudge_state "$STATE_FILE"
+
   # Current time for age calculation
   local now=$(date +%s)
   local cutoff=$((now - THRESHOLD_MINUTES * 60))
+  local max_age_cutoff=$((now - MAX_AGE_MINUTES * 60))
 
   # Find roll-call PROPOSE lines older than threshold
   declare -A propose_times propose_texts propose_channels
@@ -73,68 +112,96 @@ run_sweep() {
 
   echo "Found ${#propose_times[@]} roll-call PROPOSE lines to check for conversion..."
 
-  # Check each PROPOSE for later [task] or [done] referencing the same topic
-  declare -a stale_proposes stale_timestamps stale_channels
+  local nudged=0 escalated=0 declined=0 silent_tracked=0 converted=0
 
   for key in "${!propose_times[@]}"; do
     local propose_ts="${propose_times[$key]}"
     local propose_text="${propose_texts[$key]}"
     local channel="${propose_channels[$key]}"
+    local hash
+    hash=$(key_hash "$key")
 
     # Search for [task] or [done] after the PROPOSE timestamp that might reference it
     local later_content=$(sed -n "/${propose_ts}/,\$p" "$CHAT_LOG")
 
     # Check if there's a matching [task] or [done]
     local found_match=false
-
-    # Look for [task] or [done] that references the same channel/topic
-    # Extract key terms from the propose text for matching
     local propose_key=$(echo "$propose_text" | grep -oE '[a-z-]{3,}' | head -3 | tr '\n' '|' | sed 's/|$//')
 
     if [ -n "$propose_key" ]; then
-      # Check if any later [task] or [done] contains the same key terms
       if echo "$later_content" | grep -E "\[(task|done)\].*(${propose_key})" > /dev/null; then
         found_match=true
       fi
     fi
 
-    if ! $found_match; then
-      stale_proposes+=("$propose_text")
-      stale_timestamps+=("$propose_ts")
-      stale_channels+=("$channel")
+    if $found_match; then
+      # Resolved — clear any nudge history so a future unrelated re-proposal of the same topic starts fresh
+      unset "NUDGE_COUNT[$hash]" "NUDGE_STATUS[$hash]" 2>/dev/null
+      converted=$((converted + 1))
+      continue
     fi
+
+    local status="${NUDGE_STATUS[$hash]:-PENDING}"
+    local count="${NUDGE_COUNT[$hash]:-0}"
+
+    if [ "$status" = "ESCALATED" ] || [ "$status" = "DECLINED" ]; then
+      continue  # already handled — permanently silent, never re-nudge/re-escalate
+    fi
+
+    local propose_ts_sec=$(date -d "$propose_ts" +%s 2>/dev/null || echo 0)
+    if [ "$propose_ts_sec" -gt 0 ] && [ "$propose_ts_sec" -lt "$max_age_cutoff" ]; then
+      NUDGE_STATUS[$hash]="DECLINED"
+      NUDGE_COUNT[$hash]="$count"
+      declined=$((declined + 1))
+      echo "Declined (older than max-age ${MAX_AGE_MINUTES}m): ${channel} '${propose_text}' at ${propose_ts}"
+      continue
+    fi
+
+    case "$count" in
+      0)
+        local nudge="[fyi] stale-propose: ${channel} proposed '${propose_text}' at ${propose_ts}, never filed — review?"
+        echo "Would post: $nudge"
+        if $DO_POST; then
+          if command -v mesh-chat >/dev/null 2>&1; then
+            mesh-chat "$nudge" > /dev/null 2>&1
+            echo "Posted to board"
+          else
+            echo "(mesh-chat not found, skipping post)"
+          fi
+        fi
+        NUDGE_COUNT[$hash]=1
+        NUDGE_STATUS[$hash]="PENDING"
+        nudged=$((nudged + 1))
+        ;;
+      1)
+        # Already nudged once — this is the first unanswered sweep since the nudge; stay silent
+        NUDGE_COUNT[$hash]=2
+        NUDGE_STATUS[$hash]="PENDING"
+        silent_tracked=$((silent_tracked + 1))
+        ;;
+      *)
+        # 2 unanswered sweeps since the nudge — escalate exactly once, then go permanently silent
+        local short="${hash:0:8}"
+        local escalate="[task] chat-review/stale-propose-${short}: PROPOSE from ${channel} ('${propose_text}', at ${propose_ts}) went unanswered after a nudge + 2 follow-up sweeps — decide: file a real task with an owner, or explicitly decline. owner: ${channel}"
+        echo "Would post: $escalate"
+        if $DO_POST; then
+          if command -v mesh-chat >/dev/null 2>&1; then
+            mesh-chat "$escalate" > /dev/null 2>&1
+            echo "Posted to board"
+          else
+            echo "(mesh-chat not found, skipping post)"
+          fi
+        fi
+        NUDGE_STATUS[$hash]="ESCALATED"
+        escalated=$((escalated + 1))
+        ;;
+    esac
   done
 
-  if [ ${#stale_proposes[@]} -eq 0 ]; then
-    echo "All roll-call PROPOSE lines have corresponding [task]/[done] entries — no stale proposes found"
-    set -u
-    return 0
-  fi
-
-  echo "Found ${#stale_proposes[@]} stale roll-call PROPOSE lines (no matching task/done found):"
-
-  # Post nudges for each stale propose
-  for i in "${!stale_proposes[@]}"; do
-    local propose_text="${stale_proposes[$i]}"
-    local ts="${stale_timestamps[$i]}"
-    local channel="${stale_channels[$i]}"
-
-    local nudge="[fyi] stale-propose: ${channel} proposed '${propose_text}' at ${ts}, never filed — review?"
-
-    echo "Would post: $nudge"
-
-    if $DO_POST; then
-      if command -v mesh-chat >/dev/null 2>&1; then
-        mesh-chat "$nudge" > /dev/null 2>&1
-        echo "Posted to board"
-      else
-        echo "(mesh-chat not found, skipping post)"
-      fi
-    fi
-  done
+  save_nudge_state "$STATE_FILE"
 
   echo ""
-  echo "Total: ${#stale_proposes[@]} stale propose(s)"
+  echo "Total: ${nudged} nudge(s), ${escalated} escalation(s), ${declined} declined (max-age), ${silent_tracked} silently tracked, ${converted} converted"
   set -u
   return 0
 }
@@ -143,54 +210,100 @@ run_test() {
   # Create fixture board with test PROPOSE scenarios
   local test_dir="$HOME/.mesh/test-rollcall-sweep"
   local test_log="$test_dir/chat.log"
+  local state_file="$test_dir/nudge-state"
   mkdir -p "$test_dir"
+  rm -f "$state_file"
 
   # Timestamps computed relative to NOW — a hardcoded fixture date ages past the
   # threshold within hours and turns the smoke-test into a time bomb
-  local old_time=$(date -u -d '4 hours ago' +%Y-%m-%dT%H:%M:%SZ)     # stale, unconverted
-  local recent_time=$(date -u -d '3 hours ago' +%Y-%m-%dT%H:%M:%SZ)  # stale, but converted below
+  local old_time=$(date -u -d '4 hours ago' +%Y-%m-%dT%H:%M:%SZ)      # stale, unconverted
+  local recent_time=$(date -u -d '3 hours ago' +%Y-%m-%dT%H:%M:%SZ)   # stale, but converted below
   local current_time=$(date -u -d '1 minute ago' +%Y-%m-%dT%H:%M:%SZ)
+  local ancient_time=$(date -u -d '20 days ago' +%Y-%m-%dT%H:%M:%SZ)  # past max-age
 
   # Create test chat log with scenarios
   cat > "$test_log" <<EOF
 ${old_time} test_channel :: [fyi] roll-call room: PROPOSE test-old-unconverted — this should trigger a nudge
 ${recent_time} test_channel :: [fyi] roll-call genome: PROPOSE test-recent-converted — this should NOT trigger (has task below)
 ${current_time} test_channel :: [task] chat-review/test-recent-converted: testing the sweep
+${ancient_time} test_channel :: [fyi] roll-call attic: PROPOSE test-ancient-unconverted — this is past max-age
 EOF
 
-  echo "=== Test 1: old unconverted PROPOSE → should nudge ==="
-  echo "Test timestamps: old=$old_time, recent=$recent_time, current=$current_time"
-
-  # Run sweep against test log
-  local output
-  output=$(run_sweep "$test_log" "120" "false" 2>&1)
-  echo "$output"
-
-  if echo "$output" | grep -q "test-old-unconverted"; then
-    echo "PASS: Found stale propose (test-old-unconverted)"
+  echo "=== Test 1: old unconverted PROPOSE -> first sweep nudges ==="
+  local out1
+  out1=$(run_sweep "$test_log" "120" "false" "$state_file" 2>&1)
+  echo "$out1"
+  if echo "$out1" | grep -q "stale-propose.*test-old-unconverted"; then
+    echo "PASS: first sweep nudged the stale propose"
   else
-    echo "FAIL: Did not find expected stale propose (test-old-unconverted)"
-    echo "Output: $output"
+    echo "FAIL: first sweep did not nudge (expected nudge for test-old-unconverted)"
     rm -rf "$test_dir"
     exit 1
   fi
 
   echo ""
-  echo "=== Test 2: recent converted PROPOSE → should be silent ==="
-  if echo "$output" | grep -q "stale-propose.*test-recent-converted"; then
-    echo "FAIL: Incorrectly flagged converted propose as stale"
-    echo "Output: $output"
+  echo "=== Test 2: recent converted PROPOSE -> always silent ==="
+  if echo "$out1" | grep -q "stale-propose.*test-recent-converted"; then
+    echo "FAIL: incorrectly flagged converted propose as stale"
     rm -rf "$test_dir"
     exit 1
   else
-    echo "PASS: Correctly ignored converted propose (test-recent-converted)"
+    echo "PASS: correctly ignored converted propose (test-recent-converted)"
+  fi
+
+  echo ""
+  echo "=== Test 3: already-nudged PROPOSE -> second sweep stays silent (dedup via state file) ==="
+  local out2
+  out2=$(run_sweep "$test_log" "120" "false" "$state_file" 2>&1)
+  echo "$out2"
+  if echo "$out2" | grep -q "stale-propose.*test-old-unconverted"; then
+    echo "FAIL: second sweep re-nudged an already-nudged propose — state check is broken/missing"
+    rm -rf "$test_dir"
+    exit 1
+  else
+    echo "PASS: second sweep stayed silent for the already-nudged propose"
+  fi
+
+  echo ""
+  echo "=== Test 4: unanswered nudge -> third sweep escalates exactly once ==="
+  local out3
+  out3=$(run_sweep "$test_log" "120" "false" "$state_file" 2>&1)
+  echo "$out3"
+  if echo "$out3" | grep -q "\[task\] chat-review/stale-propose-.*test-old-unconverted"; then
+    echo "PASS: third sweep escalated the unanswered propose to a [task]"
+  else
+    echo "FAIL: expected an escalation [task] line on the third sweep"
+    rm -rf "$test_dir"
+    exit 1
+  fi
+
+  echo ""
+  echo "=== Test 5: escalated PROPOSE -> never posted again ==="
+  local out4
+  out4=$(run_sweep "$test_log" "120" "false" "$state_file" 2>&1)
+  if echo "$out4" | grep -E "(stale-propose|\[task\] chat-review/stale-propose)" | grep -q "test-old-unconverted"; then
+    echo "FAIL: escalated propose was posted again — should be permanently silent"
+    rm -rf "$test_dir"
+    exit 1
+  else
+    echo "PASS: escalated propose stayed silent on the fourth sweep"
+  fi
+
+  echo ""
+  echo "=== Test 6: 20-day-old PROPOSE -> declined immediately, never nudged ==="
+  if echo "$out1" | grep -q "stale-propose.*test-ancient-unconverted"; then
+    echo "FAIL: an ancient (past max-age) propose was nudged — max-age cutoff missing"
+    rm -rf "$test_dir"
+    exit 1
+  else
+    echo "PASS: ancient propose was declined/skipped, not nudged"
   fi
 
   echo ""
   echo "=== Cleaning up test fixtures ==="
   rm -rf "$test_dir"
   echo "Test fixtures cleaned up"
-  echo "smoke-test: ok (fixture scenarios verified: unconverted→nudge, converted→silent)"
+  echo "smoke-test: ok (dedup-once, escalate-after-2, max-age-decline, converted-silent all verified)"
   exit 0
 }
 
