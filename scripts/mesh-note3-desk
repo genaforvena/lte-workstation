@@ -1,0 +1,251 @@
+#!/usr/bin/env bash
+# orphan-ok: on-demand cross-sense fusion probe — mind pulls when checking desk occupancy;
+#   the adb round-trip (proximity) is too costly to add to a tight cron cadence, so this is
+#   pulled live (like body-context/tamper/operator-state in the LIVE-ONLY dash category),
+#   not scheduled. Revisit if a consumer wants it cron-wired.
+#
+# mesh-note3-desk — CRAFT-ROOM DESK OCCUPANCY fusion: Note3 near-field IR proximity
+# (MAX88920, raw ADC reflectance, ~/.mesh/knowledge/capability-note3-ir-proximity-gesture-
+# 20260707.md) + Note3 craft-room ambient light (MAX88922, via `mesh-light --craft-status`)
+# combined into a richer "is something/someone actually AT THE DESK" signal that neither
+# sensor gives alone: light alone can't distinguish an empty-but-lit room from an occupied
+# one; proximity alone has no context for WHY (broad daylight vs pitch dark). Both signals
+# come off the SAME fixed physical location (the Note3 sitting in the craft room) via the
+# SAME adb->ds relay, so this is a genuine same-body cross-sense fusion, not two unrelated
+# readings glued together.
+#
+# Verdicts:
+#   DESK_OCCUPIED         proximity NEAR + light lit   — something/someone right at the desk, lit
+#   DESK_OCCUPIED_DARK    proximity NEAR + light dark  — close object in the dark (picked up / covered)
+#   DESK_LIT_EMPTY        proximity FAR  + light lit   — room lit, nothing near the phone itself
+#   DESK_EMPTY_DARK       proximity FAR  + light dark  — desk unoccupied, lights off
+#   DESK_PARTIAL_PROX_*   light UNKNOWN, proximity known  — degraded, not silent
+#   DESK_PARTIAL_LIGHT_*  proximity UNKNOWN, light known  — degraded, not silent
+#   DESK_UNKNOWN          both inputs UNKNOWN — honest cannot-assess
+#
+# Usage:
+#   mesh-note3-desk           one-shot verdict to stdout
+#   mesh-note3-desk --json    machine-readable JSON {verdict, prox, raw, baseline, light, lux, ts}
+#   mesh-note3-desk --status  non-blocking cached read (no adb call, no mesh-light call)
+#   mesh-note3-desk --test    smoke test (fixture-driven, no live reads/network)
+#
+# Proximity classification (self-calibrating, best-effort): MAX88920 raw_data is a raw
+# IR-reflectance ADC, not a calibrated distance — live reads 2026-07-07/08 with nothing
+# covering it drifted 15-28 (ambient noise band). NEAR fires only on a jump clearly outside
+# that band (raw >= baseline + max(ABS_MARGIN, baseline*REL_MARGIN)); the baseline is an EMA
+# that folds NEAR reads back in only weakly, so a genuine sustained cover doesn't get
+# absorbed as "the new normal" within a few reads. This is pending a confirmed real
+# "covered" calibration sample — see the knowledge doc above.
+#
+# Honest-degrade: adb unreachable -> prox=UNKNOWN. mesh-light --craft-status stale/missing/
+# UNKNOWN -> light=UNKNOWN. An unreachable input renders a DESK_PARTIAL_*/DESK_UNKNOWN
+# verdict, never a faked verdict from the other half alone.
+
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+
+MESH="${MESH_DIR:-$HOME/.mesh}"
+STATE="$MESH/.note3-desk-state"
+BASELINE="$MESH/.note3-prox-baseline"
+CRAFT_LIGHT_STATE="$MESH/.light-craft-state"
+
+NOTE3_ADB_NODE="${MESH_NOTE3_ADB_NODE:-${MESH_BARO_ADB_NODE:-}}"
+NOTE3_ADB_SERIAL="${MESH_NOTE3_ADB_SERIAL:-${MESH_BARO_ADB_SERIAL:-}}"
+
+ABS_MARGIN="${MESH_DESK_PROX_ABS_MARGIN:-15}"
+REL_MARGIN="${MESH_DESK_PROX_REL_MARGIN:-0.5}"
+EMA_ALPHA="${MESH_DESK_PROX_EMA_ALPHA:-0.2}"
+LIGHT_STALE="${MESH_DESK_LIGHT_STALE:-1200}"   # 2x mesh-light --craft cadence (9-59/10)
+
+# --status: READ-ONLY cached read — $STATE + its mtime, no adb, no mesh-light call
+# (status-read-shares-write-path-mutates: a dash poll must never mutate the sense).
+if [ "${1:-}" = --status ]; then
+  if [ -f "$STATE" ]; then
+    raw_line="$(cat "$STATE" 2>/dev/null)"
+    verdict="${raw_line%%|*}"
+    mtime="$(stat -c %Y "$STATE" 2>/dev/null || echo 0)"
+    age=$(( $(date +%s) - mtime ))
+    [ -z "$verdict" ] && { echo "note3-desk: cached state unreadable (empty)"; exit 2; }
+    printf 'note3-desk: %s (%ss ago)\n' "$verdict" "$age"
+    case "$verdict" in *UNKNOWN*) exit 2 ;; *) exit 0 ;; esac
+  fi
+  echo "note3-desk: no cached state yet (never produced)"
+  exit 2
+fi
+
+# note3_prox_raw — live raw_data from the MAX88920 proximity sysfs node, via the SAME
+# adb->ds relay baro/light use. Empty + rc1 on any failure (adb down, ssh down, no digits).
+# Test override: NOTE3_DESK_PROX_RAW_OVERRIDE skips the network entirely (fixture-only knob).
+note3_prox_raw() {
+  if [ -n "${NOTE3_DESK_PROX_RAW_OVERRIDE:-}" ]; then
+    printf '%s' "$NOTE3_DESK_PROX_RAW_OVERRIDE"; return 0
+  fi
+  [ -z "$NOTE3_ADB_NODE" ] && return 1
+  local ser=""; [ -n "$NOTE3_ADB_SERIAL" ] && ser="-s $NOTE3_ADB_SERIAL"
+  local out
+  if [ "$NOTE3_ADB_NODE" = local ]; then
+    out="$(timeout 15 adb $ser shell 'cat /sys/class/sensors/proximity_sensor/raw_data' 2>/dev/null)"
+  else
+    out="$(timeout 20 ssh -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new \
+      "$NOTE3_ADB_NODE" "adb $ser shell 'cat /sys/class/sensors/proximity_sensor/raw_data'" </dev/null 2>/dev/null)"
+  fi
+  out="$(printf '%s' "$out" | tr -dc '0-9\n' | head -1)"
+  [ -n "$out" ] || return 1
+  printf '%s' "$out"
+}
+
+# classify_prox <raw> -> prints "<NEAR|FAR> <baseline_used>" on stdout, rc 0. Updates
+# $BASELINE (EMA) as a side effect. Pure given (raw, $BASELINE contents) — no network — so
+# it's directly unit-testable by pointing $BASELINE at a sandbox file.
+classify_prox() {
+  local raw="$1" prev_baseline out near baseline
+  [ -f "$BASELINE" ] && prev_baseline="$(cat "$BASELINE" 2>/dev/null)"
+  case "${prev_baseline:-}" in ''|*[!0-9.]*) prev_baseline="$raw" ;; esac   # bootstrap / corrupt-file guard
+  # ONE python3 call does margin+near+EMA together (doctor-smoke-python-fanout: 3 separate
+  # subprocess spawns per call multiplied across the --test fixtures into ~20 python3 forks,
+  # slow enough under this node's routine high mind-concurrency load to blow the doctor's
+  # smoke-test timeout — collapsed to 1 spawn/call, same math).
+  out="$(ABS_MARGIN="$ABS_MARGIN" REL_MARGIN="$REL_MARGIN" EMA_ALPHA="$EMA_ALPHA" \
+    PREV="$prev_baseline" RAW="$raw" python3 -c '
+import os
+prev = float(os.environ["PREV"]); raw = float(os.environ["RAW"])
+margin = max(float(os.environ["ABS_MARGIN"]), prev * float(os.environ["REL_MARGIN"]))
+near = raw >= prev + margin
+baseline = prev*0.95 + raw*0.05 if near else prev*(1 - float(os.environ["EMA_ALPHA"])) + raw*float(os.environ["EMA_ALPHA"])
+print("NEAR" if near else "FAR", round(baseline, 2))
+' 2>/dev/null)"
+  read -r near baseline <<<"$out"
+  if [ -n "$baseline" ]; then
+    printf '%s\n' "$baseline" > "$BASELINE"
+  else
+    near="FAR"   # python3 failed — degrade to FAR (never fake NEAR) but still record something
+  fi
+  echo "$near $prev_baseline"
+}
+
+# parse_light_line <line> -> DARK|LIT|UNKNOWN. Pure string classify — handles both
+# mesh-light --craft-status shapes: "LEVEL|room=craft|lux=N" and "UNKNOWN <ts> reason=...".
+# DIM/MODERATE/LIT/BRIGHT all fold to LIT here — the desk fusion only needs dark-vs-lit.
+parse_light_line() {
+  case "$1" in
+    UNKNOWN*|'') echo UNKNOWN ;;
+    DARK*)       echo DARK ;;
+    DIM*|MODERATE*|LIT*|BRIGHT*) echo LIT ;;
+    *)           echo UNKNOWN ;;
+  esac
+}
+
+# light_read -> prints "<DARK|LIT|UNKNOWN> <lux-or-empty>". Test override:
+# NOTE3_DESK_LIGHT_OVERRIDE supplies the raw --craft-status line directly (skips mesh-light
+# + the mtime staleness check, fixture-only knob).
+light_read() {
+  local line lux
+  if [ -n "${NOTE3_DESK_LIGHT_OVERRIDE+x}" ]; then
+    line="$NOTE3_DESK_LIGHT_OVERRIDE"
+  else
+    if [ ! -f "$CRAFT_LIGHT_STATE" ]; then echo "UNKNOWN "; return; fi
+    local mtime age; mtime="$(stat -c %Y "$CRAFT_LIGHT_STATE" 2>/dev/null || echo 0)"
+    age=$(( $(date +%s) - mtime ))
+    if [ "$age" -gt "$LIGHT_STALE" ]; then echo "UNKNOWN "; return; fi
+    line="$(mesh-light --craft-status 2>/dev/null)"
+  fi
+  lux="$(printf '%s' "$line" | grep -oE 'lux=[0-9]+' | cut -d= -f2)"
+  printf '%s %s\n' "$(parse_light_line "$line")" "${lux:-}"
+}
+
+# fuse <prox> <light> -> verdict on stdout
+fuse() {
+  local prox="$1" light="$2"
+  case "$prox:$light" in
+    UNKNOWN:UNKNOWN) echo DESK_UNKNOWN ;;
+    UNKNOWN:*)       echo "DESK_PARTIAL_LIGHT_${light}" ;;
+    *:UNKNOWN)       echo "DESK_PARTIAL_PROX_${prox}" ;;
+    NEAR:LIT)        echo DESK_OCCUPIED ;;
+    NEAR:DARK)       echo DESK_OCCUPIED_DARK ;;
+    FAR:LIT)         echo DESK_LIT_EMPTY ;;
+    FAR:DARK)        echo DESK_EMPTY_DARK ;;
+    *)               echo DESK_UNKNOWN ;;
+  esac
+}
+
+if [ "${1:-}" = --test ]; then
+  _f=0
+  # --- pure fusion table ---
+  [ "$(fuse NEAR LIT)"     = DESK_OCCUPIED ]           || { echo "  FAIL fuse NEAR/LIT"; _f=1; }
+  [ "$(fuse NEAR DARK)"    = DESK_OCCUPIED_DARK ]      || { echo "  FAIL fuse NEAR/DARK"; _f=1; }
+  [ "$(fuse FAR LIT)"      = DESK_LIT_EMPTY ]          || { echo "  FAIL fuse FAR/LIT"; _f=1; }
+  [ "$(fuse FAR DARK)"     = DESK_EMPTY_DARK ]         || { echo "  FAIL fuse FAR/DARK"; _f=1; }
+  [ "$(fuse UNKNOWN UNKNOWN)" = DESK_UNKNOWN ]         || { echo "  FAIL fuse both-unknown"; _f=1; }
+  [ "$(fuse UNKNOWN LIT)"  = DESK_PARTIAL_LIGHT_LIT ]  || { echo "  FAIL fuse prox-unknown"; _f=1; }
+  [ "$(fuse FAR UNKNOWN)"  = DESK_PARTIAL_PROX_FAR ]   || { echo "  FAIL fuse light-unknown"; _f=1; }
+  # --- parse_light_line ---
+  [ "$(parse_light_line 'DIM|room=craft|lux=11')" = LIT ]          || { echo "  FAIL parse DIM->LIT"; _f=1; }
+  [ "$(parse_light_line 'DARK|room=craft|lux=1')" = DARK ]         || { echo "  FAIL parse DARK"; _f=1; }
+  [ "$(parse_light_line 'BRIGHT|room=craft|lux=900')" = LIT ]      || { echo "  FAIL parse BRIGHT->LIT"; _f=1; }
+  [ "$(parse_light_line 'UNKNOWN 2026-07-08T00:00:00Z reason=adb-unreachable room=craft')" = UNKNOWN ] \
+    || { echo "  FAIL parse UNKNOWN line"; _f=1; }
+  [ "$(parse_light_line '')" = UNKNOWN ]                           || { echo "  FAIL parse empty"; _f=1; }
+  # --- classify_prox (sandboxed baseline file, no network) ---
+  _sd="$(mktemp -d)"; BASELINE="$_sd/.baseline"
+  printf '20\n' > "$BASELINE"
+  read -r _st _bl <<<"$(classify_prox 21)"
+  [ "$_st" = FAR ] || { echo "  FAIL classify_prox: 21 vs baseline 20 should stay FAR (within noise), got $_st"; _f=1; }
+  printf '20\n' > "$BASELINE"
+  read -r _st2 _bl2 <<<"$(classify_prox 60)"
+  [ "$_st2" = NEAR ] || { echo "  FAIL classify_prox: 60 vs baseline 20 should be NEAR, got $_st2"; _f=1; }
+  _newbl="$(cat "$BASELINE")"
+  python3 -c "exit(0 if $_newbl < 25 else 1)" || { echo "  FAIL classify_prox: NEAR must fold back weakly (baseline drifted too far: $_newbl)"; _f=1; }
+  rm -f "$BASELINE"
+  read -r _st3 _bl3 <<<"$(classify_prox 17)"
+  [ "$_st3" = FAR ] && [ "$_bl3" = 17 ] || { echo "  FAIL classify_prox: bootstrap (no baseline file) should self-seed and read FAR, got $_st3/$_bl3"; _f=1; }
+  rm -rf "$_sd"
+  # --- full pipeline via env overrides (no network, no real state touched) ---
+  _sd2="$(mktemp -d)"
+  _out="$(MESH_DIR="$_sd2" NOTE3_DESK_PROX_RAW_OVERRIDE=17 NOTE3_DESK_LIGHT_OVERRIDE='DIM|room=craft|lux=11' "$0" --json 2>&1)"
+  printf '%s' "$_out" | grep -q '"verdict": *"DESK_LIT_EMPTY"' || { echo "  FAIL pipeline: expected DESK_LIT_EMPTY, got: $_out"; _f=1; }
+  _out2="$(MESH_DIR="$_sd2" NOTE3_DESK_PROX_RAW_OVERRIDE=90 NOTE3_DESK_LIGHT_OVERRIDE='DARK|room=craft|lux=1' "$0" --json 2>&1)"
+  printf '%s' "$_out2" | grep -q '"verdict": *"DESK_OCCUPIED_DARK"' || { echo "  FAIL pipeline: expected DESK_OCCUPIED_DARK, got: $_out2"; _f=1; }
+  _out3="$(MESH_DIR="$_sd2" NOTE3_DESK_PROX_RAW_OVERRIDE=17 NOTE3_DESK_LIGHT_OVERRIDE='' "$0" 2>&1)"
+  printf '%s' "$_out3" | grep -q 'DESK_PARTIAL_PROX_FAR' || { echo "  FAIL pipeline: expected DESK_PARTIAL_PROX_FAR with no light override text, got: $_out3"; _f=1; }
+  _stat_out="$(MESH_DIR="$_sd2" "$0" --status 2>&1)"; _stat_rc=$?
+  printf '%s' "$_stat_out" | grep -q 'note3-desk:' || { echo "  FAIL status: expected cached readback, got: $_stat_out"; _f=1; }
+  [ "$_stat_rc" = 0 ] || [ "$_stat_rc" = 2 ] || { echo "  FAIL status: unexpected rc=$_stat_rc"; _f=1; }
+  rm -rf "$_sd2"
+  # --- unreachable adb -> UNKNOWN, not a silent all-clear ---
+  _sd3="$(mktemp -d)"
+  _out4="$(MESH_DIR="$_sd3" MESH_NOTE3_ADB_NODE='' "$0" --json 2>&1)"
+  printf '%s' "$_out4" | grep -q '"prox": *"UNKNOWN"' || { echo "  FAIL unreachable: expected prox UNKNOWN with no adb node configured, got: $_out4"; _f=1; }
+  rm -rf "$_sd3"
+  [ "$_f" = 0 ] || { echo "smoke-test: FAIL"; exit 1; }
+  echo "smoke-test: ok (7 fuse-table + 5 parse_light + 4 classify_prox + 4 full-pipeline + 1 unreachable-gate)"
+  exit 0
+fi
+
+ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+raw="$(note3_prox_raw)"; prox_rc=$?
+if [ "$prox_rc" = 0 ] && [ -n "$raw" ]; then
+  read -r prox_state baseline_used <<<"$(classify_prox "$raw")"
+else
+  prox_state="UNKNOWN"; raw=""; baseline_used=""
+fi
+
+read -r light_state lux <<<"$(light_read)"
+
+verdict="$(fuse "$prox_state" "$light_state")"
+
+printf '%s|prox=%s|raw=%s|baseline=%s|light=%s|lux=%s|ts=%s\n' \
+  "$verdict" "$prox_state" "${raw:-}" "${baseline_used:-}" "$light_state" "${lux:-}" "$ts" > "$STATE"
+mesh-state-touch "$STATE" 2>/dev/null || true
+
+if [ "${1:-}" = --json ]; then
+  python3 -c "
+import json
+print(json.dumps({
+  'verdict': '$verdict', 'prox': '$prox_state', 'raw': '${raw:-}',
+  'baseline': '${baseline_used:-}', 'light': '$light_state', 'lux': '${lux:-}', 'ts': '$ts'
+}, indent=None))
+"
+else
+  printf '[note3-desk-%s] %s — prox=%s(raw=%s,baseline=%s) light=%s(lux=%s)\n' \
+    "${verdict,,}" "$verdict" "$prox_state" "${raw:-?}" "${baseline_used:-?}" "$light_state" "${lux:-?}"
+fi
