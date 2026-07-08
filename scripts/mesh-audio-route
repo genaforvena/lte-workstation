@@ -1,0 +1,171 @@
+#!/usr/bin/env bash
+# reflex-cadence: */5 * * * *
+# doctor-artifact: $HOME/.mesh/.audio-route-state 1800 phone
+#   ^ smoke-theater gate (mesh-doctor): .audio-route-state is rewritten on EVERY successful read (not
+#     only on a verdict change), so phone-reachable + state >1800s stale ⟹ the sense is silently not
+#     producing despite a green --test. Phone offline → gate skips (no false-fail). See mesh-doctor
+#     _theater_check.
+# mesh-audio-route — the phone's audio-OUTPUT-DEVICE sense: is the operator on Bluetooth headphones,
+# a wired headset, or neither (speaker/idle)?
+#
+# WHY THIS IS NEW: mesh-phone-audio already calls termux-audio-info, but only parses the ALSA
+# `controls` mixer array (internal codec control names) to GUESS a route — it never reads the two
+# dynamic top-level booleans termux-audio-info actually returns for this:
+#   BLUETOOTH_A2DP_IS_ON        — a BT A2DP sink (headphones/speaker) is the active audio output
+#   WIREDHEADSET_IS_CONNECTED   — a wired headset is plugged in
+# (capability-phone-audio-route-20260702.md: proven live 2026-07-02, "grep -r termux-audio-info
+# scripts/ → empty [consumer of these two fields]"). Those fields are a direct HAL-level signal —
+# no heuristic control-name matching — and answer a different question than mesh-phone-audio's ALSA
+# route guess: is the OPERATOR currently wearing/using headphones (a listening-context / focus /
+# interruptibility cue), not what the phone's internal mixer happens to be doing.
+#
+#   mesh-audio-route            one-shot verdict (BT_HEADPHONES|WIRED|SPEAKER_OR_IDLE) + raw booleans
+#   mesh-audio-route --json     machine-readable {route, bt_a2dp, wired, ts}
+#   mesh-audio-route --edge     debounced state write; only touches STATE on a route change (cron mode)
+#   mesh-audio-route --test     smoke test (classifier fixtures, offline) + live phone reachability gate
+#
+# Precedence when both are somehow true: BT_HEADPHONES (a BT sink actively used implies deliberate
+# listening even if a wired plug is also inserted).
+# Exit: 0 = assessed · 2 = phone unreachable / termux-audio-info unavailable (honest n/a, never faked)
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+[ -f "$HOME/.mesh/nodes" ] && . "$HOME/.mesh/nodes" 2>/dev/null || true
+. "${MESH_PATTERNS:-$HOME/.local/bin/mesh-patterns.sh}" 2>/dev/null || \
+  . "$(dirname "$0")/mesh-patterns.sh" 2>/dev/null || true
+
+PHONE_PORT="${PHONE_SSH_PORT:-8022}"
+MESH="${MESH_DIR:-$HOME/.mesh}"; mkdir -p "$MESH" 2>/dev/null || true
+STATE="$MESH/.audio-route-state"
+OFFLINEFILE="$MESH/.audio-route-offline"
+
+# classify_route — PURE (no SSH): parse termux-audio-info JSON on stdin, emit the route verdict
+# from its two top-level dynamic booleans (never the `controls` mixer array — that's a different,
+# already-tapped signal via mesh-phone-audio).
+classify_route() {
+  python3 -c '
+import json, sys
+
+def out(d):
+    print(json.dumps(d)); sys.exit(0)
+
+try:
+    data = json.load(sys.stdin)
+except Exception as e:
+    out({"route": "UNKNOWN", "error": "unparseable audio-info read", "detail": str(e)})
+
+bt = bool(data.get("BLUETOOTH_A2DP_IS_ON", False))
+wired = bool(data.get("WIREDHEADSET_IS_CONNECTED", False))
+
+if bt:
+    route = "BT_HEADPHONES"
+elif wired:
+    route = "WIRED"
+else:
+    route = "SPEAKER_OR_IDLE"
+
+out({"route": route, "bt_a2dp": bt, "wired": wired})
+'
+}
+
+if [ "${1:-}" = --test ]; then
+  command -v ssh >/dev/null 2>&1 || { echo "smoke-test: FAIL (no ssh)"; exit 1; }
+  command -v python3 >/dev/null 2>&1 || { echo "smoke-test: FAIL (no python3)"; exit 1; }
+
+  # Pure classifier unit tests (offline, no phone needed)
+  bt="$(printf '{"BLUETOOTH_A2DP_IS_ON":true,"WIREDHEADSET_IS_CONNECTED":false}' | classify_route)"
+  echo "$bt" | grep -q '"route": "BT_HEADPHONES"' || { echo "smoke-test: FAIL (bt classify: $bt)"; exit 1; }
+
+  w="$(printf '{"BLUETOOTH_A2DP_IS_ON":false,"WIREDHEADSET_IS_CONNECTED":true}' | classify_route)"
+  echo "$w" | grep -q '"route": "WIRED"' || { echo "smoke-test: FAIL (wired classify: $w)"; exit 1; }
+
+  s="$(printf '{"BLUETOOTH_A2DP_IS_ON":false,"WIREDHEADSET_IS_CONNECTED":false}' | classify_route)"
+  echo "$s" | grep -q '"route": "SPEAKER_OR_IDLE"' || { echo "smoke-test: FAIL (speaker classify: $s)"; exit 1; }
+
+  # both true -> BT precedence
+  both="$(printf '{"BLUETOOTH_A2DP_IS_ON":true,"WIREDHEADSET_IS_CONNECTED":true}' | classify_route)"
+  echo "$both" | grep -q '"route": "BT_HEADPHONES"' || { echo "smoke-test: FAIL (precedence: $both)"; exit 1; }
+
+  # Phone reachability + a REAL live read (not just callable) — a reachable phone whose driver
+  # returns empty/unparseable is a hollow sense, not a pass.
+  pip="$(phone_reachable_ip 2>/dev/null)" || { echo "smoke-test: n/a (phone unreachable — audio-route sense unavailable)"; exit 2; }
+
+  live_json="$(timeout 10 ssh -p "$PHONE_PORT" -o BatchMode=yes -o ConnectTimeout=6 \
+    -o StrictHostKeyChecking=accept-new "${PHONE_USER:-u0_a380}@$pip" \
+    'termux-audio-info 2>/dev/null' </dev/null 2>/dev/null)" || \
+  live_json="$(timeout 10 ssh -p "$PHONE_PORT" -o BatchMode=yes -o ConnectTimeout=6 \
+    -o StrictHostKeyChecking=accept-new "${PHONE_USER:-u0_a380}@$pip" \
+    'termux-audio-info 2>/dev/null' </dev/null 2>/dev/null)"
+
+  [ -n "$live_json" ] || { echo "smoke-test: n/a (termux-audio-info returned nothing)"; exit 2; }
+  live_route="$(printf '%s' "$live_json" | classify_route 2>/dev/null)"
+  echo "$live_route" | grep -q '"route"' || { echo "smoke-test: FAIL (live read did not classify: $live_route)"; exit 1; }
+
+  echo "smoke-test: ok (classifier unit x4 + live phone read: $live_route)"; exit 0
+fi
+
+EDGE=0
+[ "${1:-}" = --edge ] && EDGE=1
+JSONMODE=0
+[ "${1:-}" = --json ] && JSONMODE=1
+
+if type phone_reachable_ip >/dev/null 2>&1; then
+  pip="$(phone_reachable_ip 2>/dev/null)" || { echo "phone unreachable — no audio-route read (n/a)" >&2; exit 2; }
+else
+  pip="$(mesh-phone-ip 2>/dev/null)" || { echo "phone unreachable — no audio-route read (n/a)" >&2; exit 2; }
+fi
+
+PUSER="${PHONE_USER:-u0_a380}"
+SSH_OPTS=(-p "$PHONE_PORT" -o BatchMode=yes -o ConnectTimeout=6 -o StrictHostKeyChecking=accept-new)
+TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+# Retry-once pattern: first SSH may drop in the doze window (dozing-phone-first-ssh-drop memory)
+audio_json="$(timeout 12 ssh "${SSH_OPTS[@]}" "${PUSER}@${pip}" \
+  'termux-audio-info 2>/dev/null' </dev/null 2>/dev/null)" || \
+audio_json="$(timeout 12 ssh "${SSH_OPTS[@]}" "${PUSER}@${pip}" \
+  'termux-audio-info 2>/dev/null' </dev/null 2>/dev/null)"
+
+if [ -z "$audio_json" ]; then
+  if [ ! -f "$OFFLINEFILE" ]; then
+    echo "phone unreachable / termux-audio-info failed (not an alarm)" >&2
+    touch "$OFFLINEFILE"
+  fi
+  exit 2
+fi
+rm -f "$OFFLINEFILE"
+
+result="$(printf '%s' "$audio_json" | classify_route 2>/dev/null)" || {
+  echo "UNKNOWN classifier failed on live read" >&2
+  exit 2
+}
+route="$(printf '%s' "$result" | python3 -c 'import json,sys; print(json.load(sys.stdin)["route"])' 2>/dev/null)"
+[ -n "$route" ] || { echo "UNKNOWN classifier produced no route" >&2; exit 2; }
+
+prev=""
+[ -f "$STATE" ] && prev="$(cut -d'|' -f1 "$STATE" 2>/dev/null)"
+
+if [ "$EDGE" = 1 ]; then
+  if [ "$route" != "$prev" ]; then
+    printf '%s|%s\n' "$route" "$TS" > "$STATE"
+    echo "[sense] audio-route: $prev -> $route ($TS)"
+  fi
+  mesh-state-touch "$STATE" 2>/dev/null || touch "$STATE" 2>/dev/null
+  exit 0
+fi
+
+printf '%s|%s\n' "$route" "$TS" > "$STATE"
+mesh-state-touch "$STATE" 2>/dev/null || touch "$STATE" 2>/dev/null
+
+if [ "$JSONMODE" = 1 ]; then
+  printf '%s' "$result" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+d["ts"] = "'"$TS"'"
+print(json.dumps(d))
+'
+else
+  detail="$(printf '%s' "$result" | python3 -c 'import json,sys
+d = json.load(sys.stdin)
+print("bt_a2dp=" + str(d["bt_a2dp"]) + " wired=" + str(d["wired"]))')"
+  echo "$route ($detail)"
+fi
