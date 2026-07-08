@@ -1,0 +1,195 @@
+#!/usr/bin/env bash
+# orphan-ok: on-demand cross-sense fusion probe — mind pulls when checking whether WAN traffic is
+#   explained by household activity; the router SSH round-trip (GL-MT3000, often offline) is too
+#   costly/flaky for a tight cron cadence, so this is pulled live (like mesh-note3-desk/body-context/
+#   operator-state), not scheduled. Revisit if a consumer wants it cron-wired.
+#
+# mesh-wan-attribution — TRAFFIC-ATTRIBUTION fusion: is this WAN traffic burst EXPLAINED by
+# household activity, or happening while nobody's home/awake to have caused it?
+#
+# Fuses TWO senses that live on physically DIFFERENT nodes and answer unrelated questions:
+#   * mesh-wan-traffic     (GL-MT3000 router, /proc/net/dev eth0 over SSH) — HOW MUCH data crossed
+#     the WAN in the last window. Says nothing about WHO.
+#   * mesh-household-state (this node, BLE/phone/keypress fusion, ~/.mesh/.household.state) — WHO
+#     is home/awake right now. Says nothing about whether the network is actually busy.
+#
+# Neither alone answers a real security/awareness question: a WAN byte-spike while the household is
+# AWAY or ASLEEP is a genuinely different event (unattended device syncing, a scheduled backup, a
+# breach/pivot) than the identical spike while someone is home and ACTIVE (expected: streaming,
+# downloads, browsing). mesh-perimeter's NETWORK axis already watches *new devices*/gateway-identity
+# on the LAN; it never looks at WAN traffic VOLUME, so this is a genuinely new derived signal, not a
+# duplicate of an existing fusion.
+#
+# Verdicts:
+#   EXPLAINED        spike + household ACTIVE            — busy household explains the traffic
+#   UNEXPLAINED      spike + household AWAY or ASLEEP     — traffic with nobody around to cause it:
+#                    worth a look (unattended device, scheduled job, or something that isn't either)
+#   SPIKE_UNCERTAIN  spike + household UNCERTAIN/UNKNOWN  — can't attribute either way
+#   QUIET            no spike (household state noted for context only — QUIET never alarms)
+#   CANNOT-ASSESS    WAN traffic input unreachable (router offline/SSH fail) — never a faked QUIET
+#
+# Honest-fusion (memory fusion-tools-distinguish-empty-from-failed): the router is INTERMITTENTLY
+# OFFLINE (live, 2026-07-08 — GL-MT3000 down in the senses device census at the time this tool was
+# built). An unreachable WAN read renders CANNOT-ASSESS, visibly distinct from a genuine QUIET (both
+# inputs reachable, no spike). A stale/missing household read renders occ=UNKNOWN, which downgrades
+# a SPIKE to SPIKE_UNCERTAIN rather than silently assuming ACTIVE or AWAY.
+#
+# Usage:
+#   mesh-wan-attribution           one-shot verdict to stdout (live WAN probe + cached household read)
+#   mesh-wan-attribution --json    machine-readable JSON {verdict, wan, occ, ts}
+#   mesh-wan-attribution --status  non-blocking cached read (no SSH probe) — last verdict + age
+#   mesh-wan-attribution --test    smoke test (fixture-driven, no live SSH/network)
+#
+# Honest-exit contract:
+#   0 = confident verdict (QUIET / EXPLAINED / UNEXPLAINED)
+#   2 = degraded verdict (CANNOT-ASSESS / SPIKE_UNCERTAIN) — an input was unreachable/stale
+#   1 = unexpected error
+
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+
+MESH="${MESH_DIR:-$HOME/.mesh}"
+STATE="$MESH/.wan-attribution-state"
+HOUSEHOLD_STATE="$MESH/.household.state"
+OCC_STALE="${MESH_WAN_ATTR_OCC_STALE:-900}"   # 3x household-state's 5-min cadence
+mkdir -p "$MESH"
+
+# --status: READ-ONLY cached read — $STATE + its mtime, no SSH, no household re-read
+# (status-read-shares-write-path-mutates: a dash poll must never mutate the sense).
+if [ "${1:-}" = --status ]; then
+  if [ -f "$STATE" ]; then
+    raw_line="$(cat "$STATE" 2>/dev/null)"
+    verdict="${raw_line%%|*}"
+    mtime="$(stat -c %Y "$STATE" 2>/dev/null || echo 0)"
+    age=$(( $(date +%s) - mtime ))
+    [ -z "$verdict" ] && { echo "wan-attribution: cached state unreadable (empty)"; exit 2; }
+    printf 'wan-attribution: %s (%ss ago)\n' "$verdict" "$age"
+    case "$verdict" in CANNOT-ASSESS|SPIKE_UNCERTAIN) exit 2 ;; *) exit 0 ;; esac
+  fi
+  echo "wan-attribution: no cached state yet (never produced)"
+  exit 2
+fi
+
+# wan_probe -> prints mesh-wan-traffic's one-shot text on stdout, returns its rc.
+# Test override: WAN_ATTR_WAN_OVERRIDE supplies the text directly (skips the live SSH probe);
+# WAN_ATTR_WAN_RC_OVERRIDE supplies the rc to simulate (default 0 when the override is set).
+wan_probe() {
+  if [ -n "${WAN_ATTR_WAN_OVERRIDE+x}" ]; then
+    printf '%s' "$WAN_ATTR_WAN_OVERRIDE"
+    return "${WAN_ATTR_WAN_RC_OVERRIDE:-0}"
+  fi
+  mesh-wan-traffic 2>&1
+}
+
+# classify_wan <probe_text> <probe_rc> -> SPIKE|QUIET|UNREACHABLE. Pure string classify.
+classify_wan() {
+  local text="$1" rc="$2"
+  [ "$rc" -eq 0 ] || { echo UNREACHABLE; return; }
+  case "$text" in *SPIKE*) echo SPIKE ;; *) echo QUIET ;; esac
+}
+
+# occ_read -> prints ACTIVE|ASLEEP|AWAY|UNCERTAIN|UNKNOWN. Test override: WAN_ATTR_OCC_OVERRIDE
+# supplies the value directly (skips the file read + staleness check).
+occ_read() {
+  if [ -n "${WAN_ATTR_OCC_OVERRIDE+x}" ]; then
+    printf '%s' "$WAN_ATTR_OCC_OVERRIDE"
+    return
+  fi
+  [ -f "$HOUSEHOLD_STATE" ] || { echo UNKNOWN; return; }
+  local mtime age line
+  mtime="$(stat -c %Y "$HOUSEHOLD_STATE" 2>/dev/null || echo 0)"
+  age=$(( $(date +%s) - mtime ))
+  if [ "$age" -gt "$OCC_STALE" ]; then echo UNKNOWN; return; fi
+  line="$(head -1 "$HOUSEHOLD_STATE" 2>/dev/null | tr -d '[:space:]')"
+  case "$line" in
+    ACTIVE|ASLEEP|AWAY|UNCERTAIN) echo "$line" ;;
+    *) echo UNKNOWN ;;
+  esac
+}
+
+# fuse <wan> <occ> -> verdict on stdout
+fuse() {
+  local wan="$1" occ="$2"
+  case "$wan" in
+    UNREACHABLE) echo CANNOT-ASSESS; return ;;
+    QUIET)       echo QUIET; return ;;
+  esac
+  case "$occ" in
+    ACTIVE)            echo EXPLAINED ;;
+    ASLEEP|AWAY)       echo UNEXPLAINED ;;
+    UNCERTAIN|UNKNOWN) echo SPIKE_UNCERTAIN ;;
+    *)                 echo SPIKE_UNCERTAIN ;;
+  esac
+}
+
+if [ "${1:-}" = --test ]; then
+  _f=0
+  # --- classify_wan ---
+  [ "$(classify_wan 'RX delta: 0
+⚠ RX SPIKE' 0)" = SPIKE ]              || { echo "  FAIL classify_wan: spike text"; _f=1; }
+  [ "$(classify_wan 'RX delta: 0' 0)" = QUIET ]         || { echo "  FAIL classify_wan: quiet text"; _f=1; }
+  [ "$(classify_wan '' 1)" = UNREACHABLE ]              || { echo "  FAIL classify_wan: nonzero rc"; _f=1; }
+  # --- fuse table ---
+  [ "$(fuse UNREACHABLE ACTIVE)" = CANNOT-ASSESS ]      || { echo "  FAIL fuse: unreachable dominates"; _f=1; }
+  [ "$(fuse QUIET ACTIVE)" = QUIET ]                    || { echo "  FAIL fuse: quiet+active"; _f=1; }
+  [ "$(fuse QUIET AWAY)" = QUIET ]                      || { echo "  FAIL fuse: quiet+away"; _f=1; }
+  [ "$(fuse SPIKE ACTIVE)" = EXPLAINED ]                || { echo "  FAIL fuse: spike+active"; _f=1; }
+  [ "$(fuse SPIKE AWAY)" = UNEXPLAINED ]                || { echo "  FAIL fuse: spike+away"; _f=1; }
+  [ "$(fuse SPIKE ASLEEP)" = UNEXPLAINED ]              || { echo "  FAIL fuse: spike+asleep"; _f=1; }
+  [ "$(fuse SPIKE UNCERTAIN)" = SPIKE_UNCERTAIN ]       || { echo "  FAIL fuse: spike+uncertain"; _f=1; }
+  [ "$(fuse SPIKE UNKNOWN)" = SPIKE_UNCERTAIN ]         || { echo "  FAIL fuse: spike+unknown"; _f=1; }
+  # --- occ_read staleness gate, via the real MESH_DIR-scoped household.state (no fixture-only
+  #     shortcut for this axis — proves the actual file-path + mtime-gate logic, not a stand-in) ---
+  _sd="$(mktemp -d)"
+  printf 'ACTIVE\n' > "$_sd/.household.state"
+  _o="$(MESH_DIR="$_sd" WAN_ATTR_WAN_OVERRIDE='RX delta: 0' "$0" --json 2>&1)"
+  printf '%s' "$_o" | grep -q '"occ": *"ACTIVE"' || { echo "  FAIL occ_read: fresh ACTIVE file, got: $_o"; _f=1; }
+  touch -d '@0' "$_sd/.household.state"
+  _o2="$(MESH_DIR="$_sd" WAN_ATTR_WAN_OVERRIDE='RX delta: 0' "$0" --json 2>&1)"
+  printf '%s' "$_o2" | grep -q '"occ": *"UNKNOWN"' || { echo "  FAIL occ_read: stale file should be UNKNOWN, got: $_o2"; _f=1; }
+  rm -rf "$_sd"
+  # --- full pipeline via env overrides (no network, no real state touched) ---
+  _sd2="$(mktemp -d)"
+  _out="$(MESH_DIR="$_sd2" WAN_ATTR_WAN_OVERRIDE='RX delta: 0' WAN_ATTR_OCC_OVERRIDE=ACTIVE "$0" --json 2>&1)"
+  printf '%s' "$_out" | grep -q '"verdict": *"QUIET"' || { echo "  FAIL pipeline: expected QUIET, got: $_out"; _f=1; }
+  _out2="$(MESH_DIR="$_sd2" WAN_ATTR_WAN_OVERRIDE='RX delta: 999
+⚠ RX SPIKE' WAN_ATTR_OCC_OVERRIDE=AWAY "$0" --json 2>&1)"
+  printf '%s' "$_out2" | grep -q '"verdict": *"UNEXPLAINED"' || { echo "  FAIL pipeline: expected UNEXPLAINED, got: $_out2"; _f=1; }
+  _out3="$(MESH_DIR="$_sd2" WAN_ATTR_WAN_OVERRIDE='RX delta: 999
+⚠ RX SPIKE' WAN_ATTR_OCC_OVERRIDE=ACTIVE "$0" 2>&1)"
+  printf '%s' "$_out3" | grep -q 'EXPLAINED' || { echo "  FAIL pipeline: expected EXPLAINED text, got: $_out3"; _f=1; }
+  _stat_out="$(MESH_DIR="$_sd2" "$0" --status 2>&1)"; _stat_rc=$?
+  printf '%s' "$_stat_out" | grep -q 'wan-attribution:' || { echo "  FAIL status: expected cached readback, got: $_stat_out"; _f=1; }
+  [ "$_stat_rc" = 0 ] || [ "$_stat_rc" = 2 ] || { echo "  FAIL status: unexpected rc=$_stat_rc"; _f=1; }
+  rm -rf "$_sd2"
+  # --- unreachable WAN -> CANNOT-ASSESS, never a silent all-clear ---
+  _sd3="$(mktemp -d)"
+  _out4="$(MESH_DIR="$_sd3" WAN_ATTR_WAN_OVERRIDE='' WAN_ATTR_WAN_RC_OVERRIDE=1 WAN_ATTR_OCC_OVERRIDE=ACTIVE "$0" --json 2>&1)"
+  printf '%s' "$_out4" | grep -q '"verdict": *"CANNOT-ASSESS"' || { echo "  FAIL unreachable: expected CANNOT-ASSESS, got: $_out4"; _f=1; }
+  rm -rf "$_sd3"
+  [ "$_f" = 0 ] || { echo "smoke-test: FAIL"; exit 1; }
+  echo "smoke-test: ok (3 classify_wan + 8 fuse-table + 2 occ_read-staleness + 3 full-pipeline + 1 unreachable-gate)"
+  exit 0
+fi
+
+ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+wan_text="$(wan_probe)"; wan_rc=$?
+wan_status="$(classify_wan "$wan_text" "$wan_rc")"
+occ="$(occ_read)"
+verdict="$(fuse "$wan_status" "$occ")"
+
+printf '%s|wan=%s|occ=%s|ts=%s\n' "$verdict" "$wan_status" "$occ" "$ts" > "$STATE"
+mesh-state-touch "$STATE" 2>/dev/null || true
+
+if [ "${1:-}" = --json ]; then
+  python3 -c "
+import json
+print(json.dumps({
+  'verdict': '$verdict', 'wan': '$wan_status', 'occ': '$occ', 'ts': '$ts'
+}, indent=None))
+"
+else
+  printf '[wan-attribution-%s] %s — wan=%s occ=%s\n' "${verdict,,}" "$verdict" "$wan_status" "$occ"
+fi
+
+case "$verdict" in CANNOT-ASSESS|SPIKE_UNCERTAIN) exit 2 ;; *) exit 0 ;; esac
