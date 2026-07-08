@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+# mesh-vote <topic> — STUDY(byzantine-consensus, 2026-07-08): a simple probabilistic voting
+# system for tmux status lines. Several workers/minds can independently report an "opinion"
+# about the same question (e.g. is this node healthy, what's the presence state); a naive
+# plurality count flickers the displayed status whenever one flaky/Byzantine reporter disagrees,
+# and ties (2v2) resolve to nothing. This weights each worker's vote by a REPUTATION score — an
+# EWMA of how often that worker's past vote matched the eventual consensus — so consistently
+# agreeing workers get more say and a noisy/wrong one is gradually discounted, never permanently
+# silenced (floor 0.05 — a probabilistic, recoverable penalty, not a ban).
+#
+# Classic BFT quorum: with weight-sum quorum > 2/3, the mesh tolerates any weighted minority
+# < 1/3 lying/flaking without flipping the displayed consensus. Below quorum, the tool HOLDS the
+# last confirmed consensus (marked "(held)") instead of blanking or flapping to a minority
+# report — the actual noise-reduction this study set out for.
+#
+# Usage:
+#   printf 'worker|opinion\n...' | mesh-vote <topic>       # one round, prints consensus line
+#   printf 'worker|opinion\n...' | mesh-vote <topic> --json
+#   mesh-vote --test
+#
+# State: ~/.mesh/vote-state/<topic>.json — {reputation: {worker: 0..1}, last_consensus, last_confidence}
+# Small in-tree STUDY prototype (idea-queue byzantine-consensus, 2026-07-08) — not wired into any
+# dash/cron; a real integration (e.g. mesh-dash rendering a topic's vote) is a separate step.
+set -uo pipefail
+QUORUM=0.66
+
+_run() {
+  local topic="$1" state_dir="$HOME/.mesh/vote-state" state_file json_mode="${2:-0}" votes_file
+  mkdir -p "$state_dir" 2>/dev/null
+  state_file="$state_dir/$topic.json"
+  # heredoc (below) occupies python's stdin, so the caller's piped votes must be captured to a
+  # file FIRST — otherwise the vote data is silently lost under the heredoc redirect.
+  votes_file="$(mktemp)" || { echo "mesh-vote: FAIL (mktemp)" >&2; return 1; }
+  cat > "$votes_file"
+  python3 - "$state_file" "$json_mode" "$QUORUM" "$votes_file" << 'PYEOF'
+import sys, json, os
+
+state_file, json_mode, quorum, votes_file = sys.argv[1], sys.argv[2] == "1", float(sys.argv[3]), sys.argv[4]
+
+try:
+    with open(state_file) as f:
+        state = json.load(f)
+except (FileNotFoundError, ValueError):
+    state = {}
+reputation = state.get("reputation", {})
+last_consensus = state.get("last_consensus")
+last_confidence = state.get("last_confidence", 0.0)
+
+votes = {}  # worker -> opinion
+with open(votes_file) as vf:
+    vote_lines = vf.readlines()
+os.unlink(votes_file)
+for line in vote_lines:
+    line = line.strip()
+    if not line or "|" not in line:
+        continue
+    worker, opinion = line.split("|", 1)
+    worker, opinion = worker.strip(), opinion.strip()
+    if worker and opinion:
+        votes[worker] = opinion
+
+if not votes:
+    out = {"topic": None, "consensus": last_consensus, "confidence": last_confidence,
+           "quorum_reached": False, "held": True, "n": 0, "error": "no votes"}
+else:
+    tally = {}
+    for worker, opinion in votes.items():
+        w = reputation.get(worker, 0.5)
+        tally[opinion] = tally.get(opinion, 0.0) + w
+    total_weight = sum(reputation.get(w, 0.5) for w in votes)
+    winner, winner_weight = max(tally.items(), key=lambda kv: kv[1])
+    confidence = (winner_weight / total_weight) if total_weight > 0 else 0.0
+    quorum_reached = confidence >= quorum
+
+    if quorum_reached:
+        for worker in votes:
+            agreed = 1.0 if votes[worker] == winner else 0.0
+            prev = reputation.get(worker, 0.5)
+            reputation[worker] = max(0.05, min(1.0, prev * 0.9 + agreed * 0.1))
+        consensus, out_confidence, held = winner, confidence, False
+    else:
+        # split round: no clear truth signal, don't reward/penalize reputations —
+        # hold the last confirmed consensus instead of flapping to a minority report
+        consensus, out_confidence, held = last_consensus, last_confidence, True
+
+    state["reputation"] = reputation
+    state["last_consensus"] = consensus
+    state["last_confidence"] = out_confidence
+    with open(state_file, "w") as f:
+        json.dump(state, f)
+
+    out = {"consensus": consensus, "confidence": round(out_confidence, 3),
+           "quorum_reached": quorum_reached, "held": held, "n": len(votes),
+           "reputation": {k: round(v, 3) for k, v in reputation.items()}}
+
+if json_mode:
+    print(json.dumps(out))
+else:
+    if out.get("error"):
+        print(f"NO VOTES ({out['n']}) — holding: {out['consensus'] or 'UNKNOWN'}")
+    else:
+        tag = "(held, no quorum)" if out["held"] else "(quorum)"
+        print(f"{out['consensus']} — confidence {out['confidence']*100:.0f}% {tag} n={out['n']}")
+PYEOF
+}
+
+case "${1:-}" in
+  --test)
+    command -v python3 >/dev/null 2>&1 || { echo "smoke-test: FAIL (no python3)"; exit 1; }
+    tmp="$(mktemp -d)" || { echo "smoke-test: FAIL (mktemp failed)"; exit 1; }
+    trap 'rm -rf "$tmp"' EXIT
+
+    # Round 1: unanimous 3/3 "healthy" -> quorum, all reputations start equal at 0.5
+    out1="$(printf 'a|healthy\nb|healthy\nc|healthy\n' | HOME="$tmp" "$0" topic1 2>&1)" || {
+      echo "smoke-test: FAIL (round1 failed: $out1)"; exit 1; }
+    printf '%s' "$out1" | grep -q '^healthy — confidence 100% (quorum)' || {
+      echo "smoke-test: FAIL (round1 expected unanimous quorum: $out1)"; exit 1; }
+
+    # Build up a & b's reputation via several rounds where they agree and c is the lone
+    # dissenter (raw count 2v1 = 0.667 >= default quorum, so this establishes a & b as trusted)
+    for i in $(seq 1 10); do
+      HOME="$tmp" bash -c "printf 'a|ok\nb|ok\nc|bad\n' | \"$0\" reptopic >/dev/null"
+    done
+    # Now a genuine 2v2 TIE: a,b (built-up reputation) vs c,d (c never built rep, d is new ->
+    # default 0.5). Raw plurality count is a TIE (no naive majority) but weighted vote should
+    # resolve it because a&b's reputation now exceeds 0.5.
+    out2="$(printf 'a|ok\nb|ok\nc|bad\nd|bad\n' | HOME="$tmp" "$0" reptopic 2>&1)" || {
+      echo "smoke-test: FAIL (tie-break round failed: $out2)"; exit 1; }
+    printf '%s' "$out2" | grep -q '^ok — confidence' || {
+      echo "smoke-test: FAIL (reputation-weighted vote should break the 2v2 tie toward the consistent workers 'ok': $out2)"; exit 1; }
+    printf '%s' "$out2" | grep -q '(quorum)' || {
+      echo "smoke-test: FAIL (weighted tie-break should reach quorum, naive count could not: $out2)"; exit 1; }
+
+    # Split round with NO prior history -> below quorum -> must HOLD the prior consensus
+    # (topic1 was unanimous 'healthy'), never flip to a minority report or go blank
+    out3="$(printf 'x|healthy\ny|degraded\n' | HOME="$tmp" "$0" topic1 2>&1)" || {
+      echo "smoke-test: FAIL (split round failed: $out3)"; exit 1; }
+    printf '%s' "$out3" | grep -q '^healthy — confidence.*held, no quorum' || {
+      echo "smoke-test: FAIL (split vote must HOLD prior consensus 'healthy', not flip/blank: $out3)"; exit 1; }
+
+    # --json mode sanity
+    outj="$(printf 'a|up\nb|up\n' | HOME="$tmp" "$0" jsontopic --json 2>&1)" || {
+      echo "smoke-test: FAIL (json mode failed: $outj)"; exit 1; }
+    printf '%s' "$outj" | grep -q '"consensus": "up"' || {
+      echo "smoke-test: FAIL (json mode missing consensus field: $outj)"; exit 1; }
+
+    echo "smoke-test: ok"
+    exit 0
+    ;;
+  ""|--json)
+    echo "usage: mesh-vote <topic> [--json]  (opinions on stdin as worker|opinion)" >&2
+    exit 1
+    ;;
+  *)
+    topic="$1"; shift
+    json_mode=0
+    [ "${1:-}" = --json ] && json_mode=1
+    _run "$topic" "$json_mode"
+    ;;
+esac
