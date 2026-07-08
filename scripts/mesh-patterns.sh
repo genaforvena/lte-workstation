@@ -172,6 +172,44 @@ weather_field() {
   printf '%s\n' "${v:-UNKNOWN}"
 }
 
+# ---- shared-board cross-node dedup (extracted 2026-07-08 — see LITERATURE note below) ----
+#
+# LITERATURE (live review, 2026-07-08): Kumar, Clune, Lehman & Stanley, "Questioning
+# Representational Optimism in Deep Learning: The Fractured Entangled Representation Hypothesis"
+# (arXiv:2505.11581, 2025). FER names a failure mode of incremental, gradient-style optimization:
+# a single concept ends up re-encoded as multiple disconnected, slightly-divergent copies
+# ("fractured") instead of one reusable modular unit — versus the "unified factored representation"
+# open-ended/evolutionary search tends to produce. WE APPLIED THIS MESH'S OWN REMEDY (this file,
+# built 2026-06-14 for the rate-limit-regex case — see the file header) TOO LOOSELY: it fixed ONE
+# instance of the pattern and was never generalized as a standing rule, so the SAME anti-pattern
+# re-grew somewhere this file doesn't cover. Concretely: "check the shared mesh-chat board for
+# another node's matching post within a cooldown window before minting my own" is ONE concept, but
+# it now has independently-hand-rolled copies in scan_orphans (mesh-mind-control, 04a98cf),
+# mesh-sweep-rollcall-proposes (d357653, exact-substring match), and — freshly written the same day
+# this was noticed — mesh-criticality's alarm_emit() (timestamp-window match). Three fractured,
+# slightly-divergent encodings of one idea, exactly the FER symptom, not three genuinely different
+# problems. board_recent_ts_within() below is the ONE reusable primitive; mesh-criticality has been
+# migrated onto it (lowest-risk instance — written same-session, fully understood). scan_orphans and
+# sweep-rollcall-proposes are NOT yet migrated (each has its own battle-tested match semantics —
+# exact-substring vs timestamp-window — worth reconciling deliberately, not folded in blind); flagged
+# here rather than silently left, per the mesh's own no-silent-caps convention.
+#
+# board_recent_ts_within — $1=board-log-path $2=literal marker (grep -F, NOT a regex) $3=window_s
+# [$4=now_epoch, default now] → prints the epoch of the most recent matching line IF one exists
+# within the window; exit 0. Otherwise prints nothing, exit 1. Read-only / no side effects — the
+# caller decides what "found" means (adopt the timestamp into local cooldown state, skip a post,
+# log-only, etc).
+board_recent_ts_within(){
+  local board="$1" marker="$2" window="$3" now="${4:-$(date +%s)}"
+  [ -r "$board" ] || return 1
+  local ts epoch
+  ts="$(grep -F -- "$marker" "$board" 2>/dev/null | tail -1 | awk '{print $1}')"
+  [ -n "$ts" ] || return 1
+  epoch="$(date -u -d "$ts" +%s 2>/dev/null)" || return 1
+  [ $(( now - epoch )) -lt "$window" ] || return 1
+  printf '%s' "$epoch"
+}
+
 # Guard: run the test block ONLY when this file is EXECUTED directly — never when SOURCED.
 # (A sourced lib inherits the caller's $1, so without this guard `consumer --test` would trip the
 # lib's own test+exit and hijack the consumer's self-check.)
@@ -251,5 +289,20 @@ if [ "${1:-}" = --test ] && [ "${BASH_SOURCE[0]}" = "${0}" ]; then
   printf 'mesh-weather: BLIND (open-meteo fetch/parse failed)\n' > "$_wtd/blind"
   ck2 "$(weather_field thermal_day "$_wtd/blind")" UNKNOWN "BLIND/malformed content → UNKNOWN, never a fabricated 0"
   rm -rf "$_wtd"
+  echo "board_recent_ts_within — shared cross-node dedup primitive (FER extraction, 2026-07-08):"
+  _brd="$(mktemp -d)"
+  _bts0="$(date -u -d '2026-07-08T12:00:00Z' +%s)"
+  printf '2026-07-08T12:00:00Z  a@host  ::  [alert] widget: SUPERCRITICAL\n' > "$_brd/board"
+  bts="$(board_recent_ts_within "$_brd/board" '[alert] widget: SUPERCRITICAL' 3600 "$((_bts0+1800))")"
+  ck2 "$bts" "$_bts0" "match within window (30min later, 1h window) → epoch printed"
+  board_recent_ts_within "$_brd/board" '[alert] widget: SUPERCRITICAL' 3600 "$((_bts0+1800))" >/dev/null
+  ck2 "$?" 0 "match within window → exit 0"
+  board_recent_ts_within "$_brd/board" '[alert] widget: SUPERCRITICAL' 3600 "$((_bts0+7200))" >/dev/null
+  ck2 "$?" 1 "match but OUTSIDE window (2h later, 1h window) → exit 1"
+  board_recent_ts_within "$_brd/board" '[alert] nomatch: anything' 3600 "$((_bts0+1800))" >/dev/null
+  ck2 "$?" 1 "no matching marker → exit 1"
+  board_recent_ts_within "$_brd/no-such-file" '[alert] widget: SUPERCRITICAL' 3600 "$((_bts0+1800))" >/dev/null
+  ck2 "$?" 1 "unreadable board → exit 1, never a false match"
+  rm -rf "$_brd"
   [ "$fail" = 0 ] && { echo "smoke-test: ok"; exit 0; } || { echo "smoke-test: FAIL"; exit 1; }
 fi
