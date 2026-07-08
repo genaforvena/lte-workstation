@@ -1,0 +1,190 @@
+#!/usr/bin/env bash
+# reflex-cadence: 1-59/5 * * * *
+# reflex-args: --edge
+# mesh-note3-mag — the Note3's OWN magnetometer (AK09911C, android.sensor.magnetic_field via
+# `adb shell dumpsys sensorservice`) as a STABLE/DISTURBED edge for its fixed craft-room location,
+# via the SAME adb->ds relay mesh-baro/mesh-note3-motion/mesh-note3-desk already use.
+#
+# WHY THIS IS NEW: capability-note3-second-room-body-map-20260707.md's sensor census flagged
+# AK09911C magnetometer (last=<-347.9,-502.1,293.8>) as untapped — "nearby motor/appliance on-off
+# magnetic signature, or a magnet-on-door contact sensor" — and capability-note3-ir-proximity-
+# gesture-20260707.md confirmed the /sys/class/sensors/magnetic_sensor/raw_data mirror reads
+# -1,-1,-1 (idle: the SSP enable bitmask gates it, and writing that bitmask live was explicitly
+# DEFERRED — "risks disturbing the live HAL", not done blind/unattended). So the sysfs path
+# mesh-note3-motion uses for the accelerometer is dead for mag; the only read-only path is the
+# Android sensor HAL's own cached reading via `dumpsys sensorservice`, verified LIVE 2026-07-08
+# (last=<63.3,-6.9,102.1,...>, a real AK09911C vector — NOT the sysfs dead zero/-1). Neither
+# mesh-baro nor mesh-note3-motion nor mesh-note3-desk reads this field; nothing on the mesh senses
+# magnetic disturbance in the craft room today.
+#
+# Honest contract: this HAL entry is on-change/cached (same caveat mesh-note3-motion documents for
+# the accelerometer) — it only moves when SOME listener (system or app) actually requests a sample,
+# not a guaranteed 100Hz stream from our polling alone. So the sense is a discrete STABLE/DISTURBED
+# edge from comparing successive cached vectors, never a claim of continuous live flux. adb/ssh
+# unreachable OR the field unparsable -> UNREACHABLE, exit 2, never fake a reading.
+#
+#   mesh-note3-mag            one-shot verdict (INIT|STABLE|DISTURBED) + vector + delta
+#   mesh-note3-mag --json     machine-readable
+#   mesh-note3-mag --edge     debounced state write; board post ONLY on a STABLE<->DISTURBED transition
+#   mesh-note3-mag --test     fixture-driven classifier smoke test + live adb read-gate
+#
+# Exit: 0 = assessed (INIT/STABLE/DISTURBED) · 2 = adb body unreachable (honest n/a, never faked)
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+[ -f "$HOME/.mesh/nodes" ] && . "$HOME/.mesh/nodes"
+
+MESH="${MESH_DIR:-$HOME/.mesh}"; mkdir -p "$MESH" 2>/dev/null || true
+STATE="$MESH/.note3-mag-state"          # "verdict|x|y|z|ts"
+EDGE_STATE="$MESH/.note3-mag-edge"      # last POSTED verdict (for --edge dedup)
+
+# Note3 body is the SAME fixed adb->ds relay mesh-baro/mesh-note3-motion use; falls back to the
+# baro node vars so a single ~/.mesh/nodes entry covers every Note3-body sense.
+NOTE3_ADB_NODE="${MESH_NOTE3_ADB_NODE:-${MESH_BARO_ADB_NODE:-}}"
+NOTE3_ADB_SERIAL="${MESH_NOTE3_ADB_SERIAL:-${MESH_BARO_ADB_SERIAL:-}}"
+# Disturbance band unknown yet (first-cut, generous): Earth field is ~25-65uT; indoor readings run
+# much higher near metal/electronics (observed live: magnitude ~121uT resting). A door-mounted magnet
+# or a moved appliance swings a single axis by tens-to-hundreds of uT, so 40uT total-vector delta is
+# well above HAL read noise (which is ~0 between two dumpsys calls of the SAME cached sample) yet
+# comfortably below a real magnetic event.
+MAG_THRESH="${MESH_NOTE3_MAG_THRESH:-40}"
+
+adb_dumpsys() {   # echo raw `dumpsys sensorservice` from the adb body (empty on failure)
+  local ser=""; [ -n "$NOTE3_ADB_SERIAL" ] && ser="-s $NOTE3_ADB_SERIAL"
+  if [ "$NOTE3_ADB_NODE" = local ]; then
+    timeout 20 adb $ser shell dumpsys sensorservice 2>/dev/null
+  else
+    [ -z "$NOTE3_ADB_NODE" ] && return 1
+    timeout 30 ssh -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new \
+      "$NOTE3_ADB_NODE" "adb $ser shell dumpsys sensorservice 2>/dev/null" </dev/null 2>/dev/null
+  fi
+}
+
+# note3_mag_raw — live "x,y,z" (uT) from the AK09911C dumpsys line. Empty + rc1 on any failure
+# (adb down, ssh down, sensor line absent/malformed). Test override: NOTE3_MAG_RAW_OVERRIDE skips
+# the network entirely. Deliberately matches the CALIBRATED "android.sensor.magnetic_field" line,
+# never the "..._uncalibrated" variant (which reads all-zero on this HAL with no listener — see
+# capability doc — and would otherwise be silently mistaken for a real reading).
+note3_mag_raw() {
+  local out
+  if [ -n "${NOTE3_MAG_RAW_OVERRIDE:-}" ]; then
+    out="$NOTE3_MAG_RAW_OVERRIDE"
+  else
+    local dump; dump="$(adb_dumpsys)" || return 1
+    [ -n "$dump" ] || return 1
+    out="$(printf '%s\n' "$dump" | awk -F'last=<' '
+      /android\.sensor\.magnetic_field\|/ && !/uncalibrated/ {
+        n = split($2, a, ",")
+        if (n >= 3) { gsub(/ /,"",a[1]); gsub(/ /,"",a[2]); gsub(/ /,"",a[3]); printf "%s,%s,%s", a[1], a[2], a[3]; exit }
+      }')"
+  fi
+  printf '%s' "$out" | grep -qE '^-?[0-9]+(\.[0-9]+)?,-?[0-9]+(\.[0-9]+)?,-?[0-9]+(\.[0-9]+)?$' || return 1
+  printf '%s' "$out"
+}
+
+# classify <x> <y> <z> <prev_x|""> <prev_y> <prev_z> <thresh> -> "VERDICT DELTA"
+# DELTA is "-" for INIT (no prior vector to compare against). Pure function — no I/O — directly testable.
+classify() {
+  local x="$1" y="$2" z="$3" px="$4" py="$5" pz="$6" thresh="$7"
+  if [ -z "$px" ]; then printf 'INIT -\n'; return; fi
+  python3 -c "
+import math
+d = math.sqrt(($x-$px)**2 + ($y-$py)**2 + ($z-$pz)**2)
+print(('DISTURBED' if d >= $thresh else 'STABLE'), '%.1f' % d)
+"
+}
+
+# ─── --test: fixture-driven classifier + live adb read-gate ────────────────
+if [ "${1:-}" = --test ]; then
+  command -v python3 >/dev/null 2>&1 || { echo "smoke-test: FAIL (no python3)"; exit 1; }
+  _f=0
+
+  r="$(classify 63.3 -6.9 102.1 "" "" "" "$MAG_THRESH")"
+  [ "$(echo "$r" | awk '{print $1}')" = INIT ] || { echo "  FAIL: no prior vector must be INIT, got '$r'"; _f=1; }
+
+  r="$(classify 64.0 -7.5 103.0 63.3 -6.9 102.1 40)"
+  [ "$(echo "$r" | awk '{print $1}')" = STABLE ] || { echo "  FAIL: tiny jitter (delta~1.5) should be STABLE, got '$r'"; _f=1; }
+
+  r="$(classify 150.0 40.0 20.0 63.3 -6.9 102.1 40)"
+  [ "$(echo "$r" | awk '{print $1}')" = DISTURBED ] || { echo "  FAIL: large field swing should be DISTURBED, got '$r'"; _f=1; }
+
+  r="$(classify 63.3 -6.9 102.1 63.3 -6.9 102.1 40)"
+  [ "$(echo "$r" | awk '{print $1}')" = STABLE ] || { echo "  FAIL: identical vector (delta=0) should be STABLE, got '$r'"; _f=1; }
+  [ "$(echo "$r" | awk '{print $2}')" = "0.0" ]  || { echo "  FAIL: identical vector delta should print 0.0, got '$r'"; _f=1; }
+
+  # parse gate: malformed / uncalibrated-zero dumpsys must be rejected, never silently accepted
+  NOTE3_MAG_RAW_OVERRIDE="not,a,vector,x" note3_mag_raw >/dev/null 2>&1 && { echo "  FAIL: malformed raw must be rejected"; _f=1; }
+  NOTE3_MAG_RAW_OVERRIDE="63.3,-6.9,102.1" note3_mag_raw >/dev/null 2>&1 || { echo "  FAIL: well-formed raw must be accepted"; _f=1; }
+  _fix='AK09911C Magnetic field Sensor| Asahi Kasei Microdevices| version=1 |android.sensor.magnetic_field| 0x00000001 | "" | type=2 | continuous | maxDelay=0us |maxRate=100.00Hz | no batching | non-wakeUp | last=< 63.3, -6.9,102.1, 243818847577501>
+AK09911C Magnetic Sensor UnCalibrated| Asahi Kasei Microdevices| version=1 |android.sensor.magnetic_field_uncalibrated| 0x00000009 | "" | type=14 | continuous | maxDelay=0us |maxRate=100.00Hz | no batching | non-wakeUp | last=<  0.0,  0.0,  0.0,  0.0,  0.0,  0.0, 0>'
+  _parsed="$(printf '%s' "$_fix" | awk -F'last=<' '/android\.sensor\.magnetic_field\|/ && !/uncalibrated/ {n=split($2,a,","); gsub(/ /,"",a[1]); gsub(/ /,"",a[2]); gsub(/ /,"",a[3]); printf "%s,%s,%s", a[1],a[2],a[3]; exit}')"
+  [ "$_parsed" = "63.3,-6.9,102.1" ] || { echo "  FAIL: dumpsys parse should pick the CALIBRATED line (got '$_parsed')"; _f=1; }
+
+  # ── live adb read-gate (mesh-land treats exit 2 = honest n/a as a pass) ──
+  if [ -z "$NOTE3_ADB_NODE" ]; then
+    [ "$_f" = 0 ] || { echo "smoke-test: FAIL (classifier contract violated)"; exit 1; }
+    echo "smoke-test: n/a (MESH_NOTE3_ADB_NODE/MESH_BARO_ADB_NODE unset — Note3 body not configured on this node)"
+    exit 2
+  fi
+  _live="$(note3_mag_raw)"
+  if [ -z "$_live" ]; then
+    [ "$_f" = 0 ] || { echo "smoke-test: FAIL (classifier contract violated)"; exit 1; }
+    echo "smoke-test: n/a (adb body unreachable — Note3 mag sense unavailable)"
+    exit 2
+  fi
+  _x="$(echo "$_live" | cut -d, -f1)"; _y="$(echo "$_live" | cut -d, -f2)"; _z="$(echo "$_live" | cut -d, -f3)"
+  _ok="$(python3 -c "
+import math
+m = math.sqrt($_x**2 + $_y**2 + $_z**2)
+print(1 if 0.5 < m < 3000 else 0)
+" 2>/dev/null)"
+  [ "$_ok" = 1 ] || { echo "  FAIL: live vector magnitude implausible for a magnetometer: $_live"; _f=1; }
+  [ "$_f" = 0 ] || { echo "smoke-test: FAIL (classify/parse/live-read contract violated)"; exit 1; }
+  echo "smoke-test: ok (4 classifier + parse-gate assertions + LIVE adb read $_live uT)"
+  exit 0
+fi
+
+# ─── live read ───────────────────────────────────────────────────────────
+raw="$(note3_mag_raw)"
+if [ -z "$raw" ]; then
+  echo "note3-mag: UNREACHABLE (adb body offline/unreadable/sensor line absent)" >&2
+  [ "${1:-}" = --json ] && printf '{"verdict":"UNREACHABLE"}\n'
+  exit 2
+fi
+x="$(echo "$raw" | cut -d, -f1)"; y="$(echo "$raw" | cut -d, -f2)"; z="$(echo "$raw" | cut -d, -f3)"
+
+px=""; py=""; pz=""
+if [ -f "$STATE" ]; then
+  IFS='|' read -r _pv px py pz _pts < "$STATE" 2>/dev/null || true
+fi
+
+result="$(classify "$x" "$y" "$z" "${px:-}" "${py:-}" "${pz:-}" "$MAG_THRESH")"
+verdict="$(echo "$result" | awk '{print $1}')"
+delta="$(echo "$result" | awk '{print $2}')"
+ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+printf '%s|%s|%s|%s|%s\n' "$verdict" "$x" "$y" "$z" "$ts" > "$STATE"
+mesh-state-touch "$STATE" 2>/dev/null || touch "$STATE" 2>/dev/null || true   # ran-live liveness, independent of value-changed
+
+case "${1:-}" in
+  --json)
+    printf '{"verdict":"%s","x":%s,"y":%s,"z":%s,"delta":"%s","ts":"%s"}\n' "$verdict" "$x" "$y" "$z" "$delta" "$ts"
+    ;;
+  --edge)
+    prev_posted=""
+    [ -f "$EDGE_STATE" ] && prev_posted="$(cat "$EDGE_STATE" 2>/dev/null)"
+    if [ "$verdict" != "$prev_posted" ] && [ "$verdict" != INIT ]; then
+      board="${MESH_NOTE3_MAG_BOARD:-$MESH/chat.log}"
+      ts_board="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+      printf '%s  note3-mag@%s  ::  [note3-mag] %s (delta=%s uT vs prior read)\n' "$ts_board" "$(hostname)" "$verdict" "$delta" >> "$board" 2>/dev/null || true
+      printf '%s\n' "$verdict" > "$EDGE_STATE"
+    elif [ "$verdict" = INIT ]; then
+      printf '%s\n' "$verdict" > "$EDGE_STATE"
+    fi
+    printf 'note3-mag: %s (delta=%s uT)\n' "$verdict" "$delta"
+    ;;
+  *)
+    printf 'note3-mag: %s (x=%s y=%s z=%s uT delta=%s)\n' "$verdict" "$x" "$y" "$z" "$delta"
+    ;;
+esac
+exit 0
