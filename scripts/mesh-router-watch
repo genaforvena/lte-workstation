@@ -21,6 +21,17 @@ ROUTER="${MESH_ROUTER:-$(mesh-peer-addr router 2>/dev/null || mesh-peer-addr GL-
 RUSER="${MESH_ROUTER_USER:-root}"
 HOT="${MESH_ROUTER_HOT_C:-85}"   # °C — "running hot" warning, well below thermal shutdown (~100C+)
 STATE="$HOME/.mesh/.router-thermal-state"
+# HOLLOW-STREAK tracking (chat-review/senses-liveness 2026-07-09): "unreachable-alive" is an honest
+# signal for ONE tick, but reflex-health only gates on the STATE file's mtime — which this reflex
+# rewrites every */15 run regardless of branch — so a router stuck thermal-BLIND for WEEKS (found
+# live: GL-MT3000 tailscale offline 20d+, no LAN SSH key fallback) reads as fresh/ok forever with
+# zero signal the watchdog's actual purpose (catch a silent overheat) has been structurally inert
+# the whole time. BLIND_SINCE seeds on first blind tick, persists across ticks; once the streak
+# exceeds BLIND_ALERT_S it fires ONE edge-triggered board notice (not every cycle) so the mesh
+# stops silently assuming the sense is live. Cleared the moment a real reading resumes.
+BLIND_SINCE="$HOME/.mesh/.router-thermal-blind-since"
+BLIND_ALERTED="$HOME/.mesh/.router-thermal-blind-alerted"
+BLIND_ALERT_S="${MESH_ROUTER_BLIND_ALERT_S:-21600}"   # 6h — well past any real transient
 SSH=(ssh -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new)
 
 if [ "${1:-}" = --test ]; then
@@ -53,7 +64,58 @@ EOF
     echo "smoke-test: FAIL (status dry-run errored)"; exit 1; }
   printf '%s\n' "$out" | grep -q 'router fake-router: 86C  load 1.23' || {
     echo "smoke-test: FAIL (status output did not parse the synthetic router temp/load)"; exit 1; }
-  echo "smoke-test: ok (status dry-run parsed synthetic router temp/load)"; exit 0
+  echo "  ok: status dry-run parsed synthetic router temp/load"
+
+  # HOLLOW-STREAK regression (chat-review/senses-liveness 2026-07-09): unreachable-alive must seed
+  # a blind-since streak, escalate ONCE past a long threshold, and clear the moment a real reading
+  # resumes — the live gap found: GL-MT3000 tailscale down 20d+, watcher smoke-passed the whole time.
+  _td2="$(mktemp -d /tmp/mesh-router-watch-test2.XXXXXX)" || { echo "smoke-test: FAIL (mktemp2)"; exit 1; }
+  trap 'rm -rf "$_td" "$_td2"' EXIT
+  mkdir -p "$_td2/home/.mesh" "$_td2/bin"
+  for b in bash hostname timeout awk rm cat date mkdir touch; do ln -s "/usr/bin/$b" "$_td2/bin/$b"; done
+  cat > "$_td2/bin/ssh" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+  cat > "$_td2/bin/ip" <<'EOF'
+#!/usr/bin/env bash
+echo "default via 10.0.0.1 dev eth0"
+EOF
+  cat > "$_td2/bin/ping" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+  chmod +x "$_td2/bin/ssh" "$_td2/bin/ip" "$_td2/bin/ping"
+
+  HOME="$_td2/home" PATH="$_td2/bin" MESH_ROUTER=fake-router bash "$0" >/dev/null 2>&1
+  [ "$(cat "$_td2/home/.mesh/.router-thermal-state" 2>/dev/null)" = unreachable-alive ] || {
+    echo "smoke-test: FAIL (unreachable-alive not written on blind tick)"; exit 1; }
+  [ -f "$_td2/home/.mesh/.router-thermal-blind-since" ] || {
+    echo "smoke-test: FAIL (blind-since streak marker not seeded on first blind tick)"; exit 1; }
+  echo "  ok: unreachable-alive seeds a blind-since streak marker"
+
+  # age the streak past the alert threshold (rewrite content, not just mtime — the reflex reads
+  # the epoch from the file's CONTENT) and re-run: must trip the one-time alert flag
+  echo "$(( $(date +%s) - 25200 ))" > "$_td2/home/.mesh/.router-thermal-blind-since"   # 7h ago
+  HOME="$_td2/home" PATH="$_td2/bin" MESH_ROUTER=fake-router bash "$0" >/dev/null 2>&1
+  [ -f "$_td2/home/.mesh/.router-thermal-blind-alerted" ] || {
+    echo "smoke-test: FAIL (7h-old blind streak did not trip the one-time alert flag)"; exit 1; }
+  echo "  ok: a sustained (7h) thermal-BLIND streak trips the one-time alert flag"
+
+  # a real thermal reading resuming must clear both streak markers
+  cat > "$_td2/bin/ssh" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' '50000|0.10'
+EOF
+  chmod +x "$_td2/bin/ssh"
+  HOME="$_td2/home" PATH="$_td2/bin" MESH_ROUTER=fake-router bash "$0" >/dev/null 2>&1
+  [ -f "$_td2/home/.mesh/.router-thermal-blind-since" ] && {
+    echo "smoke-test: FAIL (blind-since not cleared after a real reading resumed)"; exit 1; }
+  [ -f "$_td2/home/.mesh/.router-thermal-blind-alerted" ] && {
+    echo "smoke-test: FAIL (blind-alerted not cleared after a real reading resumed)"; exit 1; }
+  echo "  ok: a resumed real thermal reading clears the blind-streak markers"
+
+  echo "smoke-test: ok (status parse + hollow-streak seed/escalate/clear all verified)"; exit 0
 fi
 
 [ -n "$ROUTER" ] || { echo "no router in ~/.mesh/nodes — nothing to watch on this node"; exit 0; }
@@ -71,13 +133,24 @@ mt="${raw%%|*}"; load="${raw##*|}"
   if [ -n "$gw" ] && timeout 4 ping -c1 -W3 "$gw" >/dev/null 2>&1; then
     echo "router temp unreadable: $ROUTER (tailnet probe path) down, but gateway $gw ALIVE on LAN — thermal-BLIND (no LAN SSH key), monitoring gap not a fire"
     echo unreachable-alive > "$STATE"
+    now=$(date +%s)
+    [ -f "$BLIND_SINCE" ] || echo "$now" > "$BLIND_SINCE"
+    since="$(cat "$BLIND_SINCE" 2>/dev/null || echo "$now")"
+    blind_age=$(( now - since ))
+    if [ "$blind_age" -ge "$BLIND_ALERT_S" ] && [ ! -f "$BLIND_ALERTED" ]; then
+      command -v mesh-chat >/dev/null 2>&1 && MESH_WHO="router-watch@$(hostname)" \
+        mesh-chat "[router-watch-blind] GL-MT3000 thermal probe has been BLIND for $((blind_age/3600))h+ (tailnet probe path down, no LAN SSH key fallback) — the overheat watchdog has been structurally inert this whole time, though reflex-health reports it fresh/ok (mtime-only gate). Not a code bug — honest no-LAN-key monitoring gap — flagging so it's not silently assumed live." >/dev/null 2>&1
+      touch "$BLIND_ALERTED"
+    fi
   else
     echo "router temp unreadable AND default gateway unreachable on LAN — gateway may be DOWN (LAN+egress at risk)"
     echo unreachable-down > "$STATE"
+    rm -f "$BLIND_SINCE" "$BLIND_ALERTED"
   fi
   exit 0
 }
 tc=$((mt / 1000))
+rm -f "$BLIND_SINCE" "$BLIND_ALERTED"   # a real reading just landed — any blind streak is over
 
 [ "${1:-}" = --status ] && { echo "router $ROUTER: ${tc}C  load ${load}  (hot-threshold ${HOT}C)"; exit 0; }
 
