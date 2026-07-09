@@ -23,19 +23,30 @@
 # edge from comparing successive cached vectors, never a claim of continuous live flux. adb/ssh
 # unreachable OR the field unparsable -> UNREACHABLE, exit 2, never fake a reading.
 #
-#   mesh-note3-mag            one-shot verdict (INIT|STABLE|DISTURBED) + vector + delta
+#   mesh-note3-mag            one-shot verdict (INIT/STABLE/DISTURBED/FROZEN) + vector + delta
 #   mesh-note3-mag --json     machine-readable
-#   mesh-note3-mag --edge     debounced state write; board post ONLY on a STABLE<->DISTURBED transition
+#   mesh-note3-mag --edge     debounced state write; board post ONLY on a verdict transition
 #   mesh-note3-mag --test     fixture-driven classifier smoke test + live adb read-gate
 #
-# Exit: 0 = assessed (INIT/STABLE/DISTURBED) · 2 = adb body unreachable (honest n/a, never faked)
+# FROZEN (sense-liveness sweep 2026-07-10): `dumpsys sensorservice`'s "Active sensors:" section
+# proved 0 listeners are registered for this sensor on this device (only SAMSUNG Significant
+# Motion has one) — so the HAL's cached "last=" value never receives a new sample and every poll
+# returns the byte-identical vector forever. That is NOT the same thing as "STABLE" (a real, live,
+# unchanging reading) — it is a hollow sense that LOOKS green (parses fine, exit 0, cron fires)
+# but can never again reflect reality. The HAL's own event timestamp (the 4th "last=<...>" field,
+# ns-since-boot) is the tell: this sensor is `continuous, maxRate=100.00Hz`, so a live listener
+# cannot reproduce the exact same tick across a 5-minute cron gap. An unchanged tick vs the prior
+# poll is conclusive proof of a frozen cache, not a quiet environment — reported as FROZEN instead
+# of silently folding into STABLE.
+#
+# Exit: 0 = assessed (INIT/STABLE/DISTURBED/FROZEN) · 2 = adb body unreachable (honest n/a, never faked)
 set -uo pipefail
 export PATH="$HOME/.local/bin:$PATH"
 [ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
 [ -f "$HOME/.mesh/nodes" ] && . "$HOME/.mesh/nodes"
 
 MESH="${MESH_DIR:-$HOME/.mesh}"; mkdir -p "$MESH" 2>/dev/null || true
-STATE="$MESH/.note3-mag-state"          # "verdict|x|y|z|ts"
+STATE="$MESH/.note3-mag-state"          # "verdict|x|y|z|haltick|ts"
 EDGE_STATE="$MESH/.note3-mag-edge"      # last POSTED verdict (for --edge dedup)
 
 # Note3 body is the SAME fixed adb->ds relay mesh-baro/mesh-note3-motion use; falls back to the
@@ -60,11 +71,12 @@ adb_dumpsys() {   # echo raw `dumpsys sensorservice` from the adb body (empty on
   fi
 }
 
-# note3_mag_raw — live "x,y,z" (uT) from the AK09911C dumpsys line. Empty + rc1 on any failure
-# (adb down, ssh down, sensor line absent/malformed). Test override: NOTE3_MAG_RAW_OVERRIDE skips
-# the network entirely. Deliberately matches the CALIBRATED "android.sensor.magnetic_field" line,
-# never the "..._uncalibrated" variant (which reads all-zero on this HAL with no listener — see
-# capability doc — and would otherwise be silently mistaken for a real reading).
+# note3_mag_raw — live "x,y,z,haltick" (uT + the HAL event's OWN ns-since-boot timestamp, the 4th
+# "last=<...>" field) from the AK09911C dumpsys line. Empty + rc1 on any failure (adb down, ssh
+# down, sensor line absent/malformed). Test override: NOTE3_MAG_RAW_OVERRIDE skips the network
+# entirely. Deliberately matches the CALIBRATED "android.sensor.magnetic_field" line, never the
+# "..._uncalibrated" variant (which reads all-zero on this HAL with no listener — see capability
+# doc — and would otherwise be silently mistaken for a real reading).
 note3_mag_raw() {
   local out
   if [ -n "${NOTE3_MAG_RAW_OVERRIDE:-}" ]; then
@@ -75,10 +87,10 @@ note3_mag_raw() {
     out="$(printf '%s\n' "$dump" | awk -F'last=<' '
       /android\.sensor\.magnetic_field\|/ && !/uncalibrated/ {
         n = split($2, a, ",")
-        if (n >= 3) { gsub(/ /,"",a[1]); gsub(/ /,"",a[2]); gsub(/ /,"",a[3]); printf "%s,%s,%s", a[1], a[2], a[3]; exit }
+        if (n >= 4) { gsub(/ /,"",a[1]); gsub(/ /,"",a[2]); gsub(/ /,"",a[3]); gsub(/[ >\r]/,"",a[4]); printf "%s,%s,%s,%s", a[1], a[2], a[3], a[4]; exit }
       }')"
   fi
-  printf '%s' "$out" | grep -qE '^-?[0-9]+(\.[0-9]+)?,-?[0-9]+(\.[0-9]+)?,-?[0-9]+(\.[0-9]+)?$' || return 1
+  printf '%s' "$out" | grep -qE '^-?[0-9]+(\.[0-9]+)?,-?[0-9]+(\.[0-9]+)?,-?[0-9]+(\.[0-9]+)?,[0-9]+$' || return 1
   printf '%s' "$out"
 }
 
@@ -92,6 +104,13 @@ import math
 d = math.sqrt(($x-$px)**2 + ($y-$py)**2 + ($z-$pz)**2)
 print(('DISTURBED' if d >= $thresh else 'STABLE'), '%.1f' % d)
 "
+}
+
+# is_frozen_tick <tick> <prev_tick|""> -> rc0 (frozen: identical HAL event as last poll) or rc1
+# (fresh event, or no prior poll to compare against). Pure — no I/O — directly testable.
+is_frozen_tick() {
+  local tick="$1" ptick="$2"
+  [ -n "$ptick" ] && [ "$tick" = "$ptick" ]
 }
 
 # ─── --test: fixture-driven classifier + live adb read-gate ────────────────
@@ -112,13 +131,19 @@ if [ "${1:-}" = --test ]; then
   [ "$(echo "$r" | awk '{print $1}')" = STABLE ] || { echo "  FAIL: identical vector (delta=0) should be STABLE, got '$r'"; _f=1; }
   [ "$(echo "$r" | awk '{print $2}')" = "0.0" ]  || { echo "  FAIL: identical vector delta should print 0.0, got '$r'"; _f=1; }
 
+  # frozen-tick detection: identical haltick vs prior poll -> FROZEN even though vector is identical
+  r="$(classify 63.3 -6.9 102.1 63.3 -6.9 102.1 40)"
+  [ "$(is_frozen_tick 243818847577501 243818847577501; echo $?)" = 0 ] || { echo "  FAIL: identical haltick must be detected as frozen"; _f=1; }
+  [ "$(is_frozen_tick 243818847577999 243818847577501; echo $?)" = 1 ] || { echo "  FAIL: differing haltick must NOT be detected as frozen"; _f=1; }
+  [ "$(is_frozen_tick 243818847577501 ""; echo $?)" = 1 ] || { echo "  FAIL: no prior haltick must NOT be frozen (first read)"; _f=1; }
+
   # parse gate: malformed / uncalibrated-zero dumpsys must be rejected, never silently accepted
   NOTE3_MAG_RAW_OVERRIDE="not,a,vector,x" note3_mag_raw >/dev/null 2>&1 && { echo "  FAIL: malformed raw must be rejected"; _f=1; }
-  NOTE3_MAG_RAW_OVERRIDE="63.3,-6.9,102.1" note3_mag_raw >/dev/null 2>&1 || { echo "  FAIL: well-formed raw must be accepted"; _f=1; }
+  NOTE3_MAG_RAW_OVERRIDE="63.3,-6.9,102.1,243818847577501" note3_mag_raw >/dev/null 2>&1 || { echo "  FAIL: well-formed raw must be accepted"; _f=1; }
   _fix='AK09911C Magnetic field Sensor| Asahi Kasei Microdevices| version=1 |android.sensor.magnetic_field| 0x00000001 | "" | type=2 | continuous | maxDelay=0us |maxRate=100.00Hz | no batching | non-wakeUp | last=< 63.3, -6.9,102.1, 243818847577501>
 AK09911C Magnetic Sensor UnCalibrated| Asahi Kasei Microdevices| version=1 |android.sensor.magnetic_field_uncalibrated| 0x00000009 | "" | type=14 | continuous | maxDelay=0us |maxRate=100.00Hz | no batching | non-wakeUp | last=<  0.0,  0.0,  0.0,  0.0,  0.0,  0.0, 0>'
-  _parsed="$(printf '%s' "$_fix" | awk -F'last=<' '/android\.sensor\.magnetic_field\|/ && !/uncalibrated/ {n=split($2,a,","); gsub(/ /,"",a[1]); gsub(/ /,"",a[2]); gsub(/ /,"",a[3]); printf "%s,%s,%s", a[1],a[2],a[3]; exit}')"
-  [ "$_parsed" = "63.3,-6.9,102.1" ] || { echo "  FAIL: dumpsys parse should pick the CALIBRATED line (got '$_parsed')"; _f=1; }
+  _parsed="$(printf '%s' "$_fix" | awk -F'last=<' '/android\.sensor\.magnetic_field\|/ && !/uncalibrated/ {n=split($2,a,","); gsub(/ /,"",a[1]); gsub(/ /,"",a[2]); gsub(/ /,"",a[3]); gsub(/[ >\r]/,"",a[4]); printf "%s,%s,%s,%s", a[1],a[2],a[3],a[4]; exit}')"
+  [ "$_parsed" = "63.3,-6.9,102.1,243818847577501" ] || { echo "  FAIL: dumpsys parse should pick the CALIBRATED line + haltick (got '$_parsed')"; _f=1; }
 
   # ── live adb read-gate (mesh-land treats exit 2 = honest n/a as a pass) ──
   if [ -z "$NOTE3_ADB_NODE" ]; then
@@ -140,7 +165,7 @@ print(1 if 0.5 < m < 3000 else 0)
 " 2>/dev/null)"
   [ "$_ok" = 1 ] || { echo "  FAIL: live vector magnitude implausible for a magnetometer: $_live"; _f=1; }
   [ "$_f" = 0 ] || { echo "smoke-test: FAIL (classify/parse/live-read contract violated)"; exit 1; }
-  echo "smoke-test: ok (4 classifier + parse-gate assertions + LIVE adb read $_live uT)"
+  echo "smoke-test: ok (4 classifier + 3 frozen-tick + parse-gate assertions + LIVE adb read $_live uT)"
   exit 0
 fi
 
@@ -152,18 +177,22 @@ if [ -z "$raw" ]; then
   exit 2
 fi
 x="$(echo "$raw" | cut -d, -f1)"; y="$(echo "$raw" | cut -d, -f2)"; z="$(echo "$raw" | cut -d, -f3)"
+tick="$(echo "$raw" | cut -d, -f4)"
 
-px=""; py=""; pz=""
+px=""; py=""; pz=""; ptick=""
 if [ -f "$STATE" ]; then
-  IFS='|' read -r _pv px py pz _pts < "$STATE" 2>/dev/null || true
+  IFS='|' read -r _pv px py pz ptick _pts < "$STATE" 2>/dev/null || true
 fi
 
 result="$(classify "$x" "$y" "$z" "${px:-}" "${py:-}" "${pz:-}" "$MAG_THRESH")"
 verdict="$(echo "$result" | awk '{print $1}')"
 delta="$(echo "$result" | awk '{print $2}')"
+if [ "$verdict" != INIT ] && is_frozen_tick "$tick" "${ptick:-}"; then
+  verdict=FROZEN   # HAL delivered no new event at all since the last poll — see header
+fi
 ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-printf '%s|%s|%s|%s|%s\n' "$verdict" "$x" "$y" "$z" "$ts" > "$STATE"
+printf '%s|%s|%s|%s|%s|%s\n' "$verdict" "$x" "$y" "$z" "$tick" "$ts" > "$STATE"
 mesh-state-touch "$STATE" 2>/dev/null || touch "$STATE" 2>/dev/null || true   # ran-live liveness, independent of value-changed
 
 case "${1:-}" in
