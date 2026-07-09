@@ -210,6 +210,31 @@ board_recent_ts_within(){
   printf '%s' "$epoch"
 }
 
+# mesh_is_minter — $1=board-log-path [$2=window_s, default 86400] → true (exit 0) iff THIS host is
+# the elected minter: the lexically-lowest hostname that posted ANY line to the board within the
+# window. Origin: mesh-sweep-rollcall-proposes' _rollcall_is_minter (6b3281b, chat-review/
+# rollcallprop-dedup-race-persists) — closes the case board_recent_ts_within can't: a genuine
+# same-tick collision where every racing host's check-then-act grep sees an empty/no-match board
+# (nobody has posted yet) and all fall through to mint. Election converges concurrent same-cadence
+# cron ticks across mind nodes onto ONE poster instead of racing; board_recent_ts_within stays the
+# first-line (staggered-race) defense, this is the true-simultaneity guard behind it.
+# NOT YET migrated: mesh-sweep-rollcall-proposes keeps its own copy (own battle-tested env-var
+# names, MESH_ROLLCALL_HOSTNAME/MESH_ROLLCALL_MINTER) — flagged here rather than silently left, same
+# as board_recent_ts_within above. mesh-criticality is the first consumer of this shared copy.
+# MESH_MINTER_HOSTNAME overrides the real hostname (hermetic multi-host test fixtures);
+# MESH_MINTER_PIN pins an explicit override, skipping election entirely.
+mesh_is_minter(){
+  local log="$1" window="${2:-86400}" host="${MESH_MINTER_HOSTNAME:-$(hostname)}" minter="${MESH_MINTER_PIN:-}"
+  [ -n "$minter" ] && { [ "$host" = "$minter" ]; return; }
+  [ -r "$log" ] || return 0   # nothing to elect from -> mint anyway (racy edge, never a silent drop)
+  local cutoff now_e
+  now_e="$(date +%s)"
+  cutoff="$(date -u -d "@$(( now_e - window ))" +%FT%TZ 2>/dev/null)" || cutoff=""
+  minter="$(awk -v cut="$cutoff" '$1 >= cut { n = split($2, a, "@"); if (n > 1) print a[n] }' "$log" 2>/dev/null | sort -u | head -1)"
+  [ -n "$minter" ] || return 0
+  [ "$host" = "$minter" ]
+}
+
 # Guard: run the test block ONLY when this file is EXECUTED directly — never when SOURCED.
 # (A sourced lib inherits the caller's $1, so without this guard `consumer --test` would trip the
 # lib's own test+exit and hijack the consumer's self-check.)
@@ -304,5 +329,19 @@ if [ "${1:-}" = --test ] && [ "${BASH_SOURCE[0]}" = "${0}" ]; then
   board_recent_ts_within "$_brd/no-such-file" '[alert] widget: SUPERCRITICAL' 3600 "$((_bts0+1800))" >/dev/null
   ck2 "$?" 1 "unreadable board → exit 1, never a false match"
   rm -rf "$_brd"
+  echo "mesh_is_minter — single-minter election, true-simultaneity guard:"
+  _mnd="$(mktemp -d)"
+  printf '2026-07-09T02:00:00Z  a@host-a  ::  hello\n2026-07-09T02:00:01Z  b@host-b  ::  hello\n2026-07-09T02:00:02Z  c@host-c  ::  hello\n' > "$_mnd/board"
+  if MESH_MINTER_HOSTNAME=host-a mesh_is_minter "$_mnd/board" 86400; then got=minter; else got=not; fi
+  ck2 "$got" "minter" "lexically-lowest hostname (host-a) elected"
+  if MESH_MINTER_HOSTNAME=host-b mesh_is_minter "$_mnd/board" 86400; then got=minter; else got=not; fi
+  ck2 "$got" "not" "non-lowest hostname (host-b) NOT elected"
+  if MESH_MINTER_HOSTNAME=host-c mesh_is_minter "$_mnd/board" 86400; then got=minter; else got=not; fi
+  ck2 "$got" "not" "non-lowest hostname (host-c) NOT elected"
+  if MESH_MINTER_HOSTNAME=host-z mesh_is_minter "$_mnd/no-such-file" 86400; then got=minter; else got=not; fi
+  ck2 "$got" "minter" "unreadable/empty log -> mint anyway (racy edge, never a silent drop)"
+  if MESH_MINTER_HOSTNAME=host-b MESH_MINTER_PIN=host-b mesh_is_minter "$_mnd/board" 86400; then got=minter; else got=not; fi
+  ck2 "$got" "minter" "MESH_MINTER_PIN overrides election"
+  rm -rf "$_mnd"
   [ "$fail" = 0 ] && { echo "smoke-test: ok"; exit 0; } || { echo "smoke-test: FAIL"; exit 1; }
 fi
