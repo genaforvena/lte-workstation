@@ -1,0 +1,183 @@
+#!/usr/bin/env bash
+# reflex-cadence: 2-59/5 * * * *
+# reflex-args: --edge
+# mesh-note3-light-raw — the Note3 MAX88922's RAW (uncalibrated) broadband-light ADC channel,
+# via the SAME `dumpsys sensorservice` adb->ds relay mesh-light/mesh-note3-mag already use.
+#
+# WHY THIS IS NEW: `android.sensor.light`'s dumpsys line reports THREE values —
+#   last=<lux, raw, 0, ts>
+# mesh-light's note3_light_lux() parses ONLY values[0] (the calibrated lux) for the craft-room
+# light sense; values[1] (the raw ADC/broadband-IR count feeding that calibration, observed live
+# 2026-07-09 as 4651.8 while lux read 11.0 — see capability-note3-ir-proximity-gesture-
+# 20260707.md) is read off the wire and silently discarded. It is a genuinely different quantity:
+# un-quantized (lux prints as a rounded integer; raw carries sub-lux resolution) and un-clamped
+# by whatever calibration curve produces lux, so it can register a real intensity swing (e.g. a
+# dimming trend, a partial obstruction) that the coarse lux value hides. No other mesh sense
+# reads this field — a real, live, previously-thrown-away signal, not a new probe.
+#
+# Honest contract: on-change sensor (same caveat as mesh-light's craft light) — moves only when
+# the Note3's own listener fires, not a guaranteed poll-rate stream. adb/ssh unreachable OR the
+# light line unparsable -> UNREACHABLE, exit 2, never fake a reading.
+#
+#   mesh-note3-light-raw            one-shot verdict (INIT|STABLE|CHANGED) + raw/lux/delta%
+#   mesh-note3-light-raw --json     machine-readable
+#   mesh-note3-light-raw --edge     debounced state write; board post ONLY on a STABLE<->CHANGED transition
+#   mesh-note3-light-raw --test     fixture-driven classifier smoke test + live adb read-gate
+#
+# Exit: 0 = assessed (INIT/STABLE/CHANGED) · 2 = adb body unreachable (honest n/a, never faked)
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+[ -f "$HOME/.mesh/nodes" ] && . "$HOME/.mesh/nodes"
+
+MESH="${MESH_DIR:-$HOME/.mesh}"; mkdir -p "$MESH" 2>/dev/null || true
+STATE="$MESH/.note3-light-raw-state"      # "verdict|raw|lux|ts"
+EDGE_STATE="$MESH/.note3-light-raw-edge"  # last POSTED verdict (for --edge dedup)
+
+# Same fixed adb->ds relay mesh-baro/mesh-note3-mag/mesh-light's craft light use.
+NOTE3_ADB_NODE="${MESH_NOTE3_ADB_NODE:-${MESH_BARO_ADB_NODE:-}}"
+NOTE3_ADB_SERIAL="${MESH_NOTE3_ADB_SERIAL:-${MESH_BARO_ADB_SERIAL:-}}"
+# Relative-change band: raw runs in the thousands (observed live ~4651.8) with sensor-internal
+# jitter at rest; a >=15% swing is well above that jitter but well below a real light-on/off or
+# hand-over-sensor event (which swings raw by multiples).
+RAW_THRESH_PCT="${MESH_NOTE3_LIGHT_RAW_THRESH_PCT:-15}"
+
+adb_dumpsys() {   # echo raw `dumpsys sensorservice` from the adb body (empty on failure)
+  local ser=""; [ -n "$NOTE3_ADB_SERIAL" ] && ser="-s $NOTE3_ADB_SERIAL"
+  if [ "$NOTE3_ADB_NODE" = local ]; then
+    timeout 20 adb $ser shell dumpsys sensorservice 2>/dev/null
+  else
+    [ -z "$NOTE3_ADB_NODE" ] && return 1
+    timeout 30 ssh -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new \
+      "$NOTE3_ADB_NODE" "adb $ser shell dumpsys sensorservice 2>/dev/null" </dev/null 2>/dev/null
+  fi
+}
+
+# note3_light_raw_line <line> -> "raw,lux" from an android.sensor.light dumpsys line, or empty
+# + rc1 if unparseable. Pure/offline-testable.
+note3_light_raw_line() {
+  printf '%s\n' "$1" | awk -F'last=<' '
+    /android\.sensor\.light\|/ {
+      n = split($2, a, ",")
+      if (n >= 2) { gsub(/ /,"",a[1]); gsub(/ /,"",a[2]); printf "%s,%s", a[2], a[1]; exit }
+    }'
+}
+
+# note3_light_raw — live "raw,lux" from the MAX88922 dumpsys line. Empty + rc1 on any failure
+# (adb down, ssh down, sensor line absent/malformed). Test override: NOTE3_LIGHT_RAW_OVERRIDE
+# skips the network entirely.
+note3_light_raw() {
+  local out
+  if [ -n "${NOTE3_LIGHT_RAW_OVERRIDE:-}" ]; then
+    out="$NOTE3_LIGHT_RAW_OVERRIDE"
+  else
+    local dump; dump="$(adb_dumpsys)" || return 1
+    [ -n "$dump" ] || return 1
+    out="$(printf '%s\n' "$dump" | grep 'android\.sensor\.light|' | head -1 | { IFS= read -r l; note3_light_raw_line "$l"; })"
+  fi
+  printf '%s' "$out" | grep -qE '^-?[0-9]+(\.[0-9]+)?,-?[0-9]+(\.[0-9]+)?$' || return 1
+  printf '%s' "$out"
+}
+
+# classify <raw> <prev_raw|""> <thresh_pct> -> "VERDICT DELTA_PCT"
+# DELTA_PCT is "-" for INIT (no prior to compare against). Pure function — directly testable.
+classify() {
+  local raw="$1" praw="$2" thresh="$3"
+  if [ -z "$praw" ]; then printf 'INIT -\n'; return; fi
+  python3 -c "
+raw, praw, thresh = $raw, $praw, $thresh
+base = praw if praw != 0 else 1
+pct = abs(raw - praw) / abs(base) * 100
+print(('CHANGED' if pct >= thresh else 'STABLE'), '%.1f' % pct)
+"
+}
+
+# ─── --test: fixture-driven classifier + live adb read-gate ────────────────
+if [ "${1:-}" = --test ]; then
+  command -v python3 >/dev/null 2>&1 || { echo "smoke-test: FAIL (no python3)"; exit 1; }
+  _f=0
+
+  r="$(classify 4651.8 "" "$RAW_THRESH_PCT")"
+  [ "$(echo "$r" | awk '{print $1}')" = INIT ] || { echo "  FAIL: no prior raw must be INIT, got '$r'"; _f=1; }
+
+  r="$(classify 4700.0 4651.8 15)"
+  [ "$(echo "$r" | awk '{print $1}')" = STABLE ] || { echo "  FAIL: tiny jitter (~1%) should be STABLE, got '$r'"; _f=1; }
+
+  r="$(classify 2000.0 4651.8 15)"
+  [ "$(echo "$r" | awk '{print $1}')" = CHANGED ] || { echo "  FAIL: large raw swing should be CHANGED, got '$r'"; _f=1; }
+
+  r="$(classify 4651.8 4651.8 15)"
+  [ "$(echo "$r" | awk '{print $1}')" = STABLE ] || { echo "  FAIL: identical raw (delta=0) should be STABLE, got '$r'"; _f=1; }
+  [ "$(echo "$r" | awk '{print $2}')" = "0.0" ]  || { echo "  FAIL: identical raw delta should print 0.0, got '$r'"; _f=1; }
+
+  # parse gate: malformed / absent light line must be rejected, never silently accepted
+  NOTE3_LIGHT_RAW_OVERRIDE="not,a,pair,x" note3_light_raw >/dev/null 2>&1 && { echo "  FAIL: malformed raw must be rejected"; _f=1; }
+  NOTE3_LIGHT_RAW_OVERRIDE="4651.8,11.0" note3_light_raw >/dev/null 2>&1 || { echo "  FAIL: well-formed raw,lux pair must be accepted"; _f=1; }
+  _fix='MAX88922 RGB Sensor| MAXIM, Inc.| version=1 |android.sensor.light| 0x00000006 | "" | type=5 | on-change | maxDelay=0us |maxRate=5.00Hz | no batching | non-wakeUp | last=< 11.0,4651.8,  0.0, 175726812743590>'
+  _parsed="$(note3_light_raw_line "$_fix")"
+  [ "$_parsed" = "4651.8,11.0" ] || { echo "  FAIL: dumpsys parse should pick values[1] as raw + values[0] as lux (got '$_parsed')"; _f=1; }
+
+  # ── live adb read-gate (mesh-land treats exit 2 = honest n/a as a pass) ──
+  if [ -z "$NOTE3_ADB_NODE" ]; then
+    [ "$_f" = 0 ] || { echo "smoke-test: FAIL (classifier contract violated)"; exit 1; }
+    echo "smoke-test: n/a (MESH_NOTE3_ADB_NODE/MESH_BARO_ADB_NODE unset — Note3 body not configured on this node)"
+    exit 2
+  fi
+  _live="$(note3_light_raw)"
+  if [ -z "$_live" ]; then
+    [ "$_f" = 0 ] || { echo "smoke-test: FAIL (classifier contract violated)"; exit 1; }
+    echo "smoke-test: n/a (adb body unreachable — Note3 light-raw sense unavailable)"
+    exit 2
+  fi
+  _raw="$(echo "$_live" | cut -d, -f1)"
+  _ok="$(python3 -c "print(1 if 0 <= ($_raw) < 200000 else 0)" 2>/dev/null)"
+  [ "$_ok" = 1 ] || { echo "  FAIL: live raw implausible for this ADC: $_live"; _f=1; }
+  [ "$_f" = 0 ] || { echo "smoke-test: FAIL (classify/parse/live-read contract violated)"; exit 1; }
+  echo "smoke-test: ok (5 classifier + parse-gate assertions + LIVE adb read $_live)"
+  exit 0
+fi
+
+# ─── live read ───────────────────────────────────────────────────────────
+pair="$(note3_light_raw)"
+if [ -z "$pair" ]; then
+  echo "note3-light-raw: UNREACHABLE (adb body offline/unreadable/sensor line absent)" >&2
+  [ "${1:-}" = --json ] && printf '{"verdict":"UNREACHABLE"}\n'
+  exit 2
+fi
+raw="$(echo "$pair" | cut -d, -f1)"; lux="$(echo "$pair" | cut -d, -f2)"
+
+praw=""
+if [ -f "$STATE" ]; then
+  IFS='|' read -r _pv praw _plux _pts < "$STATE" 2>/dev/null || true
+fi
+
+result="$(classify "$raw" "${praw:-}" "$RAW_THRESH_PCT")"
+verdict="$(echo "$result" | awk '{print $1}')"
+delta="$(echo "$result" | awk '{print $2}')"
+ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+printf '%s|%s|%s|%s\n' "$verdict" "$raw" "$lux" "$ts" > "$STATE"
+mesh-state-touch "$STATE" 2>/dev/null || touch "$STATE" 2>/dev/null || true   # ran-live liveness, independent of value-changed
+
+case "${1:-}" in
+  --json)
+    printf '{"verdict":"%s","raw":%s,"lux":%s,"delta_pct":"%s","ts":"%s"}\n' "$verdict" "$raw" "$lux" "$delta" "$ts"
+    ;;
+  --edge)
+    prev_posted=""
+    [ -f "$EDGE_STATE" ] && prev_posted="$(cat "$EDGE_STATE" 2>/dev/null)"
+    if [ "$verdict" != "$prev_posted" ] && [ "$verdict" != INIT ]; then
+      board="${MESH_NOTE3_LIGHT_RAW_BOARD:-$MESH/chat.log}"
+      ts_board="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+      printf '%s  note3-light-raw@%s  ::  [note3-light-raw] %s (raw=%s lux=%s delta=%s%%)\n' "$ts_board" "$(hostname)" "$verdict" "$raw" "$lux" "$delta" >> "$board" 2>/dev/null || true
+      printf '%s\n' "$verdict" > "$EDGE_STATE"
+    elif [ "$verdict" = INIT ]; then
+      printf '%s\n' "$verdict" > "$EDGE_STATE"
+    fi
+    printf 'note3-light-raw: %s (raw=%s lux=%s delta=%s%%)\n' "$verdict" "$raw" "$lux" "$delta"
+    ;;
+  *)
+    printf 'note3-light-raw: %s (raw=%s lux=%s delta=%s%%)\n' "$verdict" "$raw" "$lux" "$delta"
+    ;;
+esac
+exit 0
