@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+# reflex-cadence: */15 * * * *
+# reflex-args: --edge
+# mesh-wifi-heat-attrib — CROSS-SENSE FUSION: is the WiFi radio's heat coming from this node's
+# Tailscale exit-node RELAY traffic, or from its own LOCAL wifi/internet use, or neither?
+#
+# Fuses mesh-wifi-temp (radio junction temp, /sys/class/hwmon iwlwifi*) with mesh-net-io
+# (per-interface rx/tx rate: tailscale0 = this node's own tailnet traffic PLUS every forwarded
+# exit-node client's egress; wlp0s20f3 = the physical radio's total traffic, local+forwarded).
+# Neither sense alone answers "why is the radio hot": mesh-wifi-temp only says COOL/WARM/HOT,
+# mesh-net-io only says which interface is busy — it takes BOTH to attribute a WARM/HOT radio to
+# RELAY-LOAD (exit-node forwarding is driving it) vs LOCAL-LOAD (this node's own traffic) vs
+# UNEXPLAINED (hot with no traffic correlate — worth a closer look, not "just relay").
+#
+# WHY THIS IS NEW: this node is CLAUDE.local.md's declared Tailscale exit node — every consenting
+# tailnet peer's internet traffic rides this radio. mesh-wifi-temp already names that fact in its
+# own header but never attributes; mesh-stress's thermal axis fuses CPU/package/GPU/swap against
+# temp but has no NETWORK term at all. A hot radio during heavy relay is a different operational
+# fact (throttle/shed the exit-node role) than a hot radio during heavy local use (nothing to do
+# about it) — this is the fusion that tells them apart.
+#
+# Honest-fusion: wifi-temp unreadable (no iwlwifi hwmon — most nodes) -> UNAVAILABLE, exit 2, never
+# a fabricated verdict. net-io producing no rate for an interface (first run, no PREV yet) reads as
+# 0 upstream already (mesh-net-io's own contract) — this tool inherits that, does not paper over it.
+#
+#   mesh-wifi-heat-attrib          one fused line + verdict
+#   mesh-wifi-heat-attrib --json   machine-readable
+#   mesh-wifi-heat-attrib --edge   emit only on verdict change (state still refreshed every success)
+#   mesh-wifi-heat-attrib --test   fixture-backed classifier + real-read gate
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+
+MESH="${MESH_DIR:-$HOME/.mesh}"
+STATE="$MESH/.wifi-heat-attrib.state"
+mkdir -p "$MESH" 2>/dev/null || true
+
+MIN_ACTIVE="${MESH_WIFI_HEAT_MIN_ACTIVE:-20000}"   # B/s combined rx+tx below which a rate reads as "idle", not a load correlate
+
+json_num() { # $1=json $2=key -> numeric value or empty
+  printf '%s' "$1" | grep -oE "\"$2\":[0-9.]+" | head -1 | cut -d: -f2
+}
+json_str() { # $1=json $2=key -> string value or empty
+  printf '%s' "$1" | grep -oE "\"$2\":\"[^\"]*\"" | head -1 | cut -d: -f2- | tr -d '"'
+}
+
+# iface_rate <net-io-json> <iface> -> combined rx+tx B/s for that interface, 0 if absent
+iface_rate() {
+  local j="$1" iface="$2" block
+  block="$(printf '%s' "$j" | grep -oE "\{\"name\":\"$iface\"[^}]*\}" | head -1)"
+  [ -n "$block" ] || { echo 0; return; }
+  local rr tr
+  rr="$(json_num "$block" rx_rate)"; tr="$(json_num "$block" tx_rate)"
+  [[ "$rr" =~ ^[0-9]+$ ]] || rr=0
+  [[ "$tr" =~ ^[0-9]+$ ]] || tr=0
+  echo $((rr + tr))
+}
+
+# classify <label> <ts_rate> <local_rate> <min_active> -> RELAY-LOAD|LOCAL-LOAD|UNEXPLAINED-HOT|NOMINAL
+classify() {
+  local label="$1" ts_rate="$2" local_rate="$3" min="$4"
+  case "$label" in
+    COOL|"") echo NOMINAL; return ;;
+  esac
+  if [ "$ts_rate" -ge "$min" ] 2>/dev/null && [ "$ts_rate" -ge "$local_rate" ] 2>/dev/null; then
+    echo RELAY-LOAD
+  elif [ "$local_rate" -ge "$min" ] 2>/dev/null && [ "$local_rate" -gt "$ts_rate" ] 2>/dev/null; then
+    echo LOCAL-LOAD
+  else
+    echo UNEXPLAINED-HOT
+  fi
+}
+
+if [ "${1:-}" = --test ]; then
+  fail=0
+  # --- pure classifier fixtures (no hardware needed) ---
+  [ "$(classify COOL 0 0 20000)" = NOMINAL ] || { echo "smoke-test: FAIL (COOL must be NOMINAL regardless of traffic)"; fail=1; }
+  [ "$(classify WARM 50000 5000 20000)" = RELAY-LOAD ] || { echo "smoke-test: FAIL (tailscale-dominant WARM should be RELAY-LOAD)"; fail=1; }
+  [ "$(classify HOT 5000 90000 20000)" = LOCAL-LOAD ] || { echo "smoke-test: FAIL (wifi-dominant HOT should be LOCAL-LOAD)"; fail=1; }
+  [ "$(classify HOT 500 300 20000)" = UNEXPLAINED-HOT ] || { echo "smoke-test: FAIL (HOT with no active traffic should be UNEXPLAINED-HOT, not silently NOMINAL)"; fail=1; }
+  [ "$(classify WARM 25000 25000 20000)" = RELAY-LOAD ] || { echo "smoke-test: FAIL (tie at/above min should favor RELAY-LOAD, ts_rate>=local_rate branch)"; fail=1; }
+
+  # --- iface_rate parsing fixture ---
+  fx='{"interfaces":[{"name":"wlp0s20f3","rx_rate":90008,"tx_rate":62279,"rx_total":1,"tx_total":1},{"name":"tailscale0","rx_rate":11387,"tx_rate":14157,"rx_total":1,"tx_total":1}],"spike":0,"ts":"x"}'
+  [ "$(iface_rate "$fx" wlp0s20f3)" = 152287 ] || { echo "smoke-test: FAIL (iface_rate wlp0s20f3 parse)"; fail=1; }
+  [ "$(iface_rate "$fx" tailscale0)" = 25544 ] || { echo "smoke-test: FAIL (iface_rate tailscale0 parse)"; fail=1; }
+  [ "$(iface_rate "$fx" nonexistent0)" = 0 ] || { echo "smoke-test: FAIL (iface_rate absent-interface must be 0, not error)"; fail=1; }
+
+  [ "$fail" = 0 ] || exit 1
+
+  # --- real-read gate: on THIS node (iwlwifi hwmon present) a live run must produce a real verdict,
+  # not just exercise the offline classifier (canonical mesh-mag/mesh-gyro hollow-sense lesson) ---
+  if command -v mesh-wifi-temp >/dev/null 2>&1 && mesh-wifi-temp --json >/dev/null 2>&1; then
+    live="$("$0" --json 2>/dev/null)" || { echo "smoke-test: FAIL (live run errored despite wifi-temp available)"; exit 1; }
+    printf '%s' "$live" | grep -qE '"verdict":"(NOMINAL|RELAY-LOAD|LOCAL-LOAD|UNEXPLAINED-HOT)"' \
+      || { echo "smoke-test: FAIL (live run produced no real verdict: $live)"; exit 1; }
+    printf '%s' "$live" | grep -q '"temp_c":' || { echo "smoke-test: FAIL (live run missing temp_c: $live)"; exit 1; }
+  fi
+  echo "smoke-test: ok"
+  exit 0
+fi
+
+MODE=text; EDGE=0
+case "${1:-}" in
+  --json) MODE=json ;;
+  --edge) EDGE=1 ;;
+esac
+
+TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+wt_json="$(mesh-wifi-temp --json 2>/dev/null)"
+wt_rc=$?
+if [ "$wt_rc" -ne 0 ] || [ -z "$wt_json" ]; then
+  # honest-fusion: no radio hwmon on this node (or wifi-temp itself unreachable) -> UNAVAILABLE,
+  # never a fabricated verdict. mesh-state-touch still refreshes liveness (we DID run, just have no
+  # thermal input to attribute).
+  mesh-state-touch "$STATE" 2>/dev/null || true
+  if [ "$MODE" = json ]; then
+    printf '{"verdict":"UNAVAILABLE","reason":"wifi-temp unreachable (no iwlwifi hwmon)","ts":"%s"}\n' "$TS"
+  else
+    echo "wifi-heat-attrib: UNAVAILABLE (no iwlwifi radio hwmon on this node)"
+  fi
+  exit 2
+fi
+
+label="$(json_str "$wt_json" label)"
+temp_c="$(json_num "$wt_json" temp_c)"
+
+ni_json="$(mesh-net-io --json 2>/dev/null)"
+ts_rate=0; local_rate=0
+if [ -n "$ni_json" ]; then
+  ts_rate="$(iface_rate "$ni_json" tailscale0)"
+  local_rate="$(iface_rate "$ni_json" wlp0s20f3)"
+fi
+
+verdict="$(classify "$label" "$ts_rate" "$local_rate" "$MIN_ACTIVE")"
+
+prev="$(cat "$STATE" 2>/dev/null | cut -d'|' -f1)"
+printf '%s|%s|%s|%s\n' "$verdict" "$label" "$ts_rate" "$local_rate" > "$STATE" 2>/dev/null
+mesh-state-touch "$STATE" 2>/dev/null || true
+
+if [ "$EDGE" = 1 ] && [ "$verdict" = "$prev" ]; then
+  exit 0
+fi
+
+if [ "$MODE" = json ]; then
+  printf '{"verdict":"%s","temp_label":"%s","temp_c":%s,"tailscale_rate":%s,"local_rate":%s,"ts":"%s"}\n' \
+    "$verdict" "$label" "${temp_c:-null}" "$ts_rate" "$local_rate" "$TS"
+else
+  printf 'wifi-heat-attrib: radio=%s (%s°C) tailscale0=%sB/s wlp0s20f3=%sB/s -> %s\n' \
+    "$label" "${temp_c:-?}" "$ts_rate" "$local_rate" "$verdict"
+fi
