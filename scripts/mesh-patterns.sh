@@ -331,7 +331,12 @@ if [ "${1:-}" = --test ] && [ "${BASH_SOURCE[0]}" = "${0}" ]; then
   rm -rf "$_brd"
   echo "mesh_is_minter — single-minter election, true-simultaneity guard:"
   _mnd="$(mktemp -d)"
-  printf '2026-07-09T02:00:00Z  a@host-a  ::  hello\n2026-07-09T02:00:01Z  b@host-b  ::  hello\n2026-07-09T02:00:02Z  c@host-c  ::  hello\n' > "$_mnd/board"
+  # timestamps RELATIVE to test-run time (was hardcoded 2026-07-09T02:00:00Z..:02Z, which aged out of
+  # mesh_is_minter's own 86400s window as wall-clock advanced → host-b/c wrongly "mint anyway" → FAIL
+  # on any run >~24h after the fixed date; chat-review/patterns-minter-test-date-drift 2026-07-10).
+  _mn_e="$(date +%s)"
+  printf '%s  a@host-a  ::  hello\n%s  b@host-b  ::  hello\n%s  c@host-c  ::  hello\n' \
+    "$(date -u -d "@$((_mn_e-30))" +%FT%TZ)" "$(date -u -d "@$((_mn_e-29))" +%FT%TZ)" "$(date -u -d "@$((_mn_e-28))" +%FT%TZ)" > "$_mnd/board"
   if MESH_MINTER_HOSTNAME=host-a mesh_is_minter "$_mnd/board" 86400; then got=minter; else got=not; fi
   ck2 "$got" "minter" "lexically-lowest hostname (host-a) elected"
   if MESH_MINTER_HOSTNAME=host-b mesh_is_minter "$_mnd/board" 86400; then got=minter; else got=not; fi
