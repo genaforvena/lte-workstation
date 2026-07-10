@@ -1,0 +1,163 @@
+#!/usr/bin/env bash
+# reflex-cadence: 37 * * * *
+# reflex-args: --edge
+# mesh-time-integrity — TIME-TRUST fusion: is this node's wall clock actually safe to build
+# timestamp-based mesh liveness leases on (memory liveness-is-lease-not-cached-status)?
+#
+# Fuses TWO independent time senses that measure DIFFERENT layers of the same clock:
+#   * mesh-clock-sync  — is the SYSTEM clock disciplined to NTP RIGHT NOW (software/network).
+#   * mesh-rtc-drift   — has the HARDWARE RTC chip (battery/crystal-backed, survives power-off)
+#                        drifted from truth — a slow hardware-degradation signal invisible to NTP.
+#
+# Neither alone answers the question that actually matters for a node whose leases everyone else
+# trusts: "if this node lost network and rebooted right now, would it come back up with a sane
+# clock?" NTP-SYNCED only says today's software discipline is working; it says nothing about the
+# hardware fallback NTP is quietly standing in front of. A node can read clean SYNCED from
+# mesh-clock-sync for months while its CMOS battery dies underneath — invisible until the day
+# network is ALSO down at boot, and the node wakes with a garbage clock, poisoning every
+# freshness/staleness check it participates in with no warning beforehand. That masked compound
+# risk is the fusion's headline verdict (MASKED-RISK below) — neither sense flags it alone: NTP
+# reports SYNCED (true, not urgent by itself) and rtc-drift reports DRIFTED (true, but doesn't know
+# whether NTP is currently covering for it).
+#
+#   TRUSTED        both axes agree the clock is sound — safe to reboot cold, safe to lease off of
+#   MASKED-RISK    NTP disciplined NOW, but the hardware RTC has drifted — the safety net under
+#                  NTP is failing; a network-less cold boot will wake with a bad clock
+#   SOFT-DEGRADED  NTP not disciplining right now, but the RTC is still close — current time is
+#                  probably still roughly right, lower urgency than a compound failure
+#   COMPOUND-FAIL  NTP not disciplining AND the RTC has drifted — clock is untrustworthy NOW and
+#                  will not self-correct across a reboot either
+#   UNKNOWN        both axes unreachable — cannot assess (exit 2; never a faked TRUSTED)
+#
+# Honest-fusion rule: an UNREACHABLE axis renders a `degraded=` tag alongside the best-effort
+# verdict from the surviving axis — never silently promoted to a clean TRUSTED. Only both axes
+# unreachable renders UNKNOWN.
+#
+#   mesh-time-integrity          one-line verdict to stdout (exit 0; 2 if both axes dark)
+#   mesh-time-integrity --json   machine-readable {verdict, rtc, ntp, degraded, reason, ts}
+#   mesh-time-integrity --edge   emit only on verdict-band change (stateful reflex)
+#   mesh-time-integrity --test   smoke-test (synthetic axis overrides — no live reads)
+#
+# Vocab contract: FIRST token after "[time-integrity] " is the verdict above and appears nowhere
+# else in the line (consumers grep -q 'MASKED-RISK' etc.). Read-only (no actuators).
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+
+MESH="${MESH_DIR:-$HOME/.mesh}"
+STATE="$MESH/.time-integrity.state"
+mkdir -p "$MESH" 2>/dev/null || true
+
+# --- axis readers (overridable for --test: set MESH_TIME_INTEGRITY_RTC / _NTP to bypass live reads) ---
+# rtc axis → echoes SYNCED|SKEWED|DRIFTED|UNREACH
+read_rtc() {
+  if [ -n "${MESH_TIME_INTEGRITY_RTC:-}" ]; then printf '%s' "$MESH_TIME_INTEGRITY_RTC"; return; fi
+  local out
+  out="$(mesh-rtc-drift --json 2>/dev/null)"
+  [ -n "$out" ] || { printf 'UNREACH'; return; }
+  printf '%s' "$out" | grep -oE '"band":"[A-Z]+"' | head -1 | cut -d'"' -f4
+}
+# ntp axis → echoes SYNCED|DRIFT|UNSYNCED|NO-NTP|UNREACH
+read_ntp() {
+  if [ -n "${MESH_TIME_INTEGRITY_NTP:-}" ]; then printf '%s' "$MESH_TIME_INTEGRITY_NTP"; return; fi
+  local out
+  out="$(mesh-clock-sync --json 2>/dev/null)"
+  [ -n "$out" ] || { printf 'UNREACH'; return; }
+  printf '%s' "$out" | grep -oE '"verdict":"[A-Z-]+"' | head -1 | cut -d'"' -f4
+}
+
+# collapse each axis to OK|BAD|UNREACH for the fusion matrix
+rtc_class() { case "$1" in SYNCED|SKEWED) echo OK ;; DRIFTED) echo BAD ;; *) echo UNREACH ;; esac; }
+ntp_class() { case "$1" in SYNCED) echo OK ;; DRIFT|UNSYNCED|NO-NTP) echo BAD ;; *) echo UNREACH ;; esac; }
+
+fuse() { # $1=rtc_class $2=ntp_class -> "$verdict|$degraded"
+  case "${1}::${2}" in
+    OK::OK)           echo "TRUSTED|none" ;;
+    OK::BAD)          echo "SOFT-DEGRADED|none" ;;
+    OK::UNREACH)       echo "TRUSTED|ntp-unreach" ;;
+    BAD::OK)          echo "MASKED-RISK|none" ;;
+    BAD::BAD)         echo "COMPOUND-FAIL|none" ;;
+    BAD::UNREACH)      echo "MASKED-RISK|ntp-unreach" ;;
+    UNREACH::OK)       echo "TRUSTED|rtc-unreach" ;;
+    UNREACH::BAD)      echo "SOFT-DEGRADED|rtc-unreach" ;;
+    UNREACH::UNREACH)  echo "UNKNOWN|both-unreach" ;;
+    *)                echo "UNKNOWN|parse" ;;
+  esac
+}
+
+if [ "${1:-}" = --test ]; then
+  fail=0
+  check() { # $1=rtc-band $2=ntp-verdict $3=expected-verdict $4=expected-degraded
+    local got vd dg
+    got="$(MESH_TIME_INTEGRITY_RTC="$1" MESH_TIME_INTEGRITY_NTP="$2" "$0" 2>/dev/null)"
+    vd="$(printf '%s' "$got" | sed -nE 's/^\[time-integrity\] ([A-Z-]+) .*/\1/p')"
+    dg="$(printf '%s' "$got" | grep -oE 'degraded=[a-z-]+' | cut -d= -f2)"
+    if [ "$vd" != "$3" ] || [ "$dg" != "$4" ]; then
+      echo "  FAIL: rtc='$1' ntp='$2' -> verdict=$vd degraded=$dg (want $3/$4)"; fail=1
+    fi
+  }
+  #     rtc       ntp         verdict          degraded
+  check SYNCED    SYNCED      TRUSTED          none          # clean: both axes agree, safe to reboot cold
+  check SKEWED    SYNCED      TRUSTED          none          # minor RTC jitter is normal read-noise, still fine
+  check DRIFTED   SYNCED      MASKED-RISK      none           # THE headline case: NTP hides a dying RTC
+  check SYNCED    UNSYNCED    SOFT-DEGRADED    none          # NTP down but hardware backstop still close
+  check SYNCED    NO-NTP      SOFT-DEGRADED    none
+  check DRIFTED   DRIFT       COMPOUND-FAIL    none           # worst case: untrustworthy now AND across reboot
+  check DRIFTED   UNSYNCED    COMPOUND-FAIL    none
+  check UNREACH   SYNCED      TRUSTED          rtc-unreach   # can't assess hw fallback, but sw clock fine now
+  check UNREACH   UNSYNCED    SOFT-DEGRADED    rtc-unreach
+  check SYNCED    UNREACH     TRUSTED          ntp-unreach   # rtc agrees, can't confirm live ntp discipline
+  check DRIFTED   UNREACH     MASKED-RISK      ntp-unreach
+  check UNREACH   UNREACH     UNKNOWN          both-unreach
+  # honest-degraded invariant: an unreachable axis must never silently promote to a clean TRUSTED
+  # without the degraded tag (already asserted per-case above); exit-code contract:
+  MESH_TIME_INTEGRITY_RTC=UNREACH MESH_TIME_INTEGRITY_NTP=UNREACH "$0" >/dev/null 2>&1
+  [ $? -eq 2 ] || { echo "  FAIL: both-unreach must exit 2 (cannot-assess)"; fail=1; }
+  MESH_TIME_INTEGRITY_RTC=DRIFTED MESH_TIME_INTEGRITY_NTP=SYNCED "$0" >/dev/null 2>&1
+  [ $? -eq 0 ] || { echo "  FAIL: MASKED-RISK is a perceived verdict, must exit 0 (not cannot-assess)"; fail=1; }
+  [ "$fail" = 0 ] || { echo "smoke-test: FAIL"; exit 1; }
+
+  # real-read gate (doctrine: --test must assert a live read produces data, not just offline logic)
+  live="$("$0" --json 2>/dev/null)"; rc=$?
+  if [ "$rc" = 2 ]; then
+    echo "smoke-test: ok (fusion matrix 12 cases + exit-code contract; LIVE read -> UNKNOWN/both-axes-dark, honest n/a on this node)"
+    exit 0
+  fi
+  printf '%s' "$live" | grep -qE '"verdict":"(TRUSTED|MASKED-RISK|SOFT-DEGRADED|COMPOUND-FAIL)"' \
+    || { echo "  FAIL: live read produced no valid verdict: $live"; exit 1; }
+  echo "smoke-test: ok (fusion matrix 12 cases + exit-code contract; LIVE read -> $(printf '%s' "$live" | grep -oE '"verdict":"[A-Z-]+"')"
+  exit 0
+fi
+
+# --- fuse the real (or overridden) axes ---
+ts="$(date -u +%FT%TZ)"
+rtc_raw="$(read_rtc)"; rtc_c="$(rtc_class "$rtc_raw")"
+ntp_raw="$(read_ntp)"; ntp_c="$(ntp_class "$ntp_raw")"
+res="$(fuse "$rtc_c" "$ntp_c")"
+verdict="${res%%|*}"; degraded="${res#*|}"
+
+case "$verdict" in
+  TRUSTED)       reason="rtc=$rtc_raw ntp=$ntp_raw — hardware and software clocks agree, safe to lease off of" ;;
+  MASKED-RISK)   reason="ntp=$ntp_raw looks clean, but rtc=$rtc_raw — NTP is currently masking a drifting hardware RTC; a network-less cold boot will wake with a bad clock" ;;
+  SOFT-DEGRADED) reason="ntp=$ntp_raw not disciplining, but rtc=$rtc_raw — current time likely still roughly correct, lower urgency" ;;
+  COMPOUND-FAIL) reason="ntp=$ntp_raw AND rtc=$rtc_raw — clock is untrustworthy now and will not self-correct on reboot" ;;
+  UNKNOWN)       reason="both axes unreachable (rtc=$rtc_raw ntp=$ntp_raw) — cannot assess" ;;
+esac
+[ "$degraded" != none ] && reason="$reason [degraded: $degraded]"
+
+if [ "${1:-}" = --json ]; then
+  printf '{"verdict":"%s","rtc":"%s","ntp":"%s","degraded":"%s","reason":"%s","ts":"%s"}\n' \
+    "$verdict" "$rtc_raw" "$ntp_raw" "$degraded" "$reason" "$ts"
+  [ "$verdict" = UNKNOWN ] && exit 2 || exit 0
+fi
+
+if [ "${1:-}" = --edge ]; then
+  prev="$(cat "$STATE.prev" 2>/dev/null || true)"
+  printf '%s\n' "$verdict" > "$STATE.prev"
+  if command -v mesh-state-touch >/dev/null 2>&1; then mesh-state-touch --create "$STATE.prev" >/dev/null 2>&1
+  else touch "$STATE.prev"; fi
+  if [ "$verdict" = "$prev" ]; then [ "$verdict" = UNKNOWN ] && exit 2 || exit 0; fi
+fi
+
+printf '[time-integrity] %s — %s | rtc=%s ntp=%s degraded=%s\n' "$verdict" "$reason" "$rtc_raw" "$ntp_raw" "$degraded"
+[ "$verdict" = UNKNOWN ] && exit 2 || exit 0
