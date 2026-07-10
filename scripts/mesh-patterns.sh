@@ -210,6 +210,31 @@ board_recent_ts_within(){
   printf '%s' "$epoch"
 }
 
+# board_presync — $1=stamp_file $2=min_interval_s $3=timeout_s $4=sync_cmd (may be empty to disable)
+# Pulls fresh cross-node gossip synchronously, rate-limited by $stamp_file so repeat calls within
+# min_interval_s no-op, hard-timeout so a slow/partitioned peer can never wedge the caller. Call this
+# immediately before board_recent_ts_within (or any other read of the local gossiped board) whenever
+# the caller is about to trust that board for cross-node dedup — extracted from mesh-mind-control's
+# dispatch() presync gate (538b3f1, chat-review/dispatch-gossip-lag-recur 2026-07-09), which closed a
+# live double-dispatch (two nodes minted the same slug 4s apart because the periodic mesh-chat-sync
+# gossip cron — up to ~25min stale — hadn't yet pulled the peer's fresh post). That fix stayed local
+# to dispatch(); mesh-fawxible-watch/mesh-criticality/mesh-session-watchdog hit the identical gap
+# (mesh-fawxible-watch double-posted fawxible-review-b0aa8ba from 2 nodes 0s apart, 2026-07-09T21:17:03Z)
+# with no shared remedy — chat-review/patterns-presync-gate-shared(-relanded).
+# No side effects beyond running $sync_cmd and touching $stamp_file; caller decides what "synced" means.
+board_presync(){
+  local stamp="$1" min_interval="${2:-300}" timeout_s="${3:-25}" cmd="$4"
+  [ -n "$cmd" ] || return 0
+  local now age
+  now=$(date +%s)
+  age=999999
+  [ -f "$stamp" ] && age=$(( now - $(stat -c %Y "$stamp" 2>/dev/null || echo 0) ))
+  if [ "$age" -ge "$min_interval" ]; then
+    timeout "$timeout_s" $cmd >/dev/null 2>&1 || true
+    touch "$stamp" 2>/dev/null || true
+  fi
+}
+
 # mesh_is_minter — $1=board-log-path [$2=window_s, default 86400] → true (exit 0) iff THIS host is
 # the elected minter: the lexically-lowest hostname that posted ANY line to the board within the
 # window. Origin: mesh-sweep-rollcall-proposes' _rollcall_is_minter (6b3281b, chat-review/
@@ -348,5 +373,29 @@ if [ "${1:-}" = --test ] && [ "${BASH_SOURCE[0]}" = "${0}" ]; then
   if MESH_MINTER_HOSTNAME=host-b MESH_MINTER_PIN=host-b mesh_is_minter "$_mnd/board" 86400; then got=minter; else got=not; fi
   ck2 "$got" "minter" "MESH_MINTER_PIN overrides election"
   rm -rf "$_mnd"
+  echo "board_presync — rate-limited synchronous gossip pull before trusting the local board:"
+  _psd="$(mktemp -d)"
+  _ps_calls="$_psd/calls"
+  _ps_cmd="$_psd/ps_cmd.sh"
+  printf '#!/bin/sh\necho called >> "%s"\n' "$_ps_calls" > "$_ps_cmd"; chmod +x "$_ps_cmd"
+  board_presync "$_psd/stamp" 300 5 ""
+  [ -f "$_ps_calls" ] && { echo "  FAIL: empty cmd must be a no-op (nothing called)"; fail=1; } || echo "  ok: empty cmd no-op"
+  board_presync "$_psd/stamp" 300 5 "$_ps_cmd"
+  [ "$(grep -c . "$_ps_calls" 2>/dev/null || echo 0)" = 1 ] || { echo "  FAIL: no stamp (first call) must sync (got $(grep -c . "$_ps_calls" 2>/dev/null || echo 0) calls)"; fail=1; }
+  [ -f "$_psd/stamp" ] || { echo "  FAIL: stamp file must be touched after a sync"; fail=1; }
+  echo "  ok: first call (no stamp) syncs + touches stamp"
+  board_presync "$_psd/stamp" 300 5 "$_ps_cmd"
+  [ "$(grep -c . "$_ps_calls" 2>/dev/null || echo 0)" = 1 ] || { echo "  FAIL: fresh stamp (within min_interval) must skip the pull (rate-limit) — got $(grep -c . "$_ps_calls" 2>/dev/null || echo 0) calls"; fail=1; }
+  echo "  ok: fresh stamp skips (rate-limited)"
+  touch -d '-400 seconds' "$_psd/stamp"
+  board_presync "$_psd/stamp" 300 5 "$_ps_cmd"
+  [ "$(grep -c . "$_ps_calls" 2>/dev/null || echo 0)" = 2 ] || { echo "  FAIL: stale stamp (older than min_interval) must sync again — got $(grep -c . "$_ps_calls" 2>/dev/null || echo 0) calls"; fail=1; }
+  echo "  ok: stale stamp (past min_interval) re-syncs"
+  _ps_start=$(date +%s)
+  board_presync "$_psd/hangstamp" 300 1 "sleep 5"
+  _ps_elapsed=$(( $(date +%s) - _ps_start ))
+  [ "$_ps_elapsed" -lt 4 ] || { echo "  FAIL: a hanging sync_cmd must be killed by the timeout (elapsed=${_ps_elapsed}s, want <4s)"; fail=1; }
+  echo "  ok: hung sync_cmd bounded by timeout (elapsed=${_ps_elapsed}s)"
+  rm -rf "$_psd"
   [ "$fail" = 0 ] && { echo "smoke-test: ok"; exit 0; } || { echo "smoke-test: FAIL"; exit 1; }
 fi
