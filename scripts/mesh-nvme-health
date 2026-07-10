@@ -1,0 +1,196 @@
+#!/usr/bin/env bash
+# reflex-cadence: 0 */6 * * *
+# reflex-args: --edge
+# mesh-nvme-health — NVMe controller's own SMART wear-out self-report (percentage_used, available_spare,
+# media/data integrity errors, critical_warning bitmask) via `smartctl -A`.
+#
+# Why this is new:
+#   mesh-nvme-temp already senses controller TEMPERATURE; mesh-disk-health senses PERFORMANCE (await via
+#   iostat). Neither reads the drive's own vendor-computed wear-out counters — the signal the controller
+#   itself uses to predict its remaining life, and the one that catches degradation (spare blocks
+#   consumed, uncorrectable media errors) *before* it ever shows up as a latency blip or heat.
+#
+# Honest contract:
+#   no smartctl / no NVMe device / no sudo / unparseable output -> exit 2, never fabricate a reading
+#
+#   mesh-nvme-health            one read → one classified line
+#   mesh-nvme-health --json     machine-readable
+#   mesh-nvme-health --edge     emit only on band change (state still refreshed every success)
+#   mesh-nvme-health --test     fixture-backed classifier + real-read gate
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+
+MESH="${MESH_DIR:-$HOME/.mesh}"
+STATE="$MESH/.nvme-health.state"
+OFFLINEFILE="$MESH/.nvme-health-offline"
+ROOT="${MESH_NVME_HEALTH_ROOT:-/sys/class/nvme}"
+SMARTCTL="${MESH_NVME_HEALTH_SMARTCTL:-sudo -n smartctl}"
+mkdir -p "$MESH" 2>/dev/null || true
+
+discover_dev() {
+  local n
+  shopt -s nullglob
+  for n in "$ROOT"/nvme*; do
+    [ -e "$n" ] || continue
+    printf '/dev/%s\n' "$(basename "$n")"
+    shopt -u nullglob
+    return 0
+  done
+  shopt -u nullglob
+  return 1
+}
+
+# reads smartctl -A output on stdin, emits: critwarn\tspare\tsparethr\tused\tmediaerr
+parse_smart() {
+  awk '
+    /^Critical Warning:/            { gsub(/^0[xX]/,"",$3); cw=$3 }
+    /^Available Spare:/              { gsub(/%/,"",$3); spare=$3 }
+    /^Available Spare Threshold:/    { gsub(/%/,"",$4); sparethr=$4 }
+    /^Percentage Used:/              { gsub(/%/,"",$3); used=$3 }
+    /^Media and Data Integrity Errors:/ { mediaerr=$NF }
+    END {
+      if (used == "" ) exit 1
+      printf "%s\t%s\t%s\t%s\t%s\n", cw, spare, sparethr, used, mediaerr+0
+    }
+  '
+}
+
+classify() {
+  local cw="$1" spare="$2" sparethr="$3" used="$4" mediaerr="$5"
+  local cwdec=0
+  case "$cw" in *[!0-9a-fA-F]*|'') cwdec=0 ;; *) cwdec=$((16#$cw)) 2>/dev/null || cwdec=0 ;; esac
+  if [ "$cwdec" -ne 0 ] 2>/dev/null; then echo CRITICAL; return; fi
+  if [ -n "$mediaerr" ] && [ "$mediaerr" -gt 0 ] 2>/dev/null; then echo CRITICAL; return; fi
+  if [ -n "$spare" ] && [ -n "$sparethr" ] && [ "$spare" -le "$sparethr" ] 2>/dev/null; then echo CRITICAL; return; fi
+  if [ -n "$used" ] && [ "$used" -ge 90 ] 2>/dev/null; then echo WORN; return; fi
+  if [ -n "$used" ] && [ "$used" -ge 50 ] 2>/dev/null; then echo AGING; return; fi
+  echo HEALTHY
+}
+
+if [ "${1:-}" = --test ]; then
+  fake="$(mktemp)" || { echo "smoke-test: FAIL (mktemp)"; exit 1; }
+  trap 'rm -f "$fake"' EXIT
+
+  # fixture 1: healthy
+  cat > "$fake" <<'EOF'
+Critical Warning:                   0x00
+Available Spare:                    100%
+Available Spare Threshold:          10%
+Percentage Used:                    7%
+Media and Data Integrity Errors:    0
+EOF
+  got="$(parse_smart < "$fake")" || { echo "smoke-test: FAIL (parse healthy fixture)"; exit 1; }
+  IFS=$'\t' read -r cw spare sparethr used mediaerr <<<"$got"
+  [ "$(classify "$cw" "$spare" "$sparethr" "$used" "$mediaerr")" = HEALTHY ] \
+    || { echo "smoke-test: FAIL (healthy fixture misclassified: $got)"; exit 1; }
+
+  # fixture 2: worn (percentage_used >= 90)
+  cat > "$fake" <<'EOF'
+Critical Warning:                   0x00
+Available Spare:                    80%
+Available Spare Threshold:          10%
+Percentage Used:                    93%
+Media and Data Integrity Errors:    0
+EOF
+  got="$(parse_smart < "$fake")"
+  IFS=$'\t' read -r cw spare sparethr used mediaerr <<<"$got"
+  [ "$(classify "$cw" "$spare" "$sparethr" "$used" "$mediaerr")" = WORN ] \
+    || { echo "smoke-test: FAIL (worn fixture misclassified: $got)"; exit 1; }
+
+  # fixture 3: critical via nonzero critical_warning bitmask
+  cat > "$fake" <<'EOF'
+Critical Warning:                   0x04
+Available Spare:                    90%
+Available Spare Threshold:          10%
+Percentage Used:                    12%
+Media and Data Integrity Errors:    0
+EOF
+  got="$(parse_smart < "$fake")"
+  IFS=$'\t' read -r cw spare sparethr used mediaerr <<<"$got"
+  [ "$(classify "$cw" "$spare" "$sparethr" "$used" "$mediaerr")" = CRITICAL ] \
+    || { echo "smoke-test: FAIL (critical-warning fixture misclassified: $got)"; exit 1; }
+
+  # fixture 4: critical via spare exhausted below threshold
+  cat > "$fake" <<'EOF'
+Critical Warning:                   0x00
+Available Spare:                    5%
+Available Spare Threshold:          10%
+Percentage Used:                    40%
+Media and Data Integrity Errors:    0
+EOF
+  got="$(parse_smart < "$fake")"
+  IFS=$'\t' read -r cw spare sparethr used mediaerr <<<"$got"
+  [ "$(classify "$cw" "$spare" "$sparethr" "$used" "$mediaerr")" = CRITICAL ] \
+    || { echo "smoke-test: FAIL (spare-exhausted fixture misclassified: $got)"; exit 1; }
+
+  # fixture 5: critical via nonzero media/data integrity errors
+  cat > "$fake" <<'EOF'
+Critical Warning:                   0x00
+Available Spare:                    90%
+Available Spare Threshold:          10%
+Percentage Used:                    12%
+Media and Data Integrity Errors:    3
+EOF
+  got="$(parse_smart < "$fake")"
+  IFS=$'\t' read -r cw spare sparethr used mediaerr <<<"$got"
+  [ "$(classify "$cw" "$spare" "$sparethr" "$used" "$mediaerr")" = CRITICAL ] \
+    || { echo "smoke-test: FAIL (media-error fixture misclassified: $got)"; exit 1; }
+
+  # unparseable output -> parse_smart must fail (rc != 0), never silently classify garbage
+  printf 'garbage\n' > "$fake"
+  parse_smart < "$fake" >/dev/null 2>&1 && { echo "smoke-test: FAIL (garbage input parsed as if valid)"; exit 1; }
+
+  # real-read gate: a live device must actually produce a numeric percentage_used, not just exercise
+  # the offline classifier
+  dev="$(discover_dev)" || { echo "smoke-test: n/a (no NVMe device node on this node)"; exit 2; }
+  real="$($SMARTCTL -A "$dev" 2>/dev/null | parse_smart)" || {
+    echo "smoke-test: n/a (smartctl unreadable — no sudo/binary on this node)"; exit 2;
+  }
+  IFS=$'\t' read -r cw spare sparethr used mediaerr <<<"$real"
+  case "$used" in ''|*[!0-9]*) echo "smoke-test: FAIL (live read missing numeric percentage_used: $real)"; exit 1 ;; esac
+  echo "smoke-test: ok (fixture classify x5 + garbage-rejected + live NVMe SMART read: used=${used}% spare=${spare}%)"
+  exit 0
+fi
+
+JSON=0
+EDGE=0
+for a in "$@"; do
+  case "$a" in
+    --json) JSON=1 ;;
+    --edge) EDGE=1 ;;
+  esac
+done
+
+DEV="$(discover_dev)" || {
+  [ -f "$OFFLINEFILE" ] || { echo "nvme-health: UNREACHABLE — no NVMe device node under $ROOT" >&2; : > "$OFFLINEFILE"; }
+  exit 2
+}
+
+READOUT="$($SMARTCTL -A "$DEV" 2>/dev/null | parse_smart)" || {
+  [ -f "$OFFLINEFILE" ] || { echo "nvme-health: UNREACHABLE — smartctl unreadable on $DEV (binary/sudo missing?)" >&2; : > "$OFFLINEFILE"; }
+  exit 2
+}
+rm -f "$OFFLINEFILE" 2>/dev/null || true
+
+IFS=$'\t' read -r CW SPARE SPARETHR USED MEDIAERR <<<"$READOUT"
+LABEL="$(classify "$CW" "$SPARE" "$SPARETHR" "$USED" "$MEDIAERR")"
+TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+PREV_LABEL=""
+[ -f "$STATE" ] && PREV_LABEL="$(cut -d'|' -f1 "$STATE" 2>/dev/null || true)"
+
+printf '%s|%s|%s|%s|%s|%s|%s|%s\n' "$LABEL" "$USED" "$SPARE" "$SPARETHR" "$MEDIAERR" "0x$CW" "$DEV" "$TS" > "$STATE"
+mesh-state-touch "$STATE"
+
+if [ "$JSON" = 1 ]; then
+  printf '{"label":"%s","percentage_used":%s,"available_spare":%s,"available_spare_threshold":%s,"media_errors":%s,"critical_warning":"0x%s","device":"%s","ts":"%s"}\n' \
+    "$LABEL" "$USED" "${SPARE:-null}" "${SPARETHR:-null}" "$MEDIAERR" "$CW" "$DEV" "$TS"
+  exit 0
+fi
+
+if [ "$EDGE" = 1 ] && [ "$PREV_LABEL" = "$LABEL" ]; then
+  exit 0
+fi
+
+printf '[nvme-health] %s — used=%s%% spare=%s%%(thr=%s%%) media_err=%s crit=0x%s device=%s @ %s %s\n' \
+  "$LABEL" "$USED" "${SPARE:-?}" "${SPARETHR:-?}" "$MEDIAERR" "$CW" "$DEV" "$(hostname)" "$TS"
