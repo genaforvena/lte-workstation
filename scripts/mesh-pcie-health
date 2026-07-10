@@ -1,0 +1,186 @@
+#!/usr/bin/env bash
+# reflex-cadence: 7,37 * * * *
+# mesh-pcie-health — PCIe LINK INTEGRITY via the kernel's AER (Advanced Error Reporting) counters.
+#
+# A NEW physical axis no existing sense reads. The mesh already sees the SSD's media wear
+# (mesh-nvme-health/SMART), the wifi RADIO (mesh-wifi-*), TCP-layer loss (mesh-tcp-retrans) and
+# link-layer drops (mesh-nic-drops) — but NOTHING watches the PCIe BUS underneath them. Every
+# NVMe SSD and every internal wifi/GPU card hangs off a PCIe link, and the kernel silently
+# counts every physical error on that link in /sys/bus/pci/devices/*/aer_dev_{correctable,
+# nonfatal,fatal}: BadTLP/BadDLLP/RxErr (electrical), Timeout, ECRC/CRC. Correctable errors
+# are auto-recovered by the link layer so nothing logs — but a RISING correctable RATE is the
+# earliest honest sign of a physically marginal link (thermal creep, an aging/badly-seated M.2,
+# a riser, EMI) that only surfaces as a latency blip or a device drop hours later. mesh-node-care
+# greps dmesg for 'aer' TEXT from the PREVIOUS boot; this reads the LIVE per-device counters and
+# the DELTA since the last sample.
+#
+# Source: /sys/bus/pci/devices/<slot>/aer_dev_correctable (TOTAL_ERR_COR),
+#         .../aer_dev_nonfatal (TOTAL_ERR_NONFATAL), .../aer_dev_fatal (TOTAL_ERR_FATAL).
+# Cumulative lifetime counters — the SIGNAL is the delta vs the previous reading (state-backed).
+#
+# Per-device verdict (on the delta since last sample, once a baseline exists):
+#   CLEAN      — no errors this interval (and none in lifetime)
+#   HEALED     — lifetime errors > 0 but ZERO new this interval (past event, link quiet now)
+#   CORRECTING — NEW correctable errors this interval (link is auto-recovering — watch the rate)
+#   NONFATAL   — NEW non-fatal uncorrectable error (a transaction was lost, link survived)
+#   FATAL      — NEW fatal error (link went down / device reset)
+#   BASELINE   — first sample (no prior reading) — lifetime shown, rate not yet knowable
+# Overall = worst device (FATAL > NONFATAL > CORRECTING > BASELINE > HEALED > CLEAN).
+#
+# Exit 2 (honest n/a, never a fake CLEAN): kernel exposes no AER counters (CONFIG_PCIEAER off,
+# a VM/container with no PCIe AER, or no AER-capable device). mesh-land treats exit 2 as a pass,
+# so this runs green on nodes that physically cannot produce the reading.
+#
+# Change-gated: rewrites its STATE only when a total moves, but mesh-state-touch's the STATE on
+# EVERY successful run so a long-CLEAN (stable-zero) link cannot decay to a FALSE-STALE.
+#
+#   mesh-pcie-health           one reading + delta vs last sample (updates the baseline)
+#   mesh-pcie-health --raw     also print the non-zero error-type breakdown per device
+#   mesh-pcie-health --test    synthetic parser/classifier fixtures + a real-hardware read gate
+set -uo pipefail
+
+PCI_ROOT="${MESH_PCI_ROOT:-/sys/bus/pci/devices}"
+STATE="${MESH_PCIE_STATE:-$HOME/.mesh/.pcie-aer-state}"
+RAW=0
+[ "${1:-}" = --raw ] && { RAW=1; shift; }
+
+# class (0xCCSSPP) -> friendly device kind, keyed on the class+subclass (first 4 hex)
+kind_of() {
+  case "${1#0x}" in
+    0108*) echo NVMe ;;
+    0100*|0101*|0106*|0107*) echo Storage ;;
+    0280*|0200*) echo Network ;;
+    0300*|0302*|0380*) echo GPU ;;
+    0403*) echo Audio ;;
+    0604*|0600*) echo Bridge ;;
+    0c03*) echo USB ;;
+    *) echo dev ;;
+  esac
+}
+
+# read the "TOTAL_ERR_*" line's value from an aer_dev_* file (last field of the TOTAL_ line);
+# echoes a non-negative integer, or empty if the file is missing/garbage
+total_of() {
+  local f="$1" v
+  [ -r "$f" ] || return 1
+  v="$(awk '/^TOTAL_ERR_/{print $2; found=1} END{exit !found}' "$f" 2>/dev/null)" || return 1
+  case "$v" in ''|*[!0-9]*) return 1;; esac
+  printf '%s' "$v"
+}
+
+# snapshot -> one line per AER-capable device: "<slot> <kind> <corr> <nonfatal> <fatal>"
+# devices with no readable aer_dev_correctable are skipped (never invent a zero).
+snapshot() {
+  local d slot cor non fat cls kind
+  for d in "$PCI_ROOT"/*/; do
+    [ -e "$d/aer_dev_correctable" ] || continue
+    cor="$(total_of "$d/aer_dev_correctable")" || continue
+    non="$(total_of "$d/aer_dev_nonfatal")" || non=0
+    fat="$(total_of "$d/aer_dev_fatal")"     || fat=0
+    slot="$(basename "$d")"
+    cls="$(cat "$d/class" 2>/dev/null)"; kind="$(kind_of "${cls:-0x000000}")"
+    echo "$slot $kind $cor $non $fat"
+  done
+}
+
+# classify <dcor> <dnon> <dfat> <life_cor> <life_non> <life_fat> <have_prior>
+classify() {
+  local dc=$1 dn=$2 df=$3 lc=$4 ln=$5 lf=$6 prior=$7
+  if [ "$prior" = 0 ]; then
+    [ $((lc+ln+lf)) -gt 0 ] && { echo BASELINE; return; }
+    echo CLEAN; return
+  fi
+  [ "$df" -gt 0 ] && { echo FATAL; return; }
+  [ "$dn" -gt 0 ] && { echo NONFATAL; return; }
+  [ "$dc" -gt 0 ] && { echo CORRECTING; return; }
+  [ $((lc+ln+lf)) -gt 0 ] && { echo HEALED; return; }
+  echo CLEAN
+}
+rank_of() { case "$1" in FATAL) echo 5;; NONFATAL) echo 4;; CORRECTING) echo 3;; BASELINE) echo 2;; HEALED) echo 1;; *) echo 0;; esac; }
+
+# ---- --test: synthetic fixtures + real-hardware read gate --------------------------------
+if [ "${1:-}" = --test ]; then
+  e=0
+  # (1) parser: total_of picks the TOTAL_ERR_ line, rejects garbage
+  tf="$(mktemp -d)"; trap 'rm -rf "$tf"' EXIT
+  printf 'BadTLP 3\nRxErr 1\nTOTAL_ERR_COR 7\n' > "$tf/c"
+  [ "$(total_of "$tf/c")" = 7 ] || { echo "test: total_of pick FAIL"; e=1; }
+  printf 'no total here 9\n' > "$tf/bad"
+  total_of "$tf/bad" >/dev/null 2>&1 && { echo "test: total_of should reject no-TOTAL FAIL"; e=1; }
+  # (2) classifier truth table
+  [ "$(classify 0 0 0 0 0 0 0)" = CLEAN ]      || { echo "test: cls CLEAN(first) FAIL"; e=1; }
+  [ "$(classify 0 0 0 5 0 0 0)" = BASELINE ]   || { echo "test: cls BASELINE FAIL"; e=1; }
+  [ "$(classify 4 0 0 9 0 0 1)" = CORRECTING ] || { echo "test: cls CORRECTING FAIL"; e=1; }
+  [ "$(classify 0 2 0 9 2 0 1)" = NONFATAL ]   || { echo "test: cls NONFATAL FAIL"; e=1; }
+  [ "$(classify 0 0 1 9 2 1 1)" = FATAL ]      || { echo "test: cls FATAL FAIL"; e=1; }
+  [ "$(classify 0 0 0 5 0 0 1)" = HEALED ]     || { echo "test: cls HEALED FAIL"; e=1; }
+  [ "$(classify 0 0 0 0 0 0 1)" = CLEAN ]      || { echo "test: cls CLEAN(quiet) FAIL"; e=1; }
+  # (3) snapshot over a synthetic /sys tree
+  fr="$tf/pci"; mkdir -p "$fr/0000:01:00.0" "$fr/0000:00:1f.0"
+  printf 'RxErr 2\nTOTAL_ERR_COR 2\n' > "$fr/0000:01:00.0/aer_dev_correctable"
+  printf 'TOTAL_ERR_NONFATAL 0\n'     > "$fr/0000:01:00.0/aer_dev_nonfatal"
+  printf 'TOTAL_ERR_FATAL 0\n'        > "$fr/0000:01:00.0/aer_dev_fatal"
+  printf '0x010802\n'                 > "$fr/0000:01:00.0/class"
+  # 2nd dir has NO aer file -> must be skipped, never emitted as a zero
+  printf '0x060400\n'                 > "$fr/0000:00:1f.0/class"
+  n="$(MESH_PCI_ROOT="$fr" bash -c 'PCI_ROOT="$MESH_PCI_ROOT"; '"$(declare -f total_of kind_of snapshot)"'; snapshot' | wc -l)"
+  [ "$n" -eq 1 ] || { echo "test: snapshot should emit exactly the 1 AER device (got $n) FAIL"; e=1; }
+  MESH_PCI_ROOT="$fr" bash -c 'PCI_ROOT="$MESH_PCI_ROOT"; '"$(declare -f total_of kind_of snapshot)"'; snapshot' | grep -q '^0000:01:00.0 NVMe 2 0 0$' || { echo "test: snapshot content FAIL"; e=1; }
+  # (4) REAL-HARDWARE read gate: a live read must parse >=1 device's counters, OR exit 2 (honest n/a).
+  real="$(snapshot)"
+  if [ -z "$real" ]; then
+    echo "test: no live AER device on this node — honest n/a (exit 2)"; [ "$e" = 0 ] && exit 2 || exit 1
+  fi
+  echo "$real" | awk 'NF!=5 || $3 ~ /[^0-9]/ || $4 ~ /[^0-9]/ || $5 ~ /[^0-9]/ {bad=1} END{exit bad}' \
+    || { echo "test: live read produced a non-numeric counter FAIL"; e=1; }
+  ndev="$(printf '%s\n' "$real" | grep -c .)"
+  [ "$e" = 0 ] && echo "test: PASS (real read: $ndev AER device(s))" || echo "test: FAIL"
+  exit "$e"
+fi
+
+# ---- live run ---------------------------------------------------------------------------
+cur="$(snapshot)"
+[ -n "$cur" ] || { echo "pcie-aer: n/a — no PCIe AER counters exposed (CONFIG_PCIEAER off / no AER device)"; exit 2; }
+
+mkdir -p "$(dirname "$STATE")" 2>/dev/null
+have_prior=0; [ -s "$STATE" ] && have_prior=1
+declare -A P_COR P_NON P_FAT
+if [ "$have_prior" = 1 ]; then
+  while read -r slot _k pc pn pf; do
+    [ -n "$slot" ] || continue
+    P_COR["$slot"]=$pc; P_NON["$slot"]=$pn; P_FAT["$slot"]=$pf
+  done < "$STATE"
+fi
+
+worst=CLEAN; worst_rank=0
+report=""
+while read -r slot kind cor non fat; do
+  [ -n "$slot" ] || continue
+  pc=${P_COR["$slot"]:-0}; pn=${P_NON["$slot"]:-0}; pf=${P_FAT["$slot"]:-0}
+  prior="$have_prior"; [ -n "${P_COR["$slot"]+x}" ] || prior=0   # a device unseen last time has no baseline
+  dc=$((cor-pc)); dn=$((non-pn)); df=$((fat-pf))
+  [ "$dc" -lt 0 ] && dc=0; [ "$dn" -lt 0 ] && dn=0; [ "$df" -lt 0 ] && df=0   # counter reset (reboot) -> no negative rate
+  v="$(classify "$dc" "$dn" "$df" "$cor" "$non" "$fat" "$prior")"
+  r="$(rank_of "$v")"; [ "$r" -gt "$worst_rank" ] && { worst_rank=$r; worst=$v; }
+  d_note=""
+  [ $((dc+dn+df)) -gt 0 ] && d_note=" (+${dc}cor +${dn}nf +${df}f since last)"
+  report+="  $slot [$kind] $v — lifetime: cor=$cor nonfatal=$non fatal=$fat$d_note"$'\n'
+  if [ "$RAW" = 1 ]; then
+    for cls in correctable nonfatal fatal; do
+      nz="$(awk '$2+0>0 && $1 !~ /^TOTAL_ERR_/ {printf " %s=%s",$1,$2}' "$PCI_ROOT/$slot/aer_dev_$cls" 2>/dev/null)"
+      [ -n "$nz" ] && report+="      $cls:$nz"$'\n'
+    done
+  fi
+done <<< "$cur"
+
+echo "pcie-aer: $worst"
+printf '%s' "$report"
+
+# change-gated write (only when a total moved) + unconditional liveness touch
+new_state="$(printf '%s\n' "$cur")"
+if [ ! -s "$STATE" ] || [ "$new_state" != "$(cat "$STATE" 2>/dev/null)" ]; then
+  printf '%s\n' "$new_state" > "$STATE"
+fi
+mesh-state-touch "$STATE" 2>/dev/null || touch "$STATE" 2>/dev/null
+
+case "$worst" in FATAL|NONFATAL) exit 1;; *) exit 0;; esac

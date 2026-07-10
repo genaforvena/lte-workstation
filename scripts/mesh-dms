@@ -44,9 +44,34 @@
 # board [design] proposal + buy-in from the other running minds, not a solo genome edit.
 set -euo pipefail
 
+# ── FENCING (Kleppmann 2016, martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html) ──
+# A lease-based lock is NOT safe alone: a holder can pause PAST its lease (GC / page fault / THERMAL
+# THROTTLE — a live hazard on this node) while a second holder legitimately acquires, then wake and
+# write, clobbering the second. Ordering the grants is not enough — the RESOURCE must reject a write
+# from a holder that no longer owns the lock, AT THE POINT OF COMMIT. Here the commit is disarming
+# the rollback: mesh-dms did that on VERIFY alone, never re-checking the caller still holds its claim.
+# Checking the claim BEFORE the change (the CLAUDE.md protocol step) is TOCTOU — the stall happens
+# between check and commit. So: opt-in MESH_DMS_FENCE_KEY=<mesh-claim key>. When set, the disarm gate
+# becomes VERIFY && fence-held, where fence-held requires `mesh-claim --check <key>` == 1 (yours) AT
+# COMMIT. Superseded(2)/stale(3)/unclaimed(0)/mesh-claim-absent → FAIL-CLOSED: rollback fires, the
+# stale writer's change is reverted rather than committed over a live second writer. Unset key =
+# today's behavior exactly (backward compatible). Review: ~/.mesh/knowledge/review-fencing-tokens-*.
+# _fence_ok is PURE (rc -> pass/fail) so the fencing LOGIC is testable without faking mesh-claim identity.
+_fence_ok() {  # <mesh-claim --check exit code>  ->  0 pass (still yours) / 1 fenced-out
+  [ "${1:-}" = 1 ] && return 0 || return 1   # ONLY exit 1 (yours) passes; 0/2/3/anything = fail-closed
+}
+# integration: run the live check, map to a verdict. Absent tool / unresolved key -> fail-closed (rc 127/2).
+fence_held() {  # <key>  ->  0 still held / 1 fenced
+  local key="$1" rc
+  command -v mesh-claim >/dev/null 2>&1 || return 1   # can't fence -> fail-closed (no hollow all-clear)
+  mesh-claim --check "$key" >/dev/null 2>&1; rc=$?
+  _fence_ok "$rc"
+}
+
 if [ "${1:-}" = --help ] || [ "${1:-}" = -h ]; then
   echo "usage: mesh-dms <timeout_sec> <rollback_cmd> <verify_cmd> <change_cmd>"
   echo "  Dead-man's switch: schedules rollback, fires if verify fails."
+  echo "  Set MESH_DMS_FENCE_KEY=<claim-key> to also fence: disarm only if you still hold the claim."
   echo "  Always run as root (sudo) for substrate changes."
   exit 0
 fi
@@ -82,6 +107,30 @@ if [ "${1:-}" = --test ]; then
   printf '%s\n' "$out" | grep -q 'Rollback complete' || { echo "smoke-test: FAIL (verify-fail path did not complete rollback: $out)"; exit 1; }
   [ -f "$tmp/rollback" ] || { echo "smoke-test: FAIL (rollback did NOT fire after verify fail: $out)"; exit 1; }
   [ ! -f "$tmp/changed" ] || { echo "smoke-test: FAIL (change was NOT reverted after verify fail: $out)"; exit 1; }
+
+  # ── FENCING (Kleppmann): pure decision fn — ONLY exit 1 (yours) commits; 0/2/3 fence out ──
+  _fence_ok 1 || { echo "smoke-test: FAIL (_fence_ok 1 should PASS — yours)"; exit 1; }
+  ! _fence_ok 0 || { echo "smoke-test: FAIL (_fence_ok 0 should FAIL — unclaimed)"; exit 1; }
+  ! _fence_ok 2 || { echo "smoke-test: FAIL (_fence_ok 2 should FAIL — theirs)"; exit 1; }
+  ! _fence_ok 3 || { echo "smoke-test: FAIL (_fence_ok 3 should FAIL — stale)"; exit 1; }
+  ! _fence_ok "" || { echo "smoke-test: FAIL (_fence_ok empty should FAIL — fail-closed)"; exit 1; }
+  # Integration (hermetic): VERIFY passes but MESH_DMS_FENCE_KEY names a NEVER-claimed key on an empty
+  # temp board -> mesh-claim --check returns 0 (unclaimed) -> fence FAILS -> rollback fires despite
+  # verify-ok. Proves the wired path end-to-end without faking mesh-claim's identity. Skips honestly if
+  # mesh-claim is absent (then fence_held fail-closes anyway, still exercising the rollback path).
+  rm -rf "$tmp" 2>/dev/null; tmp="$(mktemp -d)" || { echo "smoke-test: FAIL (mktemp)"; exit 1; }   # prior test left a fired rollback file — rmdir would fail under set -e; nuke the whole dir
+  : > "$tmp/board"   # empty board -> the key is unclaimed
+  rollback_cmd="echo rollback > '$tmp/rollback'; rm -f '$tmp/changed'"
+  change_cmd="echo changed > '$tmp/changed'"
+  verify_cmd="test -f '$tmp/changed'"   # VERIFY deliberately PASSES — only the fence should stop the commit
+  rc=0
+  out="$(MESH_DMS_FENCE_KEY='fence-test/never-claimed-key' MESH_CHAT_LOG="$tmp/board" \
+         timeout 15 "$0" 3 "$rollback_cmd" "$verify_cmd" "$change_cmd" 2>&1)" || rc=$?
+  [ "$rc" = 1 ] || { echo "smoke-test: FAIL (fence path should exit 1, got $rc: $out)"; exit 1; }
+  printf '%s\n' "$out" | grep -q 'FENCE FAILED' || { echo "smoke-test: FAIL (did not report FENCE FAILED — did the gate run? $out)"; exit 1; }
+  [ -f "$tmp/rollback" ] || { echo "smoke-test: FAIL (rollback did NOT fire on fence fail: $out)"; exit 1; }
+  [ ! -f "$tmp/changed" ] || { echo "smoke-test: FAIL (change NOT reverted after fence fail: $out)"; exit 1; }
+
   echo "smoke-test: ok"; exit 0
 fi
 TIMEOUT="${1:?usage: mesh-dms <timeout_sec> <rollback_cmd> <verify_cmd> <change_cmd>}"
@@ -112,13 +161,22 @@ log "Applying change: $CHANGE"
 eval "$CHANGE"
 
 log "Verifying: $VERIFY"
-if eval "$VERIFY"; then
+commit_ok=1; fail_reason="VERIFY FAILED"
+if ! eval "$VERIFY"; then
+    commit_ok=0
+elif [ -n "${MESH_DMS_FENCE_KEY:-}" ]; then
+    log "Fencing: mesh-claim --check $MESH_DMS_FENCE_KEY (must still be yours)"
+    if ! fence_held "$MESH_DMS_FENCE_KEY"; then
+        commit_ok=0; fail_reason="FENCE FAILED (claim '$MESH_DMS_FENCE_KEY' superseded/stale/absent — a second writer holds it)"
+    fi
+fi
+if [ "$commit_ok" = 1 ]; then
     log "VERIFIED OK — disarming rollback"
     kill "$DMS_PID" 2>/dev/null || true
     trap - EXIT
     log "Done. Change is live."
 else
-    log "VERIFY FAILED — rollback will fire at timeout"
+    log "$fail_reason — rollback will fire at timeout"
     wait "$DMS_PID" 2>/dev/null || true
     trap - EXIT
     log "Rollback complete."
