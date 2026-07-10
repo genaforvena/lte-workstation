@@ -1,0 +1,215 @@
+#!/usr/bin/env bash
+# reflex-cadence: 4-59/10 * * * *
+# mesh-wifi-mimo — NODE WiFi SPATIAL-LINK sense: the MIMO rank (number of spatial
+# streams, NSS) and channel width (MHz) the node's WiFi link is actually sustaining.
+# Reads `iw dev <iface> link` — the driver's live rate-control MIMO state. A REAL
+# hardware signal, orthogonal to everything the mesh already senses on WiFi.
+#
+# WHY (the gap this fills): the mesh reads its WiFi link's SIGNAL + discards
+# (mesh-wifi-quality) and its MODULATION rate MCS + retries (mesh-wifi-contention).
+# Neither emits NSS or channel width. Those are the SPATIAL axis: a MIMO link runs
+# 2 (or more) independent spatial streams over antenna diversity + multipath. When the
+# link collapses 2→1 streams (or 80→40→20 MHz) *while signal dBm barely moves*, the
+# cause is PHYSICAL and distinct from weak-signal: an antenna path is obstructed — a
+# hand/body/object over the radio, the lid angled shut over the antennas, or multipath
+# richness lost — or the AP fell back to a narrower channel under RF interference.
+# Signal-strength and MCS can't see this; the spatial rank can. That is the sense:
+# "is something physically interfering with the radio path", read from the RF itself.
+#
+#   mesh-wifi-mimo              one-line spatial-link state
+#   mesh-wifi-mimo --json       machine-readable {bssid,tx_nss,rx_nss,width_mhz,rank,...}
+#   mesh-wifi-mimo --test       classifier asserts on synthetic `iw link` fixtures
+#                               + a real-read gate (live iw link yields numeric rank/width)
+#
+# Verdict (per-BSSID rolling-max baseline in STATE — honest: DEGRADED only fires once a
+# HIGHER rank/width has actually been observed on THIS AP; first sight of an AP = FULL):
+#   FULL            rank + width at the best seen on this BSSID — clean MIMO path
+#   DEGRADED-MIMO   spatial rank dropped below baseline — likely antenna obstruction
+#   NARROW-CHANNEL  channel width fell below baseline — likely RF interference fallback
+#   DEGRADED        both collapsed
+#   DISCONNECTED    associated to no AP (a real assessment, not an error)
+#
+# Exit codes:
+#   0 = assessment produced (DISCONNECTED included)
+#   2 = no wireless interface / `iw` unavailable (honest n/a — unreachable radio, NEVER faked)
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+
+STATE_FILE="$HOME/.mesh/.wifi-mimo-state"   # per-BSSID rolling-max baseline: "bssid rank width"
+
+# --- Find the active wireless interface (same idiom as mesh-wifi-quality) ---
+find_wifi_iface() {
+  local f iface=""
+  for f in /sys/class/net/*/wireless; do
+    [ -d "$f" ] || continue
+    iface="$(basename "$(dirname "$f")")"
+    break
+  done
+  echo "$iface"
+}
+
+# --- Parse `iw ... link` text on stdin → "<bssid> <tx_bitrate> <tx_width> <tx_nss> <rx_bitrate> <rx_width> <rx_nss> <signal>"
+# Emits "DISCONNECTED" (single token) when there is no "Connected to" line.
+# NSS: explicit VHT/HE/EHT-NSS token when present; for pure-HT rates derived from the
+# HT-MCS index (MCS 0-7 = 1 stream, 8-15 = 2, 16-23 = 3, 24-31 = 4). Missing fields → 0.
+parse_link() {
+  awk '
+    function nss_from(line,   i,n,f,tok,mcs) {
+      n = split(line, f, /[ \t]+/)
+      # explicit spatial-stream count wins
+      for (i = 1; i <= n; i++) if (f[i] ~ /-NSS$/) { return f[i+1]+0 }
+      # pure-HT: derive NSS from the HT-MCS index
+      for (i = 1; i <= n; i++) if (f[i] == "MCS") { mcs = f[i+1]+0; return int(mcs/8)+1 }
+      return 0
+    }
+    function bitrate_from(line,   i,n,f) {
+      n = split(line, f, /[ \t]+/)
+      for (i = 1; i <= n; i++) if (f[i] == "MBit/s") return f[i-1]+0
+      return 0
+    }
+    function width_from(line,   i,n,f) {
+      n = split(line, f, /[ \t]+/)
+      for (i = 1; i <= n; i++) if (f[i] ~ /^[0-9]+MHz$/) { sub(/MHz$/, "", f[i]); return f[i]+0 }
+      return 0
+    }
+    /Connected to/ { for (i=1;i<=NF;i++) if ($i=="to") { bssid=$(i+1); conn=1 } }
+    /signal:/      { for (i=1;i<=NF;i++) if ($i=="signal:") sig=$(i+1)+0 }
+    /tx bitrate:/  { txb=bitrate_from($0); txw=width_from($0); txn=nss_from($0) }
+    /rx bitrate:/  { rxb=bitrate_from($0); rxw=width_from($0); rxn=nss_from($0) }
+    END {
+      if (!conn) { print "DISCONNECTED"; exit }
+      printf "%s %d %d %d %d %d %d %d\n", bssid, txb, txw, txn, rxb, rxw, rxn, sig
+    }
+  '
+}
+
+# --- Baseline (per-BSSID rolling max of rank + width) ---
+read_baseline() { # <bssid> -> "rank width" (0 0 if unseen)
+  local bssid="$1"
+  [ -r "$STATE_FILE" ] || { echo "0 0"; return; }
+  awk -v b="$bssid" '$1==b { print $2, $3; found=1; exit } END { if(!found) print "0 0" }' "$STATE_FILE"
+}
+write_baseline() { # <bssid> <rank> <width>  (upsert the rolling max, preserve other BSSIDs)
+  local bssid="$1" rank="$2" width="$3" tmp
+  mkdir -p "$(dirname "$STATE_FILE")" 2>/dev/null
+  tmp="$STATE_FILE.$$"
+  { [ -r "$STATE_FILE" ] && grep -v -e "^$bssid " "$STATE_FILE" 2>/dev/null; echo "$bssid $rank $width"; } > "$tmp" 2>/dev/null \
+    && mv -f "$tmp" "$STATE_FILE" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+}
+
+# --- Classify current vs baseline → verdict ---
+classify() { # <rank> <width> <base_rank> <base_width> -> verdict
+  local rank="$1" width="$2" br="$3" bw="$4"
+  local mimo_lo=0 chan_lo=0
+  [ "$br" -gt 0 ] && [ "$rank" -lt "$br" ] && mimo_lo=1
+  [ "$bw" -gt 0 ] && [ "$width" -lt "$bw" ] && chan_lo=1
+  if   [ "$mimo_lo" = 1 ] && [ "$chan_lo" = 1 ]; then echo DEGRADED
+  elif [ "$mimo_lo" = 1 ]; then echo DEGRADED-MIMO
+  elif [ "$chan_lo" = 1 ]; then echo NARROW-CHANNEL
+  else echo FULL
+  fi
+}
+
+emit() { # produces verdict from a parsed line; updates baseline; writes STATE (change-gated) + touches mtime
+  local parsed="$1" json="$2"
+  if [ "$parsed" = DISCONNECTED ]; then
+    if [ "$json" = 1 ]; then printf '{"verdict":"DISCONNECTED","bssid":null,"ts":"%s"}\n' "$(date -u +%FT%TZ)"
+    else echo "DISCONNECTED|no associated AP"; fi
+    return 0
+  fi
+  local bssid txb txw txn rxb rxw rxn sig
+  read -r bssid txb txw txn rxb rxw rxn sig <<<"$parsed"
+  local rank=$txn; [ "$rxn" -gt "$rank" ] && rank=$rxn
+  local width=$txw; [ "$rxw" -gt "$width" ] && width=$rxw
+  local br bw; read -r br bw <<<"$(read_baseline "$bssid")"
+  local verdict; verdict="$(classify "$rank" "$width" "$br" "$bw")"
+  # rolling-max baseline upsert
+  local nbr=$br nbw=$bw
+  [ "$rank" -gt "$nbr" ] && nbr=$rank
+  [ "$width" -gt "$nbw" ] && nbw=$width
+  write_baseline "$bssid" "$nbr" "$nbw"
+  # change-gated content marker + ALWAYS refresh mtime (liveness = ran-live, content = value-changed)
+  local marker="$verdict $bssid $rank $width"
+  local line_state="$HOME/.mesh/.wifi-mimo-last"
+  local prev=""; [ -r "$line_state" ] && prev="$(cat "$line_state" 2>/dev/null)"
+  if [ "$marker" != "$prev" ]; then printf '%s\n' "$marker" > "$line_state" 2>/dev/null; fi
+  mesh-state-touch "$line_state" 2>/dev/null || touch "$line_state" 2>/dev/null
+  if [ "$json" = 1 ]; then
+    printf '{"verdict":"%s","bssid":"%s","tx_nss":%d,"rx_nss":%d,"rank":%d,"width_mhz":%d,"base_rank":%d,"base_width":%d,"tx_bitrate":%s,"rx_bitrate":%s,"signal_dbm":%d,"ts":"%s"}\n' \
+      "$verdict" "$bssid" "$txn" "$rxn" "$rank" "$width" "$nbr" "$nbw" "$txb" "$rxb" "$sig" "$(date -u +%FT%TZ)"
+  else
+    echo "$verdict|rank=${rank}ss(tx${txn}/rx${rxn})|width=${width}MHz|base=${nbr}ss/${nbw}MHz|signal=${sig}dBm|tx=${txb}/rx=${rxb}Mbps|$bssid"
+  fi
+}
+
+# --------------------------- --test ---------------------------
+if [ "${1:-}" = --test ]; then
+  fails=0
+  # (a) FULL fixture (VHT 2ss 80MHz) parses rank=2 width=80
+  full='Connected to 26:48:d7:9b:2d:88 (on wlan0)
+	signal: -60 dBm
+	tx bitrate: 390.0 MBit/s VHT-MCS 4 80MHz short GI VHT-NSS 2
+	rx bitrate: 260.0 MBit/s VHT-MCS 3 80MHz short GI VHT-NSS 2'
+  p="$(printf '%s\n' "$full" | parse_link)"
+  read -r _b _txb _txw _txn _rxb _rxw _rxn _sig <<<"$p"
+  { [ "$_txw" = 80 ] && [ "$_txn" = 2 ] && [ "$_sig" = -60 ]; } \
+    || { echo "  FAIL a: FULL parse got '$p' (want width80 nss2 sig-60)"; fails=$((fails+1)); }
+
+  # (b) DEGRADED-MIMO: 1ss @80MHz against baseline 2ss/80
+  degm='Connected to AA:BB:CC:DD:EE:FF (on wlan0)
+	signal: -58 dBm
+	tx bitrate: 195.0 MBit/s VHT-MCS 4 80MHz short GI VHT-NSS 1
+	rx bitrate: 195.0 MBit/s VHT-MCS 4 80MHz short GI VHT-NSS 1'
+  read -r _b b1 w1 n1 _ <<<"$(printf '%s\n' "$degm" | parse_link)"
+  v="$(classify "$n1" "$w1" 2 80)"
+  [ "$v" = DEGRADED-MIMO ] || { echo "  FAIL b: 1ss/80 vs 2ss/80 got '$v' (want DEGRADED-MIMO)"; fails=$((fails+1)); }
+
+  # (c) NARROW-CHANNEL: 2ss @40MHz against baseline 2ss/80
+  read -r _b _tb tw2 tn2 _ <<<"$(printf 'Connected to X (on wlan0)\n\ttx bitrate: 180.0 MBit/s VHT-MCS 9 40MHz short GI VHT-NSS 2\n\trx bitrate: 180.0 MBit/s VHT-MCS 9 40MHz short GI VHT-NSS 2\n' | parse_link)"
+  v="$(classify "$tn2" "$tw2" 2 80)"
+  [ "$v" = NARROW-CHANNEL ] || { echo "  FAIL c: 2ss/40 vs 2ss/80 got '$v' (want NARROW-CHANNEL)"; fails=$((fails+1)); }
+
+  # (d) DISCONNECTED: no "Connected to" line
+  d="$(printf 'Not connected.\n' | parse_link)"
+  [ "$d" = DISCONNECTED ] || { echo "  FAIL d: disconnected got '$d'"; fails=$((fails+1)); }
+
+  # (e) pure-HT MCS→NSS: MCS 12 → 2 streams, MCS 5 → 1 stream
+  read -r _b _ _ hn _ <<<"$(printf 'Connected to X (on wlan0)\n\ttx bitrate: 144.0 MBit/s MCS 12 40MHz short GI\n\trx bitrate: 72.0 MBit/s MCS 5 20MHz\n' | parse_link)"
+  [ "$hn" = 2 ] || { echo "  FAIL e: HT MCS12 got nss '$hn' (want 2)"; fails=$((fails+1)); }
+
+  # (f) first-sight of a BSSID (baseline 0 0) is FULL, never a false DEGRADED
+  v="$(classify 1 20 0 0)"
+  [ "$v" = FULL ] || { echo "  FAIL f: first-sight got '$v' (want FULL)"; fails=$((fails+1)); }
+
+  # (g) REAL-READ GATE (CLAUDE.md doctrine): a live radio must yield a numeric rank+width.
+  #     Honest n/a when no iface / not associated — required-but-non-blocking (exit-2 class).
+  iface="$(find_wifi_iface)"
+  if [ -z "$iface" ] || ! command -v iw >/dev/null 2>&1; then
+    echo "  real-read: n/a (no wifi iface or iw missing) — honest skip, not a fail"
+  else
+    live="$(iw dev "$iface" link 2>/dev/null | parse_link)"
+    if [ "$live" = DISCONNECTED ] || [ -z "$live" ]; then
+      echo "  real-read: n/a (iface $iface not associated) — honest skip, not a fail"
+    else
+      read -r _b _tb _tw ltn _rb _rw lrn _s <<<"$live"
+      lrank=$ltn; [ "${lrn:-0}" -gt "$lrank" ] && lrank=$lrn
+      if [ "${lrank:-0}" -ge 1 ]; then
+        echo "  real-read: OK — live link on $iface yields rank=${lrank}ss"
+      else
+        echo "  FAIL g: live link on $iface produced no spatial rank (got '$live')"; fails=$((fails+1))
+      fi
+    fi
+  fi
+
+  [ "$fails" = 0 ] && { echo "smoke-test: PASS"; exit 0; } || { echo "smoke-test: FAIL ($fails)"; exit 1; }
+fi
+
+# --------------------------- main ---------------------------
+json=0; [ "${1:-}" = --json ] && json=1
+command -v iw >/dev/null 2>&1 || { echo "mesh-wifi-mimo: iw unavailable — no radio to read (n/a)" >&2; exit 2; }
+iface="$(find_wifi_iface)"
+[ -n "$iface" ] || { echo "mesh-wifi-mimo: no wireless interface (n/a)" >&2; exit 2; }
+parsed="$(iw dev "$iface" link 2>/dev/null | parse_link)"
+[ -n "$parsed" ] || { echo "mesh-wifi-mimo: iw link produced no output on $iface (n/a)" >&2; exit 2; }
+emit "$parsed" "$json"
