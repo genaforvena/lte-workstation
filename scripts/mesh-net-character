@@ -1,0 +1,239 @@
+#!/usr/bin/env bash
+# mesh-net-character — CROSS-SENSE FUSION: what KIND of network traffic is this node doing?
+#
+# Fuses TWO independent, node-local network senses that answer DIFFERENT halves of a question
+# neither can answer alone:
+#   1. CONNECTION LOAD  (mesh-conntrack-load / kernel conntrack) — HOW MANY flows are open right
+#      now (all tracked conns: local sockets + MASQUERADE'd exit-node forwards). Answers "how many
+#      conversations?" — but is blind to how many BYTES move (a forwarded stream is one flow).
+#   2. THROUGHPUT       (mesh-net-io / /proc/net/dev) — HOW MANY bytes/s cross the wire (wlan + the
+#      tailscale mesh interface), and which DIRECTION. Answers "how much data?" — but is blind to
+#      whether it's one fat pipe or a thousand chatty sockets.
+#
+# WHY THIS IS NEW (not another net-health meter): flow-count and byte-rate are never fused. Their
+# RATIO — bytes-per-flow — is the derived quantity that separates traffic CHARACTER:
+#     many flows  +  few bytes each   → CHATTER   (API polling, mind sessions, telemetry, signaling)
+#     few flows   +  many bytes each  → BULK      (a download/upload/stream) + direction (DOWN/UP)
+#     both high                       → BUSY      (saturated on both axes)
+#     little of either                → IDLE / LIGHT
+# On a mind node running many claude/opencode API sessions this tells "are the minds just
+# chattering with APIs, or is something pulling/pushing a big transfer?" — and an unexpected
+# BULK-UP from a node that should never send bulk is a security-shaped signal.
+#
+# Honest-fusion (memory fusion-tools-distinguish-empty-from-failed): each half degrades VISIBLY.
+#   both live + quiet          → IDLE            (a genuine empty — a real token)
+#   throughput sense dead      → CONNS-ONLY ...  (io=UNKNOWN, NOT a fake IDLE)
+#   conntrack sense dead       → IO-ONLY ...     (conns=UNKNOWN, NOT a fake CHATTER)
+#   both dead                  → UNKNOWN
+# An unreachable input can NEVER read as a calm all-clear.
+#
+# Usage:
+#   mesh-net-character           one fused character line (samples ~2s of live throughput)
+#   mesh-net-character --json    machine-readable
+#   mesh-net-character --edge    emit only on character change (always touches state = liveness)
+#   mesh-net-character --test    smoke test (real-read gate; exit 2 = both senses n/a on this node)
+#
+# Exit codes (honest-exit contract): 0 = assessed · 2 = neither sense available (honest n/a, never fake)
+#
+# orphan-ok: on-demand traffic-character fusion — read live (/proc conntrack + a 2s mesh-net-io
+#   sample); NOT cron-wired, invoked from a dash/query like its sibling mesh-net-io. Change-gated
+#   state is touched every run (liveness) so an on-demand read never ages into a false STALE.
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+
+STATE_DIR="${MESH_STATE_DIR:-$HOME/.mesh}"
+STATE="$STATE_DIR/.net-character-state"
+CONN_STATE="$STATE_DIR/.conntrack-state"           # sat + fwd verdict from mesh-conntrack-load
+CNT_F=/proc/sys/net/netfilter/nf_conntrack_count   # live flow count (world-readable, no sudo)
+
+CONN_STALE="${MESH_NETCHAR_CONN_STALE:-1800}"      # cached conntrack verdict older than this = UNKNOWN
+NETIO_WIN="${MESH_NETCHAR_WIN:-2}"                  # throughput sample window (s)
+BULK_BPF="${MESH_NETCHAR_BULK_BPF:-40000}"         # bytes/s per flow above which traffic reads BULK
+CHATTER_FLOWS="${MESH_NETCHAR_CHATTER_FLOWS:-250}" # flow count above which low-per-flow reads CHATTER
+IDLE_BPS="${MESH_NETCHAR_IDLE_BPS:-20000}"         # total bytes/s below which = IDLE
+LIGHT_BPS="${MESH_NETCHAR_LIGHT_BPS:-200000}"      # < this = LIGHT tier
+HEAVY_BPS="${MESH_NETCHAR_HEAVY_BPS:-2000000}"     # >= this = HEAVY tier
+
+# --- gather CONNECTION-LOAD sense (live count + cached qualitative verdict) ---
+gather_conns(){ # sets FLOWS (int|NA), SAT, FWD
+  FLOWS=NA; SAT=UNKNOWN; FWD=UNKNOWN
+  if [ -r "$CNT_F" ]; then
+    local c; c=$(cat "$CNT_F" 2>/dev/null)
+    printf '%s' "$c" | grep -qE '^[0-9]+$' && FLOWS="$c"
+  fi
+  # cached mesh-conntrack-load verdict: "<sat> <fwd> <floor>", only if fresh
+  if [ -f "$CONN_STATE" ]; then
+    local age now; now=$(date +%s); age=$(( now - $(stat -c %Y "$CONN_STATE" 2>/dev/null || echo 0) ))
+    if [ "$age" -le "$CONN_STALE" ]; then
+      SAT=$(awk '{print $1}' "$CONN_STATE" 2>/dev/null); [ -n "$SAT" ] || SAT=UNKNOWN
+      FWD=$(awk '{print $2}' "$CONN_STATE" 2>/dev/null); [ -n "$FWD" ] || FWD=UNKNOWN
+    fi
+  fi
+}
+
+# --- gather THROUGHPUT sense: a controlled ~NETIO_WIN sample via the mesh-net-io organ ---
+gather_netio(){ # sets NETIO_JSON (json|"") — prime prev, sleep, read the delta over the window
+  NETIO_JSON=""
+  command -v mesh-net-io >/dev/null 2>&1 || return 0
+  mesh-net-io --json >/dev/null 2>&1 || return 0      # prime .net-io.prev to now
+  sleep "$NETIO_WIN"
+  local j; j=$(mesh-net-io --json 2>/dev/null) || return 0
+  printf '%s' "$j" | grep -q '"interfaces"' && NETIO_JSON="$j"
+}
+
+# --- classify: emit "label|tier|dir|locus|bpf|total|rx|tx|flows_tok|io_tok" ---
+classify(){ # args via env: FLOWS SAT FWD NETIO_JSON + thresholds
+  FLOWS="$FLOWS" SAT="$SAT" NETIO_JSON="$NETIO_JSON" \
+  BULK_BPF="$BULK_BPF" CHATTER_FLOWS="$CHATTER_FLOWS" IDLE_BPS="$IDLE_BPS" \
+  LIGHT_BPS="$LIGHT_BPS" HEAVY_BPS="$HEAVY_BPS" python3 - <<'PY'
+import os, json
+def gi(k):
+    v=os.environ.get(k,"")
+    try: return int(v)
+    except: return None
+flows=gi("FLOWS"); sat=os.environ.get("SAT","UNKNOWN")
+bulk_bpf=int(os.environ["BULK_BPF"]); chatter_flows=int(os.environ["CHATTER_FLOWS"])
+idle_bps=int(os.environ["IDLE_BPS"]); light_bps=int(os.environ["LIGHT_BPS"]); heavy_bps=int(os.environ["HEAVY_BPS"])
+
+nio=os.environ.get("NETIO_JSON","")
+rx=tx=None; ts_rx=ts_tx=0; ws_rx=ws_tx=0
+io_ok=False
+if nio:
+    try:
+        d=json.loads(nio); rx=tx=0
+        for i in d.get("interfaces",[]):
+            r=int(i.get("rx_rate",0)); t=int(i.get("tx_rate",0))
+            rx+=r; tx+=t
+            if "tailscale" in i.get("name",""): ts_rx+=r; ts_tx+=t
+            else: ws_rx+=r; ws_tx+=t
+        io_ok=True
+    except Exception:
+        rx=tx=None; io_ok=False
+
+conns_ok = flows is not None
+total = (rx+tx) if io_ok else None
+bpf = (total/max(flows,1)) if (io_ok and conns_ok) else None
+
+# direction (throughput only)
+def direction(rx,tx):
+    if rx>2*tx: return "DOWN"
+    if tx>2*rx: return "UP"
+    return "SYM"
+# locus: mesh (tailscale) vs wan (wlan/other)
+def locus():
+    m=ts_rx+ts_tx; w=ws_rx+ws_tx
+    if m>2*w: return "MESH"
+    if w>2*m: return "WAN"
+    return "SPLIT"
+
+tier="?"; dir_="?"; loc="?"
+if io_ok:
+    dir_=direction(rx,tx); loc=locus()
+    if total<idle_bps: tier="IDLE"
+    elif total<light_bps: tier="LIGHT"
+    elif total<heavy_bps: tier="MODERATE"
+    else: tier="HEAVY"
+
+flows_tok = str(flows) if conns_ok else "UNKNOWN"
+io_tok = "ok" if io_ok else "UNKNOWN"
+
+# --- character label (the derived signal) ---
+if not io_ok and not conns_ok:
+    label="UNKNOWN"
+elif not io_ok:
+    # throughput sense dead — report the connection half only, VISIBLY partial
+    label="CONNS-ONLY:%s/%sflows" % (sat, flows_tok)
+elif not conns_ok:
+    # conntrack sense dead — report throughput half only, VISIBLY partial
+    label="IO-ONLY:%s-%s" % (tier, dir_)
+else:
+    # both live — fuse
+    if tier=="IDLE":
+        label="IDLE"
+    elif bpf is not None and bpf>=bulk_bpf:
+        label="BULK-%s" % dir_               # few flows, many bytes each → a stream/transfer
+    elif flows>=chatter_flows:
+        label="CHATTER"                      # many flows, few bytes each → signaling/API/minds
+    elif total>=heavy_bps:
+        label="BUSY-%s" % dir_               # heavy on both, not cleanly bulk
+    elif total>=light_bps:
+        label="ACTIVE-%s" % dir_             # moderate mixed traffic
+    else:
+        label="LIGHT"                        # light traffic, nothing notable
+
+bpf_s = ("%d" % round(bpf)) if bpf is not None else "NA"
+tot_s = str(total) if total is not None else "NA"
+rx_s = str(rx) if io_ok else "NA"; tx_s = str(tx) if io_ok else "NA"
+print("|".join([label,tier,dir_,loc,bpf_s,tot_s,rx_s,tx_s,flows_tok,io_tok]))
+PY
+}
+
+run_once(){ # -> sets LABEL and the detail vars; returns 2 if BOTH senses n/a
+  gather_conns
+  gather_netio
+  local parsed; parsed=$(classify) || return 1
+  IFS='|' read -r LABEL TIER DIR LOCUS BPF TOTAL RXB TXB FLOWS_TOK IO_TOK <<<"$parsed"
+  [ "$LABEL" = UNKNOWN ] && return 2
+  return 0
+}
+
+# ---------------- --test ----------------
+if [ "${1:-}" = --test ]; then
+  command -v python3 >/dev/null 2>&1 || { echo "smoke-test: FAIL (no python3)"; exit 1; }
+  # classifier unit checks (synthetic, independent of live values)
+  chk(){ # $1=desc expected in $2 given env
+    local got; got=$(classify | cut -d'|' -f1)
+    [ "$got" = "$2" ] || { echo "smoke-test: FAIL ($1: got '$got' want '$2')"; exit 1; }
+  }
+  FLOWS=90  SAT=LOW NETIO_JSON='{"interfaces":[{"name":"wlp0s20f3","rx_rate":5000000,"tx_rate":10000}]}' ; chk bulk-down "BULK-DOWN"
+  FLOWS=90  SAT=LOW NETIO_JSON='{"interfaces":[{"name":"wlp0s20f3","rx_rate":10000,"tx_rate":5000000}]}' ; chk bulk-up "BULK-UP"
+  FLOWS=400 SAT=NORMAL NETIO_JSON='{"interfaces":[{"name":"wlp0s20f3","rx_rate":50000,"tx_rate":50000}]}' ; chk chatter "CHATTER"
+  FLOWS=90  SAT=LOW NETIO_JSON='{"interfaces":[{"name":"wlp0s20f3","rx_rate":1000,"tx_rate":1000}]}' ; chk idle "IDLE"
+  # honest-degradation: unreachable input is NOT a calm all-clear
+  FLOWS=90  SAT=LOW NETIO_JSON='' ; chk conns-only-partial "CONNS-ONLY:LOW/90flows"
+  FLOWS=NA  SAT=UNKNOWN NETIO_JSON='{"interfaces":[{"name":"wlp0s20f3","rx_rate":10000,"tx_rate":5000}]}' ; got=$(classify|cut -d'|' -f1)
+    case "$got" in IO-ONLY:*) : ;; *) echo "smoke-test: FAIL (io-only partial: got '$got')"; exit 1;; esac
+  FLOWS=NA  SAT=UNKNOWN NETIO_JSON='' ; chk both-dead "UNKNOWN"
+  # REAL-read gate (verification principle: a reachable-but-hollow read is not a pass):
+  # at least ONE live sense must produce data on this node, in a throwaway state dir.
+  _td="$(mktemp -d)"
+  out="$(MESH_STATE_DIR="$_td" "$0" 2>&1)"; rc=$?
+  jout="$(MESH_STATE_DIR="$_td" "$0" --json 2>&1)"; jrc=$?
+  rm -rf "$_td"
+  if [ "$rc" = 2 ]; then
+    echo "smoke-test: n/a (neither conntrack nor mesh-net-io available on this node — honest exit 2)"; exit 2
+  fi
+  { [ "$rc" = 0 ] && printf '%s' "$out" | grep -qE 'net-character: [A-Z]'; } \
+    || { echo "smoke-test: FAIL (one-shot shape: rc=$rc out='$out')"; exit 1; }
+  { [ "$jrc" = 0 ] && printf '%s' "$jout" | grep -q '"character"'; } \
+    || { echo "smoke-test: FAIL (--json missing character: rc=$jrc)"; exit 1; }
+  echo "smoke-test: ok (classifier units + honest-degradation + live fusion: $out)"; exit 0
+fi
+
+# ---------------- normal modes ----------------
+MODE=oneshot
+case "${1:-}" in --edge) MODE=edge ;; --json) MODE=json ;; esac
+
+run_once; rc=$?
+if [ "$rc" = 2 ]; then
+  echo "net-character: UNAVAILABLE (neither conntrack nor mesh-net-io on this node)" >&2
+  exit 2
+fi
+
+ts="$(date -u +%FT%TZ)"
+
+# state: content = change-gated label; mtime = liveness on EVERY eval (liveness-touch convention)
+mkdir -p "$STATE_DIR"
+prev="$(awk 'NR==1{print $1}' "$STATE" 2>/dev/null)"
+[ "$prev" != "$LABEL" ] && printf '%s %s\n' "$LABEL" "$ts" > "$STATE"
+command -v mesh-state-touch >/dev/null 2>&1 && mesh-state-touch "$STATE" >/dev/null 2>&1 || touch "$STATE" 2>/dev/null
+
+line="net-character: $LABEL | flows=$FLOWS_TOK sat=$SAT fwd=$FWD | io=${TOTAL}B/s (rx=$RXB tx=$TXB) tier=$TIER dir=$DIR locus=$LOCUS bpf=$BPF"
+case "$MODE" in
+  json) printf '{"ts":"%s","character":"%s","flows":"%s","sat":"%s","fwd":"%s","total_bps":"%s","rx_bps":"%s","tx_bps":"%s","tier":"%s","dir":"%s","locus":"%s","bytes_per_flow":"%s","io":"%s"}\n' \
+          "$ts" "$LABEL" "$FLOWS_TOK" "$SAT" "$FWD" "$TOTAL" "$RXB" "$TXB" "$TIER" "$DIR" "$LOCUS" "$BPF" "$IO_TOK" ;;
+  edge) [ "$prev" != "$LABEL" ] && echo "$ts $line" ;;
+  *)    echo "$line" ;;
+esac
+exit 0
