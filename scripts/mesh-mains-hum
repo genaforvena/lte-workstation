@@ -1,0 +1,297 @@
+#!/usr/bin/env python3
+# orphan-ok: on-demand acoustic mains-hum probe — captures a few seconds of the node
+#   mic and FFTs it for the 50 Hz powerline line, sampled when asked (like mesh-proc-churn
+#   / mesh-irq-rate), NOT scheduled: a periodic mic grab would contend with the always-on
+#   audio senses (overhear/soundscape/voice-*). Pull it on demand.
+"""mesh-mains-hum — the node's ACOUSTIC MAINS-HUM sense (electrical umwelt).
+
+Captures ~6 s of the local mic and measures the 50 Hz powerline hum and its
+100/150 Hz harmonics in the ambient sound — a physical signal NO existing sense
+reads. What it perceives:
+
+  * mains hum LEVEL — the strength of the 50 Hz line = how much AC-energised
+    equipment (LED/fluorescent ballasts, transformers, chargers, a fridge/fan
+    motor) is acoustically + electrically coupling into the room right now. A
+    quiet battery-only corner reads ABSENT; a room full of live mains gear reads
+    STRONG.
+  * ENF (grid frequency) — the EXACT measured frequency of the fundamental
+    (nominally 50.00 Hz in this region). The grid frequency drifts ~+/-0.1 Hz with
+    load; the reading is a live read of the power grid's state and a forensic
+    timestamp axis.
+
+WHY THIS IS NEW — orthogonal to every existing audio sense:
+  mesh-tuner          -> YIN pitch of a MONOPHONIC INSTRUMENT (musical note), not
+                         a fixed spectral line at the mains frequency.
+  mesh-audio-energy   -> broadband loudness (how loud), not WHICH frequencies.
+  mesh-soundscape /   -> texture / event classification, never the 50 Hz line.
+  mesh-voice-*          speech, not sub-bass electrical tone.
+  mesh-mains-hum      -> the powerline's acoustic signature: presence, strength,
+                         and exact frequency of the 50 Hz line.
+
+HONEST separation of hum from a LOUD room (the core trick): mains hum is a NARROW
+peak locked to an EXACT frequency (50.00 / 100.00 / 150.00 Hz) with harmonics on
+the grid, whereas music/voice bass is broadband and wanders. We (a) require the
+peak to sit within LINE_TOL of the nominal line (FREQUENCY-LOCK gate — rejects a
+47 Hz bass note) and (b) score it by LOCAL peak-to-shoulder contrast (against the
++/-2..6 Hz neighbourhood), not the whole-spectrum floor — so a loud broadband room
+raises the shoulders too and the sense honestly reports the line as buried rather
+than faking hum. Even through a clipping room the 50/100 Hz lines punch through at
+their exact bins; clip% is reported as a quality flag.
+
+HONEST unreachable: exit 2 (BLIND) when there is no capture tool, the mic grab
+fails, or the buffer is empty/all-zero (a dead/muted device) — never a fabricated
+ABSENT. No state file: every run is a fresh capture (not change-gated -> no
+mesh-state-touch needed, same as mesh-proc-churn / mesh-irq-rate).
+
+Usage:
+  mesh-mains-hum          one-shot verdict to stdout
+  mesh-mains-hum --json   machine-readable
+  mesh-mains-hum --test   offline classifier fixtures + a LIVE-READ gate
+                          (exit 2 = honest n/a when no mic, never a fake pass)
+"""
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+import wave
+
+import numpy as np
+
+# --- capture config (env-overridable for testing / odd hardware) ---
+CAP_SECS = float(os.environ.get("MESH_HUM_SECS", "6"))
+CAP_RATE = int(os.environ.get("MESH_HUM_RATE", "8000"))
+MAINS_HZ = float(os.environ.get("MESH_HUM_MAINS", "50"))   # 50 EU/RU, 60 for the Americas
+LINES = [MAINS_HZ, MAINS_HZ * 2, MAINS_HZ * 3]             # fundamental + 2 harmonics
+
+# frequency-lock: we hunt the true local peak in a WIDE +/-SEARCH_HZ band, then demand
+# it fall within the TIGHT LINE_TOL of the exact grid line. A 47 Hz bass note peaks at
+# 47 -> 3 Hz off 50 -> rejected; real mains peaks at ~50.0 -> locks. (The tight-only
+# version was fake: picking the max INSIDE +/-0.7 always "locks".)
+SEARCH_HZ = float(os.environ.get("MESH_HUM_SEARCH", "3.0"))
+LINE_TOL = float(os.environ.get("MESH_HUM_TOL", "0.7"))
+
+# classification on the strongest LOCKED line's local peak-to-shoulder contrast (dB)
+DB_FAINT = 3.0
+DB_PRESENT = 6.0
+DB_STRONG = 12.0
+
+
+def classify(contrast_db):
+    if contrast_db >= DB_STRONG:
+        return "STRONG"
+    if contrast_db >= DB_PRESENT:
+        return "PRESENT"
+    if contrast_db >= DB_FAINT:
+        return "FAINT"
+    return "ABSENT"
+
+
+def _parabolic(freqs, mags, i):
+    """Parabolic-interpolate the true peak frequency around bin i (sub-bin ENF)."""
+    if i <= 0 or i >= len(mags) - 1:
+        return float(freqs[i])
+    a, b, c = mags[i - 1], mags[i], mags[i + 1]
+    denom = (a - 2 * b + c)
+    if denom == 0:
+        return float(freqs[i])
+    delta = 0.5 * (a - c) / denom
+    return float(freqs[i] + delta * (freqs[1] - freqs[0]))
+
+
+def analyze(samples, sr):
+    """Given a float sample array + samplerate, return the mains-hum reading dict.
+
+    Pure DSP, no hardware — so --test can drive it on synthesised buffers. Returns
+    None on a degenerate (empty / all-zero / silent) buffer so the caller renders
+    an honest BLIND rather than a fabricated ABSENT."""
+    x = np.asarray(samples, dtype=float)
+    if x.size < sr:                       # need >= ~1 s to resolve the line
+        return None
+    clip_pct = float(np.mean(np.abs(x) >= 32000) * 100.0)
+    x = x - x.mean()
+    rms = float(np.sqrt(np.mean(x * x)))
+    if rms < 1.0:                         # dead / muted device -> not an honest ABSENT
+        return None
+    win = np.hanning(x.size)
+    spec = np.abs(np.fft.rfft(x * win))
+    freq = np.fft.rfftfreq(x.size, 1.0 / sr)
+
+    lines = []
+    for f0 in LINES:
+        if f0 >= sr / 2:                  # harmonic above Nyquist for this rate
+            continue
+        # WIDE search for the true local peak, then a TIGHT lock check against f0.
+        search = (freq >= f0 - SEARCH_HZ) & (freq <= f0 + SEARCH_HZ)
+        # shoulder = broadband neighbourhood OUTSIDE the search band (local floor)
+        shoulder = (((freq >= f0 - 8) & (freq <= f0 - 4)) |
+                    ((freq >= f0 + 4) & (freq <= f0 + 8)))
+        if not search.any() or not shoulder.any():
+            continue
+        s_idx = np.where(search)[0]
+        pk = s_idx[np.argmax(spec[s_idx])]
+        peak_f = _parabolic(freq, spec, pk)
+        peak_mag = float(spec[pk])
+        sh = float(np.median(spec[shoulder]))
+        contrast_db = 20.0 * np.log10(peak_mag / max(sh, 1e-9))
+        locked = abs(peak_f - f0) <= LINE_TOL and contrast_db >= DB_FAINT
+        lines.append({
+            "nominal_hz": f0,
+            "peak_hz": round(peak_f, 3),
+            "contrast_db": round(contrast_db, 1),
+            "locked": bool(locked),
+        })
+
+    locked = [ln for ln in lines if ln["locked"]]
+    # a positive mains verdict needs the FUNDAMENTAL locked OR >=2 harmonically-related
+    # lines locked — one lone locked line is a noise coincidence, not the grid.
+    fund_locked = any(ln["nominal_hz"] == MAINS_HZ for ln in locked)
+    if locked and not (fund_locked or len(locked) >= 2):
+        locked = []
+    if locked:
+        best = max(locked, key=lambda ln: ln["contrast_db"])
+        contrast = best["contrast_db"]
+        # ENF from the fundamental if it locked, else the strongest locked line / its order
+        fund = next((ln for ln in locked if ln["nominal_hz"] == MAINS_HZ), None)
+        if fund:
+            enf = round(fund["peak_hz"], 3)
+        else:
+            enf = round(best["peak_hz"] / round(best["nominal_hz"] / MAINS_HZ), 3)
+    else:
+        contrast = max((ln["contrast_db"] for ln in lines), default=0.0)
+        enf = None
+    level = classify(contrast) if locked else "ABSENT"
+    return {
+        "level": level,
+        "contrast_db": round(contrast, 1),
+        "enf_hz": enf,
+        "mains_hz": MAINS_HZ,
+        "clip_pct": round(clip_pct, 1),
+        "rms": round(rms, 1),
+        "lines": lines,
+    }
+
+
+def capture(path):
+    """Grab CAP_SECS of mono audio to a WAV via arecord. Return True on a real file."""
+    from shutil import which
+    if which("arecord") is None:
+        return False
+    try:
+        subprocess.run(
+            ["arecord", "-q", "-f", "S16_LE", "-r", str(CAP_RATE), "-c", "1",
+             "-d", str(int(CAP_SECS)), path],
+            check=True, timeout=CAP_SECS + 8,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+        return False
+    return os.path.exists(path) and os.path.getsize(path) > 44   # > WAV header
+
+
+def read_wav(path):
+    with wave.open(path, "rb") as w:
+        sr = w.getframerate()
+        n = w.getnframes()
+        raw = w.readframes(n)
+    return np.frombuffer(raw, dtype=np.int16).astype(float), sr
+
+
+def live_read():
+    """Capture + analyse the real mic. Return (reading_dict_or_None, ok_capture)."""
+    with tempfile.TemporaryDirectory() as td:
+        wav = os.path.join(td, "hum.wav")
+        if not capture(wav):
+            return None, False
+        try:
+            samples, sr = read_wav(wav)
+        except (wave.Error, OSError, ValueError):
+            return None, True   # capture happened but buffer unreadable -> BLIND, mic present
+        return analyze(samples, sr), True
+
+
+def _synth(sr, secs, freqs_amps, noise=0.0, seed=1):
+    rng = np.random.default_rng(seed)
+    t = np.arange(int(sr * secs)) / sr
+    x = np.zeros_like(t)
+    for f, a in freqs_amps:
+        x += a * np.sin(2 * np.pi * f * t)
+    if noise:
+        x += rng.normal(0, noise, size=t.shape)
+    return x * 8000.0   # scale into an int16-ish range
+
+
+def _test():
+    sr, secs = 8000, 6.0
+    # 1) a clean 50 Hz mains line buried in broadband noise -> LOCKED, not ABSENT
+    r = analyze(_synth(sr, secs, [(50, 1.0)], noise=0.05), sr)
+    if r is None or r["level"] == "ABSENT" or r["enf_hz"] is None:
+        print(f"smoke-test: FAIL (50Hz line should lock+detect, got {r})")
+        return 1
+    if abs(r["enf_hz"] - 50.0) > LINE_TOL:
+        print(f"smoke-test: FAIL (ENF off: {r['enf_hz']})")
+        return 1
+    # 2) FALSIFIER: a 47 Hz bass note (music, off the grid line) must NOT read as mains
+    r2 = analyze(_synth(sr, secs, [(47, 1.0)], noise=0.05, seed=2), sr)
+    if r2 is None or r2["level"] != "ABSENT" or r2["enf_hz"] is not None:
+        print(f"smoke-test: FAIL (47Hz off-line note must be ABSENT, got {r2})")
+        return 1
+    # 3) pure broadband noise, no line -> ABSENT
+    r3 = analyze(_synth(sr, secs, [], noise=1.0, seed=3), sr)
+    if r3 is None or r3["level"] != "ABSENT":
+        print(f"smoke-test: FAIL (noise-only should be ABSENT, got {r3})")
+        return 1
+    # 4) a STRONG mains stack (50+100+150) -> STRONG band
+    r4 = analyze(_synth(sr, secs, [(50, 1.0), (100, 0.7), (150, 0.3)], noise=0.02, seed=4), sr)
+    if r4 is None or r4["level"] not in ("STRONG", "PRESENT"):
+        print(f"smoke-test: FAIL (mains stack should be strong, got {r4})")
+        return 1
+    # 5) honest BLIND on a degenerate buffer (all-zero / silent device)
+    if analyze(np.zeros(int(sr * secs)), sr) is not None:
+        print("smoke-test: FAIL (all-zero buffer must be BLIND None, not ABSENT)")
+        return 1
+    if classify(13) != "STRONG" or classify(8) != "PRESENT" or classify(4) != "FAINT" or classify(1) != "ABSENT":
+        print("smoke-test: FAIL (classify bands wrong)")
+        return 1
+    # 6) REAL-READ GATE: exercise the actual mic. No mic -> honest n/a (exit 2), never a
+    #    fake pass; a reachable mic MUST yield a parseable buffer (not a hollow read).
+    reading, ok = live_read()
+    if not ok:
+        print("smoke-test: n/a (no mic / capture unavailable) — honest UNREACHABLE")
+        return 2
+    if reading is None:
+        print("smoke-test: FAIL (mic captured but produced no analysable audio — hollow read)")
+        return 1
+    print(f"smoke-test: ok (line-lock + 47Hz falsifier + noise/stack/BLIND bands + "
+          f"live-read gate: level={reading['level']} enf={reading['enf_hz']} "
+          f"clip%={reading['clip_pct']})")
+    return 0
+
+
+def main():
+    args = sys.argv[1:]
+    if "--test" in args:
+        raise SystemExit(_test())
+
+    reading, ok = live_read()
+    if not ok:
+        print("mesh-mains-hum: no mic / capture failed — UNREACHABLE", file=sys.stderr)
+        raise SystemExit(2)
+    if reading is None:
+        print("mesh-mains-hum: mic reachable but buffer empty/silent — BLIND", file=sys.stderr)
+        raise SystemExit(2)
+
+    if "--json" in args:
+        reading["ts"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        print(json.dumps(reading))
+        raise SystemExit(0)
+
+    enf = f"{reading['enf_hz']:.2f}Hz" if reading["enf_hz"] is not None else "n/a"
+    clip = f" clip={reading['clip_pct']:.0f}%" if reading["clip_pct"] >= 5 else ""
+    print(f"[mains-hum] {reading['level']} — {reading['contrast_db']:.1f}dB line-contrast "
+          f"| ENF={enf} (nominal {reading['mains_hz']:.0f}Hz){clip}")
+
+
+if __name__ == "__main__":
+    main()
