@@ -1,0 +1,169 @@
+#!/usr/bin/env bash
+# reflex-cadence: 17 * * * *
+# mesh-fs-integrity — FILESYSTEM-LAYER integrity via the kernel's ext4 error counters.
+#
+# A NEW physical axis no existing sense reads. The mesh already sees the SSD's media wear
+# (mesh-nvme-health/SMART), the PCIe BUS underneath it (mesh-pcie-health/AER), and CPU/mem
+# machine-checks (mesh-hw-fault-watch/MCE) — but NOTHING watches the FILESYSTEM layer that
+# rides on top of all of them. When the kernel catches on-disk ext4 metadata corruption
+# (a bad directory entry, a checksum mismatch, an impossible inode) it increments a durable
+# counter in the SUPERBLOCK and exposes it at /sys/fs/ext4/<dev>/errors_count, alongside the
+# first/last error's time, inode, block and kernel function. Because it lives in the superblock
+# it SURVIVES a reboot — where a dmesg-grep for 'EXT4-fs error' loses everything from before the
+# clean reincarnation. mesh-nvme-health sees the disk is physically healthy while ext4 above it
+# may already be logging structural damage; this is the layer that gap leaves blind.
+#
+# Source: /sys/fs/ext4/<dev>/errors_count (cumulative count of kernel-caught fs errors),
+#         .../first_error_{time,ino,block,func}, .../last_error_{time,ino,block,func}.
+# Cumulative superblock counter — the SIGNAL is the delta vs the previous reading (state-backed).
+#
+# Per-device verdict (on the delta since last sample, once a baseline exists):
+#   CLEAN      — errors_count 0 (and none in lifetime)
+#   HEALED     — lifetime errors > 0 but ZERO new this interval (past event; fsck likely cleared it)
+#   CORRUPTING — errors_count ROSE this interval (kernel caught fresh on-disk metadata corruption)
+#   BASELINE   — first sample (no prior reading) — lifetime shown, rate not yet knowable
+# Overall = worst device (CORRUPTING > BASELINE > HEALED > CLEAN).
+#
+# Exit 2 (honest n/a, never a fake CLEAN): kernel exposes no ext4 error counters (no ext4
+# filesystem mounted, a non-ext4 root, or a kernel without the sysfs export). mesh-land treats
+# exit 2 as a pass, so this runs green on nodes that physically cannot produce the reading.
+#
+# Change-gated: rewrites its STATE only when a count moves, but mesh-state-touch's the STATE on
+# EVERY successful run so a long-CLEAN (stable-zero) filesystem cannot decay to a FALSE-STALE.
+#
+#   mesh-fs-integrity           one reading + delta vs last sample (updates the baseline)
+#   mesh-fs-integrity --raw     also print the first/last-error detail fields per non-clean device
+#   mesh-fs-integrity --test    synthetic parser/classifier fixtures + a real-hardware read gate
+set -uo pipefail
+
+EXT4_ROOT="${MESH_EXT4_ROOT:-/sys/fs/ext4}"
+STATE="${MESH_FS_STATE:-$HOME/.mesh/.fs-integrity-state}"
+RAW=0
+[ "${1:-}" = --raw ] && { RAW=1; shift; }
+
+# read a non-negative integer from a sysfs file; echoes the int, or fails if missing/garbage
+int_of() {
+  local f="$1" v
+  [ -r "$f" ] || return 1
+  v="$(cat "$f" 2>/dev/null)" || return 1
+  case "$v" in ''|*[!0-9]*) return 1;; esac
+  printf '%s' "$v"
+}
+
+# snapshot -> one line per ext4 device: "<dev> <errors_count>"
+# only real device dirs carry errors_count; the special 'features/' dir has none -> skipped.
+# never invent a zero for a dir without the counter.
+snapshot() {
+  local d dev ec
+  for d in "$EXT4_ROOT"/*/; do
+    [ -e "$d/errors_count" ] || continue
+    ec="$(int_of "$d/errors_count")" || continue
+    dev="$(basename "$d")"
+    echo "$dev $ec"
+  done
+}
+
+# classify <delta> <lifetime> <have_prior>
+classify() {
+  local d=$1 life=$2 prior=$3
+  if [ "$prior" = 0 ]; then
+    [ "$life" -gt 0 ] && { echo BASELINE; return; }
+    echo CLEAN; return
+  fi
+  [ "$d" -gt 0 ] && { echo CORRUPTING; return; }
+  [ "$life" -gt 0 ] && { echo HEALED; return; }
+  echo CLEAN
+}
+rank_of() { case "$1" in CORRUPTING) echo 3;; BASELINE) echo 2;; HEALED) echo 1;; *) echo 0;; esac; }
+
+# human-readable last-error detail for a device (only meaningful when lifetime > 0)
+detail_of() {
+  local dev="$1" t ino blk fn
+  t="$(cat "$EXT4_ROOT/$dev/last_error_time" 2>/dev/null)"
+  ino="$(cat "$EXT4_ROOT/$dev/last_error_ino" 2>/dev/null)"
+  blk="$(cat "$EXT4_ROOT/$dev/last_error_block" 2>/dev/null)"
+  fn="$(cat "$EXT4_ROOT/$dev/last_error_func" 2>/dev/null)"
+  local when="$t"
+  case "$t" in ''|0) when="—";; *[!0-9]*) : ;; *) when="$(date -d "@$t" '+%Y-%m-%dT%H:%M:%SZ' -u 2>/dev/null || echo "$t")";; esac
+  printf 'last_error: time=%s ino=%s block=%s func=%s' "$when" "${ino:-?}" "${blk:-?}" "${fn:-?}"
+}
+
+# ---- --test: synthetic fixtures + real-hardware read gate --------------------------------
+if [ "${1:-}" = --test ]; then
+  e=0
+  tf="$(mktemp -d)"; trap 'rm -rf "$tf"' EXIT
+  # (1) parser: int_of accepts an int, rejects garbage/missing
+  printf '7\n' > "$tf/ec"
+  [ "$(int_of "$tf/ec")" = 7 ] || { echo "test: int_of pick FAIL"; e=1; }
+  printf 'not-a-number\n' > "$tf/bad"
+  int_of "$tf/bad" >/dev/null 2>&1 && { echo "test: int_of should reject garbage FAIL"; e=1; }
+  int_of "$tf/nope" >/dev/null 2>&1 && { echo "test: int_of should reject missing FAIL"; e=1; }
+  # (2) classifier truth table
+  [ "$(classify 0 0 0)" = CLEAN ]      || { echo "test: cls CLEAN(first) FAIL"; e=1; }
+  [ "$(classify 0 5 0)" = BASELINE ]   || { echo "test: cls BASELINE FAIL"; e=1; }
+  [ "$(classify 3 9 1)" = CORRUPTING ] || { echo "test: cls CORRUPTING FAIL"; e=1; }
+  [ "$(classify 0 5 1)" = HEALED ]     || { echo "test: cls HEALED FAIL"; e=1; }
+  [ "$(classify 0 0 1)" = CLEAN ]      || { echo "test: cls CLEAN(quiet) FAIL"; e=1; }
+  # (3) snapshot over a synthetic /sys/fs/ext4 tree — must skip 'features' (no errors_count)
+  fr="$tf/ext4"; mkdir -p "$fr/dm-0" "$fr/sda2" "$fr/features"
+  printf '4\n' > "$fr/dm-0/errors_count"
+  printf '0\n' > "$fr/sda2/errors_count"
+  printf 'needs_recovery\n' > "$fr/features/foo"   # features dir: no errors_count -> skipped
+  snap="$(MESH_EXT4_ROOT="$fr" bash -c 'EXT4_ROOT="$MESH_EXT4_ROOT"; '"$(declare -f int_of snapshot)"'; snapshot')"
+  n="$(printf '%s\n' "$snap" | grep -c .)"
+  [ "$n" -eq 2 ] || { echo "test: snapshot should emit exactly the 2 ext4 devices, skipping features (got $n) FAIL"; e=1; }
+  printf '%s\n' "$snap" | grep -q '^dm-0 4$' || { echo "test: snapshot content FAIL"; e=1; }
+  # (4) REAL-HARDWARE read gate: a live read must parse >=1 device's counter, OR exit 2 (honest n/a).
+  real="$(snapshot)"
+  if [ -z "$real" ]; then
+    echo "test: no live ext4 error counter on this node — honest n/a (exit 2)"; [ "$e" = 0 ] && exit 2 || exit 1
+  fi
+  echo "$real" | awk 'NF!=2 || $2 ~ /[^0-9]/ {bad=1} END{exit bad}' \
+    || { echo "test: live read produced a non-numeric counter FAIL"; e=1; }
+  ndev="$(printf '%s\n' "$real" | grep -c .)"
+  [ "$e" = 0 ] && echo "test: PASS (real read: $ndev ext4 device(s))" || echo "test: FAIL"
+  exit "$e"
+fi
+
+# ---- live run ---------------------------------------------------------------------------
+cur="$(snapshot)"
+[ -n "$cur" ] || { echo "fs-integrity: n/a — no ext4 error counters exposed (no ext4 fs / kernel without sysfs export)"; exit 2; }
+
+mkdir -p "$(dirname "$STATE")" 2>/dev/null
+have_prior=0; [ -s "$STATE" ] && have_prior=1
+declare -A P_EC
+if [ "$have_prior" = 1 ]; then
+  while read -r dev pec; do
+    [ -n "$dev" ] || continue
+    P_EC["$dev"]=$pec
+  done < "$STATE"
+fi
+
+worst=CLEAN; worst_rank=0
+report=""
+while read -r dev ec; do
+  [ -n "$dev" ] || continue
+  pec=${P_EC["$dev"]:-0}
+  prior="$have_prior"; [ -n "${P_EC["$dev"]+x}" ] || prior=0   # a device unseen last time has no baseline
+  d=$((ec-pec)); [ "$d" -lt 0 ] && d=0                          # counter reset (fsck/reprovision) -> no negative rate
+  v="$(classify "$d" "$ec" "$prior")"
+  r="$(rank_of "$v")"; [ "$r" -gt "$worst_rank" ] && { worst_rank=$r; worst=$v; }
+  d_note=""
+  [ "$prior" = 1 ] && [ "$d" -gt 0 ] && d_note=" (+$d since last)"   # no "since last" on a first-seen/BASELINE device
+  report+="  $dev [$v] — errors_count=$ec$d_note"$'\n'
+  if [ "$RAW" = 1 ] && [ "$ec" -gt 0 ]; then
+    report+="      $(detail_of "$dev")"$'\n'
+  fi
+done <<< "$cur"
+
+echo "fs-integrity: $worst"
+printf '%s' "$report"
+
+# change-gated write (only when a count moved) + unconditional liveness touch
+new_state="$(printf '%s\n' "$cur")"
+if [ ! -s "$STATE" ] || [ "$new_state" != "$(cat "$STATE" 2>/dev/null)" ]; then
+  printf '%s\n' "$new_state" > "$STATE"
+fi
+mesh-state-touch "$STATE" 2>/dev/null || touch "$STATE" 2>/dev/null
+
+case "$worst" in CORRUPTING) exit 1;; *) exit 0;; esac
