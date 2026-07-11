@@ -1,0 +1,217 @@
+#!/usr/bin/env bash
+# orphan-ok: on-demand advisory — a mind reads it AT THE MOMENT it is about to decide "shed minds
+#            or not?" / "is this heat mine to fix?". The answer is only meaningful right then, so it
+#            is deliberately NOT cron-wired (same posture as its thermal siblings mesh-therm-regime /
+#            mesh-burn-window). Writes .therm-headroom.state every run for a dash to surface; state
+#            mtime is always fresh (no change-gating → structurally cannot false-STALE).
+#
+# mesh-therm-headroom — CROSS-SENSE FUSION: this node's #1 failure mode is thermal throttle, and the
+# recurring board question is NOT "how hot?" (mesh-therm-watch answers that) but "SHOULD I SHED, OR
+# WILL SHEDDING BARELY HELP BECAUSE IT'S THE ROOM?". No single thermal sensor answers that. This
+# folds TWO INDEPENDENT hardware temperature domains to ATTRIBUTE the throttle risk:
+#
+#   * CPU PACKAGE temp  (coretemp "Package id 0" → x86_pkg_temp fallback) — the FAST, load-driven
+#     head. Rises/falls within seconds of workload. Ground truth for "how close to throttle".
+#   * SSD (NVMe) temp   (hwmon name=nvme) — a SLOW, ambient-coupled FLOOR. The SSD does little work,
+#     so its temperature tracks the CHASSIS/ROOM baseline the CPU is bathed in, not the CPU's own
+#     burst. It barely moves on a load spike. → the coolest the CPU could ever idle toward.
+#
+# THE SYNERGY neither sensor gives alone: PACKAGE alone says "95°C = danger" but not whether shedding
+# fixes it. FLOOR alone says "chassis is 55°C" but not whether that matters. TOGETHER they split the
+# thermal budget:  headroom = CEIL − pkg   (°C to throttle)   ·   load_rise = pkg − floor  (self-
+# inflicted heat ABOVE the ambient baseline ≈ what shedding could recover). A tight headroom with a
+# COOL floor is LOAD-BOUND (shed minds → recover ~load_rise°C). A tight headroom with a HOT floor is
+# AMBIENT-BOUND (the box is baking in a hot room — shedding recovers little; the remedy is COOLING,
+# not shedding). This is exactly the board's 2026-07-11 pain: "HOT because 26.8°C outside" — where
+# shedding was tried and barely helped.
+#
+# VERDICTS (a JOINT pattern over BOTH axes, not a max-selector of the hotter one):
+#   COMFORTABLE    headroom ≥ HEADROOM_OK — plenty of room; attribution is informational.
+#   LOAD-BOUND     headroom tight AND floor COOL → the heat is yours: shedding load recovers headroom.
+#   AMBIENT-BOUND  headroom tight AND floor HOT AND load_rise NOT dominant → the room/chassis is the
+#                  root; shedding gives little back → operator remedy is cooling (lid/AC/move air).
+#   MIXED          headroom tight AND floor HOT AND load_rise dominant → both: shed recovers ~load_rise
+#                  but the floor is high too; shedding alone won't reach comfort.
+#   TIGHT-UNKNOWN  headroom tight but the FLOOR sensor is unreadable → cannot attribute (partial).
+#
+# HONEST-DEGRADE ([[fusion-tools-distinguish-empty-from-failed]]): NO CPU package sensor at all (e.g. a
+# VM like phaedra) → exit 2 (honest n/a — this organ isn't here), never a fake all-clear. FLOOR sensor
+# missing but package present → attribution renders UNKNOWN + "(partial)"; headroom is still reported
+# but no LOAD/AMBIENT verdict is faked. An unreachable input is visibly different from a cool read.
+#
+#   mesh-therm-headroom            fold → one verdict + reason line
+#   mesh-therm-headroom --json     machine-readable {verdict, headroom_c, load_rise_c, pkg_c, floor_c, partial, reason, ts}
+#   mesh-therm-headroom --edge     emit ONLY on verdict change (for a consumer/board)
+#   mesh-therm-headroom --test     assert the joint attribution rules + a live read yields real temps
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+
+M="$HOME/.mesh"
+STATE="$M/.therm-headroom.state"
+NOW="${THERM_HEADROOM_NOW:-$(date +%s)}"
+
+# thresholds (env-overridable) — °C
+CEIL="${THERM_HEADROOM_CEIL:-95}"           # practical throttle onset (hw crit is 100; this box sheds ~92-98)
+HEADROOM_OK="${THERM_HEADROOM_OK:-20}"      # ≥ this → COMFORTABLE regardless of attribution
+FLOOR_HOT="${THERM_HEADROOM_FLOOR_HOT:-50}" # ambient/chassis floor ≥ this = the ROOM is hot (cool-idle SSD ~35-45)
+LOAD_DOMINANT="${THERM_HEADROOM_LOAD_DOM:-30}" # load_rise ≥ this = self-inflicted heat dominates
+
+# ---- sensor discovery (both from /sys, no SSH, no re-sensing cost) ----
+# echo integer °C, or empty if the sensor is absent.
+read_pkg() {
+  local h name lab f v
+  for h in /sys/class/hwmon/hwmon*; do
+    [ -r "$h/name" ] || continue
+    [ "$(cat "$h/name" 2>/dev/null)" = coretemp ] || continue
+    for lab in "$h"/temp*_label; do
+      [ -r "$lab" ] || continue
+      [ "$(cat "$lab" 2>/dev/null)" = "Package id 0" ] || continue
+      f="${lab%_label}_input"; v=$(cat "$f" 2>/dev/null) || continue
+      [ -n "$v" ] && { echo $(( v / 1000 )); return; }
+    done
+  done
+  # fallback: x86_pkg_temp thermal zone
+  local z t
+  for z in /sys/class/thermal/thermal_zone*; do
+    [ -r "$z/type" ] || continue
+    [ "$(cat "$z/type" 2>/dev/null)" = x86_pkg_temp ] || continue
+    t=$(cat "$z/temp" 2>/dev/null) || continue
+    [ -n "$t" ] && { echo $(( t / 1000 )); return; }
+  done
+}
+
+# SSD temp = ambient-coupled FLOOR proxy. nvme primary; fallback = coolest plausible chassis zone.
+read_floor() {
+  local h v
+  for h in /sys/class/hwmon/hwmon*; do
+    [ -r "$h/name" ] || continue
+    [ "$(cat "$h/name" 2>/dev/null)" = nvme ] || continue
+    v=$(cat "$h/temp1_input" 2>/dev/null) || continue
+    [ -n "$v" ] && { echo $(( v / 1000 )); return; }
+  done
+  # fallback: coolest thermal zone that is a real chassis sensor (exclude CPU-coupled + the static
+  # INT3400 placeholder), sanity-bounded 15..85°C.
+  local z ty t c min=""
+  for z in /sys/class/thermal/thermal_zone*; do
+    [ -r "$z/type" ] || continue
+    ty=$(cat "$z/type" 2>/dev/null)
+    case "$ty" in x86_pkg_temp|INT3400*|coretemp*) continue;; esac
+    t=$(cat "$z/temp" 2>/dev/null) || continue
+    c=$(( t / 1000 ))
+    [ "$c" -ge 15 ] && [ "$c" -le 85 ] || continue
+    if [ -z "$min" ] || [ "$c" -lt "$min" ]; then min="$c"; fi
+  done
+  [ -n "$min" ] && echo "$min"
+}
+
+# classify <pkg> <floor|UNKNOWN> — echoes: "<VERDICT>\t<partial>\t<headroom>\t<load_rise|->\t<reason>"
+classify() {
+  local pkg="$1" floor="$2" partial=0
+  local headroom=$(( CEIL - pkg ))
+  local load_rise="-" verdict reason
+
+  if [ "$headroom" -ge "$HEADROOM_OK" ]; then
+    verdict=COMFORTABLE
+    if [ "$floor" = UNKNOWN ]; then
+      partial=1; reason="pkg=${pkg}°C, ${headroom}°C to ${CEIL}°C ceiling — ample headroom (floor sensor n/a)"
+    else
+      load_rise=$(( pkg - floor )); [ "$load_rise" -lt 0 ] && load_rise=0
+      reason="pkg=${pkg}°C floor=${floor}°C, ${headroom}°C to ${CEIL}°C ceiling — ample headroom (load-rise ${load_rise}°C)"
+    fi
+    printf '%s\t%s\t%s\t%s\t%s' "$verdict" "$partial" "$headroom" "$load_rise" "$reason"; return
+  fi
+
+  # headroom is TIGHT — attribute it
+  if [ "$floor" = UNKNOWN ]; then
+    verdict=TIGHT-UNKNOWN; partial=1
+    reason="pkg=${pkg}°C, only ${headroom}°C to ${CEIL}°C — TIGHT but floor sensor n/a, cannot attribute (shed conservatively)"
+    printf '%s\t%s\t%s\t%s\t%s' "$verdict" "$partial" "$headroom" "-" "$reason"; return
+  fi
+
+  load_rise=$(( pkg - floor )); [ "$load_rise" -lt 0 ] && load_rise=0
+  local ambient_hot=0 load_dom=0
+  [ "$floor" -ge "$FLOOR_HOT" ] && ambient_hot=1
+  [ "$load_rise" -ge "$LOAD_DOMINANT" ] && load_dom=1
+
+  if [ "$ambient_hot" -eq 1 ] && [ "$load_dom" -eq 1 ]; then
+    verdict=MIXED
+    reason="pkg=${pkg}°C floor=${floor}°C (HOT room) load-rise=${load_rise}°C — ${headroom}°C to throttle: BOTH; shed recovers ~${load_rise}°C but the floor is high — shed AND cool"
+  elif [ "$ambient_hot" -eq 1 ]; then
+    verdict=AMBIENT-BOUND
+    reason="pkg=${pkg}°C floor=${floor}°C (HOT room) — ${headroom}°C to throttle but load-rise only ${load_rise}°C: shedding recovers little, the ROOM is the root → cool it (lid/AC/air)"
+  else
+    verdict=LOAD-BOUND
+    reason="pkg=${pkg}°C floor=${floor}°C (cool) load-rise=${load_rise}°C — ${headroom}°C to throttle: heat is SELF-inflicted → shed load, recovers ~${load_rise}°C"
+  fi
+  printf '%s\t%s\t%s\t%s\t%s' "$verdict" "$partial" "$headroom" "$load_rise" "$reason"
+}
+
+fold() {
+  local pkg floor
+  pkg=$(read_pkg)
+  if [ -z "$pkg" ]; then echo "__NOPKG__"; return; fi
+  floor=$(read_floor); [ -z "$floor" ] && floor=UNKNOWN
+  classify "$pkg" "$floor"
+}
+
+emit_state() {  # <verdict> <partial> <headroom> <load_rise> — always rewrite (mtime = liveness)
+  printf '%s|partial=%s|headroom=%s|load_rise=%s|ts=%s\n' "$1" "$2" "$3" "$4" "$NOW" > "$STATE" 2>/dev/null || true
+  command -v mesh-state-touch >/dev/null 2>&1 && mesh-state-touch "$STATE" >/dev/null 2>&1 || true
+}
+
+case "${1:-}" in
+  --test)
+    fail() { echo "FAIL: $1"; exit 1; }
+    v() { classify "$@" | cut -f1; }
+    hr() { classify "$@" | cut -f3; }
+    # COMFORTABLE: big headroom (defaults CEIL=95, OK=20) — pkg 60, floor 40
+    [ "$(v 60 40)" = COMFORTABLE ] || fail "60/40 must be COMFORTABLE"
+    # LOAD-BOUND: tight headroom (pkg 82 → 13 to ceiling) with a COOL floor (40) → self-inflicted
+    [ "$(v 82 40)" = LOAD-BOUND ] || fail "82/40 must be LOAD-BOUND (cool floor, tight)"
+    # AMBIENT-BOUND: tight headroom, HOT floor (55≥50), load-rise 25 (<30, not dominant) → room is root
+    [ "$(v 80 55)" = AMBIENT-BOUND ] || fail "80/55 must be AMBIENT-BOUND (hot floor, sub-dominant load)"
+    # MIXED: tight headroom, HOT floor (52) AND dominant load-rise (85-52=33≥30)
+    [ "$(v 85 52)" = MIXED ] || fail "85/52 must be MIXED (hot floor + dominant load)"
+    # THE JOINT PROOF: SAME pkg=82 flips verdict on the FLOOR alone — cool→LOAD-BOUND, hot→attribution changes.
+    [ "$(v 82 40)" != "$(v 82 60)" ] || fail "same pkg must change verdict when floor flips cool→hot (the fusion synergy)"
+    # HONEST-DEGRADE: floor UNKNOWN with tight headroom → TIGHT-UNKNOWN + partial, never a faked LOAD/AMBIENT
+    [ "$(v 82 UNKNOWN)" = TIGHT-UNKNOWN ] || fail "tight + UNKNOWN floor must be TIGHT-UNKNOWN"
+    classify 82 UNKNOWN | grep -q 'partial=\?1\|cannot attribute' || classify 82 UNKNOWN | cut -f2 | grep -q 1 || fail "UNKNOWN floor must set partial"
+    [ "$(classify 82 UNKNOWN | cut -f2)" = 1 ] || fail "UNKNOWN floor must set partial=1"
+    # headroom arithmetic is real, not interpretation
+    [ "$(hr 75 40)" = 20 ] || fail "headroom 95-75 must be 20"
+    # LIVE READ gate — a real CPU package temp must come back as a plausible number (real hardware read
+    # produces data, not just the offline classifier). exit 2 honest-n/a only if the node truly has none.
+    pkg=$(read_pkg)
+    if [ -z "$pkg" ]; then echo "PASS (classifier asserted; no CPU package sensor on this node — honest n/a, would exit 2 live)"; exit 0; fi
+    [ "$pkg" -ge 20 ] && [ "$pkg" -le 110 ] || fail "live package temp implausible: ${pkg}°C"
+    floor=$(read_floor)
+    if [ -n "$floor" ]; then [ "$floor" -ge 10 ] && [ "$floor" -le 95 ] || fail "live floor temp implausible: ${floor}°C"; fi
+    live=$(fold | cut -f1)
+    case "$live" in COMFORTABLE|LOAD-BOUND|AMBIENT-BOUND|MIXED|TIGHT-UNKNOWN) ;; *) fail "live fold produced invalid verdict '$live'";; esac
+    echo "PASS (joint-attribution + honest-degrade asserted; live pkg=${pkg}°C floor=${floor:-n/a}°C verdict=$live)"
+    exit 0 ;;
+  --json)
+    out=$(fold)
+    if [ "$out" = "__NOPKG__" ]; then
+      printf '{"verdict":"NOSENSE","reason":"no CPU package thermal sensor on this node","ts":%s}\n' "$NOW"; exit 2
+    fi
+    IFS=$'\t' read -r vv pp hh lr rr <<<"$out"; emit_state "$vv" "$pp" "$hh" "$lr"
+    pkg=$(read_pkg); floor=$(read_floor); [ -z "$floor" ] && floor=null
+    printf '{"verdict":"%s","headroom_c":%s,"load_rise_c":"%s","pkg_c":%s,"floor_c":%s,"partial":%s,"reason":"%s","ts":%s}\n' \
+      "$vv" "$hh" "$lr" "$pkg" "$floor" "$pp" "$(echo "$rr" | sed 's/"/\\"/g')" "$NOW" ;;
+  --edge)
+    out=$(fold)
+    [ "$out" = "__NOPKG__" ] && exit 2
+    IFS=$'\t' read -r vv pp hh lr rr <<<"$out"
+    prev=$(cut -d'|' -f1 "$STATE" 2>/dev/null || echo "")
+    emit_state "$vv" "$pp" "$hh" "$lr"
+    [ "$vv" != "$prev" ] && echo "[therm-headroom] $vv — $rr"
+    exit 0 ;;
+  *)
+    out=$(fold)
+    if [ "$out" = "__NOPKG__" ]; then echo "NOSENSE — no CPU package thermal sensor on this node (honest n/a)"; exit 2; fi
+    IFS=$'\t' read -r vv pp hh lr rr <<<"$out"; emit_state "$vv" "$pp" "$hh" "$lr"
+    echo "$vv — $rr" ;;
+esac
