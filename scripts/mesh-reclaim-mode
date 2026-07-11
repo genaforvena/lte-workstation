@@ -18,6 +18,18 @@
 #   THAT is the latency hit minds feel, and it LEADS the OOM/thrash collapse. kswapd-only = healthy
 #   pressure the system absorbs; direct = pressure that has broken through to foreground work.
 #
+# COMPANION AXIS — high-order FRAGMENTATION (compaction failure), added 2026-07-12 (discover+health
+# CONFIRMED find, knowledge/capability-compaction-fail-fragmentation-20260712.md):
+#   reclaim answers "can the kernel FREE enough pages?"; compaction answers "even after freeing, can it
+#   ASSEMBLE a CONTIGUOUS run?" — the second failure mode is invisible to reclaim/PSI/swap. A node with
+#   free memory (reclaim fine) still fails THP/jumbo-buffer/driver high-order allocs when it's fragmented.
+#   compact_stall = high-order allocs that had to trigger compaction; compact_fail = of those, ones that
+#   STILL couldn't produce the run; thp_fault_fallback = THP faults that fell back to 4K. The live
+#   compaction-fail FRACTION (Δcompact_fail/Δcompact_stall this window) is a LEADING indicator of
+#   fragmentation latency BEFORE oom, caught by no other sense. This is a SOFT axis: absent compaction
+#   accounting (old kernel) renders frag=n/a and NEVER blocks the reclaim verdict; the authoritative
+#   first-token LABEL is unchanged (reclaim CALM/CONTENDED/STALLING) — frag rides as additive fields.
+#
 # Signals (two-sample counter delta over a short window):
 #   allocstall/s   — allocations that entered DIRECT reclaim per sec (the primary; 0 on a calm system)
 #   direct_frac    — pgsteal_direct_delta / (pgsteal_direct + pgsteal_kswapd)_delta, 0..100%
@@ -48,6 +60,10 @@ CONTEND_SPS="${RECLAIM_CONTEND_SPS:-1}"
 STALL_SPS="${RECLAIM_STALL_SPS:-50}"
 WINDOW_S="${RECLAIM_WINDOW_S:-3}"
 VMSTAT="${MESH_VMSTAT:-/proc/vmstat}"
+# compaction/fragmentation axis thresholds (fail% = compact_fail/compact_stall this window):
+FRAG_WARN_PCT="${FRAG_WARN_PCT:-25}"   # < this = LOOSE (compaction assembling runs fine)
+FRAG_HI_PCT="${FRAG_HI_PCT:-60}"       # >= this = FRAGMENTED (most high-order allocs failing)
+FRAG_MIN_STALL="${FRAG_MIN_STALL:-1}"  # fewer stalls than this in the window = QUIET (no high-order pressure)
 
 # read_counters <file> → echoes "allocstall steal_direct steal_kswapd scan_direct" or returns 1.
 # allocstall is summed across per-zone lines (allocstall_dma/dma32/normal/movable/device on modern
@@ -100,6 +116,41 @@ classify() {
   echo "STALLING|${sps} allocstall/s — allocations routinely blocking; reclaim hurting latency now"
 }
 
+# read_compaction <file> → echoes "compact_stall compact_fail thp_fault_fallback" or returns 1 if the
+# compaction counters are absent (kernel without CONFIG_COMPACTION accounting). SOFT: the reclaim
+# verdict never depends on this — an absent axis renders frag=n/a, it does not fail the read. compact_fail
+# is a SUBSET of compact_stall (a failure is one of the stalls). thp_fault_fallback is context (0 if absent).
+read_compaction() {
+  local f="$1" cs cf tf
+  [ -r "$f" ] || return 1
+  cs="$(awk '$1=="compact_stall"{print $2; exit}' "$f" 2>/dev/null)"
+  cf="$(awk '$1=="compact_fail"{print $2; exit}' "$f" 2>/dev/null)"
+  tf="$(awk '$1=="thp_fault_fallback"{print $2; exit}' "$f" 2>/dev/null)"
+  for v in "$cs" "$cf"; do
+    [ -n "$v" ] && printf '%s' "$v" | grep -qE '^[0-9]+$' || return 1
+  done
+  [ -n "$tf" ] && printf '%s' "$tf" | grep -qE '^[0-9]+$' || tf=0
+  printf '%s %s %s\n' "$cs" "$cf" "$tf"
+}
+
+# frag_classify <compact_fail_delta> <compact_stall_delta> → "LABEL|reason". Pure/falsifiable.
+# No compaction stalls this window → QUIET (no high-order alloc pressure to judge). Otherwise the
+# fail FRACTION (fail/stall, fail⊆stall) ladders LOOSE→FRAGMENTING→FRAGMENTED — a rising fraction
+# means memory is too fragmented to assemble contiguous runs = alloc latency that LEADS oom.
+frag_classify() {
+  local fd="$1" sd="$2" pct
+  if [ -z "$sd" ] || ! printf '%d' "$sd" >/dev/null 2>&1; then
+    echo "UNKNOWN|non-numeric compaction stall delta (sd=$sd)"; return
+  fi
+  if [ "$sd" -lt "$FRAG_MIN_STALL" ]; then
+    echo "QUIET|${sd} compaction stalls this window — no high-order alloc pressure"; return
+  fi
+  pct=$(( fd * 100 / sd ))
+  if   [ "$pct" -lt "$FRAG_WARN_PCT" ]; then echo "LOOSE|${pct}% of ${sd} high-order allocs failed compaction — assembling contiguous runs fine"; return; fi
+  if   [ "$pct" -lt "$FRAG_HI_PCT" ];   then echo "FRAGMENTING|${pct}% of ${sd} high-order allocs failed compaction — memory fragmenting"; return; fi
+  echo "FRAGMENTED|${pct}% of ${sd} high-order allocs failed compaction — can't assemble contiguous pages; alloc latency before oom"
+}
+
 if [ "${1:-}" = --test ]; then
   fail=0
   # Pin thresholds so asserts are deterministic regardless of env overrides.
@@ -136,8 +187,35 @@ if [ "${1:-}" = --test ]; then
   # A vmstat missing the steal pair must be REJECTED (→ n/a, not a faked reading).
   printf 'allocstall_normal 100\npgscan_direct 2000\n' > "$tmp/bad"
   read_counters "$tmp/bad" >/dev/null 2>&1 && { echo "  FAIL bad-vmstat (no steal pair) accepted"; fail=1; }
+
+  # --- compaction/fragmentation axis ---
+  FRAG_WARN_PCT=25 FRAG_HI_PCT=60 FRAG_MIN_STALL=1
+  r="$(frag_classify 0 0)";     echo "$r" | grep -q '^QUIET'       || { echo "  FAIL frag QUIET(0 stall): $r"; fail=1; }
+  r="$(frag_classify 1 10)";    echo "$r" | grep -q '^LOOSE'       || { echo "  FAIL frag LOOSE(10%): $r"; fail=1; }
+  r="$(frag_classify 4 10)";    echo "$r" | grep -q '^FRAGMENTING' || { echo "  FAIL frag FRAGMENTING(40%): $r"; fail=1; }
+  r="$(frag_classify 25 100)";  echo "$r" | grep -q '^FRAGMENTING' || { echo "  FAIL frag boundary(25%→WARN): $r"; fail=1; }
+  r="$(frag_classify 59 100)";  echo "$r" | grep -q '^FRAGMENTING' || { echo "  FAIL frag boundary(59%): $r"; fail=1; }
+  r="$(frag_classify 60 100)";  echo "$r" | grep -q '^FRAGMENTED'  || { echo "  FAIL frag boundary(60%→HI): $r"; fail=1; }
+  r="$(frag_classify 8 10)";    echo "$r" | grep -q '^FRAGMENTED'  || { echo "  FAIL frag FRAGMENTED(80%): $r"; fail=1; }
+  r="$(frag_classify 1 abc)";   echo "$r" | grep -q '^UNKNOWN'     || { echo "  FAIL frag UNKNOWN-nonnum: $r"; fail=1; }
+  # fail⊆stall so frac(fail, stall-fail) == fail/stall% — the fraction the state line reports.
+  [ "$(frac 3 7)" = 30 ] || { echo "  FAIL frag fail-frac(3/10)=30 got=$(frac 3 7)"; fail=1; }
+  # read_compaction fixture: parse + delta-classify end to end
+  printf 'compact_stall 500\ncompact_fail 150\nthp_fault_fallback 40\n' > "$tmp/cv1"
+  printf 'compact_stall 600\ncompact_fail 210\nthp_fault_fallback 55\n' > "$tmp/cv2"
+  k1="$(read_compaction "$tmp/cv1")" || { echo "  FAIL compaction v1 unparsed"; fail=1; }
+  k2="$(read_compaction "$tmp/cv2")" || { echo "  FAIL compaction v2 unparsed"; fail=1; }
+  kcs1="${k1%% *}"; kcf1="$(printf '%s' "$k1" | awk '{print $2}')"; ktf1="$(printf '%s' "$k1" | awk '{print $3}')"
+  kcs2="${k2%% *}"; kcf2="$(printf '%s' "$k2" | awk '{print $2}')"; ktf2="$(printf '%s' "$k2" | awk '{print $3}')"
+  # stall Δ=100, fail Δ=60 → 60% → FRAGMENTED; thp_fallback Δ=15
+  r="$(frag_classify $((kcf2-kcf1)) $((kcs2-kcs1)))"; echo "$r" | grep -q '^FRAGMENTED' || { echo "  FAIL compaction fixture 60%→FRAGMENTED: $r"; fail=1; }
+  [ "$((ktf2-ktf1))" = 15 ] || { echo "  FAIL compaction thp_fallback Δ=15 got=$((ktf2-ktf1))"; fail=1; }
+  # a vmstat with reclaim counters but NO compaction accounting → read_compaction rejects (frag=n/a,
+  # never a faked reading), while the reclaim verdict on the same file is unaffected.
+  read_compaction "$tmp/v1" >/dev/null 2>&1 && { echo "  FAIL compaction accepted vmstat w/o compact counters"; fail=1; }
+
   [ "$fail" = 1 ] && { echo "smoke-test: FAIL"; exit 1; }
-  echo "  ok: classify (7) + rate (3) + frac (4) + fixture parse/delta + reject-missing-fields"
+  echo "  ok: classify (7) + rate (3) + frac (4) + reclaim fixture + frag_classify (8) + compaction fixture/reject"
   # REAL-READ gate: reachability != producing. /proc/vmstat must be readable, the fields must parse,
   # AND a live two-sample must yield a FINITE NON-NEGATIVE allocstall rate (a hollow sense would pass
   # classify yet never touch the kernel). Short 1s window keeps --test fast.
@@ -148,7 +226,15 @@ if [ "${1:-}" = --test ]; then
   la1="${r1%% *}"; la2="${r2%% *}"
   sps="$(rate "$la2" "$la1" 1)"
   [ "$sps" -ge 0 ] 2>/dev/null || { echo "smoke-test: FAIL (live allocstall rate not a non-negative integer: sps=$sps)"; exit 1; }
-  echo "smoke-test: ok (logic + REAL two-sample vmstat read: ${sps} allocstall/s over 1s)"
+  # frag axis real-read: if this kernel exposes compaction accounting, assert the load-bearing invariant
+  # on LIVE counters (fail ⊆ stall) — a hollow axis would classify fixtures yet never touch the kernel.
+  if k="$(read_compaction "$VMSTAT")"; then
+    kcs="${k%% *}"; kcf="$(printf '%s' "$k" | awk '{print $2}')"
+    [ "$kcf" -le "$kcs" ] 2>/dev/null || { echo "smoke-test: FAIL (live compact_fail>compact_stall: $kcf>$kcs — impossible; parse bug)"; exit 1; }
+    echo "smoke-test: ok (logic + REAL two-sample vmstat: ${sps} allocstall/s over 1s; live frag axis compact_fail=$kcf/compact_stall=$kcs)"
+  else
+    echo "smoke-test: ok (logic + REAL two-sample vmstat: ${sps} allocstall/s over 1s; compaction accounting absent → frag=n/a honest)"
+  fi
   exit 0
 fi
 
@@ -163,12 +249,14 @@ t1=$(date +%s); c1="$(read_counters "$VMSTAT")" || {
   echo "mesh-reclaim-mode: pgsteal_direct/pgsteal_kswapd absent in $VMSTAT (old kernel?) — not an alarm" >&2
   exit 2
 }
+cc1="$(read_compaction "$VMSTAT")" || cc1=""   # SOFT axis: near-instant re-read of same file; absence is fine
 sleep "$WINDOW_S"
 t2=$(date +%s); c2="$(read_counters "$VMSTAT")" || {
   printf 'UNKNOWN|reason=vmstat-2nd-read-failed\n' > "$STATE"; mesh-state-touch "$STATE" 2>/dev/null || touch "$STATE"
   echo "mesh-reclaim-mode: 2nd vmstat read failed — not an alarm" >&2
   exit 2
 }
+cc2="$(read_compaction "$VMSTAT")" || cc2=""
 dt=$(( t2 - t1 )); [ "$dt" -ge 1 ] || dt="$WINDOW_S"
 
 as1="${c1%% *}"; sd1="$(printf '%s' "$c1" | awk '{print $2}')"; sk1="$(printf '%s' "$c1" | awk '{print $3}')"; scd1="$(printf '%s' "$c1" | awk '{print $4}')"
@@ -183,15 +271,41 @@ result="$(classify "$alloc_sps")"
 label="${result%%|*}"; reason="${result#*|}"
 TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
-# additive-fields contract: first |-field is the authoritative LABEL (first-token consumers untouched).
-printf '%s|allocstall_sps=%s|direct_frac=%s|scan_direct_sps=%s|window=%ss\n' \
-  "$label" "$alloc_sps" "$direct_frac" "$scan_sps" "$dt" > "$STATE"
+# compaction/fragmentation axis (SOFT): compute frag verdict + fail% only if the counters are present.
+frag_label="n/a"; frag_frac="n/a"; thp_fb_d="n/a"
+frag_reason="compaction accounting absent (kernel without CONFIG_COMPACTION) — frag n/a"
+if [ -n "$cc1" ] && [ -n "$cc2" ]; then
+  cs1="${cc1%% *}"; cf1="$(printf '%s' "$cc1" | awk '{print $2}')"; tf1="$(printf '%s' "$cc1" | awk '{print $3}')"
+  cs2="${cc2%% *}"; cf2="$(printf '%s' "$cc2" | awk '{print $2}')"; tf2="$(printf '%s' "$cc2" | awk '{print $3}')"
+  cs_d=$(( cs2 - cs1 )); [ "$cs_d" -lt 0 ] && cs_d=0
+  cf_d=$(( cf2 - cf1 )); [ "$cf_d" -lt 0 ] && cf_d=0
+  [ "$cf_d" -gt "$cs_d" ] && cf_d="$cs_d"      # fail ⊆ stall; clamp any counter-reset skew
+  thp_fb_d=$(( tf2 - tf1 )); [ "$thp_fb_d" -lt 0 ] && thp_fb_d=0
+  fr="$(frag_classify "$cf_d" "$cs_d")"
+  frag_label="${fr%%|*}"; frag_reason="${fr#*|}"
+  frag_frac="$(frac "$cf_d" "$(( cs_d - cf_d ))")"   # frac(fail, stall-fail) == fail/stall%
+fi
+
+# additive-fields contract: first |-field is the authoritative LABEL (first-token consumers untouched);
+# reclaim fields are unchanged; frag=/compact_fail_pct=/thp_fallback_delta= ride as trailing additions.
+printf '%s|allocstall_sps=%s|direct_frac=%s|scan_direct_sps=%s|window=%ss|frag=%s|compact_fail_pct=%s|thp_fallback_delta=%s\n' \
+  "$label" "$alloc_sps" "$direct_frac" "$scan_sps" "$dt" "$frag_label" "$frag_frac" "$thp_fb_d" > "$STATE"
 mesh-state-touch "$STATE" 2>/dev/null || touch "$STATE"
 
+# JSON: frag fields are null (not "n/a") when the axis is absent, so the object stays valid+typed.
+if [ "$frag_frac" = n/a ]; then j_frac=null; else j_frac="$frag_frac"; fi
+if [ "$thp_fb_d" = n/a ]; then j_thp=null; else j_thp="$thp_fb_d"; fi
+
 if [ "${1:-}" = --json ]; then
-  printf '{"label":"%s","allocstall_sps":%s,"direct_frac_pct":%s,"scan_direct_sps":%s,"window_s":%s,"ts":"%s"}\n' \
-    "$label" "$alloc_sps" "$direct_frac" "$scan_sps" "$dt" "$TS"
+  printf '{"label":"%s","allocstall_sps":%s,"direct_frac_pct":%s,"scan_direct_sps":%s,"window_s":%s,"frag":"%s","compact_fail_pct":%s,"thp_fallback_delta":%s,"ts":"%s"}\n' \
+    "$label" "$alloc_sps" "$direct_frac" "$scan_sps" "$dt" "$frag_label" "$j_frac" "$j_thp" "$TS"
   exit 0
 fi
 printf '[reclaim-mode-%s] %s — %s allocstall/s, %s%% reclaim direct (scan_direct=%s/s) over %ss | %s\n' \
   "$(printf '%s' "$label" | tr '[:upper:]' '[:lower:]')" "$label" "$alloc_sps" "$direct_frac" "$scan_sps" "$dt" "$reason"
+if [ "$frag_label" = n/a ]; then
+  printf '[frag-n/a] %s\n' "$frag_reason"
+else
+  printf '[frag-%s] %s — compaction-fail %s%% this window, thp_fallback+%s | %s\n' \
+    "$(printf '%s' "$frag_label" | tr '[:upper:]' '[:lower:]')" "$frag_label" "$frag_frac" "$thp_fb_d" "$frag_reason"
+fi
