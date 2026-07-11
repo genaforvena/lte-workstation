@@ -44,7 +44,7 @@
 # reflex-args: --edge
 set -u
 
-CPUBASE=/sys/devices/system/cpu
+CPUBASE="${MESH_CPUBASE:-/sys/devices/system/cpu}"
 TT="${MESH_TT_DIR:-$CPUBASE/cpu0/thermal_throttle}"
 STATE="${MESH_THROTTLE_STATE:-$HOME/.mesh/cpu-throttle.state}"
 
@@ -66,6 +66,54 @@ trace() {
 
 read_int() { local f="$1"; [ -r "$f" ] && cat "$f" 2>/dev/null || echo ""; }
 
+# per_core_summary — the DIE-HOTSPOT skew axis the package counter is blind to.
+#   package_throttle_count is UNIFORM across all CPUs, so mesh-therm/pkg senses can't tell
+#   WHICH physical core is cooking. This folds logical CPUs → physical cores via
+#   topology/core_id, AVERAGES the HT-sibling counters (a physical core has ONE throttle
+#   counter shared by its threads; a read race can leave siblings off-by-one, so summing
+#   would DOUBLE-COUNT — we average), then derives the asymmetry (hot core / cold core).
+#   Live on IdeaPad: core2=544933 vs core3=37 → a ~14700x stable die hotspot.
+# Sets globals (n/a-safe): pc_avail(1/0) pc_list("core0=N core1=N …") pc_ncores
+#   pc_hot_core pc_hot_count pc_cold_core pc_cold_count pc_ratio pc_skew(1/0)
+per_core_summary() {
+  pc_avail=0; pc_list=""; pc_ncores=0
+  pc_hot_core=na; pc_hot_count=0; pc_cold_core=na; pc_cold_count=0; pc_ratio=0; pc_skew=0
+  declare -A _sum _cnt
+  local any=0 d cpu core c first avg denom
+  for d in "$CPUBASE"/cpu[0-9]*/thermal_throttle/core_throttle_count; do
+    [ -r "$d" ] || continue
+    cpu="${d%/thermal_throttle/core_throttle_count}"; cpu="${cpu##*/}"   # cpuN
+    core=$(read_int "$CPUBASE/$cpu/topology/core_id"); core="${core:-${cpu#cpu}}"
+    c=$(read_int "$d"); [ -n "$c" ] || continue
+    [ "$c" -ge 0 ] 2>/dev/null || continue
+    _sum[$core]=$(( ${_sum[$core]:-0} + c ))
+    _cnt[$core]=$(( ${_cnt[$core]:-0} + 1 ))
+    any=1
+  done
+  [ "$any" = 1 ] || return 0   # no core_throttle_count files → honest n/a (VM/container/pkg-only)
+  pc_avail=1; first=1
+  for core in $(printf '%s\n' "${!_sum[@]}" | sort -n); do
+    avg=$(( _sum[$core] / _cnt[$core] ))    # AVERAGE siblings — never sum (would double-count)
+    pc_list="$pc_list core$core=$avg"
+    pc_ncores=$((pc_ncores + 1))
+    if [ "$first" = 1 ]; then
+      pc_hot_core=$core; pc_hot_count=$avg; pc_cold_core=$core; pc_cold_count=$avg; first=0
+    else
+      [ "$avg" -gt "$pc_hot_count" ] && { pc_hot_core=$core; pc_hot_count=$avg; }
+      [ "$avg" -lt "$pc_cold_count" ] && { pc_cold_core=$core; pc_cold_count=$avg; }
+    fi
+  done
+  pc_list="${pc_list# }"
+  # skew ratio = hottest / coldest (coldest clamped to 1 → a 0-count cold core against a hot
+  # one is maximal asymmetry, not a div-by-zero). No throttle anywhere (hot=0) → no skew.
+  if [ "$pc_hot_count" -gt 0 ]; then
+    denom="$pc_cold_count"; [ "$denom" -lt 1 ] && denom=1
+    pc_ratio=$(( pc_hot_count / denom ))
+    [ "$pc_ratio" -ge "${MESH_THROTTLE_SKEW_RATIO:-4}" ] && pc_skew=1
+  fi
+  return 0
+}
+
 # --- portable logic self-test (runs on ANY node, no sysfs needed) -------------
 if [ "${1:-}" = "--test" ]; then
   fail=""
@@ -84,6 +132,7 @@ if [ "${1:-}" = "--test" ]; then
     printf '0\n'      > "$ett/package_throttle_total_time_ms"
     MESH_TT_DIR="$ett" MESH_THROTTLE_STATE="$et/state" \
     MESH_NOM_COOLDOWN_FILE="$et/cooldown" MESH_THROTTLE_NOCHAT=1 \
+    MESH_CPUBASE="$et/nocpu" \
       "$0" --edge 2>&1 1>/dev/null
   }
   efail=""
@@ -137,7 +186,7 @@ if [ "${1:-}" = "--test" ]; then
     [ -n "${2:-}" ] && printf '%s\n' "$2" > "$ft/cooldown"
     MESH_TT_DIR="$ftt" MESH_THROTTLE_STATE="$ft/state" \
     MESH_NOM_COOLDOWN_FILE="$ft/cooldown" MESH_THROTTLE_NOCHAT=1 \
-    MESH_THROTTLE_ALARM_COOLDOWN=999999 \
+    MESH_THROTTLE_ALARM_COOLDOWN=999999 MESH_CPUBASE="$ft/nocpu" \
       "$0" --edge 2>&1 1>/dev/null
   }
   _now=$(date +%s)
@@ -153,6 +202,49 @@ if [ "${1:-}" = "--test" ]; then
   rm -rf "$ft"
 
   if [ -n "$efail" ]; then echo "edge-test: FAIL ($efail )"; exit 1; fi
+
+  # --- per-physical-core DIE-HOTSPOT skew (hermetic, via --json against a fixture CPUBASE) -----
+  #   Exercises the real fold-and-skew path: build cpu0..7 with core_ids 0,1,2,3 (HT-siblings
+  #   share a core_id) + a package fixture so the exit-2 gate passes, then parse --json.
+  pfail=""
+  pt=$(mktemp -d); pkgd="$pt/pkg"; mkdir -p "$pkgd"
+  printf '10\n' > "$pkgd/package_throttle_count"; printf '0\n' > "$pkgd/package_throttle_total_time_ms"
+  mk_cpu() {  # $1=cpubase $2=cpuN $3=core_id $4=count
+    mkdir -p "$1/$2/thermal_throttle" "$1/$2/topology"
+    printf '%s\n' "$3" > "$1/$2/topology/core_id"
+    printf '%s\n' "$4" > "$1/$2/thermal_throttle/core_throttle_count"
+  }
+  pcj() { MESH_TT_DIR="$pkgd" MESH_CPUBASE="$1" MESH_THROTTLE_NOCHAT=1 "$0" --json; }
+
+  # (1) core2 >> core3 → hotspot=core2, skew flagged.  (3) siblings AVERAGED not summed:
+  #     core2 = (500000+499999)/2 = 499999, NOT ~1,000,000.
+  cbS="$pt/skew"
+  mk_cpu "$cbS" cpu0 0 100 ; mk_cpu "$cbS" cpu4 0 100
+  mk_cpu "$cbS" cpu1 1 200 ; mk_cpu "$cbS" cpu5 1 200
+  mk_cpu "$cbS" cpu2 2 500000 ; mk_cpu "$cbS" cpu6 2 499999   # off-by-one read race
+  mk_cpu "$cbS" cpu3 3 50  ; mk_cpu "$cbS" cpu7 3 50
+  jS=$(pcj "$cbS")
+  case "$jS" in *'"hotspot_core":2'*) : ;; *) pfail="$pfail skew-hotspot-not-core2:[$jS]";; esac
+  case "$jS" in *'"skew":true'*)      : ;; *) pfail="$pfail skew-not-flagged:[$jS]";; esac
+  case "$jS" in *'"2":499999'*)       : ;; *) pfail="$pfail siblings-not-averaged(double-count?):[$jS]";; esac
+
+  # (2) uniform cores → NO skew (ratio 1x, skew:false)
+  cbU="$pt/uniform"
+  mk_cpu "$cbU" cpu0 0 42 ; mk_cpu "$cbU" cpu4 0 42
+  mk_cpu "$cbU" cpu1 1 42 ; mk_cpu "$cbU" cpu5 1 42
+  mk_cpu "$cbU" cpu2 2 42 ; mk_cpu "$cbU" cpu6 2 42
+  mk_cpu "$cbU" cpu3 3 42 ; mk_cpu "$cbU" cpu7 3 42
+  jU=$(pcj "$cbU")
+  case "$jU" in *'"skew":false'*) : ;; *) pfail="$pfail uniform-flagged-skew:[$jU]";; esac
+
+  # (4) missing core_throttle_count files → honest n/a (null), never a faked distribution
+  cbN="$pt/nocores"; mkdir -p "$cbN"
+  jN=$(pcj "$cbN")
+  case "$jN" in *'"per_core_throttle":null'*) : ;; *) pfail="$pfail missing-cores-not-null:[$jN]";; esac
+  case "$jN" in *'"hotspot_core":null'*)      : ;; *) pfail="$pfail missing-hotspot-not-null:[$jN]";; esac
+  rm -rf "$pt"
+  if [ -n "$pfail" ]; then echo "percore-test: FAIL ($pfail )"; exit 1; fi
+
   if [ -r "$TT/package_throttle_count" ]; then
     echo "smoke-test: ok (logic sound; counters present — sense LIVE here)"
   else
@@ -174,6 +266,8 @@ core_max=0
 for d in "$CPUBASE"/cpu[0-9]*/thermal_throttle/core_throttle_count; do
   c=$(read_int "$d"); [ -n "$c" ] && [ "$c" -gt "$core_max" ] 2>/dev/null && core_max="$c"
 done
+# per-physical-core distribution + die-hotspot skew axis (core_max above stays unchanged)
+per_core_summary
 
 # current avg frequency across cores — CONTEXT only (low freq != throttle)
 sum_cur=0; max_one=0; n=0
@@ -188,9 +282,9 @@ avg_mhz=0; pct=0
 
 # --- edge / stream mode: stateful delta, post on transition -------------------
 if [ "${1:-}" = "--edge" ]; then
-  prev_pkg=""; prev_state="NONE"; prev_dwell=0; prev_announced=0; prev_board_alarmed=0
-  if [ -r "$STATE" ]; then read -r prev_pkg prev_state _ prev_dwell prev_announced prev_board_alarmed < "$STATE" 2>/dev/null || true; fi
-  prev_dwell="${prev_dwell:-0}"; prev_announced="${prev_announced:-0}"; prev_board_alarmed="${prev_board_alarmed:-0}"
+  prev_pkg=""; prev_state="NONE"; prev_dwell=0; prev_announced=0; prev_board_alarmed=0; prev_hot_core=na
+  if [ -r "$STATE" ]; then read -r prev_pkg prev_state _ prev_dwell prev_announced prev_board_alarmed prev_hot_core < "$STATE" 2>/dev/null || true; fi
+  prev_dwell="${prev_dwell:-0}"; prev_announced="${prev_announced:-0}"; prev_board_alarmed="${prev_board_alarmed:-0}"; prev_hot_core="${prev_hot_core:-na}"
   delta=0
   if [ -n "$prev_pkg" ] && [ "$pkg" -ge "$prev_pkg" ] 2>/dev/null; then delta=$((pkg - prev_pkg)); fi
   state=$(verdict_for_delta "$delta")
@@ -229,8 +323,19 @@ if [ "${1:-}" = "--edge" ]; then
     announced=0
     board_alarmed=0
   fi
+  # DIE-HOTSPOT drift: the throttle-eating physical core MOVING is itself a signal (a new die
+  # region is now cooking). Delta-gated — trace ONLY when the hot core changes across a real skew,
+  # never every run. (Trace, not board: informational; the board alarm stays the pkg-rate one above.)
+  if [ "$prev_state" != "NONE" ] && [ "$pc_avail" = 1 ] && [ "$pc_skew" = 1 ] \
+     && [ "$prev_hot_core" != na ] && [ "$pc_hot_core" != "$prev_hot_core" ]; then
+    trace "[cpu-hotspot-moved] $(hostname): die throttle hotspot moved core${prev_hot_core}→core${pc_hot_core} (${pc_ratio}x skew) — a different die region is now absorbing the throttle."
+  fi
   mkdir -p "$(dirname "$STATE")" 2>/dev/null
-  printf '%s %s %s %s %s %s\n' "$pkg" "$state" "$pkg_ms" "$dwell" "$announced" "$board_alarmed" > "$STATE"
+  # 7th field = current hot physical core (delta-gated content above; the file itself is written
+  # UNCONDITIONALLY every run so mtime==liveness, then state-touched per the liveness convention —
+  # a value that legitimately holds must never read as a dead reflex).
+  printf '%s %s %s %s %s %s %s\n' "$pkg" "$state" "$pkg_ms" "$dwell" "$announced" "$board_alarmed" "$pc_hot_core" > "$STATE"
+  command -v mesh-state-touch >/dev/null 2>&1 && mesh-state-touch "$STATE" >/dev/null 2>&1 || true
   # seed silently on first run (no prior baseline)
   if [ "$prev_state" = "NONE" ]; then exit 0; fi
   if [ "$do_throttle_post" = 1 ]; then
@@ -266,8 +371,17 @@ fi
 
 # --- json ---------------------------------------------------------------------
 if [ "${1:-}" = "--json" ]; then
-  printf '{"package_throttle_count":%s,"package_throttle_total_ms":%s,"core_throttle_count_max":%s,"avg_freq_mhz":%s,"freq_pct_of_max":%s,"ever_throttled":%s}\n' \
-    "$pkg" "$pkg_ms" "$core_max" "$avg_mhz" "$pct" "$([ "$pkg" -gt 0 ] && echo true || echo false)"
+  if [ "$pc_avail" = 1 ]; then
+    pc_json="{"; _sep=""
+    for kv in $pc_list; do k="${kv%%=*}"; k="${k#core}"; v="${kv#*=}"; pc_json="$pc_json$_sep\"$k\":$v"; _sep=","; done
+    pc_json="$pc_json}"
+    hotspot_j="$pc_hot_core"; ratio_j="$pc_ratio"; skew_j=$([ "$pc_skew" = 1 ] && echo true || echo false)
+  else
+    pc_json=null; hotspot_j=null; ratio_j=null; skew_j=false
+  fi
+  printf '{"package_throttle_count":%s,"package_throttle_total_ms":%s,"core_throttle_count_max":%s,"avg_freq_mhz":%s,"freq_pct_of_max":%s,"ever_throttled":%s,"per_core_throttle":%s,"hotspot_core":%s,"skew_ratio":%s,"skew":%s}\n' \
+    "$pkg" "$pkg_ms" "$core_max" "$avg_mhz" "$pct" "$([ "$pkg" -gt 0 ] && echo true || echo false)" \
+    "$pc_json" "$hotspot_j" "$ratio_j" "$skew_j"
   exit 0
 fi
 
@@ -278,5 +392,16 @@ else
   echo "cpu-throttle: CLEAN — never throttled since boot (pkg events=0)"
 fi
 echo "  freq now: ${avg_mhz}MHz (${pct}% of hardware max) across ${n} cores  [context — idle low-freq is NOT throttle]"
+if [ "$pc_avail" = 1 ]; then
+  echo "  per-core throttle: ${pc_list}  [physical cores, HT-siblings folded/averaged]"
+  if [ "$pc_skew" = 1 ]; then
+    echo "  DIE-HOTSPOT: core${pc_hot_core} eats ${pc_hot_count} vs core${pc_cold_core}=${pc_cold_count} (${pc_ratio}x skew)"
+    echo "  HINT: pin sustained work OFF the hot core — 'taskset -c <cpus-of-core-${pc_cold_core}>' (coolest); keep it off core ${pc_hot_core}"
+  else
+    echo "  die-throttle even across cores (no hotspot skew, ${pc_ratio}x)"
+  fi
+else
+  echo "  per-core throttle: n/a (no core_throttle_count — package-only sysfs)"
+fi
 echo "  (use --edge for the stateful ACTIVE-throttle reflex; --json for machines)"
 exit 0
