@@ -32,7 +32,7 @@ export PATH="$HOME/.local/bin:$PATH"
 
 MESH="${MESH_DIR:-$HOME/.mesh}"; mkdir -p "$MESH" 2>/dev/null || true
 STATE="$MESH/.note3-light-raw-state"      # "verdict|raw|lux|ts"
-EDGE_STATE="$MESH/.note3-light-raw-edge"  # last POSTED verdict (for --edge dedup)
+LEVEL_STATE="$MESH/.note3-light-raw-level" # "confirmed|candidate|count" for the sustained-change board gate
 
 # Same fixed adb->ds relay mesh-baro/mesh-note3-mag/mesh-light's craft light use.
 NOTE3_ADB_NODE="${MESH_NOTE3_ADB_NODE:-${MESH_BARO_ADB_NODE:-}}"
@@ -41,6 +41,15 @@ NOTE3_ADB_SERIAL="${MESH_NOTE3_ADB_SERIAL:-${MESH_BARO_ADB_SERIAL:-}}"
 # jitter at rest; a >=15% swing is well above that jitter but well below a real light-on/off or
 # hand-over-sensor event (which swings raw by multiples).
 RAW_THRESH_PCT="${MESH_NOTE3_LIGHT_RAW_THRESH_PCT:-15}"
+# Sustained-change board gate (chat-review/note3-light-raw-floor-jitter, 2026-07-11): at the DARK
+# ADC floor (lux~0) the raw does NOT rest near one value — it bounces between discrete quantized
+# levels (observed live 2300/3467/4003/4337/4685, deltas 30-88%) while lux stays 0.0-7.7. A per-poll
+# %-gate on the immediately-prior raw therefore fires CHANGED on every quantization bounce (~9
+# content-free board lines/window, each asserting a light event lux contradicts). Fix: board only
+# when a NEW raw level PERSISTS N consecutive polls (compared vs the last CONFIRMED level, so a
+# single-poll bounce A->B->A never accumulates a streak) — mirrors the note3-mag macro-gate (80966a4).
+# The fine single-step STABLE/CHANGED verdict still flows to STATE/--json unchanged.
+LIGHT_SUSTAIN_N="${MESH_NOTE3_LIGHT_SUSTAIN_N:-2}"
 
 adb_dumpsys() {   # echo raw `dumpsys sensorservice` from the adb body (empty on failure)
   local ser=""; [ -n "$NOTE3_ADB_SERIAL" ] && ser="-s $NOTE3_ADB_SERIAL"
@@ -92,6 +101,40 @@ print(('CHANGED' if pct >= thresh else 'STABLE'), '%.1f' % pct)
 "
 }
 
+# board_gate <raw> <confirmed|""> <candidate|""> <count> <thresh_pct> <N> -> "DECISION|conf|cand|count|delta"
+# The sustained-change debounce for the BOARD write. Unlike classify() (single-step vs the immediately-
+# prior poll), this compares vs the last CONFIRMED level, so a floor-quantization bounce A->B->A stays
+# STABLE-vs-confirmed on the return and never accumulates a streak. A raw that CHANGES vs confirmed
+# opens a candidate; the candidate must hold (STABLE vs itself) for N consecutive polls before it is
+# confirmed and BOARDed — a single-poll spike resets. delta is "-" unless BOARD, then it is the real
+# shift magnitude (raw vs the OLD confirmed level, not the ~0% single-step delta at the moment of
+# confirmation). Pure — directly testable.
+board_gate() {
+  python3 -c "
+raw=float('$1'); thresh=float('$5'); N=int('$6')
+conf='''$2'''.strip(); cand='''$3'''.strip(); cnt='$4'
+cnt=int(cnt) if cnt.strip().lstrip('-').isdigit() else 0
+def out(d,c,cd,n,dl='-'):
+    print('%s|%s|%s|%d|%s' % (d, c, cd, n, dl))
+if conf=='':                                   # first read — adopt raw as the baseline, nothing to post
+    out('HOLD', '%g'%raw, '', 0); raise SystemExit
+cf=float(conf); base=cf if cf!=0 else 1
+pct=abs(raw-cf)/abs(base)*100
+if pct < thresh:                               # steady at the confirmed level — drop any pending candidate
+    out('HOLD', '%g'%cf, '', 0); raise SystemExit
+if cand=='':                                   # first poll of a possible new level — open a candidate
+    out('HOLD', '%g'%cf, '%g'%raw, 1); raise SystemExit
+cd=float(cand); cbase=cd if cd!=0 else 1
+cpct=abs(raw-cd)/abs(cbase)*100
+if cpct < thresh:                              # candidate held — is the streak long enough to confirm?
+    n2=cnt+1
+    if n2 >= N:
+        out('BOARD', '%g'%raw, '', 0, '%.1f'%pct); raise SystemExit
+    out('HOLD', '%g'%cf, '%g'%raw, n2); raise SystemExit
+out('HOLD', '%g'%cf, '%g'%raw, 1)              # a different, fresh candidate — restart the streak
+"
+}
+
 # is_relay_run <arg1> <adb_node> -> rc0 when this is a SCHEDULED --edge poll on a RELAY node
 # (adb_node is a non-empty remote host, i.e. NOT "local"). A relay reaches the SAME physical Note3
 # by SSH-ing to the direct-adb owner, so its cron poll is pure redundancy — a double board post +
@@ -138,28 +181,37 @@ if [ "${1:-}" = --test ]; then
   [ -s "$_rboard" ] && { echo "  FAIL: relay --edge wrote to the board (should skip): $(cat "$_rboard")"; _f=1; }
   rm -rf "$_rsd" 2>/dev/null || true
 
-  # ── board-write gate: CHANGED posts, the following STABLE echo does NOT (chat-review) ──
-  # verdict is driven by classify(override-raw, STATE-praw); EDGE_STATE is the board dedup.
-  _esd="$(mktemp -d)"; _eboard="$_esd/chat.log"
-  _run_edge() {  # <state_praw> <edge_prev> <override_raw> -> runs --edge into a fresh board
-    : > "$_eboard"
-    printf 'X|%s|11.0|t\n' "$1" > "$_esd/.note3-light-raw-state"
-    printf '%s\n' "$2"        > "$_esd/.note3-light-raw-edge"
+  # ── board_gate unit (sustained-level debounce, chat-review/note3-light-raw-floor-jitter) ──
+  _g() { board_gate "$@" | cut -d'|' -f1; }                       # decision only
+  [ "$(_g 2300 '' '' 0 15 2)" = HOLD ]      || { echo "  FAIL: first read (no confirmed) must HOLD + adopt baseline"; _f=1; }
+  [ "$(_g 2350 2300 '' 0 15 2)" = HOLD ]    || { echo "  FAIL: steady near confirmed (2%) must HOLD"; _f=1; }
+  [ "$(_g 4337 2300 '' 0 15 2)" = HOLD ]    || { echo "  FAIL: 1st poll of a new level must open a candidate (HOLD), not board"; _f=1; }
+  [ "$(_g 4337 2300 4337 1 15 2)" = BOARD ] || { echo "  FAIL: candidate held to N=2 must BOARD"; _f=1; }
+  [ "$(_g 2300 2300 4337 1 15 2)" = HOLD ]  || { echo "  FAIL: bounce back to confirmed must HOLD (drop candidate), never board"; _f=1; }
+  # BOARD delta must be the vs-confirmed magnitude (~88.6%), not the ~0% single-step at confirmation
+  _bd="$(board_gate 4337 2300 4337 1 15 2 | cut -d'|' -f5)"
+  [ "$_bd" = "88.6" ] || { echo "  FAIL: BOARD delta should be vs-confirmed magnitude 88.6, got '$_bd'"; _f=1; }
+
+  # ── integration: a floor bounce posts 0 lines; a sustained shift posts exactly 1 (task spec) ──
+  _esd="$(mktemp -d)"; _eboard="$_esd/chat.log"; : > "$_eboard"
+  _poll() {  # <override_raw> -> one --edge poll, carrying LEVEL_STATE forward across the sequence
     MESH_DIR="$_esd" MESH_SKIP_NODES_SOURCE=1 MESH_NOTE3_LIGHT_RAW_BOARD="$_eboard" \
-      NOTE3_LIGHT_RAW_OVERRIDE="$3,11.0" MESH_NOTE3_ADB_NODE='' MESH_BARO_ADB_NODE='' \
+      NOTE3_LIGHT_RAW_OVERRIDE="$1,11.0" MESH_NOTE3_ADB_NODE='' MESH_BARO_ADB_NODE='' \
       "$0" --edge >/dev/null 2>&1
   }
-  # (a) prev=STABLE, big swing -> CHANGED -> board line written
-  _run_edge 4651.8 STABLE 2000.0
-  [ -s "$_eboard" ] || { echo "  FAIL: STABLE->CHANGED must post a board line"; _f=1; }
-  grep -q '\[note3-light-raw\] CHANGED' "$_eboard" 2>/dev/null || { echo "  FAIL: posted line should be CHANGED"; _f=1; }
-  # (b) prev=CHANGED, identical raw -> STABLE echo -> NO board line, EDGE_STATE becomes STABLE
-  _run_edge 4651.8 CHANGED 4651.8
-  [ -s "$_eboard" ] && { echo "  FAIL: CHANGED->STABLE echo must NOT post (falsify: revert to both-directions gate): $(cat "$_eboard")"; _f=1; }
-  [ "$(cat "$_esd/.note3-light-raw-edge" 2>/dev/null)" = STABLE ] || { echo "  FAIL: EDGE_STATE must advance to STABLE so the next change re-fires"; _f=1; }
-  # (c) INIT (no prior raw) -> NO board line, EDGE_STATE=INIT
-  _run_edge '' STABLE 4651.8
-  [ -s "$_eboard" ] && { echo "  FAIL: INIT must NOT post: $(cat "$_eboard")"; _f=1; }
+  # (a) 2300 -> 4337 -> 2300 single-poll quantization bounce -> 0 board lines
+  _poll 2300; _poll 4337; _poll 2300
+  [ -s "$_eboard" ] && { echo "  FAIL: single-poll floor bounce must post 0 lines (falsify: revert to per-poll %-gate): $(cat "$_eboard")"; _f=1; }
+  # (b) sustained shift held 2 polls -> exactly 1 CHANGED line
+  rm -f "$_esd/.note3-light-raw-level" "$_esd/.note3-light-raw-state"; : > "$_eboard"
+  _poll 2300; _poll 4337; _poll 4337
+  _n="$(grep -c '\[note3-light-raw\] CHANGED' "$_eboard" 2>/dev/null || echo 0)"
+  [ "$_n" = 1 ] || { echo "  FAIL: sustained 2-poll shift must post exactly 1 CHANGED line, got $_n"; _f=1; }
+  grep -q 'delta=88.6%' "$_eboard" 2>/dev/null || { echo "  FAIL: boarded line should carry the vs-confirmed delta 88.6%, got: $(cat "$_eboard")"; _f=1; }
+  # (c) INIT (a single first poll) -> NO board line
+  rm -f "$_esd/.note3-light-raw-level" "$_esd/.note3-light-raw-state"; : > "$_eboard"
+  _poll 4651.8
+  [ -s "$_eboard" ] && { echo "  FAIL: INIT (first poll) must NOT post: $(cat "$_eboard")"; _f=1; }
   rm -rf "$_esd" 2>/dev/null || true
 
   # ── live adb read-gate (mesh-land treats exit 2 = honest n/a as a pass) ──
@@ -178,7 +230,7 @@ if [ "${1:-}" = --test ]; then
   _ok="$(python3 -c "print(1 if 0 <= ($_raw) < 200000 else 0)" 2>/dev/null)"
   [ "$_ok" = 1 ] || { echo "  FAIL: live raw implausible for this ADC: $_live"; _f=1; }
   [ "$_f" = 0 ] || { echo "smoke-test: FAIL (classify/parse/live-read contract violated)"; exit 1; }
-  echo "smoke-test: ok (5 classifier + parse-gate + 5 relay-gate unit + 1 board-skip + 3 board-write-gate integration + LIVE adb read $_live)"
+  echo "smoke-test: ok (5 classifier + parse-gate + 5 relay-gate unit + 1 board-skip + 6 board_gate unit + 3 sustained-gate integration + LIVE adb read $_live)"
   exit 0
 fi
 
@@ -215,21 +267,24 @@ case "${1:-}" in
     printf '{"verdict":"%s","raw":%s,"lux":%s,"delta_pct":"%s","ts":"%s"}\n' "$verdict" "$raw" "$lux" "$delta" "$ts"
     ;;
   --edge)
-    prev_posted=""
-    [ -f "$EDGE_STATE" ] && prev_posted="$(cat "$EDGE_STATE" 2>/dev/null)"
-    # Board ONLY on CHANGED. STABLE is never an independent coordination event here:
-    # classify() is single-step (raw vs the immediately-prior poll's raw, rewritten every
-    # run at $STATE), so a discrete light change reads CHANGED once then STABLE forever —
-    # the both-directions gate posted a content-free STABLE(delta=0.0%) echo one poll after
-    # EVERY CHANGED (board-confirmed 4 events → 8 lines, half zero-info). Still advance
-    # EDGE_STATE on STABLE/INIT so the next genuine change re-fires CHANGED.
-    if [ "$verdict" = CHANGED ] && [ "$verdict" != "$prev_posted" ]; then
+    # Board ONLY when a NEW raw level has PERSISTED N consecutive polls (board_gate). A discrete
+    # dark-floor quantization bounce (A->B->A) stays STABLE-vs-confirmed on the return, never
+    # accumulates a streak, and posts nothing — the single-step classify verdict above already
+    # went to STATE/--json for fine-grained consumers. board_gate carries confirmed|candidate|count
+    # forward in LEVEL_STATE; only a confirmed shift writes the board (with the real vs-confirmed delta).
+    lconf=""; lcand=""; lcnt=0
+    [ -f "$LEVEL_STATE" ] && IFS='|' read -r lconf lcand lcnt < "$LEVEL_STATE" 2>/dev/null || true
+    gate="$(board_gate "$raw" "${lconf:-}" "${lcand:-}" "${lcnt:-0}" "$RAW_THRESH_PCT" "$LIGHT_SUSTAIN_N")"
+    IFS='|' read -r decision nconf ncand ncnt bdelta <<EOF
+$gate
+EOF
+    printf '%s|%s|%s\n' "$nconf" "$ncand" "$ncnt" > "$LEVEL_STATE"
+    if [ "$decision" = BOARD ]; then
       board="${MESH_NOTE3_LIGHT_RAW_BOARD:-$MESH/chat.log}"
       ts_board="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-      printf '%s  note3-light-raw@%s  ::  [note3-light-raw] %s (raw=%s lux=%s delta=%s%%)\n' "$ts_board" "$(hostname)" "$verdict" "$raw" "$lux" "$delta" >> "$board" 2>/dev/null || true
+      printf '%s  note3-light-raw@%s  ::  [note3-light-raw] CHANGED (raw=%s lux=%s delta=%s%%)\n' "$ts_board" "$(hostname)" "$raw" "$lux" "$bdelta" >> "$board" 2>/dev/null || true
     fi
-    printf '%s\n' "$verdict" > "$EDGE_STATE"
-    printf 'note3-light-raw: %s (raw=%s lux=%s delta=%s%%)\n' "$verdict" "$raw" "$lux" "$delta"
+    printf 'note3-light-raw: %s (raw=%s lux=%s delta=%s%% gate=%s)\n' "$verdict" "$raw" "$lux" "$delta" "$decision"
     ;;
   *)
     printf 'note3-light-raw: %s (raw=%s lux=%s delta=%s%%)\n' "$verdict" "$raw" "$lux" "$delta"

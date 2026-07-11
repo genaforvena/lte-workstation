@@ -1,0 +1,197 @@
+#!/usr/bin/env bash
+# mesh-reclaim-mode — the kernel's MEMORY-RECLAIM-MECHANISM sense: is memory being freed the CHEAP
+# way (background kswapd, async) or the PAINFUL way (direct reclaim — a foreground task blocked in the
+# allocator, synchronously freeing pages before its malloc can return)? Read from /proc/vmstat.
+#
+# orphan-ok: on-demand direct-reclaim-mode probe — sampled when investigating memory pressure, not
+# scheduled (mesh-swap-rate/mesh-psi-memory already hold the scheduled memory-pressure axis; this
+# reveals the reclaim MECHANISM behind their stall/rate readings, like mesh-irq-rate for interrupts).
+#
+# Why a new axis (the other two memory senses don't see it):
+#   mesh-swap        → /proc/swaps               — how FULL swap is (snapshot)
+#   mesh-swap-rate   → pswpin/pswpout pages/sec  — how FAST pages shuttle RAM<->disk NOW
+#   mesh-psi-memory  → /proc/pressure/memory     — kernel wait-STALL time on memory
+#   mesh-reclaim-mode→ pgsteal_direct vs _kswapd — WHO is doing the reclaim (bg daemon vs blocked task)
+#   Reclaim happens for FILE-CACHE pressure too, not just swap — so this axis fires even when swap I/O
+#   is ~0. And a node can reclaim heavily via kswapd with ZERO direct reclaim (healthy: the background
+#   daemon keeps up). The moment `allocstall` climbs, foreground allocations are blocking to reclaim —
+#   THAT is the latency hit minds feel, and it LEADS the OOM/thrash collapse. kswapd-only = healthy
+#   pressure the system absorbs; direct = pressure that has broken through to foreground work.
+#
+# Signals (two-sample counter delta over a short window):
+#   allocstall/s   — allocations that entered DIRECT reclaim per sec (the primary; 0 on a calm system)
+#   direct_frac    — pgsteal_direct_delta / (pgsteal_direct + pgsteal_kswapd)_delta, 0..100%
+#                    (of pages reclaimed this window, what fraction the painful synchronous way)
+#   scan_direct/s  — pages scanned in direct reclaim per sec (corroborating context)
+#
+# Classification (FALSIFIABLE via --test; primary = allocstall/s), thresholds env-overridable:
+#   CALM        < RECLAIM_CONTEND_SPS (1)   allocstall/s — no foreground reclaim; kswapd coping (or idle)
+#   CONTENDED   1 .. RECLAIM_STALL_SPS (50)  — foreground tasks occasionally blocking to reclaim
+#   STALLING    >= RECLAIM_STALL_SPS (50)    — allocations routinely blocking; reclaim hurting latency NOW
+#   UNKNOWN     /proc/vmstat unreadable or required fields absent (defensive; never a faked CALM)
+# Window RECLAIM_WINDOW_S (3). A counter reset (reboot mid-window) floors to 0, never a bogus negative.
+#
+# Honest-exit contract:
+#   0 = verdict produced (CALM/CONTENDED/STALLING)
+#   2 = /proc/vmstat missing/unreadable, or the direct/kswapd/allocstall fields absent (old kernel) —
+#       never a fabricated verdict.
+#
+# State ~/.mesh/.reclaim-mode.state is written EVERY run (mtime = liveness; no change-gate, so no
+# false-STALE possible) for on-demand consumers; a state-touch backstops it regardless.
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+MESH_DIR="${MESH_DIR:-$HOME/.mesh}"
+STATE="$MESH_DIR/.reclaim-mode.state"
+
+CONTEND_SPS="${RECLAIM_CONTEND_SPS:-1}"
+STALL_SPS="${RECLAIM_STALL_SPS:-50}"
+WINDOW_S="${RECLAIM_WINDOW_S:-3}"
+VMSTAT="${MESH_VMSTAT:-/proc/vmstat}"
+
+# read_counters <file> → echoes "allocstall steal_direct steal_kswapd scan_direct" or returns 1.
+# allocstall is summed across per-zone lines (allocstall_dma/dma32/normal/movable/device on modern
+# kernels; a lone `allocstall` on very old ones) — either way `^allocstall` catches them. The other
+# three are single cumulative-since-boot counters. All monotone non-negative integers.
+read_counters() {
+  local f="$1" as sd sk scd
+  [ -r "$f" ] || return 1
+  as="$(awk '$1 ~ /^allocstall/ {s+=$2} END{print s+0}' "$f" 2>/dev/null)"
+  sd="$(awk '$1=="pgsteal_direct"{print $2; exit}' "$f" 2>/dev/null)"
+  sk="$(awk '$1=="pgsteal_kswapd"{print $2; exit}' "$f" 2>/dev/null)"
+  scd="$(awk '$1=="pgscan_direct"{print $2; exit}' "$f" 2>/dev/null)"
+  # pgsteal_direct + pgsteal_kswapd are the load-bearing pair; require them. allocstall/scan_direct
+  # default to 0 via the awk above but must still be integers. If the steal pair is absent this is not
+  # the vmstat we expect (old/foreign kernel) → caller renders n/a, never a faked reading.
+  for v in "$as" "$sd" "$sk" "$scd"; do
+    [ -n "$v" ] && printf '%s' "$v" | grep -qE '^[0-9]+$' || return 1
+  done
+  printf '%s %s %s %s\n' "$as" "$sd" "$sk" "$scd"
+}
+
+# rate <cur> <prev> <dt> → per-sec (integer, floored), never negative (reset → 0).
+rate() {
+  local cur="$1" prev="$2" dt="$3" d
+  [ "$dt" -ge 1 ] 2>/dev/null || dt=1
+  d=$(( cur - prev ))
+  [ "$d" -lt 0 ] && d=0
+  printf '%s' "$(( d / dt ))"
+}
+
+# frac <direct_delta> <kswapd_delta> → integer percent 0..100 of reclaim done the direct way.
+# No reclaim at all this window (both 0) → 0% (healthy: nothing needed freeing).
+frac() {
+  local dd="$1" kd="$2" tot
+  [ "$dd" -lt 0 ] 2>/dev/null && dd=0
+  [ "$kd" -lt 0 ] 2>/dev/null && kd=0
+  tot=$(( dd + kd ))
+  [ "$tot" -le 0 ] && { printf '0'; return; }
+  printf '%s' "$(( dd * 100 / tot ))"
+}
+
+# classify <allocstall_sps> → echoes "LABEL|reason". Pure/falsifiable, no side effects.
+classify() {
+  local sps="$1"
+  if [ -z "$sps" ] || ! printf '%d' "$sps" >/dev/null 2>&1; then
+    echo "UNKNOWN|non-numeric allocstall rate (sps=$sps)"; return
+  fi
+  if   [ "$sps" -lt "$CONTEND_SPS" ]; then echo "CALM|${sps} allocstall/s — no foreground reclaim; kswapd coping"; return; fi
+  if   [ "$sps" -lt "$STALL_SPS" ];   then echo "CONTENDED|${sps} allocstall/s — foreground tasks blocking to reclaim"; return; fi
+  echo "STALLING|${sps} allocstall/s — allocations routinely blocking; reclaim hurting latency now"
+}
+
+if [ "${1:-}" = --test ]; then
+  fail=0
+  # Pin thresholds so asserts are deterministic regardless of env overrides.
+  CONTEND_SPS=1 STALL_SPS=50
+  r="$(classify 0)";    echo "$r" | grep -q '^CALM'      || { echo "  FAIL CALM-0: $r"; fail=1; }
+  r="$(classify 1)";    echo "$r" | grep -q '^CONTENDED' || { echo "  FAIL CONTENDED-boundary(1): $r"; fail=1; }
+  r="$(classify 25)";   echo "$r" | grep -q '^CONTENDED' || { echo "  FAIL CONTENDED-mid(25): $r"; fail=1; }
+  r="$(classify 49)";   echo "$r" | grep -q '^CONTENDED' || { echo "  FAIL CONTENDED-boundary(49): $r"; fail=1; }
+  r="$(classify 50)";   echo "$r" | grep -q '^STALLING'  || { echo "  FAIL STALLING-boundary(50): $r"; fail=1; }
+  r="$(classify 5000)"; echo "$r" | grep -q '^STALLING'  || { echo "  FAIL STALLING-hi(5000): $r"; fail=1; }
+  r="$(classify abc)";  echo "$r" | grep -q '^UNKNOWN'   || { echo "  FAIL UNKNOWN-nonnum: $r"; fail=1; }
+  # rate(): floors, never negative, divides by window
+  [ "$(rate 100 40 3)" = 20 ] || { echo "  FAIL rate(100,40,3)=20 got=$(rate 100 40 3)"; fail=1; }
+  [ "$(rate 40 100 3)" = 0 ]  || { echo "  FAIL rate reset→0 got=$(rate 40 100 3)"; fail=1; }
+  [ "$(rate 100 40 0)" = 60 ] || { echo "  FAIL rate dt<1 floored-to-1 got=$(rate 100 40 0)"; fail=1; }
+  # frac(): percent split, both-zero → 0, all-direct → 100, half → 50
+  [ "$(frac 0 0)" = 0 ]    || { echo "  FAIL frac(0,0)=0 got=$(frac 0 0)"; fail=1; }
+  [ "$(frac 10 0)" = 100 ] || { echo "  FAIL frac(10,0)=100 got=$(frac 10 0)"; fail=1; }
+  [ "$(frac 5 5)" = 50 ]   || { echo "  FAIL frac(5,5)=50 got=$(frac 5 5)"; fail=1; }
+  [ "$(frac 1 3)" = 25 ]   || { echo "  FAIL frac(1,3)=25 got=$(frac 1 3)"; fail=1; }
+  # Fixture: synthetic 2-sample vmstat proves the field-parse + delta arithmetic end to end.
+  tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+  printf 'allocstall_normal 100\nallocstall_movable 50\npgsteal_direct 1000\npgsteal_kswapd 3000\npgscan_direct 2000\n' > "$tmp/v1"
+  printf 'allocstall_normal 200\nallocstall_movable 90\npgsteal_direct 1500\npgsteal_kswapd 4000\npgscan_direct 3000\n' > "$tmp/v2"
+  c1="$(read_counters "$tmp/v1")" || { echo "  FAIL fixture v1 unparsed"; fail=1; }
+  c2="$(read_counters "$tmp/v2")" || { echo "  FAIL fixture v2 unparsed"; fail=1; }
+  # allocstall summed: v1=150, v2=290 → delta 140 over dt=1 → 140/s
+  as1="${c1%% *}"; as2="${c2%% *}"
+  [ "$(rate "$as2" "$as1" 1)" = 140 ] || { echo "  FAIL fixture allocstall/s=140 got=$(rate "$as2" "$as1" 1)"; fail=1; }
+  # direct_frac: steal_direct delta=500, kswapd delta=1000 → 500/1500 = 33%
+  sd1="$(printf '%s' "$c1" | awk '{print $2}')"; sd2="$(printf '%s' "$c2" | awk '{print $2}')"
+  sk1="$(printf '%s' "$c1" | awk '{print $3}')"; sk2="$(printf '%s' "$c2" | awk '{print $3}')"
+  [ "$(frac $((sd2-sd1)) $((sk2-sk1)))" = 33 ] || { echo "  FAIL fixture direct_frac=33 got=$(frac $((sd2-sd1)) $((sk2-sk1)))"; fail=1; }
+  # A vmstat missing the steal pair must be REJECTED (→ n/a, not a faked reading).
+  printf 'allocstall_normal 100\npgscan_direct 2000\n' > "$tmp/bad"
+  read_counters "$tmp/bad" >/dev/null 2>&1 && { echo "  FAIL bad-vmstat (no steal pair) accepted"; fail=1; }
+  [ "$fail" = 1 ] && { echo "smoke-test: FAIL"; exit 1; }
+  echo "  ok: classify (7) + rate (3) + frac (4) + fixture parse/delta + reject-missing-fields"
+  # REAL-READ gate: reachability != producing. /proc/vmstat must be readable, the fields must parse,
+  # AND a live two-sample must yield a FINITE NON-NEGATIVE allocstall rate (a hollow sense would pass
+  # classify yet never touch the kernel). Short 1s window keeps --test fast.
+  [ -r "$VMSTAT" ] || { echo "smoke-test: n/a (/proc/vmstat unreadable — not Linux? /procfs missing?); logic ok"; exit 2; }
+  r1="$(read_counters "$VMSTAT")" || { echo "smoke-test: n/a (direct/kswapd reclaim fields absent — old kernel); logic ok"; exit 2; }
+  sleep 1
+  r2="$(read_counters "$VMSTAT")" || { echo "smoke-test: n/a (vmstat 2nd read failed); logic ok"; exit 2; }
+  la1="${r1%% *}"; la2="${r2%% *}"
+  sps="$(rate "$la2" "$la1" 1)"
+  [ "$sps" -ge 0 ] 2>/dev/null || { echo "smoke-test: FAIL (live allocstall rate not a non-negative integer: sps=$sps)"; exit 1; }
+  echo "smoke-test: ok (logic + REAL two-sample vmstat read: ${sps} allocstall/s over 1s)"
+  exit 0
+fi
+
+# --- Live read path: two-sample counter delta over WINDOW_S ---
+[ -r "$VMSTAT" ] || {
+  printf 'UNKNOWN|reason=vmstat-unreadable\n' > "$STATE"; mesh-state-touch "$STATE" 2>/dev/null || touch "$STATE"
+  echo "mesh-reclaim-mode: $VMSTAT not readable (not Linux? /procfs missing?) — not an alarm" >&2
+  exit 2
+}
+t1=$(date +%s); c1="$(read_counters "$VMSTAT")" || {
+  printf 'UNKNOWN|reason=reclaim-fields-absent\n' > "$STATE"; mesh-state-touch "$STATE" 2>/dev/null || touch "$STATE"
+  echo "mesh-reclaim-mode: pgsteal_direct/pgsteal_kswapd absent in $VMSTAT (old kernel?) — not an alarm" >&2
+  exit 2
+}
+sleep "$WINDOW_S"
+t2=$(date +%s); c2="$(read_counters "$VMSTAT")" || {
+  printf 'UNKNOWN|reason=vmstat-2nd-read-failed\n' > "$STATE"; mesh-state-touch "$STATE" 2>/dev/null || touch "$STATE"
+  echo "mesh-reclaim-mode: 2nd vmstat read failed — not an alarm" >&2
+  exit 2
+}
+dt=$(( t2 - t1 )); [ "$dt" -ge 1 ] || dt="$WINDOW_S"
+
+as1="${c1%% *}"; sd1="$(printf '%s' "$c1" | awk '{print $2}')"; sk1="$(printf '%s' "$c1" | awk '{print $3}')"; scd1="$(printf '%s' "$c1" | awk '{print $4}')"
+as2="${c2%% *}"; sd2="$(printf '%s' "$c2" | awk '{print $2}')"; sk2="$(printf '%s' "$c2" | awk '{print $3}')"; scd2="$(printf '%s' "$c2" | awk '{print $4}')"
+alloc_sps="$(rate "$as2" "$as1" "$dt")"
+scan_sps="$(rate "$scd2" "$scd1" "$dt")"
+sd_d=$(( sd2 - sd1 )); [ "$sd_d" -lt 0 ] && sd_d=0
+sk_d=$(( sk2 - sk1 )); [ "$sk_d" -lt 0 ] && sk_d=0
+direct_frac="$(frac "$sd_d" "$sk_d")"
+
+result="$(classify "$alloc_sps")"
+label="${result%%|*}"; reason="${result#*|}"
+TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+# additive-fields contract: first |-field is the authoritative LABEL (first-token consumers untouched).
+printf '%s|allocstall_sps=%s|direct_frac=%s|scan_direct_sps=%s|window=%ss\n' \
+  "$label" "$alloc_sps" "$direct_frac" "$scan_sps" "$dt" > "$STATE"
+mesh-state-touch "$STATE" 2>/dev/null || touch "$STATE"
+
+if [ "${1:-}" = --json ]; then
+  printf '{"label":"%s","allocstall_sps":%s,"direct_frac_pct":%s,"scan_direct_sps":%s,"window_s":%s,"ts":"%s"}\n' \
+    "$label" "$alloc_sps" "$direct_frac" "$scan_sps" "$dt" "$TS"
+  exit 0
+fi
+printf '[reclaim-mode-%s] %s — %s allocstall/s, %s%% reclaim direct (scan_direct=%s/s) over %ss | %s\n' \
+  "$(printf '%s' "$label" | tr '[:upper:]' '[:lower:]')" "$label" "$alloc_sps" "$direct_frac" "$scan_sps" "$dt" "$reason"
