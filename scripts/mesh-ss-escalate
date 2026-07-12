@@ -2,32 +2,45 @@
 # mesh-ss-escalate — board-post gate for the vpn mind's SS-unknown-client escalation.
 # Kills the "recry": re-posting the same unrecognized-IP set each sweep with
 # oscillating verdicts (breach->leak->benign). The mind consults this gate before
-# posting to the board; unchanged sets are routed to mesh-trace instead.
+# posting to the board; churn that isn't a breach signal is routed to mesh-trace.
 #
 #   mesh-ss-escalate              compare current unknown set to last-posted; print verdict
 #   mesh-ss-escalate --commit     record current set as just-posted (call AFTER board post)
 #   mesh-ss-escalate --clear      reset state (operator answered / situation resolved)
-#   mesh-ss-escalate --show       print persisted set + timestamp
+#   mesh-ss-escalate --show       print persisted set + timestamp + cached IP classes
 #   mesh-ss-escalate --test       smoke test
 #
 # Output (bare mode):
-#   POST <sorted ips>     — set changed (gained/lost a member) or first run; surface to board
-#   SUPPRESS <sorted ips> — set unchanged since last post; route to mesh-trace only
+#   POST <sorted ips>     — a NEWLY-ADDED IP is residential/mobile/unclassifiable; surface to board
+#   SUPPRESS <sorted ips> — unchanged, only lost members, OR every newly-added IP is a
+#                           hosting/scanner AS (pure cohort churn); route to mesh-trace only
 #   EMPTY                 — no unrecognized IPs in the log (nothing to escalate)
+#
+# WHY the AS classifier (chat-review 2026-07-11, mesh-ss-escalate:143): the SS unknown-client
+# cohort is dominated by hosting/scanner ASes (Aliyun/Tencent/DO/Hydra/Driftnet…) that add+drop
+# members every ~30m sweep. Gating on bare set-membership churn POSTed every sweep, drowning the
+# real breach signal — an unauthorized *residential-ISP* client. The breach signal is a NEW IP
+# whose AS is residential/mobile (a real person), not a datacenter. So we classify only the
+# newly-ADDED IPs (vs last-POSTED set — the delta, ~1-2/sweep), and POST only when one is
+# residential/mobile OR cannot be classified (fail-safe: never silently suppress a possible
+# breach). All-hosting churn → SUPPRESS → mesh-trace. Classification is cached (ip-api hosting/
+# mobile/proxy flags; 7-day TTL — AS ownership is stable) so churn IPs are looked up once.
 #
 # Workflow for the vpn mind:
 #   verdict=$(mesh-ss-escalate)
 #   case $verdict in
-#     POST*)    mesh-chat "[fyi] vpn: <stable verdict + one operator-ask>" ; mesh-ss-escalate --commit ;;
-#     SUPPRESS*) mesh-trace "ss-unknown unchanged (<ips>)" ;;
+#     POST*)     mesh-chat "[fyi] vpn: <stable verdict + one operator-ask>" ; mesh-ss-escalate --commit ;;
+#     SUPPRESS*) mesh-trace "ss-unknown churn (all-hosting/unchanged) (<ips>)" ;;
 #   esac
 #
 # When the operator responds (posts ack / rotates key / says ignore), run:
-#   mesh-ss-escalate --clear   # next sweep re-posts fresh if IPs still present
+#   mesh-ss-escalate --clear   # next sweep re-posts fresh if a real signal is still present
 
 set -euo pipefail
-STATE_FILE="${HOME}/.mesh/.ss-escalation-posted.state"
-LOG_FILE="${HOME}/.mesh/ss-connections.log"
+STATE_FILE="${SS_STATE_FILE:-${HOME}/.mesh/.ss-escalation-posted.state}"
+LOG_FILE="${SS_LOG_FILE:-${HOME}/.mesh/ss-connections.log}"
+CLASS_CACHE="${SS_CLASS_CACHE:-${HOME}/.mesh/.ss-ip-class.cache}"
+CLASS_TTL="${SS_CLASS_TTL:-604800}"   # 7 days — AS ownership is stable
 
 current_ips() {
   local line
@@ -36,79 +49,136 @@ current_ips() {
   printf '%s' "$line" | grep -oP '\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b' | sort -u | tr '\n' ' ' | sed 's/ $//'
 }
 
+# classify_ip <ip> -> echoes one of: hosting | mobile | residential | unknown
+#   hosting  = datacenter/hosting/proxy/tor AS  -> scanner cohort churn, suppress-worthy
+#   mobile   = mobile-carrier AS                -> a real user, breach-worthy
+#   residential = neither hosting nor mobile    -> a real user, breach-worthy
+#   unknown  = could not classify (offline / lookup failed) -> fail-safe POST, never cached
+# Cache is append-only (`<ip> <class> <epoch>`); tail -1 wins so a refresh supersedes.
+classify_ip() {
+  local ip="$1" now line cls ts resp hosting mobile proxy
+  now=$(date +%s)
+  if [ -f "$CLASS_CACHE" ]; then
+    line=$(grep -E "^${ip//./\\.} " "$CLASS_CACHE" 2>/dev/null | tail -1 || true)
+    if [ -n "$line" ]; then
+      cls=$(awk '{print $2}' <<<"$line"); ts=$(awk '{print $3}' <<<"$line")
+      if [ -n "${ts:-}" ] && [ "$((now - ts))" -lt "$CLASS_TTL" ]; then echo "$cls"; return; fi
+    fi
+  fi
+  # offline / test guard: no network -> unknown (fail-safe, uncached)
+  if [ "${SS_CLASS_OFFLINE:-0}" = "1" ]; then echo "unknown"; return; fi
+  resp=$(curl -s -m 3 "http://ip-api.com/json/${ip}?fields=status,hosting,mobile,proxy" 2>/dev/null || true)
+  if [ -z "$resp" ] || ! grep -q '"status":"success"' <<<"$resp"; then
+    echo "unknown"; return    # do NOT cache a failed lookup
+  fi
+  hosting=$(grep -oP '"hosting":\s*\K(true|false)' <<<"$resp" 2>/dev/null || echo false)
+  mobile=$(grep -oP '"mobile":\s*\K(true|false)' <<<"$resp" 2>/dev/null || echo false)
+  proxy=$(grep -oP '"proxy":\s*\K(true|false)' <<<"$resp" 2>/dev/null || echo false)
+  if [ "$hosting" = "true" ] || [ "$proxy" = "true" ]; then cls="hosting"
+  elif [ "$mobile" = "true" ]; then cls="mobile"
+  else cls="residential"; fi
+  mkdir -p "$(dirname "$CLASS_CACHE")"
+  printf '%s %s %s\n' "$ip" "$cls" "$now" >> "$CLASS_CACHE"
+  echo "$cls"
+}
+
+# decide -> prints POST/SUPPRESS/EMPTY given current log + last-posted state.
+decide() {
+  local ips prev added ip cls verdict
+  ips=$(current_ips)
+  if [ -z "$ips" ]; then echo "EMPTY"; return; fi
+  prev=""
+  [ -f "$STATE_FILE" ] && prev=$(tail -1 "$STATE_FILE" 2>/dev/null || true)
+  if [ "$prev" = "$ips" ]; then echo "SUPPRESS $ips"; return; fi   # unchanged
+  # newly-ADDED vs last-POSTED set (prev empty => every current IP is "added")
+  added=$(comm -23 <(printf '%s\n' $ips | sort -u) <(printf '%s\n' $prev | sort -u) 2>/dev/null || true)
+  if [ -z "$added" ]; then echo "SUPPRESS $ips"; return; fi        # only lost members — not a new threat
+  verdict="SUPPRESS"
+  for ip in $added; do
+    cls=$(classify_ip "$ip")
+    case "$cls" in
+      residential|mobile|unknown) verdict="POST" ;;   # real user or blind -> surface
+      *) ;;                                            # hosting/proxy -> cohort churn
+    esac
+  done
+  echo "$verdict $ips"
+}
+
 do_test() {
-  local TESTS_FAILED=0 td
+  local TESTS_FAILED=0 td SELF out
+  SELF="$(readlink -f "${BASH_SOURCE[0]}")"
   test_ok() { echo "  ok: $1"; }
   test_fail() { TESTS_FAILED=$((TESTS_FAILED + 1)); echo "  FAIL: $1"; }
 
   td="$(mktemp -d)" || { echo "FAIL (mktemp)"; exit 1; }
-  # Override paths for test scope
-  LOG_FILE="$td/ss-connections.log"
-  STATE_FILE="$td/.ss-escalation-posted.state"
+  local L="$td/ss-connections.log" S="$td/.ss-escalation-posted.state" C="$td/.ss-ip-class.cache"
+  # drive the REAL decision path via subprocess with overridden paths + offline classifier
+  run() { SS_LOG_FILE="$L" SS_STATE_FILE="$S" SS_CLASS_CACHE="$C" SS_CLASS_OFFLINE="${SS_CLASS_OFFLINE:-1}" bash "$SELF"; }
+  seed_log() { printf '[ss-connections] %s unrecognized client IP(s), not geo-verified breach (%s)\n' "$1" "$2" > "$L"; }
+  seed_state() { printf '%s\n%s\n' "2026-07-10T23:00:00Z" "$1" > "$S"; }
+  seed_class() { printf '%s %s %s\n' "$1" "$2" "$(date +%s)" >> "$C"; }
 
-  # --- scenario 1: first run, IPs present -> POST ---
-  printf '[ss-connections] 6 unrecognized client IP(s), not geo-verified breach (89.39.95.45 130.255.149.20 47.81.39.232 2.27.248.118 188.240.59.60 69.5.169.190)\n' > "$LOG_FILE"
+  # --- current_ips parse/sort invariance (in-process) ---
+  LOG_FILE="$L"
+  seed_log 6 "89.39.95.45 130.255.149.20 47.81.39.232 2.27.248.118 188.240.59.60 69.5.169.190"
   out=$(current_ips) || true
   [ "$out" = "130.255.149.20 188.240.59.60 2.27.248.118 47.81.39.232 69.5.169.190 89.39.95.45" ] \
-    || test_fail "current_ips parse/sort drift: '$out'"
+    && test_ok "current_ips parse+sort" || test_fail "current_ips drift: '$out'"
 
-  # bare mode = first run -> POST
-  out=$("${BASH_SOURCE[0]}" 2>/dev/null || true)
-  # BASH_SOURCE won't work when invoked as function; test the logic directly:
-  # Simulate: no state file -> POST
-  ips=$(current_ips)
-  prev=""
-  [ -f "$STATE_FILE" ] && prev=$(tail -1 "$STATE_FILE" 2>/dev/null || true)
-  { [ -z "$prev" ] || [ "$prev" != "$ips" ]; } && test_ok "first run -> POST (no prior state)" \
-    || test_fail "first run should POST"
+  # --- 1: unchanged set -> SUPPRESS (no classifier call) ---
+  seed_log 3 "1.1.1.1 2.2.2.2 3.3.3.3"
+  seed_state "1.1.1.1 2.2.2.2 3.3.3.3"
+  out=$(run); [ "$out" = "SUPPRESS 1.1.1.1 2.2.2.2 3.3.3.3" ] \
+    && test_ok "unchanged -> SUPPRESS" || test_fail "unchanged: '$out'"
 
-  # --- scenario 2: commit, then same set -> SUPPRESS ---
-  printf '%s\n%s\n' "2026-07-10T23:00:00Z" "$ips" > "$STATE_FILE"
-  prev=$(tail -1 "$STATE_FILE")
-  [ "$prev" = "$ips" ] && test_ok "commit stores sorted set" || test_fail "commit drift"
-  { [ -z "$prev" ] || [ "$prev" != "$ips" ]; } && test_fail "same set should SUPPRESS" \
-    || test_ok "same set -> SUPPRESS"
+  # --- 2: changed, newly-added is HOSTING -> SUPPRESS (route to trace) ---
+  : > "$C"; seed_state "1.1.1.1 2.2.2.2"; seed_log 3 "1.1.1.1 2.2.2.2 9.9.9.9"; seed_class 9.9.9.9 hosting
+  out=$(SS_CLASS_OFFLINE=1 run); case "$out" in SUPPRESS\ *) test_ok "new hosting IP -> SUPPRESS" ;; *) test_fail "new hosting should SUPPRESS: '$out'" ;; esac
 
-  # --- scenario 3: set gains a member -> POST ---
-  printf '[ss-connections] 7 unrecognized client IP(s), not geo-verified breach (89.39.95.45 130.255.149.20 47.81.39.232 2.27.248.118 188.240.59.60 69.5.169.190 1.2.3.4)\n' > "$LOG_FILE"
-  ips2=$(current_ips)
-  prev=$(tail -1 "$STATE_FILE")
-  { [ -z "$prev" ] || [ "$prev" != "$ips2" ]; } && test_ok "set gained member -> POST" \
-    || test_fail "gained member should POST"
+  # --- 3: changed, newly-added is RESIDENTIAL -> POST ---
+  : > "$C"; seed_state "1.1.1.1 2.2.2.2"; seed_log 3 "1.1.1.1 2.2.2.2 8.8.8.8"; seed_class 8.8.8.8 residential
+  out=$(SS_CLASS_OFFLINE=1 run); case "$out" in POST\ *) test_ok "new residential IP -> POST" ;; *) test_fail "new residential should POST: '$out'" ;; esac
 
-  # --- scenario 4: set loses a member -> POST ---
-  printf '[ss-connections] 5 unrecognized client IP(s), not geo-verified breach (89.39.95.45 130.255.149.20 47.81.39.232 2.27.248.118 188.240.59.60)\n' > "$LOG_FILE"
-  ips3=$(current_ips)
-  { [ -z "$prev" ] || [ "$prev" != "$ips3" ]; } && test_ok "set lost member -> POST" \
-    || test_fail "lost member should POST"
+  # --- 4: changed, newly-added UNCLASSIFIABLE (offline, uncached) -> POST (fail-safe) ---
+  : > "$C"; seed_state "1.1.1.1 2.2.2.2"; seed_log 3 "1.1.1.1 2.2.2.2 7.7.7.7"
+  out=$(SS_CLASS_OFFLINE=1 run); case "$out" in POST\ *) test_ok "unclassifiable new IP -> POST (fail-safe)" ;; *) test_fail "unknown should fail-safe POST: '$out'" ;; esac
 
-  # --- scenario 5: re-order same set -> SUPPRESS ---
-  printf '[ss-connections] 6 unrecognized client IP(s), not geo-verified breach (69.5.169.190 188.240.59.60 2.27.248.118 47.81.39.232 130.255.149.20 89.39.95.45)\n' > "$LOG_FILE"
-  ips4=$(current_ips)
-  prev="$ips"  # original committed set
-  { [ -z "$prev" ] || [ "$prev" != "$ips4" ]; } && test_fail "reordered same set should SUPPRESS" \
-    || test_ok "reordered same set -> SUPPRESS"
+  # --- 5: mixed newly-added (hosting + residential) -> POST ---
+  : > "$C"; seed_state "1.1.1.1"; seed_log 3 "1.1.1.1 9.9.9.9 8.8.8.8"; seed_class 9.9.9.9 hosting; seed_class 8.8.8.8 residential
+  out=$(SS_CLASS_OFFLINE=1 run); case "$out" in POST\ *) test_ok "mixed (hosting+residential) -> POST" ;; *) test_fail "mixed should POST: '$out'" ;; esac
 
-  # --- scenario 6: no unrecognized line in log -> EMPTY ---
-  printf '[ss-connections] BREACH — 1 geo-verified unauthorized connection(s)\n' > "$LOG_FILE"
-  ips5=$(current_ips)
-  [ -z "$ips5" ] && test_ok "no unrecognized line -> EMPTY" || test_fail "should be EMPTY, got '$ips5'"
+  # --- 6: set only LOST a member (no additions) -> SUPPRESS ---
+  : > "$C"; seed_state "1.1.1.1 2.2.2.2 3.3.3.3"; seed_log 2 "1.1.1.1 2.2.2.2"
+  out=$(SS_CLASS_OFFLINE=1 run); [ "$out" = "SUPPRESS 1.1.1.1 2.2.2.2" ] \
+    && test_ok "lost-only member -> SUPPRESS" || test_fail "lost-only: '$out'"
 
-  # --- scenario 7: empty log -> EMPTY ---
-  : > "$LOG_FILE"
-  ips6=$(current_ips)
-  [ -z "$ips6" ] && test_ok "empty log -> EMPTY" || test_fail "empty log should be EMPTY"
+  # --- 7: all newly-added hosting -> SUPPRESS even though set changed ---
+  : > "$C"; seed_state "1.1.1.1"; seed_log 3 "1.1.1.1 9.9.9.9 9.8.8.8"; seed_class 9.9.9.9 hosting; seed_class 9.8.8.8 hosting
+  out=$(SS_CLASS_OFFLINE=1 run); case "$out" in SUPPRESS\ *) test_ok "all-hosting churn -> SUPPRESS" ;; *) test_fail "all-hosting should SUPPRESS: '$out'" ;; esac
 
-  # --- scenario 8: --clear resets state ---
-  printf '%s\n%s\n' "2026-07-10T23:00:00Z" "1.2.3.4" > "$STATE_FILE"
-  LOG_FILE_REAL="$LOG_FILE" STATE_FILE_REAL="$STATE_FILE"
-  # can't call --clear with overridden paths; verify logic: rm + check
-  rm -f "$STATE_FILE"
-  [ ! -f "$STATE_FILE" ] && test_ok "--clear removes state file" || test_fail "clear failed"
+  # --- 8: stale cache entry (past TTL) is ignored -> offline unknown -> POST ---
+  : > "$C"; seed_state "1.1.1.1"; seed_log 2 "1.1.1.1 6.6.6.6"
+  printf '%s %s %s\n' "6.6.6.6" "hosting" "1000000000" >> "$C"   # year-2001 epoch, far past TTL
+  out=$(SS_CLASS_OFFLINE=1 run); case "$out" in POST\ *) test_ok "stale-cache class ignored -> fail-safe POST" ;; *) test_fail "stale cache should be ignored: '$out'" ;; esac
+
+  # --- 9: fresh cache entry is HONORED -> SUPPRESS (no re-lookup) ---
+  : > "$C"; seed_state "1.1.1.1"; seed_log 2 "1.1.1.1 6.6.6.6"; seed_class 6.6.6.6 hosting
+  out=$(SS_CLASS_OFFLINE=1 run); case "$out" in SUPPRESS\ *) test_ok "fresh-cache hosting honored -> SUPPRESS" ;; *) test_fail "fresh cache should be honored: '$out'" ;; esac
+
+  # --- 10: no unrecognized line -> EMPTY ---
+  printf '[ss-connections] BREACH — 1 geo-verified unauthorized connection(s)\n' > "$L"
+  out=$(run); [ "$out" = "EMPTY" ] && test_ok "no unrecognized line -> EMPTY" || test_fail "should be EMPTY: '$out'"
+
+  # --- 11: empty log -> EMPTY ---
+  : > "$L"; out=$(run); [ "$out" = "EMPTY" ] && test_ok "empty log -> EMPTY" || test_fail "empty log should be EMPTY: '$out'"
+
+  # --- 12: reordered same members -> SUPPRESS (no additions) ---
+  : > "$C"; seed_state "89.39.95.45 130.255.149.20"; seed_log 2 "130.255.149.20 89.39.95.45"
+  out=$(SS_CLASS_OFFLINE=1 run); case "$out" in SUPPRESS\ *) test_ok "reordered same members -> SUPPRESS" ;; *) test_fail "reorder should SUPPRESS: '$out'" ;; esac
 
   rm -rf "$td"
   [ $TESTS_FAILED -gt 0 ] && { echo "smoke-test: FAIL ($TESTS_FAILED)"; exit 1; }
-  echo "smoke-test: ok (POST/SUPPRESS/EMPTY gate logic + commit + clear + reorder-invariance)"
+  echo "smoke-test: ok (AS-classified gate: hosting-churn SUPPRESS / residential+unknown POST / cache TTL / commit / clear / EMPTY / sort-invariance)"
   exit 0
 }
 
@@ -122,7 +192,7 @@ case "${1:-}" in
     ;;
   --clear)
     rm -f "$STATE_FILE"
-    echo "cleared — next sweep will re-post if IPs still present"
+    echo "cleared — next sweep will re-post if a real signal is still present"
     ;;
   --show)
     if [ -f "$STATE_FILE" ]; then
@@ -131,20 +201,13 @@ case "${1:-}" in
     else
       echo "(no state — never posted)"
     fi
+    if [ -f "$CLASS_CACHE" ]; then
+      echo "-- cached IP classes (ip class epoch) --"
+      tail -20 "$CLASS_CACHE"
+    fi
     ;;
   "")
-    ips=$(current_ips)
-    if [ -z "$ips" ]; then
-      echo "EMPTY"
-      exit 0
-    fi
-    prev=""
-    [ -f "$STATE_FILE" ] && prev=$(tail -1 "$STATE_FILE" 2>/dev/null || true)
-    if [ -z "$prev" ] || [ "$prev" != "$ips" ]; then
-      echo "POST $ips"
-    else
-      echo "SUPPRESS $ips"
-    fi
+    decide
     ;;
   *) echo "usage: $0 [--commit|--clear|--show|--test]"; exit 1 ;;
 esac
