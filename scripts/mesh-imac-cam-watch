@@ -17,7 +17,7 @@
 #
 #   mesh-imac-cam-watch            one cycle: capture → diff vs baseline → on motion, classify+log
 #   mesh-imac-cam-watch --daemon   loop forever (systemd/launchd-friendly)
-#   mesh-imac-cam-watch --state    print the current liveness state (SEEING/DARK/FLAT/CAPTURE-FAIL)
+#   mesh-imac-cam-watch --state    print the current liveness state (SEEING/DARK/COVERED/FLAT/CAPTURE-FAIL)
 #   mesh-imac-cam-watch --test     smoke: diff-metric math (synthetic images, no real capture) + a
 #                                  REAL single-cycle capture (mesh-imac-cam --test already proves the
 #                                  hardware read; this proves the diff+classify wiring on top of it)
@@ -38,6 +38,12 @@ CAM_THRESH="${IMAC_CAM_THRESH:-14}"
 CAM_STATE_EVERY="${IMAC_CAM_STATE_EVERY:-120}"
 CAM_COOLDOWN="${IMAC_CAM_COOLDOWN:-450}"   # min gap between Groq-vision classify calls; 450s keeps sustained-motion under the 500k/day TPD budget (task imac-cam-cooldown-tpd-budget; was 45s → exhausted TPD in ~2.4h)
 LASTF="$MESH/.imac-cam-last-classify"
+# COVERED-lens discriminator (ported from mesh-cam-watch cam-covered-classifier, task imac-cam-watch-no-covered-class):
+# a covered lens (shutter/tape/cap) is a FLAT DARK field (sd≈0), NOT a DARK room the eye still SEES (real sensor
+# noise sd≳2). Without this split a blind iMac lens falls to DARK and the cat/room senses go silently hollow.
+CAM_COVERED_SD="${IMAC_CAM_COVERED_SD:-1.5}"        # luma stddev below this (AND mean<30) = COVERED, not DARK
+CAM_COVERED_DWELL="${IMAC_CAM_COVERED_DWELL:-3600}" # continuous-COVERED seconds before the ONE [cam-covered] board line
+COVSINCE="$MESH/.imac-cam-covered-since"   # "<epoch_covered_began> <announced 0|1>" — cleared when the lens opens
 now(){ date +%s; }
 stampnow(){ date -u +%FT%TZ; }
 log_evt(){ printf '%s  %s\n' "$(stampnow)" "$*" >> "$LOG"; }
@@ -57,21 +63,52 @@ except Exception:
 PY
 }
 
-frame_class() {  # <jpg> -> SEEING|DARK|FLAT|STAT-FAIL (mirrors mesh-cam-watch's blindness detector)
-  python3 - "$1" <<'PY'
+frame_class() {  # <jpg> -> SEEING|DARK|COVERED|FLAT|STAT-FAIL (mirrors mesh-cam-watch's blindness detector)
+  python3 - "$1" "$CAM_COVERED_SD" <<'PY'
 import sys
 from PIL import Image
 try:
-    im=Image.open(sys.argv[1]).convert("L").resize((160,120))
-    px=sorted(im.getdata())
-    mean=sum(px)/len(px)
-    span=px[int(len(px)*0.98)]-px[int(len(px)*0.02)]
-    if span<12 and mean<30: print("DARK")
-    elif span<12: print("FLAT")
+    # NEAREST resample: subsample, do NOT smooth — smoothing (bicubic default) averages away the very
+    # sensor-noise variance that separates a COVERED flat field (sd≈0) from a DARK room the eye SEES
+    # (sd≳2). The covered discriminator is a variance read, so it must survive the downscale.
+    im=Image.open(sys.argv[1]).convert("L").resize((160,120), Image.NEAREST)
+    raw=list(im.getdata()); n=len(raw)
+    mean=sum(raw)/n
+    var=sum((p-mean)**2 for p in raw)/n
+    sd=var**0.5
+    covered_sd=float(sys.argv[2])
+    px=sorted(raw)
+    span=px[int(n*0.98)]-px[int(n*0.02)]   # p2-p98 spread: ignores stuck pixels
+    if mean<30 and sd<covered_sd: print("COVERED")   # flat dark field: shutter/tape/cap — the eye is BLIND
+    elif span<12 and mean<30: print("DARK")          # near-black but real sensor noise: unlit room, eye SEES
+    elif span<12: print("FLAT")                      # uniform but lit: bright obstruction
     else: print("SEEING")
 except Exception:
     print("STAT-FAIL")
 PY
+}
+
+# cam_board — edge board post (best-effort). The covered-dwell one-shot uses it. Board-only: this feed is
+# ANALYSIS-ONLY (operator 2026-07-04 — no Telegram photo-alerts on the iMac eye, unlike default-string).
+cam_board(){ command -v mesh-chat >/dev/null 2>&1 && MESH_WHO="imac-cam-watch@$(hostname)" mesh-chat "$1" >/dev/null 2>&1 || true; }
+
+# covered_dwell <cls> — track continuous-COVERED time in COVSINCE; the FIRST cycle past CAM_COVERED_DWELL
+# fires exactly ONE [cam-covered] board line, guarded by an announced flag so it never repeats within an
+# episode. Any non-COVERED frame clears COVSINCE (resets the episode). Purely a side-effect on the board;
+# does not transform the class the caller writes to STATE.
+covered_dwell() {
+  local cls="$1" nowt; nowt="$(now)"
+  if [ "$cls" != COVERED ]; then rm -f "$COVSINCE" 2>/dev/null || true; return 0; fi
+  local since="" ann=""
+  [ -f "$COVSINCE" ] && read -r since ann < "$COVSINCE" 2>/dev/null
+  [[ "${since:-}" =~ ^[0-9]+$ ]] || { since="$nowt"; ann=0; }
+  [[ "${ann:-}" =~ ^[01]$ ]] || ann=0
+  if [ "$ann" != 1 ] && [ $(( nowt - since )) -ge "$CAM_COVERED_DWELL" ]; then
+    local mins=$(( (nowt - since) / 60 ))
+    cam_board "[cam-covered] iMac (ilya) camera lens BLIND ${mins}min+ (flat dark field mean<30 sd<${CAM_COVERED_SD}: shutter/tape/cap — NOT a dark room). Cat/room senses on this eye degraded until the lens is uncovered."
+    ann=1
+  fi
+  printf '%s %s\n' "$since" "$ann" > "$COVSINCE" 2>/dev/null || true
 }
 
 state_write(){ printf '%s\n' "$1" > "$STATE.tmp" 2>/dev/null && mv -f "$STATE.tmp" "$STATE" 2>/dev/null
@@ -109,6 +146,7 @@ cycle() {
     fi
   fi
   local cls; cls="$(frame_class "$nowjpg")"
+  covered_dwell "$cls"    # >dwell one-shot [cam-covered] board alert (side-effect; STATE still records COVERED)
   if [ "$cls" != "$prev_state" ] || [ ! -f "$STATE" ]; then state_write "$cls"
   elif [ $(( $(now) - $(stat -c %Y "$STATE" 2>/dev/null || echo 0) )) -ge "$CAM_STATE_EVERY" ]; then state_write "$cls"; fi
   cp -f "$nowjpg" "$PREV" 2>/dev/null || true
@@ -135,8 +173,39 @@ PY
     d_diff="$(diff_metric "$td/a.jpg" "$td/c.jpg")"
     awk "BEGIN{exit !($d_same<2)}" || { echo "smoke-test: FAIL (identical frames should diff ~0, got $d_same)"; exit 1; }
     awk "BEGIN{exit !($d_diff>=$CAM_THRESH)}" || { echo "smoke-test: FAIL (very different frames should exceed threshold, got $d_diff)"; exit 1; }
-    cls_dark="$(python3 -c "from PIL import Image; Image.new('L',(160,120),5).save('$td/dark.jpg')" && frame_class "$td/dark.jpg")"
-    [ "$cls_dark" = DARK ] || { echo "smoke-test: FAIL (near-black frame should classify DARK, got $cls_dark)"; exit 1; }
+    # blindness classifier fixtures (cam-covered-classifier): the split is VARIANCE — a COVERED flat field
+    # (sd≈0, lens blocked) vs a DARK room the eye still SEES (real low-freq structure sd≳2). JPEG DCT-quantizes
+    # away per-pixel WHITE noise, so the DARK fixture must be a LOW-FREQUENCY ramp, which JPEG preserves.
+    python3 - "$td" <<'PY'
+from PIL import Image
+import sys
+d=sys.argv[1]
+Image.new("L",(160,120),15).save(d+"/covered.jpg")     # flat dark field sd~0 → COVERED (lens blocked)
+dk=Image.new("L",(160,120))                             # smooth ramp 10..21: sd~3, span~10 (<12), mean~15
+dk.putdata([10 + (x*11)//160 for y in range(120) for x in range(160)])
+dk.save(d+"/darkroom.jpg")                              # noisy/structured near-black → DARK (eye SEES)
+PY
+    cls_cov="$(frame_class "$td/covered.jpg")"
+    [ "$cls_cov" = COVERED ] || { echo "smoke-test: FAIL (flat dark field should classify COVERED, got $cls_cov)"; exit 1; }
+    [ "$cls_cov" = DARK ] && { echo "smoke-test: FAIL (a COVERED flat field must not read DARK — the conflation bug)"; exit 1; }
+    cls_dark="$(frame_class "$td/darkroom.jpg")"
+    [ "$cls_dark" = DARK ] || { echo "smoke-test: FAIL (structured near-black room should classify DARK, got $cls_dark)"; exit 1; }
+    [ "$cls_dark" = COVERED ] && { echo "smoke-test: FAIL (a noisy DARK room must not read COVERED — sd discriminator broke)"; exit 1; }
+    # covered-dwell one-shot: fires exactly ONE [cam-covered] board line past the dwell, never within an
+    # episode. Hermetic — stub cam_board + point COVSINCE at the sandbox.
+    _ovd="$(mktemp -d)"; COVSINCE="$_ovd/since"; CAM_COVERED_DWELL=3600
+    _bc="$_ovd/board"; cam_board(){ printf '%s\n' "$1" >> "$_bc"; }
+    rm -f "$_bc" "$COVSINCE"
+    covered_dwell COVERED    # fresh (since=now) → under dwell → arms since-stamp, NO board post
+    [ -s "$_bc" ] && { echo "smoke-test: FAIL (a sub-dwell COVERED must NOT post [cam-covered])"; exit 1; }
+    printf '%s 0\n' "$(( $(now) - 4000 ))" > "$COVSINCE"   # backdate past dwell → next call fires ONE alert
+    covered_dwell COVERED
+    [ "$(wc -l < "$_bc")" = 1 ] || { echo "smoke-test: FAIL (dwelled COVERED should post exactly ONE [cam-covered], got $(wc -l < "$_bc"))"; exit 1; }
+    covered_dwell COVERED    # already announced → must NOT repeat within the episode
+    [ "$(wc -l < "$_bc")" = 1 ] || { echo "smoke-test: FAIL ([cam-covered] repeated within one episode)"; exit 1; }
+    covered_dwell SEEING     # left COVERED → clears the episode
+    [ -f "$COVSINCE" ] && { echo "smoke-test: FAIL (a non-COVERED frame must clear the dwell episode)"; exit 1; }
+    rm -rf "$_ovd"
     # cooldown TPD-budget guard (task imac-cam-cooldown-tpd-budget): default must be the
     # budget-safe 450s (falsifiable — reverting :39 to 45 fails this), and the env override must win.
     if [ -z "${IMAC_CAM_COOLDOWN:-}" ]; then
@@ -151,7 +220,7 @@ PY
     cycle >/dev/null 2>&1
     rc=$?
     [ -f "$STATE" ] || { echo "smoke-test: FAIL (cycle did not write a liveness state)"; exit 1; }
-    echo "smoke-test: ok (diff-metric math correct; DARK classified; one real cycle ran, state=$(cat "$STATE" 2>/dev/null))"
+    echo "smoke-test: ok (diff-metric math correct; COVERED/DARK split + dwell one-shot verified; one real cycle ran, state=$(cat "$STATE" 2>/dev/null))"
     exit 0 ;;
   --state)
     [ -f "$STATE" ] && cat "$STATE" || echo "no state yet (never run)"; exit 0 ;;
