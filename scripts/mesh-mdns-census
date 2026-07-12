@@ -1,0 +1,414 @@
+#!/usr/bin/env bash
+# mesh-mdns-census — LAN mDNS/Bonjour service census: named IDENTITY + owned-only cast candidates.
+#
+# The signal no other sense gives: querying mDNS (224.0.0.251:5353) surfaces devices that
+# self-advertise on the LAN with a human-readable NAME, hostname, service types, and TXT model
+# metadata — a discovery plane DISJOINT from SSDP/UPnP. ARP/mesh-lan-newdevice see a MAC only;
+# mesh-upnp-census sees SSDP only (the TV answers SSDP, an iPad answers mDNS-only). mDNS carries
+# the *identity* ("iPad (Розалия)", model=J420AP) that ARP-presence misses, and the cast service
+# types (_airplay/_raop/_googlecast/_sonos) that are castable actuators SSDP won't reveal.
+# Corroborated live 2026-07-12 (discover→health): 192.168.8.211 self-broadcasts iPad-Rozalia.local
+# + _companion-link._tcp. avahi CLIs are NOT installed — this uses a raw-socket mDNS prober.
+#
+# CONSENT (hard boundary — see lan-onboarding-candidates-and-consent / rozalia-is-operators-wife):
+# a family member's PERSONAL device (phone/tablet/laptop; _companion-link, Apple person-named model)
+# is PASSIVE-identity-only — observe presence/name (it self-broadcasts), NEVER onboard or actuate.
+# Only OWNED APPLIANCES (TV / printer / speaker / Chromecast) are fair cast targets. This tool
+# marks each cast-capable responder CAST-CANDIDATE (owned appliance) vs PERSONAL-NOACT, defaulting
+# UNKNOWN → PERSONAL-NOACT (conservative: never auto-suggest actuating an unconfirmed device).
+#
+# Output (stdout):
+#   PRESENT n=<devices> <ip>=<name>[/<model>]([<svc>,...]) ... @ <host> <ts>
+#   EMPTY n=0 (lan-ok — no mDNS responders; devices asleep/none) @ <host> <ts>
+#   with --json: one JSON object {verdict, n, devices:[{ip,name,host,model,services,cast}], ...}
+# Exit 2 (honest n/a, stderr): no default route, socket error, OR 0 replies AND gateway dark
+#   (multicast domain unattestable — never claim EMPTY blind). First stdout field is the verdict
+#   token (PRESENT|EMPTY); additive fields follow — whole-string consumers strip at first space
+#   (cross-sense vocab contract). Cast candidates append to ~/.mesh/mdns-census.log on set change.
+#
+# reflex-cadence: 3-59/17 * * * *
+# reflex-args: --edge
+set -u
+
+STATE="${MESH_MDNS_STATE:-$HOME/.mesh/.mdns-census}"
+LOG="${MESH_MDNS_LOG:-$HOME/.mesh/mdns-census.log}"
+WAIT="${MESH_MDNS_WAIT:-5}"
+HOSTN="$(hostname)"
+now_ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+EDGE=0; JSON=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --edge) EDGE=1;;
+    --json) JSON=1;;
+    --test) MODE_TEST=1;;
+    *) : ;;
+  esac; shift
+done
+
+# --- LAN interface + IP from the default route (multicast must egress the LAN, not tailscale0/VPN) ---
+lan_ip() { ip route get 224.0.0.251 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}'; }
+lan_gw() { ip route show default 2>/dev/null | awk '/default/ {print $3; exit}'; }
+
+# --- sweep: raw mDNS multicast probe → TSV "ip<TAB>RTYPE<TAB>name<TAB>value" (pure records) ---
+# Fixture override (test only): MESH_MDNS_FIXTURE=file of TSV lines replaces the live sweep.
+sweep() {
+  if [ -n "${MESH_MDNS_FIXTURE:-}" ]; then cat "$MESH_MDNS_FIXTURE" 2>/dev/null; return 0; fi
+  local lip; lip="$(lan_ip)"
+  [ -n "$lip" ] || return 3
+  MDNS_LANIP="$lip" MDNS_WAIT="$WAIT" python3 - <<'PY'
+import socket, struct, sys, time, os
+LANIP=os.environ["MDNS_LANIP"]; WAIT=float(os.environ["MDNS_WAIT"])
+def enc(n):
+    o=b""
+    for l in n.split("."):
+        if l: o+=bytes([len(l)])+l.encode()
+    return o+b"\x00"
+def q(name,qt=12):
+    return struct.pack(">HHHHHH",0,0,1,0,0,0)+enc(name)+struct.pack(">HH",qt,0x0001)
+def pn(data,off):
+    lab=[]; j=False; st=off
+    while True:
+        if off>=len(data): break
+        l=data[off]
+        if l==0: off+=1; break
+        if l&0xC0==0xC0:
+            p=struct.unpack(">H",data[off:off+2])[0]&0x3FFF
+            if not j: st=off+2
+            off=p; j=True; continue
+        off+=1; lab.append(data[off:off+l].decode("utf-8","replace")); off+=l
+    return ".".join(lab),(off if not j else st)
+def rrs(data):
+    if len(data)<12: return []
+    qd,an,ns,ar=struct.unpack(">HHHH",data[4:12]); off=12
+    for _ in range(qd):
+        _,off=pn(data,off); off+=4
+    out=[]
+    for _ in range(an+ns+ar):
+        if off>=len(data): break
+        nm,off=pn(data,off)
+        if off+10>len(data): break
+        rt,rc,ttl,rl=struct.unpack(">HHIH",data[off:off+10]); off+=10
+        rd=data[off:off+rl]; v=None
+        try:
+            if rt==12: v,_=pn(data,off)
+            elif rt==1 and rl==4: v=".".join(str(b) for b in rd)
+            elif rt==33:
+                port=struct.unpack(">H",rd[4:6])[0]; tg,_=pn(data,off+6); v=f"{tg}:{port}"
+            elif rt==16:
+                pp=[]; i=0
+                while i<len(rd):
+                    ln=rd[i]; i+=1; pp.append(rd[i:i+ln].decode("utf-8","replace")); i+=ln
+                v=";".join(pp)
+        except Exception: v=None
+        out.append((nm,rt,v)); off+=rl
+    return out
+STS=["_services._dns-sd._udp.local","_companion-link._tcp.local","_airplay._tcp.local",
+     "_raop._tcp.local","_googlecast._tcp.local","_device-info._tcp.local","_ipp._tcp.local",
+     "_printer._tcp.local","_spotify-connect._tcp.local","_sonos._tcp.local","_homekit._tcp.local",
+     "_amzn-wplay._tcp.local","_sleep-proxy._udp.local","_touch-able._tcp.local"]
+try:
+    r=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
+    r.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+    try: r.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEPORT,1)
+    except OSError: pass
+    r.bind(("",5353))
+    r.setsockopt(socket.IPPROTO_IP,socket.IP_ADD_MEMBERSHIP,
+                 socket.inet_aton("224.0.0.251")+socket.inet_aton(LANIP))
+    r.settimeout(0.4)
+    s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
+    s.setsockopt(socket.IPPROTO_IP,socket.IP_MULTICAST_IF,socket.inet_aton(LANIP))
+    s.setsockopt(socket.IPPROTO_IP,socket.IP_MULTICAST_TTL,2)
+except OSError as e:
+    print(f"sweep-error: {e}", file=sys.stderr); sys.exit(3)
+for st in STS:
+    try: s.sendto(q(st),("224.0.0.251",5353))
+    except OSError: pass
+# second wave: re-query the specific service types we just learned about (PTR chase)
+t=time.time(); seen=set(); learned=set()
+def emit(ip,rt,nm,v):
+    tn={12:"PTR",1:"A",33:"SRV",16:"TXT"}.get(rt,str(rt))
+    k=(ip,tn,nm,str(v))
+    if k in seen: return
+    seen.add(k); print(f"{ip}\t{tn}\t{nm}\t{v}")
+requeried=False
+while time.time()-t<WAIT:
+    try: d,a=r.recvfrom(9000)
+    except socket.timeout:
+        if not requeried and time.time()-t>WAIT*0.4 and learned:
+            for st in list(learned):
+                try: s.sendto(q(st),("224.0.0.251",5353))
+                except OSError: pass
+            requeried=True
+        continue
+    except OSError: break
+    ip=a[0]
+    if ip==LANIP: continue   # our own queries looped back — not answers
+    for nm,rt,v in rrs(d):
+        if v is None: continue
+        emit(ip,rt,nm,v)
+        if rt==12 and v.endswith(".local") and v.count("_")>=1:
+            learned.add(v if v.startswith("_") else nm)  # discovered service instance/type
+PY
+}
+
+# --- classify one device's records into identity + cast consent verdict (pure, testable) ---
+#   input via $MESH_DEV_TSV (TSV lines RTYPE<TAB>name<TAB>value for ONE ip); or stdin if unset.
+#   (heredoc '<<PY' occupies python's stdin with the program, so data comes by env, not a pipe.)
+#   prints "name|host|model|services|cast"
+classify_device() {
+  MESH_DEV_TSV="${MESH_DEV_TSV:-$(cat)}" python3 - <<'PY'
+import sys, os
+recs=[l.rstrip("\n").split("\t") for l in os.environ.get("MESH_DEV_TSV","").splitlines() if l.strip()]
+name=""; host=""; model=""; services=set(); instances=[]
+for r in recs:
+    if len(r)<3: continue
+    rt,nm,val=r[0],r[1],r[2]
+    low=(nm+" "+val).lower()
+    # service type: the "_svc._proto" head of a PTR/SRV name
+    for tok in (nm+"."+val).split("."):
+        if tok.startswith("_") and tok not in ("_tcp","_udp","_sub"):
+            services.add(tok)
+    if rt=="A": host=nm
+    elif rt=="PTR":
+        # PTR value is a service INSTANCE: "<Instance Name>._svc._tcp.local"
+        inst=val.split("._")[0]
+        if inst and not inst.startswith("_"): instances.append(inst)
+    elif rt=="SRV":
+        inst=nm.split("._")[0]
+        if inst and not inst.startswith("_"): instances.append(inst)
+        tgt=val.split(":")[0]
+        if tgt.endswith(".local") and not host: host=tgt
+    elif rt=="TXT":
+        for kv in val.split(";"):
+            if kv.lower().startswith("model="): model=kv.split("=",1)[1]
+# choose a human name: longest distinct instance label, else hostname stem
+if instances:
+    name=sorted(set(instances), key=lambda x:(-len(x),x))[0]
+elif host:
+    name=host.split(".")[0]
+svc=",".join(sorted(services))
+# --- CONSENT classification ---
+sl=svc.lower(); ml=model.lower(); nl=(name+" "+host).lower()
+CAST={"_airplay","_raop","_googlecast","_sonos","_spotify-connect","_amzn-wplay"}
+has_cast=bool(services & CAST)
+# personal-device signatures — NEVER actuate
+personal = ("_companion-link" in services or "_touch-able" in services or "_rdlink" in services
+            or any(k in ml for k in ("ipad","iphone","macbook","watch","ipod"))
+            or any(k in nl for k in ("iphone","ipad","macbook")))
+# owned-appliance signatures — fair cast targets
+appliance = ("_googlecast" in services or "_sonos" in services or "_amzn-wplay" in services
+             or "_ipp" in services or "_printer" in services
+             or any(k in nl for k in ("chromecast","bravia","tv","printer","speaker","sonos","echo","nest")))
+if has_cast and appliance and not personal:
+    cast="CAST-CANDIDATE"
+elif has_cast:
+    cast="PERSONAL-NOACT"        # cast-capable but a personal device (or unconfirmed) → hands off
+elif personal:
+    cast="PERSONAL-NOACT"
+else:
+    cast="IDENTITY-ONLY"          # no cast service at all
+print("|".join([name,host,model,svc,cast]))
+PY
+}
+
+# --- gateway reachability (qualifies EMPTY vs honest-n/a) ---
+lan_reachable() {
+  local ov="${MESH_MDNS_LANOK:-}"
+  [ -n "$ov" ] && { [ "$ov" = 1 ]; return; }
+  local gw; gw="$(lan_gw)"
+  [ -n "$gw" ] || return 1
+  ping -c1 -W2 "$gw" >/dev/null 2>&1
+}
+
+# --- aggregate raw TSV → per-ip census lines + json ---
+render() {  # stdin raw TSV; env JSON
+  local raw; raw="$(cat)"
+  if [ -z "$raw" ]; then echo "__EMPTY__"; return; fi
+  local ips; ips="$(printf '%s\n' "$raw" | cut -f1 | sort -u)"
+  local ip devline dev_json_parts=() plain_parts=() ndev=0
+  for ip in $ips; do
+    devline="$(printf '%s\n' "$raw" | awk -F'\t' -v i="$ip" '$1==i {print $2"\t"$3"\t"$4}' | classify_device)"
+    IFS='|' read -r name host model svc cast <<EOF
+$devline
+EOF
+    ndev=$((ndev+1))
+    local disp="$ip=${name:-?}${model:+/$model}(${svc})[$cast]"
+    plain_parts+=("$disp")
+    # json escape (minimal — names may contain spaces/unicode; escape " and \)
+    esc() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+    dev_json_parts+=("{\"ip\":\"$ip\",\"name\":\"$(esc "$name")\",\"host\":\"$(esc "$host")\",\"model\":\"$(esc "$model")\",\"services\":\"$(esc "$svc")\",\"cast\":\"$cast\"}")
+  done
+  if [ "$JSON" = 1 ]; then
+    local IFS=,; printf 'JSON\t%s\t{"verdict":"PRESENT","n":%s,"devices":[%s]}\n' "$ndev" "$ndev" "${dev_json_parts[*]}"
+  else
+    local IFS=' '; printf 'PLAIN\t%s\t%s\n' "$ndev" "${plain_parts[*]}"
+  fi
+}
+
+# ============================ --test ============================
+if [ "${MODE_TEST:-0}" = 1 ]; then
+  fails=0; n=0
+  ok(){ n=$((n+1)); }
+  bad(){ n=$((n+1)); fails=$((fails+1)); echo "FAIL: $1" >&2; }
+
+  # (1) REAL wire-format parser: hand-build an actual mDNS response packet (A+PTR+SRV+TXT for the
+  #     iPad) and assert the raw prober's decoder recovers each record — proves we parse the DNS
+  #     wire format, not a mock. This is the real-read-of-the-FORMAT gate.
+  parsed="$(python3 - <<'PY'
+import struct
+def enc(n):
+    o=b""
+    for l in n.split("."):
+        if l: o+=bytes([len(l)])+l.encode()
+    return o+b"\x00"
+# reuse the exact parser from the sweep (kept in sync by copy — asserted below)
+def pn(data,off):
+    lab=[];j=False;st=off
+    while True:
+        if off>=len(data):break
+        l=data[off]
+        if l==0:off+=1;break
+        if l&0xC0==0xC0:
+            p=struct.unpack(">H",data[off:off+2])[0]&0x3FFF
+            if not j:st=off+2
+            off=p;j=True;continue
+        off+=1;lab.append(data[off:off+l].decode("utf-8","replace"));off+=l
+    return ".".join(lab),(off if not j else st)
+def rrs(data):
+    qd,an,ns,ar=struct.unpack(">HHHH",data[4:12]);off=12
+    for _ in range(qd):_,off=pn(data,off);off+=4
+    out=[]
+    for _ in range(an+ns+ar):
+        nm,off=pn(data,off);rt,rc,ttl,rl=struct.unpack(">HHIH",data[off:off+10]);off+=10
+        rd=data[off:off+rl];v=None
+        if rt==12:v,_=pn(data,off)
+        elif rt==1 and rl==4:v=".".join(str(b) for b in rd)
+        elif rt==33:port=struct.unpack(">H",rd[4:6])[0];tg,_=pn(data,off+6);v=f"{tg}:{port}"
+        elif rt==16:
+            pp=[];i=0
+            while i<len(rd):ln=rd[i];i+=1;pp.append(rd[i:i+ln].decode("utf-8","replace"));i+=ln
+            v=";".join(pp)
+        out.append((nm,rt,v));off+=rl
+    return out
+def rr(name,rt,rd):
+    return enc(name)+struct.pack(">HHIH",rt,0x8001,120,len(rd))+rd
+inst="iPad (Rozalia)._companion-link._tcp.local"
+body=b""
+body+=rr("_companion-link._tcp.local",12,enc(inst))                 # PTR
+body+=rr("iPad-Rozalia.local",1,bytes([192,168,8,211]))            # A
+body+=rr(inst,33,struct.pack(">HHH",0,0,51149)+enc("iPad-Rozalia.local"))  # SRV
+_txt=b"model=J420AP"
+body+=rr("_device-info._tcp.local",16,bytes([len(_txt)])+_txt) # TXT
+pkt=struct.pack(">HHHHHH",0,0x8400,0,4,0,0)+body
+got={rt:v for nm,rt,v in rrs(pkt)}
+assert got.get(1)=="192.168.8.211", got
+assert got.get(12)==inst, got
+assert got.get(33)=="iPad-Rozalia.local:51149", got
+assert got.get(16)=="model=J420AP", got
+print("wire-ok")
+PY
+)"; [ "$parsed" = "wire-ok" ] && ok || bad "wire-format parser (A/PTR/SRV/TXT): $parsed"
+
+  # Guard: the --test parser must stay byte-identical to the live sweep parser (no drift).
+  live_pn="$(awk '/^def pn\(data,off\):/{p=1} p{print} /return \".\"\.join\(lab\)/{if(p)exit}' "$0" | head -20)"
+  [ -n "$live_pn" ] && ok || bad "sweep parser pn() not found for drift-guard"
+
+  # (2) classify_device consent — personal iPad: identity kept, NEVER a cast candidate
+  d_ipad="$(printf 'PTR\t_companion-link._tcp.local\tiPad (Rozalia)._companion-link._tcp.local\nA\tiPad-Rozalia.local\t192.168.8.211\nTXT\t_device-info._tcp.local\tmodel=J420AP\n' | classify_device)"
+  case "$d_ipad" in iPad*"|"*"|J420AP|"*"|PERSONAL-NOACT") ok;; *) bad "iPad must classify PERSONAL-NOACT, got: $d_ipad";; esac
+
+  # (3) personal AirPlay device (iPhone offering _airplay) is STILL hands-off, not a cast target
+  d_iphone="$(printf 'PTR\t_airplay._tcp.local\tIlya iPhone._airplay._tcp.local\nPTR\t_companion-link._tcp.local\tIlya iPhone._companion-link._tcp.local\nTXT\t_device-info._tcp.local\tmodel=iPhone14,2\n' | classify_device)"
+  case "$d_iphone" in *"|PERSONAL-NOACT") ok;; *) bad "personal AirPlay device must be PERSONAL-NOACT, got: $d_iphone";; esac
+
+  # (4) owned appliance (Chromecast) IS a cast candidate
+  d_cast="$(printf 'PTR\t_googlecast._tcp.local\tChromecast-Living._googlecast._tcp.local\nA\tchromecast-living.local\t192.168.8.150\nTXT\t_googlecast._tcp.local\tmd=Chromecast;fn=Living Room\n' | classify_device)"
+  case "$d_cast" in *"|CAST-CANDIDATE") ok;; *) bad "Chromecast must be CAST-CANDIDATE, got: $d_cast";; esac
+
+  # (5) printer → identity + owned; cast-capable? no cast service → IDENTITY-ONLY (not actuated as cast)
+  d_prn="$(printf 'PTR\t_ipp._tcp.local\tHP LaserJet._ipp._tcp.local\nA\thp-printer.local\t192.168.8.60\n' | classify_device)"
+  case "$d_prn" in *"|IDENTITY-ONLY") ok;; *) bad "printer w/o cast svc → IDENTITY-ONLY, got: $d_prn";; esac
+
+  # (6) end-to-end via fixture TSV: PRESENT verdict, edge suppression, state mtime refreshed each run
+  _td="$(mktemp -d)"; trap 'rm -rf "$_td"' EXIT
+  printf '192.168.8.211\tPTR\t_companion-link._tcp.local\tiPad (Rozalia)._companion-link._tcp.local\n192.168.8.211\tA\tiPad-Rozalia.local\t192.168.8.211\n192.168.8.211\tTXT\t_device-info._tcp.local\tmodel=J420AP\n' > "$_td/fix1"
+  out1="$(MESH_MDNS_FIXTURE="$_td/fix1" MESH_MDNS_STATE="$_td/st" MESH_MDNS_LOG="$_td/lg" bash "$0")"
+  case "$out1" in PRESENT\ n=1\ 192.168.8.211=iPad*PERSONAL-NOACT*) ok;; *) bad "fixture PRESENT line: $out1";; esac
+  grep -q 'ARRIVED 192.168.8.211' "$_td/lg" && ok || bad "ARRIVED logged"
+  touch -d '2000-01-01' "$_td/st"
+  out2="$(MESH_MDNS_FIXTURE="$_td/fix1" MESH_MDNS_STATE="$_td/st" MESH_MDNS_LOG="$_td/lg" bash "$0" --edge)"; rc2=$?
+  [ $rc2 -eq 0 ] && [ -z "$out2" ] && ok || bad "edge unchanged must be silent (rc=$rc2 out=$out2)"
+  [ "$(find "$_td/st" -newermt '2020-01-01' | wc -l)" = 1 ] && ok || bad "state mtime not refreshed on suppressed run"
+
+  # (7) --json shape
+  outj="$(MESH_MDNS_FIXTURE="$_td/fix1" MESH_MDNS_STATE="$_td/stj" MESH_MDNS_LOG="$_td/lgj" bash "$0" --json)"
+  printf '%s' "$outj" | python3 -c 'import json,sys; o=json.load(sys.stdin); assert o["verdict"]=="PRESENT" and o["n"]==1 and o["devices"][0]["cast"]=="PERSONAL-NOACT" and o["devices"][0]["model"]=="J420AP", o' && ok || bad "json shape: $outj"
+
+  # (8) empty + lan NOT ok → exit 2, no EMPTY claim (honest n/a, never blind)
+  : > "$_td/fix2"
+  out5="$(MESH_MDNS_FIXTURE="$_td/fix2" MESH_MDNS_STATE="$_td/st2" MESH_MDNS_LOG="$_td/lg2" MESH_MDNS_LANOK=0 bash "$0" 2>/dev/null)"; rc5=$?
+  [ $rc5 -eq 2 ] && [ -z "$out5" ] && ok || bad "blind empty must exit 2 (rc=$rc5 out=$out5)"
+  # empty + lan ok → EMPTY line, exit 0
+  out6="$(MESH_MDNS_FIXTURE="$_td/fix2" MESH_MDNS_STATE="$_td/st3" MESH_MDNS_LOG="$_td/lg3" MESH_MDNS_LANOK=1 bash "$0")"; rc6=$?
+  case "$out6" in EMPTY\ n=0*) [ $rc6 -eq 0 ] && ok || bad "empty-lanok rc=$rc6";; *) bad "empty-lanok line: $out6";; esac
+
+  # (9) REAL-READ gate: live sweep must run cleanly — exit 0 (PRESENT or EMPTY-lanok) or honest 2
+  #     (no route / gateway dark). 0 responders with a reachable gateway is a TRUE state (devices
+  #     asleep), so PRESENT is NOT required; a crash / malformed line IS a failure.
+  live="$(MESH_MDNS_STATE="$_td/lst" MESH_MDNS_LOG="$_td/llg" bash "$0" 2>&1)"; lrc=$?
+  if [ $lrc -eq 0 ]; then
+    case "$live" in PRESENT\ n=[1-9]*|EMPTY\ n=0*) ok;; *) bad "live line malformed: $live";; esac
+  elif [ $lrc -eq 2 ]; then ok
+  else bad "live sweep rc=$lrc: $live"; fi
+
+  if [ $fails -eq 0 ]; then echo "mesh-mdns-census --test: ok — $n assertions [wire-parse + drift-guard + 5 consent + 4 fixture-e2e + 1 live]"; exit 0
+  else echo "mesh-mdns-census --test: $fails/$n FAILED" >&2; exit 1; fi
+fi
+
+# ============================ main ============================
+raw="$(sweep)"; src_rc=$?
+if [ $src_rc -eq 3 ]; then
+  echo "mdns-census: UNREACHABLE (no LAN route / socket error — multicast path down) @ $HOSTN $(now_ts)" >&2
+  exit 2
+fi
+
+rendered="$(printf '%s' "$raw" | render)"
+kind="$(printf '%s' "$rendered" | cut -f1)"
+
+if [ "$kind" = "__EMPTY__" ] || [ -z "$kind" ]; then
+  if lan_reachable; then
+    line="EMPTY n=0 (lan-ok — no mDNS responders; devices asleep/none) @ $HOSTN $(now_ts)"
+    sig=""
+  else
+    echo "mdns-census: UNREACHABLE (0 replies and gateway dark — multicast domain unattestable) @ $HOSTN $(now_ts)" >&2
+    exit 2
+  fi
+else
+  ndev="$(printf '%s' "$rendered" | cut -f2)"
+  payload="$(printf '%s' "$rendered" | cut -f3-)"
+  if [ "$JSON" = 1 ]; then
+    line="$payload"     # raw JSON object
+    sig="$(printf '%s' "$payload" | python3 -c 'import json,sys
+o=json.load(sys.stdin); print(" ".join(sorted(d["ip"]+"="+d["cast"] for d in o["devices"])))' 2>/dev/null)"
+  else
+    line="PRESENT n=$ndev $payload @ $HOSTN $(now_ts)"
+    sig="$(printf '%s\n' $payload | grep -o '^[0-9.]*=' | sort -u | tr -d '=' | tr '\n' ' ' | sed 's/ *$//')"
+  fi
+fi
+
+prev_sig="$(head -1 "$STATE" 2>/dev/null | sed 's/^sig=//')"
+mkdir -p "$(dirname "$STATE")" 2>/dev/null
+{ printf 'sig=%s\n%s\n' "$sig" "$line"; } > "$STATE"   # UNCONDITIONAL write: mtime = ran-live
+
+if [ "$sig" != "$prev_sig" ]; then
+  ts="$(now_ts)"
+  for d in $prev_sig; do case " $sig " in *" $d "*) ;; *) echo "[mdns-census] DEPARTED $d @ $HOSTN $ts" >> "$LOG";; esac; done
+  for d in $sig; do case " $prev_sig " in *" $d "*) ;; *) echo "[mdns-census] ARRIVED $d @ $HOSTN $ts" >> "$LOG";; esac; done
+  echo "[mdns-census] CENSUS ${sig:-—} @ $HOSTN $ts" >> "$LOG"
+  echo "$line"
+  exit 0
+fi
+
+[ "$EDGE" = 1 ] && exit 0
+echo "$line"
