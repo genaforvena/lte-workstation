@@ -1,0 +1,252 @@
+#!/usr/bin/env bash
+# mesh-bt-census — classic BR/EDR Bluetooth INQUIRY census: nearby device TYPE (Class-of-Device),
+# name, and clock-offset fingerprint — WITHOUT pairing. The third RF proximity/identity plane.
+#
+# The signal no other sense gives: a classic inquiry (hcitool inq) finds *discoverable* BR/EDR
+# devices and returns per device a Class-of-Device (CoD) that decodes to a coarse device TYPE
+# (headset / set-top box / phone / computer / wearable / car-audio…) plus a friendly name and a
+# clock-offset that persists across sightings (a per-device fingerprint). This is DISJOINT from:
+#   - mesh-bt-link      — reads only OUR *connected* peripherals, never an inquiry of neighbours.
+#   - mesh-ble-proximity — scans BLE LE advertisements only; BR/EDR inquiry is a different radio.
+#     Classic-only devices (many headsets, set-top boxes, car head-units, older phones) never
+#     appear on the LE plane.
+# No mesh tool decoded CoD major/minor → device TYPE until now. Corroborated live 2026-07-12
+# (discover→health, reproduced 3× deterministic): E7:4D:F9:65:B0:65 0x240404=A/V Headset,
+# EC:C1:AB:D1:A7:EF 0x380424=A/V Set-top box.
+#
+# PASSIVE + OBSERVATION-ONLY: an inquiry never pairs, connects, or probes content — it reads what
+# a device *broadcasts* while discoverable. These are RF neighbours (may be non-owned) → TYPE +
+# name identity only, NEVER connect/onboard/actuate (inquiry can't, by construction).
+#
+# hci0 contention (health note): a classic INQUIRY needs NO elevated caps on hci0, but BLE lescan
+# on the same radio is mutually exclusive with inquiry. Today mesh-ble-proximity runs OFF-node
+# (router), so no local collision — but we flock hci0 (non-blocking) as future-insurance so a
+# local inquiry and any future local lescan serialize instead of corrupting each other's HCI state.
+#
+# Output (stdout):
+#   PRESENT n=<devices> <mac>=<name>/<TYPE>(0x<cod>) ... @ <host> <ts>
+#   EMPTY n=0 (hci-ok — no discoverable BR/EDR devices in range) @ <host> <ts>
+#   with --json: {"verdict","n","devices":[{mac,name,cod,major,minor,type,services,clkoffset}]}
+# Exit 2 (honest n/a, stderr): no hci adapter / adapter DOWN / inquiry error — never claim EMPTY
+#   with a dark radio (can't distinguish "no devices" from "radio off"). First stdout field is the
+#   verdict token (PRESENT|EMPTY); additive fields follow — whole-string consumers strip at first
+#   space (cross-sense vocab contract). Set changes append ARRIVED/DEPARTED to ~/.mesh/bt-census.log.
+#
+# reflex-cadence: 11-59/19 * * * *
+# reflex-args: --edge
+set -u
+
+STATE="${MESH_BT_STATE:-$HOME/.mesh/.bt-census}"
+LOG="${MESH_BT_LOG:-$HOME/.mesh/bt-census.log}"
+LOCK="${MESH_BT_LOCK:-$HOME/.mesh/.hci0.lock}"
+DEV="${MESH_BT_DEV:-hci0}"
+LEN="${MESH_BT_INQLEN:-8}"          # inquiry length in 1.28s units (8 ≈ 10s)
+HOSTN="$(hostname)"
+now_ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+EDGE=0; JSON=0; MODE_TEST=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --edge) EDGE=1;;
+    --json) JSON=1;;
+    --inquiry) : ;;                 # accepted (the only mode today); explicit for the caller's intent
+    --test) MODE_TEST=1;;
+    *) : ;;
+  esac; shift
+done
+
+# --- CoD decoder: 24-bit Class-of-Device → "major|minor_type|services" (pure, testable) ---
+#   input via $MESH_COD (hex like 0x240404 or 240404); prints "MajorName|MinorType|Svc,Svc"
+decode_cod() {
+  MESH_COD="${1:-${MESH_COD:-}}" python3 - <<'PY'
+import os
+raw=os.environ.get("MESH_COD","").strip().lower().replace("0x","")
+try: cod=int(raw,16)
+except ValueError: print("Unknown|unknown|"); raise SystemExit
+major=(cod>>8)&0x1F
+minor=(cod>>2)&0x3F
+svc_bits={16:"Positioning",17:"Networking",18:"Rendering",19:"Capturing",
+          20:"ObjectTransfer",21:"Audio",22:"Telephony",23:"Information"}
+MAJ={0x00:"Misc",0x01:"Computer",0x02:"Phone",0x03:"Network-AP",0x04:"Audio-Video",
+     0x05:"Peripheral",0x06:"Imaging",0x07:"Wearable",0x08:"Toy",0x09:"Health",0x1F:"Uncategorized"}
+MINOR={
+ 0x01:{1:"Desktop",2:"Server",3:"Laptop",4:"Handheld-PDA",5:"Palm-PDA",6:"Wearable-Computer",7:"Tablet"},
+ 0x02:{1:"Cellular",2:"Cordless",3:"Smartphone",4:"Wired-Modem",5:"ISDN"},
+ 0x04:{1:"Headset",2:"Hands-free",4:"Microphone",5:"Loudspeaker",6:"Headphones",7:"Portable-Audio",
+       8:"Car-Audio",9:"Set-top-box",0x0a:"HiFi-Audio",0x0b:"VCR",0x0c:"Video-Camera",0x0d:"Camcorder",
+       0x0e:"Video-Monitor",0x0f:"Video-Display+Speaker",0x10:"Video-Conferencing",0x12:"Gaming-Toy"},
+ 0x05:{},  # peripheral minor is a bitfield (kbd/mouse) — coarse only
+ 0x06:{},
+ 0x07:{1:"Wristwatch",2:"Pager",3:"Jacket",4:"Helmet",5:"Glasses"},
+ 0x09:{1:"BP-Monitor",2:"Thermometer",3:"Scale",4:"Glucose",5:"Pulse-Oximeter",6:"HR-Monitor",7:"Health-Display"},
+}
+maj=MAJ.get(major,"Major0x%02x"%major)
+if major==0x05:  # peripheral: top 2 minor bits are the pointing/keyboard field
+    kb=(minor>>5)&1; pt=(minor>>4)&1
+    mtype="Keyboard" if kb and not pt else ("Pointing" if pt and not kb else ("Keyboard+Pointing" if kb and pt else "Peripheral"))
+else:
+    mtype=MINOR.get(major,{}).get(minor,"minor0x%02x"%minor)
+svcs=[n for b,n in sorted(svc_bits.items()) if cod&(1<<b)]
+print("%s|%s|%s"%(maj,mtype,",".join(svcs)))
+PY
+}
+
+# --- adapter liveness (qualifies EMPTY vs honest-n/a) ---
+hci_up() {
+  local ov="${MESH_BT_HCIOK:-}"
+  [ -n "$ov" ] && { [ "$ov" = 1 ]; return; }
+  hciconfig "$DEV" 2>/dev/null | grep -q 'UP RUNNING'
+}
+
+# --- sweep: hcitool inq → TSV "MAC<TAB>CLKOFFSET<TAB>COD" (fixture override MESH_BT_FIXTURE) ---
+sweep() {
+  if [ -n "${MESH_BT_FIXTURE:-}" ]; then cat "$MESH_BT_FIXTURE" 2>/dev/null; return 0; fi
+  hci_up || return 3
+  # flock hci0 (non-blocking, 12s) so a future local lescan can't race the inquiry; if held, honest n/a
+  ( flock -w 12 9 || exit 3
+    timeout $(( LEN * 2 + 6 )) hcitool -i "$DEV" inq --length="$LEN" 2>/dev/null \
+      | awk 'NR>1 && /:/ {mac=$1; clk=""; cod=""; for(i=1;i<=NF;i++){if($i=="offset:")clk=$(i+1); if($i=="class:")cod=$(i+1)} if(mac!="") print mac"\t"clk"\t"cod}'
+  ) 9>"$LOCK"
+}
+
+# --- best-effort friendly-name resolution (bounded; skipped under fixture / --nonames) ---
+resolve_name() {  # $1=mac
+  [ -n "${MESH_BT_FIXTURE:-}" ] && { printf '%s' "${MESH_BT_NAME_FIX:-}"; return; }
+  [ "${MESH_BT_NONAMES:-0}" = 1 ] && return
+  timeout 3 hcitool -i "$DEV" name "$1" 2>/dev/null | head -1 | tr -d '\r'
+}
+
+# --- render raw TSV → per-device lines + json ---
+render() {
+  local raw; raw="$(cat)"
+  [ -z "$raw" ] && { echo "__EMPTY__"; return; }
+  local plain_parts=() json_parts=() ndev=0
+  esc() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+  local mac clk cod
+  while IFS=$'\t' read -r mac clk cod; do
+    [ -n "$mac" ] || continue
+    local dec; dec="$(MESH_COD="$cod" decode_cod)"
+    local maj minor svc; IFS='|' read -r maj minor svc <<EOF
+$dec
+EOF
+    local name; name="$(resolve_name "$mac")"
+    ndev=$((ndev+1))
+    local codn="${cod#0x}"
+    plain_parts+=("$mac=${name:-?}/$maj:$minor(0x$codn)")
+    json_parts+=("{\"mac\":\"$mac\",\"name\":\"$(esc "$name")\",\"cod\":\"0x$codn\",\"major\":\"$maj\",\"minor\":\"$minor\",\"type\":\"$maj/$minor\",\"services\":\"$svc\",\"clkoffset\":\"$clk\"}")
+  done <<EOF
+$raw
+EOF
+  if [ "$JSON" = 1 ]; then
+    local IFS=,; printf 'JSON\t%s\t{"verdict":"PRESENT","n":%s,"devices":[%s]}\n' "$ndev" "$ndev" "${json_parts[*]}"
+  else
+    local IFS=' '; printf 'PLAIN\t%s\t%s\n' "$ndev" "${plain_parts[*]}"
+  fi
+}
+
+# ============================ --test ============================
+if [ "$MODE_TEST" = 1 ]; then
+  fails=0; n=0
+  ok(){ n=$((n+1)); }
+  bad(){ n=$((n+1)); fails=$((fails+1)); echo "FAIL: $1" >&2; }
+
+  # (1) REAL CoD decode against the two live-observed classes (independent bit-decode, matches health)
+  [ "$(MESH_COD=0x240404 decode_cod)" = "Audio-Video|Headset|Rendering,Audio" ] && ok || bad "0x240404 decode: $(MESH_COD=0x240404 decode_cod)"
+  [ "$(MESH_COD=0x380424 decode_cod)" = "Audio-Video|Set-top-box|Capturing,ObjectTransfer,Audio" ] && ok || bad "0x380424 decode: $(MESH_COD=0x380424 decode_cod)"
+  # (2) other majors/minors
+  [ "$(MESH_COD=0x5a020c decode_cod)" = "Phone|Smartphone|Networking,Capturing,ObjectTransfer,Telephony" ] && ok || bad "smartphone decode: $(MESH_COD=0x5a020c decode_cod)"
+  [ "$(MESH_COD=0x10010c decode_cod)" = "Computer|Laptop|ObjectTransfer" ] && ok || bad "laptop decode: $(MESH_COD=0x10010c decode_cod)"
+  [ "$(MESH_COD=0x000580 decode_cod)" = "Peripheral|Keyboard|" ] && ok || bad "keyboard decode: $(MESH_COD=0x000580 decode_cod)"
+  [ "$(MESH_COD=0x000540 decode_cod)" = "Peripheral|Pointing|" ] && ok || bad "pointing decode: $(MESH_COD=0x000540 decode_cod)"
+  # (3) unparseable → honest Unknown, never crash
+  [ "$(MESH_COD=zzz decode_cod)" = "Unknown|unknown|" ] && ok || bad "bad cod → Unknown: $(MESH_COD=zzz decode_cod)"
+
+  # (4) end-to-end via fixture: PRESENT line + edge suppression + mtime refreshed each run
+  _td="$(mktemp -d)"; trap 'rm -rf "$_td"' EXIT
+  printf 'E7:4D:F9:65:B0:65\t0x558e\t0x240404\nEC:C1:AB:D1:A7:EF\t0x2b38\t0x380424\n' > "$_td/fix1"
+  out1="$(MESH_BT_FIXTURE="$_td/fix1" MESH_BT_STATE="$_td/st" MESH_BT_LOG="$_td/lg" bash "$0")"
+  case "$out1" in PRESENT\ n=2\ *E7:4D:F9:65:B0:65=*/Audio-Video:Headset\(0x240404\)*EC:C1:AB:D1:A7:EF=*/Audio-Video:Set-top-box\(0x380424\)*) ok;; *) bad "fixture PRESENT line: $out1";; esac
+  grep -q 'ARRIVED E7:4D:F9:65:B0:65' "$_td/lg" && ok || bad "ARRIVED logged"
+  touch -d '2000-01-01' "$_td/st"
+  out2="$(MESH_BT_FIXTURE="$_td/fix1" MESH_BT_STATE="$_td/st" MESH_BT_LOG="$_td/lg" bash "$0" --edge)"; rc2=$?
+  [ $rc2 -eq 0 ] && [ -z "$out2" ] && ok || bad "edge unchanged must be silent (rc=$rc2 out=$out2)"
+  [ "$(find "$_td/st" -newermt '2020-01-01' | wc -l)" = 1 ] && ok || bad "state mtime not refreshed on suppressed run"
+  # departure fires on --edge
+  : > "$_td/fix2"
+  out3="$(MESH_BT_FIXTURE="$_td/fix2" MESH_BT_STATE="$_td/st" MESH_BT_LOG="$_td/lg" MESH_BT_HCIOK=1 bash "$0" --edge)"; rc3=$?
+  case "$out3" in EMPTY\ n=0*) ok;; *) bad "edge fire on departure: $out3";; esac
+  grep -q 'DEPARTED E7:4D:F9:65:B0:65' "$_td/lg" && ok || bad "DEPARTED logged"
+
+  # (5) --json shape
+  outj="$(MESH_BT_FIXTURE="$_td/fix1" MESH_BT_STATE="$_td/stj" MESH_BT_LOG="$_td/lgj" bash "$0" --json)"
+  printf '%s' "$outj" | python3 -c 'import json,sys
+o=json.load(sys.stdin); d=o["devices"]
+assert o["verdict"]=="PRESENT" and o["n"]==2, o
+assert d[0]["type"]=="Audio-Video/Headset" and d[0]["cod"]=="0x240404" and d[0]["clkoffset"]=="0x558e", d[0]
+assert d[1]["type"]=="Audio-Video/Set-top-box" and "Audio" in d[1]["services"], d[1]' && ok || bad "json shape: $outj"
+
+  # (6) honest n/a: empty + adapter DOWN → exit 2, no EMPTY claim
+  out4="$(MESH_BT_FIXTURE="$_td/fix2" MESH_BT_STATE="$_td/st2" MESH_BT_LOG="$_td/lg2" MESH_BT_HCIOK=0 bash "$0" 2>/dev/null)"; rc4=$?
+  [ $rc4 -eq 2 ] && [ -z "$out4" ] && ok || bad "empty + adapter down must exit 2 (rc=$rc4 out=$out4)"
+  # empty + adapter up → EMPTY line exit 0
+  out5="$(MESH_BT_FIXTURE="$_td/fix2" MESH_BT_STATE="$_td/st3" MESH_BT_LOG="$_td/lg3" MESH_BT_HCIOK=1 bash "$0")"; rc5=$?
+  case "$out5" in EMPTY\ n=0*) [ $rc5 -eq 0 ] && ok || bad "empty-hciok rc=$rc5";; *) bad "empty-hciok line: $out5";; esac
+
+  # (7) REAL-READ gate: live inquiry must run clean — exit 0 (PRESENT / EMPTY-hciok) or honest 2
+  #     (no adapter / down / lock held). A crash or malformed line IS a failure.
+  live="$(MESH_BT_NONAMES=1 MESH_BT_STATE="$_td/lst" MESH_BT_LOG="$_td/llg" bash "$0" 2>&1)"; lrc=$?
+  if [ $lrc -eq 0 ]; then
+    case "$live" in PRESENT\ n=[1-9]*|EMPTY\ n=0*) ok;; *) bad "live line malformed: $live";; esac
+  elif [ $lrc -eq 2 ]; then ok
+  else bad "live inquiry rc=$lrc: $live"; fi
+
+  if [ $fails -eq 0 ]; then echo "mesh-bt-census --test: ok — $n assertions [6 CoD-decode + 5 fixture-e2e + json + 2 honest-n/a + 1 live]"; exit 0
+  else echo "mesh-bt-census --test: $fails/$n FAILED" >&2; exit 1; fi
+fi
+
+# ============================ main ============================
+raw="$(sweep)"; src_rc=$?
+if [ $src_rc -eq 3 ]; then
+  echo "bt-census: UNREACHABLE ($DEV down / no adapter / hci0 lock held — radio unattestable) @ $HOSTN $(now_ts)" >&2
+  exit 2
+fi
+
+rendered="$(printf '%s' "$raw" | render)"
+kind="$(printf '%s' "$rendered" | cut -f1)"
+
+if [ "$kind" = "__EMPTY__" ] || [ -z "$kind" ]; then
+  if hci_up; then
+    line="EMPTY n=0 (hci-ok — no discoverable BR/EDR devices in range) @ $HOSTN $(now_ts)"
+    sig=""
+  else
+    echo "bt-census: UNREACHABLE ($DEV dark — cannot distinguish no-devices from radio-off) @ $HOSTN $(now_ts)" >&2
+    exit 2
+  fi
+else
+  ndev="$(printf '%s' "$rendered" | cut -f2)"
+  payload="$(printf '%s' "$rendered" | cut -f3-)"
+  if [ "$JSON" = 1 ]; then
+    line="$payload"
+    sig="$(printf '%s' "$payload" | python3 -c 'import json,sys
+o=json.load(sys.stdin); print(" ".join(sorted(d["mac"] for d in o["devices"])))' 2>/dev/null)"
+  else
+    line="PRESENT n=$ndev $payload @ $HOSTN $(now_ts)"
+    sig="$(printf '%s\n' $payload | grep -oE '^[0-9A-Fa-f:]{17}' | sort -u | tr '\n' ' ' | sed 's/ *$//')"
+  fi
+fi
+
+prev_sig="$(head -1 "$STATE" 2>/dev/null | sed 's/^sig=//')"
+mkdir -p "$(dirname "$STATE")" 2>/dev/null
+{ printf 'sig=%s\n%s\n' "$sig" "$line"; } > "$STATE"   # UNCONDITIONAL: mtime = ran-live
+
+if [ "$sig" != "$prev_sig" ]; then
+  ts="$(now_ts)"
+  for d in $prev_sig; do case " $sig " in *" $d "*) ;; *) echo "[bt-census] DEPARTED $d @ $HOSTN $ts" >> "$LOG";; esac; done
+  for d in $sig; do case " $prev_sig " in *" $d "*) ;; *) echo "[bt-census] ARRIVED $d @ $HOSTN $ts" >> "$LOG";; esac; done
+  echo "[bt-census] CENSUS n=${ndev:-0} ${sig:-—} @ $HOSTN $ts" >> "$LOG"
+  echo "$line"
+  exit 0
+fi
+
+[ "$EDGE" = 1 ] && exit 0
+echo "$line"
