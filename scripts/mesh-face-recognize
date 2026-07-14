@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""mesh-face-recognize — zero-shot person classification on camera frames using Groq Llama 3.2 Vision.
+"""mesh-face-recognize — zero-shot person classification on camera frames.
 
 Identify who is in the photo:
   - Ilya (male operator, sitting at the desk / computer)
@@ -7,9 +7,15 @@ Identify who is in the photo:
   - Nobody (empty room/desk)
   - Stranger (any other person)
 
+Two backends (MESH_FACE_BACKEND=auto|local|groq, default auto):
+  - LOCAL  — ollama moondream on this node's GPU. Home frames NEVER leave the house,
+             no cloud cost, no shared-TPD-quota drain. Preferred on mesh-home (RTX 3060).
+  - GROQ   — Llama/qwen Vision in the cloud (fallback when ollama/model unreachable).
+  auto: use local if ollama is up AND the model is pulled, else fall back to groq.
+
 Usage:
   mesh-face-recognize [image.jpg]    classify the image, output one label
-  mesh-face-recognize --test         smoke test (logic + mock API run)
+  mesh-face-recognize --test         smoke test (logic + a REAL live read on the active backend)
 """
 import os
 import sys
@@ -19,11 +25,160 @@ import subprocess
 import tempfile
 
 GROQ_ENV = os.path.expanduser("~/.mesh/groq.env")
-DEFAULT_IMG = os.path.expanduser("~/.mesh/cam-prev.jpg")
+
+
+def _default_img():
+    """The frame used when none is passed (and by --test's real-read gate). Honors
+    MESH_FACE_DEFAULT_IMG, else the first camera frame that actually exists on this node —
+    cam-prev.jpg is the fleet convention; note3-cam-last.jpg is mesh-home's live eye."""
+    env = os.environ.get("MESH_FACE_DEFAULT_IMG")
+    if env:
+        return os.path.expanduser(env)
+    for cand in ("~/.mesh/cam-prev.jpg", "~/.mesh/note3-cam-last.jpg"):
+        p = os.path.expanduser(cand)
+        if os.path.exists(p):
+            return p
+    return os.path.expanduser("~/.mesh/cam-prev.jpg")
+
+
+DEFAULT_IMG = _default_img()
 # MESH_FACE_MODEL: per-caller override. Default qwen (reasoning, best accuracy) suits one-shot
 # reads; a POLLING caller (mesh-stranger-watch every cycle) must use a non-reasoning model on its
 # OWN per-model TPD bucket (llama-4-scout) or it exhausts the shared qwen daily quota alone.
 MODEL = os.environ.get("MESH_FACE_MODEL", "qwen/qwen3.6-27b")
+
+import re
+
+# Local backend (ollama on this node's GPU). auto → prefer local, fall back to groq.
+BACKEND = os.environ.get("MESH_FACE_BACKEND", "auto").lower()  # auto | local | groq
+OLLAMA_URL = os.environ.get("MESH_OLLAMA_URL", "http://localhost:11434").rstrip("/")
+LOCAL_MODEL = os.environ.get("MESH_FACE_LOCAL_MODEL", "moondream")
+
+# moondream (1.6B) can't follow the strict 4-way named-identity prompt — it just emits "ilya"
+# regardless — but it DESCRIBES a scene accurately (gender + presence). So the local backend asks a
+# natural free-text question and keyword-maps the reply. This means the LOCAL backend is a
+# GENDER+PRESENCE sense (man→Ilya, woman→Rozalia, empty→Nobody), NOT face identity: it cannot tell
+# the household woman from a stranger woman. True "Stranger" identity stays a cloud-model capability
+# (set MESH_FACE_BACKEND=groq, or use a stronger local model via MESH_FACE_LOCAL_MODEL).
+# NB: the literal word "nobody" (and quoted tokens) make moondream return an EMPTY string every
+# time — so the empty case is phrased "or is the room empty?" and local_map catches "empty"/"no one".
+LOCAL_PROMPT = os.environ.get(
+    "MESH_FACE_LOCAL_PROMPT",
+    "Describe the person in this photo. Is it a man or a woman, or is the room empty?")
+
+# Word-boundary matched so "man" never fires inside "woman". Female checked first: moondream
+# sometimes hedges "there is no one... the girl lying on the bed" — a named gender beats the hedge.
+_FEMALE_RE = re.compile(r"\b(woman|women|girl|girls|female|lady|she|her|hers)\b", re.I)
+_MALE_RE = re.compile(r"\b(man|men|boy|boys|male|gentleman|guy|he|him|his)\b", re.I)
+_EMPTY_RE = re.compile(r"\b(nobody|no ?one|no person|no people|empty|unoccupied|not any (?:person|people))\b", re.I)
+
+
+def local_map(text):
+    """Map moondream's free-text scene answer onto our label set. Gender-word > empty-hedge."""
+    if _FEMALE_RE.search(text):
+        return "Rozalia"
+    if _MALE_RE.search(text):
+        return "Ilya"
+    if _EMPTY_RE.search(text):
+        return "Nobody"
+    return "Stranger"
+
+# The classification prompt is shared by both backends so a local/cloud swap can't drift the labels.
+CLASSIFY_PROMPT = (
+    "This is a photo captured by a home security/monitoring webcam.\n"
+    "Identify who is in this image. Use these instructions:\n"
+    "- If there is a man in the photo (typically sitting at the computer desk / laptop), classify as 'Ilya'.\n"
+    "- If there is a woman in the photo, classify as 'Rozalia'.\n"
+    "- If there is nobody in the photo (empty desk/room/chair), classify as 'Nobody'.\n"
+    "- If there is any other person, classify as 'Stranger'.\n\n"
+    "Output EXACTLY one word from this list: Ilya, Rozalia, Nobody, Stranger. Do not write any other text, explanation, or punctuation."
+)
+LABELS = ["Ilya", "Rozalia", "Nobody", "Stranger"]
+
+
+def canonical_label(text):
+    """Map a free-text model reply onto our exact label set (substring match), else return as-is."""
+    if "</think>" in text:
+        text = text.split("</think>", 1)[1]
+    text = text.strip().strip('"').strip("'").strip(".")
+    for label in LABELS:
+        if label.lower() in text.lower():
+            return label
+    return text
+
+
+def ollama_ready():
+    """True iff the local ollama server answers AND the vision model is pulled — the gate that
+    lets `auto` fall through to groq instead of hard-failing on a node with no GPU/model."""
+    try:
+        proc = subprocess.run(
+            ["curl", "-s", "-m", "3", f"{OLLAMA_URL}/api/tags"],
+            capture_output=True, text=True, timeout=5)
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    if proc.returncode != 0:
+        return False
+    try:
+        tags = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return False
+    names = [m.get("name", "") for m in tags.get("models", [])]
+    # moondream may be tagged "moondream:latest" — match on the family prefix.
+    base = LOCAL_MODEL.split(":", 1)[0]
+    return any(n == LOCAL_MODEL or n.split(":", 1)[0] == base for n in names)
+
+
+def classify_image_local_safe(img_path):
+    """Local ollama classification with the SAME (status, value) contract as the groq path:
+      ('ok', label)   the model returned a usable reply
+      ('na', reason)  ollama unreachable/timeout (transient — treat like a rate-limit, not a break)
+      ('fail', reason) something actually broken (unreadable image, malformed response)"""
+    try:
+        base64_image = encode_image(img_path)
+    except OSError as e:
+        return ("fail", f"cannot read image: {e}")
+
+    payload = {
+        "model": LOCAL_MODEL,
+        "prompt": LOCAL_PROMPT,
+        "images": [base64_image],
+        "stream": False,
+        "options": {"temperature": 0.0},
+    }
+    # Same temp-file + `-d @file` trick as the groq path: a camera-resolution base64 image blows
+    # past Linux's per-argv limit if passed inline.
+    req_fd, req_path = tempfile.mkstemp(prefix="face-rec-local-", suffix=".json")
+    try:
+        with os.fdopen(req_fd, "w") as f:
+            json.dump(payload, f)
+        cmd = ["curl", "-s", "-m", "60", f"{OLLAMA_URL}/api/generate",
+               "-H", "Content-Type: application/json", "-d", f"@{req_path}"]
+        # moondream occasionally returns an empty string on an image it can otherwise describe —
+        # retry a couple of times before conceding 'na', so a transient blank isn't a lost read.
+        last = None
+        for _ in range(3):
+            try:
+                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=65)
+            except subprocess.TimeoutExpired:
+                return ("na", "ollama generate timed out")
+            if proc.returncode != 0:
+                return ("na", f"curl exit {proc.returncode} (ollama unreachable): {proc.stderr.strip()[:200]}")
+            try:
+                data = json.loads(proc.stdout)
+            except json.JSONDecodeError:
+                return ("fail", f"non-JSON response: {proc.stdout[:200]}")
+            if "response" not in data:
+                if "error" in data:
+                    return ("na", f"ollama error: {str(data['error'])[:200]}")
+                return ("fail", f"no 'response' field: {proc.stdout[:200]}")
+            reply = data["response"].strip()
+            if reply:
+                return ("ok", local_map(reply))
+            last = "empty reply from moondream (3 attempts)"
+        return ("na", last)
+    finally:
+        try: os.remove(req_path)
+        except OSError: pass
 
 def load_groq_key():
     if not os.path.exists(GROQ_ENV):
@@ -51,23 +206,13 @@ def classify_image_safe(img_path, api_key):
     except OSError as e:
         return ("fail", f"cannot read image: {e}")
 
-    prompt = (
-        "This is a photo captured by a home security/monitoring webcam.\n"
-        "Identify who is in this image. Use these instructions:\n"
-        "- If there is a man in the photo (typically sitting at the computer desk / laptop), classify as 'Ilya'.\n"
-        "- If there is a woman in the photo, classify as 'Rozalia'.\n"
-        "- If there is nobody in the photo (empty desk/room/chair), classify as 'Nobody'.\n"
-        "- If there is any other person, classify as 'Stranger'.\n\n"
-        "Output EXACTLY one word from this list: Ilya, Rozalia, Nobody, Stranger. Do not write any other text, explanation, or punctuation."
-    )
-
     payload = {
         "model": MODEL,
         "messages": [
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": prompt},
+                    {"type": "text", "text": CLASSIFY_PROMPT},
                     {
                         "type": "image_url",
                         "image_url": {
@@ -114,37 +259,59 @@ def classify_image_safe(img_path, api_key):
                 return ("na", f"rate-limited: {msg[:200]}")
             return ("fail", f"no choices in response: {proc.stdout[:200]}")
         result = data["choices"][0]["message"]["content"]
-        # Skip <think>...</think> block if present
-        if "</think>" in result:
-            result = result.split("</think>", 1)[1]
-        result = result.strip().strip('"').strip("'").strip(".")
-        # Canonicalize the output to match our exact set
-        for label in ["Ilya", "Rozalia", "Nobody", "Stranger"]:
-            if label.lower() in result.lower():
-                return ("ok", label)
-        return ("ok", result)
+        return ("ok", canonical_label(result))
     finally:
         try: os.remove(req_path)
         except OSError: pass
 
-def classify_image(img_path, api_key):
-    status, value = classify_image_safe(img_path, api_key)
+def resolve_backend():
+    """Which backend a call will actually use, honoring MESH_FACE_BACKEND + live availability.
+    Returns 'local' or 'groq' (or 'none' when neither is usable)."""
+    if BACKEND == "local":
+        return "local"
+    if BACKEND == "groq":
+        return "groq" if load_groq_key() else "none"
+    # auto: privacy-first — local if the GPU model is really up, else cloud fallback.
+    if ollama_ready():
+        return "local"
+    return "groq" if load_groq_key() else "none"
+
+
+def classify_safe(img_path):
+    """Backend-resolving classify. Returns (status, value, backend). In `auto`, a local 'na'
+    (ollama up a moment ago but the read went transient) falls through to groq when a key exists,
+    so a flaky GPU never silently drops a frame that the cloud could still label."""
+    backend = resolve_backend()
+    if backend == "local":
+        status, value = classify_image_local_safe(img_path)
+        if status == "na" and BACKEND == "auto" and load_groq_key():
+            gs, gv = classify_image_safe(img_path, load_groq_key())
+            return (gs, gv, "groq")
+        return (status, value, "local")
+    if backend == "groq":
+        status, value = classify_image_safe(img_path, load_groq_key())
+        return (status, value, "groq")
+    return ("fail", "no backend available (ollama+model down AND no Groq key)", "none")
+
+
+def classify_image(img_path):
+    status, value, backend = classify_safe(img_path)
     if status == "ok":
         return value
-    print(f"Error calling Groq API: {value}", file=sys.stderr)
+    print(f"Error ({backend} backend): {value}", file=sys.stderr)
     sys.exit(1)
 
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == "--test":
         # Smoke test path
-        key = load_groq_key()
-        if not key:
-            print("smoke-test: FAIL (no Groq key in ~/.mesh/groq.env)", file=sys.stderr)
-            sys.exit(1)
         if not subprocess.run(["which", "curl"], capture_output=True).stdout:
             print("smoke-test: FAIL (curl command missing)", file=sys.stderr)
             sys.exit(1)
-        
+        backend = resolve_backend()
+        if backend == "none":
+            print("smoke-test: FAIL (no backend: ollama+model down AND no Groq key)", file=sys.stderr)
+            sys.exit(1)
+
         # Test mock encoding and payload format
         mock_data = b"fake-jpeg-data"
         base64_mock = base64.b64encode(mock_data).decode('utf-8')
@@ -160,12 +327,7 @@ def main():
                 }
             ]
         }
-        res = mock_response["choices"][0]["message"]["content"].strip().strip('"').strip("'").strip(".")
-        canonical = "unknown"
-        for label in ["Ilya", "Rozalia", "Nobody", "Stranger"]:
-            if label.lower() in res.lower():
-                canonical = label
-        assert canonical == "Ilya"
+        assert canonical_label(mock_response["choices"][0]["message"]["content"]) == "Ilya"
 
         # REAL-READ GATE (doctrine: --test must assert a live read PRODUCES data, not just that
         # curl/key exist — the mock-only smoke test above stayed green while ~97% of real runs
@@ -176,15 +338,15 @@ def main():
         if not os.path.exists(DEFAULT_IMG):
             print(f"smoke-test: n/a (no test image at {DEFAULT_IMG})")
             sys.exit(2)
-        status, value = classify_image_safe(DEFAULT_IMG, key)
+        status, value, used = classify_safe(DEFAULT_IMG)
         if status == "ok":
-            print(f"smoke-test: ok (live read produced real label: {value})")
+            print(f"smoke-test: ok ({used} backend, live read produced real label: {value})")
             sys.exit(0)
         elif status == "na":
-            print(f"smoke-test: n/a (honest — {value})")
+            print(f"smoke-test: n/a (honest — {used} backend: {value})")
             sys.exit(2)
         else:
-            print(f"smoke-test: FAIL ({value})", file=sys.stderr)
+            print(f"smoke-test: FAIL ({used} backend: {value})", file=sys.stderr)
             sys.exit(1)
 
     img = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_IMG
@@ -192,12 +354,7 @@ def main():
         print(f"Error: Image not found at {img}", file=sys.stderr)
         sys.exit(1)
 
-    key = load_groq_key()
-    if not key:
-        print("Error: Groq API key not found in ~/.mesh/groq.env", file=sys.stderr)
-        sys.exit(1)
-
-    verdict = classify_image(img, key)
+    verdict = classify_image(img)
     print(verdict)
 
 if __name__ == "__main__":
