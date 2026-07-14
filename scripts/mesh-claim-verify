@@ -1,0 +1,212 @@
+#!/usr/bin/env bash
+# mesh-claim-verify — close the claim loop: AUTO-RELEASE stale claims whose work is already DONE
+# (bus evidence), NUDGE the owner of stale claims that are not. Borrowing #2 from the operator's work
+# mesh (guy-fawxible / gf-claim-verify, operator observation 2026-07-11: "8 active claims found, 5
+# already done via merged work, none released — claims sit stale forever"), re-derived as OUR tool
+# over OUR mesh-chat markers — never their repo/instance.
+#
+# The gap this closes: mesh-claim gives claim + TTL + liveness, and `mesh-claim --sweep` SURFACES
+# newly-stale claims as a [stale] line — but NOTHING checks whether the work is already DONE and
+# releases the claim. A mind finishes (posts [done]) yet forgets `mesh-claim --done`, so the claim
+# ages into a permanent [stale] cry and blocks re-dispatch of the artifact. This reflex verifies +
+# releases, or nudges. It NEVER does the work itself (operator directive: verify/mark or nudge only).
+#
+# Our markers (see mesh-claim): "[claim] <key> ttl=<sec>", released by "[claim-done]"/"[yield]".
+# A STALE claim = one `mesh-claim --list` classifies STALE (owner IDLE/DEAD via mesh-mind-state, or
+# past its TTL). We only ever touch STALE claims — a live, tended claim is never second-guessed.
+#
+# Per stale claim:
+#   1. evidence = a [done]/[interpretation] bus line AFTER the claim's timestamp that names the key —
+#      exact key match is strongest; else EVERY key-part >3 chars must match (the gf 2026-07-13
+#      hardening: a single partial token like "vast" false-released a claim on an unrelated line).
+#   2. evidence  -> `mesh-claim --done <key>` (allowed on a stale claim) + one [note] (transparency,
+#                   the release happened in a pane the operator may not be watching).
+#   3. no evidence -> `mesh-nudge` the owner window to finish or --yield (LOCAL owners only; a remote
+#                   owner can't be injected from here — surfaced, not nudged). Dedup + cooldown so a
+#                   still-stale claim isn't re-nudged every tick (the gf-claim-sweep flood we won't repeat).
+#
+# reflex-cadence: 3-59/10 * * * *
+# reflex-args: --once
+#
+#   mesh-claim-verify --once    one verification pass (cron)
+#   mesh-claim-verify --dry     preview verdicts, change nothing (no release, no nudge, no post)
+#   mesh-claim-verify --watch   live display for a verifier pane
+#   mesh-claim-verify --test    hermetic smoke (pure evidence-match logic; no board/nudge side-effects)
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"   # cron PATH gap: we call bare mesh-claim/mesh-nudge/mesh-chat
+
+BOARD="${MESH_CHAT_LOG:-$HOME/.mesh/chat.log}"
+HOST="$(hostname)"
+SEEN="$HOME/.mesh/.claim-verify-seen"
+CLAIM_MIN="${MESH_CLAIM_VERIFY_MIN:-1}"                 # a stale claim younger than this many minutes is skipped (grace)
+NUDGE_CD="${MESH_CLAIM_VERIFY_NUDGE_COOLDOWN:-30}"      # minutes between re-nudges of the same key
+INTERVAL="${MESH_CLAIM_VERIFY_INTERVAL:-30}"           # --watch refresh seconds
+: "${MESH_WHO:=claim-verify@$HOST}"; export MESH_WHO   # posts/releases attributed to the reflex, not '?'
+mkdir -p "$HOME/.mesh"; touch "$SEEN" 2>/dev/null || true
+
+now_epoch() { date +%s; }
+iso_epoch() { date -d "$1" +%s 2>/dev/null || echo 0; }
+mins_since() { local e="${1:-0}"; [ "$e" -gt 0 ] 2>/dev/null || { echo 999999; return; }; echo $(( ( $(now_epoch) - e ) / 60 )); }
+
+# --- pure: key -> its matchable parts (>3 chars), split on the artifact-key separators - / : # . ----
+key_parts() { printf '%s' "${1:-}" | tr '/:#._-' ' ' | tr ' ' '\n' | awk 'length($0)>3'; }
+
+# --- pure: does <key> have completion evidence among the candidate lines on STDIN? ------------------
+# echoes the matching line and returns 0 if yes, returns 1 (no output) if not. Exact key substring is
+# the strongest signal; else EVERY key-part >3 chars must appear (progressive AND-filter) so a lone
+# partial token can't false-release. If the key has NO part >3 chars, ONLY an exact match counts.
+evidence_match() {
+  local key="$1" lines; lines="$(cat)"
+  [ -n "$lines" ] || return 1
+  local hit; hit="$(printf '%s\n' "$lines" | grep -aiF -- "$key" | head -1)"
+  [ -n "$hit" ] && { printf '%s\n' "$hit"; return 0; }
+  local kw matched=0 rest="$lines"
+  while IFS= read -r kw; do
+    [ -n "$kw" ] || continue
+    matched=1
+    rest="$(printf '%s\n' "$rest" | grep -aiF -- "$kw")"
+    [ -n "$rest" ] || return 1
+  done <<EOF
+$(key_parts "$key")
+EOF
+  [ "$matched" = 1 ] || return 1          # no part >3 chars and no exact hit -> not evidence
+  printf '%s\n' "$rest" | head -1
+}
+
+# --- board reads -----------------------------------------------------------------------------------
+# stale active claims as "key<TAB>who" (owner = the board WHO that posted the [claim]).
+stale_claims() {
+  mesh-claim --list-stale 2>/dev/null | awk -F'\t' '{ w=$2; sub(/^owner=/,"",w); print $1 "\t" w }'
+}
+# latest [claim] line for <key> -> "ts_iso<TAB>intent" (intent = text after "[claim] <key> ttl=<sec>").
+claim_line() {
+  local key="$1"
+  awk -v key="$key" '
+    { i=index($0,"  ::  "); if(i==0) next
+      ts=$1; msg=substr($0,i+6); sub(/^[ \t]+/,"",msg)
+      if (msg !~ /^\[claim\] /) next
+      b=msg; sub(/^\[claim\] /,"",b); k=b; sub(/[ \t].*$/,"",k)
+      if (k!=key) next
+      intent=b; sub(/^[^ \t]+[ \t]+/,"",intent); sub(/^ttl=[0-9]+[ \t]*/,"",intent)
+      last=ts "\t" intent }
+    END{ if(last!="") print last }' "$BOARD" 2>/dev/null
+}
+# completion-evidence lines strictly AFTER <claim_ts> ([done]/[interpretation] markers, body-anchored).
+evidence_lines() {
+  local claim_ts="$1"
+  awk -v ts="$claim_ts" '$1 > ts' "$BOARD" 2>/dev/null \
+    | awk '{ i=index($0,"  ::  "); if(i==0) next; m=substr($0,i+6); sub(/^[ \t]+/,"",m)
+            if (m ~ /^\[(done|interpretation)\] /) print }'
+}
+
+# --- nudge dedup -----------------------------------------------------------------------------------
+nudge_due() {  # <key> -> 0 due / 1 cooling down
+  local key="$1" last
+  last="$(awk -F'\t' -v k="$key" '$1==k{v=$2} END{print v}' "$SEEN" 2>/dev/null)"
+  [ -n "$last" ] || return 0
+  [ "$(mins_since "$last")" -ge "$NUDGE_CD" ]
+}
+mark_nudged() { printf '%s\t%s\n' "$1" "$(now_epoch)" >> "$SEEN"; }
+
+# owner window if the owner is a LOCAL, injectable mind window (bare "window@thishost"); else "".
+# A "user/caller@host" identity (derive_who's reflex/cron form) has a slash and is NOT a tmux window —
+# nudging it would send-keys into a non-existent window; treat it as uninjectable (surface, don't nudge).
+local_window() {  # <who> -> window | ""
+  local who="$1"
+  case "$who" in *@*) : ;; *) return 0 ;; esac
+  [ "${who##*@}" = "$HOST" ] || return 0
+  local win="${who%@*}"
+  case "$win" in */*) return 0 ;; esac                 # user/caller identity, not a mind window
+  case "$win" in ""|*[!A-Za-z0-9_-]*) return 0 ;; esac
+  printf '%s' "$win"
+}
+
+# --- one verification pass -------------------------------------------------------------------------
+verify_pass() {
+  local dry="${1:-0}" n_done=0 n_nudge=0 n_skip=0
+  local key who
+  while IFS=$'\t' read -r key who; do
+    [ -n "$key" ] || continue
+    local rec ts intent; rec="$(claim_line "$key")"
+    ts="${rec%%$'\t'*}"; intent="${rec#*$'\t'}"; [ "$intent" = "$rec" ] && intent=""
+    local age_min; age_min="$(mins_since "$(iso_epoch "$ts")")"
+    if [ "$age_min" -lt "$CLAIM_MIN" ]; then n_skip=$((n_skip+1)); continue; fi
+    local evidence; evidence="$(evidence_lines "$ts" | evidence_match "$key")" || evidence=""
+    if [ -n "$evidence" ]; then
+      printf '  \342\234\223 %-34s DONE  <- %s\n' "$key" "$(printf '%s' "$evidence" | sed 's/.*::  //' | head -c 64)"
+      if [ "$dry" = 0 ]; then
+        if mesh-claim --done "$key" >/dev/null 2>&1; then
+          mesh-chat "[note] claim-verify: auto-released [claim] $key — done evidence: $(printf '%s' "$evidence" | sed 's/.*::  //' | head -c 100)" >/dev/null 2>&1
+        fi
+      fi
+      n_done=$((n_done+1)); continue
+    fi
+    # no evidence -> nudge the owner (local, injectable), deduped
+    local win; win="$(local_window "$who")"
+    if [ -z "$win" ]; then
+      printf '  \302\267 %-34s stale %sm, owner %s (remote/uninjectable) — surfaced only\n' "$key" "$age_min" "$who"
+      n_skip=$((n_skip+1)); continue
+    fi
+    if ! nudge_due "$key"; then
+      printf '  \302\267 %-34s stale, nudged recently — skip\n' "$key"; n_skip=$((n_skip+1)); continue
+    fi
+    printf '  \342\206\222 %-34s NUDGE %s (stale %sm)\n' "$key" "$win" "$age_min"
+    if [ "$dry" = 0 ]; then
+      printf 'Your claim "%s" is STALE (%sm old). Is the work done? If yes: mesh-claim --done %s. If not: finish it or hand it back with mesh-claim --yield %s.%s' \
+        "$key" "$age_min" "$key" "$key" "${intent:+ Intent: $intent}" \
+        | mesh-nudge "$win" >/dev/null 2>&1 && mark_nudged "$key"
+    fi
+    n_nudge=$((n_nudge+1))
+  done <<EOF
+$(stale_claims)
+EOF
+  printf '  pass: %d released, %d nudged, %d skipped\n' "$n_done" "$n_nudge" "$n_skip"
+}
+
+watch_display() {
+  while true; do
+    printf '\033[2J\033[H  \033[1mCLAIM VERIFIER\033[0m %s\n\n' "$(date -u +'%Y-%m-%d %H:%M UTC')"
+    local stale; stale="$(stale_claims)"
+    if [ -z "$stale" ]; then printf '  no stale claims — loop closed\n'
+    else printf '  STALE CLAIMS:\n'; verify_pass 1; fi
+    printf '\n  recent claim-lifecycle bus lines:\n'
+    grep -aE '\[(claim|claim-done|yield|stale|note)\]' "$BOARD" 2>/dev/null | tail -8 \
+      | sed 's/  ::  /  /; s/^/  /' | cut -c1-100
+    sleep "$INTERVAL"
+  done
+}
+
+case "${1:-}" in
+  --test)
+    f=""
+    # key_parts: only tokens >3 chars, split on - / : # .
+    kp="$(key_parts 'alert:ds-freeze-2026' | tr '\n' ',')"
+    case "$kp" in *freeze*) : ;; *) f="$f keyparts-missing-freeze" ;; esac
+    case "$kp" in *,ds,*|ds,*|*,ds) f="$f keyparts-kept-short-ds" ;; esac   # 'ds' is 2 chars -> must be dropped
+    [ -z "$(key_parts 'ab-cd:ef')" ] || f="$f keyparts-all-short-not-empty"  # no part >3 -> empty
+    # evidence_match: exact key wins
+    ev="$(printf '%s\n' '2026-07-14T10:00:00Z x  ::  [done] genome: shipped repo/run#42' | evidence_match 'repo/run#42')"
+    [ -n "$ev" ] || f="$f ev-exact-miss"
+    # evidence_match: ALL parts >3 must match (progressive AND)
+    ev2="$(printf '%s\n' 'A  ::  [done] finished the mesh-mag akm09918 two-axis fix' | evidence_match 'mesh-mag-akm09918')"
+    [ -n "$ev2" ] || f="$f ev-parts-and-miss"     # parts mesh(>3)+akm09918(>3) BOTH present -> match
+    ev3="$(printf '%s\n' 'A  ::  [done] unrelated akm09918 note' | evidence_match 'mesh-mag-akm09918')"
+    [ -z "$ev3" ] || f="$f ev-partial-false-release"   # 'mesh' absent -> NOT evidence (the gf 2026-07-13 hardening)
+    ev4="$(printf '%s\n' 'A  ::  [done] just chatter about genome' | evidence_match 'genome-x-task')"
+    [ -z "$ev4" ] || f="$f ev-partial-genome-only-matched"  # parts genome(>3)+task(>3): 'genome' present, 'task' absent -> NOT evidence
+    # local_window: bare local window injectable; reflex identity (slash) and remote are not
+    [ "$(local_window "genome@$HOST")" = "genome" ]           || f="$f lw-local"
+    [ -z "$(local_window "imozerov/mesh-x@$HOST")" ]          || f="$f lw-slash-identity-not-empty"
+    [ -z "$(local_window "genome@otherhost")" ]              || f="$f lw-remote-not-empty"
+    [ -z "$(local_window "noatsign")" ]                      || f="$f lw-noat-not-empty"
+    # deps present (release + nudge + board)
+    command -v mesh-claim >/dev/null 2>&1 || f="$f no-mesh-claim"
+    command -v mesh-nudge >/dev/null 2>&1 || f="$f no-mesh-nudge"
+    command -v mesh-chat  >/dev/null 2>&1 || f="$f no-mesh-chat"
+    if [ -n "$f" ]; then echo "smoke-test: FAIL ($f )"; exit 1; fi
+    echo "smoke-test: ok (key_parts drops <=3-char tokens, evidence_match: exact-key + all-parts-AND, partial-token does NOT false-release, local_window resolves local/strips-tag/rejects-remote, deps present)"; exit 0 ;;
+  --once)  verify_pass 0 ;;
+  --dry)   verify_pass 1 ;;
+  --watch) watch_display ;;
+  *) echo "usage: mesh-claim-verify [--once|--dry|--watch|--test]" >&2; exit 64 ;;
+esac
