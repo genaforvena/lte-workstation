@@ -75,8 +75,19 @@ Extend it to **regressions, not just new powers**: the artifact for a network ch
 *every node still reaches the internet and the LAN* — captured **before and after** — not
 "the interface came up." `mesh-health` and `mesh-card --refresh` are those artifacts.
 
+Extend it to **the SILENT FALLBACK**: `cmd 2>/dev/null || echo <default>` turns a total failure into a
+plausible constant, and the artifact still looks real. Canonical: `mesh-room-music`'s `detect_beat_ms`
+ran under system python3 (no numpy here) → the import raised → `|| echo 500` swallowed it → the
+"beat-driven" grinder used its flat-input FALLBACK on **every** render since the minds migrated, so
+`l = beat × f` was `500 × f` regardless of the source's rhythm. The mp3s came out fine; only the
+params log (`beat 500`, every line) showed the beat axis was dead, and the tool's own `--test` had
+been failing against it unread. A fallback must be **rare and loud**, and its `--test` must assert
+the REAL path (a 400ms click track reads 400/800, never the default). If a default is
+indistinguishable from a success, it will be one. (2026-07-15, fixed f51e36d.)
+
 Extend it to **test suites, not just live runs**: a sensor tool's `--test` MUST assert a real
 hardware read produces data (≥N axes / a parseable value), not just exercise the offline classifier.
+**A gate you have not seen FAIL is not a gate** — break the fix, watch the test go red, restore it.
 Reachability ≠ producing — a reachable phone whose driver returns empty/cleanup-noise is a *hollow*
 sense: cron-green while its state artifact goes stale for days. `mesh-land` treats exit 2 (honest
 n/a — phone/organ unreachable) as a pass, so the real-read gate may require the hardware without
@@ -260,6 +271,8 @@ rest and the full contracts.
 - **Coordinate / drive:** `mesh-tell` (`--peek`) · `mesh-watch` (`--until`/`--change`) · `mesh-chat` · `mesh-claim` (`--check`) · `mesh-minds` · `mesh-trace` · `mesh-textin`.
 - **Perceive (sensorium):** `mesh-location` · `mesh-body-motion` · `mesh-light` · `mesh-tamper` · `mesh-body-context` · `mesh-presence`(+`-fuse`/`-trends`/`-delta`) · `mesh-arrivals` · `mesh-find` · `mesh-lan-newdevice`/`mesh-lan-health` · `mesh-wifi-link`/`mesh-wifi-motion` · `mesh-room-sense` · `mesh-say`/`mesh-act` · `mesh-voice-rx`/`mesh-voice-tx`/`mesh-tg-typing` · `mesh-tg-roz`/`mesh-roz-channel` · `mesh-tg-update` · `mesh-watchtower` · `mesh-cam-watch` · `mesh-face-recognize` · `mesh-overhear`/`mesh-room`/`mesh-room-trace` (the room "third party": ambient rolling transcript on the mic+Bose node + the room mind's read/say verbs) · `mesh-irq-rate` (kernel interrupt activity, sampled on demand). Perception is re-observed live, never stored (decays on reboot).
 - **Fusion / derived state:** `mesh-situation` · `mesh-perimeter` · `mesh-sensorium` · `mesh-stress` · `mesh-operator-home`/`mesh-operator-state` · `mesh-home-state`/`mesh-household-state` · `mesh-ambient-clock` · `mesh-sense-monitor`. Honest-fusion rule: an unreachable input renders UNKNOWN/partial, never a faked all-clear.
+- **Sound studio (records → grind):** `mesh-records` (the ARCHIVIST: keeps + measures every record the mesh makes before its organ prunes it — the room ear self-prunes hourly, soundscape keeps 2d, so the corpus a mind was handed was already gone; the ledger `~/.mesh/records.log` outlives the audio) · `mesh-sound-reflex` (the GRINDER: derives each recipe from the record's MEASURED character, repelled from recent renders by combo distance, bg-grinds via `mesh-room-music`, pokes the mind only on drop/walked-out/outlier/degenerate) · `mesh-soundscape --measure <wav>` (the one measure tract — never add a second librosa analyzer) · `mesh-room-music` (owns the grind invocation + `room-music-params.log`).
+  - **Calibrate a derived axis against the REAL corpus, never an assumed 0..1.** Measured 2026-07-15 (n=29): `tone`'s median IS its max (1.000), so any rule keyed on it is a CONSTANT; real medians are dyn .265 / act .319 / move .141, so a naive 0.5 split calls nearly everything "even" and "sparse". (`mesh-soundscape`'s own `act > 0.55` → "busy" tag can never fire — act never exceeds .544 on real material.) Rank against the live corpus: self-calibrating, cannot saturate. Same family as the threshold-55 mix lane that sat above its own ceiling and never fired.
 - **Liveness / self-tend:** `mesh-card [--refresh]` · `mesh-health` · `mesh-hw-health` · `mesh-egress-health` · `mesh-supervise` · `mesh-verify` · `mesh-tick`/`mesh-heartbeat`/`mesh-beacon-watch`/`mesh-selfcare` · `mesh-router-watch` · `mesh-body-power` · `mesh-node-power` · `mesh-reflex-health` · `mesh-therm-watch` · `mesh-mind-state` · `mesh-resource-guard` · `mesh-state-touch`.
   - **Liveness-touch convention (conditional-write reflexes):** a reflex that rewrites its STATE artifact ONLY when the VALUE changes leaves mtime frozen on a long-stable-but-LIVE value, so the mtime-aging watchdogs (`mesh-reflex-health`/`mesh-pulse`) misread "value held" as "reflex dead" → false-STALE. **Decouple ran-live from value-changed: call `mesh-state-touch "$STATE"` (or a bare `touch "$STATE"`) on EVERY successful eval** — mtime = liveness (always refreshed), content = the reflex's own change-gated write. A dead cron never runs → never touches → still honest-STALE. (Reflexes that already write STATE unconditionally every run need nothing; this is for the change-gated/debounce subset — e.g. the `mesh-activity-tempo` oscillating-axis false-STALE, f3f84c1.)
 - **Metabolism (inference):** `mesh-relay` (text→cheapest-available-pool→text; Groq primary + local-mind fallback; key in gitignored `~/.mesh/groq.env`, never the genome).
