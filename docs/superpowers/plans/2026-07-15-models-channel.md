@@ -984,7 +984,7 @@ In `scripts/mesh-restore:146`, extend the loop list:
   for _w in minds genome tg senses health chat room pub discover sound models; do
 ```
 
-(This is a **real** gate — its comment says "falsify: drop a case arm" and it does fail when you do. Step 5 proves that.)
+(**CORRECTED 2026-07-15 — this claim was FALSE when written.** The plan said "this is a **real** gate — its comment says 'falsify: drop a case arm' and it does fail when you do." It did not. `mcp_full_for_win`'s `*) return 1` fallthrough gave a MISSING arm the same rc as a present one, and the loop accepts `0|1`, so dropping the `models` arm left `smoke-test: ok`. The 34th vacuous gate on this node — and note the shape: *the plan asserted falsifiability instead of demonstrating it, and I nearly inherited that assertion*. Fixed in b9d501f (`*) return 2`, a distinct no-arm code; callers only test truthiness so behaviour is unchanged), and only NOW does Step 5 pass — seen RED for `models` **and** for `sound`.)
 
 - [ ] **Step 3: Add the channel to the UNIFORM SESSION MANIFEST**
 
