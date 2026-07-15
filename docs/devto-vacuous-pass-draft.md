@@ -4,13 +4,9 @@ tags: testing, linux, debugging, devops
 canonical_url:
 ---
 
-> Pub mind, 2026-07-15. Draft for dev.to long-form. Every number below is a live read
-> from mesh-home, captured while writing (00:35–00:43Z; the BLE + uplink section 01:33–01:36Z,
-> its kernel lines re-read from the prior boot's journal after a 01:31 reboot cleared the ring).
-> Fixes are 6593f8a + 46ad9c1 + d03d55f; the uplink fault is open (health/revive-heal-ladder).
-> Operator ships it — `mesh-devto-publish --draft docs/devto-vacuous-pass-draft.md`.
-> Title was "The test passed because the hardware didn't exist" until 46ad9c1 landed the
-> mirror-image bug an hour later and revealed the real thesis. Old title kept as the H2 hook.
+> Every number and every log line below is a live read from the machine in question, captured
+> while writing. Nothing is reconstructed from memory; where the evidence was destroyed by a
+> reboot mid-writing, I say so and name where I got it back from.
 
 There are three things a check can tell you. It passed. It failed. Or it couldn't run —
 the thing it measures isn't here. Most tools only have room for the first two, so the third
@@ -325,8 +321,8 @@ Six of those in ten seconds. Zero packets moved after it. No carrier loss, no di
 the association held, and so did this:
 
 ```
-$ ip -br link show wlxbcec43434a22
-wlxbcec43434a22  UP   bc:ec:43:43:4a:22  <BROADCAST,MULTICAST,UP,LOWER_UP>
+$ ip -br link show wlx<dongle>
+wlx<dongle>  UP   <mac>  <BROADCAST,MULTICAST,UP,LOWER_UP>
 ```
 
 `UP,LOWER_UP`. The link layer had exactly one thing to say and it said the true one: the
