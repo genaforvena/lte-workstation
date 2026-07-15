@@ -30,8 +30,9 @@ does not move a consumer.
 
 ## Decisions taken (operator, this session)
 
-1. **Adoption = auto-swap behind a gate.** Not a proposed `[task]`. (Operator choice over two
-   alternatives.)
+1. **Adoption = auto-swap behind a gate — for STT and vision ONLY.** **TTS benches, renders
+   samples, and PROPOSES; the operator listens and picks.** (Revised mid-session against
+   evidence — see "The TTS correction" below. The original decision was auto-swap everywhere.)
 2. **The swap edits the ladders directly. No pin file.** Rejected by the operator, and he was
    right: a pin file is a SECOND statement about which model a consumer loads, and
    `mesh-model-resolve` exists *because the first such map lied*. Two sources drift. The ladder
@@ -50,8 +51,11 @@ editing safe: the reflex never parses arbitrary code.
 | consumer | organ | line | shape |
 |---|---|---|---|
 | `mesh-voice-rx:55` | STT | `for name in ("ggml-large-v3-turbo.bin", …)` | ordered tuple |
-| `mesh-note3-say:48` | TTS | `for v in "$d"/ru_RU-ruslan-*.onnx …` | ordered glob list |
 | `mesh-face-recognize:55` | vision | `LOCAL_MODEL = os.environ.get(…, "moondream")` | scalar default |
+
+TTS has **no swap surface** — see "The TTS correction". `mesh-note3-say:48`'s glob ladder was
+named as the TTS target in the first draft of this spec and is **wrong**: it is dead code on
+this node, outranked by an env pin.
 
 Each gains a marker comment in the established `# reflex-cadence:` idiom:
 
@@ -118,15 +122,51 @@ The vision fixture is **home frames**; the STT fixture is the **operator's own v
 in `~/.mesh/model-fixtures/` (gitignored, node-local) and **never** enter the genome. The genome
 is committed and pushed; a fixture is not.
 
+## The TTS correction (found during implementation, 2026-07-15)
+
+The first draft of this spec had TTS auto-swapping on round-trip WER, with `mesh-note3-say:48`'s
+glob ladder as the edit target. Both halves were wrong, and `mesh-model-resolve` is what caught
+it — the eye earning its keep before the hand was built.
+
+**(a) The ladder is not the decision surface.** Resolve reports the live voice as
+`ru_RU-irina-medium.onnx`, selected by an **env pin in `~/.mesh/nodes`** that outranks the glob
+ladder. Rewriting that ladder changes nothing: the gate would revert every TTS swap forever, and
+the "swap surface" was dead code. This is the *"a selector's answer is code AND env"* trap, live,
+in the organ the reflex was about to automate.
+
+**(b) The voice decision was already made, by the operator's ear.** The pin's own comment:
+
+> Room voice = IRINA (operator 2026-07-14, live A/B in the room). He first said "главное не
+> женщину", then reversed two minutes later after hearing ruslan: "давай попробуем Ирину, Ирина
+> никогда нас не подводила".
+
+He A/B'd it live and **reversed his own first instruction after hearing it**. An auto-swap on
+round-trip WER would overrule a human aesthetic judgement with a metric that cannot hear.
+
+**(c) Engine and voice are different questions, and the operator asked about the engine.** *"Why
+we use huge piper still"* is about **piper the runtime** (2023 prebuilt; ru voices from
+`rhasspy/piper-voices`, 37mo). The ladder is about *which voice*. And note for the record: **piper
+is not huge** — 63MB per voice, a small ONNX runtime. Confirmed with the operator that the gripe
+is **age, not size or naturalness**.
+
+**The tie that settles it:** swapping the TTS *engine* also changes the *voice* (Kokoro/XTTS ship
+their own), so every TTS swap is something the operator hears. WER can never be its whole gate.
+
+**Resulting design:** TTS benches (round-trip WER + render wall-clock), searches for
+2025/2026-era candidates, **renders candidate samples to the Note3**, and posts a proposal. The
+operator listens and picks. STT and vision keep the auto-swap: correctness is their whole story
+and there is nothing to hear.
+
 ## What this cannot know
 
 **Round-trip WER cannot hear.** It measures intelligibility. A robotic voice that is perfectly
 intelligible beats a warm one that is slightly less so. If a candidate ties piper on WER and wins
 on speed, the numbers will propose a swap on an axis the operator would not have chosen.
 
-**Mitigation:** TTS swaps require a **decisive win on both axes; a WER tie goes to the
-incumbent.** A tie plus "faster" is not a reason to change a voice the operator is used to. This
-keeps the blind spot harmless rather than pretending it is closed.
+**Mitigation:** TTS does not auto-swap at all. The numbers shortlist; the operator's ear decides.
+This is not a hedge — it is the only correct answer once you notice the operator already ran a
+live A/B and reversed himself on what he heard. A tie plus "faster" is not a reason to change a
+voice he chose.
 
 **`mesh-face-recognize` reads `MESH_FACE_LOCAL_MODEL` from env.** A swap can write the line and
 still lose to an env var in `~/.mesh/nodes` — the *"a selector's answer is code AND env"* trap
@@ -136,13 +176,15 @@ should say so.
 
 ## Build order
 
-Each step is independently useful; each feeds the next.
+Each step is independently useful; each feeds the next. Reordered after the TTS correction: STT
+leads, because it is now the first organ that actually auto-swaps.
 
-1. **TTS fixture + piper's first number.** The operator's named example. Proves the round-trip
-   oracle on piper before it is trusted anywhere near the room's ear.
-2. **`mesh-model-swap` + the gate, driven on STT.** Fixture exists, winner already known, swap is
-   small (stop `_best_model()` preferring a model that loses its own bench). Then **break it
-   deliberately** — aim it at a nonexistent model, watch resolve refuse and the line get restored.
+1. **`mesh-model-swap` + the gate, driven on STT.** Fixture exists, winner already known
+   (`voice-rx` loads `ggml-base` @ 0.812 WER while GigaAM scores 0.312), swap is small: stop
+   `_best_model()` preferring a model that loses its own bench. Then **break it deliberately** —
+   aim it at a nonexistent model, watch resolve refuse and the line get restored.
+2. **TTS fixture + piper's number + a candidate search.** Round-trip oracle, 2025/2026-era
+   candidates, samples rendered to the Note3, proposal posted. No swap.
 3. **Task-fit filter in `mesh-model-watch`.** Makes "top 3 that match our needs" a true sentence.
 4. **Vision fixture + oracle.** Last: depends on (3) for candidates worth spending GPU on.
 
