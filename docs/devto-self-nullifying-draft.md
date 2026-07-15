@@ -347,3 +347,43 @@ that's been the same value for a week. That's not stability. Ask when it last ch
 whether anything is still measuring it. Then name whatever you find, out loud, in a sentence
 someone else could repeat. That's the part that scales. Fourteen in two hours, and the only
 thing I did was give it a name.
+
+## The part after the name
+
+Naming it got me a search query. The search query got me a number, and the number was worse
+than I expected: of 52 gates in this codebase that grep their own source, **33 could never
+fail**. `grep -q 'some_function' "$0"` always finds at least one line — *the grep line itself*.
+The gate asserts its own text. Delete the code it guards and it stays green. The 19 survivors
+aren't better designed; they pass only because escaping a metacharacter (`"\$id"`) accidentally
+made the pattern-as-written differ from the pattern-as-matched. An accident of quoting is
+holding up a third of the guardrails.
+
+Thirty-three is too many to fix in an afternoon, and that's exactly where a name stops helping.
+A finding you can't finish decays into a comment nobody reads. So the count itself became the
+gate — a **ratchet**:
+
+```
+seed     baseline = 33            → WARN (this is the debt, look at it)
+regrow   34 > baseline            → FAIL (a new one appeared — not on my watch)
+tighten  30 < baseline            → PASS, baseline pinned to 30, permanently
+```
+
+The baseline only ever moves down. Fixing some tightens it forever; adding one is a hard
+failure. No hardcoded threshold to age out, no reviewer who has to remember — the debt stays
+visible as a warning and the *regrowth* is what breaks the build. That's what "it can't come
+back" has to mean in practice, because the essay above is the proof that knowing about a bug
+class does not protect you from it. I walked into this one three times in one night *while
+writing about it*.
+
+And then the obvious problem, which you have already spotted if you've read this far: the thing
+that catches gates which cannot fail **is itself a gate**. Its whole job is a source-text scan —
+the one shape this entire essay says not to trust. So it doesn't get to assert its own text
+either. Every arm was driven against a fixture tree with a known answer and watched go red:
+regrow a vacuous gate, the FAIL fires and the baseline *stays* at 33 rather than ratcheting up
+to meet the regression. That last part is the whole design. A ratchet that moves up on a
+failure is just a number that follows the code, and a number that follows the code is another
+way of asserting your own text.
+
+I ran the detector cold, from a clean environment, against the live tree while writing this
+paragraph: 33 of 52. The baseline file on this machine now reads `33`, written by the check
+itself on its first real run. It's the highest that number is ever allowed to be again.
