@@ -59,6 +59,161 @@ union_merge() {
   ' -
 }
 
+# ---- scan backends -------------------------------------------------------------------------
+# nmcli is the ORIGINAL backend and stays authoritative where NetworkManager runs. `iw` is the
+# fallback for nodes with a radio but no NM (mesh-home: nmcli absent → every sweep returned "0 AP(s)
+# in range", so ~/.mesh/wifi.log was never created, mesh-wifi-motion answered no_wifi_tape forever,
+# and mesh-bruno's whole ACTIVITY axis was dead while the radio sat associated with 31 BSSes in view).
+#
+# level_to_quality <dBm> → 0-100. iw reports dBm; nmcli reports a 0-100 quality percent, and the TAPE
+# (plus wifi-motion's thresholds, calibrated on the nmcli tape 2026-06-20) is in percent. Emitting raw
+# dBm here would silently rescale the axis every consumer reads. This mirrors NetworkManager's own
+# nm_wifi_utils_level_to_quality so the two backends produce the SAME units on the same air.
+level_to_quality() {
+  awk -v v="$1" 'BEGIN{
+    v = v < 0 ? -v : v;
+    if (v < 40) v = 40; if (v > 100) v = 100;
+    printf "%d\n", 100 - int((100.0 * (v - 40)) / 60.0);
+  }'
+}
+
+# parse_iw_scan (stdin: `iw dev X scan`) → signal|bssid|ssid|freq rows, same shape as the nmcli path.
+# Drops empty/hidden SSIDs exactly as the nmcli backend does, and collapses `iw`'s one-block-per-
+# (BSSID,freq) output to ONE ROW PER AP (strongest observation wins) to match nmcli's per-AP list.
+parse_iw_scan() {
+  awk '
+    function q_of(s,  v) {
+      v = s < 0 ? -s : s;
+      if (v < 40) v = 40; if (v > 100) v = 100;
+      return 100 - int((100.0 * (v - 40)) / 60.0);
+    }
+    function flush(  q) {
+      if (bssid != "" && ssid != "" && sig != "" && freq != "") {
+        q = q_of(sig);
+        if (!(bssid in best) || q > best[bssid]) {
+          if (!(bssid in best)) order[++nb] = bssid;
+          best[bssid] = q; bssid_ssid[bssid] = ssid; bssid_freq[bssid] = freq;
+        }
+      }
+      bssid = ssid = sig = freq = "";
+    }
+    /^BSS /          { flush(); b = $2; sub(/\(.*$/, "", b); bssid = tolower(b); next }
+    /^[ \t]*freq:/   { freq = $2; next }
+    /^[ \t]*signal:/ { sig = $2; next }
+    /^[ \t]*SSID:/   { ssid = $0; sub(/^[ \t]*SSID:[ ]?/, "", ssid); next }
+    END {
+      flush();
+      for (i = 1; i <= nb; i++) {
+        b = order[i];
+        printf "%d|%s|%s|%d\n", best[b], b, bssid_ssid[b], bssid_freq[b];
+      }
+    }
+  '
+}
+
+# scan_backend → echoes the backend name usable on THIS node ("nmcli"|"iw"), rc 1 if the node has no
+# wifi radio at all. rc 1 here means honest n/a (no radio); a backend that EXISTS but cannot drive the
+# radio must surface as a loud failure downstream, never as a 0-AP "quiet neighborhood".
+SANITY_MIN="${WIFISCAN_SANITY_MIN:-3}"   # below this AP count a scan is a STALE-CACHE MISS, not ground truth
+IW_IFACE="${WIFISCAN_IFACE:-}"
+IW_TIMEOUT="${WIFISCAN_IW_TIMEOUT:-60}"  # a full active iw sweep measured ~32s here; 20s truncated it to 0
+scan_backend() {
+  if command -v nmcli >/dev/null 2>&1 && nmcli -t radio wifi 2>/dev/null | grep -q enabled; then
+    echo nmcli; return 0
+  fi
+  if command -v iw >/dev/null 2>&1; then
+    [ -n "$IW_IFACE" ] || IW_IFACE="$(iw dev 2>/dev/null | awk '$1=="Interface"{print $2; exit}')"
+    [ -n "$IW_IFACE" ] && { echo iw; return 0; }
+  fi
+  return 1
+}
+
+# scan_probe → a BOUNDED real read for the gate: one active scan of the ASSOCIATED channel via the
+# same sudo→iw→parse path the tape uses. Rows on stdout, a note (if any) on stderr. rc 1 if the node
+# has no association to aim at. nmcli nodes are covered by their own radio check.
+#
+# EBUSY IS NOT A BROKEN BACKEND. A radio with a scan already in flight answers `Device or resource
+# busy (-16)` and the naive read then parses to 0 APs — indistinguishable from "this backend cannot
+# see anything". That MEASURABLY blocks the wire: mesh-autowire --tests every mesh-wifi-* tool in the
+# same pass, alphabetically just ahead of mesh-wifiscan, so the radio is reliably mid-sweep by the
+# time this gate runs → rc=1 → "refuse to wire a broken reflex", forever, on a tool that works.
+# So: retry the active scan, and only if the radio stays busy read the kernel's scan cache — which
+# that very in-flight scan is refreshing. Busy is itself proof the radio lives; the cache read still
+# exercises the whole parse path. Rare + LOUD (the note lands in the gate's own message), never silent.
+scan_probe() {
+  local f out try
+  # BACKEND-AWARE. `iw` is not the only backend and is not guaranteed installed on an nmcli node —
+  # probing this node's radio with a tool that node lacks would fail the gate and REFUSE TO WIRE a
+  # feeder that works fine there (the mirror image of the bug this all started as).
+  if [ "$(scan_backend 2>/dev/null)" = nmcli ]; then
+    # NM's cached list — no --rescan: a real read of the real backend, bounded for the 30s gate.
+    timeout 15 nmcli -t -f SIGNAL,BSSID,SSID,FREQ device wifi list 2>/dev/null | parse_nmcli_list
+    return 0
+  fi
+  [ -n "$IW_IFACE" ] || IW_IFACE="$(iw dev 2>/dev/null | awk '$1=="Interface"{print $2; exit}')"
+  [ -n "$IW_IFACE" ] || return 1
+  f="$(iw dev "$IW_IFACE" link 2>/dev/null | sed -nE 's/.*freq:? *([0-9]+).*/\1/p' | head -1)"
+  [ -n "$f" ] || return 1
+  for try in 1 2 3; do
+    out="$(timeout 15 sudo -n iw dev "$IW_IFACE" scan freq "$f" 2>&1)"
+    case "$out" in
+      *"resource busy"*) sleep 2; continue ;;
+    esac
+    printf '%s\n' "$out" | parse_iw_scan
+    return 0
+  done
+  echo "radio busy (another scan in flight) — read via kernel scan cache" >&2
+  timeout 10 iw dev "$IW_IFACE" scan dump 2>/dev/null | parse_iw_scan
+  return 0
+}
+
+# Read the AP list into rows/n. nmcli path (-t output: SIGNAL:BSSID\:escaped\:colons:SSID:FREQ; replace
+# \: with @ for a clean : split, then restore in BSSID): `--rescan yes` is the AUTHORITATIVE call — it
+# forces a fresh scan AND BLOCKS until results are ready, instead of returning NM's stale cache. This is
+# the fix for the TAPE GAPS — a hand-rolled `rescan; sleep N; list` races NM's ASYNCHRONOUS scan
+# completion (read too early → stale single-band cache → only the connected AP, n=1) AND can no-op on
+# rate-limit; both produced honest-skip gaps (observed 2026-06-24: cron :36/:46/:56 logged n=1 while
+# interactive runs, which kept NM's cache warm, got 17-30). `--rescan yes` lets NM own the lifecycle.
+read_aps() {
+  rows=""; n=0
+  case "$(scan_backend 2>/dev/null)" in
+    iw)
+      # `iw scan` is the AUTHORITATIVE call (it forces a fresh sweep and blocks), the direct analogue
+      # of nmcli's `--rescan yes`. It needs CAP_NET_ADMIN → sudo -n (NOPASSWD). `scan dump` is NOT a
+      # substitute: it reads the kernel's cache, so with no other scanner on the node it would freeze
+      # into a stale constant — the same shape of lie as the 0-AP fallback this backend exists to fix.
+      # Resolve the iface HERE (current shell): scan_backend's own assignment happens inside the $()
+      # subshell above and cannot propagate out — `iw dev "" scan` then fails and lands right back on
+      # a 0-AP "quiet neighborhood".
+      [ -n "$IW_IFACE" ] || IW_IFACE="$(iw dev 2>/dev/null | awk '$1=="Interface"{print $2; exit}')"
+      # A full active sweep on this radio MEASURES ~32s (mesh-home, 2026-07-15) — the nmcli path's
+      # `timeout 20` silently truncated every one of them to 0 APs. Budget over the measured cost.
+      rows="$(timeout "$IW_TIMEOUT" sudo -n iw dev "$IW_IFACE" scan 2>/dev/null | parse_iw_scan || true)"
+      rows="$(printf '%s' "$rows" | sed '/^$/d')"
+      n="$(printf '%s' "$rows" | grep -c '|' || true)"
+      [ -n "$rows" ] && rows="${rows}"$'\n'
+      ;;
+    *)
+      while IFS=':' read -r signal bssid_raw ssid freq junk; do
+        [ -z "$ssid" ] || [ -z "$signal" ] && continue
+        bssid="${bssid_raw//@/:}"; freq="${freq% MHz}"
+        rows="${rows}${signal}|${bssid}|${ssid}|${freq}"$'\n'
+        n=$((n+1))
+      done < <(timeout 20 nmcli -t -f SIGNAL,BSSID,SSID,FREQ device wifi list --rescan yes 2>/dev/null | sed 's/\\:/@/g' || true)
+      ;;
+  esac
+}
+
+# parse_nmcli_list (stdin: `nmcli -t -f SIGNAL,BSSID,SSID,FREQ device wifi list`) → the same
+# signal|bssid|ssid|freq rows. Used by the nmcli side of the gate probe; read_aps keeps its own
+# inline loop (it feeds the tape and must stay byte-identical to the long-calibrated behaviour).
+parse_nmcli_list() {
+  sed 's/\\:/@/g' | while IFS=':' read -r signal bssid_raw ssid freq junk; do
+    [ -z "$ssid" ] || [ -z "$signal" ] && continue
+    printf '%s|%s|%s|%s\n' "$signal" "${bssid_raw//@/:}" "$ssid" "${freq% MHz}"
+  done
+}
+
 if [ "${1:-}" = --test ]; then
   # union-merge fixtures (pure awk — no radio, falsifiable: each flips if the merge rules change)
   _td="$(mktemp -d)"; trap 'rm -rf "$_td"' EXIT
@@ -73,9 +228,94 @@ if [ "${1:-}" = --test ]; then
   printf 'AA:BB:CC:DD:EE:01|net1|2412|40|T0|2\n' > "$_td/u3"
   out="$(printf '80|AA:BB:CC:DD:EE:01|net1|2412\n' | union_merge "$_td/u3" 3 T1)"
   printf '%s\n' "$out" | grep -q 'AA:BB:CC:DD:EE:01|net1|2412|80|T1|0' || { echo "smoke-test: FAIL (union re-sight refresh: $out)"; exit 1; }
-  command -v nmcli >/dev/null 2>&1 || { echo "smoke-test: FAIL (no nmcli)"; exit 1; }
-  nmcli -t radio wifi 2>/dev/null | grep -q enabled || { echo "smoke-test: FAIL (wifi radio disabled)"; exit 1; }
-  echo "smoke-test: ok (4 union-merge fixtures + nmcli + radio)"; exit 0
+  # dBm -> nmcli-quality-percent fixtures (pure, falsifiable). The iw backend reports dBm but the
+  # TAPE + wifi-motion's thresholds are calibrated in nmcli's 0-100 percent, so the backends MUST
+  # agree on units or the motion classifier reads a miscalibrated axis. Mirrors NetworkManager's own
+  # nm_wifi_utils_level_to_quality: clamp to -100..-40, linear over that 60 dB span.
+  [ "$(level_to_quality -40)" = 100 ] || { echo "smoke-test: FAIL (dBm -40 must be 100, got $(level_to_quality -40))"; exit 1; }
+  [ "$(level_to_quality -100)" = 0 ] || { echo "smoke-test: FAIL (dBm -100 must be 0, got $(level_to_quality -100))"; exit 1; }
+  [ "$(level_to_quality -55)" = 75 ] || { echo "smoke-test: FAIL (dBm -55 must be 75, got $(level_to_quality -55))"; exit 1; }
+  [ "$(level_to_quality -70)" = 50 ] || { echo "smoke-test: FAIL (dBm -70 must be 50, got $(level_to_quality -70))"; exit 1; }
+  [ "$(level_to_quality -120)" = 0 ] || { echo "smoke-test: FAIL (dBm below floor must clamp to 0, got $(level_to_quality -120))"; exit 1; }
+  [ "$(level_to_quality -20)" = 100 ] || { echo "smoke-test: FAIL (dBm above ceiling must clamp to 100, got $(level_to_quality -20))"; exit 1; }
+
+  # iw BSS-block parse fixture (pure): the real `iw scan` shape, incl. the "(on <iface>) -- associated"
+  # suffix on the BSSID line and the trailing ".0"/" dBm" on freq/signal.
+  cat > "$_td/iwout" <<'IWEOF'
+BSS fa:c2:ec:d4:0f:54(on wlan0) -- associated
+	freq: 2472.0
+	signal: -55.00 dBm
+	SSID: GL-MT3000-765
+BSS b0:a7:b9:d8:97:e0(on wlan0)
+	freq: 2462.0
+	signal: -78.00 dBm
+	SSID: TP-Link_97E0
+BSS c0:ff:ee:00:00:01(on wlan0)
+	freq: 5180.0
+	signal: -40.00 dBm
+	SSID:
+IWEOF
+  out="$(parse_iw_scan < "$_td/iwout")"
+  printf '%s\n' "$out" | grep -qx '75|fa:c2:ec:d4:0f:54|GL-MT3000-765|2472' || { echo "smoke-test: FAIL (iw parse assoc row: $out)"; exit 1; }
+  printf '%s\n' "$out" | grep -qx '37|b0:a7:b9:d8:97:e0|TP-Link_97E0|2462' || { echo "smoke-test: FAIL (iw parse plain row: $out)"; exit 1; }
+  # a hidden/empty SSID must be DROPPED, matching the nmcli backend's `[ -z "$ssid" ] && continue`
+  printf '%s\n' "$out" | grep -q 'c0:ff:ee:00:00:01' && { echo "smoke-test: FAIL (empty SSID must drop, as nmcli backend does: $out)"; exit 1; }
+  [ "$(printf '%s\n' "$out" | grep -c '|')" = 2 ] || { echo "smoke-test: FAIL (iw parse must yield exactly 2 rows: $out)"; exit 1; }
+
+  # PER-BSSID DEDUP (mesh-home 2026-07-15, measured): `iw scan` emits ONE BSS BLOCK PER (BSSID, freq)
+  # — a Wi-Fi-Direct GO announcing across the band shows up 14 times. nmcli lists each AP ONCE, and the
+  # tape's whole meaning (n=, the union artifact, wifi-motion's MIN_STABLE=4 anchor count) is per-AP.
+  # Undeduped, this node's 4-AP neighborhood logged as n=27 — a dense-looking constant manufactured by
+  # one chatty TV, which would also satisfy SANITY_MIN forever even if every real AP vanished.
+  # Strongest signal per BSSID wins (the band's best observation of that AP).
+  cat > "$_td/iwdup" <<'IWEOF'
+BSS 82:56:f2:a7:90:61(on wlan0)
+	freq: 5745.0
+	signal: -40.00 dBm
+	SSID: DIRECT-i8-BRAVIA
+BSS 82:56:f2:a7:90:61(on wlan0)
+	freq: 2472.0
+	signal: -70.00 dBm
+	SSID: DIRECT-i8-BRAVIA
+BSS 50:ff:20:c9:fa:00(on wlan0)
+	freq: 2412.0
+	signal: -80.00 dBm
+	SSID: Keenetic-8813
+IWEOF
+  out="$(parse_iw_scan < "$_td/iwdup")"
+  [ "$(printf '%s\n' "$out" | grep -c '|')" = 2 ] || { echo "smoke-test: FAIL (dup BSSID must collapse to 1 row per AP, got: $out)"; exit 1; }
+  printf '%s\n' "$out" | grep -qx '100|82:56:f2:a7:90:61|DIRECT-i8-BRAVIA|5745' || { echo "smoke-test: FAIL (dedup must keep the STRONGEST observation: $out)"; exit 1; }
+
+  # nmcli list parse (fixture). This node has NO nmcli, so the nmcli side of the gate cannot be
+  # live-verified here — it is covered by fixture + the stub-backend dispatch check below, and it
+  # exists so an nmcli node's gate probes ITS OWN backend instead of an `iw` it may not have.
+  out="$(printf '70:AA\\:BB\\:CC\\:DD\\:EE\\:01:net1:2412 MHz\n40:AA\\:BB\\:CC\\:DD\\:EE\\:02:net2:5180 MHz\n55:AA\\:BB\\:CC\\:DD\\:EE\\:03::2437 MHz\n' | parse_nmcli_list)"
+  printf '%s\n' "$out" | grep -qx '70|AA:BB:CC:DD:EE:01|net1|2412' || { echo "smoke-test: FAIL (nmcli parse: $out)"; exit 1; }
+  printf '%s\n' "$out" | grep -q 'EE:03' && { echo "smoke-test: FAIL (nmcli parse must drop empty SSID: $out)"; exit 1; }
+  [ "$(printf '%s\n' "$out" | grep -c '|')" = 2 ] || { echo "smoke-test: FAIL (nmcli parse row count: $out)"; exit 1; }
+
+  # BACKEND DISPATCH: with a stub nmcli on PATH the probe must use the NMCLI path (not iw). Guards the
+  # regression where an nmcli-only node's gate probed a missing `iw` and refused to wire a working feeder.
+  mkdir -p "$_td/stub"
+  printf '#!/bin/sh\ncase "$*" in *"radio wifi"*) echo enabled;; *"device wifi list"*) echo "66:DE\\:AD\\:BE\\:EF\\:00\\:01:stubnet:2412 MHz";; esac\n' > "$_td/stub/nmcli"
+  chmod +x "$_td/stub/nmcli"
+  out="$(PATH="$_td/stub:$PATH" scan_probe 2>/dev/null)"
+  printf '%s\n' "$out" | grep -qx '66|DE:AD:BE:EF:00:01|stubnet|2412' || { echo "smoke-test: FAIL (probe must use the nmcli backend when nmcli is present: $out)"; exit 1; }
+
+  # REAL READ (the gate that matters — a backend that parses fixtures but cannot drive this node's
+  # radio is the silent fallback this tool already died of: nmcli absent -> "0 AP(s) in range", a
+  # plausible constant. exit 2 = honest n/a where the node has no wifi radio at all.)
+  #
+  # BOUNDED on purpose: a full sweep MEASURES ~32s here, and mesh-autowire runs every gate under
+  # `timeout 30` — so a full-sweep gate self-defeats (rc=124 → "SKIP: --test FAILED" → the feeder is
+  # never wired, which is exactly the hole this whole fix exists to close). scan_probe drives the
+  # IDENTICAL path (sudo -n → iw → parse_iw_scan) against the ASSOCIATED channel only: ~0.2s, and it
+  # must see at least the AP this node is associated to. Breadth is the tape's job, not the gate's.
+  bk="$(scan_backend 2>/dev/null)" || { echo "smoke-test: n/a (no wifi radio / scan backend on $(hostname))"; exit 2; }
+  probe="$(scan_probe 2>"$_td/note")"; pn="$(printf '%s' "$probe" | grep -c '|' || true)"
+  note="$(cat "$_td/note" 2>/dev/null)"
+  [ "$pn" -ge 1 ] || { echo "smoke-test: FAIL (live $bk read yielded 0 AP(s)${note:+ [$note]} — the backend cannot drive this node's radio; the tape feeder would log a false-quiet neighborhood)"; exit 1; }
+  echo "smoke-test: ok (union-merge + dBm-quality + iw-parse + dedup fixtures + REAL $bk read: $pn AP on the associated channel)${note:+  NOTE: $note}"; exit 0
 fi
 
 if [ "${1:-}" = --loop ]; then
@@ -93,26 +333,8 @@ for a in "$@"; do case "$a" in --log) LOGIT=1;; esac; done
 
 HOST="$(hostname)"; MESH="$HOME/.mesh"; LOG="$MESH/wifi.log"; mkdir -p "$MESH"
 ts="$(date -u +%FT%TZ)"
-SANITY_MIN="${WIFISCAN_SANITY_MIN:-3}"   # below this AP count a scan is a STALE-CACHE MISS, not ground truth
 UNIONF="${MESH_WIFISCAN_UNION:-$MESH/.wifiscan-union}"   # partial-sweep union artifact (see header)
 UNION_K="${WIFISCAN_UNION_K:-3}"         # AP absent from K consecutive successful sweeps decays out
-
-# Read the AP list into rows/n (nmcli -t output: SIGNAL:BSSID\:escaped\:colons:SSID:FREQ; replace \:
-# with @ for a clean : split, then restore in BSSID). `--rescan yes` is the AUTHORITATIVE call: it forces
-# a fresh scan AND BLOCKS until the results are ready, instead of returning NM's stale cache. This is the
-# fix for the TAPE GAPS — a hand-rolled `rescan; sleep N; list` races NM's ASYNCHRONOUS scan completion
-# (read too early → stale single-band cache → only the connected AP, n=1) AND can no-op on rate-limit;
-# both produced honest-skip gaps (observed 2026-06-24: cron :36/:46/:56 logged n=1 while interactive runs,
-# which kept NM's cache warm, got 17-30). `--rescan yes` lets NM own the scan lifecycle and the wait.
-read_aps() {
-  rows=""; n=0
-  while IFS=':' read -r signal bssid_raw ssid freq junk; do
-    [ -z "$ssid" ] || [ -z "$signal" ] && continue
-    bssid="${bssid_raw//@/:}"; freq="${freq% MHz}"
-    rows="${rows}${signal}|${bssid}|${ssid}|${freq}"$'\n'
-    n=$((n+1))
-  done < <(timeout 20 nmcli -t -f SIGNAL,BSSID,SSID,FREQ device wifi list --rescan yes 2>/dev/null | sed 's/\\:/@/g' || true)
-}
 
 # --rescan yes blocks for scan completion, so one call is usually enough; a small retry is a safety net
 # for the rare case NM declines the forced rescan (very recent scan) and returns a short cache. Gentle on
