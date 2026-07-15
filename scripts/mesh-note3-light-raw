@@ -19,12 +19,21 @@
 # the Note3's own listener fires, not a guaranteed poll-rate stream. adb/ssh unreachable OR the
 # light line unparsable -> UNREACHABLE, exit 2, never fake a reading.
 #
-#   mesh-note3-light-raw            one-shot verdict (INIT|STABLE|CHANGED) + raw/lux/delta%
+# SAMPLE-AGE GATE (chat-review/dumpsys-sample-age-gate, 2026-07-15): `last=<...>` is a LATCH that
+# serves its last-ever sample forever, so "parses fine + exit 0 + fresh state mtime" was NEVER
+# evidence of a live sensor — this tool published a 2.5-hour-old fossil as STABLE for hours. The
+# sample's own ts (values[3], on the wire all along, read by nobody) against the phone's boot clock
+# is the ONLY axis that separates a steady reading from a dead one; value cannot, as a probe proved
+# by re-latching the fossil at a fresh-looking number. A sample older than 2x cadence is now STALE
+# (exit 2, honest n/a) and ts=0 is NEVER-REPORTED — see freshness() for the full case.
+#
+#   mesh-note3-light-raw            one-shot verdict (INIT|STABLE|CHANGED) + raw/lux/delta%/age
 #   mesh-note3-light-raw --json     machine-readable
 #   mesh-note3-light-raw --edge     debounced state write; board post ONLY on a STABLE<->CHANGED transition
-#   mesh-note3-light-raw --test     fixture-driven classifier smoke test + live adb read-gate
+#   mesh-note3-light-raw --test     fixture-driven classifier + sample-age gate + live adb read-gate
 #
-# Exit: 0 = assessed (INIT/STABLE/CHANGED) · 2 = adb body unreachable (honest n/a, never faked)
+# Exit: 0 = assessed (INIT/STABLE/CHANGED, from a sample younger than the age gate) · 2 = no current
+#       reading (adb body unreachable, OR the sensor is latched/never-reported — honest n/a, never faked)
 set -uo pipefail
 export PATH="$HOME/.local/bin:$PATH"
 [ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
@@ -50,42 +59,104 @@ RAW_THRESH_PCT="${MESH_NOTE3_LIGHT_RAW_THRESH_PCT:-15}"
 # single-poll bounce A->B->A never accumulates a streak) — mirrors the note3-mag macro-gate (80966a4).
 # The fine single-step STABLE/CHANGED verdict still flows to STATE/--json unchanged.
 LIGHT_SUSTAIN_N="${MESH_NOTE3_LIGHT_SUSTAIN_N:-2}"
+# Sample-age gate (chat-review/dumpsys-sample-age-gate, 2026-07-15) — 2x the 5-minute cadence.
+# See freshness() for why this axis is the only one that can tell a live sensor from a latch.
+LIGHT_MAX_AGE_S="${MESH_NOTE3_LIGHT_MAX_AGE_S:-600}"
 
-adb_dumpsys() {   # echo raw `dumpsys sensorservice` from the adb body (empty on failure)
+adb_dumpsys() {   # echo the phone's `/proc/uptime` line + raw `dumpsys sensorservice` (empty on failure)
+  # The uptime cat rides the SAME adb round-trip as the dumpsys (one extra `cat`, no extra
+  # latency) because the sample AGE is only computable against the phone's own boot clock —
+  # see freshness() for why that axis is load-bearing rather than decorative.
   local ser=""; [ -n "$NOTE3_ADB_SERIAL" ] && ser="-s $NOTE3_ADB_SERIAL"
+  # The Note3's toolbox shell has no `cut`/`awk` (it answers "cut: not found"), so the phone side
+  # stays a bare `cat` and dump_uptime takes the first field on OUR side — the uptime axis must not
+  # depend on a binary this body does not have.
+  local cmd='echo "MESH_UPTIME=$(cat /proc/uptime)"; dumpsys sensorservice'
   if [ "$NOTE3_ADB_NODE" = local ]; then
-    timeout 20 adb $ser shell dumpsys sensorservice 2>/dev/null
+    timeout 20 adb $ser shell "$cmd" 2>/dev/null
   else
     [ -z "$NOTE3_ADB_NODE" ] && return 1
     timeout 30 ssh -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new \
-      "$NOTE3_ADB_NODE" "adb $ser shell dumpsys sensorservice 2>/dev/null" </dev/null 2>/dev/null
+      "$NOTE3_ADB_NODE" "adb $ser shell '$cmd' 2>/dev/null" </dev/null 2>/dev/null
   fi
 }
 
-# note3_light_raw_line <line> -> "raw,lux" from an android.sensor.light dumpsys line, or empty
-# + rc1 if unparseable. Pure/offline-testable.
+# note3_light_raw_line <line> -> "raw,lux,ts" from an android.sensor.light dumpsys line, or empty
+# + rc1 if unparseable. ts is values[-1] — the HAL event's OWN ns-since-boot timestamp, which was
+# on the wire all along and read by nobody. Pure/offline-testable.
 note3_light_raw_line() {
   printf '%s\n' "$1" | awk -F'last=<' '
     /android\.sensor\.light\|/ {
       n = split($2, a, ",")
-      if (n >= 2) { gsub(/ /,"",a[1]); gsub(/ /,"",a[2]); printf "%s,%s", a[2], a[1]; exit }
+      if (n >= 4) {
+        gsub(/ /,"",a[1]); gsub(/ /,"",a[2]); gsub(/[ >\r]/,"",a[4])
+        printf "%s,%s,%s", a[2], a[1], a[4]; exit
+      }
     }'
 }
 
-# note3_light_raw — live "raw,lux" from the MAX88922 dumpsys line. Empty + rc1 on any failure
-# (adb down, ssh down, sensor line absent/malformed). Test override: NOTE3_LIGHT_RAW_OVERRIDE
-# skips the network entirely.
+# dump_uptime <dump> -> the phone's uptime seconds (first field of the MESH_UPTIME= line
+# adb_dumpsys prepends — /proc/uptime's second field is idle time, ignored), or empty + rc1 when
+# absent/malformed. rc1 matters: an uncomputable age must fail the read, never default to "fresh".
+# Pure/offline-testable.
+dump_uptime() {
+  printf '%s\n' "$1" | awk '/^MESH_UPTIME=/ { sub(/^MESH_UPTIME=/,""); gsub(/\r/,""); print $1; exit }' | grep -E '^[0-9]+(\.[0-9]+)?$'
+}
+
+# freshness <ts_ns> <uptime_s> <max_age_s> -> "LIVE|STALE|NEVER <age_s>"
+#
+# THE POINT OF THIS TOOL'S EXISTENCE, as of 2026-07-15. `dumpsys sensorservice`'s `last=<...>` is a
+# LATCH, not a stream: it holds the last-ever sample FOREVER. With `active-count=0` (no subscriber
+# registered — the Note3's steady state, since the only listener that ever attaches is the system's
+# auto-brightness, which detaches the moment the screen sleeps at 30s) the MAX88922 reports nothing
+# and this latch keeps serving a value that is hours old. Every poll parses it fine, classifies it,
+# writes a fresh-mtime state file and exits 0 — a hollow sense that is cron-green, plausible, and
+# DEAD. Measured on this node: the light latch sat at raw=2300.0 for 43 consecutive identical reads
+# while the reflex reported STABLE and the check dash showed "note3-light-raw STABLE age 3m".
+#
+# VALUE CANNOT SEPARATE THE TWO — that is not a hypothesis, it was proved by accident: a probe
+# (screen_brightness_mode=1) briefly attached a listener, the sensor woke, took real samples, and
+# on detach RE-LATCHED at raw=5496.9. A latched-at-5496.9 sensor and a live one reading 5496.9 are
+# byte-identical. Only the sample's own ts, against the phone's boot clock, separates "steady" from
+# "dead" — and it cannot be faked: mag/baro sat at 4.9h and aged 1:1 with wall clock across two
+# independent readers 10 minutes apart.
+#
+# ts==0 => NEVER, a distinct verdict from STALE: the sensor has not reported ONCE since boot, so
+# there is no reading to be stale — the absence of a sample must never render as a reading-shaped
+# value (dumpsys prox does exactly this today: ts=0 with values all-zero, which reads as a
+# confident "FAR").
+#
+# max_age is 2x the poll cadence: when a listener IS attached this HAL batches at 200ms, so a
+# window 3000x that with no sample means nobody is listening, not that the room went quiet. A
+# negative age (clock skew / a sample stamped mid-read) is fresh, never stale. Pure — testable.
+freshness() {
+  python3 -c "
+ts, up, maxa = int('$1'), float('$2'), float('$3')
+if ts == 0:
+    print('NEVER -'); raise SystemExit
+age = up - ts / 1e9
+print(('STALE' if age > maxa else 'LIVE'), '%.1f' % age)
+"
+}
+
+# note3_light_raw — live "raw,lux,ts,uptime" from the MAX88922 dumpsys line. Empty + rc1 on any
+# failure (adb down, ssh down, sensor line absent/malformed, uptime unreadable). Test override:
+# NOTE3_LIGHT_RAW_DUMP injects a whole dump fixture (uptime line + sensor lines), skipping the
+# network — the seam is the DUMP, not the parsed pair, so a fixture exercises the real parse +
+# freshness path end to end rather than bypassing the axis under test.
 note3_light_raw() {
-  local out
-  if [ -n "${NOTE3_LIGHT_RAW_OVERRIDE:-}" ]; then
-    out="$NOTE3_LIGHT_RAW_OVERRIDE"
+  local dump out up
+  if [ -n "${NOTE3_LIGHT_RAW_DUMP:-}" ]; then
+    dump="$NOTE3_LIGHT_RAW_DUMP"
   else
-    local dump; dump="$(adb_dumpsys)" || return 1
-    [ -n "$dump" ] || return 1
-    out="$(printf '%s\n' "$dump" | grep 'android\.sensor\.light|' | head -1 | { IFS= read -r l; note3_light_raw_line "$l"; })"
+    dump="$(adb_dumpsys)" || return 1
   fi
-  printf '%s' "$out" | grep -qE '^-?[0-9]+(\.[0-9]+)?,-?[0-9]+(\.[0-9]+)?$' || return 1
-  printf '%s' "$out"
+  [ -n "$dump" ] || return 1
+  up="$(dump_uptime "$dump")" || return 1
+  [ -n "$up" ] || return 1
+  out="$(printf '%s\n' "$dump" | grep 'android\.sensor\.light|' | head -1 | { IFS= read -r l; note3_light_raw_line "$l"; })"
+  printf '%s' "$out" | grep -qE '^-?[0-9]+(\.[0-9]+)?,-?[0-9]+(\.[0-9]+)?,[0-9]+$' || return 1
+  printf '%s,%s' "$out" "$up"
 }
 
 # classify <raw> <prev_raw|""> <thresh_pct> -> "VERDICT DELTA_PCT"
@@ -161,12 +232,41 @@ if [ "${1:-}" = --test ]; then
   [ "$(echo "$r" | awk '{print $1}')" = STABLE ] || { echo "  FAIL: identical raw (delta=0) should be STABLE, got '$r'"; _f=1; }
   [ "$(echo "$r" | awk '{print $2}')" = "0.0" ]  || { echo "  FAIL: identical raw delta should print 0.0, got '$r'"; _f=1; }
 
+  # ── dump fixtures: _dump <raw> <age_s> builds a real-shaped adb dump (uptime line + the MAX88922
+  # line) whose light sample is exactly <age_s> old. The test seam is the DUMP, so every fixture
+  # below drives the true parse + freshness path — the old NOTE3_LIGHT_RAW_OVERRIDE seam handed the
+  # tool a pre-parsed "raw,lux" pair and would have sailed straight past the gate under test.
+  _UP=800000
+  _dump() {
+    local _ts; _ts="$(python3 -c "print(int(($_UP - $2) * 1e9))")"
+    printf 'MESH_UPTIME=%s\nAK09911C Magnetic field Sensor| AKM| version=1 |android.sensor.magnetic_field| 0x1 | type=2 | last=<-685.8,-90.8,-67.0, 799000000000000>\nMAX88922 RGB Sensor| MAXIM, Inc.| version=1 |android.sensor.light| 0x00000006 | "" | type=5 | on-change | maxDelay=0us |maxRate=5.00Hz | no batching | non-wakeUp | last=< 11.0,%s,  0.0, %s>\n' "$_UP" "$1" "$_ts"
+  }
+
   # parse gate: malformed / absent light line must be rejected, never silently accepted
-  NOTE3_LIGHT_RAW_OVERRIDE="not,a,pair,x" note3_light_raw >/dev/null 2>&1 && { echo "  FAIL: malformed raw must be rejected"; _f=1; }
-  NOTE3_LIGHT_RAW_OVERRIDE="4651.8,11.0" note3_light_raw >/dev/null 2>&1 || { echo "  FAIL: well-formed raw,lux pair must be accepted"; _f=1; }
+  NOTE3_LIGHT_RAW_DUMP="MESH_UPTIME=$_UP
+MAX88922 RGB Sensor|android.sensor.light| last=<not,a,pair,x>" note3_light_raw >/dev/null 2>&1 && { echo "  FAIL: malformed raw must be rejected"; _f=1; }
+  NOTE3_LIGHT_RAW_DUMP="$(_dump 4651.8 5)" note3_light_raw >/dev/null 2>&1 || { echo "  FAIL: well-formed fresh dump must be accepted"; _f=1; }
+  # a dump with NO uptime line must be rejected — the age is not computable, and an uncomputable
+  # age must never silently degrade to "fresh" (that is the whole bug, one layer down)
+  NOTE3_LIGHT_RAW_DUMP='MAX88922 RGB Sensor|android.sensor.light| last=< 11.0,4651.8, 0.0, 799999000000000>' \
+    note3_light_raw >/dev/null 2>&1 && { echo "  FAIL: dump with no MESH_UPTIME line must be rejected, not assumed fresh"; _f=1; }
+
   _fix='MAX88922 RGB Sensor| MAXIM, Inc.| version=1 |android.sensor.light| 0x00000006 | "" | type=5 | on-change | maxDelay=0us |maxRate=5.00Hz | no batching | non-wakeUp | last=< 11.0,4651.8,  0.0, 175726812743590>'
   _parsed="$(note3_light_raw_line "$_fix")"
-  [ "$_parsed" = "4651.8,11.0" ] || { echo "  FAIL: dumpsys parse should pick values[1] as raw + values[0] as lux (got '$_parsed')"; _f=1; }
+  [ "$_parsed" = "4651.8,11.0,175726812743590" ] || { echo "  FAIL: dumpsys parse should pick values[1]=raw, values[0]=lux, values[3]=ts (got '$_parsed')"; _f=1; }
+  [ "$(dump_uptime "MESH_UPTIME=812019.58
+junk")" = "812019.58" ] || { echo "  FAIL: dump_uptime should read the MESH_UPTIME line"; _f=1; }
+  dump_uptime "no uptime here" >/dev/null 2>&1 && { echo "  FAIL: dump_uptime must reject a dump with no uptime line"; _f=1; }
+
+  # ── freshness unit (the sample-age axis — chat-review/dumpsys-sample-age-gate) ──
+  [ "$(freshness 799999000000000 800000 600 | awk '{print $1}')" = LIVE ]  || { echo "  FAIL: a 1s-old sample must be LIVE"; _f=1; }
+  [ "$(freshness 782372000000000 800000 600 | awk '{print $1}')" = STALE ] || { echo "  FAIL: a 4.9h-old sample (the measured mag/baro fossil) must be STALE"; _f=1; }
+  [ "$(freshness 0 800000 600 | awk '{print $1}')" = NEVER ]               || { echo "  FAIL: ts=0 must be NEVER, distinctly — not STALE, not a reading"; _f=1; }
+  # boundary: the gate is at max_age, and it must be a real edge (not vacuous in either direction)
+  [ "$(freshness 799400000000000 800000 600 | awk '{print $1}')" = LIVE ]  || { echo "  FAIL: exactly max_age old must still be LIVE (gate is >, not >=)"; _f=1; }
+  [ "$(freshness 799399000000000 800000 600 | awk '{print $1}')" = STALE ] || { echo "  FAIL: one second past max_age must be STALE"; _f=1; }
+  [ "$(freshness 800001000000000 800000 600 | awk '{print $1}')" = LIVE ]  || { echo "  FAIL: a negative age (clock skew) must be LIVE, never STALE"; _f=1; }
+  [ "$(freshness 782372000000000 800000 600 | awk '{print $2}')" = "17628.0" ] || { echo "  FAIL: freshness must report the real age in seconds"; _f=1; }
 
   # ── relay-node gate (is_relay_run): scheduled --edge on a RELAY skips; owner + on-demand don't ──
   is_relay_run --edge imozerov@100.125.157.75 || { echo "  FAIL: --edge on a relay node must skip"; _f=1; }
@@ -194,9 +294,9 @@ if [ "${1:-}" = --test ]; then
 
   # ── integration: a floor bounce posts 0 lines; a sustained shift posts exactly 1 (task spec) ──
   _esd="$(mktemp -d)"; _eboard="$_esd/chat.log"; : > "$_eboard"
-  _poll() {  # <override_raw> -> one --edge poll, carrying LEVEL_STATE forward across the sequence
+  _poll() {  # <raw> [age_s=5] -> one --edge poll, carrying LEVEL_STATE forward across the sequence
     MESH_DIR="$_esd" MESH_SKIP_NODES_SOURCE=1 MESH_NOTE3_LIGHT_RAW_BOARD="$_eboard" \
-      NOTE3_LIGHT_RAW_OVERRIDE="$1,11.0" MESH_NOTE3_ADB_NODE='' MESH_BARO_ADB_NODE='' \
+      NOTE3_LIGHT_RAW_DUMP="$(_dump "$1" "${2:-5}")" MESH_NOTE3_ADB_NODE='' MESH_BARO_ADB_NODE='' \
       "$0" --edge >/dev/null 2>&1
   }
   # (a) 2300 -> 4337 -> 2300 single-poll quantization bounce -> 0 board lines
@@ -212,6 +312,39 @@ if [ "${1:-}" = --test ]; then
   rm -f "$_esd/.note3-light-raw-level" "$_esd/.note3-light-raw-state"; : > "$_eboard"
   _poll 4651.8
   [ -s "$_eboard" ] && { echo "  FAIL: INIT (first poll) must NOT post: $(cat "$_eboard")"; _f=1; }
+
+  # ── integration: THE SAMPLE-AGE GATE, end to end (chat-review/dumpsys-sample-age-gate) ──
+  # These are the assertions the whole find turns on: a FOSSIL — a dumpsys line that parses
+  # perfectly and carries a plausible value — must not be able to produce a reading-shaped
+  # verdict, a board post, or a fresh state artifact. To falsify: drop the `!= LIVE` branch in
+  # the live-read path and watch every one of these go red.
+  _run() {  # <raw> <age_s> -> rc + stdout+stderr of a one-shot (non-edge) poll
+    MESH_DIR="$_esd" MESH_SKIP_NODES_SOURCE=1 \
+      NOTE3_LIGHT_RAW_DUMP="$(_dump "$1" "$2")" MESH_NOTE3_ADB_NODE='' MESH_BARO_ADB_NODE='' \
+      "$0" 2>&1
+  }
+  rm -f "$_esd/.note3-light-raw-level" "$_esd/.note3-light-raw-state"; : > "$_eboard"
+  # (d) the measured fossil: raw=2300.0 latched 4.9h ago -> exit 2, STALE, never a verdict
+  _sout="$(_run 2300.0 17628)"; _src=$?
+  [ "$_src" = 2 ] || { echo "  FAIL: a 4.9h-old latched sample must exit 2 (honest n/a), got rc=$_src"; _f=1; }
+  printf '%s' "$_sout" | grep -q 'STALE' || { echo "  FAIL: a stale sample must say STALE (got: $_sout)"; _f=1; }
+  printf '%s' "$_sout" | grep -qE '(INIT|STABLE|CHANGED)' && { echo "  FAIL: a fossil must NOT render a reading-shaped verdict (got: $_sout)"; _f=1; }
+  [ -f "$_esd/.note3-light-raw-state" ] && { echo "  FAIL: a fossil must NOT write/refresh the state artifact — it must be left to age so the mtime watchdogs can see it"; _f=1; }
+  # (e) ts=0 (the prox case: never reported since boot) -> exit 2, NEVER-REPORTED, never "a reading"
+  _nout="$(_run 0.0 800000)"; _nrc=$?
+  [ "$_nrc" = 2 ] || { echo "  FAIL: ts=0 (never reported) must exit 2, got rc=$_nrc"; _f=1; }
+  printf '%s' "$_nout" | grep -q 'NEVER-REPORTED' || { echo "  FAIL: ts=0 must read as NEVER-REPORTED, distinct from STALE (got: $_nout)"; _f=1; }
+  printf '%s' "$_nout" | grep -qE '(INIT|STABLE|CHANGED)' && { echo "  FAIL: ts=0 must NOT render a reading-shaped verdict — the absence of a sample is not an all-clear (got: $_nout)"; _f=1; }
+  # (f) the control: the SAME raw value, fresh, DOES assess -> proves the gate keys on age alone
+  #     and is not just rejecting everything (a gate that never passes is not a gate).
+  _lout="$(_run 2300.0 5)"; _lrc=$?
+  [ "$_lrc" = 0 ] || { echo "  FAIL: an identical raw with a FRESH sample must assess (rc=0), got rc=$_lrc — the gate must key on age, not value"; _f=1; }
+  printf '%s' "$_lout" | grep -q 'INIT' || { echo "  FAIL: a fresh first read should be INIT (got: $_lout)"; _f=1; }
+  printf '%s' "$_lout" | grep -q 'age=5.0s' || { echo "  FAIL: a live read should carry its sample age (got: $_lout)"; _f=1; }
+  # (g) a stale sample must post NOTHING to the board, whatever its value shift would imply
+  rm -f "$_esd/.note3-light-raw-level" "$_esd/.note3-light-raw-state"; : > "$_eboard"
+  _poll 2300 5; _poll 4337 17628; _poll 4337 17628
+  [ -s "$_eboard" ] && { echo "  FAIL: a stale sample must never reach the board: $(cat "$_eboard")"; _f=1; }
   rm -rf "$_esd" 2>/dev/null || true
 
   # ── live adb read-gate (mesh-land treats exit 2 = honest n/a as a pass) ──
@@ -229,8 +362,19 @@ if [ "${1:-}" = --test ]; then
   _raw="$(echo "$_live" | cut -d, -f1)"
   _ok="$(python3 -c "print(1 if 0 <= ($_raw) < 200000 else 0)" 2>/dev/null)"
   [ "$_ok" = 1 ] || { echo "  FAIL: live raw implausible for this ADC: $_live"; _f=1; }
-  [ "$_f" = 0 ] || { echo "smoke-test: FAIL (classify/parse/live-read contract violated)"; exit 1; }
-  echo "smoke-test: ok (5 classifier + parse-gate + 5 relay-gate unit + 1 board-skip + 6 board_gate unit + 3 sustained-gate integration + LIVE adb read $_live)"
+  # The sample-age axis must be REAL on this hardware, not just in the fixtures: assert the live
+  # dump yields a ts and a phone uptime that produce an age inside [0, uptime]. This is what goes
+  # red if the HAL's last=<> ever stops carrying values[3], or if the uptime/elapsedRealtimeNanos
+  # clock bases diverge — i.e. if the one axis that can tell a live sensor from a latch stops working.
+  _lts="$(echo "$_live" | cut -d, -f3)"; _lup="$(echo "$_live" | cut -d, -f4)"
+  _age_ok="$(python3 -c "
+ts, up = int('$_lts'), float('$_lup')
+age = up - ts / 1e9
+print(1 if (ts == 0 or -5 <= age <= up) else 0)" 2>/dev/null)"
+  [ "$_age_ok" = 1 ] || { echo "  FAIL: live sample age not computable/implausible against the phone's boot clock (ts=$_lts uptime=$_lup) — the freshness axis is broken on this hardware"; _f=1; }
+  _lfresh="$(freshness "$_lts" "$_lup" "$LIGHT_MAX_AGE_S")"
+  [ "$_f" = 0 ] || { echo "smoke-test: FAIL (classify/parse/freshness/live-read contract violated)"; exit 1; }
+  echo "smoke-test: ok (5 classifier + 3 parse-gate + 2 uptime-parse + 7 freshness unit + 5 relay-gate unit + 1 board-skip + 6 board_gate unit + 3 sustained-gate integration + 11 sample-age-gate integration + LIVE adb read $_live -> $_lfresh)"
   exit 0
 fi
 
@@ -248,6 +392,26 @@ if [ -z "$pair" ]; then
   exit 2
 fi
 raw="$(echo "$pair" | cut -d, -f1)"; lux="$(echo "$pair" | cut -d, -f2)"
+hal_ts="$(echo "$pair" | cut -d, -f3)"; up="$(echo "$pair" | cut -d, -f4)"
+
+# ─── sample-age gate: a latched fossil is an ABSENT sense, not a STABLE one ───────
+# Exit 2 (honest n/a) rather than 0 — the phone is reachable and the line parses, but the MAX88922
+# has produced nothing, so there is no current reading to report. STATE is deliberately NOT written
+# or touched on this path: the state file must be allowed to AGE, so the mtime watchdogs
+# (mesh-reflex-health/mesh-pulse) can finally see what a fresh-mtime-carrying-a-4-hour-old-sample
+# hid from them. A dead sense should look dead.
+fresh="$(freshness "$hal_ts" "$up" "$LIGHT_MAX_AGE_S")"
+fverdict="$(echo "$fresh" | awk '{print $1}')"; age="$(echo "$fresh" | awk '{print $2}')"
+if [ "$fverdict" != LIVE ]; then
+  if [ "$fverdict" = NEVER ]; then
+    reason="NEVER-REPORTED (ts=0 — the MAX88922 has not produced a single sample since boot; raw=$raw/lux=$lux are the HAL's zero-init, not a reading)"
+  else
+    reason="STALE (last sample ${age}s old > ${LIGHT_MAX_AGE_S}s — dumpsys last=<> is a latch and nothing is listening; raw=$raw/lux=$lux is a fossil, not a current reading)"
+  fi
+  echo "note3-light-raw: $reason" >&2
+  [ "${1:-}" = --json ] && printf '{"verdict":"%s","age_s":"%s","latched_raw":%s,"latched_lux":%s}\n' "$fverdict" "$age" "$raw" "$lux"
+  exit 2
+fi
 
 praw=""
 if [ -f "$STATE" ]; then
@@ -257,14 +421,16 @@ fi
 result="$(classify "$raw" "${praw:-}" "$RAW_THRESH_PCT")"
 verdict="$(echo "$result" | awk '{print $1}')"
 delta="$(echo "$result" | awk '{print $2}')"
-ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+wts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-printf '%s|%s|%s|%s\n' "$verdict" "$raw" "$lux" "$ts" > "$STATE"
+# age= is appended so the artifact carries the sample's OWN freshness, not just the poll's mtime —
+# the exact pair whose divergence (4-min-young file, 2.5-hour-old sample) hid the fossil.
+printf '%s|%s|%s|%s|age=%s\n' "$verdict" "$raw" "$lux" "$wts" "$age" > "$STATE"
 mesh-state-touch "$STATE" 2>/dev/null || touch "$STATE" 2>/dev/null || true   # ran-live liveness, independent of value-changed
 
 case "${1:-}" in
   --json)
-    printf '{"verdict":"%s","raw":%s,"lux":%s,"delta_pct":"%s","ts":"%s"}\n' "$verdict" "$raw" "$lux" "$delta" "$ts"
+    printf '{"verdict":"%s","raw":%s,"lux":%s,"delta_pct":"%s","age_s":"%s","ts":"%s"}\n' "$verdict" "$raw" "$lux" "$delta" "$age" "$wts"
     ;;
   --edge)
     # Board ONLY when a NEW raw level has PERSISTED N consecutive polls (board_gate). A discrete
@@ -284,10 +450,10 @@ EOF
       ts_board="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
       printf '%s  note3-light-raw@%s  ::  [note3-light-raw] CHANGED (raw=%s lux=%s delta=%s%%)\n' "$ts_board" "$(hostname)" "$raw" "$lux" "$bdelta" >> "$board" 2>/dev/null || true
     fi
-    printf 'note3-light-raw: %s (raw=%s lux=%s delta=%s%% gate=%s)\n' "$verdict" "$raw" "$lux" "$delta" "$decision"
+    printf 'note3-light-raw: %s (raw=%s lux=%s delta=%s%% age=%ss gate=%s)\n' "$verdict" "$raw" "$lux" "$delta" "$age" "$decision"
     ;;
   *)
-    printf 'note3-light-raw: %s (raw=%s lux=%s delta=%s%%)\n' "$verdict" "$raw" "$lux" "$delta"
+    printf 'note3-light-raw: %s (raw=%s lux=%s delta=%s%% age=%ss)\n' "$verdict" "$raw" "$lux" "$delta" "$age"
     ;;
 esac
 exit 0
