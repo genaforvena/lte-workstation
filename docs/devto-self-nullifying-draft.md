@@ -10,9 +10,14 @@ canonical_url:
 > same material. Every command and every log line below is a live read from the machine in
 > question, captured while writing.
 
-The last piece ended on a fix. This one starts there, because I've since learned something
+[The last piece](https://dev.to/ilya_mozerov_867dbdd91feb/na-is-not-a-verdict-35ic) was about
+instruments that answer the question next to the one you asked — a health check that reported
+`HW: OK` because it was blind, and its mirror image that called honest "I can't measure this"
+a failure. It ended on a fix. This one starts there, because I've since learned something
 worse than a broken check: a check whose failure mode is identical to the bug it was written
 to find.
+
+Everything below is a live read from the machine in question, captured while writing.
 
 Here's the shape, in one line of shell:
 
@@ -220,12 +225,72 @@ every newcomer types, and — increasingly, on this system — what every new ag
 toolset, that reflex is indistinguishable from the action. The safe way to ask what a thing
 does must not be the thing.
 
-That's the whole family, and I think it's one idea: **the check, the fallback, the all-clear,
-and the help flag were all built out of the same material as the thing they were protecting
-you from.** The gate skipped itself on the dep it was watching for. The fallback failed in a
-way that looked like a reading. The all-clear was made of no data. The help flag did the
-thing. And when I sat down to verify the first one, my own test harness went green twice by
-the identical mechanism.
+That one is fixed, between my writing this section and publishing it. Seven tools, one guard
+each, first line, before any dispatch:
+
+```bash
+case "${1:-}" in -h|--help) usage; exit 0 ;; esac
+```
+
+with `usage()` rendering the file's own header comment — so the help can't drift from the docs
+it's printed from. Every one of these tools had already *documented* its usage up there. None
+of them had ever printed it.
+
+What I want to point at is the test that came with it, because it's the exact inverse of
+everything above. The obvious test — "run `--help`, assert usage appears" — passes on a tool
+that prints usage *and then sends the message*. So the load-bearing assertion isn't that
+something happened; it's that something **didn't**: each tool runs under a `PATH` shim where
+every sender (`ssh`, `curl`, `adb`, `tmux`, the speech binaries) is replaced by a recorder, and
+the test asserts the recorder was never called.
+
+And it ships a negative control. `--falsify` deletes each guard in turn and asserts the sender
+*fires*:
+
+```
+$ test-help-guard --falsify
+  RED (correct): mesh-tg — guard removed => rc=1 sender=[curl -s -X POST https://api.telegram.org]
+  RED (correct): mesh-tell — guard removed => rc=1 sender=[tmux list-panes -t ...:--help -F #]
+--falsify: 7 proved-red, 0 inert
+smoke-test: ok (gate is real — every guard, when deleted, fires its sender)
+```
+
+That's a test proving it can fail before it's allowed to tell you it passed. Which, after
+everything above, is the only kind I now believe.
+
+I'd love to end there. But I went to verify that harness myself — copy the tree, rip out one
+guard, watch it go red — and I got this:
+
+```
+test-help-guard: 56 assertions passed, 0 failed
+```
+
+Green. Against a tree where I had *just deleted the guard*. For about thirty seconds I thought
+I'd found a vacuous test inside the anti-vacuous-test, which would have been too perfect.
+
+I hadn't. The harness resolves the tools from the canonical repo path, not relative to wherever
+you copied it, so it had cheerfully ignored my sabotaged copy and tested the real tree — which
+was, correctly, still green. My mistake, for the third time in one night, and the same mistake
+every time: I tested something other than what I thought I was testing. Pointed at the right
+tree, it does exactly what it says:
+
+```
+FAIL: mesh-sms -h NO-SEND — REACHED THE SEND PATH: ssh -o BatchMode=yes ...
+FAIL: mesh-sms -h NO-TRACE — wrote a mark into the durable trace tier
+52 assertions passed, 4 failed
+```
+
+Three times tonight. The `2>/dev/null` that closed a guard I was standing inside. The `/bin`
+symlink that meant my "removed" binary was never removed. And now a path I assumed pointed at
+my copy. Every one produced a confident green. I have written two essays about this failure
+mode and I walked into it three times in the six hours it took to write them, which I think is
+the most honest thing I can tell you about how hard it is to see.
+
+That's the family, and it's one idea: **the check, the fallback, the all-clear, and the help
+flag were all built out of the same material as the thing they were protecting you from.** The
+gate skipped itself on the dep it was watching for. The fallback failed in a way that looked
+like a reading. The all-clear was made of no data. The help flag did the thing. And every
+time I sat down to verify one of them, my own harness went green for reasons that had nothing
+to do with the code.
 
 The uncomfortable version: these are all failures of *asking*. Not one of them is a bug in the
 thing being measured. Every one is a bug in the instrument, the guard, or the question — and
