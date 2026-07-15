@@ -18,6 +18,9 @@
 - **Exact model filenames on disk:** `ggml-tiny.bin`, `ggml-base.bin`, `ggml-large-v3-turbo-q5_0.bin`. There is **no** `ggml-large-v3-turbo.bin` — that exact-name miss is a known live trap in `mesh-voice-rx:49`'s ladder.
 - **GigaAM model id:** `v2_ctc`, loaded via `gigaam.load_model("v2_ctc")`, `cuda=True`. `.transcribe()` returns a **TranscriptionResult, not a str** — read `.transcription` (this exact bug was fatal in `mesh-room-gigaam`, fixed 3a56a92).
 - **Commit AND push every task.** Unpushed work is lost work: 55 commits sat local for 11h this morning because every push path was conditional (1969a5d).
+- **NO ABSOLUTE WER THRESHOLD ANYWHERE.** Measured on the STT fixture during planning: large-v3-turbo-q5_0 **0.250**, gigaam-v2_ctc **0.312**, whisper-tiny **0.875**. This plan originally carried `ok if wer < 0.15`, which labels the best STT organ on the node "poor" — the assumed-0..1 bug (`mesh-soundscape`'s `act > 0.55` → "busy" can never fire; act never exceeds .544 on real material). Rank **relative to the best score on the same fixture**; that is self-calibrating and cannot saturate.
+- **The ledger stores facts; the pane ranks.** Field 9 is `read-ok`/`EMPTY` — a fact about the run. A verdict frozen at write time is stale the moment the next candidate lands.
+- **Room's "GigaAM accuracy EQUAL to large-turbo" is FALSIFIED** (0.312 vs 0.250 — «ить» for «быть», dropped «и»). GigaAM still wins on a 20x speed gap. Correct the claim in `CLAUDE.local.md` and the `stt-organ-gigaam-beats-whisper` memory; do not over-claim the reverse from n=1 chunk.
 
 ## File Structure
 
@@ -70,27 +73,53 @@ Expected: one chunk's output is recognisably *"Уши на текст-ту-сп�
 
 - [ ] **Step 3: Pin the fixture to the matching chunk**
 
+**Resolved during planning: the match is `chunk-081223`.** `chunk-081205` holds the *preceding* sentence («Слушай, ну чего ты? Ну, типа, Пайпер, ну совсем древняя же штука…») — related, but not the reference. Step 2 still runs: confirm it rather than trust this line.
+
 ```bash
-# <MATCH> = the chunk identified in Step 2
-cp /tmp/chunk-<MATCH>.wav ~/.mesh/model-fixtures/stt-ru-operator-0812/input.wav
+cp /tmp/chunk-081223.wav ~/.mesh/model-fixtures/stt-ru-operator-0812/input.wav
 printf '%s\n' 'Уши на текст-ту-спич и спич-ту-текст должны быть прямо крошечные и суперские модели' \
   > ~/.mesh/model-fixtures/stt-ru-operator-0812/truth.txt
 cat > ~/.mesh/model-fixtures/stt-ru-operator-0812/provenance.txt <<'EOF'
-Operator's own voice, 2026-07-15 ~08:12Z, captured by the room ear (mesh-overhear
---daemon), 18.000s chunk.
+FIXTURE: stt-ru-operator-0812
+Operator's own voice, 2026-07-15 ~08:12Z, room ear (mesh-overhear --daemon),
+18.000s chunk = 20260715-081223-ear-2c3dd057.wav.
 
-Ground truth is the operator's sentence as attested in ~/.mesh/chat.log (room's
-09:38Z [fyi], quoting his 08:12 ask). It is NOT a model's output: whisper
-large-v3-turbo-q5_0 was used only to LOCATE which of two chunks holds the
-sentence, not to author it.
+WHY THIS FILE STILL EXISTS: the room ear self-prunes hourly. mesh-records (the
+archivist) kept it. Copied here, never referenced — the records corpus is pruned
+by its organ, and a fixture that can be pruned is not a fixture.
 
-Why this file still exists: the room ear self-prunes hourly. mesh-records (the
-archivist) kept it. Copied here, not referenced, because the records corpus is
-pruned by its organ.
+WHY IT IS A GOOD FIXTURE: real ru room speech at a real distance, and it is the
+exact utterance whisper-tiny destroyed ("Маш на тех, что спичка..." for "Уши на
+текст-ту-спич..."). It discriminates the models that matter for this organ.
 
-Why it is a good fixture: it is real ru room speech at a real distance, and it is
-the exact utterance that whisper-tiny destroyed ("Маш на тех, что спичка...") —
-so it discriminates the models that matter for this organ.
+GROUND TRUTH — READ THIS BEFORE TRUSTING AN ABSOLUTE WER.
+truth.txt is the operator's sentence as attested in ~/.mesh/chat.log (room's
+09:38Z [fyi], written before this bench existed). large-v3-turbo-q5_0 was used
+only to LOCATE which of two chunks holds it — as a search index, not an author.
+
+But the lineage is not fully independent, and pretending otherwise would be the
+lie this whole channel exists to prevent: room's own "ground truth" was the room
+ear's large-turbo transcript, cleaned up by hand. So truth.txt is
+human-mediated-model-output, not a human transcription from audio.
+
+CONSEQUENCE, MEASURED 2026-07-15: the operator said the English phrases
+"text-to-speech" / "speech-to-text" in Russian. No model renders that
+transliteration identically —
+  truth.txt          "текст-ту-спич"  /  "спич-ту-текст"
+  large-v3-turbo     "тексту спич"    /  "спич-то текст"
+  gigaam-v2_ctc      "текст у спич"   /  "спич ту текст"
+so ~half of EVERY candidate's WER on this fixture is the reference's rendering of
+a loanword, not model error. Scores: large-v3-turbo 0.250, gigaam-v2_ctc 0.312,
+whisper-tiny 0.875.
+
+It penalises all candidates EQUALLY. Therefore:
+  ORDERING on this fixture is trustworthy.
+  ABSOLUTE WER on this fixture is INFLATED and means nothing on its own.
+Never put an absolute WER threshold against this fixture. Rank relatively. That
+is why mesh-model-bench stores facts and the pane does the ranking.
+
+TO IMPROVE THIS FIXTURE: have the operator confirm or correct truth.txt by ear.
+That single act would make the lineage independent and the absolutes real.
 EOF
 ```
 
@@ -290,7 +319,9 @@ git push origin main
 **Interfaces:**
 - Consumes: `normalise()`, `wer()` from Task 2.
 - Produces: `mesh-model-bench <organ> <model> --fixture <id>` → appends one ledger line to `~/.mesh/model-bench.log`, prints the row. Ledger format (TSV):
-  `ts<TAB>organ<TAB>consumer<TAB>model<TAB>fixture<TAB>wall_s<TAB>dur_s<TAB>wer<TAB>verdict`
+  `ts<TAB>organ<TAB>consumer<TAB>model<TAB>fixture<TAB>wall_s<TAB>dur_s<TAB>wer<TAB>read_status`
+
+  Field 9 is `read-ok` or `EMPTY` — **a fact about the run, not a verdict**. Ranking lives in the pane (Task 5) so it recomputes as the corpus grows; a verdict frozen at write time is stale the moment the next candidate lands.
 
 **The gate that matters here:** `--test` must **drive a real model**. `mesh-whisper-run --test` drove echobin/errbin/sleep stubs, asserted nice/ionice/flock/admission all green — and never once invoked whisper, while whisper died rc=127 on every real call for a day (974d864). A bench whose test never benches is worse than no bench.
 
@@ -375,11 +406,32 @@ def bench(organ, model, fixture_id, consumer="-", ledger=LEDGER):
     text, wall = (_run_whisper if kind == "whisper" else _run_gigaam)(mref, wav)
     truth = truth_f.read_text().strip()
     w = wer(truth, text)
-    # An empty transcript is a FAILURE, never a quiet pass. Empty stdout reading as
-    # "no transcript" is exactly how the rpath bug stayed invisible for a day.
-    verdict = "EMPTY" if not normalise(text) else ("ok" if w < 0.15 else "poor" if w < 0.5 else "UNUSABLE")
+    # Column 9 is a FACT ABOUT THIS RUN, not a judgment: did the model return words at all.
+    # An empty transcript is a FAILURE, never a quiet pass — empty stdout reading as "no
+    # transcript" is exactly how the whisper rpath bug stayed invisible for a day (974d864).
+    #
+    # THE LEDGER STORES FACTS; THE PANE RANKS. There is deliberately NO absolute WER
+    # threshold here. Two reasons, both measured:
+    #
+    #  1. An assumed range lies. This plan originally carried `ok if w < 0.15`. Measured on
+    #     this fixture: large-v3-turbo-q5_0 = 0.250, gigaam-v2_ctc = 0.312, whisper-tiny =
+    #     0.875. That threshold labels the mesh's BEST STT organ — the only reason the room
+    #     understood the operator's 08:12 ask at all — "poor". Same family as
+    #     mesh-soundscape's `act > 0.55` -> "busy", which can never fire because act never
+    #     exceeds .544 on real material.
+    #
+    #  2. This reference's absolutes are inflated. ~half of every candidate's WER is the
+    #     REFERENCE's rendering of an English loanword ("text-to-speech" -> "текст-ту-спич"
+    #     vs "тексту спич"); no model renders it identically. It hits every candidate
+    #     EQUALLY, so ORDERING is trustworthy and absolute values are not. A threshold read
+    #     against those absolutes asserts something the fixture cannot support.
+    #
+    # A verdict frozen at write time also goes stale: bench tiny first and it is labelled
+    # against an empty corpus forever. Ranking is the pane's job, recomputed as the corpus
+    # grows.
+    read_status = "EMPTY" if not normalise(text) else "read-ok"
     row = "\t".join([time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), organ, consumer,
-                     model, fixture_id, f"{wall:.2f}", f"{_dur(wav):.2f}", f"{w:.3f}", verdict])
+                     model, fixture_id, f"{wall:.2f}", f"{_dur(wav):.2f}", f"{w:.3f}", read_status])
     with open(ledger, "a") as fh:
         fh.write(row + "\n")
     return row, text
@@ -732,9 +784,31 @@ Insert into the `case "$role" in` block in `scripts/mesh-dash` (alongside the ot
       echo
       echo "MEASURED (ledger: $(wc -l < "$HOME/.mesh/model-bench.log" 2>/dev/null || echo 0) rows):"
       if [ -s "$HOME/.mesh/model-bench.log" ]; then
-        printf "  %-30s %-24s %7s %7s  %s\n" MODEL FIXTURE WALL WER VERDICT
-        sort -t$'\t' -k8,8g "$HOME/.mesh/model-bench.log" 2>/dev/null | \
-          awk -F'\t' '{printf "  %-30s %-24s %6ss %7s  %s\n", $4, $5, $6, $8, $9}'
+        # RANK HERE, NOT IN THE LEDGER. The ledger holds facts (wall, wer); the verdict is a
+        # view over the corpus and must recompute as it grows — a verdict frozen at write
+        # time labels whatever was benched first against an empty corpus, forever.
+        #
+        # RELATIVE, NEVER AN ASSUMED RANGE. Measured 2026-07-15: large-v3-turbo-q5_0 0.250,
+        # gigaam-v2_ctc 0.312, whisper-tiny 0.875. An absolute `ok < 0.15` labels the best
+        # STT organ we have "poor" (mesh-soundscape's act>0.55 "busy" tag, which can never
+        # fire, is the same bug). And ~half of each absolute is this reference's loanword
+        # rendering — equal across candidates, so ORDER is sound and absolutes are not.
+        printf "  %-30s %-24s %7s %7s  %s\n" MODEL FIXTURE WALL WER RANK
+        awk -F'\t' '
+          $9 != "EMPTY" && (best[$2 FS $5] == "" || $8+0 < best[$2 FS $5]) { best[$2 FS $5] = $8+0 }
+          { rows[NR] = $0 }
+          END {
+            for (i = 1; i <= NR; i++) {
+              n = split(rows[i], f, "\t"); if (n < 9) continue
+              k = f[2] FS f[5]; b = best[k]
+              if (f[9] == "EMPTY")            r = "EMPTY — returned nothing"
+              else if (b == "" )              r = "?"
+              else if (f[8]+0 <= b)           r = "BEST on this fixture"
+              else if (f[8]+0 > 2*b)          r = "UNUSABLE (>2x best)"
+              else                            r = sprintf("%.1fx best", (f[8]+0)/b)
+              printf "  %-30s %-24s %6ss %7s  %s\n", f[4], f[5], f[6], f[8], r
+            }
+          }' "$HOME/.mesh/model-bench.log" 2>/dev/null | sort -k3 -g
       else
         echo "  UNMEASURED — no bench has run. The shelf is unproven, not fast."
       fi
@@ -800,13 +874,29 @@ git push origin main
 
 **Why re-run rather than backfill.** Room's 09:38 accuracy calls are eyeball verdicts ("accurate, punctuated"), and the ledger's `wer` column is mechanical — pasting prose into a numeric column either invents a number or leaves a hole that renders as a default. And the re-run is the bench's first real test: if it reproduces room's figures on room's fixture, the instrument is trustworthy *before* the mind spends four organs' work on it.
 
-**Room's figures are the expectation, not the seed** (per 18s chunk):
+**Expected values — measured during planning on `chunk-081223`, not room's prose:**
 
-| model | wall | accuracy |
-|---|---|---|
-| whisper ggml-tiny | 0.8s / 1.0s | WRONG SENTENCE |
-| whisper large-v3-turbo-q5_0 | 11.7s / 16.4s | accurate |
-| gigaam v2_ctc | 0.7s / 0.1s | accurate |
+| model | wall | WER | note |
+|---|---|---|---|
+| whisper-large-v3-turbo-q5_0 | ~12s | **0.250** | BEST accuracy |
+| gigaam-v2_ctc | **0.59s** | **0.312** | ~20x faster, slightly WORSE |
+| whisper-tiny | ~0.8s | **0.875** | UNUSABLE (>2x best) |
+
+**The re-run already paid for itself: room's "accuracy EQUAL to large-turbo" is FALSIFIED.**
+GigaAM is measurably worse on this chunk (0.312 vs 0.250) — it renders «должны **ить прям**»
+for «должны **быть прямо**» and drops the «и» between the two phrases. Room eyeballed "same
+content, both chunks" and was close but not right.
+
+This does **not** overturn GigaAM: 0.59s vs ~12s is a 20x gap for ~6 points of WER, and it is
+still the right STT organ. But the claim in `CLAUDE.local.md` and in the
+`stt-organ-gigaam-beats-whisper` memory — *"accuracy EQUAL to large-v3-turbo"* — is wrong and
+must be corrected to "slightly worse, vastly faster". n=1 chunk; do not over-claim the reverse
+either.
+
+**Reference caveat, stated in the ledger's own provenance:** ~half of every candidate's WER is
+this reference's rendering of an English loanword («текст-ту-спич» vs «тексту спич»). It hits
+all candidates equally — ordering is trustworthy, absolutes are inflated. This is exactly why
+the pane ranks relatively and no absolute threshold exists anywhere in this design.
 
 - [ ] **Step 1: Bench all three candidates**
 
@@ -818,20 +908,23 @@ for m in whisper-tiny whisper-large-v3-turbo-q5_0 gigaam-v2_ctc; do
 done
 ```
 
-Expected: three rows. `gigaam-v2_ctc` and `whisper-large-v3-turbo-q5_0` should land `wer` well under 0.15 → verdict `ok`. `whisper-tiny` should land high → verdict `UNUSABLE`.
+Expected: three rows, each ending `read-ok` (field 9 is a fact about the run, not a verdict — no candidate should read `EMPTY`). WERs land ≈0.25 (large-turbo), ≈0.31 (gigaam), ≈0.88 (tiny). The **ranking** appears in the pane at Step 3, not in the ledger.
 
-- [ ] **Step 2: Check the measurement against room's independent figures**
+- [ ] **Step 2: Check the measurement against the planning figures**
 
 ```bash
 column -t -s$'\t' ~/.mesh/model-bench.log
 ```
 
-Expected shape (exact numbers will differ; the **ordering and verdicts** are what must hold):
-- `gigaam-v2_ctc` — fastest by ~15x, `ok`
-- `whisper-large-v3-turbo-q5_0` — slowest (~12-17s), `ok`
-- `whisper-tiny` — fast, `UNUSABLE`
+Must hold (the **ordering**, within a few points of WER):
+- `whisper-large-v3-turbo-q5_0` — WER ≈ 0.25, slowest (~12s) → `BEST on this fixture`
+- `gigaam-v2_ctc` — WER ≈ 0.31, fastest (~0.6s) → `1.2x best`
+- `whisper-tiny` — WER ≈ 0.88 → `UNUSABLE (>2x best)`
 
-**If tiny does NOT come out UNUSABLE, stop.** Either the fixture is the wrong chunk (Task 1 Step 2) or the scorer is broken. Do not proceed to Task 7 with an instrument that disagrees with a known result.
+**STOP conditions — do not proceed to Task 7 with a disagreeing instrument:**
+- **tiny does NOT come out UNUSABLE** → the fixture is the wrong chunk (Task 1 Step 2) or the scorer is broken.
+- **gigaam or large-turbo land above ~0.4** → the fixture's `truth.txt` does not match its `input.wav`.
+- **any candidate reads `EMPTY`** → that organ is broken (for whisper, the rpath signature: check `ldd ~/.mesh/whispercpp/main` and `lib*.so.*`), not a "no speech" result.
 
 - [ ] **Step 3: Render the pane with real rows**
 
