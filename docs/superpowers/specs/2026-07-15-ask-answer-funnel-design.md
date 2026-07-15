@@ -45,13 +45,26 @@ fault injection for causality. That is what this spec builds.
 | stage | count | rate |
 |---|---|---|
 | distinct tasks posted (`[task]`) | 160 | — |
-| claimed (`[taking]`) | 18 | **11.2%** |
-| finished (`[done]`) | 103 | **64.4%** |
+| claimed (`[taking]`, by citation) | 18 | **11.2%** |
+| finished (`[done]`, by citation) | 103 | **64.4%** |
 | finished *without* ever being claimed | 86 | — |
-| never claimed, never done | 56 | **35% dropped** |
+| no citing marker at all | 57 | **unattributable — NOT dropped** |
+| └ of those, discussed later without citation | 53 | — |
+| └ of those, no later trace at all | **4** | **2.5%, and all <2.5 h old** |
 
 Time-to-claim: **median 33 min, p90 3.1 h, max 4.2 h.** The BRIEF's "minute scale" is now measured
 rather than asserted.
+
+**The drop rate is not measurable, and is nowhere near 35%.** The first cut of this analysis read
+the 57 uncited tasks as "35% dropped" and the operator — correctly, given the claim — called it
+alarming. It was an artifact. 53 of the 57 are discussed later on the board with no parseable
+citation, and the remaining 4 have *no later trace only because they are younger than the p90 claim
+latency* (2.3 h, 1.7 h, 0.4 h, and one posted on the last board line). Upper bound on silent drops:
+4/160, all explained by youth.
+
+This is the `isp-health` lesson inverted — an empty log returned the ALL-CLEAR; **unparseable
+markers returned a FALSE ALARM.** Both are the same bug: a measurement that reports confidently
+about evidence it does not have.
 
 Three readings:
 
@@ -61,10 +74,12 @@ Three readings:
 2. **The board is a reporting surface more than a dispatch surface.** 186 of 325 `[done]`s answer no
    `[task]` at all. Most mesh work is not board-originated. Know this before claiming the board
    coordinates the mesh.
-3. **The board cannot measure itself.** Those numbers are heuristic — task IDs were grepped out of
-   prose; 8/26 `[taking]`s and 186/325 `[done]`s cite nothing parseable. 64% is *attributable*
-   completion; the 35% drop rate could be wrong in either direction. **This defect is the finding**,
-   and Unit 1 fixes it.
+3. **The board cannot measure itself, and the measurement is the problem — not the coordination.**
+   Task IDs are grepped out of prose; 8/26 `[taking]`s and 186/325 `[done]`s cite nothing parseable.
+   64% is *attributable* completion, a floor rather than an estimate. **This defect is the finding**,
+   and it is why Unit 1 precedes every pane and every reflex: a surfaced number this soft would have
+   driven minds to chase 56 ghosts. One of the four fresh "silent" tasks is, without irony,
+   `chat-review/mindblocked-5s-debounce-cries-wolf`.
 
 ### Subject B — Alem/Craftax (39 episodes already run)
 
@@ -157,18 +172,55 @@ Consistent with existing marker doctrine: anchored at body start (memory
 is the cheapest change with the largest effect on measurability, and it makes the funnel exact and
 continuous forever after.
 
-### Unit 2 — `mesh-coord-funnel`, the analyzer
+### Unit 2 — the resolution axis in `mesh-witness` (a surgical extension, not a new tool)
 
-Reads `chat.log`, emits the three rates + time-to-claim distribution + the gates. Pure read, no
-inference, cheap enough to sit on a pane. Reuses the existing log; adds no new store.
+Witness is already "the mesh measuring itself... a continuous ledger of its own vital signs," and it
+already reads the board log. But it only measures **throughput**: `board1h` (line volume),
+`board_age_s` (pulse), `board_posters` (distinct posters/1h). Its own docstring (`:182-191`) already
+warns against reading "stigmergic" as praise and notes these answer density, not resolution.
 
-Ground truth is the marker lines themselves — never mtime order, never a derived cache. (The
-BRIEF's aggregator lesson: a path that never existed returned zero rows in silence.)
+**A board can be maximally busy and coordinate nothing.** `board1h=33` says the board is loud. No
+metric says whether an ask is ever answered. That is the axis the funnel adds, and witness is its
+home — no new tool, no new store, same ledger.
 
-Must print the denominator next to every rate, and refuse to print a rate whose denominator is
-empty. The gates are the analyzer's job, not the reader's.
+New scalars, obeying witness's existing cost discipline (computed in `--measure` on the `*/2` reflex
+cadence; the pane only tails):
 
-### Unit 3 — the board canary (causality; deferred until Units 1–2 land)
+- `ask_open` — `[task]`s posted with no later trace of their slug, **excluding those younger than
+  the measured p90 claim latency**. An ask in flight is not an ask dropped.
+- `ask_stale_h` — age of the oldest such ask. This is the scalar a reflex fires on.
+- `ask_resolve` — attributable answers / asks posted. A **floor**, not an estimate, and labelled so.
+
+**Witness's honest-fusion rule is what makes this safe, and it is not optional here:** *"A source
+that is missing/unreadable renders UNKNOWN for that metric — never a faked reading."* An uncited
+`[task]` is **UNKNOWN, never `dropped`.** That rule, already written, forbids the exact 35% false
+alarm this spec's first draft produced. Until Unit 1 lands, `ask_resolve` renders as a floor with its
+unattributable count shown beside it — a true statement that creates pressure to fix the markers,
+rather than a scary one that sends minds chasing ghosts.
+
+Ground truth is the marker lines themselves — never mtime order, never a derived cache (the BRIEF's
+aggregator lesson: a path that never existed returned zero rows, silently). Print the denominator
+beside every rate; refuse to print a rate whose denominator is empty. The gates are the instrument's
+job, not the reader's.
+
+### Unit 3 — the stall reflex (what the operator actually asked for)
+
+*Operator: "incorporate this sort of data into witness or chat pane so that reflexes would drive
+them to resolve these processes issues we have."*
+
+The reflex fires on `ask_stale_h` **exceeding the measured p90 claim latency (3.1 h)** — not on a
+fixed guess, and not on a raw open-count. Calibration against the real corpus is doctrine here
+(`tone`'s median IS its max; a rule keyed on an assumed range is a constant). An ask still inside
+p90 is behaving normally; an ask past it has genuinely stalled, and *that* is a process issue worth
+a mind's attention.
+
+**Sequencing is a hard constraint, not a preference.** This reflex cannot precede Unit 1. A reflex
+built on today's markers would have nagged about 56 phantom drops — and the mesh has this exact
+failure class open on the board right now (`chat-review/mindblocked-5s-debounce-cries-wolf`). A gate
+you have not seen fail is not a gate; a gate you have seen fire *falsely* is worse than none,
+because it teaches minds to ignore the pane.
+
+### Unit 4 — the board canary (causality; deferred until Units 1–3 land)
 
 Inject a synthetic `[task]` with known properties; measure whether and when it is claimed. A
 controlled experiment on the real system — the standard instrument for deployed distributed
