@@ -96,6 +96,40 @@ blocking landing; on an unreachable node it exits 2 honestly, never a fake green
 cron → `.mag-state` 5 days stale, yet `--test` green; fixed by `-n 2` + a `--test` gate asserting the
 live read yields 3 axes (`mesh-mag` d657375, `mesh-gyro` ditto).
 
+Extend it to **the test that writes the artifact**: a `--test` must NEVER write to the log a human (or
+a watchdog) reads for liveness — it forges the evidence it exists to check. `mesh-guardian`'s dry-run
+wrote its mock peer into the real `guardian.log`, and `mesh-doctor` runs every tool's `--test` hourly
+at :23, so the log filled with `DOWN test-guardian-peer` / `guardian pass done` — indistinguishable
+from a live pass, while the reflex was **not in cron at all and had never run on this node**. The log
+looked alive because the test was talking. Give the dry-run its own log (`MESH_GUARDIAN_LOG`); and
+note the same trap in the *gate*: the first fix's gate grepped the shared log and passed against the
+bug by reading the PREVIOUS run's line — an assertion that can read another run's artifact asserts
+nothing. Fresh artifact per direction. (2026-07-15, 09f7914.)
+
+Extend it to **the predicate that names a node**: `TG_HOST="imozerov-IdeaPad-…"` gated the keeper that
+restarts the telegram organ. The minds migrated to mesh-home; the predicate went permanently false;
+the keeper body **never executed once**, and the operator's Telegram sat unread 01:28→04:32 while
+every pass logged green. Bind a guard to the thing itself (the organ runs where `BOT_TOKEN` is), never
+to a name that ages out — and make the else-branch **say why it skipped**, so a not-me reads as
+skipped-for-this-reason instead of vanishing into a green pass.
+
+Extend it to **the proxy that is not the claim**: `[ -x "$BIN" ]` is not "it runs". whisper.cpp's
+`main` was executable and died rc=127 on every call for a day — rpath `$ORIGIN` was patched on the
+binary but not on `lib*.so.*`, which kept the deleted build-tree runpath, so its transitive deps never
+resolved. **Executable and loadable are different claims.** `mesh-whisper-run --test` drove
+echobin/errbin/sleep stubs — nice, ionice, flock, admission all genuinely asserted, all green, and it
+never once invoked whisper. Downstream, empty stdout read as "no transcript" → Groq fallback → 403 →
+the operator's voice notes surfaced as `[voice: empty transcript]`. A wrapper's test MUST exercise the
+thing it wraps (transcribe a known wav, assert the known words), exit 2 where the organ is absent.
+(2026-07-15, 974d864.)
+
+Extend it to **the reflex that was never wired**: passing `--test` and running are unrelated facts.
+`mesh-channel-keepalive`/`mesh-mind-keepalive`/`mesh-supervise` all passed green and none was in cron
+or carried a `# reflex-cadence:` header — so nothing relaunched a dead channel mind, the same hole the
+tg organ fell through. And a wired reflex can still be vacuous: `mesh-mind-keepalive` tends
+`MESH_MIND_WIN=plan`, a window the 2026-06-17 re-org deleted — cron it and you get a permanently green
+reflex tending a phantom. Check the reflex has a TARGET THAT EXISTS, not just a cadence. (cc617e5.)
+
 ## Substrate changes & multi-agent coordination
 
 Multiple agents run at once (often the same human directing several). Sensors/compute are a
