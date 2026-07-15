@@ -1,0 +1,288 @@
+#!/usr/bin/env bash
+# mesh-records — the ARCHIVIST: keep every record the mesh makes, measured, before it prunes itself.
+#
+# Operator 2026-07-15: "it would make sense to feed all records that mesh makes here so that you
+# could be deciding what to do with them with grainneukeln." The problem that ask exposes: the mesh
+# records constantly and keeps almost none of it. ~/.mesh/audio-buffer (the overhear ear) is a
+# ROLLING buffer that prunes within the hour; mesh-soundscape keeps only its own winning clip
+# (SS_KEEP_DAYS=2). Everything the mesh hears expires before the sound mind ever gets to decide
+# about it — the mind is handed a corpus that is already gone.
+#
+# So: sweep every record-producing organ, MEASURE each new file through the ear's own analyzer
+# (mesh-soundscape --measure — one measure tract, never a second librosa drifting out of sync),
+# copy it into a capped corpus, and append one line to the LEDGER (~/.mesh/records.log). The ledger
+# is the durable index: it outlives the audio, so a record evicted for space still leaves its
+# measurement behind. mesh-sound-reflex reads the ledger and decides what to grind.
+#
+#   mesh-records            one sweep: archive + measure what's new, prune the corpus
+#   mesh-records --list [n] last n ledger entries (cheap — pure tail, for the dash)
+#   mesh-records --stats    corpus size/count/axis medians (what the reflex calibrates against)
+#   mesh-records --test     real-read gate: measure a real wav, assert dur+beats+axes come back
+#
+# Tunables (env): MESH_REC_MAX_MB=2000 · MESH_REC_KEEP_DAYS=14 · MESH_REC_MAX_PER_SWEEP=8
+#   MESH_REC_MIN_AGE=5 (s — never archive a file still being written) · MESH_REC_DIR · MESH_REC_LOG
+#
+# reflex-cadence: */2 * * * *
+set -uo pipefail
+export PATH="/usr/bin:$HOME/.local/bin:$PATH"
+export LC_ALL=C.UTF-8
+MESH="${MESH_DIR:-$HOME/.mesh}"
+[ -f "$MESH/nodes" ] && . "$MESH/nodes" 2>/dev/null || true
+
+REC_DIR="${MESH_REC_DIR:-$MESH/records}"
+REC_LOG="${MESH_REC_LOG:-$MESH/records.log}"
+SEEN="${MESH_REC_SEEN:-$MESH/.records-seen}"      # content hashes already archived (dedupe key)
+# Derived from the ledger path so a sandboxed --test run locks its OWN file and never contends with
+# (or is silently skipped by) a live cron sweep.
+LOCK="${MESH_REC_LOCK:-$REC_LOG.lock}"
+TICK="${MESH_REC_TICK:-$MESH/.records-tick}"      # liveness marker (mtime = ran, always)
+MAX_MB="${MESH_REC_MAX_MB:-2000}"
+KEEP_DAYS="${MESH_REC_KEEP_DAYS:-14}"
+MAX_PER_SWEEP="${MESH_REC_MAX_PER_SWEEP:-8}"      # bound the librosa cost of one cron sweep
+MIN_AGE="${MESH_REC_MIN_AGE:-5}"                  # s — a file younger than this may still be open
+LOG_KEEP="${MESH_REC_LOG_KEEP:-600}"              # ledger lines retained
+
+# The organs that produce records here. `organ|glob` — organ is the ledger's provenance field, and
+# `drop` (the operator's own jams) is privileged everywhere downstream: it outranks the ear for
+# grinding and is never evicted for space. A gesture beats ambience.
+ORGANS_DEFAULT="drop|$MESH/inbox/*.aac
+drop|$MESH/inbox/*.oga
+drop|$MESH/inbox/*.m4a
+drop|$MESH/inbox/*.wav
+drop|$MESH/inbox/*.mp3
+ear|$MESH/audio-buffer/*.wav
+scape|$MESH/soundscapes/*.wav
+voice|$MESH/voiceref/*.wav"
+ORGANS="${MESH_REC_ORGANS:-$ORGANS_DEFAULT}"
+
+ts_utc(){ date -u +%FT%H:%MZ 2>/dev/null; }
+now(){ date +%s; }
+
+# ── corpus calibration (baked prior) ─────────────────────────────────────────────────────────────
+# MEASURED 2026-07-15 over the whole live corpus (n=29: audio-buffer + soundscapes + voiceref), NOT
+# assumed. The axes are NOT uniform on real material and a naive 0.5 split is wrong on every one of
+# them: real medians are dyn 0.265, act 0.319, move 0.141, rich 0.611. `tone` is DEAD as a
+# discriminator here — its median IS its max (1.000), i.e. every real record reads "tonal", so any
+# rule keyed on it evaluates to a constant (the same shape of bug as mesh-soundscape's threshold-55
+# mix lane that sat above its own ceiling and never fired). mesh-sound-reflex ranks a record against
+# the LIVE corpus once there is enough of it and falls back to these measured medians before then.
+REC_CAL_DYN="${REC_CAL_DYN:-0.265}"
+REC_CAL_ACT="${REC_CAL_ACT:-0.319}"
+REC_CAL_RICH="${REC_CAL_RICH:-0.611}"
+REC_CAL_MOVE="${REC_CAL_MOVE:-0.141}"
+REC_CAL_CENT="${REC_CAL_CENT:-1101.9}"
+REC_CAL_SCORE="${REC_CAL_SCORE:-44.7}"
+
+hash8(){ sha1sum "$1" 2>/dev/null | cut -c1-8; }
+
+# archive_one <organ> <file> -> ledger line on stdout (empty = skipped). Never throws.
+archive_one(){
+  local organ="$1" f="$2" h m dur score beats label dyn act rich move cent dst age
+  [ -f "$f" ] || return 0
+  [ -s "$f" ] || return 0
+  age=$(( $(now) - $(stat -c %Y "$f" 2>/dev/null || echo 0) ))
+  # A file younger than MIN_AGE may still be OPEN (overhear writes audio-buffer wavs continuously).
+  # Archiving a half-written wav gives a truncated copy and a measurement of nothing — wait a sweep.
+  [ "$age" -lt "$MIN_AGE" ] && return 0
+  h="$(hash8 "$f")"; [ -n "$h" ] || return 0
+  # dedupe on CONTENT, not path: a rolling-buffer file surviving two sweeps must land once, and an
+  # identical capture re-appearing under a new name is the same record.
+  grep -qxF "$h" "$SEEN" 2>/dev/null && return 0
+
+  m="$(timeout "${MESH_REC_MEASURE_TIMEOUT:-90}" mesh-soundscape --measure "$f" 2>/dev/null | head -1)"
+  case "$m" in
+    ""|"MEASURE none")
+      # Unmeasurable/near-silent: mark seen anyway so we never re-pay librosa for it every 2 minutes,
+      # and leave a ledger line so the record is accounted for rather than silently vanishing.
+      echo "$h" >> "$SEEN"
+      printf '%s %s %s dur=? score=? beats=? [unmeasurable] -> skip:silent-or-unreadable\n' \
+        "$(ts_utc)" "$organ" "$h"
+      return 0 ;;
+  esac
+  kv(){ grep -oE "(^| )$1=[^ ]+" <<<"$m" | head -1 | cut -d= -f2; }
+  # dur = the WHOLE file; win = the analyzer's winning WINDOW. Both, because `beats` is counted over
+  # the WINDOW, not the file: dividing the file duration by the window's beat count is a category
+  # error that yields a nonsense period (18s/5b = 3600ms), falls outside the detector's honest range,
+  # and silently lands on the 500ms fallback — flattening `l = beat x f` to a constant across every
+  # render. Same shape as the mesh-room-music flat-beat bug fixed the same day. Consumers doing beat
+  # math MUST use win/beats.
+  dur="$(kv total)"; win="$(kv dur)"; score="$(kv score)"; beats="$(kv beats)"; label="$(kv label)"
+  dyn="$(kv dyn)"; act="$(kv act)"; rich="$(kv rich)"; move="$(kv move)"; cent="$(kv cent)"
+
+  dst="$REC_DIR/$(date -u -d "@$(stat -c %Y "$f" 2>/dev/null || now)" +%Y%m%d-%H%M%S 2>/dev/null || date -u +%Y%m%d-%H%M%S)-$organ-$h.${f##*.}"
+  cp -p "$f" "$dst" 2>/dev/null || return 0
+  echo "$h" >> "$SEEN"
+  printf '%s %s %s dur=%s win=%s score=%s beats=%s [%s] dyn=%s act=%s rich=%s move=%s cent=%s -> pending\n' \
+    "$(ts_utc)" "$organ" "$h" "${dur:-?}" "${win:-?}" "${score:-?}" "${beats:-?}" "${label:-?}" \
+    "${dyn:-?}" "${act:-?}" "${rich:-?}" "${move:-?}" "${cent:-?}"
+}
+
+# prune — cap the corpus by age then size, evicting oldest-lowest-score first. Operator drops are
+# NEVER evicted for space: an operator gesture is not ambience and must not be aged out by room hum.
+prune_corpus(){
+  find "$REC_DIR" -type f -mtime +"$KEEP_DAYS" ! -name '*-drop-*' -delete 2>/dev/null
+  local used
+  used=$(( $(du -sm "$REC_DIR" 2>/dev/null | cut -f1 || echo 0) ))
+  [ "$used" -le "$MAX_MB" ] && return 0
+  # score is embedded in the ledger, not the filename — join on the hash. Sort by score asc, mtime
+  # asc, and drop until under the cap.
+  local hash score f
+  while [ "$used" -gt "$MAX_MB" ]; do
+    f="$(for p in "$REC_DIR"/*; do
+           [ -f "$p" ] || continue
+           case "$p" in *-drop-*) continue ;; esac
+           hash="${p##*-}"; hash="${hash%.*}"
+           score="$(grep -F " $hash " "$REC_LOG" 2>/dev/null | tail -1 | grep -oE 'score=[0-9.]+' | cut -d= -f2)"
+           printf '%s\t%s\t%s\n' "${score:-0}" "$(stat -c %Y "$p" 2>/dev/null || echo 0)" "$p"
+         done | sort -k1,1n -k2,2n | head -1 | cut -f3)"
+    [ -n "$f" ] || break
+    rm -f "$f" 2>/dev/null || break
+    used=$(( $(du -sm "$REC_DIR" 2>/dev/null | cut -f1 || echo 0) ))
+  done
+}
+
+case "${1:-}" in
+  --list)
+    n="${2:-6}"
+    [ -s "$REC_LOG" ] && tail -n "$n" "$REC_LOG" || echo "  (no records yet)"
+    exit 0 ;;
+
+  --stats)
+    if [ ! -s "$REC_LOG" ]; then echo "records: none yet ($REC_LOG)"; exit 0; fi
+    cnt="$(ls "$REC_DIR" 2>/dev/null | wc -l)"
+    mb="$(du -sm "$REC_DIR" 2>/dev/null | cut -f1)"
+    echo "corpus: ${cnt} file(s) / ${mb:-0}M (cap ${MAX_MB}M / ${KEEP_DAYS}d) · ledger $(wc -l < "$REC_LOG") line(s)"
+    awk '{for(i=1;i<=NF;i++){split($i,a,"=");
+            if(a[1]=="score"&&a[2]+0>0){s[++n]=a[2]+0}
+            if(a[1]=="dyn"&&a[2]!="?"){d[++m]=a[2]+0}
+            if(a[1]=="act"&&a[2]!="?"){c[++k]=a[2]+0}}}
+         END{if(n){asort(s); asort(d); asort(c);
+             printf "  medians: score %.1f · dyn %.3f · act %.3f  (n=%d — the reflex ranks against these)\n",
+               s[int(n/2)+1], d[int(m/2)+1], c[int(k/2)+1], n}}' "$REC_LOG" 2>/dev/null \
+      || echo "  (medians need gawk)"
+    grep -c ' -> pending' "$REC_LOG" 2>/dev/null | sed 's/^/  pending: /'
+    exit 0 ;;
+
+  --test)
+    fail(){ echo "smoke-test: FAIL ($1)"; exit 1; }
+    # ENV-ABSENT is honest n/a (exit 2), never FAIL: the audio stack + grainneukeln venv only exist on
+    # nodes carrying this sense. mesh-land treats 2 as a pass, so the real-read gate can require the
+    # hardware without blocking a landing on a node that has none. FAIL is reserved for a REAL
+    # regression: env present but the archivist misreads a real wav.
+    na(){ echo "smoke-test: n/a ($1)"; exit 2; }
+    command -v ffmpeg >/dev/null 2>&1 || na "no ffmpeg (audio stack absent)"
+    command -v mesh-soundscape >/dev/null 2>&1 || na "mesh-soundscape absent (measure tract missing)"
+    mesh-soundscape --measure /nonexistent.wav >/dev/null 2>&1
+    [ "$?" = 2 ] || [ "$?" = 1 ] || na "mesh-soundscape --measure not available (old version deployed?)"
+
+    # REAL-READ GATE: archive an actual synthesized wav through the real path and assert the ledger
+    # line carries a real measurement. A sense whose --test only exercises the offline bookkeeping is
+    # HOLLOW — it goes green while the thing it exists to do (measure a record) returns nothing.
+    tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+    src="$tmp/src"; mkdir -p "$src"
+    ffmpeg -v quiet -y -f lavfi \
+      -i "aevalsrc='0.3*(1+sin(2*PI*0.5*t))*sin(2*PI*(300+200*t)*t)':d=14:s=22050" -ac 1 "$src/probe.wav" \
+      || fail "ffmpeg synth failed"
+    touch -d '@1' "$src/probe.wav" 2>/dev/null   # age it past MIN_AGE
+
+    # Drive the REAL entry point against a sandboxed corpus/ledger/seen-index — never the live ones.
+    out="$(MESH_REC_DIR="$tmp/rec" MESH_REC_LOG="$tmp/log" MESH_REC_SEEN="$tmp/seen" \
+           MESH_REC_TICK="$tmp/tick" MESH_REC_ORGANS="drop|$src/*.wav" "$0" 2>&1)"
+    [ -s "$tmp/log" ] || fail "sweep wrote no ledger line for a real 14s wav (real-read gate) — out: $out"
+    l="$(head -1 "$tmp/log")"
+    echo "  ledger: $l"
+    case "$l" in *unmeasurable*) fail "archivist could not measure a real structured 14s signal (real-read gate)";; esac
+    for k in dur win score beats dyn act rich move cent; do
+      grep -qE "(^| )$k=[0-9.]+" <<<"$l" || fail "ledger line missing real '$k' (measurement did not land)"
+    done
+    # win (the analyzer's winning WINDOW) must be present AND <= dur (the whole file). Consumers do
+    # beat math as win/beats; if win silently vanished or took the file duration, the period lands
+    # out of range and the grinder falls back to a constant 500ms on every render — the beat axis
+    # dies while the renders still come out looking fine.
+    wv="$(grep -oE '(^| )win=[0-9.]+' <<<"$l" | grep -oE '[0-9.]+')"
+    dv="$(grep -oE '(^| )dur=[0-9.]+' <<<"$l" | grep -oE '[0-9.]+')"
+    awk -v w="$wv" -v d="$dv" 'BEGIN{exit !(w+0 > 0 && w+0 <= d+0)}' \
+      || fail "win=$wv is not a window within dur=$dv (beat math would take the 500ms fallback)"
+    grep -qE '(^| )dur=[0-9.]+' <<<"$l" || fail "no duration measured"
+    d="$(grep -oE '(^| )dur=[0-9.]+' <<<"$l" | grep -oE '[0-9.]+')"
+    awk -v v="$d" 'BEGIN{exit !(v+0>=10 && v+0<=20)}' || fail "measured dur=$d for a 14s wav (wrong read)"
+    [ "$(ls "$tmp/rec" 2>/dev/null | wc -l)" -ge 1 ] || fail "record was measured but never archived to the corpus"
+    # DEDUPE gate: a second sweep over the same content must NOT re-archive (the rolling buffer
+    # re-presents surviving files every sweep; without content-dedupe the corpus duplicates hourly).
+    MESH_REC_DIR="$tmp/rec" MESH_REC_LOG="$tmp/log" MESH_REC_SEEN="$tmp/seen" \
+      MESH_REC_TICK="$tmp/tick" MESH_REC_ORGANS="drop|$src/*.wav" "$0" >/dev/null 2>&1
+    n="$(ls "$tmp/rec" 2>/dev/null | wc -l)"
+    [ "$n" = 1 ] || fail "re-sweep duplicated an identical record ($n copies — content-dedupe broken)"
+
+    # CONCURRENCY gate: reproduce the live 2026-07-15 race. Content-dedupe is check-then-write, so
+    # two sweeps racing the same NEW record both pass the check and both archive it. Without the
+    # lock this yields 2 ledger rows for one record; with it, exactly 1. This is the steady state
+    # once autowired, not a corner case — a sweep costs ~29s and the cadence is 120s.
+    rm -rf "$tmp/rec2"; mkdir -p "$tmp/rec2"; : > "$tmp/log2"; : > "$tmp/seen2"
+    ffmpeg -v quiet -y -f lavfi -i "aevalsrc='0.4*sin(2*PI*(200+120*t)*t)':d=12:s=22050" -ac 1 "$src/race.wav" \
+      || fail "ffmpeg synth (race probe) failed"
+    touch -d '@1' "$src/race.wav" 2>/dev/null
+    for _ in 1 2; do
+      MESH_REC_DIR="$tmp/rec2" MESH_REC_LOG="$tmp/log2" MESH_REC_SEEN="$tmp/seen2" \
+        MESH_REC_TICK="$tmp/tick2" MESH_REC_ORGANS="drop|$src/race.wav" "$0" >/dev/null 2>&1 &
+    done
+    wait
+    rc="$(grep -c 'race\|drop ' "$tmp/log2" 2>/dev/null || echo 0)"
+    hd="$(awk '{print $3}' "$tmp/log2" 2>/dev/null | sort | uniq -d | wc -l)"
+    [ "$hd" = 0 ] || fail "two concurrent sweeps duplicated a ledger row (TOCTOU race — the lock is not holding)"
+    echo "  concurrency: 2 racing sweeps -> $rc row(s), 0 duplicate hashes"
+    [ -f "$tmp/tick" ] || fail "no liveness touch (mtime-aging watchdogs would read a live archivist as STALE)"
+    echo "smoke-test: ok (archived+measured a real 14s wav -> dur=${d}s, all axes real; content-dedupe holds on re-sweep; liveness touch present; no mic/grind side-effect)"
+    exit 0 ;;
+
+  ""|--sweep) : ;;
+  *) echo "usage: mesh-records [--sweep] | --list [n] | --stats | --test"; exit 1 ;;
+esac
+
+mkdir -p "$REC_DIR"; touch "$SEEN" 2>/dev/null
+
+# SINGLE-WRITER. The dedupe is check-then-write (grep the seen-index, then archive, then append), so
+# two concurrent sweeps both pass the check and both archive the same record — a TOCTOU race that
+# duplicates every ledger row. Not theoretical: caught live 2026-07-15, minutes after mesh-autowire
+# put this on */2 — the cron sweep and a manual sweep interleaved and produced 16 rows from a sweep
+# capped at 8, each hash written twice. It is also self-inflicted at steady state: one sweep costs
+# ~29s of librosa for 8 records, so a backlog (or bigger files) pushes it past the 120s cadence and
+# it races ITSELF. A skipped sweep is free — the next one is 2 minutes away and the work is
+# idempotent — so a held lock exits 0, not an error.
+exec 9>"$LOCK" 2>/dev/null || true
+if command -v flock >/dev/null 2>&1; then
+  flock -n 9 || { [ -t 1 ] && echo "records: another sweep holds the lock — skipping (not an error)"; exit 0; }
+fi
+
+n=0
+while IFS='|' read -r organ glob; do
+  [ -n "${organ:-}" ] || continue
+  for f in $glob; do
+    [ -f "$f" ] || continue
+    [ "$n" -ge "$MAX_PER_SWEEP" ] && break 2
+    line="$(archive_one "$organ" "$f")"
+    [ -n "$line" ] || continue
+    echo "$line" >> "$REC_LOG"
+    n=$((n+1))
+    [ -t 1 ] && echo "$line"
+  done
+done <<< "$ORGANS"
+
+prune_corpus
+tail -n "$LOG_KEEP" "$REC_LOG" > "$REC_LOG.tmp" 2>/dev/null && mv "$REC_LOG.tmp" "$REC_LOG"
+# Keep the seen-index bounded alongside the ledger, but generously: it must outlive the ledger's own
+# window, or a record pruned from the log gets re-archived as "new" the next sweep.
+tail -n 5000 "$SEEN" > "$SEEN.tmp" 2>/dev/null && mv "$SEEN.tmp" "$SEEN"
+
+# mtime = liveness (EVERY successful sweep, whether or not anything was new); content = the ledger's
+# own change-gated write. Decoupling them is the liveness-touch convention: a quiet-but-live
+# archivist must never read as STALE to the mtime-aging watchdogs, and a dead cron never runs, never
+# touches, and stays honestly STALE.
+# --create, not a bare touch: mesh-state-touch SKIPS a missing file by design (it refuses to create a
+# hollow state a consumer would read as real) and still exits 0, so a `|| touch` fallback never fires
+# and the very first sweep leaves no marker at all — the archivist would read STALE from birth.
+if command -v mesh-state-touch >/dev/null 2>&1; then
+  mesh-state-touch --create "$TICK" >/dev/null 2>&1 || touch "$TICK"
+else touch "$TICK"; fi
+[ -t 1 ] && [ "$n" = 0 ] && echo "records: nothing new (corpus $(ls "$REC_DIR" 2>/dev/null | wc -l) files)"
+exit 0
