@@ -509,14 +509,17 @@ Expected: `real read ok: tiny returned N words in X.Xs` then `smoke-test: ok`. I
 
 ```bash
 cd ~/lte-workstation
+cp scripts/mesh-model-bench /tmp/mmb.bak   # back up by COPY — git checkout would revert Step 1-2's work too
 # point the gate at a model that does not exist → the real read must raise, not pass
 sed -i 's|text, wall = _run_whisper("ggml-tiny.bin", fx / "input.wav")|text, wall = _run_whisper("ggml-NOPE.bin", fx / "input.wav")|' scripts/mesh-model-bench
-./scripts/mesh-model-bench --test    # EXPECT: exit 2 "whisper organ absent" — honest n/a
-sed -i 's|text, wall = _run_whisper("ggml-NOPE.bin", fx / "input.wav")|text, wall = _run_whisper("ggml-tiny.bin", fx / "input.wav")|' scripts/mesh-model-bench
-./scripts/mesh-model-bench --test    # EXPECT: ok
+./scripts/mesh-model-bench --test    # EXPECT: exit 1, "the real read raised — the organ is broken, not the test"
+cp /tmp/mmb.bak scripts/mesh-model-bench
+./scripts/mesh-model-bench --test    # EXPECT: smoke-test: ok
 ```
 
-Expected: the break yields a non-zero exit naming the absent model; restore returns ok.
+Expected: the break yields **exit 1** naming the missing model; restore returns ok.
+
+**Why exit 1 and not exit 2 here** — this distinction is the point, not pedantry. `run_test()` returns **2** only when `WHISPER_BIN` itself is absent: the organ is genuinely not on this node, an honest n/a. But if `main` is present and its *model* is missing, the organ is **broken**, and that is a **1**. Getting this backwards is dangerous in one direction only: `mesh-land` counts exit 2 as a pass, so a broken organ reporting n/a disappears into a green board — the node renders its own regression as a capability gap. A false FAIL is loud and gets fixed; a false n/a is silent and does not. When in doubt here, fail loud.
 
 - [ ] **Step 5: Commit**
 
