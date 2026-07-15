@@ -41,12 +41,34 @@ STATE_FILE="${SS_STATE_FILE:-${HOME}/.mesh/.ss-escalation-posted.state}"
 LOG_FILE="${SS_LOG_FILE:-${HOME}/.mesh/ss-connections.log}"
 CLASS_CACHE="${SS_CLASS_CACHE:-${HOME}/.mesh/.ss-ip-class.cache}"
 CLASS_TTL="${SS_CLASS_TTL:-604800}"   # 7 days — AS ownership is stable
+SWEEP_WINDOW="${SS_SWEEP_WINDOW:-8}"  # union the last N sweeps (*/15 cadence -> ~2h)
 
+# current_ips — the union of the unknown sets seen across the last SWEEP_WINDOW sweeps.
+#
+# WAS `tail -1` (fixed 2026-07-15): one sweep line is a SAMPLE, not "the current set". Real clients
+# connect and disconnect; the unknown set oscillates sweep to sweep. Measured on the live log:
+# 95.26.152.231 (residential, ~20 concurrent conns — the heaviest user on the box) was present in
+# 9 of the last 12 sweeps and ABSENT from the newest, so the gate could not see it at all. Two
+# failures, both silent:
+#   1. HIDDEN. A residential unknown — the exact breach signal this gate exists for — is invisible
+#      whenever it happens to be absent from the newest line. Worse for a SHORT visit: an IP that
+#      connects and leaves between sweeps never lands on the last line and is never surfaceable.
+#      The 15:36 escalation named only 78.90.233.46 because the sweep it read was one of the rare
+#      ones without 95.26; the operator got a real but INCOMPLETE ask.
+#   2. THE RECRY, RESURRECTED. State only advances on --commit, so a commit taken on a sweep that
+#      lacked a flapping member makes that member "newly-added" the moment it returns -> POST ->
+#      absent again -> SUPPRESS -> POST... forever, on precisely the residential IPs the gate was
+#      built to stop drowning. The AS classifier killed the hosting-cohort recry; sampling one
+#      sweep reintroduced it for real users.
+# The union is the high-water mark over the window: stable across flap, and it cannot hide a heavy
+# user behind one unlucky draw. Lingering after a member truly leaves is harmless — losses never
+# POST ("only lost members -> SUPPRESS"); the cost is a slightly stale --show, the gain is that a
+# brief unauthorized connection stays surfaceable.
 current_ips() {
-  local line
-  line=$(grep 'unrecognized client IP' "$LOG_FILE" 2>/dev/null | tail -1 || true)
-  [ -z "$line" ] && { echo ""; return; }
-  printf '%s' "$line" | grep -oP '\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b' | sort -u | tr '\n' ' ' | sed 's/ $//'
+  local lines
+  lines=$(grep 'unrecognized client IP' "$LOG_FILE" 2>/dev/null | tail -n "$SWEEP_WINDOW" || true)
+  [ -z "$lines" ] && { echo ""; return; }
+  printf '%s' "$lines" | grep -oP '\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b' | sort -u | tr '\n' ' ' | sed 's/ $//'
 }
 
 # classify_ip <ip> -> echoes one of: hosting | mobile | residential | unknown
@@ -176,9 +198,46 @@ do_test() {
   : > "$C"; seed_state "89.39.95.45 130.255.149.20"; seed_log 2 "130.255.149.20 89.39.95.45"
   out=$(SS_CLASS_OFFLINE=1 run); case "$out" in SUPPRESS\ *) test_ok "reordered same members -> SUPPRESS" ;; *) test_fail "reorder should SUPPRESS: '$out'" ;; esac
 
+  # --- 13: OSCILLATION — a residential IP absent from the NEWEST sweep but present earlier must
+  #     still be seen (the tail-1 defect, 2026-07-15). Every case above seeds a ONE-LINE log, which
+  #     is exactly why the suite could not catch this: `tail -1` and a union are indistinguishable
+  #     on a single sweep. This is the first multi-sweep log in the suite.
+  #     Falsify: restore `tail -1` in current_ips -> this goes red (reads SUPPRESS, the real bug).
+  : > "$C"; seed_state "1.1.1.1"; seed_class 8.8.8.8 residential
+  { append_sweep() { printf '[ss-connections] %s unrecognized client IP(s), not geo-verified breach (%s)\n' "$1" "$2" >> "$L"; }; }
+  : > "$L"
+  append_sweep 2 "1.1.1.1 8.8.8.8"
+  append_sweep 2 "1.1.1.1 8.8.8.8"
+  append_sweep 1 "1.1.1.1"          # newest sweep: the residential client happens to be offline
+  out=$(SS_CLASS_OFFLINE=1 run)
+  case "$out" in
+    POST*8.8.8.8*) test_ok "residential absent from newest sweep is still seen (union window)" ;;
+    *) test_fail "oscillating residential IP hidden by newest sweep: '$out'" ;;
+  esac
+
+  # --- 14: THE LIVE RECRY, reproduced — --commit reads current_ips too, so a commit landing on a
+  #     sweep that happens to lack a flapping member records a SHORT set; the moment the member
+  #     returns it reads newly-added -> POST -> drops -> SUPPRESS -> POST, forever. This is not
+  #     hypothetical: the real 15:36 commit hit one of the 3-in-12 sweeps without 95.26.152.231.
+  #     The union makes --commit record the high-water mark, so the flap cannot re-cry.
+  #     Falsify: restore `tail -1` -> commit records only 1.1.1.1 and the return POSTs (red).
+  run_commit() { SS_LOG_FILE="$L" SS_STATE_FILE="$S" SS_CLASS_CACHE="$C" SS_CLASS_OFFLINE=1 bash "$SELF" --commit; }
+  : > "$C"; : > "$S"; seed_class 8.8.8.8 residential
+  : > "$L"
+  append_sweep 2 "1.1.1.1 8.8.8.8"
+  append_sweep 1 "1.1.1.1"          # newest sweep lacks it — the unlucky draw the real commit hit
+  run_commit >/dev/null 2>&1
+  case "$(sed -n 2p "$S")" in
+    *8.8.8.8*) test_ok "--commit records the flapping member absent from the newest sweep" ;;
+    *) test_fail "--commit recorded a short set: '$(sed -n 2p "$S")'" ;;
+  esac
+  append_sweep 2 "1.1.1.1 8.8.8.8"  # ...and it returns
+  out=$(SS_CLASS_OFFLINE=1 run)
+  case "$out" in SUPPRESS\ *) test_ok "returning member after commit -> SUPPRESS (recry killed)" ;; *) test_fail "flap re-cried after commit: '$out'" ;; esac
+
   rm -rf "$td"
   [ $TESTS_FAILED -gt 0 ] && { echo "smoke-test: FAIL ($TESTS_FAILED)"; exit 1; }
-  echo "smoke-test: ok (AS-classified gate: hosting-churn SUPPRESS / residential+unknown POST / cache TTL / commit / clear / EMPTY / sort-invariance)"
+  echo "smoke-test: ok (AS-classified gate: hosting-churn SUPPRESS / residential+unknown POST / cache TTL / commit / clear / EMPTY / sort-invariance / oscillation+flap across sweeps)"
   exit 0
 }
 
