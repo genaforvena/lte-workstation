@@ -298,6 +298,52 @@ instruments don't have instruments. At some point the regress stops, and what st
 another layer of check. It's going and looking at the artifact: the params log with the flat
 column, the zero-byte file, the `ip link` that says UP while the counters don't move.
 
+## Postscript: what happened when it got a name
+
+I published the first of these two essays at 03:17. I'm writing this line at 05:32. In those
+two hours and fifteen minutes, nineteen commits landed on this codebase, and fourteen of them
+are this bug.
+
+Not similar bugs. This one. A battery sense that proved its classifier against a fixture and
+wired itself onto a desktop with no battery. Three CPU senses with the same shape. A watcher
+that threw away its live run's exit code and wired with an empty watch list. A keeper hardcoded
+to a machine that stopped being the mind node a day ago. A transcription shim whose test drove
+stubs while the real binary died `rc=127` on every call. Two tools that shipped without `+x` —
+deployable, not runnable, which is the first essay's coda wearing a different hat.
+
+Two of them are worth stopping on.
+
+The first essay opens on a health check that looped over `/sys/class/thermal/thermal_zone*`,
+found none — because this is an AMD box and there aren't any — and reported `HW: OK` at 76°C.
+That got fixed before I wrote it. Two hours after publishing, the sweep found *the same
+assumption still alive in a different tool*: `mesh-therm`, reading zones only, structurally
+incapable of reporting HOT since the machine was built. Forty-eight minutes after *that*, it
+turned up a third time, in `mesh-vitals`, because whoever fixed the second one didn't sweep its
+siblings. Same bug, same root assumption, three files, and the second and third only died
+because the first had been given a name.
+
+The other one I can't improve on. A tool called `wifi-heat-attrib` already *had* a real-read
+gate. Written to the doctrine. Citing the canonical hollow-sense case by name, in a comment,
+correctly. And the gate was wrapped in this:
+
+```bash
+if command -v mesh-wifi-temp >/dev/null 2>&1 && mesh-wifi-temp --json >/dev/null 2>&1; then
+  ... assert a real verdict + temp_c ...
+```
+
+Someone read the lesson, agreed with it, cited it, implemented it — and switched it off with
+the exact condition it existed to catch. Knowing about this bug class does not protect you from
+it. I have now written two essays about it and walked into it three times in one night.
+
+That's the actual finding, and it's not a flattering one. These fourteen bugs were not
+introduced tonight. They'd been running for days or months, quietly, on a system that looked
+fine. What changed at 03:17 wasn't the code. It's that the shape got a name, and a name is a
+search query. Before it had one, each of these looked like its own little quirk — a thermal
+thing, a wifi thing, a battery thing — and there was nothing to count. You cannot grep for a
+pattern you haven't named. You can't even *notice* it twice.
+
 So: go read one of your logs. Not the alerts — the boring column nobody looks at, the one
 that's been the same value for a week. That's not stability. Ask when it last changed, and
-whether anything is still measuring it.
+whether anything is still measuring it. Then name whatever you find, out loud, in a sentence
+someone else could repeat. That's the part that scales. Fourteen in two hours, and the only
+thing I did was give it a name.
