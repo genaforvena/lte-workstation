@@ -1,0 +1,164 @@
+#!/home/mesh-home/.venv-ai/bin/python
+# orphan-ok: node-bound room-ears transcriber daemon (started by mesh-room-gigaam.service on mesh-home).
+# mesh-room-gigaam — keep ~/.mesh/room-transcript.txt live using GigaAM v2 (Sber, Russian-specialised
+# CTC/NAR ASR on the RTX 3060). Chosen over whisper tiny/turbo because it is SOTA for Russian AND,
+# being non-autoregressive, does NOT hallucinate text on silence/music (whisper invents
+# "субтитры создавал…" / "динамичная музыка" on non-speech — the garbage the operator flagged).
+#
+# Loads the model ONCE (GPU-warm) then transcribes each new 18s audio-buffer chunk the
+# mesh-overhear --daemon writes. Chunks are <25s so the plain .transcribe() path fits. An RMS
+# energy gate skips near-silence before hitting the model. Prunes to OH_KEEP_MIN minutes.
+import os, sys, time, glob, wave, audioop, re
+
+HOME = os.path.expanduser("~")
+BUF  = os.path.join(HOME, ".mesh", "audio-buffer")
+OUT  = os.path.join(HOME, ".mesh", "room-transcript.txt")
+MARK = os.path.join(HOME, ".mesh", ".room-gigaam-last")
+KEEP_MIN = int(os.environ.get("OH_KEEP_MIN", "10"))
+EVERY    = int(os.environ.get("ROOM_TRANSCRIBE_EVERY", "8"))
+RMS_MIN  = int(os.environ.get("ROOM_RMS_MIN", "120"))   # below this = silence, skip the model
+MODEL    = os.environ.get("GIGAAM_MODEL", "v2_ctc")
+
+def log(m): print(m, flush=True)
+
+def transcribe_text(model, path):
+    """The real extraction path. gigaam returns a TranscriptionResult (.text), NOT a str —
+    calling .strip() on it raises AttributeError and kills the daemon on its first non-silent
+    chunk. --test drives THIS, so the gate covers the extraction, not just the model."""
+    r = model.transcribe(path)
+    return str(getattr(r, "text", r) or "").strip()
+
+def is_speech(txt):
+    return len(re.sub(r"[^\w]", "", txt)) >= 3
+
+def chunk_rms(path):
+    try:
+        w = wave.open(path, "rb"); d = w.readframes(w.getnframes()); w.close()
+        return audioop.rms(d, 2)
+    except Exception:
+        return 0
+
+def read_last():
+    try:
+        return int(open(MARK).read().strip())
+    except Exception:
+        return 0
+
+def prune(out=OUT, keep_min=KEEP_MIN):
+    if not os.path.exists(out):
+        return
+    cutoff = time.time() - keep_min * 60
+    keep = []
+    for ln in open(out, encoding="utf-8", errors="replace"):
+        m = re.match(r"\[(\d\d):(\d\d):(\d\d)\]", ln)
+        if m:
+            h, mi, s = map(int, m.groups())
+            lt = time.localtime()
+            t = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, h, mi, s, 0, 0, -1))
+            if t > time.time() + 60:   # rolled past midnight → belongs to yesterday
+                t -= 86400
+            if t < cutoff:
+                continue
+        keep.append(ln)
+    open(out, "w", encoding="utf-8").write("".join(keep))
+
+PIPER = os.path.join(HOME, ".mesh", "piper", "piper", "piper")
+VOICE = os.path.join(HOME, ".mesh", "piper", "voices", "ruslan.onnx")
+
+def run_test():
+    """Real-read gate: synthesise a KNOWN Russian utterance with piper, transcribe it through
+    the daemon's own path, assert the known words come back. Exit 2 (honest n/a) only when this
+    node genuinely lacks the organ — never a default that looks like a pass. Writes nothing to
+    OUT/MARK: a test that writes the liveness artifact forges the evidence it exists to check."""
+    import subprocess, tempfile, shutil
+    try:
+        import gigaam
+    except Exception as e:
+        log("n/a: gigaam not importable on this node (%s)" % e); return 2
+    if not (os.path.exists(PIPER) and os.path.exists(VOICE)):
+        log("n/a: piper+ruslan voice absent — no fixture source on this node"); return 2
+
+    tmp = tempfile.mkdtemp(prefix="gigaam-test-")
+    try:
+        say, want = "Привет, это проверка комнаты.", ["привет", "проверка", "комнаты"]
+        wav = os.path.join(tmp, "fixture.wav")
+        p = subprocess.run([PIPER, "--model", VOICE, "--output_file", wav],
+                           input=say.encode(), capture_output=True)
+        if p.returncode != 0 or not os.path.exists(wav) or os.path.getsize(wav) < 1000:
+            log("FAIL: piper produced no fixture (rc=%s)" % p.returncode); return 1
+
+        model = gigaam.load_model(MODEL)
+        txt = transcribe_text(model, wav)          # the REAL path, incl. .text extraction
+        if not isinstance(txt, str):
+            log("FAIL: transcribe_text returned %s, not str" % type(txt)); return 1
+        low = txt.lower()
+        miss = [w for w in want if w not in low]
+        if miss:
+            log("FAIL: known words %s missing from %r" % (miss, txt)); return 1
+        if not is_speech(txt):
+            log("FAIL: is_speech() rejected a real utterance %r" % txt); return 1
+        log("pass: real read -> %r" % txt)
+
+        # silence must be gated BEFORE the model (the anti-hallucination claim)
+        sil = os.path.join(tmp, "silence.wav")
+        w = wave.open(sil, "wb"); w.setnchannels(1); w.setsampwidth(2); w.setframerate(16000)
+        w.writeframes(b"\x00\x00" * 16000); w.close()
+        if chunk_rms(sil) >= RMS_MIN:
+            log("FAIL: silence rms %d >= RMS_MIN %d — gate open" % (chunk_rms(sil), RMS_MIN)); return 1
+        if chunk_rms(wav) < RMS_MIN:
+            log("FAIL: real speech rms %d < RMS_MIN %d — gate shuts on speech" % (chunk_rms(wav), RMS_MIN)); return 1
+        log("pass: rms gate (silence %d < %d <= speech %d)" % (chunk_rms(sil), RMS_MIN, chunk_rms(wav)))
+
+        # prune against a TEMP transcript — never the live one
+        out = os.path.join(tmp, "transcript.txt")
+        old = time.strftime("%H:%M:%S", time.localtime(time.time() - (KEEP_MIN + 5) * 60))
+        new = time.strftime("%H:%M:%S", time.localtime())
+        open(out, "w", encoding="utf-8").write("[%s] stale\n[%s] fresh\n" % (old, new))
+        prune(out=out, keep_min=KEEP_MIN)
+        kept = open(out, encoding="utf-8").read()
+        if "stale" in kept or "fresh" not in kept:
+            log("FAIL: prune kept %r" % kept); return 1
+        log("pass: prune drops >%dmin, keeps fresh" % KEEP_MIN)
+        return 0
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+if "--test" in sys.argv:
+    sys.exit(run_test())
+
+log("mesh-room-gigaam: loading %s ..." % MODEL)
+import gigaam
+model = gigaam.load_model(MODEL)
+try:
+    import torch
+    log("mesh-room-gigaam: model up (cuda=%s)" % torch.cuda.is_available())
+except Exception:
+    log("mesh-room-gigaam: model up")
+
+while True:
+    last = read_last()
+    newest = last
+    for W in sorted(glob.glob(os.path.join(BUF, "*.wav"))):
+        b = os.path.basename(W)[:-4]
+        try:
+            ep = int(b[:10])
+        except ValueError:
+            continue
+        if ep <= last:
+            continue
+        newest = max(newest, ep)
+        if chunk_rms(W) < RMS_MIN:      # silence → nothing to say (no hallucination)
+            continue
+        try:
+            txt = transcribe_text(model, W)
+        except Exception as e:
+            log("transcribe error %s: %s" % (b, e))
+            continue
+        if is_speech(txt):
+            stamp = time.strftime("%H:%M:%S", time.localtime(ep))
+            with open(OUT, "a", encoding="utf-8") as f:
+                f.write("[%s] %s\n" % (stamp, txt))
+    if newest > last:
+        open(MARK, "w").write(str(newest))
+    prune()
+    time.sleep(EVERY)
