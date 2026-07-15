@@ -130,6 +130,26 @@ tg organ fell through. And a wired reflex can still be vacuous: `mesh-mind-keepa
 `MESH_MIND_WIN=plan`, a window the 2026-06-17 re-org deleted — cron it and you get a permanently green
 reflex tending a phantom. Check the reflex has a TARGET THAT EXISTS, not just a cadence. (cc617e5.)
 
+Extend it to **the gate that greps its own source**: `grep -q '<literal>' "$0"` ALWAYS finds at least
+one line — **the grep line itself**. The gate asserts its own text and can never fail. `mesh-land`
+carried two ("the self-heal exists", "the self-heal is ff-gated") guarding the mesh's only unattended
+push; deleting that push entirely still yielded `smoke-test: ok`. Swept 2026-07-15: **33 of 52**
+self-grep gates across 20+ tools are self-matching. The 19 survivors pass only by ESCAPING metachars
+(`idle_exposure_tick "\$id"`) so the pattern-as-written differs from the pattern-as-matched — an
+accident of quoting, not a designed gate. Detector: run the pattern against the grep LINE alone; a
+match means vacuous. But the deeper rule is that **source text is never behaviour** — even a
+non-self-matching self-grep only proves a string is present, not that the code RUNS. Assert the
+ARTIFACT (drive a real push at a real bare origin, assert the ref MOVES). Same family as the
+`--test`-that-drives-only-stubs (974d864) and the assertion that read the previous run's log line
+(09f7914). (2026-07-15, 1969a5d.)
+
+Extend it to **the push that only happens when something else does**: every path that got the genome
+onto origin was conditional on THAT run having work to land — `--autoland` carried the self-heal but
+exits at "nothing settled" before reaching it (and was in no crontab at all); `--apply` pushes only
+what it just committed. Minds commit in their own panes, satisfying neither, so **55 commits sat local
+for 11h** and the OPERATOR noticed before any reflex did — none was looking. A step that everything
+depends on must have its own unconditional cadence, not ride inside a conditional path. (1969a5d.)
+
 ## Substrate changes & multi-agent coordination
 
 Multiple agents run at once (often the same human directing several). Sensors/compute are a
