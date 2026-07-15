@@ -63,6 +63,24 @@ is_skip_sentinel(){ case "$1" in none|None|NONE|@reboot|on-demand|manual|off) re
 # a cron schedule = 5 fields (min hr dom mon dow), each from the cron charset. Reject anything else
 # (don't inject a malformed/garbage line into crontab).
 valid_cadence(){ printf '%s' "$1" | grep -qE '^[-0-9*,/ ]+$' && [ "$(printf '%s' "$1" | awk '{print NF}')" = 5 ]; }
+# THE MESH HAS TWO SCHEDULERS, and this tool could only see one. reflexes.cron is ours; the OTHER is
+# mesh-liveness-loop's TASKS table (user systemd, deliberately cron-free). A tool present in both runs
+# TWICE per cadence, seconds apart — and the harm is correctness, not cost: mesh-node-care commits a
+# state only after "2 consecutive identical raw reads", a guard whose whole meaning is 2 reads ONE
+# CADENCE apart. Two runs in the same minute collapse that window, so one dropped SSH probe reads twice
+# and commits — phaedra posted [node-down] at 10:35Z with its uptime monotonic straight through
+# (47225→47245m). It never left. Same shape for any debounce/hysteresis reflex.
+# The liveness path is a PARAMETER so --test drives this against fixtures, not the live scheduler.
+LIVENESS_SRC="${MESH_LIVENESS_SRC-$(command -v mesh-liveness-loop 2>/dev/null || true)}"
+liveness_tasks(){ # $1=liveness-loop script → basenames of every tool in its TASKS table (empty if unreadable)
+  [ -n "${1:-}" ] && [ -r "$1" ] || return 0
+  sed -n '/^TASKS=(/,/^)/p' "$1" 2>/dev/null \
+    | sed -nE 's@^[[:space:]]*"[^"|]*\|[0-9]+\|([^ "]+).*@\1@p' | sed -E 's@.*/@@'
+}
+# FAIL-OPEN by design: an unreadable/absent liveness-loop yields no tasks → nothing is skipped. A
+# broken read must never mute the whole autowire pass (that would be a silent fallback wearing a
+# green face — the exact trap in doctrine); it may only fail to catch a duplicate.
+liveness_scheduled(){ liveness_tasks "${2-$LIVENESS_SRC}" | grep -qxF "$1"; }
 # stdout journal for a wired reflex: <name-sans-mesh>.log — UNLESS the tool itself references an
 # artifact of that exact name (its own structured log/telemetry): appending cron stdout there
 # mixes human status lines into the tool's data (the mesh-gpu-activity → gpu-activity.log
@@ -102,6 +120,40 @@ if [ "${1:-}" = --test ]; then
   is_skip_sentinel "@reboot" || { echo "smoke-test: FAIL (@reboot not recognized as skip)"; exit 1; }
   is_skip_sentinel "on-demand" || { echo "smoke-test: FAIL (on-demand not recognized as skip)"; exit 1; }
   is_skip_sentinel "*/10" && { echo "smoke-test: FAIL (real cadence misread as sentinel)"; exit 1; }
+
+  # --- double-scheduling gate (chat-review/node-care-double-scheduled) ---
+  # Fixture mirrors mesh-liveness-loop's REAL TASKS syntax: "name|cadence_sec|command [args]".
+  cat > "$td/liveness" <<'EOF'
+#!/usr/bin/env bash
+TASKS=(
+  "consume-ensure|60|mesh-consume-all"
+  "node-care|300|mesh-node-care"
+  "session-watchdog|600|mesh-session-watchdog --edge"
+  "restore|300|/home/x/.local/bin/mesh-restore"
+)
+EOF
+  # in the table → caught (the bug: this returned false, so cron wired a second copy)
+  liveness_scheduled mesh-node-care "$td/liveness" || { echo "smoke-test: FAIL (mesh-node-care in TASKS not detected)"; exit 1; }
+  # with args → the command's first token is what schedules
+  liveness_scheduled mesh-session-watchdog "$td/liveness" || { echo "smoke-test: FAIL (task with args not detected)"; exit 1; }
+  # full-path command form → basename must match
+  liveness_scheduled mesh-restore "$td/liveness" || { echo "smoke-test: FAIL (absolute-path task not detected)"; exit 1; }
+  # NOT in the table → must still wire (a blanket skip would strand every real reflex)
+  liveness_scheduled mesh-tick "$td/liveness" && { echo "smoke-test: FAIL (mesh-tick absent from TASKS but reported scheduled)"; exit 1; }
+  # substring must not match: node-care is in the table, node-care-extra is NOT
+  liveness_scheduled mesh-node-care-extra "$td/liveness" && { echo "smoke-test: FAIL (substring false-positive)"; exit 1; }
+  # a task name is not a tool name (field 1 must not be read as the command)
+  liveness_scheduled node-care "$td/liveness" && { echo "smoke-test: FAIL (TASKS field-1 label matched as a tool)"; exit 1; }
+  # lines outside the TASKS array must not be harvested
+  printf 'OTHER=(\n  "x|60|mesh-decoy"\n)\n' >> "$td/liveness"
+  liveness_scheduled mesh-decoy "$td/liveness" && { echo "smoke-test: FAIL (harvested a non-TASKS array)"; exit 1; }
+  # FAIL-OPEN: no liveness-loop → no tasks → nothing skipped (never mute the whole pass)
+  liveness_scheduled mesh-node-care "$td/nonexistent" && { echo "smoke-test: FAIL (absent liveness-loop must not report scheduled)"; exit 1; }
+  [ -z "$(liveness_tasks "$td/nonexistent")" ] || { echo "smoke-test: FAIL (absent liveness-loop yielded tasks)"; exit 1; }
+  # and it reads the LIVE scheduler when deployed — the table is non-empty on a mind node
+  if [ -n "$LIVENESS_SRC" ] && [ -r "$LIVENESS_SRC" ]; then
+    [ -n "$(liveness_tasks "$LIVENESS_SRC")" ] || { echo "smoke-test: FAIL (live mesh-liveness-loop present but its TASKS table parsed EMPTY — syntax drifted, gate is blind)"; exit 1; }
+  fi
   # journal-collision guard: a tool writing its own <stem>.log must NOT get that as its journal
   printf '#!/bin/sh\nLOG="$HOME/.mesh/fixt.log"\n' > "$td/mesh-fixt"
   [ "$(journal_of "$td/mesh-fixt" mesh-fixt)" = '$HOME/.mesh/fixt.cron.log' ] \
@@ -170,6 +222,10 @@ for tool in "$BIN"/mesh-*; do
   if ! valid_cadence "$cad"; then echo "$(ts) SKIP $name: malformed reflex-cadence '$cadraw'" >> "$LOG"; continue; fi
   # already wired? (present in the desired set OR the live crontab)
   if grep -qE "[/]$name( |$)" "$CRON" 2>/dev/null || crontab -l 2>/dev/null | grep -qE "[/]$name( |$)"; then continue; fi
+  # already scheduled by the OTHER scheduler? (chat-review/node-care-double-scheduled, 2026-07-15)
+  if liveness_scheduled "$name"; then
+    echo "$(ts) SKIP $name: mesh-liveness-loop's TASKS table already schedules it — wiring cron too would DOUBLE-SCHEDULE (collapses debounce windows into the same minute → false edges)" >> "$LOG"; continue
+  fi
   args="$(args_of "$tool")"
   line="$cad \$HOME/.local/bin/$name${args:+ $args} >> $(journal_of "$tool" "$name") 2>&1   # autowired $(date -u +%F)"
   if [ "$CHECK" = 1 ]; then echo "WOULD WIRE: $line"; continue; fi
