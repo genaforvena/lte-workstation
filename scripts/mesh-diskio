@@ -24,7 +24,10 @@
 #
 # Exit codes (honest-exit contract):
 #   0 = assessment produced
-#   2 = /proc/diskstats unreadable — cannot assess, never faked
+#   1 = a real defect (root IS a block device but we cannot read its stats)
+#   2 = nothing to assess on this node: /proc/diskstats unreadable, or root is not
+#       block-backed (overlay/NFS/tmpfs). n/a is a claim about the NODE, never a
+#       place to park our own bugs — see the exit-2 note at the sampling site.
 set -uo pipefail
 export PATH="$HOME/.local/bin:$PATH"
 [ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
@@ -33,22 +36,43 @@ DISKSTATS="/proc/diskstats"
 STATE_FILE="$HOME/.mesh/.diskio-state"
 
 # --- Read /proc/diskstats for the root disk (nvme0n1 or sda) ---
-# Returns: total_reads_sectors total_writes_sectors total_reads_io total_writes_io
+# Returns: total_reads_sectors total_writes_sectors total_reads_io total_writes_io time_ms
+#
+# COLUMN MAP — verified by controlled write, not by counting. The kernel doc
+# (Documentation/admin-guide/iostats.rst) numbers "Field 1 = reads completed", but that
+# is COLUMN 4 here: major, minor, name come first. Reading the doc's numbers as awk's
+# columns is off by three, which is exactly what this tool did ($7,$11,$6,$10,$12 =
+# ms-reading, ms-writing, sectors-read, sectors-written, ios-in-progress). Every axis
+# was mislabelled: throughput came from MILLISECOND deltas (so read/write KB/s sat at 0
+# forever, even under a 400MB direct write) and "iops" was really sectors/s, ~1500x over
+# its own >50 threshold, pinning the verdict at PRESSURED. The tell was in the output's
+# own words: "PRESSURED — read=0 KB/s write=0 KB/s" — under load with zero throughput.
+# Re-derive with `dd oflag=direct` and diff the columns; do not trust the numbering.
+#   $4 reads completed   $5 reads merged   $6 sectors read     $7 ms reading
+#   $8 writes completed  $9 writes merged  $10 sectors written $11 ms writing
+#   $12 ios in progress  $13 ms doing I/O  $14 weighted ms
 read_diskstats() {
   local dev="$1"
   awk -v d="$dev" '$3 == d {
-    # field  6 = reads completed,  10 = writes completed
-    # field  5 = reads merged (skip),  9 = writes merged (skip)
-    # field  7 = sectors read,  11 = sectors written
-    # field  12 = time doing I/O (ms)
-    printf "%d %d %d %d %d\n", $7, $11, $6, $10, $12
+    printf "%d %d %d %d %d\n", $6, $10, $4, $8, $13
   }' "$DISKSTATS" 2>/dev/null
 }
 
 # Find the root disk name from mounted root
+# /proc/diskstats names devices by KERNEL name, so a df path that is a symlink
+# (every LVM/crypt root: /dev/mapper/<vg>-<lv> → /dev/dm-N) must be resolved
+# before basename — else we search diskstats for a name it can never contain.
+# The raw df source for / — a path for any block-backed root, a bare word
+# ("overlay", "tmpfs") otherwise. The n/a claim is made on THIS, never on the
+# resolved kernel name: a name-resolution bug must not be able to answer
+# "is root block-backed?" — that is how it would launder itself into an n/a.
+root_src_path() { df / 2>/dev/null | tail -1 | awk '{print $1}'; }
+
 find_root_disk() {
   local dev
-  dev="$(df / 2>/dev/null | tail -1 | awk '{print $1}')"
+  dev="$(root_src_path)"
+  # /dev/mapper/ubuntu--vg-ubuntu--lv → /dev/dm-0 (no-op for a real device node)
+  [ "${dev#/}" != "$dev" ] && dev="$(readlink -f "$dev" 2>/dev/null || echo "$dev")"
   dev="$(basename "$dev")"
   # NVMe: nvme0n1p5 → nvme0n1 (strip pN partition suffix)
   if [[ "$dev" =~ ^nvme[0-9]+n[0-9]+p[0-9]+$ ]]; then
@@ -108,11 +132,54 @@ if [ "${1:-}" = --test ]; then
   # /proc/diskstats must be readable
   [ -r "$DISKSTATS" ] || { echo "smoke-test: FAIL ($DISKSTATS not readable)"; exit 1; }
 
-  # Root disk must be found and have stats
+  # Root disk must be found and have stats. THIS is the real-read gate: it is what
+  # caught the LVM bug (root resolved to 'ubuntu--vg-ubuntu--lv', a name /proc/diskstats
+  # can never contain) and it goes red the moment name resolution regresses.
   _disk="$(find_root_disk)"
   [ -n "$_disk" ] || { echo "smoke-test: FAIL (can't find root disk)"; exit 1; }
   _ds="$(read_diskstats "$_disk")"
   [ -n "$_ds" ] || { echo "smoke-test: FAIL (no stats for $_disk)"; exit 1; }
+
+  # Non-empty is not correct: the shipped mapping returned five perfectly parseable
+  # numbers off the WRONG columns and sailed through this gate for the tool's whole life.
+  # Bind to a PHYSICAL invariant instead — an I/O transfers at least one sector, so
+  # sectors >= completed-IOs always. The old mapping had sectors=ms-reading(276593) and
+  # ios=sectors-read(103952066): 1000x inverted, red on sight.
+  read -r _t_rsec _t_wsec _t_rio _t_wio _t_ms <<< "$_ds"
+  [ "$_t_rsec" -ge "$_t_rio" ] || { echo "smoke-test: FAIL (sectors_read=$_t_rsec < reads_completed=$_t_rio — impossible; column mapping is wrong)"; exit 1; }
+  [ "$_t_wsec" -ge "$_t_wio" ] || { echo "smoke-test: FAIL (sectors_written=$_t_wsec < writes_completed=$_t_wio — impossible; column mapping is wrong)"; exit 1; }
+
+  # The invariant still cannot prove the axis MOVES. Drive a real write and assert the
+  # sense sees it: the old code reported write_kb_s=0 under a 400MB direct write (it was
+  # differencing MILLISECONDS) and no offline assertion could ever notice. HOME is
+  # sandboxed so this child cannot forge the real .diskio-state — a --test must never
+  # write the artifact a watchdog reads for liveness.
+  _tl="$(mktemp -d)"; mkdir -p "$_tl/.mesh"
+  ( dd if=/dev/zero of="$_tl/probe" bs=1M count=20000 oflag=direct 2>/dev/null ) & _dd=$!
+  sleep 0.3
+  _live="$(HOME="$_tl" "$0" --json 2>/dev/null)"
+  kill $_dd 2>/dev/null; wait $_dd 2>/dev/null
+  _wkb="$(printf '%s' "$_live" | sed -n 's/.*"write_kb_s":\([0-9]*\).*/\1/p')"
+  rm -rf "$_tl"
+  [ -n "$_wkb" ] || { echo "smoke-test: FAIL (no write_kb_s in live --json: $_live)"; exit 1; }
+  [ "$_wkb" -gt 100 ] || { echo "smoke-test: FAIL (write_kb_s=$_wkb under a sustained direct write — the throughput axis is dead, not idle)"; exit 1; }
+
+  # The exit-2 branch must be a claim about the NODE, not a hiding place for our own
+  # bugs. Drive the LIVE path with a stubbed df reporting a non-block-backed root and
+  # assert it exits 2. The shim genuinely bites (there is no df in ~/.local/bin, so the
+  # tool's PATH re-export cannot shadow it) — confirmed by it MOVING the verdict off the
+  # real reading. Without this, the first fix's own /sys/block guard silently laundered a
+  # broken resolution back into "nothing to measure" — the very failure being fixed.
+  _tn="$(mktemp -d)"
+  printf '#!/bin/sh\necho "Filesystem 1K-blocks Used Avail Use%%%% Mounted"\necho "overlay 1 1 1 1%%%% /"\n' > "$_tn/df"
+  chmod +x "$_tn/df"
+  _na_out="$(PATH="$_tn:$PATH" "$0" 2>&1)"; _na_rc=$?
+  rm -rf "$_tn"
+  [ "$_na_rc" = 2 ] || { echo "smoke-test: FAIL (non-block-backed root must exit 2 honest-n/a, got rc=$_na_rc: $_na_out)"; exit 1; }
+  case "$_na_out" in
+    *"not block-backed"*) : ;;
+    *) echo "smoke-test: FAIL (exit-2 must name the NODE's limit, got: $_na_out)"; exit 1 ;;
+  esac
 
   [ "$fail" = 0 ] || { echo "smoke-test: FAIL ($fail assertion(s))"; exit 1; }
   echo "smoke-test: ok (classify: 6 assertions + /proc/diskstats readable + root disk=$_disk)"
@@ -124,15 +191,26 @@ ROOT_DISK="$(find_root_disk)"
 [ -n "$ROOT_DISK" ] || { echo "mesh-diskio: can't determine root disk" >&2; exit 2; }
 
 # --- Sample 1: snapshot now ---
+# Absent-from-diskstats is NOT the same claim as diskstats-unreadable. Conflating
+# them under exit 2 is what hid this sense's death: a resolution bug rendered as an
+# honest "no organ here" (which doctor/land count as a pass) for its whole life.
+# 2 only where root is genuinely not block-backed (overlay/NFS/tmpfs root — nothing
+# to measure); a root block device missing from a READABLE diskstats is a defect: exit 1, loud.
+[ -r "$DISKSTATS" ] || { echo "mesh-diskio: $DISKSTATS unreadable — cannot assess" >&2; exit 2; }
+# -b follows symlinks, so /dev/mapper/<vg>-<lv> answers true here even when our own
+# name resolution is broken — which is the point: block-backed is a fact about the
+# NODE, established independently of the code path under suspicion.
+_src="$(root_src_path)"
+[ -b "$_src" ] || { echo "mesh-diskio: root '$_src' is not block-backed — nothing to measure" >&2; exit 2; }
 now_read="$(read_diskstats "$ROOT_DISK")"
-[ -n "$now_read" ] || { echo "mesh-diskio: /proc/diskstats unreadable for $ROOT_DISK" >&2; exit 2; }
+[ -n "$now_read" ] || { echo "mesh-diskio: root block device '$ROOT_DISK' absent from a readable $DISKSTATS — device-name resolution is broken, not a missing organ" >&2; exit 1; }
 now_epoch="$(date +%s)"
 read -r nr_sectors nw_sectors nr_ios nw_ios _ <<< "$now_read"
 
 # --- Sample 2: wait 1s, snapshot again ---
 sleep 1
 later_read="$(read_diskstats "$ROOT_DISK")"
-[ -n "$later_read" ] || { echo "mesh-diskio: /proc/diskstats unreadable on second sample" >&2; exit 2; }
+[ -n "$later_read" ] || { echo "mesh-diskio: '$ROOT_DISK' vanished from $DISKSTATS between samples" >&2; exit 1; }
 later_epoch="$(date +%s)"
 read -r lr_sectors lw_sectors lr_ios lw_ios _ <<< "$later_read"
 
@@ -157,6 +235,16 @@ reason="${fused#*|}"
 
 # --- Output ---
 ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+# --- State artifact ---
+# STATE_FILE was declared and never written: a 10-min reflex with nowhere to produce
+# TO leaves no artifact for a consumer and nothing for the mtime-aging watchdogs, so
+# the lane reads as absent rather than dead. Written on EVERY successful eval (this
+# sense has no change-gate), which is also what puts `diskio` on the health pane —
+# mesh-dash's state_wall globs .[a-z]*-state.
+printf '%s|read_kb_s=%s|write_kb_s=%s|iops=%s|disk=%s|%s\n' \
+  "$state" "$read_kb" "$write_kb" "$iops" "$ROOT_DISK" "$ts" > "$STATE_FILE"
+mesh-state-touch "$STATE_FILE" 2>/dev/null || true
 
 if [ "${1:-}" = --json ]; then
   printf '{"state":"%s","read_kb_s":%d,"write_kb_s":%d,"iops":%d,"disk":"%s","ts":"%s"}\n' \
