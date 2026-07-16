@@ -1,0 +1,333 @@
+#!/usr/bin/env bash
+# reflex-cadence: 2-59/5 * * * *
+# mesh-room-sense-loss — WAKE THE ROOM MIND WHEN IT LOSES A SENSE (operator 2026-07-16: "the room mind
+# was NOT woken when it lost one of its VISIONS"). The room's own reflex for organ health: it watches the
+# room mind's DECLARED senses and, on a LIVE->dead EDGE, POKES the mind (mesh-tell room) so it wakes,
+# notices its eyes/ears went dark, and acts AT ITS DISCRETION — revive the organ, or tell the operator.
+#
+# THE GAP THIS FILLS (confirmed 2026-07-16): mesh-cam-watch.service went inactive ~Jul-15 05:09 (the room
+# mind's local camera — its eyes) and NOTHING woke the room for ~30h. mesh-room-reflex fires ONLY on
+# transcript name/ambient speech (zero organ-health awareness); mesh-sense-monitor fuses cam liveness into
+# a DISPLAY pane but never pokes a mind; mesh-room-sense silently degrades cam->UNKNOWN. A dash SHOWS a
+# dead organ; nothing WAKES the mind about it. This reflex is that missing edge-triggered wake.
+#
+# POLARITY — FAIL LOUD, the OPPOSITE of the address gate. mesh-room-address fails OPEN toward SILENCE
+# (its job is to REMOVE false wakes; when unsure it suppresses). This reflex fails LOUD toward WAKING:
+# a sense that was LIVE and now reads DEAD *or* UNKNOWN (can't-tell) is treated as a loss worth a poke.
+# A missing sense that was NEVER live here (camera-less node: the unit isn't installed) reads UNKNOWN
+# from the first sight and seeds silently — it is not a loss, so it never cries wolf.
+#
+# DEBOUNCE — a loss must PERSIST to be believed. A sense reading not-live goes PENDING (no poke); only a
+# SECOND consecutive not-live reading CONFIRMS the loss and pokes. A lone probe blip (a systemctl race,
+# a momentary restart) clears from PENDING back to LIVE with no poke ever sent. This is the fix for the
+# 2026-07-16 false poke: one cron fire read a rock-solid-active mesh-overhear as empty and woke the room.
+# UNOBSERVABLE readings (bus unreachable, empty is-active) never even reach the machine — tick() FREEZES
+# that sense (UNOBS != a sense verdict), so a session/cron quirk can never be laundered into a loss.
+#
+# FLAP GUARD — on top of debounce, a per-sense COOLDOWN (default 1h) caps a genuinely flapping organ to
+# one paid poke per cooldown. Recovery (dead->LIVE) is recorded SILENTLY (re-arm the latch + a cheap chat
+# [fyi], never a paid mind poke) — the both-edges-need-a-gate rule: the recovery edge MUST reset the
+# latch, or after the first loss the reflex would never fire for that sense again.
+#
+# LIVENESS-TOUCH — the STATE artifact's mtime is refreshed on EVERY run (mesh-state-touch), so a
+# long-stable all-LIVE reading never reads as a dead reflex to the staleness watchdogs; the file's
+# CONTENT is change-gated (per-sense state + lastpoke). A genuinely dead cron never runs -> never
+# touches -> honest-STALE.
+#
+# THE SENSE LIST REUSES THE ROOM DASH'S ORGAN GATES (mesh-dash room remote_probe) — one definition of
+# "is this organ alive", not a parallel list that rots: systemd is-active answers about the UNIT, and a
+# running-but-stale producer (fresh unit, frozen artifact) is a HOLLOW sense counted DEAD, not LIVE.
+#
+#   mesh-room-sense-loss           one tick (probe every sense, poke on a LIVE->dead edge) — cron entry
+#   mesh-room-sense-loss --status  human view: each sense's current verdict + last poke, no poke/no write
+#   mesh-room-sense-loss --test    self-check: a simulated LIVE->dead pokes; cooldown suppresses a
+#                                   re-fire; recovery re-arms; first-sight seeds silently
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+# CRON RUNS WITHOUT A SESSION BUS: `systemctl --user` needs XDG_RUNTIME_DIR to reach the user manager,
+# or every is-active call fails with "Failed to connect to bus" and empty stdout — which, unguarded,
+# reads as DEAD and floods the room with false LOSS pokes on every fire (caught live 2026-07-16: the
+# first cron tick poked ear/stt/wake though all three were active). Restore the runtime dir like the
+# other user-systemd reflexes (mesh-room-reflex) do; a bus we STILL cannot reach reads UNKNOWN, not DEAD.
+: "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; export XDG_RUNTIME_DIR
+MESH="$HOME/.mesh"
+STATE="${ROOM_SENSE_LOSS_STATE:-$MESH/.room-sense-loss.state}"
+COOLDOWN="${ROOM_SENSE_LOSS_COOLDOWN:-3600}"     # s between pokes for the SAME sense (flap guard)
+STALE="${ROOM_SENSE_LOSS_STALE:-300}"            # s: a producer's artifact older than this = hollow/DEAD
+CAM_STALE="${ROOM_SENSE_LOSS_CAM_STALE:-600}"    # s: cam eyes run on a ~3min cron -> lease > 2 cycles
+TRANS="${ROOM_TRANSCRIPT:-$MESH/room-transcript.txt}"
+
+now() { date +%s; }
+
+# The room mind's declared senses, each with a one-word human gloss for the poke.
+SENSES="cam ear stt wake"
+gloss() { case "$1" in
+  cam)  echo "its EYES (room camera — mesh-misha-wake / mesh-cam-watch)";;
+  ear)  echo "its EARS (room mic / mesh-overhear)";;
+  stt)  echo "its HEARING-INTO-WORDS (transcriber / mesh-room-gigaam)";;
+  wake) echo "its WAKE REFLEX (mesh-room-reflex — the thing that hears its name)";;
+  *)    echo "$1";;
+esac; }
+
+# ---- probes: each echoes LIVE | DEAD | UNKNOWN ---------------------------------------------------
+# UNKNOWN is reserved for "can't tell / no such sense here" (unit not installed, systemctl absent) — it
+# never fires a loss from first sight. DEAD is a POSITIVE "the organ that lives here is down or hollow".
+_unit_active() { systemctl --user is-active "$1" 2>/dev/null | head -1; }   # active|inactive|failed|""
+_unit_installed() { systemctl --user list-unit-files "$1" >/dev/null 2>&1 \
+  && systemctl --user list-unit-files "$1" 2>/dev/null | grep -q "^$1"; }
+# Can we reach the user manager AT ALL? A bus-connect failure (no XDG_RUNTIME_DIR / no session) must read
+# as can't-tell, never as a fabricated DEAD — the difference between UNKNOWN and DEAD is the difference
+# between staying quiet and flooding the room. `show-environment` is a cheap query that succeeds only when
+# the manager is actually reachable.
+_mgr_ok() { systemctl --user show-environment >/dev/null 2>&1; }
+_artifact_fresh() {  # <file> [max_age=STALE] — 0 if it exists and mtime <= max, 1 otherwise
+  local f="$1" max="${2:-$STALE}" age
+  [ -f "$f" ] || return 1
+  age=$(( $(now) - $(stat -c %Y "$f" 2>/dev/null || echo 0) ))
+  [ "$age" -le "$max" ]
+}
+
+# A unit-backed organ. THREE distinct classes of "not LIVE", never conflated:
+#   UNOBS   — we could not OBSERVE the unit (no systemctl, bus unreachable, empty is-active from a
+#             reachable-looking mgr). Not a sense verdict at all; tick() FREEZES the sense and never
+#             pokes, so a cron session quirk or a bus outage can never fabricate a loss (the 11:42
+#             ear=UNKNOWN false poke, 2026-07-16). Unobservable != lost.
+#   UNKNOWN — the unit is genuinely NOT INSTALLED here (no such sense on this node) -> never a loss.
+#   DEAD    — a REACHABLE manager says the installed unit is inactive/failed, or it is active but its
+#             producer artifact is frozen (a hollow sense). A positive "the organ that lives here is down".
+_probe_unit() {  # <unit> [freshness-artifact]
+  local unit="$1" art="${2:-}" st
+  command -v systemctl >/dev/null 2>&1 || { echo UNOBS; return; }
+  _mgr_ok || { echo UNOBS; return; }                            # bus unreachable -> unobservable, not DEAD
+  _unit_installed "$unit" || { echo UNKNOWN; return; }          # genuinely no such unit here
+  st="$(_unit_active "$unit")"
+  [ -z "$st" ] && { echo UNOBS; return; }                       # empty answer -> couldn't read, don't guess
+  if [ "$st" != active ]; then echo DEAD; return; fi
+  if [ -n "$art" ] && ! _artifact_fresh "$art"; then echo DEAD; return; fi   # up but not cycling = hollow
+  echo LIVE
+}
+
+# The room's EYES vary by node: a service (mesh-cam-watch -> cam-prev.jpg) OR a cron (mesh-misha-wake,
+# fswebcam every ~3min -> .misha-wake-frame.jpg). Probe whichever this node actually runs, so the
+# gate tracks the REAL vision organ — not a unit that isn't installed here (which is how the room dash's
+# own pgrep-cam-watch gate reads cam=DOWN forever on this node while the webcam works fine). No producer
+# present at all -> UNKNOWN (camera-less, never a false loss).
+_probe_cam() {
+  command -v systemctl >/dev/null 2>&1 && _unit_installed mesh-cam-watch.service \
+    && { _probe_unit mesh-cam-watch.service "$MESH/cam-prev.jpg"; return; }
+  if crontab -l 2>/dev/null | grep -q 'mesh-misha-wake'; then
+    _artifact_fresh "$MESH/.misha-wake-frame.jpg" "$CAM_STALE" && echo LIVE || echo DEAD; return
+  fi
+  echo UNKNOWN
+}
+_probe_ear()  { _probe_unit mesh-overhear.service; }
+_probe_stt()  { _probe_unit mesh-room-gigaam.service "$TRANS"; }  # transcript must be CYCLING (mtime fresh)
+_probe_wake() { _probe_unit mesh-room-reflex.service; }
+probe() { "_probe_$1"; }
+
+# ---- state: one line per sense — "name status lastpoke reading" ---------------------------------
+# status is the DEBOUNCE state machine, not the raw reading:
+#   LIVE     — healthy (last reading was LIVE)
+#   PENDING  — read not-LIVE exactly ONCE; a poke is withheld until a SECOND consecutive not-LIVE
+#              reading confirms it. A lone transient (probe race, momentary restart) clears from here
+#              back to LIVE with no poke ever sent.
+#   LOST     — confirmed lost (>=2 consecutive not-LIVE) and poked; holds until it recovers.
+# reading = the last raw probe verdict (LIVE/DEAD/UNKNOWN), carried only to word the poke (DEAD vs
+# UNKNOWN). UNOBS readings never reach here — tick() drops them before _evaluate.
+_get() {  # <name> -> echoes "status lastpoke reading" (empty if unseen)
+  awk -v n="$1" '$1==n{print $2, $3, $4}' "$STATE" 2>/dev/null
+}
+_set() {  # <name> <status> <lastpoke> <reading>
+  local n="$1" s="$2" lp="$3" rd="$4" tmp
+  tmp="$(mktemp "${STATE}.XXXXXX")" || return 1
+  { [ -f "$STATE" ] && grep -v -E "^$n[[:space:]]" "$STATE" 2>/dev/null; echo "$n $s $lp $rd"; } > "$tmp"
+  mv -f "$tmp" "$STATE"
+}
+
+poke() {  # <name> <verdict>   — the LOUD paid wake
+  local name="$1" verdict="$2"
+  mesh-tell room "[room-sense-loss] YOU HAVE LOST A SENSE: $(gloss "$name") just went ${verdict} (was LIVE).
+The room can no longer rely on this organ. React AT YOUR DISCRETION: try to bring it back (e.g. a cam
+loss -> \`systemctl --user restart mesh-cam-watch.service\` and re-check; an ear/stt loss -> restart the
+overhear/gigaam unit), and if you cannot, say so to the operator. Don't narrate — either act on it or,
+if it is expected/known, note it and move on. This fires once per organ per cooldown, so it is real." \
+    >/dev/null 2>&1
+}
+
+recovery_note() {  # <name> — cheap, no paid mind turn
+  command -v mesh-chat >/dev/null 2>&1 && \
+    mesh-chat "[fyi] room sense recovered: $(gloss "$1") is LIVE again (mesh-room-sense-loss re-armed)" \
+      >/dev/null 2>&1 || true
+}
+
+# The debounce state machine, isolated from the probe so --test can inject a reading. cur is a real
+# sense verdict (LIVE/DEAD/UNKNOWN) — NEVER UNOBS (tick() filters those). Reads+writes STATE and pokes;
+# echoes what it did (SEED|PENDING|POKE|SUPPRESS|HOLD|RECOVER|CLEAR) for the test and --status.
+_evaluate() {  # <name> <cur:LIVE|DEAD|UNKNOWN>
+  local name="$1" cur="$2" status lp rd t alive=0
+  read -r status lp rd < <(_get "$name"); lp="${lp:-0}"
+  case "$lp" in (''|*[!0-9]*) lp=0 ;; esac
+  [ "$cur" = LIVE ] && alive=1
+
+  if [ -z "$status" ]; then                                   # first sight — never poke (never saw it live)
+    [ "$alive" = 1 ] && _set "$name" LIVE "$lp" "$cur" || _set "$name" LOST "$lp" "$cur"
+    echo SEED; return
+  fi
+  if [ "$alive" = 1 ]; then                                   # healthy this tick
+    if [ "$status" = LOST ]; then recovery_note "$name"; _set "$name" LIVE "$lp" LIVE; echo RECOVER; return; fi
+    # LIVE->LIVE, or PENDING->LIVE (a transient that never confirmed → cleared, no poke)
+    [ "$status" = PENDING ] && { _set "$name" LIVE "$lp" LIVE; echo CLEAR; return; }
+    _set "$name" LIVE "$lp" LIVE; echo HOLD; return
+  fi
+  # not alive this tick (DEAD or UNKNOWN)
+  case "$status" in
+    LIVE)    _set "$name" PENDING "$lp" "$cur"; echo PENDING; return ;;   # first not-live — WITHHOLD the poke
+    PENDING) t="$(now)"                                                    # second consecutive — CONFIRMED loss
+             if [ $(( t - lp )) -ge "$COOLDOWN" ]; then poke "$name" "$cur"; _set "$name" LOST "$t" "$cur"; echo POKE
+             else _set "$name" LOST "$lp" "$cur"; echo SUPPRESS; fi; return ;;
+    *)       _set "$name" LOST "$lp" "$cur"; echo HOLD; return ;;          # already LOST — hold, no re-poke
+  esac
+}
+
+tick() {
+  mkdir -p "$MESH"
+  local s cur
+  for s in $SENSES; do
+    cur="$(probe "$s")"
+    # UNOBS = we could not observe this sense this tick (no bus, empty read). FREEZE it — do not evaluate,
+    # do not poke, do not rewrite its status. A probe fault must never be laundered into a sense loss.
+    [ "$cur" = UNOBS ] && continue
+    _evaluate "$s" "$cur" >/dev/null
+  done
+  mesh-state-touch "$STATE" 2>/dev/null || touch "$STATE" 2>/dev/null || true   # liveness on EVERY run
+}
+
+if [ "${1:-}" = --status ]; then
+  printf '=== room senses @%s ===\n' "$(date -u +%FT%TZ)"
+  for s in $SENSES; do
+    cur="$(probe "$s")"; read -r prev lp _ < <(_get "$s"); lp="${lp:-0}"
+    case "$lp" in (''|*[!0-9]*) lp=0 ;; esac
+    if [ "$lp" = 0 ]; then last="never"; else last="$(( ($(now)-lp)/60 ))m ago"; fi
+    printf '  %-5s %-8s (stored:%-8s last-poke:%s) — %s\n' "$s" "$cur" "${prev:-?}" "$last" "$(gloss "$s")"
+  done
+  exit 0
+fi
+
+if [ "${1:-}" = --test ]; then
+  f=0; tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+  HOME="$tmp"; MESH="$tmp/.mesh"; mkdir -p "$MESH"; STATE="$MESH/.room-sense-loss.state"
+  # Stub the paid poke and the liveness primitive so nothing real is touched and the poke is observable.
+  # One record per poke — a sentinel line, NOT the (multi-line) message, so the counter counts POKES
+  # not message lines. The full text still lands in pokes.txt for the content asserts below.
+  printf '#!/usr/bin/env bash\nprintf "<<POKE>> %%s\\n" "$*" >> "%s/pokes"\n' "$tmp" > "$tmp/mesh-tell"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$tmp/mesh-state-touch"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$tmp/mesh-chat"
+  chmod +x "$tmp/mesh-tell" "$tmp/mesh-state-touch" "$tmp/mesh-chat"; PATH="$tmp:$PATH"
+  npokes() { [ -f "$tmp/pokes" ] && grep -c '<<POKE>>' "$tmp/pokes" || echo 0; }
+
+  COOLDOWN=3600
+  # 1. FIRST SIGHT seeds silently — never a poke (we never saw it LIVE, so a loss is undefined).
+  for seed in LIVE DEAD UNKNOWN; do
+    rm -f "$STATE" "$tmp/pokes"
+    [ "$(_evaluate s "$seed")" = SEED ] || { echo "  FAIL: first sight of $seed was not SEED"; f=1; }
+    [ "$(npokes)" = 0 ] || { echo "  FAIL: first sight of $seed poked (must seed silently)"; f=1; }
+  done
+
+  # 2. THE CORE REQUIREMENT — a LIVE->dead loss POKES. DEBOUNCED: the FIRST not-live reading only
+  #    goes PENDING (no poke); a SECOND consecutive not-live CONFIRMS and pokes. This is the fix for
+  #    the transient false poke (a lone probe blip must never reach the room).
+  rm -f "$STATE" "$tmp/pokes"; _evaluate cam LIVE >/dev/null
+  [ "$(_evaluate cam DEAD)" = PENDING ] || { echo "  FAIL: first not-live was not withheld as PENDING"; f=1; }
+  [ "$(npokes)" = 0 ] || { echo "  FAIL: a single not-live reading poked (debounce broken)"; f=1; }
+  [ "$(_evaluate cam DEAD)" = POKE ] || { echo "  FAIL: confirmed LIVE->DEAD did not POKE"; f=1; }
+  [ "$(npokes)" = 1 ] || { echo "  FAIL: confirmed loss produced $(npokes) pokes, want 1"; f=1; }
+  grep -q 'LOST A SENSE' "$tmp/pokes" || { echo "  FAIL: poke text missing the loss headline"; f=1; }
+  grep -q 'EYES' "$tmp/pokes" || { echo "  FAIL: poke did not name the cam gloss (EYES)"; f=1; }
+
+  # 3. THE TRANSIENT-CLEARS GATE (the 11:42 regression, 2026-07-16): a lone not-live reading that
+  #    RECOVERS on the next tick must CLEAR with NO poke ever sent. Without debounce this flooded.
+  rm -f "$STATE" "$tmp/pokes"; _evaluate ear LIVE >/dev/null
+  [ "$(_evaluate ear UNKNOWN)" = PENDING ] || { echo "  FAIL: transient not-live was not PENDING"; f=1; }
+  [ "$(_evaluate ear LIVE)" = CLEAR ] || { echo "  FAIL: a cleared transient was not CLEAR"; f=1; }
+  [ "$(npokes)" = 0 ] || { echo "  FAIL: a one-tick transient POKED the room (debounce failed)"; f=1; }
+
+  # 4. staying DEAD after a confirmed loss does NOT re-poke (LOST holds; it is not a level trigger).
+  rm -f "$STATE" "$tmp/pokes"; _evaluate cam LIVE >/dev/null; _evaluate cam DEAD >/dev/null; _evaluate cam DEAD >/dev/null
+  [ "$(_evaluate cam DEAD)" = HOLD ] || { echo "  FAIL: LOST->DEAD was not HOLD"; f=1; }
+  [ "$(npokes)" = 1 ] || { echo "  FAIL: a held LOST sense re-poked"; f=1; }
+
+  # 5. LIVE->UNKNOWN (confirmed) is ALSO a loss (fail-loud polarity) — can't-see is a loss, not a pass.
+  rm -f "$STATE" "$tmp/pokes"; _evaluate ear LIVE >/dev/null; _evaluate ear UNKNOWN >/dev/null
+  [ "$(_evaluate ear UNKNOWN)" = POKE ] || { echo "  FAIL: confirmed LIVE->UNKNOWN did not POKE (fail-loud)"; f=1; }
+
+  # 6. COOLDOWN gates a fast flap: lose (confirmed, poke) -> recover -> lose again (confirmed) WITHIN
+  #    cooldown -> SUPPRESS. A flapping organ costs at most one paid poke per cooldown.
+  rm -f "$STATE" "$tmp/pokes"; COOLDOWN=3600
+  _evaluate cam LIVE >/dev/null; _evaluate cam DEAD >/dev/null
+  [ "$(_evaluate cam DEAD)" = POKE ] || { echo "  FAIL: first confirmed loss did not POKE"; f=1; }
+  [ "$(_evaluate cam LIVE)" = RECOVER ] || { echo "  FAIL: recovery not detected (latch never re-arms)"; f=1; }
+  _evaluate cam DEAD >/dev/null                                   # PENDING again
+  [ "$(_evaluate cam DEAD)" = SUPPRESS ] || { echo "  FAIL: second confirmed loss within cooldown not SUPPRESSED"; f=1; }
+  [ "$(npokes)" = 1 ] || { echo "  FAIL: flap produced $(npokes) pokes within cooldown, want 1"; f=1; }
+
+  # 7. ...but past the cooldown, a real re-loss pokes again (not permanently latched).
+  rm -f "$STATE" "$tmp/pokes"; COOLDOWN=0
+  _evaluate cam LIVE >/dev/null; _evaluate cam DEAD >/dev/null
+  [ "$(_evaluate cam DEAD)" = POKE ] || { echo "  FAIL: loss did not POKE at cooldown 0"; f=1; }
+  _evaluate cam LIVE >/dev/null; _evaluate cam DEAD >/dev/null
+  [ "$(_evaluate cam DEAD)" = POKE ] || { echo "  FAIL: re-loss past cooldown did not POKE"; f=1; }
+  [ "$(npokes)" = 2 ] || { echo "  FAIL: two real losses past cooldown gave $(npokes) pokes, want 2"; f=1; }
+
+  # 8. RECOVERY carries no paid poke.
+  rm -f "$STATE" "$tmp/pokes"; COOLDOWN=3600
+  _evaluate cam LIVE >/dev/null; _evaluate cam DEAD >/dev/null; _evaluate cam DEAD >/dev/null; rm -f "$tmp/pokes"
+  [ "$(_evaluate cam LIVE)" = RECOVER ] || { echo "  FAIL: recovery not RECOVER"; f=1; }
+  [ "$(npokes)" = 0 ] || { echo "  FAIL: recovery burned a paid poke"; f=1; }
+
+  # 9. CRON-ENV REGRESSION (caught live 2026-07-16): an UNOBSERVABLE unit — bus unreachable, or an
+  #    empty is-active from a reachable-looking manager — must read UNOBS (not DEAD/UNKNOWN), and tick()
+  #    must FREEZE that sense (never evaluate, never poke). This is the root-cause gate for the false
+  #    poke that woke the room about three healthy organs. Drive _probe_unit through a stubbed systemctl.
+  sc="$tmp/systemctl"
+  cat > "$sc" <<'SC'
+#!/usr/bin/env bash
+shift  # drop --user
+case "$FAKE_SC" in
+  busfail)  exit 1 ;;                                    # every query fails: bus unreachable
+  emptyact) case "$1" in show-environment) exit 0;; list-unit-files) echo "$2 enabled enabled"; exit 0;; is-active) exit 3;; esac ;;  # reachable but empty read
+  inactive) case "$1" in show-environment) exit 0;; list-unit-files) echo "$2 enabled enabled"; exit 0;; is-active) echo inactive; exit 3;; esac ;;
+  active)   case "$1" in show-environment) exit 0;; list-unit-files) echo "$2 enabled enabled"; exit 0;; is-active) echo active; exit 0;; esac ;;
+  nounit)   case "$1" in show-environment) exit 0;; list-unit-files) exit 0;; is-active) echo inactive; exit 3;; esac ;;  # mgr ok, unit absent
+esac
+exit 0
+SC
+  chmod +x "$sc"
+  [ "$(FAKE_SC=busfail  PATH="$tmp:$PATH" _probe_unit x.service)" = UNOBS ]   || { echo "  FAIL: unreachable bus was not UNOBS (would flood under cron)"; f=1; }
+  [ "$(FAKE_SC=emptyact PATH="$tmp:$PATH" _probe_unit x.service)" = UNOBS ]   || { echo "  FAIL: empty is-active read was not UNOBS"; f=1; }
+  [ "$(FAKE_SC=nounit   PATH="$tmp:$PATH" _probe_unit x.service)" = UNKNOWN ] || { echo "  FAIL: an uninstalled unit was not UNKNOWN"; f=1; }
+  [ "$(FAKE_SC=inactive PATH="$tmp:$PATH" _probe_unit x.service)" = DEAD ]    || { echo "  FAIL: reachable+inactive was not DEAD"; f=1; }
+  [ "$(FAKE_SC=active   PATH="$tmp:$PATH" _probe_unit x.service)" = LIVE ]    || { echo "  FAIL: reachable+active was not LIVE"; f=1; }
+  # tick() must FREEZE an UNOBS sense: state untouched, no poke. Seed cam=LIVE, then a probe that returns
+  # UNOBS every tick must never advance cam toward PENDING/LOST and never poke.
+  rm -f "$STATE" "$tmp/pokes"; SENSES=cam; _evaluate cam LIVE >/dev/null
+  probe() { echo UNOBS; }
+  tick; tick
+  [ "$(_get cam)" = "LIVE 0 LIVE" ] || { echo "  FAIL: an UNOBS sense was not frozen at LIVE (got: $(_get cam))"; f=1; }
+  [ "$(npokes)" = 0 ] || { echo "  FAIL: an UNOBS (unobservable) sense POKED the room"; f=1; }
+  unset -f probe; SENSES="cam ear stt wake"
+
+  # 10. LIVENESS-TOUCH: tick() refreshes STATE mtime even when nothing changes (all senses hold LIVE).
+  probe() { echo LIVE; }
+  rm -f "$STATE"; : > "$STATE"; touch -d '2020-01-01' "$STATE"
+  rm -f "$tmp/mesh-state-touch"                          # exercise the real `touch` fallback path
+  tick
+  m="$(stat -c %Y "$STATE" 2>/dev/null || echo 0)"
+  [ "$m" -gt "$(date -d '2021-01-01' +%s)" ] || { echo "  FAIL: tick() did not liveness-touch STATE mtime"; f=1; }
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$tmp/mesh-state-touch"; chmod +x "$tmp/mesh-state-touch"; unset -f probe
+
+  [ "$f" = 0 ] && echo "  PASS: seeds silent, loss debounced+poked, transient clears free, flap cooldown-gated, recovery free, UNOBS frozen, liveness-touched" || exit 1
+  exit 0
+fi
+
+tick
