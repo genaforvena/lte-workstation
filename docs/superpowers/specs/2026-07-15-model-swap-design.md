@@ -157,6 +157,38 @@ their own), so every TTS swap is something the operator hears. WER can never be 
 operator listens and picks. STT and vision keep the auto-swap: correctness is their whole story
 and there is nothing to hear.
 
+## The TTS oracle mostly does not work (measured 2026-07-15)
+
+Built the fixture (`tts-ru-authored-01`), tested the oracle by hand before tooling it, and it
+largely failed. Full numbers in that fixture's `provenance.txt`.
+
+**Through GigaAM it is a CONSTANT.** irina/ruslan/dmitri all score **0.000** — identical,
+perfect. TTS output is clean, noiseless, perfectly articulated speech: the easiest possible
+input for a good STT. A ranking keyed on this can never fire. Same family as `tone`, whose
+median is its max, and `act > 0.55` which can never fire.
+
+**Through whisper-tiny it discriminates — but it is a RANDOM VARIABLE.** Piper's render is
+**non-deterministic** (3 identical invocations → 3 different md5s; VITS samples). whisper-tiny
+is perfectly deterministic (0.207 three times on a fixed wav), so all variance is the
+synthesiser's. The first pass read 0.103/0.172/0.207 and looked like a clean ranking; the
+**within-voice** spread (0.207 vs 0.345, nominally identical renders) is **larger than that
+whole between-voice gap**. n=1 is meaningless. At n=6: irina 0.144±0.034, ruslan 0.195±0.068,
+dmitri 0.368±0.042 — only dmitri-vs-irina is robustly separated.
+
+**And it is confounded by speaking rate.** irina renders this text in 13.6s, dmitri in 9.4s;
+slower is easier to read. Control (vary only rate, n=6): dmitri 9.4s→0.368, 12.0s→**0.270**,
+vs irina 13.6s→0.144. Rate is a real driver worth ~27% of the gap — but irina at 13.6s still
+beats dmitri at 12.0s, so a residual voice effect survives. Durations were not matched exactly,
+so neither "it's pure rate" nor "rate is controlled" is claimable.
+
+**Consequence:** the spec's TTS design is not viable as written. Round-trip WER cannot rank
+voices or engines on quality. It is honestly good for: render wall-clock, speaking rate, and a
+**floor gate** (a candidate NOT scoring ~0.000 through gigaam is broken/mispronouncing/silent —
+a genuine regression detector). Quality stays the ear's.
+
+This is the answer to *"why we use huge piper still"*: **no mechanical axis can currently prove a
+replacement is better.** The only defensible axes are age, speed, and the operator's ear.
+
 ## What this cannot know
 
 **Round-trip WER cannot hear.** It measures intelligibility. A robotic voice that is perfectly
