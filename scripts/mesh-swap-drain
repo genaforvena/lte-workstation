@@ -75,6 +75,14 @@ MIN_RESIDUE_MB="${MESH_SWAPDRAIN_MIN_RESIDUE_MB:-2048}"
 NICE="${MESH_SWAPDRAIN_NICE:-19}"
 DRYRUN="${MESH_SWAPDRAIN_DRYRUN:-0}"            # 1 = never fire a real swapoff/swapon (used by --test)
 CONFIG_WARN_STATE="${MESH_SWAPDRAIN_CONFIG_WARN_STATE:-$MESH/.swap-drain-config-warn}"
+# TREADMILL breadcrumb (chat-review/swap-drain-treadmill-detection, 2026-07-16): "<epoch> DRAINED|TREADMILL",
+# written ONLY by do_drain — deliberately NOT the one-line $STATE, which do_status rewrites on every bare
+# run and would clobber the drain history (the selfcare-once class, 086b420). Live treadmill 2026-07-16:
+# back-to-back hourly DRAINED 21:17+22:17, ~2.3GB/h refill vs prior ~0.3GB/h — gigaam's 1531MB warm-model
+# VmSwap re-evicted after every forced re-ingest; swap-rate's THRASHING in= spikes were the drain itself.
+TREADF="${MESH_SWAPDRAIN_TREADMILL_STATE:-$MESH/.swap-drain.treadmill}"
+TREADMILL_WINDOW_S="${MESH_SWAPDRAIN_TREADMILL_WINDOW_S:-7500}"   # 2 hourly cadences + slack
+PROCDIR="${MESH_SWAPDRAIN_PROCDIR:-/proc}"       # injectable so --test names a fixture proc, not a live one
 
 ts(){ date -u +%Y-%m-%dT%H:%M:%SZ; }
 
@@ -184,6 +192,19 @@ do_swap(){
   "${pre[@]}" sudo -n "$@"
 }
 
+# top_vmswap — the process holding the most VmSwap: "name(pid N) NNNMB", or "?" if unreadable.
+# cat (not awk-on-glob) so a PID that exits mid-scan skips with a warning instead of aborting
+# the whole read (gawk treats an unopenable command-line file as fatal and drops END).
+top_vmswap(){
+  local out
+  out="$(cat "$PROCDIR"/[0-9]*/status 2>/dev/null | awk '
+    /^Name:/  {name=$2}
+    /^Pid:/   {pid=$2}
+    /^VmSwap:/{if ($2+0 > best) {best=$2+0; bn=name; bp=pid}}
+    END{if (bn != "") printf "%s(pid %s) %dMB\n", bn, bp, int(best/1024)}')"
+  printf '%s\n' "${out:-?}"
+}
+
 swap_used_mb(){ # current SwapUsed in MB from live MEMINFO
   local st sf; st="$(read_meminfo_kb SwapTotal)"; sf="$(read_meminfo_kb SwapFree)"
   [ -n "$st" ] && [ -n "$sf" ] || { echo "?"; return; }
@@ -203,6 +224,33 @@ live_verdict(){ # echoes the decide_drain verdict from live /proc
 
 do_drain(){ # the gated actuate
   local verdict label reason; verdict="$(live_verdict)"; label="${verdict%%|*}"; reason="${verdict#*|}"
+  # TREADMILL gate: a drain whose reclaim refills within TREADMILL_WINDOW_S is not reclaiming residue,
+  # it is forcing a warm process's pages on a re-ingest/re-evict loop — the drain IS the thrash. Skip
+  # it (and keep skipping while the refill persists) UNLESS swap is pct-full (SwapFree < FREE_PCT_MAX%):
+  # that emergency is what the buffer exists for and always drains. First-time-above-floor is unchanged.
+  if [ "$label" = DRAIN ]; then
+    local _tst _tsf _tfp=0
+    _tst="$(read_meminfo_kb SwapTotal)"; _tsf="$(read_meminfo_kb SwapFree)"
+    { [ -n "$_tst" ] && [ "$_tst" -gt 0 ]; } 2>/dev/null && _tfp=$(( ${_tsf:-0} * 100 / _tst ))
+    if [ "$_tfp" -ge "$FREE_PCT_MAX" ]; then      # floor-triggered drain, not the pct emergency
+      local _tread _pepoch _plabel _page
+      _tread="$(cat "$TREADF" 2>/dev/null || echo)"
+      _pepoch="${_tread%% *}"; _plabel="${_tread#* }"
+      case "$_pepoch" in ''|*[!0-9]*) _pepoch=0 ;; esac
+      if [ "$_pepoch" -gt 0 ] && { _page=$(( $(date -u +%s) - _pepoch )); [ "$_page" -le "$TREADMILL_WINDOW_S" ]; }; then
+        case "$_plabel" in
+          DRAINED|TREADMILL)
+            local _top; _top="$(top_vmswap)"
+            # board ONCE, on the DRAINED→TREADMILL edge only — a persisting treadmill renews quietly
+            [ "$_plabel" = DRAINED ] && board "[swap-treadmill] $(hostname) swap back above floor ${_page}s after a drain — draining forces re-ingest and the kernel re-evicts (top VmSwap: ${_top}); skipping drains until the treadmill breaks (emergency SwapFree<${FREE_PCT_MAX}% still drains)"
+            printf '%s TREADMILL\n' "$(date -u +%s)" > "$TREADF" 2>/dev/null || true
+            write_state "TREADMILL|refilled above floor ${_page}s after ${_plabel} (top VmSwap: ${_top}) — drain skipped, would thrash"
+            echo "swap-drain: TREADMILL — skip (top VmSwap: ${_top})" >&2
+            return 0 ;;
+        esac
+      fi
+    fi
+  fi
   write_state "$verdict"
   case "$label" in
     NA)     echo "swap-drain: n/a — $reason" >&2; return 2 ;;
@@ -230,6 +278,7 @@ do_drain(){ # the gated actuate
     echo "swap-drain: CRITICAL — swapon -a failed after swapoff; escalated" >&2; return 1
   fi
   after="$(swap_used_mb)"
+  printf '%s DRAINED\n' "$(date -u +%s)" > "$TREADF" 2>/dev/null || true   # the treadmill gate's clock
   board "[swap-drained] $(hostname) swap residue reclaimed: SwapUsed ${before}→${after}MB — buffer reset ($reason)"
   write_state "DRAINED|SwapUsed ${before}→${after}MB reclaimed ($reason)"
   echo "swap-drain: DRAINED (SwapUsed ${before}→${after}MB)"
@@ -333,17 +382,66 @@ case "${1:---status}" in
     printf 'MemAvailable: 4194304 kB\nSwapTotal: 4194304 kB\nSwapFree: 80000 kB\n' > "$_refusemi"  # margin REFUSE
     printf 'full avg10=0.00 avg60=0.00 avg300=0.00 total=1\n' > "$_td/psi"
     _stf="$_td/state"
-    # DRAIN: DRYRUN so do_swap only echoes; heavy free; must post [swap-drained] + write DRAINED state
-    ( DRYRUN=1 MEMINFO="$_drainmi" PSI="$_td/psi" STATE="$_stf" LOCK="$_td/lk" \
+    # DRAIN: DRYRUN so do_swap only echoes; heavy free; must post [swap-drained] + write DRAINED state.
+    # TREADF is sandboxed: a fixture drain must never stamp the LIVE treadmill breadcrumb (a test that
+    # writes a live artifact forges the evidence it checks) nor read it (a real drain <2h ago would
+    # flip this fixture to TREADMILL and flake the assert).
+    ( DRYRUN=1 MEMINFO="$_drainmi" PSI="$_td/psi" STATE="$_stf" LOCK="$_td/lk" TREADF="$_td/tread0" \
       MESH_SWAPDRAIN_HEAVY_BUSY=0 do_drain >/dev/null 2>&1 )
     grep -q '\[swap-drained\]' "$_cap" || fail "a DRAIN verdict must post [swap-drained] (DRYRUN)"
     grep -q '^[0-9T:Z-]* | DRAINED' "$_stf" || fail "a DRAIN must record DRAINED in the state file"
     : > "$_cap"
     # REFUSE(margin): must NOT actuate, must NOT post, state records REFUSE
-    ( DRYRUN=1 MEMINFO="$_refusemi" PSI="$_td/psi" STATE="$_stf" LOCK="$_td/lk2" \
+    ( DRYRUN=1 MEMINFO="$_refusemi" PSI="$_td/psi" STATE="$_stf" LOCK="$_td/lk2" TREADF="$_td/tread0" \
       MESH_SWAPDRAIN_HEAVY_BUSY=0 do_drain >/dev/null 2>&1 )
     [ -s "$_cap" ] && fail "a REFUSE verdict must NOT post any board edge"
     grep -q 'REFUSE|insufficient' "$_stf" || fail "a REFUSE must record the refusal reason in the state file"
+    unset -f mesh-chat
+
+    # ---- TREADMILL: consecutive-DRAINED awareness (chat-review/swap-drain-treadmill-detection) ----
+    # Live 2026-07-16: hourly DRAINED 21:17+22:17 back-to-back, swap back at 1558MB by 22:43 — all of
+    # it a warm model the kernel re-evicts after every forced re-ingest; the drain WAS the thrash.
+    # prior=DRAINED within the window + above-floor again via the FLOOR trigger (not pct-emergency)
+    # must SKIP the drain (no swapoff, even DRYRUN-echoed), post ONE [swap-treadmill] naming the
+    # top-VmSwap process, and renew the breadcrumb; TREADMILL→TREADMILL must not re-post; fresh or
+    # aged-out state must still DRAIN; pct-emergency must drain THROUGH a treadmill.
+    _cap2="$_td/board2"; mesh-chat(){ printf '%s\n' "$*" >> "$_cap2"; return 0; }
+    _floormi="$_td/mi-floor"   # SwapUsed 3000MB >= floor, SwapFree 27% >= 15% (not emergency), margin OK
+    printf 'MemAvailable: 7340032 kB\nSwapTotal: 4194304 kB\nSwapFree: 1122304 kB\n' > "$_floormi"
+    mkdir -p "$_td/proc/101" "$_td/proc/202"
+    printf 'Name:\tgigaam-fixture\nPid:\t101\nVmSwap:\t1567744 kB\n' > "$_td/proc/101/status"
+    printf 'Name:\tsmallfry\nPid:\t202\nVmSwap:\t8192 kB\n'          > "$_td/proc/202/status"
+    _tf="$_td/tread"; printf '%s DRAINED\n' "$(( $(date -u +%s) - 3600 ))" > "$_tf"  # drained 1 cadence ago
+    _out="$(DRYRUN=1 MEMINFO="$_floormi" PSI="$_td/psi" STATE="$_stf" LOCK="$_td/lk3" TREADF="$_tf" \
+            PROCDIR="$_td/proc" MESH_SWAPDRAIN_HEAVY_BUSY=0 do_drain 2>&1)"
+    case "$_out" in *"DRYRUN sudo swapoff"*) fail "prior-DRAINED + above-floor-again must SKIP the drain (treadmill), not swapoff";; esac
+    grep -q '\[swap-treadmill\]' "$_cap2" || fail "a treadmill must post ONE [swap-treadmill] board line"
+    grep -q 'gigaam-fixture' "$_cap2"     || fail "the [swap-treadmill] line must name the top-VmSwap process"
+    grep -q 'TREADMILL|' "$_stf"          || fail "a treadmill skip must record TREADMILL in the state file"
+    grep -q ' TREADMILL$' "$_tf"          || fail "a treadmill skip must renew the breadcrumb to TREADMILL"
+    # TREADMILL→TREADMILL: keep skipping, but NO re-post (one loud line per treadmill, not per tick)
+    : > "$_cap2"
+    _out="$(DRYRUN=1 MEMINFO="$_floormi" PSI="$_td/psi" STATE="$_stf" LOCK="$_td/lk3" TREADF="$_tf" \
+            PROCDIR="$_td/proc" MESH_SWAPDRAIN_HEAVY_BUSY=0 do_drain 2>&1)"
+    case "$_out" in *"DRYRUN sudo swapoff"*) fail "an ongoing treadmill must keep skipping";; esac
+    [ -s "$_cap2" ] && fail "TREADMILL→TREADMILL must NOT re-post the board line every tick"
+    # fresh state (no breadcrumb) + above-floor: first-time drain unchanged, and it stamps DRAINED
+    : > "$_cap2"; rm -f "$_tf"
+    _out="$(DRYRUN=1 MEMINFO="$_floormi" PSI="$_td/psi" STATE="$_stf" LOCK="$_td/lk4" TREADF="$_tf" \
+            PROCDIR="$_td/proc" MESH_SWAPDRAIN_HEAVY_BUSY=0 do_drain 2>&1)"
+    case "$_out" in *"DRYRUN sudo swapoff"*) : ;; *) fail "fresh state + above-floor must still DRAIN";; esac
+    grep -q '\[swap-drained\]' "$_cap2" || fail "a fresh drain must still post [swap-drained]"
+    grep -q ' DRAINED$' "$_tf"          || fail "a real drain must stamp the DRAINED breadcrumb"
+    # aged-out breadcrumb (3h > window) + above-floor: not a treadmill, must DRAIN
+    : > "$_cap2"; printf '%s DRAINED\n' "$(( $(date -u +%s) - 10800 ))" > "$_tf"
+    _out="$(DRYRUN=1 MEMINFO="$_floormi" PSI="$_td/psi" STATE="$_stf" LOCK="$_td/lk5" TREADF="$_tf" \
+            PROCDIR="$_td/proc" MESH_SWAPDRAIN_HEAVY_BUSY=0 do_drain 2>&1)"
+    case "$_out" in *"DRYRUN sudo swapoff"*) : ;; *) fail "a breadcrumb older than the window must still DRAIN (treadmill broke)";; esac
+    # pct-EMERGENCY (SwapFree 2% < 15%) drains straight through a fresh treadmill
+    : > "$_cap2"; printf '%s DRAINED\n' "$(( $(date -u +%s) - 3600 ))" > "$_tf"
+    _out="$(DRYRUN=1 MEMINFO="$_drainmi" PSI="$_td/psi" STATE="$_stf" LOCK="$_td/lk6" TREADF="$_tf" \
+            PROCDIR="$_td/proc" MESH_SWAPDRAIN_HEAVY_BUSY=0 do_drain 2>&1)"
+    case "$_out" in *"DRYRUN sudo swapoff"*) : ;; *) fail "pct-emergency (SwapFree<${FREE_PCT_MAX}%) must drain THROUGH a treadmill";; esac
     unset -f mesh-chat
 
     # ---- REAL-READ GATE: live /proc must yield a real verdict, or honest n/a exit 2 if no swap ----
@@ -353,7 +451,7 @@ case "${1:---status}" in
     fi
     _lv="$(live_verdict)"
     case "$_lv" in DRAIN\|*|REFUSE\|*|NA\|*) : ;; *) fail "live verdict malformed: '$_lv'";; esac
-    echo "smoke-test: ok (decide gate 10 cases both-ways + real flock heavy_busy + do_drain DRYRUN drain/refuse asserts + live verdict: $_lv)"
+    echo "smoke-test: ok (decide gate 10 cases both-ways + real flock heavy_busy + do_drain DRYRUN drain/refuse + treadmill skip/renew/fresh/aged/emergency asserts + live verdict: $_lv)"
     exit 0 ;;
   *) echo "usage: mesh-swap-drain [--status] | --drain | --sweep | --test" >&2; exit 64 ;;
 esac
