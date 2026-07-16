@@ -72,10 +72,30 @@ scan_sampled() {
 # peer) distinction is the honesty fix — they are DIFFERENT operator fixes and must not both read
 # as "could not reach / check SSH". ssh passes the remote command's exit code through on a live
 # connection, so rc alone separates them.
-classify_peer_fail() {  # <local_ok 0|1> <peer_ok 0|1> <peer_rc>
-  local lok="$1" pok="$2" prc="$3"
+# The SAME honesty rule binds the LOCAL arm (2026-07-16). The old single message blamed
+# "bluetoothctl/D-Bus" for EVERY non-sample, but scan_sampled rejects a scan for three causes with
+# three different fixes: BUSY/SUSPECT (rc 3 — adapter scan-locked by another local scanner, or an
+# RSSI-cache race: transient CONTENTION, the sense is alive), rc 124 (the outer timeout fired — a
+# genuinely wedged adapter / D-Bus stall), and rc 2 (no bluetoothctl / adapter unpowered — the only
+# case the old message actually described). Proven 2026-07-16 by holding presence.scan.lock while
+# the adapter was Powered:yes before AND after: fusion emitted the verbatim production line
+# "LOCAL BLE scan on mesh-home failed (bluetoothctl/D-Bus)" against a HEALTHY stack. That message is
+# why the recurring :49 local-zero cycles (19/31 since the */10 mesh-presence autowire, vs ~1/31 at
+# :09/:19/:39) could not be diagnosed from the log at all — it sent every reader hunting a dead
+# radio. Same defect class as the rc255-vs-rc127 collapse above, and the same asymmetry as the
+# peer-only retry in scan_both: a cause the tool cannot name is a cause nobody can fix.
+classify_peer_fail() {  # <local_ok 0|1> <peer_ok 0|1> <peer_rc> [local_rc]
+  local lok="$1" pok="$2" prc="$3" lrc="${4:-0}"
   [ "$lok" = 1 ] && [ "$pok" = 1 ] && { echo ""; return; }
-  [ "$lok" != 1 ] && { echo "LOCAL BLE scan on ${SELF} failed (bluetoothctl/D-Bus) — not a peer problem"; return; }
+  [ "$lok" != 1 ] && {
+    case "$lrc" in
+      3)   echo "LOCAL BLE scan on ${SELF} was SCAN-LOCKED/degraded (BUSY or SUSPECT) and stayed so after a retry — another local BLE scanner held the adapter; the sense is ALIVE — fix: stagger the local BLE scanners, NOT the radio" ;;
+      124) echo "LOCAL BLE scan on ${SELF} TIMED OUT — adapter wedged (bluetoothctl/D-Bus stall) — fix: the local BT stack" ;;
+      2)   echo "LOCAL BLE sense on ${SELF} is UNREACHABLE (no bluetoothctl / adapter not powered) — fix: the local BT stack" ;;
+      *)   echo "LOCAL BLE scan on ${SELF} produced no usable artifact (rc=$lrc) — not a peer problem" ;;
+    esac
+    return
+  }
   case "$prc" in
     255) echo "SSH to ${PEER_USER}@${PEER_HOST} FAILED (host down / auth / network) — fix: SSH reachability" ;;
     127) echo "peer ${PEER_USER}@${PEER_HOST} is SSH-reachable but mesh-presence is NOT installed there — fix: deploy mesh-presence to the peer" ;;
@@ -113,6 +133,86 @@ dev_class() {
 }
 
 while [ $# -gt 0 ]; do
+# NOTE: scan_both is defined ABOVE the --test dispatch on purpose — the dispatch `exit`s, so a
+# real-drive gate placed below it would call an UNDEFINED function and fail for the wrong reason
+# (observed 2026-07-16: the gate read "0 scans, retry gone" against a correct retry).
+# --- scan_both: collect local + peer presence, return arrays populated ---
+scan_both() {
+  local local_out peer_out
+  # OUTER timeout on BOTH BLE scans, bounding a WEDGED adapter (bluetoothctl query can block forever on
+  # a D-Bus stall — without this a wedge hangs the cron reflex; ConnectTimeout only guards the SSH
+  # handshake, not the remote command). The timeout is a WEDGE-BOUND, NOT a tight SLA, so it MUST sit
+  # well above a HEALTHY-but-slow scan. The old `timeout 20` for a 10s scan was mis-sized: a real ds
+  # peer scan is ~26s wall (10s BLE window + bluetoothctl adapter setup/teardown + D-Bus device query
+  # + SSH), so EVERY peer scan was killed at 20s → rc=124 INCOMPLETE → the peer column was permanently
+  # EMPTY (peer_unique=0 in every presence-fusion.log line) and the cross-vantage DIFFERENTIAL — the
+  # devices only the PEER sees (health proved ds uniquely covers Rosalia's iPhone + K380, IdeaPad
+  # blind) — was silently LOST, the exact value this fusion exists to surface. Headroom = scan_win+35
+  # (45s for a 10s window) covers the measured 26s with margin and still catches a true wedge.
+  # (genome 2026-06-26, discover→health→genome baton: ds proven a real 2nd BLE vantage, fusion hollow.)
+  # SCAN_COMPLETE stays content-based (see scan_sampled): mesh-presence exits 1 on a successful
+  # 0-device scan (empty room), so exit-code gating misreads empty rooms as incomplete (same bug class
+  # as mesh-arrivals/mesh-body-state, mesh-chat 2026-06-18 thread).
+  local scan_win="${MESH_FUSE_SCAN_WIN:-10}"
+  local scan_to=$(( scan_win + 35 ))
+  # Capture the local rc — the old `|| true` DISCARDED it, so every local non-sample (contention,
+  # wedge, absent stack) collapsed into one "bluetoothctl/D-Bus" message (see classify_peer_fail).
+  local local_rc
+  local_out="$(timeout "$scan_to" mesh-presence "$scan_win" 2>/dev/null)"; local_rc=$?
+  # RETRY-ONCE on rc=3/124, the SAME contention the peer arm below already retries. The asymmetry was
+  # the bug: a local scan-lock is if anything MORE likely than a remote one (every local BLE reflex
+  # contends for this one adapter), yet only the peer got a second chance — so local contention went
+  # straight to a permanent INCOMPLETE for the whole cron cycle while the adapter was healthy.
+  if [ "$local_rc" = 3 ] || [ "$local_rc" = 124 ]; then
+    sleep "${MESH_FUSE_RETRY_DELAY_S:-25}"
+    local_out="$(timeout "$scan_to" mesh-presence "$scan_win" 2>/dev/null)"; local_rc=$?
+  fi
+  # Capture the peer rc so an INCOMPLETE fusion can attribute the REAL cause. ssh passes the REMOTE
+  # command's exit code through on a successful connection (rc 127 = remote shell "command not
+  # found" → mesh-presence missing on the peer) and returns 255 when the SSH layer itself fails
+  # (host down / auth / network). These are different operator fixes; conflating them as "check
+  # SSH" (the old message) sent a reader hunting the wrong problem when the peer simply lacked the
+  # tool (ds, 2026-06-21: SSH-OK + PRESENCE-MISSING → false "could not reach").
+  local peer_rc
+  peer_out="$(timeout "$scan_to" ssh $SSH_OPTS "${PEER_USER}@${PEER_HOST}" "\$HOME/.local/bin/mesh-presence $scan_win" 2>/dev/null)"; peer_rc=$?
+  # RETRY-ONCE on rc=3 (the retry-once standard, 5c47ea1): exit 3 is a DEGRADED read — the peer's
+  # adapter was scan-locked (BUSY: another scanner's flock window, seconds long) or the read raced a
+  # cache clear (SUSPECT). Both are transient contention, not a dead sense; one short-delay retry
+  # heals them (live case 2026-07-07: scheduled :39 cycles read rc=3 while the peer's own scans were
+  # producing n=4..8 all morning). A retry that still fails is reported as before — never faked.
+  # ALSO retry on rc=124 (2026-07-10): a live scan-lock can hold past the full $scan_to budget
+  # instead of surfacing BUSY quickly — same contention, just slower to report — so the SSH+scan
+  # itself gets killed by `timeout` before mesh-presence ever prints BUSY. Without this the peer
+  # column reads permanently INCOMPLETE for that whole 30min cron cycle (verified live: 03:39:58Z
+  # cycle hit rc=124 with ds's own adapter healthy seconds later — a rc=3-only retry never caught it).
+  if [ "$peer_rc" = 3 ] || [ "$peer_rc" = 124 ]; then
+    sleep "${MESH_FUSE_RETRY_DELAY_S:-25}"
+    peer_out="$(timeout "$scan_to" ssh $SSH_OPTS "${PEER_USER}@${PEER_HOST}" "\$HOME/.local/bin/mesh-presence $scan_win" 2>/dev/null)"; peer_rc=$?
+  fi
+  local lok=0 pok=0
+  scan_sampled "$local_out" && lok=1
+  scan_sampled "$peer_out" && pok=1
+  SCAN_COMPLETE=0; [ "$lok" = 1 ] && [ "$pok" = 1 ] && SCAN_COMPLETE=1
+  PEER_FAIL_REASON="$(classify_peer_fail "$lok" "$pok" "$peer_rc" "$local_rc")"
+
+  unset l_rssi l_name p_rssi p_name 2>/dev/null || true
+  declare -gA l_rssi l_name p_rssi p_name
+
+  while IFS='|' read -r rssi mac name; do
+    [ -z "$mac" ] && continue
+    l_rssi["$mac"]="$rssi"
+    l_name["$mac"]="${name:-?}"
+  done < <(echo "$local_out" | grep -E '^-?[0-9]+\|' || true)
+
+  while IFS='|' read -r rssi mac name; do
+    [ -z "$mac" ] && continue
+    p_rssi["$mac"]="$rssi"
+    p_name["$mac"]="${name:-?}"
+  done < <(echo "$peer_out" | grep -E '^-?[0-9]+\|' || true)
+
+  PEER_NAME="$(timeout 8 ssh $SSH_OPTS "${PEER_USER}@${PEER_HOST}" 'hostname' 2>/dev/null || echo peer)"
+}
+
   case "$1" in
     --test)
       command -v mesh-presence >/dev/null 2>&1 || { echo "smoke-test: FAIL (no mesh-presence)"; exit 1; }
@@ -147,7 +247,44 @@ while [ $# -gt 0 ]; do
       case "$(classify_peer_fail 1 0 127)" in *NOT\ installed*) ;; *) echo "smoke-test: FAIL (rc127 must blame missing mesh-presence on peer, NOT SSH)"; exit 1 ;; esac
       [ "$(classify_peer_fail 1 0 255)" != "$(classify_peer_fail 1 0 127)" ] \
         || { echo "smoke-test: FAIL (rc255 and rc127 collapsed to one message — the misattribution bug)"; exit 1; }
-      case "$(classify_peer_fail 0 0 127)" in *LOCAL*scan*) ;; *) echo "smoke-test: FAIL (local-scan failure must blame the local adapter, not the peer)"; exit 1 ;; esac
+      # LOCAL-arm attribution (2026-07-16). The OLD gate here asserted only "*LOCAL*scan*" against a
+      # single hardcoded message — it PASSED against the bug it was supposed to catch, certifying
+      # "failed (bluetoothctl/D-Bus)" as correct for a merely scan-locked (rc 3) adapter. A local
+      # non-sample has three causes with three different fixes; they must not collapse.
+      case "$(classify_peer_fail 0 0 127 3)"   in *SCAN-LOCKED*) ;; *) echo "smoke-test: FAIL (local rc3 is CONTENTION — must not read as a dead radio)"; exit 1 ;; esac
+      case "$(classify_peer_fail 0 0 127 3)"   in *bluetoothctl/D-Bus*) echo "smoke-test: FAIL (local rc3 blamed bluetoothctl/D-Bus — the misattribution bug is back)"; exit 1 ;; esac
+      case "$(classify_peer_fail 0 0 127 124)" in *TIMED\ OUT*) ;; *) echo "smoke-test: FAIL (local rc124 must blame a wedged adapter)"; exit 1 ;; esac
+      case "$(classify_peer_fail 0 0 127 2)"   in *UNREACHABLE*) ;; *) echo "smoke-test: FAIL (local rc2 must blame an absent/unpowered BT stack)"; exit 1 ;; esac
+      { [ "$(classify_peer_fail 0 0 127 3)" != "$(classify_peer_fail 0 0 127 2)" ] \
+        && [ "$(classify_peer_fail 0 0 127 3)" != "$(classify_peer_fail 0 0 127 124)" ]; } \
+        || { echo "smoke-test: FAIL (local rc3/rc2/rc124 collapsed to one message — the misattribution bug)"; exit 1; }
+      # REAL-DRIVE: the assertions above are PURE calls — they prove the classifier's vocabulary, never
+      # that scan_both WIRES the local rc into it or that the retry fires. Drive the real scan_both
+      # against a stub mesh-presence that emits a genuine BUSY artifact + rc 3, and assert the
+      # BEHAVIOUR (two invocations = the retry actually ran; the reason names contention). Falsify by
+      # deleting the local retry block → call count 1 → this trips. Bounded well under autowire's
+      # timeout 30: retry delay 1s + an unroutable TEST-NET peer at ConnectTimeout 1.
+      _lsb="$(mktemp -d)"; mkdir -p "$_lsb/bin" "$_lsb/mesh"
+      cat > "$_lsb/bin/mesh-presence" <<EOF
+#!/bin/sh
+echo x >> "$_lsb/mesh/calls"
+echo "=== mesh-presence stub @ \$(date -u +%FT%TZ) — BUSY (adapter scan-locked by another scanner) ==="
+exit 3
+EOF
+      chmod +x "$_lsb/bin/mesh-presence"
+      ( PATH="$_lsb/bin:$PATH"; MESH_FUSE_RETRY_DELAY_S=1; MESH_FUSE_SCAN_WIN=1
+        PEER_HOST=192.0.2.1; PEER_USER=nobody          # TEST-NET-1: unroutable, ssh fails fast
+        SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=1 -o StrictHostKeyChecking=no"
+        scan_both >/dev/null 2>&1
+        _n="$(wc -l < "$_lsb/mesh/calls" 2>/dev/null || echo 0)"
+        [ "$_n" = 2 ] || { echo "smoke-test: FAIL (local BUSY got $_n scan(s), expected 2 — the retry-once on local rc=3 is gone; local contention goes straight to INCOMPLETE)"; exit 1; }
+        case "$PEER_FAIL_REASON" in
+          *SCAN-LOCKED*) ;;
+          *) echo "smoke-test: FAIL (scan_both does not wire the local rc into the reason: '$PEER_FAIL_REASON')"; exit 1 ;;
+        esac
+        [ "$SCAN_COMPLETE" = 0 ] || { echo "smoke-test: FAIL (a BUSY local scan must never read COMPLETE)"; exit 1; }
+      ) || { rm -rf "$_lsb"; exit 1; }
+      rm -rf "$_lsb"
       # RETRY-ONCE on rc=3 (2026-07-07): a peer exit-3 (BUSY/SUSPECT — transient scan contention) must
       # get exactly one delayed re-read before being reported INCOMPLETE. Structural (falsify: drop the
       # retry block — this trips). Pattern via concatenation so this line never self-matches.
@@ -160,7 +297,7 @@ while [ $# -gt 0 ]; do
       [ "$(dev_class "?" "4A:18:79:30:A3:0F")" = PERSONAL ]  || { echo "smoke-test: FAIL (nameless RANDOM-addr MAC must fuse to PERSONAL — the person-zone recovery)"; exit 1; }
       [ "$(dev_class "?" "64:3E:0F:48:72:3E")" != PERSONAL ] || { echo "smoke-test: FAIL (nameless PUBLIC-addr MAC must NOT be claimed PERSONAL)"; exit 1; }
       [ "$(dev_class "Bose SoundLink" "4A:18:79:30:A3:0F")" = APPLIANCE ] || { echo "smoke-test: FAIL (named appliance must keep APPLIANCE — name outranks a random MAC)"; exit 1; }
-      echo "smoke-test: ok (peer=$_resolved · scan_sampled:5 + peer-resolve/router + classify_peer_fail:5 + dev_class-addrtype:3 assertions)"; exit 0 ;;
+      echo "smoke-test: ok (peer=$_resolved · scan_sampled:5 + peer-resolve/router + classify_peer_fail:10 incl. local-rc attribution + scan_both REAL-DRIVE retry/wiring + dev_class-addrtype:3 assertions)"; exit 0 ;;
     --stream)
       MODE=stream; shift
       if [[ "${1:-}" =~ ^[1-9][0-9]*$ ]]; then INTERVAL="$1"; shift; fi ;;
@@ -185,71 +322,6 @@ if [[ "$PEER_HOST" == *@* ]]; then
   PEER_USER="${PEER_HOST%@*}"; PEER_HOST="${PEER_HOST##*@}"
 fi
 
-# --- scan_both: collect local + peer presence, return arrays populated ---
-scan_both() {
-  local local_out peer_out
-  # OUTER timeout on BOTH BLE scans, bounding a WEDGED adapter (bluetoothctl query can block forever on
-  # a D-Bus stall — without this a wedge hangs the cron reflex; ConnectTimeout only guards the SSH
-  # handshake, not the remote command). The timeout is a WEDGE-BOUND, NOT a tight SLA, so it MUST sit
-  # well above a HEALTHY-but-slow scan. The old `timeout 20` for a 10s scan was mis-sized: a real ds
-  # peer scan is ~26s wall (10s BLE window + bluetoothctl adapter setup/teardown + D-Bus device query
-  # + SSH), so EVERY peer scan was killed at 20s → rc=124 INCOMPLETE → the peer column was permanently
-  # EMPTY (peer_unique=0 in every presence-fusion.log line) and the cross-vantage DIFFERENTIAL — the
-  # devices only the PEER sees (health proved ds uniquely covers Rosalia's iPhone + K380, IdeaPad
-  # blind) — was silently LOST, the exact value this fusion exists to surface. Headroom = scan_win+35
-  # (45s for a 10s window) covers the measured 26s with margin and still catches a true wedge.
-  # (genome 2026-06-26, discover→health→genome baton: ds proven a real 2nd BLE vantage, fusion hollow.)
-  # SCAN_COMPLETE stays content-based (see scan_sampled): mesh-presence exits 1 on a successful
-  # 0-device scan (empty room), so exit-code gating misreads empty rooms as incomplete (same bug class
-  # as mesh-arrivals/mesh-body-state, mesh-chat 2026-06-18 thread).
-  local scan_win="${MESH_FUSE_SCAN_WIN:-10}"
-  local scan_to=$(( scan_win + 35 ))
-  local_out="$(timeout "$scan_to" mesh-presence "$scan_win" 2>/dev/null)" || true
-  # Capture the peer rc so an INCOMPLETE fusion can attribute the REAL cause. ssh passes the REMOTE
-  # command's exit code through on a successful connection (rc 127 = remote shell "command not
-  # found" → mesh-presence missing on the peer) and returns 255 when the SSH layer itself fails
-  # (host down / auth / network). These are different operator fixes; conflating them as "check
-  # SSH" (the old message) sent a reader hunting the wrong problem when the peer simply lacked the
-  # tool (ds, 2026-06-21: SSH-OK + PRESENCE-MISSING → false "could not reach").
-  local peer_rc
-  peer_out="$(timeout "$scan_to" ssh $SSH_OPTS "${PEER_USER}@${PEER_HOST}" "\$HOME/.local/bin/mesh-presence $scan_win" 2>/dev/null)"; peer_rc=$?
-  # RETRY-ONCE on rc=3 (the retry-once standard, 5c47ea1): exit 3 is a DEGRADED read — the peer's
-  # adapter was scan-locked (BUSY: another scanner's flock window, seconds long) or the read raced a
-  # cache clear (SUSPECT). Both are transient contention, not a dead sense; one short-delay retry
-  # heals them (live case 2026-07-07: scheduled :39 cycles read rc=3 while the peer's own scans were
-  # producing n=4..8 all morning). A retry that still fails is reported as before — never faked.
-  # ALSO retry on rc=124 (2026-07-10): a live scan-lock can hold past the full $scan_to budget
-  # instead of surfacing BUSY quickly — same contention, just slower to report — so the SSH+scan
-  # itself gets killed by `timeout` before mesh-presence ever prints BUSY. Without this the peer
-  # column reads permanently INCOMPLETE for that whole 30min cron cycle (verified live: 03:39:58Z
-  # cycle hit rc=124 with ds's own adapter healthy seconds later — a rc=3-only retry never caught it).
-  if [ "$peer_rc" = 3 ] || [ "$peer_rc" = 124 ]; then
-    sleep "${MESH_FUSE_RETRY_DELAY_S:-25}"
-    peer_out="$(timeout "$scan_to" ssh $SSH_OPTS "${PEER_USER}@${PEER_HOST}" "\$HOME/.local/bin/mesh-presence $scan_win" 2>/dev/null)"; peer_rc=$?
-  fi
-  local lok=0 pok=0
-  scan_sampled "$local_out" && lok=1
-  scan_sampled "$peer_out" && pok=1
-  SCAN_COMPLETE=0; [ "$lok" = 1 ] && [ "$pok" = 1 ] && SCAN_COMPLETE=1
-  PEER_FAIL_REASON="$(classify_peer_fail "$lok" "$pok" "$peer_rc")"
-
-  unset l_rssi l_name p_rssi p_name 2>/dev/null || true
-  declare -gA l_rssi l_name p_rssi p_name
-
-  while IFS='|' read -r rssi mac name; do
-    [ -z "$mac" ] && continue
-    l_rssi["$mac"]="$rssi"
-    l_name["$mac"]="${name:-?}"
-  done < <(echo "$local_out" | grep -E '^-?[0-9]+\|' || true)
-
-  while IFS='|' read -r rssi mac name; do
-    [ -z "$mac" ] && continue
-    p_rssi["$mac"]="$rssi"
-    p_name["$mac"]="${name:-?}"
-  done < <(echo "$peer_out" | grep -E '^-?[0-9]+\|' || true)
-
-  PEER_NAME="$(timeout 8 ssh $SSH_OPTS "${PEER_USER}@${PEER_HOST}" 'hostname' 2>/dev/null || echo peer)"
-}
 
 # --- closest_node: for a given MAC, return which node has strongest RSSI ---
 closest_node() {
