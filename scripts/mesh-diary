@@ -1,0 +1,213 @@
+#!/usr/bin/env bash
+# mesh-diary — the mesh keeps a DIARY of the home's life. A reflex, not a mind.
+#
+# Operator (2026-07-17): "пусть записывает вообще все и оформляет в дневник. минд почти ничего
+# не делать должен, только проверять, что дневник ведётся. большая часть работы окна — рефлексы."
+#
+# Every run it reads whatever is NEW across the life-sources (room speech, arrivals, presence,
+# activity states) since its per-source byte watermark, hands the raw material to mesh-relay to
+# be written up as a short diary entry (Russian, first-person "мы/дом"), and appends it to the
+# day's file. The mind's only job is to check the diary is still being kept (mesh-diary --status).
+#
+#   mesh-diary                run once: ingest new material → format → append today's entry
+#   mesh-diary --status       liveness verdict for the mind (KEPT | STALE | EMPTY-OK)
+#   mesh-diary --tail [n]      last n lines of the current diary file (default 40)
+#   mesh-diary --today         path of today's diary file
+#   mesh-diary --json          machine-readable status
+#   mesh-diary --test          smoke test (drives the REAL ingest pipeline, sandboxed)
+#
+# Diary:     ~/.mesh/diary/YYYY-MM-DD.md   (one file per day, entries appended)
+# Watermark: ~/.mesh/diary/.offsets        (per-source byte offset; reset to 0 on rotation)
+# State:     ~/.mesh/diary/.state          (mtime = last live run; content = last verdict)
+#
+# MESH_DIARY_SOURCES : space-sep basenames under ~/.mesh to ingest (default below).
+# MESH_DIARY_RELAY   : formatter command (default: mesh-relay). Test stubs this — never the pipeline.
+# MESH_DIARY_MODEL   : optional model pin passed to the relay via MESH_GROQ_MODEL.
+# MESH_DIARY_CAP     : max bytes read per source per run (default 8000) — bounds the relay prompt.
+#
+# NO SILENT FALLBACK: if the relay produces nothing, the entry is still written but marked
+#   [RELAY-FAILED] with the RAW material verbatim — the diary keeps progressing and the failure is
+#   LOUD in the file and the verdict, never a plausible blank. A dead cron never runs → never
+#   touches → --status honestly reads STALE.
+#
+# reflex-cadence: */20 * * * *
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+[ -f "$HOME/.mesh/nodes" ] && . "$HOME/.mesh/nodes" 2>/dev/null || true
+
+MESH="${MESH_DIR:-$HOME/.mesh}"
+DIARY_DIR="$MESH/diary"
+OFFSETS="$DIARY_DIR/.offsets"
+STATE="$DIARY_DIR/.state"
+CAP="${MESH_DIARY_CAP:-8000}"
+RELAY="${MESH_DIARY_RELAY:-mesh-relay}"
+# A life-diary needs a model that FOLLOWS the Russian first-person instruction — the relay's default
+# llama-3.1-8b-instant ignores it and dumps an English device analysis (relay-verdict-needs-a-pin).
+# Pin a prose-grade instruct model; override per node via MESH_DIARY_MODEL.
+: "${MESH_DIARY_MODEL:=llama-4-scout-17b-16e-instruct}"
+# Life-sources by default — SPEECH in the room and WHO came/went are what a home diary is of. Raw
+# device/BLE scans (presence.log) and mesh-internal coordination (chat/traces/records) are NOISE that
+# drowns the life signal — the model latched onto MAC addresses when presence.log was fed. Widen
+# deliberately via MESH_DIARY_SOURCES (e.g. add home-state.log for activity narration).
+SOURCES="${MESH_DIARY_SOURCES:-room-transcript.txt arrivals.log}"
+
+mkdir -p "$DIARY_DIR"
+[ -e "$OFFSETS" ] || : >"$OFFSETS"
+
+today_file(){ echo "$DIARY_DIR/$(date -u +%Y-%m-%d).md"; }
+now_hm(){ date -u +%H:%M; }
+
+# --- per-source watermark: emit only bytes appended since last run ------------------------------
+_get_off(){ awk -v k="$1" '$1==k{print $2; found=1} END{if(!found)print 0}' "$OFFSETS"; }
+_set_off(){ # $1=key $2=offset  (rewrite the one line, keep the rest)
+  local k="$1" v="$2" tmp; tmp="$(mktemp)"
+  awk -v k="$k" -v v="$v" '$1==k{print k, v; done=1; next} {print} END{if(!done)print k, v}' "$OFFSETS" >"$tmp" && mv "$tmp" "$OFFSETS"
+}
+
+# Collect the new material across all sources into $RAW_TMP; stage the would-be offsets into
+# $STAGE_TMP (committed by the caller only once the entry is safely written — a crash mid-format
+# then re-reads the same material next run rather than losing it). Files, not shell vars, because
+# the caller reads this via $(...) and a subshell var would never reach the parent to commit.
+RAW_TMP="" STAGE_TMP=""
+collect_new(){
+  local src f size off new tag any=0 start
+  RAW_TMP="$(mktemp)"; STAGE_TMP="$(mktemp)"
+  for src in $SOURCES; do
+    f="$MESH/$src"
+    [ -e "$f" ] || continue
+    size=$(stat -c%s "$f" 2>/dev/null || echo 0)
+    off=$(_get_off "$src")
+    # rotation/truncation guard — file shrank under our offset → start from the top
+    [ "$off" -gt "$size" ] 2>/dev/null && off=0
+    if [ "$size" -gt "$off" ]; then
+      # read at most CAP bytes of the NEW tail (skip ahead if the gap is larger than the cap)
+      start=$off
+      [ $(( size - off )) -gt "$CAP" ] && start=$(( size - CAP ))
+      new="$(tail -c +"$(( start + 1 ))" "$f" 2>/dev/null | grep -a -v '^[[:space:]]*$' || true)"
+      if [ -n "$new" ]; then
+        tag="${src%.*}"
+        printf '## %s\n%s\n\n' "$tag" "$new" >>"$RAW_TMP"
+        any=1
+      fi
+    fi
+    printf '%s %s\n' "$src" "$size" >>"$STAGE_TMP"
+  done
+  return $(( any ? 0 : 1 ))
+}
+commit_off(){ [ -s "$STAGE_TMP" ] || return 0; while read -r k v; do [ -n "$k" ] && _set_off "$k" "$v"; done <"$STAGE_TMP"; }
+
+# --- the mind-less formatter: raw material → one short diary entry -------------------------------
+# NO "Тихо." escape hatch in the prompt — the model over-takes it and collapses a lively scene into
+# one word (skip-hatch trap). Quiet is decided in CODE: collect_new returns "nothing new" → EMPTY-OK,
+# no entry. By the time we prompt, there IS material, so demand a grounded paragraph about it.
+DIARY_PROMPT='Ты — дневник умного дома. Ниже сырые события за последние ~20 минут (речь в комнате,
+приходы/уходы). Напиши ОДИН короткий живой абзац дневника на русском от лица дома ("мы", "у нас") —
+что происходило, кто был, о чём говорили, какое настроение. Пиши только про то, что реально есть в
+событиях, не выдумывай. Только сам текст записи: без заголовков, без списков, без преамбулы, без
+английского. Вот события:'
+
+format_entry(){ # stdin=raw material -> stdout=entry text (empty on relay failure)
+  local raw; raw="$(cat)"
+  [ -n "$raw" ] || { echo; return; }
+  local env_pin=(); [ -n "${MESH_DIARY_MODEL:-}" ] && env_pin=(env "MESH_GROQ_MODEL=$MESH_DIARY_MODEL")
+  printf '%s\n\n%s\n' "$DIARY_PROMPT" "$raw" \
+    | timeout 90 "${env_pin[@]}" "$RELAY" 2>/dev/null | sed '/^[[:space:]]*$/d'
+}
+
+run_once(){
+  local raw entry f
+  if ! collect_new; then # nothing new — stay LIVE, write no filler entry
+    rm -f "$RAW_TMP" "$STAGE_TMP" 2>/dev/null
+    echo "EMPTY-OK $(date -u +%FT%TZ) no new material" >"$STATE"
+    echo "diary: no new material (still kept)"; return 0
+  fi
+  raw="$(cat "$RAW_TMP")"
+  entry="$(format_entry <"$RAW_TMP")"
+  rm -f "$RAW_TMP" 2>/dev/null
+  f="$(today_file)"
+  { echo "### $(now_hm)Z"
+    if [ -n "$entry" ]; then
+      printf '%s\n\n' "$entry"
+    else
+      # LOUD failure — the relay gave nothing; preserve raw material so the day is never blank-lied.
+      echo "[RELAY-FAILED — raw material preserved]"
+      printf '```\n%s\n```\n\n' "$raw"
+    fi
+  } >>"$f"
+  commit_off
+  rm -f "$STAGE_TMP" 2>/dev/null
+  if [ -n "$entry" ]; then
+    echo "KEPT $(date -u +%FT%TZ) $(wc -c <"$f") bytes" >"$STATE"
+    echo "diary: entry appended -> $f"
+  else
+    echo "RELAY-FAILED $(date -u +%FT%TZ) raw preserved" >"$STATE"
+    echo "diary: RELAY-FAILED — raw material preserved in $f" >&2
+    return 3
+  fi
+}
+
+status_verdict(){ # KEPT | STALE | EMPTY-OK | UNKNOWN, with age
+  local age v
+  [ -e "$STATE" ] || { echo "UNKNOWN (never run)"; return; }
+  age=$(( $(date +%s) - $(stat -c%Y "$STATE" 2>/dev/null || echo 0) ))
+  v="$(cut -d' ' -f1 "$STATE" 2>/dev/null)"
+  # the reflex runs every 20m; > 2 cadences without a live touch = the diary has stopped being kept
+  if [ "$age" -gt 2700 ]; then echo "STALE (${age}s since last run — diary not being kept)"; return; fi
+  case "$v" in
+    KEPT)          echo "KEPT (${age}s — entries flowing)";;
+    EMPTY-OK)      echo "EMPTY-OK (${age}s — live, quiet home)";;
+    RELAY-FAILED)  echo "RELAY-FAILED (${age}s — formatter down, raw preserved)";;
+    *)             echo "UNKNOWN (${age}s)";;
+  esac
+}
+
+# --- test: drive the REAL ingest→collect→format→append→offset pipeline (relay stubbed, HOME sandboxed) --
+if [ "${1:-}" = --test ]; then
+  for x in awk tail stat sed wc; do command -v "$x" >/dev/null 2>&1 || { echo "smoke-test: FAIL (no $x)"; exit 1; }; done
+  td="$(mktemp -d)" || { echo "smoke-test: FAIL (mktemp)"; exit 1; }
+  trap 'rm -rf "$td"' EXIT
+  mkdir -p "$td/.mesh"
+  # a stub formatter that PROVES the real material reached it — echoes a marker + a hash of stdin
+  stub="$td/relay-stub"; cat >"$stub" <<'EOF'
+#!/usr/bin/env bash
+in="$(cat)"; echo "STUBENTRY:$(printf '%s' "$in" | wc -c)b"
+EOF
+  chmod +x "$stub"
+  seed(){ printf '[20:57:03] [note3] привет дом\nкак дела\n' >"$td/.mesh/room-transcript.txt"; }
+  seed
+  # 1) REAL run: must ingest the fixture, call the (stub) formatter with the fixture inside it, append an entry
+  out="$(HOME="$td" MESH_DIR="$td/.mesh" MESH_DIARY_RELAY="$stub" MESH_DIARY_SOURCES=room-transcript.txt "$0" 2>&1)" \
+    || { echo "smoke-test: FAIL (run_once errored: $out)"; exit 1; }
+  df="$td/.mesh/diary/$(date -u +%Y-%m-%d).md"
+  [ -s "$df" ] || { echo "smoke-test: FAIL (no diary file written)"; exit 1; }
+  grep -q 'STUBENTRY:' "$df" || { echo "smoke-test: FAIL (formatter output not in diary — pipeline broken)"; exit 1; }
+  # the stub proves the RAW fixture actually reached the formatter (byte count > the prompt alone would be)
+  grep -qE 'STUBENTRY:[0-9]+b' "$df" || { echo "smoke-test: FAIL (formatter received no material)"; exit 1; }
+  # 2) DEDUP: immediate re-run with no new bytes must NOT append a second real entry (offset advanced)
+  before="$(grep -c 'STUBENTRY:' "$df")"
+  HOME="$td" MESH_DIR="$td/.mesh" MESH_DIARY_RELAY="$stub" MESH_DIARY_SOURCES=room-transcript.txt "$0" >/dev/null 2>&1
+  after="$(grep -c 'STUBENTRY:' "$df")"
+  [ "$before" = "$after" ] || { echo "smoke-test: FAIL (re-ran with no new material yet appended again — watermark not committed)"; exit 1; }
+  # and status must read live+quiet after the empty run
+  HOME="$td" MESH_DIR="$td/.mesh" "$0" --status 2>/dev/null | grep -q 'EMPTY-OK' \
+    || { echo "smoke-test: FAIL (--status not EMPTY-OK after an empty run)"; exit 1; }
+  # 3) LOUD relay failure: a formatter that emits nothing must still write an entry, marked, with raw preserved
+  printf 'новое событие для проверки сбоя\n' >>"$td/.mesh/room-transcript.txt"
+  emptyrelay="$td/relay-empty"; printf '#!/usr/bin/env bash\ncat >/dev/null; exit 0\n' >"$emptyrelay"; chmod +x "$emptyrelay"
+  HOME="$td" MESH_DIR="$td/.mesh" MESH_DIARY_RELAY="$emptyrelay" MESH_DIARY_SOURCES=room-transcript.txt "$0" >/dev/null 2>&1
+  grep -q 'RELAY-FAILED' "$df" || { echo "smoke-test: FAIL (empty relay output did not produce a LOUD [RELAY-FAILED] entry)"; exit 1; }
+  grep -q 'новое событие для проверки сбоя' "$df" || { echo "smoke-test: FAIL (raw material not preserved on relay failure)"; exit 1; }
+  echo "smoke-test: ok (ingest→format→append, watermark dedup, EMPTY-OK liveness, LOUD relay-fail all asserted)"
+  exit 0
+fi
+
+case "${1:-}" in
+  --status) status_verdict;;
+  --today)  today_file;;
+  --tail)   f="$(today_file)"; [ -e "$f" ] && tail -n "${2:-40}" "$f" || echo "(no diary yet today)";;
+  --json)   f="$(today_file)"; v="$(status_verdict)"
+            printf '{"verdict":"%s","today":"%s","bytes":%s}\n' "${v%% *}" "$f" "$([ -e "$f" ] && stat -c%s "$f" || echo 0)";;
+  ""|--run) run_once;;
+  *) echo "usage: mesh-diary [--status|--tail [n]|--today|--json|--test]" >&2; exit 2;;
+esac
