@@ -29,6 +29,7 @@ SMARTCTL="${MESH_NVME_HEALTH_SMARTCTL:-sudo -n smartctl}"
 mkdir -p "$MESH" 2>/dev/null || true
 
 discover_dev() {
+  # first controller only — kept for the --test real-read gate (any one live device proves the read)
   local n
   shopt -s nullglob
   for n in "$ROOT"/nvme*; do
@@ -39,6 +40,23 @@ discover_dev() {
   done
   shopt -u nullglob
   return 1
+}
+
+# every NVMe controller under $ROOT — a node's spare/scratch drive is a SEPARATE controller
+# (nvme1 on mesh-home wears 2.7x faster than the root nvme0) and must not be dropped. Match only
+# the controller nodes (nvmeN), never the namespace/partition nodes (nvmeNnM / nvmeNnMpK).
+discover_devs() {
+  local n base found=1
+  shopt -s nullglob
+  for n in "$ROOT"/nvme*; do
+    [ -e "$n" ] || continue
+    base="$(basename "$n")"
+    [[ "$base" =~ ^nvme[0-9]+$ ]] || continue
+    printf '/dev/%s\n' "$base"
+    found=0
+  done
+  shopt -u nullglob
+  return $found
 }
 
 # reads smartctl -A output on stdin, emits: critwarn\tspare\tsparethr\tused\tmediaerr
@@ -67,6 +85,10 @@ classify() {
   if [ -n "$used" ] && [ "$used" -ge 50 ] 2>/dev/null; then echo AGING; return; fi
   echo HEALTHY
 }
+
+# worst-of ranking so the aggregate label is the most-worn drive's — a healthy root must never
+# mask a critical spare (the whole point of reading every controller)
+sev_rank() { case "$1" in CRITICAL) echo 3 ;; WORN) echo 2 ;; AGING) echo 1 ;; *) echo 0 ;; esac; }
 
 if [ "${1:-}" = --test ]; then
   fake="$(mktemp)" || { echo "smoke-test: FAIL (mktemp)"; exit 1; }
@@ -141,11 +163,25 @@ EOF
   printf 'garbage\n' > "$fake"
   parse_smart < "$fake" >/dev/null 2>&1 && { echo "smoke-test: FAIL (garbage input parsed as if valid)"; exit 1; }
 
+  # multi-controller gate (RED-first vs the return-on-first-device bug): a fixture ROOT with TWO
+  # controller nodes where the SECOND is WORN must (a) enumerate BOTH devices and (b) aggregate to
+  # WORN — the old discover_dev returned on nvme0 and never saw nvme1, so the worn spare was invisible
+  troot="$(mktemp -d)" || { echo "smoke-test: FAIL (mktemp -d)"; exit 1; }
+  trap 'rm -f "$fake"; rm -rf "$troot"' EXIT
+  mkdir -p "$troot/nvme0" "$troot/nvme1" "$troot/nvme0n1" "$troot/nvme0n1p1"  # + namespace/partition decoys
+  n_devs="$(ROOT="$troot" discover_devs | wc -l | tr -d ' ')"
+  [ "$n_devs" = 2 ] || { echo "smoke-test: FAIL (discover_devs saw $n_devs controllers, expected 2 — namespace/partition decoys or single-device bug)"; exit 1; }
+  ROOT="$troot" discover_devs | grep -qx '/dev/nvme1' \
+    || { echo "smoke-test: FAIL (discover_devs dropped nvme1 — the return-on-first-device bug)"; exit 1; }
+  # a WORN second drive must set the aggregate to WORN via the worst-of rank
+  [ "$(sev_rank WORN)" -gt "$(sev_rank HEALTHY)" ] \
+    || { echo "smoke-test: FAIL (sev_rank does not rank WORN above HEALTHY — a worn spare would not surface)"; exit 1; }
+
   # real-read gate: a live device must actually produce a numeric percentage_used, not just exercise
   # the offline classifier
   dev="$(discover_dev)" || { echo "smoke-test: n/a (no NVMe device node on this node)"; exit 2; }
   real="$($SMARTCTL -A "$dev" 2>/dev/null | parse_smart)" || {
-    echo "smoke-test: n/a (smartctl unreadable — no sudo/binary on this node)"; exit 2;
+    echo "smoke-test: n/a (smartctl unreadable — a missing DEP, not a missing drive: 'sudo apt install smartmontools'; a reimage must reprovision it)"; exit 2;
   }
   IFS=$'\t' read -r cw spare sparethr used mediaerr <<<"$real"
   case "$used" in ''|*[!0-9]*) echo "smoke-test: FAIL (live read missing numeric percentage_used: $real)"; exit 1 ;; esac
@@ -162,35 +198,63 @@ for a in "$@"; do
   esac
 done
 
-DEV="$(discover_dev)" || {
+mapfile -t DEVS < <(discover_devs) || true
+if [ "${#DEVS[@]}" -eq 0 ]; then
   [ -f "$OFFLINEFILE" ] || { echo "nvme-health: UNREACHABLE — no NVMe device node under $ROOT" >&2; : > "$OFFLINEFILE"; }
   exit 2
-}
+fi
 
-READOUT="$($SMARTCTL -A "$DEV" 2>/dev/null | parse_smart)" || {
-  [ -f "$OFFLINEFILE" ] || { echo "nvme-health: UNREACHABLE — smartctl unreadable on $DEV (binary/sudo missing?)" >&2; : > "$OFFLINEFILE"; }
-  exit 2
-}
-rm -f "$OFFLINEFILE" 2>/dev/null || true
-
-IFS=$'\t' read -r CW SPARE SPARETHR USED MEDIAERR <<<"$READOUT"
-LABEL="$(classify "$CW" "$SPARE" "$SPARETHR" "$USED" "$MEDIAERR")"
 TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 PREV_LABEL=""
-[ -f "$STATE" ] && PREV_LABEL="$(cut -d'|' -f1 "$STATE" 2>/dev/null || true)"
+[ -f "$STATE" ] && PREV_LABEL="$(head -n1 "$STATE" 2>/dev/null | cut -d'|' -f1 | sed 's/^AGG://' || true)"
 
-printf '%s|%s|%s|%s|%s|%s|%s|%s\n' "$LABEL" "$USED" "$SPARE" "$SPARETHR" "$MEDIAERR" "0x$CW" "$DEV" "$TS" > "$STATE"
+# per-device readouts; a drive whose smartctl is unreadable is UNKNOWN (honest partial), never a
+# fabricated pass and never a hard exit that drops its healthy siblings
+declare -a LINES JSON_OBJS HUMAN
+AGG_RANK=-1
+AGG_LABEL=""
+READ_ANY=1
+for DEV in "${DEVS[@]}"; do
+  READOUT="$($SMARTCTL -A "$DEV" 2>/dev/null | parse_smart)" || {
+    LINES+=("UNKNOWN|?|?|?|?|0x?|$DEV|$TS")
+    JSON_OBJS+=("$(printf '{"label":"UNKNOWN","device":"%s","ts":"%s"}' "$DEV" "$TS")")
+    HUMAN+=("$(printf '[nvme-health] UNKNOWN — smartctl unreadable device=%s @ %s %s' "$DEV" "$(hostname)" "$TS")")
+    continue
+  }
+  READ_ANY=0
+  IFS=$'\t' read -r CW SPARE SPARETHR USED MEDIAERR <<<"$READOUT"
+  LABEL="$(classify "$CW" "$SPARE" "$SPARETHR" "$USED" "$MEDIAERR")"
+  r="$(sev_rank "$LABEL")"
+  if [ "$r" -gt "$AGG_RANK" ]; then AGG_RANK="$r"; AGG_LABEL="$LABEL"; fi
+  LINES+=("$LABEL|$USED|$SPARE|$SPARETHR|$MEDIAERR|0x$CW|$DEV|$TS")
+  JSON_OBJS+=("$(printf '{"label":"%s","percentage_used":%s,"available_spare":%s,"available_spare_threshold":%s,"media_errors":%s,"critical_warning":"0x%s","device":"%s","ts":"%s"}' \
+    "$LABEL" "$USED" "${SPARE:-null}" "${SPARETHR:-null}" "$MEDIAERR" "$CW" "$DEV" "$TS")")
+  HUMAN+=("$(printf '[nvme-health] %s — used=%s%% spare=%s%%(thr=%s%%) media_err=%s crit=0x%s device=%s @ %s %s' \
+    "$LABEL" "$USED" "${SPARE:-?}" "${SPARETHR:-?}" "$MEDIAERR" "$CW" "$DEV" "$(hostname)" "$TS")")
+done
+
+# every controller unreadable → same honest UNREACHABLE as no-device (don't write a state of UNKNOWNs)
+if [ "$READ_ANY" = 1 ]; then
+  [ -f "$OFFLINEFILE" ] || { echo "nvme-health: UNREACHABLE — smartctl unreadable on all controllers (a missing DEP, not missing drives: 'sudo apt install smartmontools'; a reimage must reprovision it)" >&2; : > "$OFFLINEFILE"; }
+  exit 2
+fi
+rm -f "$OFFLINEFILE" 2>/dev/null || true
+
+# aggregate label = worst live drive; UNKNOWN siblings never lower it, but surface in per-device lines
+[ -n "$AGG_LABEL" ] || AGG_LABEL=UNKNOWN
+
+# state: aggregate line first (label = worst), then one line per controller
+{ printf 'AGG:%s|devices=%s|%s\n' "$AGG_LABEL" "${#DEVS[@]}" "$TS"; printf '%s\n' "${LINES[@]}"; } > "$STATE"
 mesh-state-touch "$STATE"
 
 if [ "$JSON" = 1 ]; then
-  printf '{"label":"%s","percentage_used":%s,"available_spare":%s,"available_spare_threshold":%s,"media_errors":%s,"critical_warning":"0x%s","device":"%s","ts":"%s"}\n' \
-    "$LABEL" "$USED" "${SPARE:-null}" "${SPARETHR:-null}" "$MEDIAERR" "$CW" "$DEV" "$TS"
+  printf '{"label":"%s","device_count":%s,"ts":"%s","devices":[%s]}\n' \
+    "$AGG_LABEL" "${#DEVS[@]}" "$TS" "$(IFS=,; echo "${JSON_OBJS[*]}")"
   exit 0
 fi
 
-if [ "$EDGE" = 1 ] && [ "$PREV_LABEL" = "$LABEL" ]; then
+if [ "$EDGE" = 1 ] && [ "$PREV_LABEL" = "$AGG_LABEL" ]; then
   exit 0
 fi
 
-printf '[nvme-health] %s — used=%s%% spare=%s%%(thr=%s%%) media_err=%s crit=0x%s device=%s @ %s %s\n' \
-  "$LABEL" "$USED" "${SPARE:-?}" "${SPARETHR:-?}" "$MEDIAERR" "$CW" "$DEV" "$(hostname)" "$TS"
+printf '%s\n' "${HUMAN[@]}"
