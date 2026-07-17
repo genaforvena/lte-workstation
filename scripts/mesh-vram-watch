@@ -10,6 +10,13 @@
 #                       the GPU "100% GPU" (no spill) at REDUCED clocks → inference silently slows, no alarm.
 #   (C) SPILL           ollama ps PROCESSOR column flipping "100% GPU" → any "% CPU" — a warm model fell to
 #                       CPU (huge slowdown, still "green"). The gigaam-warm-daemon-degrades failure family.
+#   (D) TEMPERATURE     temperature.gpu — a GRADUATED axis that warns on the RAMP toward the ~83C thermal
+#                       slowdown and the ~93C hard shutdown, BEFORE the (B) throttle bits ever trip. The
+#                       throttle bitmask only speaks once HwThermalSlowdown (0x40) is ALREADY clamping the
+#                       clocks; a stuck fan / dust-choked heatsink climbs there silently first. sysfs hwmon
+#                       has NO nvidia chip on this node (hwmon0/1=nvme, hwmon2=k10temp) so the zone-scanner
+#                       is structurally blind to it — health-verified 2026-07-17: fan-seize was silent-green
+#                       to a 98C shutdown on the mind node, nvidia-smi being the ONLY reader of GPU temp.
 #
 # Why new (grep receipt, 2026-07-17): the only tools that touch nvidia-smi read the WRONG field —
 # mesh-model-watch:220 reads memory.TOTAL (static sizing) only; mesh-therm:28 names GPU as a COMMENT-only
@@ -52,6 +59,10 @@ VRAM_CRIT_PCT="${MESH_VRAM_CRIT_PCT:-90}"   # used/total ≥ this → CRITICAL (
 VRAM_WARN_PCT="${MESH_VRAM_WARN_PCT:-85}"   # used/total ≥ this → WARN (pressure building)
 CLK_WARN_PCT="${MESH_VRAM_CLK_WARN_PCT:-70}" # clocks.cur/max < this% WHILE loaded → WARN (silent clamp)
 UTIL_LOAD_PCT="${MESH_VRAM_UTIL_LOAD_PCT:-50}" # util ≥ this = "under load" (gate for the clamp warn)
+# GPU die temperature (°C). RTX 3060 thermal slowdown ~83C, hard shutdown ~93C — warn on the ramp,
+# crit while still BELOW slowdown so a fan-seize is caught before the throttle bits (B) ever trip.
+GPU_TEMP_WARN_C="${MESH_VRAM_TEMP_WARN_C:-80}"  # ≥ this → WARN (hot, fan should be ramping)
+GPU_TEMP_CRIT_C="${MESH_VRAM_TEMP_CRIT_C:-88}"  # ≥ this → CRITICAL (approaching slowdown/shutdown)
 
 # BENIGN reason bits (idle/config/sync — never a degrade): GpuIdle 0x1, AppClocksSetting 0x2,
 # SyncBoost 0x10, DisplayClockSetting 0x100. Everything else in supported(0x1FF) is a real clamp.
@@ -70,16 +81,17 @@ throttle_names() {
   printf '%s' "${names% }"
 }
 
-# parse_nvsmi: reads the CSV line "used, total, util, cur_clk, max_clk, active_mask" on stdin,
-# emits: used\ttotal\tutil\tcurclk\tmaxclk\tmask   (exit 1 if the required numerics are absent)
+# parse_nvsmi: reads the CSV line "used, total, util, cur_clk, max_clk, active_mask, temp" on stdin,
+# emits: used\ttotal\tutil\tcurclk\tmaxclk\tmask\ttemp   (exit 1 if the required numerics are absent)
 parse_nvsmi() {
   awk -F',' '
     { for (i=1;i<=NF;i++){ gsub(/^[ \t]+|[ \t]+$/,"",$i) } }
     {
-      used=$1; total=$2; util=$3; curclk=$4; maxclk=$5; mask=$6
-      # required numeric fields
-      if (used ~ /^[0-9]+$/ && total ~ /^[0-9]+$/ && total+0>0 && mask ~ /^0[xX][0-9a-fA-F]+$/) {
-        printf "%s\t%s\t%s\t%s\t%s\t%s\n", used, total, util, curclk, maxclk, mask
+      used=$1; total=$2; util=$3; curclk=$4; maxclk=$5; mask=$6; temp=$7
+      # required numeric fields — temp too: a card that cannot report its own die temp offers no
+      # thermal organ (exit 2 upstream), never a fabricated cool reading.
+      if (used ~ /^[0-9]+$/ && total ~ /^[0-9]+$/ && total+0>0 && mask ~ /^0[xX][0-9a-fA-F]+$/ && temp ~ /^[0-9]+$/) {
+        printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", used, total, util, curclk, maxclk, mask, temp
         found=1
       }
     }
@@ -104,7 +116,7 @@ sev_rank() { case "$1" in CRITICAL) echo 3 ;; WARN) echo 2 ;; UNKNOWN) echo 1 ;;
 
 # classify_all: given the parsed axes + spill, prints "LABEL|reason" for the WORST axis.
 classify_all() {
-  local used="$1" total="$2" util="$3" curclk="$4" maxclk="$5" mask="$6" spill="$7"
+  local used="$1" total="$2" util="$3" curclk="$4" maxclk="$5" mask="$6" spill="$7" temp="$8"
   local best_rank=0 best_label=HEALTHY best_reason="ok"
   consider() { # $1=label $2=reason
     local r; r="$(sev_rank "$1")"
@@ -129,6 +141,13 @@ classify_all() {
     UNKNOWN)   consider UNKNOWN  "spill unknown (ollama unreadable)" ;;
   esac
 
+  # (D) die temperature — graduated, catches a fan-seize ramp BEFORE the throttle bits (B) trip
+  if [[ "$temp" =~ ^[0-9]+$ ]]; then
+    if   [ "$temp" -ge "$GPU_TEMP_CRIT_C" ]; then consider CRITICAL "gpu ${temp}C (≥${GPU_TEMP_CRIT_C}C — approaching thermal slowdown/shutdown)"
+    elif [ "$temp" -ge "$GPU_TEMP_WARN_C" ]; then consider WARN "gpu ${temp}C (≥${GPU_TEMP_WARN_C}C — hot, check fan/airflow)"
+    fi
+  fi
+
   # (B') clock clamp UNDER LOAD (util-gated so an idle downclock never fires)
   if [ "${util}" -eq "${util}" ] 2>/dev/null && [ "${maxclk:-0}" -gt 0 ] 2>/dev/null; then
     local ratio=$(( curclk * 100 / maxclk ))
@@ -145,77 +164,97 @@ if [ "${1:-}" = --test ]; then
   fail() { echo "smoke-test: FAIL ($1)"; exit 1; }
 
   # helper: parse a CSV line then classify with a given spill state
-  run() { # $1=csv $2=spill  → "LABEL|reason"
+  run() { # $1=csv (7 fields incl. temp) $2=spill  → "LABEL|reason"
     local got
     got="$(printf '%s\n' "$1" | parse_nvsmi)" || { echo "PARSEFAIL"; return; }
-    IFS=$'\t' read -r used total util curclk maxclk mask <<<"$got"
-    classify_all "$used" "$total" "$util" "$curclk" "$maxclk" "$mask" "$2"
+    IFS=$'\t' read -r used total util curclk maxclk mask temp <<<"$got"
+    classify_all "$used" "$total" "$util" "$curclk" "$maxclk" "$mask" "$2" "$temp"
   }
 
-  # control 1: TRUE IDLE — mask=0x1 (GpuIdle), idle downclock 330/2160, util 0, low vram, 100% GPU.
+  # every fixture carries a 7th field = die temperature °C; benign (≤65) here unless the axis under test.
+  # control 1: TRUE IDLE — mask=0x1 (GpuIdle), idle downclock 330/2160, util 0, low vram, 100% GPU, cool.
   # The naive "non-0x0 → alarm" / "ratio<0.7 → warn" rule fires here; ours MUST stay HEALTHY.
-  out="$(run '6697, 12288, 0, 330, 2160, 0x0000000000000001' GPU)"
+  out="$(run '6697, 12288, 0, 330, 2160, 0x0000000000000001, 42' GPU)"
   [ "${out%%|*}" = HEALTHY ] || fail "idle (GpuIdle 0x1 + idle downclock) must be HEALTHY, got: $out"
 
   # control 2: benign display/sync/appclock bits set, still idle → HEALTHY
-  out="$(run '3000, 12288, 0, 300, 2160, 0x0000000000000112' GPU)"
+  out="$(run '3000, 12288, 0, 300, 2160, 0x0000000000000112, 40' GPU)"
   [ "${out%%|*}" = HEALTHY ] || fail "benign bits (AppClocks|SyncBoost|DisplayClock) must be HEALTHY, got: $out"
 
   # RED 1: SW_POWER_CAP (0x4) → CRITICAL naming the reason
-  out="$(run '6000, 12288, 92, 1200, 2160, 0x0000000000000004' GPU)"
+  out="$(run '6000, 12288, 92, 1200, 2160, 0x0000000000000004, 60' GPU)"
   [ "${out%%|*}" = CRITICAL ] || fail "SW_POWER_CAP (0x4) must be CRITICAL, got: $out"
   case "$out" in *SW_POWER_CAP*) : ;; *) fail "throttle alarm must NAME the reason SW_POWER_CAP, got: $out" ;; esac
 
   # RED 2: HwSlowdown (0x8) — the task's "0x8" case, named correctly as HW_SLOWDOWN
-  out="$(run '6000, 12288, 92, 1000, 2160, 0x0000000000000008' GPU)"
+  out="$(run '6000, 12288, 92, 1000, 2160, 0x0000000000000008, 60' GPU)"
   [ "${out%%|*}" = CRITICAL ] || fail "HW_SLOWDOWN (0x8) must be CRITICAL, got: $out"
   case "$out" in *HW_SLOWDOWN*) : ;; *) fail "0x8 must be named HW_SLOWDOWN (NVML), got: $out" ;; esac
 
   # RED 3: thermal slowdown (0x40 HwThermal) mixed WITH benign GpuIdle 0x1 → CRITICAL, benign bit ignored
-  out="$(run '6000, 12288, 88, 1400, 2160, 0x0000000000000041' GPU)"
+  out="$(run '6000, 12288, 88, 1400, 2160, 0x0000000000000041, 60' GPU)"
   [ "${out%%|*}" = CRITICAL ] || fail "HW_THERMAL (0x41=0x40|0x1) must be CRITICAL, got: $out"
   case "$out" in *HW_THERMAL_SLOWDOWN*) : ;; *) fail "0x41 must name HW_THERMAL_SLOWDOWN, got: $out" ;; esac
 
   # RED 4: VRAM pressure — 11500/12288 = 93% → CRITICAL
-  out="$(run '11500, 12288, 10, 1800, 2160, 0x0000000000000000' GPU)"
+  out="$(run '11500, 12288, 10, 1800, 2160, 0x0000000000000000, 55' GPU)"
   [ "${out%%|*}" = CRITICAL ] || fail "vram 93% must be CRITICAL, got: $out"
   case "$out" in *vram*) : ;; *) fail "vram-crit must cite vram, got: $out" ;; esac
 
   # WARN: VRAM 86% → WARN (not yet critical)
-  out="$(run '10600, 12288, 10, 1800, 2160, 0x0000000000000000' GPU)"
+  out="$(run '10600, 12288, 10, 1800, 2160, 0x0000000000000000, 55' GPU)"
   [ "${out%%|*}" = WARN ] || fail "vram 86% must be WARN, got: $out"
 
   # RED 5: SPILL — clean nvidia-smi but ollama shows a model on CPU → CRITICAL
-  out="$(run '3000, 12288, 0, 300, 2160, 0x0000000000000001' CPU-SPILL)"
+  out="$(run '3000, 12288, 0, 300, 2160, 0x0000000000000001, 45' CPU-SPILL)"
   [ "${out%%|*}" = CRITICAL ] || fail "ollama CPU spill must be CRITICAL, got: $out"
   case "$out" in *SPILL*) : ;; *) fail "spill alarm must cite SPILL, got: $out" ;; esac
 
-  # WARN: clock clamped UNDER LOAD — util 92, 1200/2160 = 55% < 70%, no bad bit, low vram → WARN
-  out="$(run '6000, 12288, 92, 1200, 2160, 0x0000000000000000' GPU)"
+  # RED 6: DIE TEMP — 90C ≥ crit, clean mask, low vram, idle, 100% GPU → CRITICAL from temp ALONE,
+  # BEFORE any throttle bit trips (the fan-seize-ramp case the throttle bitmask can't see yet).
+  out="$(run '3000, 12288, 0, 300, 2160, 0x0000000000000000, 90' GPU)"
+  [ "${out%%|*}" = CRITICAL ] || fail "gpu 90C must be CRITICAL, got: $out"
+  case "$out" in *gpu*90C*) : ;; *) fail "temp-crit must cite gpu temp, got: $out" ;; esac
+
+  # WARN: DIE TEMP 82C ≥ warn (< crit) → WARN
+  out="$(run '3000, 12288, 0, 300, 2160, 0x0000000000000000, 82' GPU)"
+  [ "${out%%|*}" = WARN ] || fail "gpu 82C must be WARN, got: $out"
+  case "$out" in *gpu*82C*) : ;; *) fail "temp-warn must cite gpu temp, got: $out" ;; esac
+
+  # control 4: DIE TEMP 65C — warm but below warn → HEALTHY (no cry-wolf on a normal load temp)
+  out="$(run '6000, 12288, 92, 1900, 2160, 0x0000000000000000, 65' GPU)"
+  [ "${out%%|*}" = HEALTHY ] || fail "gpu 65C (below warn) must be HEALTHY, got: $out"
+
+  # WARN: clock clamped UNDER LOAD — util 92, 1200/2160 = 55% < 70%, no bad bit, low vram, cool → WARN
+  out="$(run '6000, 12288, 92, 1200, 2160, 0x0000000000000000, 60' GPU)"
   [ "${out%%|*}" = WARN ] || fail "clock-clamp-under-load must be WARN, got: $out"
   case "$out" in *clamp*) : ;; *) fail "clamp warn must cite clamp, got: $out" ;; esac
 
   # control 3: SAME low clock ratio but IDLE (util 0) → HEALTHY (idle downclock is not a clamp)
-  out="$(run '6000, 12288, 0, 1200, 2160, 0x0000000000000000' GPU)"
+  out="$(run '6000, 12288, 0, 1200, 2160, 0x0000000000000000, 45' GPU)"
   [ "${out%%|*}" = HEALTHY ] || fail "low clock ratio at util=0 must be HEALTHY (idle≠clamp), got: $out"
 
   # spill UNKNOWN (ollama unreadable) is honest partial, not a green pass and not a crit
-  out="$(run '3000, 12288, 0, 300, 2160, 0x0000000000000001' UNKNOWN)"
+  out="$(run '3000, 12288, 0, 300, 2160, 0x0000000000000001, 45' UNKNOWN)"
   [ "${out%%|*}" = UNKNOWN ] || fail "unreadable ollama must be UNKNOWN (honest partial), got: $out"
 
   # garbage nvidia-smi line → parse_nvsmi must reject, never classify garbage
   printf 'no GPU here\n' | parse_nvsmi >/dev/null 2>&1 && fail "garbage nvidia-smi output parsed as valid"
 
-  # real-read gate: a LIVE nvidia-smi must yield a parseable hex bitmask + numeric used, or exit 2
+  # a read MISSING the temp field (6 cols, e.g. [N/A] temp) must be REJECTED — no fabricated cool GPU
+  printf '3000, 12288, 0, 300, 2160, 0x0000000000000000\n' | parse_nvsmi >/dev/null 2>&1 && fail "6-field line (no temp) must be rejected — temp is required"
+
+  # real-read gate: a LIVE nvidia-smi must yield a parseable hex bitmask + numeric used + numeric temp, or exit 2
   if ! command -v "$NVSMI" >/dev/null 2>&1; then
     echo "smoke-test: n/a (no nvidia-smi on this node — no dGPU organ)"; exit 2
   fi
-  live="$("$NVSMI" --query-gpu=memory.used,memory.total,utilization.gpu,clocks.current.graphics,clocks.max.graphics,clocks_event_reasons.active --format=csv,noheader,nounits 2>/dev/null | parse_nvsmi)" || {
+  live="$("$NVSMI" --query-gpu=memory.used,memory.total,utilization.gpu,clocks.current.graphics,clocks.max.graphics,clocks_event_reasons.active,temperature.gpu --format=csv,noheader,nounits 2>/dev/null | parse_nvsmi)" || {
     echo "smoke-test: n/a (nvidia-smi unreadable — no dGPU / driver down)"; exit 2; }
-  IFS=$'\t' read -r used total util curclk maxclk mask <<<"$live"
+  IFS=$'\t' read -r used total util curclk maxclk mask temp <<<"$live"
   case "$used" in ''|*[!0-9]*) fail "live read missing numeric memory.used: $live" ;; esac
   case "$mask" in 0[xX]*) : ;; *) fail "live read missing hex throttle bitmask: $live" ;; esac
-  echo "smoke-test: ok (idle-benign + 5 RED axes + clamp-vs-idle + spill-unknown + garbage-reject + live read: used=${used}/${total}MiB util=${util}% clk=${curclk}/${maxclk}MHz mask=${mask})"
+  case "$temp" in ''|*[!0-9]*) fail "live read missing numeric temperature.gpu: $live" ;; esac
+  echo "smoke-test: ok (idle-benign + 7 RED axes + temp-warn/control + clamp-vs-idle + spill-unknown + garbage/no-temp reject + live read: used=${used}/${total}MiB util=${util}% clk=${curclk}/${maxclk}MHz mask=${mask} temp=${temp}C)"
   exit 0
 fi
 # ---------------------------------------------------------------------------
@@ -227,15 +266,15 @@ command -v "$NVSMI" >/dev/null 2>&1 || {
   [ -f "$OFFLINEFILE" ] || { echo "vram-watch: UNREACHABLE — no nvidia-smi (no dGPU organ on this node)" >&2; : > "$OFFLINEFILE"; }
   exit 2
 }
-LIVE="$("$NVSMI" --query-gpu=memory.used,memory.total,utilization.gpu,clocks.current.graphics,clocks.max.graphics,clocks_event_reasons.active --format=csv,noheader,nounits 2>/dev/null | parse_nvsmi)" || {
+LIVE="$("$NVSMI" --query-gpu=memory.used,memory.total,utilization.gpu,clocks.current.graphics,clocks.max.graphics,clocks_event_reasons.active,temperature.gpu --format=csv,noheader,nounits 2>/dev/null | parse_nvsmi)" || {
   [ -f "$OFFLINEFILE" ] || { echo "vram-watch: UNREACHABLE — nvidia-smi unreadable (driver down?)" >&2; : > "$OFFLINEFILE"; }
   exit 2
 }
 rm -f "$OFFLINEFILE" 2>/dev/null || true
 
-IFS=$'\t' read -r USED TOTAL UTIL CURCLK MAXCLK MASK <<<"$LIVE"
+IFS=$'\t' read -r USED TOTAL UTIL CURCLK MAXCLK MASK TEMP <<<"$LIVE"
 SPILL="$(spill_state)"
-RESULT="$(classify_all "$USED" "$TOTAL" "$UTIL" "$CURCLK" "$MAXCLK" "$MASK" "$SPILL")"
+RESULT="$(classify_all "$USED" "$TOTAL" "$UTIL" "$CURCLK" "$MAXCLK" "$MASK" "$SPILL" "$TEMP")"
 LABEL="${RESULT%%|*}"; REASON="${RESULT#*|}"
 PCT=$(( USED * 100 / TOTAL ))
 RATIO=0; [ "${MAXCLK:-0}" -gt 0 ] 2>/dev/null && RATIO=$(( CURCLK * 100 / MAXCLK ))
@@ -245,17 +284,17 @@ PREV_LABEL=""
 [ -f "$STATE" ] && PREV_LABEL="$(head -n1 "$STATE" 2>/dev/null | cut -d'|' -f1 | sed 's/^GPU://' || true)"
 
 # state artifact (mesh-stress / mesh-doctor may read the live axis); mtime = liveness (always touched)
-printf 'GPU:%s|vram=%s/%sMiB(%s%%)|util=%s%%|clk=%s/%sMHz(%s%%)|throttle=%s|spill=%s|%s|%s\n' \
-  "$LABEL" "$USED" "$TOTAL" "$PCT" "$UTIL" "$CURCLK" "$MAXCLK" "$RATIO" "$MASK" "$SPILL" "$REASON" "$TS" > "$STATE"
+printf 'GPU:%s|vram=%s/%sMiB(%s%%)|util=%s%%|clk=%s/%sMHz(%s%%)|temp=%sC|throttle=%s|spill=%s|%s|%s\n' \
+  "$LABEL" "$USED" "$TOTAL" "$PCT" "$UTIL" "$CURCLK" "$MAXCLK" "$RATIO" "$TEMP" "$MASK" "$SPILL" "$REASON" "$TS" > "$STATE"
 mesh-state-touch "$STATE" 2>/dev/null || touch "$STATE" 2>/dev/null || true
 
 if [ "$JSON" = 1 ]; then
-  printf '{"label":"%s","vram_used_mib":%s,"vram_total_mib":%s,"vram_pct":%s,"util_pct":%s,"clock_cur_mhz":%s,"clock_max_mhz":%s,"clock_ratio_pct":%s,"throttle_mask":"%s","throttle_reasons":"%s","spill":"%s","reason":"%s","ts":"%s"}\n' \
-    "$LABEL" "$USED" "$TOTAL" "$PCT" "$UTIL" "$CURCLK" "$MAXCLK" "$RATIO" "$MASK" "$(throttle_names "$MASK")" "$SPILL" "$REASON" "$TS"
+  printf '{"label":"%s","vram_used_mib":%s,"vram_total_mib":%s,"vram_pct":%s,"util_pct":%s,"clock_cur_mhz":%s,"clock_max_mhz":%s,"clock_ratio_pct":%s,"temp_c":%s,"throttle_mask":"%s","throttle_reasons":"%s","spill":"%s","reason":"%s","ts":"%s"}\n' \
+    "$LABEL" "$USED" "$TOTAL" "$PCT" "$UTIL" "$CURCLK" "$MAXCLK" "$RATIO" "$TEMP" "$MASK" "$(throttle_names "$MASK")" "$SPILL" "$REASON" "$TS"
   exit 0
 fi
 
 if [ "$EDGE" = 1 ] && [ "$PREV_LABEL" = "$LABEL" ]; then exit 0; fi
 
-printf '[vram-watch] %s — vram=%s/%sMiB(%s%%) util=%s%% clk=%s/%sMHz(%s%%) throttle=%s spill=%s — %s @ %s %s\n' \
-  "$LABEL" "$USED" "$TOTAL" "$PCT" "$UTIL" "$CURCLK" "$MAXCLK" "$RATIO" "$MASK" "$SPILL" "$REASON" "$(hostname)" "$TS"
+printf '[vram-watch] %s — vram=%s/%sMiB(%s%%) util=%s%% clk=%s/%sMHz(%s%%) temp=%sC throttle=%s spill=%s — %s @ %s %s\n' \
+  "$LABEL" "$USED" "$TOTAL" "$PCT" "$UTIL" "$CURCLK" "$MAXCLK" "$RATIO" "$TEMP" "$MASK" "$SPILL" "$REASON" "$(hostname)" "$TS"
