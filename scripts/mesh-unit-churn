@@ -1,0 +1,295 @@
+#!/usr/bin/env bash
+# mesh-unit-churn — SYSTEMD RESTART-CHURN edge-watch: turn a crash-looping auto-restart unit into an event.
+#
+# WHY (proven gap, discover 2026-07-17T22:03Z; EXISTS-proof reproduced by genome before landing):
+# a `Restart=always` (or on-failure) user service that CRASH-LOOPS is invisible to every existing
+# systemd sense. Between two crashes the unit is `active` → `is-active`=active, `systemctl --failed`
+# absent, and mtime-aging watchdogs (mesh-reflex-health/mesh-pulse) read it fresh. mesh-doctor is the
+# ONLY continuous systemd sense (hourly :23) and it reads `--failed` ONLY — its poll never samples the
+# millisecond a self-healing unit spends `failed`. The churn's ONLY durable record is NRestarts
+# (monotonic-since-start) + Result=/ExecMainStatus, and `grep -lE 'NRestarts|ExecMainStatus|Result='
+# ~/.local/bin/mesh-*` returned NONE. We have ALREADY seen this fire and miss: mesh-overhear thrashed
+# on a 3s cycle (restart counter 46, ear DOWN, green everywhere — memory overhear-execstartpre-must-be-
+# nonfatal). 6 load-bearing organs carry Restart=always here (overhear, room-gigaam, room-reflex,
+# liveness-loop, imac-cam-watch, ollama). Same hollow-sense FAMILY as overhear-pw-record-stall (output
+# mtime frozen while systemd-green) and the NVRM-Xid unsensed GPU fault — but a NEW AXIS: the restart
+# counter, not output freshness. This is the SOLE reader of that axis.
+#
+#   mesh-unit-churn           one delta pass: read NRestarts per auto-restart unit, emit churn, advance baseline
+#   mesh-unit-churn --check   read-only report (no board post, no baseline advance)
+#   mesh-unit-churn --status  last state reading, no new read
+#   mesh-unit-churn --test    fixture first-sight/delta/no-replay/reset/restart-no/BLIND/distinct/debounce + REAL-read gate
+#
+# Design constraints (each a logged mesh failure class):
+#   - Baseline = per-unit LAST-SEEN NRestarts (`~/.mesh/.unit-churn-baseline`, `unit<TAB>NRestarts<TAB>epoch`).
+#     The DELTA vs baseline (not the absolute) is the churn — NRestarts is monotonic-since-unit-start.
+#   - COUNTER RESET is NOT churn (never alarm on absolute): NRestarts resets to 0 on a clean
+#     stop/start, `systemctl restart`, daemon-reexec or reboot. current < baseline ⇒ reset ⇒
+#     re-baseline to current, ZERO alarm. (Rare miss: a unit that churns THROUGH a reset within one
+#     window under-counts — acceptable; never-false-alarm on the constant daemon-reload event wins.)
+#   - FIRST SIGHT of a unit = baseline only, zero events — a unit appearing already at NRestarts=40 is
+#     recorded, never replayed as 40 fresh churns (the reviving-offset-replays trap, unit-scoped).
+#   - ONLY auto-restart units (Restart != no). A `Restart=no` unit that dies STAYS dead and is already
+#     visible via `--failed`/mesh-doctor; only a SELF-HEALING unit hides its crash-loop behind `active`.
+#   - BLIND read (systemctl unreadable / zero `Id=` blocks) → exit 2, baseline UNTOUCHED — a transient
+#     blind pass must not skip-past or drop the baseline. Never a fake QUIET.
+#   - Board post is per-UNIT collapsed (one [unit-churn] line per unit per pass, ≤3/pass) +
+#     env-gated (MESH_UNIT_CHURN_CHAT=0 silences; --test sandboxes). A distinct unit boards FRESH; a
+#     repeat of the SAME unit inside the window is cross-pass DEBOUNCED (MESH_UNIT_CHURN_DEBOUNCE_MIN,
+#     default 30) — a chronic crash-loop must not re-post every 5min; LOG/STATE stay full. Same
+#     per-key machinery as mesh-hw-fault-watch's per-driver / OOM-per-victim collapse.
+#   - CROSS-UNIT OVERFLOW summary: >3 distinct units churn in ONE pass → 3 board lines + a "+N more
+#     unit(s)" line so a multi-unit storm (a shared dependency flapping) never silently undercounts.
+#   - State written EVERY successful pass (mtime = liveness); line 1 token grammar for consumers:
+#     CHURN | QUIET | BLIND.
+#
+# Exit codes: 0 = pass done (churn or quiet) · 2 = systemd unreadable (honest BLIND, never fake)
+# orphan-ok: --check/--status/--test are on-demand; the bare form is the scheduled reflex (cadence below)
+# reflex-cadence: */5 * * * *
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+
+STATE_DIR="${MESH_STATE_DIR:-$HOME/.mesh}"
+STATE="$STATE_DIR/.unit-churn-state"
+BASELINE="$STATE_DIR/.unit-churn-baseline"        # per-unit last-seen NRestarts: unit<TAB>N<TAB>epoch
+LOG="${MESH_UNIT_CHURN_LOG:-$STATE_DIR/unit-churn.log}"
+CHAT="${MESH_UNIT_CHURN_CHAT:-1}"
+SRC="${MESH_UNIT_CHURN_SRC:-}"                     # test fixture: a file in `systemctl show` grouped shape
+DEBOUNCE="$STATE_DIR/.unit-churn-debounce"         # per-unit last-BOARD-post epoch (cross-pass flood guard)
+DEBOUNCE_MIN="${MESH_UNIT_CHURN_DEBOUNCE_MIN:-30}" # suppress a repeat BOARD post for the SAME unit within N min
+WINDOW="${MESH_UNIT_CHURN_WINDOW:-~5m}"            # descriptive window label for the board line (the cadence stride)
+
+read_source(){ # `systemctl --user show` grouped output (Id=/Restart=/NRestarts= blocks, blank-separated)
+  if [ -n "$SRC" ]; then cat "$SRC" 2>/dev/null
+  else systemctl --user show '*.service' --property=Id,Restart,NRestarts 2>/dev/null
+  fi
+}
+
+parse_units(){ # stdin = grouped show output → one `unit<TAB>restart<TAB>nrestarts` line per unit
+  awk -v RS='' '{
+    id=""; rs=""; nr=""
+    n=split($0, L, "\n")
+    for(i=1;i<=n;i++){
+      if      (L[i] ~ /^Id=/)        { id=L[i]; sub(/^Id=/,"",id) }
+      else if (L[i] ~ /^Restart=/)   { rs=L[i]; sub(/^Restart=/,"",rs) }
+      else if (L[i] ~ /^NRestarts=/) { nr=L[i]; sub(/^NRestarts=/,"",nr) }
+    }
+    if (id != "") print id"\t"rs"\t"nr
+  }'
+}
+
+board_debounced(){ # $1=unit → exit 0 (true) if the SAME unit hit the board within DEBOUNCE_MIN (suppress
+  # THIS pass's post — a chronic crash-loop must not re-post every 5min); exit 1 (false) if OK to post
+  # now, recording this post's epoch. GENTLE: full lines still hit LOG/STATE, and a genuinely new churn
+  # >DEBOUNCE_MIN later re-posts. Identical idiom to mesh-hw-fault-watch's board_debounced.
+  local u="$1" now last
+  now="$(date +%s)"
+  last="$(awk -F'\t' -v u="$u" '$1==u{print $2}' "$DEBOUNCE" 2>/dev/null | tail -1)"
+  if printf '%s' "$last" | grep -qE '^[0-9]+$' && [ $(( now - last )) -lt $(( DEBOUNCE_MIN * 60 )) ]; then
+    return 0
+  fi
+  mkdir -p "$STATE_DIR"
+  { awk -F'\t' -v u="$u" '$1!=u' "$DEBOUNCE" 2>/dev/null; printf '%s\t%s\n' "$u" "$now"; } > "$DEBOUNCE.tmp" 2>/dev/null \
+    && mv "$DEBOUNCE.tmp" "$DEBOUNCE" 2>/dev/null || true
+  return 1
+}
+
+pass(){ # one delta pass; echoes churn summary lines; sets PASS_TOKEN/PASS_NEW. $1=--check → no writes.
+  local checkonly="${1:-}" raw units now unit rs nr base churned nunit over
+  raw="$(read_source)" || raw=""
+  # BLIND: a real `systemctl show` always emits many Id= blocks; zero = read failed / hollow.
+  printf '%s\n' "$raw" | grep -qE '^Id=' || return 2
+  units="$(printf '%s\n' "$raw" | parse_units)"
+  [ -n "$units" ] || return 2
+  now="$(date +%s)"
+  mkdir -p "$STATE_DIR"
+  churned=""
+  : > "$BASELINE.tmp" 2>/dev/null || true
+  while IFS=$'\t' read -r unit rs nr; do
+    [ -n "$unit" ] || continue
+    # only self-healing units hide a crash-loop behind `active`; Restart=no dies visibly (--failed).
+    [ -n "$rs" ] && [ "$rs" != no ] || continue
+    printf '%s' "$nr" | grep -qE '^[0-9]+$' || nr=0
+    base="$(awk -F'\t' -v u="$unit" '$1==u{print $2}' "$BASELINE" 2>/dev/null | tail -1)"
+    if printf '%s' "$base" | grep -qE '^[0-9]+$'; then
+      if [ "$nr" -lt "$base" ]; then
+        :                                    # counter RESET → re-baseline (below), never alarm
+      elif [ "$nr" -gt "$base" ]; then
+        churned="$churned$unit"$'\t'"$(( nr - base ))"$'\t'"$base"$'\t'"$nr"$'\n'
+      fi
+    fi                                       # else first sight → baseline only (below), no event
+    printf '%s\t%s\t%s\n' "$unit" "$nr" "$now" >> "$BASELINE.tmp"
+  done <<EOF
+$units
+EOF
+  # --check must not advance the baseline (read-only); the real pass commits it.
+  if [ "$checkonly" = --check ]; then rm -f "$BASELINE.tmp" 2>/dev/null || true
+  else mv "$BASELINE.tmp" "$BASELINE" 2>/dev/null || true; fi
+
+  # `churned` is built by appending `<line>\n` per churning unit → it ends in a newline (or is empty).
+  # Do NOT round-trip it through $(...) — that strips the trailing newline and `while read` then drops
+  # the last (often only) line. Keep it verbatim.
+  if [ -z "$churned" ]; then PASS_TOKEN=QUIET; PASS_NEW=0; return 0; fi
+  nunit="$(printf '%s' "$churned" | grep -c .)"
+  PASS_NEW="$nunit"; PASS_TOKEN=CHURN
+  # LOG the complete record FIRST (unit-churn.log never loses a churn line).
+  printf '%s' "$churned" | while IFS=$'\t' read -r unit delta base cur; do
+    [ -n "$unit" ] || continue
+    printf '%s unit-churn %s +%s (NRestarts %s->%s)\n' "$(date -u +%FT%TZ)" "$unit" "$delta" "$base" "$cur" >> "$LOG" 2>/dev/null || true
+  done
+  # ≤3 board lines per pass; same-unit flood debounced across passes; distinct unit boards fresh.
+  printf '%s' "$churned" | head -3 | while IFS=$'\t' read -r unit delta base cur; do
+    [ -n "$unit" ] || continue
+    msg="[unit-churn] $unit: +$delta restart(s)/$WINDOW (NRestarts $base->$cur — Restart=always crash-loop reads 'active' between crashes, invisible to systemctl --failed)"
+    if board_debounced "$unit"; then
+      echo "$msg (board-debounced <${DEBOUNCE_MIN}m)"
+    else
+      echo "$msg"
+      if [ "$CHAT" = 1 ] && command -v mesh-chat >/dev/null 2>&1; then
+        MESH_WHO="unit-churn@$(hostname)" mesh-chat "[unit-churn] $unit crash-looping: +$delta restart(s) in the last $WINDOW (NRestarts $base->$cur) on $(hostname) — a self-healing unit hides this behind 'active'; full record ~/.mesh/unit-churn.log" >/dev/null 2>&1 || true
+      fi
+    fi
+  done
+  if [ "$nunit" -gt 3 ]; then
+    over=$(( nunit - 3 ))
+    if board_debounced "+overflow"; then
+      echo "[unit-churn] +$over more unit(s) churned this pass (board-debounced <${DEBOUNCE_MIN}m), see ~/.mesh/unit-churn.log"
+    else
+      echo "[unit-churn] +$over more unit(s) churned this pass, see ~/.mesh/unit-churn.log"
+      if [ "$CHAT" = 1 ] && command -v mesh-chat >/dev/null 2>&1; then
+        MESH_WHO="unit-churn@$(hostname)" mesh-chat "[unit-churn] +$over more unit(s) churned this pass on $(hostname) (board caps at 3/pass), full lines in ~/.mesh/unit-churn.log" >/dev/null 2>&1 || true
+      fi
+    fi
+  fi
+  return 0
+}
+
+write_state(){ printf '%s %s new=%s\n' "$1" "$(date -u +%FT%TZ)" "${2:-0}" > "$STATE"; }
+
+if [ "${1:-}" = --test ]; then
+  command -v awk >/dev/null 2>&1 || { echo "smoke-test: FAIL (no awk)"; exit 1; }
+  command -v systemctl >/dev/null 2>&1 || { echo "smoke-test: n/a (no systemctl on this node)"; exit 2; }
+  # REAL-read gate (verification principle): the ACTUAL systemd read must yield parseable unit blocks
+  # AND at least one Restart!=no unit — a hollow read (0 Id=, or every unit Restart=no) means the sense
+  # can never fire here, so assert the live source produces the axis, not just that the fixtures parse.
+  _rn="$(read_source 2>/dev/null)"
+  printf '%s\n' "$_rn" | grep -qE '^Id=' \
+    || { echo "smoke-test: n/a (systemctl --user show yields no Id= blocks on this node)"; exit 2; }
+  printf '%s\n' "$_rn" | parse_units | awk -F'\t' '$2!="no" && $2!=""{f=1} END{exit f?0:1}' \
+    || { echo "smoke-test: n/a (no Restart!=no unit live on this node — nothing this sense can watch)"; exit 2; }
+
+  _mk(){ # write a one-unit `systemctl show` fixture block: _mk FILE ID RESTART NRESTARTS [ID2 R2 N2 ...]
+    local f="$1"; shift; : > "$f"
+    while [ $# -ge 3 ]; do
+      printf 'Id=%s\nRestart=%s\nNRestarts=%s\n\n' "$1" "$2" "$3" >> "$f"; shift 3
+    done
+  }
+  _td="$(mktemp -d)"; _fx="$_td/fx"
+  _env="MESH_STATE_DIR=$_td MESH_UNIT_CHURN_SRC=$_fx MESH_UNIT_CHURN_CHAT=0 MESH_UNIT_CHURN_DEBOUNCE_MIN=30"
+
+  # 1) FIRST SIGHT: a unit already at NRestarts=40 must baseline, never replay 40 as fresh churn.
+  _mk "$_fx" mesh-organ.service always 40
+  out="$(env $_env "$0" 2>&1)"; rc=$?
+  { [ "$rc" = 0 ] && ! printf '%s' "$out" | grep -qF '[unit-churn]'; } \
+    || { rm -rf "$_td"; echo "smoke-test: FAIL (first sight must baseline, not replay: rc=$rc out='$out')"; exit 1; }
+
+  # 2) DELTA: same unit now 43 → +3 churn, boards exactly once for that unit.
+  _mk "$_fx" mesh-organ.service always 43
+  out="$(env $_env "$0" 2>&1)"; rc=$?
+  { [ "$rc" = 0 ] && [ "$(printf '%s\n' "$out" | grep -cF '[unit-churn]')" = 1 ] \
+      && printf '%s' "$out" | grep -qF 'mesh-organ.service: +3'; } \
+    || { rm -rf "$_td"; echo "smoke-test: FAIL (delta +3 must board once naming the unit: rc=$rc out='$out')"; exit 1; }
+
+  # 3) NO-REPLAY: unchanged rerun (still 43) → delta 0 → silent.
+  out="$(env $_env "$0" 2>&1)"; rc=$?
+  { [ "$rc" = 0 ] && ! printf '%s' "$out" | grep -qF '[unit-churn]'; } \
+    || { rm -rf "$_td"; echo "smoke-test: FAIL (unchanged rerun replayed: rc=$rc out='$out')"; exit 1; }
+
+  # 4) COUNTER RESET: NRestarts drops 43→2 (clean restart/daemon-reload/reboot) → NO alarm, and it
+  # RE-BASELINES to 2 so a later rise is caught from the reset floor. RED-first: if reset kept the old
+  # baseline (43), the +5 rise below (2→7) reads 7<43 as another reset → the 'must board +5' assert reds.
+  _mk "$_fx" mesh-organ.service always 2
+  out="$(env $_env "$0" 2>&1)"; rc=$?
+  { [ "$rc" = 0 ] && ! printf '%s' "$out" | grep -qF '[unit-churn]'; } \
+    || { rm -rf "$_td"; echo "smoke-test: FAIL (counter reset must NOT alarm: rc=$rc out='$out')"; exit 1; }
+  _mk "$_fx" mesh-organ.service always 7
+  out="$(env $_env "$0" 2>&1)"; rc=$?
+  { [ "$rc" = 0 ] && printf '%s' "$out" | grep -qF 'mesh-organ.service: +5'; } \
+    || { rm -rf "$_td"; echo "smoke-test: FAIL (rise after reset must board +5 from the reset floor, not miss it: rc=$rc out='$out')"; exit 1; }
+
+  # 5) RESTART=no is NOT watched: a Restart=no unit whose NRestarts jumps must NEVER board (it dies
+  # visibly via --failed; only self-healing units hide the loop). RED-first: drop the `!= no` guard and
+  # this reds. Fresh state dir so the first sight baselines then the jump would-be-fires.
+  _nd="$(mktemp -d)"; _nfx="$_nd/fx"
+  _nenv="MESH_STATE_DIR=$_nd MESH_UNIT_CHURN_SRC=$_nfx MESH_UNIT_CHURN_CHAT=0"
+  _mk "$_nfx" oneshot-thing.service no 5
+  env $_nenv "$0" >/dev/null 2>&1                     # baseline
+  _mk "$_nfx" oneshot-thing.service no 25
+  out="$(env $_nenv "$0" 2>&1)"; rc=$?
+  { [ "$rc" = 0 ] && ! printf '%s' "$out" | grep -qF '[unit-churn]'; } \
+    || { rm -rf "$_td" "$_nd"; echo "smoke-test: FAIL (Restart=no jump must NOT board: rc=$rc out='$out')"; exit 1; }
+  rm -rf "$_nd"
+
+  # 6) BLIND: unreadable/empty source → exit 2, baseline UNTOUCHED (no skip-past, no drop).
+  base_before="$(cat "$_td/.unit-churn-baseline" 2>/dev/null)"
+  env MESH_STATE_DIR="$_td" MESH_UNIT_CHURN_SRC="$_td/nonexistent" MESH_UNIT_CHURN_CHAT=0 "$0" >/dev/null 2>&1; rc=$?
+  { [ "$rc" = 2 ] && [ "$(cat "$_td/.unit-churn-baseline" 2>/dev/null)" = "$base_before" ]; } \
+    || { rm -rf "$_td"; echo "smoke-test: FAIL (BLIND must exit 2 + not touch baseline: rc=$rc)"; exit 1; }
+  # a source with blocks but NO Id= (hollow) is also BLIND
+  printf 'Restart=always\nNRestarts=9\n\n' > "$_td/hollow"
+  env MESH_STATE_DIR="$_td" MESH_UNIT_CHURN_SRC="$_td/hollow" MESH_UNIT_CHURN_CHAT=0 "$0" >/dev/null 2>&1; rc=$?
+  { [ "$rc" = 2 ]; } \
+    || { rm -rf "$_td"; echo "smoke-test: FAIL (hollow no-Id source must be BLIND exit 2: rc=$rc)"; exit 1; }
+
+  # 7) DISTINCT UNITS board fresh + OVERFLOW: 4 units churn in one pass → 3 lines + '+1 more'.
+  _od="$(mktemp -d)"; _ofx="$_od/fx"
+  _oenv="MESH_STATE_DIR=$_od MESH_UNIT_CHURN_SRC=$_ofx MESH_UNIT_CHURN_CHAT=0 MESH_UNIT_CHURN_DEBOUNCE_MIN=30"
+  _mk "$_ofx" a.service always 1 b.service always 1 c.service always 1 d.service always 1
+  env $_oenv "$0" >/dev/null 2>&1                     # baseline all four
+  _mk "$_ofx" a.service always 2 b.service always 2 c.service always 2 d.service always 2
+  out="$(env $_oenv "$0" 2>&1)"; rc=$?
+  { [ "$rc" = 0 ] && [ "$(printf '%s\n' "$out" | grep -cF '[unit-churn]')" = 4 ] && printf '%s' "$out" | grep -qF '+1 more unit'; } \
+    || { rm -rf "$_td" "$_od"; echo "smoke-test: FAIL (4 churning units must post 3 + overflow summary: rc=$rc out='$out')"; exit 1; }
+  rm -rf "$_od"
+
+  # 8) CROSS-PASS DEBOUNCE: same unit churns two consecutive passes within window → board once, then suppressed.
+  _dd="$(mktemp -d)"; _dfx="$_dd/fx"
+  _denv="MESH_STATE_DIR=$_dd MESH_UNIT_CHURN_SRC=$_dfx MESH_UNIT_CHURN_CHAT=0 MESH_UNIT_CHURN_DEBOUNCE_MIN=30"
+  _mk "$_dfx" flap.service always 1
+  env $_denv "$0" >/dev/null 2>&1                     # baseline
+  _mk "$_dfx" flap.service always 4
+  out1="$(env $_denv "$0" 2>&1)"                      # first churn: posts
+  _mk "$_dfx" flap.service always 9
+  out2="$(env $_denv "$0" 2>&1)"                      # same unit again within window: board-debounced
+  { printf '%s' "$out1" | grep -qF '[unit-churn]' && ! printf '%s' "$out1" | grep -qF 'board-debounced' \
+      && printf '%s' "$out2" | grep -qF 'board-debounced'; } \
+    || { rm -rf "$_td" "$_dd"; echo "smoke-test: FAIL (same-unit repeat must debounce 2nd board post: out1='$out1' out2='$out2')"; exit 1; }
+  rm -rf "$_dd"
+
+  rm -rf "$_td"
+  echo "smoke-test: ok (real systemd read + Restart!=no live · first-sight/delta/no-replay/reset-rebaseline/restart-no/BLIND/distinct-overflow/debounce fixtures)"; exit 0
+fi
+
+if [ "${1:-}" = --status ]; then
+  [ -r "$STATE" ] && cat "$STATE" || echo "unit-churn: no state yet"
+  exit 0
+fi
+
+if [ "${1:-}" = --check ]; then
+  pass --check; prc=$?
+  [ "$prc" = 2 ] && { echo "unit-churn: BLIND (systemctl --user show unreadable/hollow)"; exit 2; }
+  [ "$PASS_TOKEN" = QUIET ] && echo "unit-churn: QUIET (no restart-counter delta)"
+  exit 0
+fi
+
+pass; prc=$?
+if [ "$prc" = 2 ]; then
+  write_state BLIND 0
+  echo "unit-churn: BLIND (systemctl --user show unreadable — no Id= blocks)" >&2
+  exit 2
+fi
+write_state "$PASS_TOKEN" "$PASS_NEW"
+command -v mesh-state-touch >/dev/null 2>&1 && mesh-state-touch "$STATE" >/dev/null 2>&1 || true
+[ "$PASS_TOKEN" = QUIET ] && echo "unit-churn: QUIET (no restart-counter delta this pass)"
+exit 0
