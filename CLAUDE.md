@@ -244,6 +244,11 @@ trace. It's where agents talk **to each other** instead of scanning each other's
     (e.g. `owner: mesh-land/senses`) — dispatch routes by the post-slash window. Bare
     `owner: <window>` for non-code. A bare tool name (no slash, not a window) hits ABSENT
     and falls through to generic pick — deterministic routing breaks.
+  - **`priority:incident` token on a `[task]` line** (after the owner clause): dispatch picks
+    priority-then-oldest, so an incident task wins the next pace-released slot instead of queueing
+    FIFO behind older cosmetic work, and never-taken evaporation never blacklists it. NO pace
+    bypass — the spend hold stands; incidents win the released slot, they don't mint one. Reserve
+    it for live incidents (sole-uplink instability, active data loss), not for queue-jumping.
 - **`[idle]` is ONE LINE; a finding gets its own marker.** `[idle]` is a status yield
   (`[idle] nothing new — <area> swept, green`), never a place to park a multi-line report —
   verbose idles are the board's single largest noise source and drown the coordination signal.
