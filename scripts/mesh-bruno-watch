@@ -1,0 +1,350 @@
+#!/usr/bin/env bash
+# mesh-bruno-watch — spot the operator's cat (Bruno) on ANY silent eye the mesh has, and when he is
+# spotted, send a REAL photo to the operator's Telegram + feed the sighting into the mesh-bruno
+# fusion (so the coarse cat STATE — sleeping/eating/DRINKING/resting/active — is EYES-OBSERVED, not
+# merely predicted). Pure reflex (operator 2026-07-17): NO minds, no tokens beyond the vision call.
+#
+# Modeled on the reference mesh-imac-cam-watch (motion-gated poll → classify), but with two
+# deliberate differences the operator asked for:
+#   1. it DELIVERS the frame to Telegram on a spot (imac-cam-watch is analysis-only, no photo), and
+#   2. it iterates the EYES REGISTRY — "look and spot bruno on ANY eye mesh has" — not one camera.
+#
+# WHY A SEPARATE TOOL, not an extension of imac-cam-watch: that feed is contractually ANALYSIS-ONLY
+# (no raw retention, no TG — operator was explicit for it). This one's whole purpose is the photo.
+#
+# THE EYES (silent, pollable — a shutter-clicking eye is NOT pollable):
+#   homecam   local USB webcam /dev/video0 on mesh-home (fswebcam; sudo -n fallback until the
+#             video-group membership lands on next login). SILENT → safe to poll. Primary.
+#   <remote>  a peer node's webcam, captured over SSH — reachable-gated: an OFFLINE/unreachable peer
+#             is SKIPPED honestly (logged as n/a), never faked. Add peers via MESH_BRUNO_WATCH_EYES.
+#   NOT note3 — mesh-note3-cam is an ACTUATOR (screen wakes, SHUTTER SOUND) and is marked never-cron;
+#             polling it would click the shutter in the room every cycle. It stays ON-DEMAND only
+#             (`mesh-bruno-watch --eye-shot note3` snaps it once by hand). The poll loop never touches it.
+#
+# HOW ONE CYCLE WORKS, per reachable poll-eye:
+#   capture a frame → blind-class (SEEING/DARK/COVERED/CAPTURE-FAIL — a covered/dark lens cannot spot a
+#   cat, so we don't waste a vision call on it) → motion-diff vs this eye's previous frame → on MOTION
+#   (or a periodic forced look) ask the vision model "is there a cat, and what is it DOING (drinking /
+#   eating / sleeping / resting / grooming / playing)?" → append the verdict to the mesh-bruno CATLOG
+#   (so the fusion reads SEEN + the activity) → if the verdict AFFIRMS a cat, it is a SPOT: send the
+#   frame to Telegram, debounced (SPOT_TG_COOLDOWN) so a cat that lingers at the bowl is ONE photo,
+#   not twenty, and a fresh arrival after an absence always re-notifies.
+#
+# The CATLOG we feed is mesh-bruno's OWN input path (${MESH_BRUNO_CAMLOG:-imac-cat-log.tsv}) — one
+# source of truth for the sighting log, tagged with the eye that saw him. Feeding it is what closes
+# the loop the operator asked for: spot Bruno DRINKING on the homecam → CATLOG row "Cat drinking at a
+# bowl" → mesh-bruno classify_label → state DRINKING.
+#
+# HONEST CONTRACT (doctrine): every claimed spot is a real JPEG that was really classified and really
+# sent. A capture that fails is CAPTURE-FAIL (not a silent no-cat); an unreachable eye is n/a (not a
+# faked all-clear); a vision call that fails logs "classification failed" (mesh-bruno reads that as
+# NOT-IN-FRAME, never a phantom sighting). The --test drives the REAL spot→CATLOG→fusion→TG wiring
+# with stubs for the two external organs (vision + telegram), and asserts a real capture on the node.
+#
+#   mesh-bruno-watch --once        one cycle over all reachable poll-eyes (cron-style)
+#   mesh-bruno-watch --daemon      poll forever (the systemd --user ExecStart)
+#   mesh-bruno-watch --eye-shot <eye>  capture+classify ONE named eye now (incl. note3), print verdict
+#   mesh-bruno-watch --state       print each eye's current liveness state
+#   mesh-bruno-watch --install     install+enable the systemd --user service (reboot-survivable)
+#   mesh-bruno-watch --test        fail-then-pass wiring gate (stubbed vision+TG) + a real capture assert
+#
+# Tunables (env): BRUNO_WATCH_POLL=20 · BRUNO_WATCH_THRESH=12 (motion) · BRUNO_WATCH_FORCE=900 (force a
+#   look every N s even without motion, so a still cat is caught) · SPOT_TG_COOLDOWN=1800 (min s between
+#   operator photos per eye) · BRUNO_WATCH_RES=1280x720 · MESH_BRUNO_WATCH_EYES="homecam ..." .
+# reflex-cadence: none — runs as a --daemon service (see --install), not cron. Registered on-demand below.
+# orphan-ok: runs as the mesh-bruno-watch.service daemon (installed by --install), not a cron reflex.
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+MESH="$HOME/.mesh"
+[ -f "$MESH/nodes" ] && . "$MESH/nodes" 2>/dev/null || true
+
+# --- config -----------------------------------------------------------------------------------------
+CATLOG="${MESH_BRUNO_CAMLOG:-$MESH/imac-cat-log.tsv}"   # mesh-bruno's OWN input — feed it, don't fork it
+LOG="${MESH_BRUNO_WATCH_LOG:-$MESH/bruno-watch.log}"
+STATEDIR="${MESH_BRUNO_WATCH_STATEDIR:-$MESH}"
+EYES="${MESH_BRUNO_WATCH_EYES:-homecam}"               # space-separated poll-eyes (note3 excluded by design)
+POLL="${BRUNO_WATCH_POLL:-20}"
+THRESH="${BRUNO_WATCH_THRESH:-12}"
+FORCE="${BRUNO_WATCH_FORCE:-900}"
+TG_COOLDOWN="${SPOT_TG_COOLDOWN:-1800}"
+RES="${BRUNO_WATCH_RES:-1280x720}"
+HOMECAM_DEV="${BRUNO_WATCH_HOMECAM_DEV:-/dev/video0}"
+CAM_COVERED_SD="${BRUNO_WATCH_COVERED_SD:-1.5}"
+
+# test/injection hooks (external organs are stubbable so --test drives the REAL internal wiring):
+OBJID="${MESH_BRUNO_WATCH_OBJID:-}"   # if set, run as the vision verb: "$OBJID <jpg>" -> verdict on stdout
+TG="${MESH_BRUNO_WATCH_TG:-}"         # if set, run as the telegram verb: "$TG <jpg> <caption>" -> rc
+
+now(){ date +%s; }
+stampnow(){ date -u +%FT%TZ; }
+log_evt(){ printf '%s  %s\n' "$(stampnow)" "$*" >> "$LOG"; }
+
+# --- capture: dispatch per eye. echoes the jpg path on success, nothing on failure ------------------
+capture_eye(){  # <eye> <out.jpg> -> rc 0 + jpg written | rc 1 capture-fail | rc 2 eye unreachable
+  local eye="$1" out="$2"
+  case "$eye" in
+    homecam)
+      # SILENT USB webcam. Try unprivileged first (once the video group lands), then sudo -n.
+      # -S 25 SKIPS the first ~20 warmup/garbage frames a cold USB webcam emits — a single-grab
+      # ("-S 0") intermittently returns an EMPTY file (the 19:44 "capture produced empty file"),
+      # which the honest contract must not read as "no cat". Retry a few times to ride out a busy grab.
+      # Two traps make this fiddly, both learned live (2026-07-17):
+      #  (a) fswebcam EXITS 0 even when it writes nothing (permission-denied → rc 0, empty file), so we
+      #      gate on the FILE, never on rc.
+      #  (b) fswebcam-as-root gets fopen "Permission denied" when its output path ALREADY EXISTS owned by
+      #      another uid (an empty me-owned file the non-sudo attempt just left) — it must CREATE the file
+      #      fresh. So we rm the path before each attempt (sudo-rm if a prior root-owned frame lingers in
+      #      sticky /tmp), let non-sudo try first (clean once the video group lands), and on an empty
+      #      result rm again and let sudo create it fresh, then chown it back to us.
+      local try
+      for try in 1 2 3 4 5; do
+        rm -f "$out" 2>/dev/null || sudo -n rm -f "$out" >/dev/null 2>&1 || true
+        fswebcam -q -S 25 -d "$HOMECAM_DEV" -r "$RES" --no-banner "$out" >/dev/null 2>&1 || true
+        if [ ! -s "$out" ]; then
+          rm -f "$out" 2>/dev/null || true          # drop the empty me-owned file so root can CREATE fresh
+          sudo -n fswebcam -q -S 25 -d "$HOMECAM_DEV" -r "$RES" --no-banner "$out" >/dev/null 2>&1 || true
+          [ -O "$out" ] || sudo -n chown "$(id -u):$(id -g)" "$out" >/dev/null 2>&1 || true
+        fi
+        [ -s "$out" ] && return 0
+        sleep 2
+      done
+      log_evt "$eye: capture produced empty file after 5 tries (device busy?)"; return 1 ;;
+    note3)
+      # ON-DEMAND ONLY (shutter). Never called from the poll loop; only --eye-shot reaches here.
+      mesh-note3-cam "$out" >/dev/null 2>&1 || return $?   # 2 = phone n/a, 1 = no frame
+      [ -s "$out" ] && return 0 || return 1 ;;
+    *)
+      # remote peer eye: "<eye>" must resolve to MESH_BRUNO_WATCH_<EYE>_SSH="user@ip" +
+      # MESH_BRUNO_WATCH_<EYE>_CMD (a cam tool on that node that writes a jpg to a path it prints).
+      local up cmd host; up="$(printf '%s' "$eye" | tr '[:lower:]-' '[:upper:]_')"
+      host="$(eval echo "\${MESH_BRUNO_WATCH_${up}_SSH:-}")"
+      cmd="$(eval echo "\${MESH_BRUNO_WATCH_${up}_CMD:-mesh-object-id --capture-only}")"
+      [ -n "$host" ] || { log_evt "$eye: no SSH endpoint configured — skipped"; return 2; }
+      # reachability gate: an offline peer is n/a, not a capture-fail.
+      ssh -o ConnectTimeout=5 -o BatchMode=yes "$host" true >/dev/null 2>&1 \
+        || { log_evt "$eye: peer $host unreachable — n/a"; return 2; }
+      local rpath; rpath="$(ssh -o ConnectTimeout=8 "$host" "$cmd" 2>/dev/null | tail -1)"
+      [ -n "$rpath" ] || { log_evt "$eye: remote capture produced no path"; return 1; }
+      scp -o ConnectTimeout=8 "$host:$rpath" "$out" >/dev/null 2>&1 && [ -s "$out" ] && return 0
+      log_evt "$eye: scp of remote frame failed"; return 1 ;;
+  esac
+}
+
+# --- blind detection: a covered/dark lens can't spot a cat -------------------------------------------
+blind_class(){  # <jpg> -> SEEING|DARK|COVERED|STAT-FAIL
+  python3 - "$1" "$CAM_COVERED_SD" <<'PY' 2>/dev/null || echo STAT-FAIL
+import sys
+from PIL import Image, ImageStat
+try:
+    im=Image.open(sys.argv[1]).convert("L").resize((160,120))
+    st=ImageStat.Stat(im); mean=st.mean[0]; sd=st.stddev[0]
+    if mean<30 and sd < float(sys.argv[2]): print("COVERED")
+    elif mean<30: print("DARK")
+    else: print("SEEING")
+except Exception:
+    print("STAT-FAIL")
+PY
+}
+
+diff_metric(){  # <a.jpg> <b.jpg> -> mean abs luma diff (0 if either unreadable -> safe no-trigger)
+  python3 - "$1" "$2" <<'PY' 2>/dev/null || echo "0.00"
+import sys
+from PIL import Image
+try:
+    a=Image.open(sys.argv[1]).convert("L").resize((160,120))
+    b=Image.open(sys.argv[2]).convert("L").resize((160,120))
+    pa=list(a.getdata()); pb=list(b.getdata())
+    print(f"{sum(abs(x-y) for x,y in zip(pa,pb))/len(pa):.2f}")
+except Exception:
+    print("0.00")
+PY
+}
+
+CAT_PROMPT='Is there a cat visible anywhere in this image? If yes, describe where it is (which piece of furniture / area) AND what it is doing — say explicitly if it is DRINKING water at a bowl, EATING from a bowl, sleeping, lying/resting, grooming, or active/playing. If there is no cat, reply with exactly: No cat visible.'
+
+classify_frame(){  # <jpg> -> verdict text on stdout (never empty; failure -> "classification failed")
+  local jpg="$1" out
+  if [ -n "$OBJID" ]; then out="$($OBJID "$jpg" 2>/dev/null)"
+  else out="$(mesh-object-id "$jpg" --ask "$CAT_PROMPT" 2>>"$LOG")"; fi
+  [ -n "$out" ] && printf '%s' "$out" || printf 'classification failed'
+}
+
+# a verdict AFFIRMS a cat iff it names a cat and is not a negative/failed read (mirrors mesh-bruno's
+# own affirm-scan, so "spotted here" and "SEEN there" are the SAME predicate — no drift).
+affirms_cat(){ printf '%s' "$1" | grep -qiE '(cat|кот|bruno|бруно)' && ! printf '%s' "$1" | grep -qiE 'no cat|not visible|no .*visible|classification failed'; }
+
+send_photo(){  # <jpg> <caption> -> rc
+  if [ -n "$TG" ]; then "$TG" "$1" "$2"; return $?; fi
+  local envf="$HOME/.config/remote-access/env" tok chat
+  [ -f "$envf" ] || { log_evt "TG: no creds ($envf)"; return 1; }
+  # shellcheck disable=SC1090
+  tok="$(. "$envf"; printf '%s' "${BOT_TOKEN:-}")"; chat="$(. "$envf"; printf '%s' "${CHAT_ID:-}")"
+  [ -n "$tok" ] && [ -n "$chat" ] || { log_evt "TG: BOT_TOKEN/CHAT_ID unset"; return 1; }
+  curl -s --max-time 30 "https://api.telegram.org/bot${tok}/sendPhoto" \
+       -F "chat_id=${chat}" -F "photo=@$1" -F "caption=$2" \
+    | grep -q '"ok":true'
+}
+
+# --- one eye, one cycle -----------------------------------------------------------------------------
+cycle_eye(){  # <eye>
+  local eye="$1"
+  local prev="$STATEDIR/.bruno-watch.$eye.prev.jpg"
+  local statef="$STATEDIR/.bruno-watch.$eye.state"
+  local lastlook="$STATEDIR/.bruno-watch.$eye.lastlook"
+  local lasttg="$STATEDIR/.bruno-watch.$eye.lasttg"
+  local nowjpg; nowjpg="$(mktemp --suffix=.jpg)"
+  local rc; capture_eye "$eye" "$nowjpg"; rc=$?
+  if [ "$rc" = 2 ]; then printf 'n/a\n' > "$statef"; rm -f "$nowjpg"; return 2; fi
+  if [ "$rc" != 0 ]; then printf 'CAPTURE-FAIL\n' > "$statef"; rm -f "$nowjpg"; return 1; fi
+
+  local blind; blind="$(blind_class "$nowjpg")"
+  if [ "$blind" != SEEING ]; then
+    printf '%s\n' "$blind" > "$statef"          # mtime = the loop really captured; content = what it sees
+    cp -f "$nowjpg" "$prev" 2>/dev/null; rm -f "$nowjpg"; return 0
+  fi
+
+  # motion gate: classify on real motion OR when we haven't looked in FORCE seconds (a still cat)
+  local d="99.00" look=0 lastt=0
+  [ -f "$prev" ] && d="$(diff_metric "$prev" "$nowjpg")"
+  [ -f "$lastlook" ] && lastt="$(cat "$lastlook" 2>/dev/null || echo 0)"
+  awk "BEGIN{exit !($d >= $THRESH)}" && look=1
+  [ $(( $(now) - lastt )) -ge "$FORCE" ] && look=1
+  cp -f "$nowjpg" "$prev" 2>/dev/null
+
+  if [ "$look" != 1 ]; then
+    printf 'SEEING (still, d=%s)\n' "$d" > "$statef"; rm -f "$nowjpg"; return 0
+  fi
+
+  now > "$lastlook"
+  local verdict; verdict="$(classify_frame "$nowjpg")"
+  # feed the mesh-bruno CATLOG (single source of truth), tagged with the eye
+  printf '%s\t[%s] %s\n' "$(stampnow)" "$eye" "$verdict" >> "$CATLOG"
+
+  if affirms_cat "$verdict"; then
+    printf 'SPOT: %s\n' "$verdict" > "$statef"
+    log_evt "$eye: SPOT — $verdict"
+    local lt=0; [ -f "$lasttg" ] && lt="$(cat "$lasttg" 2>/dev/null || echo 0)"
+    if [ $(( $(now) - lt )) -ge "$TG_COOLDOWN" ]; then
+      if send_photo "$nowjpg" "🐈 Бруно замечен — $eye ($(TZ="${MESH_BRUNO_TZ:-Europe/Moscow}" date '+%H:%M')): $verdict"; then
+        now > "$lasttg"; log_evt "$eye: photo delivered to operator"
+      else
+        log_evt "$eye: SPOT but TG delivery FAILED (will retry next spot)"
+      fi
+    else
+      log_evt "$eye: SPOT within TG cooldown ($(( $(now) - lt ))s < ${TG_COOLDOWN}s) — fed CATLOG, no photo"
+    fi
+  else
+    printf 'SEEING (no cat)\n' > "$statef"
+  fi
+  rm -f "$nowjpg"; return 0
+}
+
+one_cycle(){ local e; for e in $EYES; do cycle_eye "$e" || true; done; }
+
+case "${1:-}" in
+  --once)    one_cycle; exit 0 ;;
+  --daemon)  log_evt "daemon start (eyes: $EYES, poll ${POLL}s)"; while true; do one_cycle; sleep "$POLL"; done ;;
+  --state)
+    for e in $EYES note3; do
+      f="$STATEDIR/.bruno-watch.$e.state"
+      [ -f "$f" ] && printf '%-10s %s (age %ss)\n' "$e" "$(cat "$f")" "$(( $(now) - $(stat -c %Y "$f" 2>/dev/null || now) ))" \
+                  || printf '%-10s (no state yet)\n' "$e"
+    done; exit 0 ;;
+  --eye-shot)
+    e="${2:?usage: --eye-shot <eye>}"; j="$(mktemp --suffix=.jpg)"
+    if capture_eye "$e" "$j"; then v="$(classify_frame "$j")"; echo "$e: $v"; rm -f "$j"; exit 0
+    else echo "$e: capture unavailable" >&2; rm -f "$j"; exit 1; fi ;;
+  --install)
+    U="$HOME/.config/systemd/user"; mkdir -p "$U"
+    cat > "$U/mesh-bruno-watch.service" <<EOF
+[Unit]
+Description=mesh-bruno-watch — spot Bruno on the mesh's silent eyes, photo to operator TG
+After=default.target
+
+[Service]
+Type=simple
+# 30s poll (not the 20s default): the homecam's MIC is the room EAR (overhear streams audio on the
+# SAME USB webcam), so a brief video grab contends for USB bandwidth — a gentler cadence keeps the
+# ear's stream healthy while still catching a bowl-side visit (a cat drinks for tens of seconds).
+Environment=BRUNO_WATCH_POLL=30
+ExecStart=%h/.local/bin/mesh-bruno-watch --daemon
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+EOF
+    systemctl --user daemon-reload
+    systemctl --user enable --now mesh-bruno-watch.service
+    systemctl --user --no-pager status mesh-bruno-watch.service | head -5
+    exit 0 ;;
+  --test)
+    f=0; tmp="$(mktemp -d)"
+    # Override the already-assigned config vars DIRECTLY (env exports would be too late — the top of
+    # the script already read them). The functions above are in scope, so we drive cycle_eye directly.
+    STATEDIR="$tmp"; LOG="$tmp/log"; CATLOG="$tmp/catlog"; EYES="testeye"
+    OBJID="$tmp/objid.sh"; TG="$tmp/tg.sh"; THRESH=1; FORCE=0; TG_COOLDOWN=100000; LIT="$tmp/lit.jpg"
+
+    # solid-color synthetic frames so blind_class reads SEEING (lit) / COVERED (flat dark)
+    python3 - "$tmp" <<'PY'
+from PIL import Image
+import sys
+d=sys.argv[1]
+Image.new("L",(320,240),200).save(d+"/lit.jpg")
+Image.new("L",(320,240),10).save(d+"/dark.jpg")
+PY
+
+    # stub vision: always says Bruno is DRINKING (so BOTH cycles are spots -> tests debounce)
+    printf '#!/usr/bin/env bash\necho "Cat visible on the kitchen floor, drinking water at a bowl."\n' > "$tmp/objid.sh"
+    chmod +x "$tmp/objid.sh"
+    # stub TG: record each send so we can assert exactly-once (debounced) delivery
+    printf '#!/usr/bin/env bash\necho "SENT|$2" >> "%s/tg.log"\n' "$tmp" > "$tmp/tg.sh"
+    chmod +x "$tmp/tg.sh"
+
+    # Drive the REAL cycle_eye wiring; override ONLY the hardware capture, in a subshell so the real
+    # capture_eye survives for the real-capture assert (5) below.
+    (
+      capture_eye(){ cp "$LIT" "$2"; return 0; }
+      cycle_eye testeye        # cat present -> SPOT -> CATLOG row + one TG
+      cycle_eye testeye        # still present, cooldown huge -> NO second TG (debounce)
+    ) >/dev/null 2>&1
+
+    # (1) the SPOT wrote a real CATLOG row that mesh-bruno reads as SEEN + DRINKING
+    grep -qiE 'cat' "$tmp/catlog" || { echo "  FAIL: SPOT did not append an affirming row to the CATLOG"; f=1; }
+    if command -v mesh-bruno >/dev/null 2>&1; then
+      out="$(MESH_BRUNO_CAMLOG="$tmp/catlog" MESH_BRUNO_VOICELOG=/dev/null MESH_BRUNO_STATE="$tmp/bs" \
+             MESH_BRUNO_NOWIFI=1 "$(command -v mesh-bruno)" --json 2>/dev/null)"
+      case "$out" in *'"seen":"SEEN"'*) : ;; *) echo "  FAIL: the fed CATLOG row must read SEEN in mesh-bruno (got: $out)"; f=1 ;; esac
+      case "$out" in *'"state":"DRINKING"'*) : ;; *) echo "  FAIL: a 'drinking at a bowl' spot must FUSE to state DRINKING (the loop the operator asked for; got: $out)"; f=1 ;; esac
+    fi
+    # (2) the SPOT delivered exactly ONE operator photo (debounce: a lingering cat is not a photo storm)
+    n_sent=$(grep -c '^SENT|' "$tmp/tg.log" 2>/dev/null || echo 0)
+    [ "$n_sent" = 1 ] || { echo "  FAIL: expected exactly ONE debounced TG send, got $n_sent"; f=1; }
+    # (3) affirms_cat predicate matches mesh-bruno's: a 'No cat visible' verdict is NOT a spot
+    affirms_cat "No cat visible." && { echo "  FAIL: 'No cat visible.' must NOT affirm a cat"; f=1; }
+    affirms_cat "Cat drinking at a bowl." || { echo "  FAIL: 'Cat drinking at a bowl.' must affirm a cat"; f=1; }
+    # (4) blind lens is not spotted-through: a flat dark frame classifies COVERED, never SEEING
+    [ "$(blind_class "$tmp/dark.jpg")" = COVERED ] || { echo "  FAIL: flat dark frame must read COVERED (blind), got $(blind_class "$tmp/dark.jpg")"; f=1; }
+
+    # (5) REAL capture on THIS node (the hardware read the wiring rides on). Honest n/a where absent:
+    #     no homecam device -> exit 2 (mesh-land passes it), never a fake green.
+    if [ -e "$HOMECAM_DEV" ]; then
+      rj="$(mktemp --suffix=.jpg)"
+      if capture_eye homecam "$rj" && [ -s "$rj" ] && [ "$(blind_class "$rj")" != STAT-FAIL ]; then
+        echo "  (real capture: homecam $HOMECAM_DEV -> $(stat -c %s "$rj") bytes, $(blind_class "$rj"))"
+      else
+        echo "  FAIL: homecam device $HOMECAM_DEV present but a real capture did not yield a readable JPEG"; f=1
+      fi
+      rm -f "$rj"
+    else
+      echo "  (n/a: no homecam device $HOMECAM_DEV on this node — wiring gate still asserted above)"
+      [ "$f" = 0 ] && { rm -rf "$tmp"; echo "smoke-test: n/a (no camera here; wiring OK)"; exit 2; }
+    fi
+
+    rm -rf "$tmp"
+    [ "$f" = 0 ] && { echo "smoke-test: ok (spot->CATLOG->DRINKING fusion + one-debounced-TG + blind-gate + affirm-predicate + real capture)"; exit 0; }
+    echo "smoke-test: FAIL"; exit 1 ;;
+  *)
+    sed -n '2,/^set -uo/p' "$0" | sed 's/^# \?//'; exit 0 ;;
+esac
