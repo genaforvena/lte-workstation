@@ -1,0 +1,374 @@
+#!/usr/bin/env bash
+# mesh-music-session — when the operator plays music in a room, RECORD it, GRIND mixes from it, and
+# deliver them to his Telegram on its own — reflexively, every time, forever.
+#
+# Operator 2026-07-17: "каждый раз как играю музыку — записывайте, делайте миксы из этого, и сразу
+# мне сюда рефлексом как готово. всегда." Assigned to the sound window.
+#
+# This is a SEPARATE lane from mesh-sound-reflex. sound-reflex grinds INDIVIDUAL standout records and
+# pokes a MIND for judgement; this lane detects a SUSTAINED music SESSION (many consecutive rhythmic
+# windows, not one transient), archives its material as it plays, and on session END auto-grinds K
+# mixes and ships them straight to the operator — no mind in the loop. Both read the same ear ledger
+# (~/.mesh/records.log) but keep independent anchors/state, so they never contend. Coordinate
+# false-positive tuning with the `room` window (shares the mic) and mic contention with `health`.
+#
+#   mesh-music-session              one tick: fold fresh ear records into the session state machine;
+#                                   START on sustained music, archive as-you-go, END+deliver on a gap
+#   mesh-music-session --status     print current session state, no side effects
+#   mesh-music-session --test       sandboxed gates: real classifier on music/speech fixtures,
+#                                   idempotent delivery, archive-survives-prune (never the live files)
+#
+# WHY the classifier is what it is (see CLAUDE.md + mesh-sound-reflex header):
+#   SCORE ALONE IS A COUGH DETECTOR — mesh-soundscape weights `dyn` at 0.28, so ONE transient (cough,
+#   door, dropped fork) tops the corpus. The reliable music signal is SUSTAINED rhythm across
+#   CONSECUTIVE records: a cough/door is ONE window; music is many. So a record is "musical" only if
+#   it clears a rhythm-density floor AND richness AND a score floor, and a SESSION starts only after
+#   MS_ONSET consecutive musical records. The consecutive requirement is the real defense against
+#   one-window transients; the per-record floors are the conservative starting point.
+#
+#   HONEST CAVEAT: these default floors were set against an ambient-only corpus (no real music
+#   samples on this node yet) — sustained ambient tone can hallucinate high beat-density, and a
+#   dynamic passage (someone moving around) can run a few high-score records in a row. They WILL
+#   need tuning against the operator's first real sessions. Every floor is an env var for exactly
+#   that; tune with the room window watching the same mic. Do not trust these numbers as validated.
+#
+# MULTI-MIC (addendum 2026-07-17): the core here is SOURCE-TAGGED (MS_SOURCE) but currently wired to
+# the ONE local ear (mesh-home USB webcam mic, via records.log). The fan-out across reachable remote
+# mics (ilya/phaedra/Note3/Termux) is a LATER layer that will call this core per-source with honest
+# n/a for unreachable mics. Single-mic path ships first (operator: "ship it, then layer the fan-out").
+#
+# Tunables (env): MS_MIN_BEATS=4 · MS_MIN_DENSITY=0.8 (beats/s) · MS_MIN_RICH=0.5 · MS_MIN_SCORE=48
+#   MS_ONSET=3 (consecutive musical records to START) · MS_GAP=180 (s of no-music to END) · MS_K=3
+#   (mixes per session) · MS_CAP=120 (s of session audio fed to each grind) · MS_SOURCE=mesh-home
+#
+# reflex-cadence: */4 * * * *
+set -uo pipefail
+export PATH="/usr/bin:$HOME/.local/bin:$PATH"
+export LC_ALL=C.UTF-8
+MESH="${MESH_DIR:-$HOME/.mesh}"
+[ -f "$MESH/nodes" ] && . "$MESH/nodes" 2>/dev/null || true
+
+# Every path is overridable so --test locks its own files and never the live ones.
+LEDGER="${MESH_MS_LEDGER:-$MESH/records.log}"
+REC_DIR="${MESH_MS_REC_DIR:-$MESH/records}"
+STATE="${MESH_MS_STATE:-$MESH/.music-session.json}"
+ARCHIVE_ROOT="${MESH_MS_ARCHIVE_ROOT:-$MESH/music-sessions}"
+SENT_LOG="${MESH_MS_SENT_LOG:-$MESH/room-music-sent.log}"
+LOG="${MESH_MS_LOG:-$MESH/music-session.log}"
+LOCK="${MESH_MS_LOCK:-$STATE.lock}"
+GRIND_BIN="${MESH_MS_GRIND_BIN:-mesh-room-music}"
+
+MIN_BEATS="${MS_MIN_BEATS:-4}"
+MIN_DENSITY="${MS_MIN_DENSITY:-0.8}"
+MIN_RICH="${MS_MIN_RICH:-0.5}"
+MIN_SCORE="${MS_MIN_SCORE:-48}"
+ONSET="${MS_ONSET:-3}"
+GAP="${MS_GAP:-180}"
+K="${MS_K:-3}"
+CAP="${MS_CAP:-120}"
+SOURCE="${MS_SOURCE:-mesh-home}"
+
+now(){ echo "${MESH_MS_NOW:-$(date +%s)}"; }   # overridable so --test controls the clock
+ts_utc(){ date -u +%FT%TZ; }
+log(){ printf '%s %s\n' "$(ts_utc)" "$*" >> "$LOG" 2>/dev/null || true; }
+
+# ── ledger parsing ─────────────────────────────────────────────────────────────────────────────
+# A line: `TS <organ> <id> dur=.. win=.. score=.. beats=.. [tags] dyn=.. act=.. rich=.. move=.. cent=.. -> verdict`
+# Fields are key=value, so we pull each by name (robust to column drift) rather than by position.
+field(){ sed -n "s/.*[[:space:]]$1=\([^[:space:]]*\).*/\1/p" <<<"$2"; }
+line_id(){ awk '{print $3}' <<<"$1"; }
+line_ts(){ awk '{print $1}' <<<"$1"; }
+ts_epoch(){ date -u -d "$1" +%s 2>/dev/null || echo 0; }
+
+# classify one ledger line: prints "music" or "other". A record is musical iff it clears ALL floors.
+classify(){
+  local line="$1" beats win score rich
+  beats="$(field beats "$line")"; win="$(field win "$line")"
+  score="$(field score "$line")"; rich="$(field rich "$line")"
+  # Missing/unmeasurable fields (silent/unreadable records) are never music.
+  case "${beats}${win}${score}${rich}" in *[!0-9.]*|'') echo other; return;; esac
+  awk -v b="$beats" -v w="$win" -v sc="$score" -v r="$rich" \
+      -v mb="$MIN_BEATS" -v md="$MIN_DENSITY" -v ms="$MIN_SCORE" -v mr="$MIN_RICH" 'BEGIN{
+    if (w<=0){ print "other"; exit }
+    dens = b / w
+    if (b>=mb && dens>=md && sc>=ms && r>=mr) print "music"; else print "other"
+  }'
+}
+
+# ── state (JSON, per the operator-named artifact) ────────────────────────────────────────────────
+# python3 for json I/O only; all logic stays in bash. archived is a set of already-copied record ids.
+state_get(){ # $1=key -> value (empty if unset)
+  python3 - "$STATE" "$1" <<'PY' 2>/dev/null || true
+import json,sys
+try: d=json.load(open(sys.argv[1]))
+except Exception: d={}
+v=d.get(sys.argv[2],"")
+if isinstance(v,list): print(" ".join(map(str,v)))
+else: print(v if v is not None else "")
+PY
+}
+state_set(){ # key value key value ...  (merge into the json)
+  python3 - "$STATE" "$@" <<'PY' 2>/dev/null
+import json,sys
+p=sys.argv[1]
+try: d=json.load(open(p))
+except Exception: d={}
+a=sys.argv[2:]
+for i in range(0,len(a),2):
+    k=a[i]; v=a[i+1]
+    if k in ("archived",):
+        d[k]=v.split() if v else []
+    elif k in ("run","last_music"):
+        try: d[k]=int(v)
+        except Exception: d[k]=0
+    else:
+        d[k]=v
+json.dump(d,open(p,"w"))
+PY
+}
+archived_has(){ case " $(state_get archived) " in *" $1 "*) return 0;; *) return 1;; esac; }
+archived_add(){ state_set archived "$(state_get archived) $1"; }
+
+# sanitize a ledger TS into a filesystem-safe session slug (2026-07-17T17:38Z -> 20260717-1738Z)
+slug(){ echo "$1" | tr -d ':-' | sed 's/T/-/'; }
+session_dir(){ echo "$ARCHIVE_ROOT/${SOURCE}__$(slug "$1")"; }
+
+# copy a record's wav into the session dir BEFORE the ear prunes it (verification principle: the
+# artifact must survive its producer's prune). Idempotent — skip an id already archived.
+archive_wav(){ # $1=record id  $2=session_dir
+  local id="$1" sdir="$2" src
+  archived_has "$id" && return 0
+  src="$(ls "$REC_DIR"/*-"$id".wav 2>/dev/null | head -1)"
+  [ -n "$src" ] && [ -f "$src" ] || { log "archive: no wav for $id (already pruned?)"; archived_add "$id"; return 0; }
+  mkdir -p "$sdir"
+  cp -f "$src" "$sdir/" 2>/dev/null && log "archive: $id -> $sdir"
+  archived_add "$id"
+}
+
+# ── the deliver worker: concat session wavs -> grind K mixes -> ship to TG -> log. Spawned ONCE at
+# session END, backgrounded in live operation (idempotent: END flips state to idle first, so no
+# second tick can re-spawn it). --test drives it synchronously via MESH_MS_SYNC=1.
+deliver_session(){ # $1=session_dir  $2=start_ts  $3=end_ts
+  local sdir="$1" start="$2" end="$3" feed list f out sent=0
+  mapfile -t wavs < <(ls "$sdir"/*.wav 2>/dev/null | sort)
+  [ "${#wavs[@]}" -gt 0 ] || { log "deliver: no wavs in $sdir — nothing to grind"; return 1; }
+  feed="$sdir/_feed.wav"; list="$sdir/_list.txt"; : > "$list"
+  for f in "${wavs[@]}"; do printf "file '%s'\n" "$f" >> "$list"; done
+  ffmpeg -hide_banner -nostats -y -f concat -safe 0 -i "$list" -t "$CAP" -ac 2 -ar 44100 "$feed" >/dev/null 2>&1
+  [ -s "$feed" ] || { log "deliver: concat produced no audio ($sdir)"; return 1; }
+  log "deliver: session $SOURCE $start..$end — ${#wavs[@]} wav(s), grinding $K mix(es)"
+  local -a mixes=()
+  local k
+  for ((k=1;k<=K;k++)); do
+    # unpinned --remix rotates the recipe against recent renders, so K back-to-back grinds vary.
+    out="$("$GRIND_BIN" --remix "$feed" 2>/dev/null)" || { log "deliver: grind $k failed"; continue; }
+    [ -n "$out" ] && [ -f "$out" ] && mixes+=("$out") && log "deliver: mix $k -> $out"
+  done
+  [ "${#mixes[@]}" -gt 0 ] || { log "deliver: 0 mixes ground — session $start not delivered"; return 1; }
+  # ship each mix to the operator's TG
+  local ENVF="$HOME/.config/remote-access/env"
+  [ -f "$ENVF" ] && { set -a; . "$ENVF" 2>/dev/null; set +a; }
+  local note="готово — миксы из твоей музыки (сессия $start–$end, источник: $SOURCE)"
+  for f in "${mixes[@]}"; do
+    if [ "${MESH_MS_TG_DRYRUN:-0}" = 1 ]; then
+      log "deliver: DRYRUN would send $(basename "$f")"
+    elif [ -n "${BOT_TOKEN:-}" ] && [ -n "${CHAT_ID:-}" ]; then
+      curl -s --max-time 90 "https://api.telegram.org/bot${BOT_TOKEN}/sendAudio" \
+        -F "chat_id=${CHAT_ID}" -F "audio=@${f};type=audio/mpeg" \
+        -F "title=Music session ($SOURCE $start)" -F "caption=$note" >/dev/null 2>&1 \
+        && log "deliver: sent $(basename "$f") to operator TG"
+    fi
+    printf '%s sent %s(music-session %s %s) src=%s\n' "$(ts_utc)" "$(basename "$f")" "$SOURCE" "$start" "$SOURCE" >> "$SENT_LOG"
+    sent=$((sent+1))
+  done
+  log "deliver: session $start delivered $sent mix(es)"
+  rm -f "$feed" "$list" 2>/dev/null
+  return 0
+}
+
+# ── one tick of the state machine ────────────────────────────────────────────────────────────────
+tick(){
+  mkdir -p "$ARCHIVE_ROOT"
+  [ -f "$STATE" ] || echo '{"state":"idle","run":0}' > "$STATE"
+
+  local -a L; local n anchor idx=-1 i
+  [ -f "$LEDGER" ] || return 0
+  mapfile -t L < "$LEDGER" 2>/dev/null || return 0
+  n=${#L[@]}; [ "$n" -eq 0 ] && return 0
+
+  # fresh_lines: anchor on LINE ID (the ledger tail-prunes; a byte offset would replay the corpus —
+  # the false-wake storm). Anchor gone (genuinely pruned) -> resync to END, never replay.
+  anchor="$(state_get anchor)"
+  if [ -n "$anchor" ]; then
+    for ((i=n-1;i>=0;i--)); do [ "$(line_id "${L[i]}")" = "$anchor" ] && { idx=$i; break; }; done
+  fi
+  if [ "$idx" -lt 0 ]; then state_set anchor "$(line_id "${L[n-1]}")"; return 0; fi
+
+  local st run last_music sess_start sdir
+  st="$(state_get state)"; st="${st:-idle}"
+  run="$(state_get run)"; run="${run:-0}"
+  last_music="$(state_get last_music)"; last_music="${last_music:-0}"
+  sess_start="$(state_get session_start)"
+
+  # fold each fresh record into the machine, in order
+  for ((i=idx+1;i<n;i++)); do
+    local line="${L[i]}" id kind ep
+    id="$(line_id "$line")"; kind="$(classify "$line")"; ep="$(ts_epoch "$(line_ts "$line")")"
+    if [ "$kind" = music ]; then
+      if [ "$run" -eq 0 ]; then
+        # new candidate run — stamp its start now so onset material is archived from record #1
+        sess_start="$(line_ts "$line")"
+        state_set session_start "$sess_start" archived ""
+      fi
+      run=$((run+1)); last_music="$ep"
+      sdir="$(session_dir "$sess_start")"
+      archive_wav "$id" "$sdir"
+      if [ "$st" = idle ] && [ "$run" -ge "$ONSET" ]; then
+        st=active
+        log "session START: $SOURCE $sess_start (run=$run)"
+      fi
+    else
+      if [ "$st" = idle ]; then
+        # candidate died before onset — discard its staged material, reset the run
+        if [ "$run" -gt 0 ] && [ -n "$sess_start" ]; then
+          rm -rf "$(session_dir "$sess_start")" 2>/dev/null
+        fi
+        run=0; sess_start=""
+        state_set session_start "" archived ""
+      fi
+      # active + non-music: do nothing here; the GAP check below decides END.
+    fi
+    state_set state "$st" run "$run" last_music "$last_music" anchor "$id"
+  done
+
+  # END check: an active session with no music for MS_GAP seconds is over.
+  if [ "$st" = active ]; then
+    local gap=$(( $(now) - last_music ))
+    if [ "$gap" -ge "$GAP" ]; then
+      local end_ts; end_ts="$(ts_utc)"
+      sdir="$(session_dir "$sess_start")"
+      # Flip to idle FIRST (idempotency): once idle, no later tick re-enters END for this session.
+      state_set state idle run 0 session_start "" archived ""
+      log "session END: $SOURCE $sess_start (gap=${gap}s) -> deliver"
+      if [ "${MESH_MS_SYNC:-0}" = 1 ]; then
+        deliver_session "$sdir" "$sess_start" "$end_ts"
+      else
+        # background the grind+deliver; the state is already idle so this cannot double-fire
+        ( deliver_session "$sdir" "$sess_start" "$end_ts" ) >/dev/null 2>&1 &
+      fi
+    fi
+  fi
+}
+
+# ══ dispatch ═════════════════════════════════════════════════════════════════════════════════════
+case "${1:-}" in
+  --status)
+    if [ -f "$STATE" ]; then
+      echo "state:   $(state_get state)"
+      echo "source:  $SOURCE"
+      echo "run:     $(state_get run)"
+      echo "start:   $(state_get session_start)"
+      echo "last_music_epoch: $(state_get last_music)"
+      echo "archived: $(state_get archived)"
+    else
+      echo "no session state yet ($STATE)"
+    fi
+    exit 0 ;;
+
+  --test)
+    tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+    fail(){ echo "TEST FAIL: $*"; exit 1; }
+    # The path GLOBALS were frozen from env at script load (before this case ran), so the functions
+    # read whatever was set THEN — the LIVE ledger/state if --test was invoked bare. Exporting the
+    # sandbox env now is not enough; REASSIGN the globals the functions actually read, so the test
+    # can never touch the live files. (A gate that runs against the live corpus asserts nothing.)
+    LEDGER="$tmp/records.log";   REC_DIR="$tmp/records"
+    STATE="$tmp/state.json";     ARCHIVE_ROOT="$tmp/sessions"
+    SENT_LOG="$tmp/sent.log";    LOG="$tmp/ms.log";        LOCK="$tmp/lock"
+    ONSET=3; GAP=180; K="${K:-3}"
+    export MESH_MS_SYNC=1 MESH_MS_TG_DRYRUN=1
+    mkdir -p "$REC_DIR"
+    : > "$SENT_LOG"
+    # a stub grinder: emits a fresh fake mp3 and echoes its path (never touches the real automixer)
+    stub="$tmp/grind-stub"; cat > "$stub" <<STUB
+#!/usr/bin/env bash
+[ "\$1" = --remix ] || exit 1
+o="$tmp/mix-\$RANDOM\$RANDOM.mp3"; echo fake-audio > "\$o"; echo "\$o"
+STUB
+    chmod +x "$stub"; GRIND_BIN="$stub"
+    mkwav(){ ffmpeg -v quiet -y -f lavfi -i "aevalsrc='0.4*sin(2*PI*(200+120*t)*t)':d=1:s=22050" -ac 1 "$1" >/dev/null 2>&1; }
+    ml(){ # emit one ledger line: $1=ts $2=id $3=beats $4=win $5=score $6=rich  (+ create its wav)
+      printf '%s ear %s dur=%s win=%s score=%s beats=%s [t] dyn=0.5 act=0.3 rich=%s move=0.1 cent=1100 -> pending\n' \
+        "$1" "$2" "$4" "$4" "$5" "$3" "$6" >> "$LEDGER"
+      mkwav "$REC_DIR/20260717-000000-ear-$2.wav"
+    }
+
+    echo "gate 1: the REAL classifier separates music from speech/cough"
+    # music-like: beats 20 / win 10 = 2.0 b/s, score 52, rich 0.6  -> music
+    [ "$(classify '2026-07-17T10:00Z ear m1 dur=10 win=10 score=52 beats=20 [t] dyn=0.5 act=0.3 rich=0.60 move=0.1 cent=1100 -> pending')" = music ] \
+      || fail "a sustained rhythmic record must classify as music"
+    # a cough transient: high score, but 3 beats over 3s = density 1.0 yet beats<4 -> other
+    [ "$(classify '2026-07-17T10:00Z ear c1 dur=3 win=3 score=65 beats=3 [t] dyn=1.0 act=0.3 rich=0.60 move=0.1 cent=1100 -> pending')" = other ] \
+      || fail "a <MIN_BEATS transient must NOT classify as music"
+    # speech: low score, thin rhythm -> other
+    [ "$(classify '2026-07-17T10:00Z ear s1 dur=10 win=10 score=40 beats=6 [t] dyn=0.4 act=0.3 rich=0.45 move=0.1 cent=1100 -> pending')" = other ] \
+      || fail "a low-score/low-rich speech record must NOT classify as music"
+
+    echo "gate 2: N-1 musical records do NOT start a session; N do"
+    rm -f "$LEDGER"; echo '{"state":"idle","run":0}' > "$STATE"
+    # prime the anchor (cold-start resyncs to END without replaying — as in live, where the ear
+    # stream is already flowing before the first music record). Records after the prime get folded.
+    ml 2026-07-17T09:59Z p0 6 10 40 0.45    # non-music prime
+    MESH_MS_NOW=$(ts_epoch 2026-07-17T09:59Z) tick
+    ml 2026-07-17T10:00Z a1 20 10 52 0.60   # music
+    ml 2026-07-17T10:01Z a2 20 10 52 0.60   # music (run=2, still < onset 3)
+    MESH_MS_NOW=$(ts_epoch 2026-07-17T10:01Z) tick
+    [ "$(state_get run)" = 2 ] || fail "2 musical records must be folded (run=2), got run=$(state_get run)"
+    [ "$(state_get state)" = idle ] || fail "2 musical records (< onset) must NOT start a session"
+    ml 2026-07-17T10:02Z a3 20 10 52 0.60   # music (run=3 == onset)
+    MESH_MS_NOW=$(ts_epoch 2026-07-17T10:02Z) tick
+    [ "$(state_get state)" = active ] || fail "onset musical records must START a session"
+
+    echo "gate 3: archive survives a prune (wav copied before source removed)"
+    sdir="$(session_dir "$(state_get session_start)")"
+    [ -f "$sdir/20260717-000000-ear-a1.wav" ] || fail "onset record a1's wav must be archived from record #1"
+    rm -f "$REC_DIR"/*.wav          # simulate the ear pruning ALL source wavs
+    [ -f "$sdir/20260717-000000-ear-a1.wav" ] || fail "archived wav must survive the source prune"
+
+    echo "gate 4: a music gap ENDs the session and delivers K mixes exactly once"
+    # push 'now' past the gap with no new music; a non-music record keeps flowing
+    ml 2026-07-17T10:10Z b1 6 10 40 0.45    # other (silence-ish)
+    MESH_MS_NOW=$(( $(ts_epoch 2026-07-17T10:02Z) + GAP + 60 )) tick
+    [ "$(state_get state)" = idle ] || fail "a >MS_GAP music gap must END the session"
+    sent1="$(grep -c 'music-session' "$SENT_LOG")"
+    [ "$sent1" = "$K" ] || fail "END must deliver exactly K=$K mixes (got $sent1)"
+
+    echo "gate 5: idempotent — a re-tick after END does NOT re-deliver"
+    MESH_MS_NOW=$(( $(ts_epoch 2026-07-17T10:02Z) + GAP + 120 )) tick
+    sent2="$(grep -c 'music-session' "$SENT_LOG")"
+    [ "$sent2" = "$sent1" ] || fail "a re-tick re-delivered ($sent1 -> $sent2) — delivery not idempotent"
+
+    echo "gate 6: a pure speech/cough ledger never starts a session"
+    rm -f "$LEDGER"; echo '{"state":"idle","run":0}' > "$STATE"
+    ml 2026-07-17T10:59Z p9 6 10 40 0.45    # non-music prime (establishes the anchor)
+    MESH_MS_NOW=$(ts_epoch 2026-07-17T10:59Z) tick
+    ml 2026-07-17T11:00Z d1 3 3 65 0.60     # cough (beats<4)
+    ml 2026-07-17T11:01Z d2 6 10 40 0.45    # speech
+    ml 2026-07-17T11:02Z d3 3 3 66 0.60     # cough
+    ml 2026-07-17T11:03Z d4 6 10 41 0.45    # speech
+    MESH_MS_NOW=$(ts_epoch 2026-07-17T11:03Z) tick
+    [ "$(state_get state)" = idle ] || fail "a speech/cough-only stream must NOT start a session"
+
+    echo "smoke-test: ok — classifier, onset, archive-survives-prune, gap-END, idempotent delivery, speech-reject"
+    exit 0 ;;
+
+  ""|--tick)
+    # single-writer: one tick at a time (the deliver worker is backgrounded, so the lock is brief)
+    exec 9>"$LOCK"
+    flock -n 9 || { echo "music-session: another tick holds the lock"; exit 0; }
+    tick
+    exit 0 ;;
+
+  *)
+    echo "usage: mesh-music-session [--tick] | --status | --test"; exit 1 ;;
+esac
