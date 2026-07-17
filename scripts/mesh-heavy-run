@@ -78,6 +78,42 @@ nice_prefix() {
   command -v ionice >/dev/null 2>&1 && PRE+=(ionice -c3)
 }
 
+# true when a real per-job memory CEILING actually BINDS here — not merely that a scope launches.
+# The trap this fixes (a1274ab reverted 648ceb0): the old probe ran `true` under MemoryMax=64M and
+# read a clean launch as "cgroup available". But `true` allocates nothing, so a launch proves only
+# that systemd-run reached the --user manager — NOT that the memory controller is delegated and the
+# ceiling constrains RSS. Where the controller is undelegated (fitness's runner) the scope launches,
+# the ceiling is a no-op, and `--capcheck` said "available" → --test drove the cgroup assertion → the
+# over-budget alloc FINISHED uncapped → rc=1 → fitness auto-reverted the whole fix. Launch ≠ bind (the
+# 'cap that does not cap' trap, same family as whisper's [ -x ] ≠ loadable). So PROBE THE BIND: run a
+# real over-alloc PAST a tiny ceiling in a throwaway --collect scope and require the ceiling to KILL
+# it. Survives → the ceiling is not binding here → report unavailable so the run path falls back to
+# ulimit + a LOUD why, rather than running a job it only BELIEVES is capped. Prefer python3 (one
+# process = one unambiguous OOM victim); absent it, require the memory controller delegated to our
+# user slice AND the scope to launch (structural bind evidence, still stronger than a bare launch).
+mem_cap_available() {
+  command -v systemd-run >/dev/null 2>&1 || return 1
+  if command -v python3 >/dev/null 2>&1; then
+    local _o _rc
+    _o="$(systemd-run --user --scope -q --collect -p MemoryMax=32M -p MemorySwapMax=0M -- \
+          python3 -c 'a=bytearray(128*1024*1024); print("ALIVE",len(a))' 2>/dev/null)"; _rc=$?
+    # Three outcomes, and empty stdout is AMBIGUOUS between two of them: (a) the alloc printed ALIVE →
+    # survived → ceiling did NOT bind; (b) the alloc was OOM-killed → scope exits 128+SIGKILL(9)=137 →
+    # ceiling BINDS; (c) systemd-run failed to LAUNCH (no user bus / broken) → empty stdout too, but a
+    # non-signal rc (<128) → NOT a working ceiling. So require a real signal-kill rc, never bare-empty.
+    case "$_o" in *ALIVE*) return 1 ;; esac      # survived → not capping
+    [ "${_rc:-0}" -ge 128 ] && return 0          # killed by a signal (cgroup-OOM = 137) → ceiling binds
+    return 1                                      # launch failure / non-kill exit → no binding ceiling
+  fi
+  local _cg="/sys/fs/cgroup/user.slice/user-$(id -u 2>/dev/null).slice/cgroup.controllers"
+  grep -qw memory "$_cg" 2>/dev/null && \
+    systemd-run --user --scope -q --collect -p MemoryMax=32M -- true >/dev/null 2>&1
+}
+
+# --capcheck: exit 0 iff a real cgroup memory ceiling actually binds here. --test uses it to choose the
+# cgroup vs ulimit-fallback assertions; a caller may use it to decide whether to trust the cap.
+[ "${1:-}" = --capcheck ] && { mem_cap_available; exit $?; }
+
 # --admit <budget-mb>: run ONLY the admission gate (defer-poll then refuse), no serialization/exec.
 # For heavy callers that keep their OWN serialization lock but delegate the memory/pressure decision
 # to this single source of truth (mesh-whisper-run's whisper-gate fold, chat-review/whisper-run-fold-heavy-gate).
@@ -114,8 +150,11 @@ if [ "${1:-}" = --test ]; then
   [ "$?" = 7 ] || { echo "smoke-test: FAIL (command exit code not propagated — expected 7)"; exit 1; }
 
   # 2b) STDERR PASSTHROUGH: the command's stderr must not be swallowed by the lock/gate plumbing.
+  # Containment, not equality: where no cgroup ceiling binds the run site legitimately PREPENDS a loud
+  # one-line fallback WHY to stderr (a silent weak cap is worse), so assert the command's own stderr is
+  # PRESENT, not that it is the sole line.
   _err="$(env $_base MESH_HEAVY_FORCE=1 MESH_HEAVY_MEMINFO="$_ample" "$0" 500 -- sh -c 'printf on-stderr >&2' 2>&1 >/dev/null)"
-  [ "$_err" = on-stderr ] || { echo "smoke-test: FAIL (command STDERR swallowed — expected 'on-stderr', got '$_err')"; exit 1; }
+  case "$_err" in *on-stderr*) : ;; *) echo "smoke-test: FAIL (command STDERR swallowed — expected to contain 'on-stderr', got '$_err')"; exit 1;; esac
 
   # 3) BUDGET GATE — REFUSE: budget 2000MB > 293MB tight headroom, node clear → EX_TEMPFAIL (75), no run.
   _marker="$_td/ran"; rm -f "$_marker"
@@ -149,10 +188,13 @@ if [ "${1:-}" = --test ]; then
     || { echo "smoke-test: FAIL (MESH_HEAVY_FORCE=1 must bypass the admission gate)"; exit 1; }
 
   # 5) SERIALIZATION: two concurrent 1s runs must NOT overlap → elapsed >= ~1.8s (falsify: drop the flock
-  #    → ~1s). Gate forced open + ample mem so only the flock governs timing.
+  #    → ~1s). Gate forced open + ample mem so only the flock governs timing. Budget 256MB (NOT a token
+  #    1MB): this leg tests the FLOCK, but the run path now caps memory too — under the ulimit -v
+  #    fallback a 1MB address-space cap would kill `sleep` outright (vaddr ≫ RSS), failing this test on
+  #    every no-binding-cgroup node. 256MB clears sleep's vaddr under BOTH the cgroup and ulimit caps.
   _sleep="$(command -v sleep)"; _start="$(date +%s.%N)"
-  ( env $_base MESH_HEAVY_FORCE=1 MESH_HEAVY_LOCK_WAIT=15 "$0" 1 -- "$_sleep" 1 >/dev/null 2>&1 ) &
-  ( env $_base MESH_HEAVY_FORCE=1 MESH_HEAVY_LOCK_WAIT=15 "$0" 1 -- "$_sleep" 1 >/dev/null 2>&1 ) &
+  ( env $_base MESH_HEAVY_FORCE=1 MESH_HEAVY_LOCK_WAIT=15 "$0" 256 -- "$_sleep" 1 >/dev/null 2>&1 ) &
+  ( env $_base MESH_HEAVY_FORCE=1 MESH_HEAVY_LOCK_WAIT=15 "$0" 256 -- "$_sleep" 1 >/dev/null 2>&1 ) &
   wait
   _el="$(awk -v a="$_start" -v b="$(date +%s.%N)" 'BEGIN{printf "%.2f", b-a}')"
   awk -v e="$_el" 'BEGIN{exit !(e >= 1.8)}' \
@@ -168,7 +210,41 @@ if [ "${1:-}" = --test ]; then
   env $_base "$0" --admit notanumber >/dev/null 2>&1; [ "$?" = "$EX_USAGE" ] \
     || { echo "smoke-test: FAIL (--admit non-integer budget must be EX_USAGE 64)"; exit 1; }
 
-  echo "smoke-test: ok (arg-validate + passthrough/exit + stderr + budget-gate both ways + node-pressure-gate + accel-precursor-gate + FORCE-bypass + admit-preflight + 2×1s-serialize=${_el}s)"
+  # 7) MEMORY CEILING — the budget is a CAP, not just an admission precondition (chat-review/
+  #    heavy-run-budget-is-admission-not-cap). A job allocating PAST its budget must die ALONE
+  #    (cgroup-OOM), not balloon node-wide; a within-budget job completes. RED-first: without the
+  #    per-job cap at the run site the over-alloc below FINISHES rc=0. Branch on --capcheck, which now
+  #    probes the BIND (not just the launch) — so on a runner where the ceiling does NOT bind (the
+  #    exact env that reverted a1274ab) we take the ulimit-fallback assertion instead of demanding an
+  #    OOM the kernel was never going to deliver. (Needs python3 to allocate.)
+  if env $_base "$0" --capcheck >/dev/null 2>&1; then
+    # the ceiling BINDS here — assert an over-budget job dies alone and a within-budget one completes.
+    if command -v python3 >/dev/null 2>&1; then
+      _hog='a=bytearray(256*1024*1024); print("FINISHED", len(a))'   # 256MB under a 64MB ceiling → OOM
+      _out="$(env $_base MESH_HEAVY_FORCE=1 MESH_HEAVY_MEMINFO="$_ample" MESH_HEAVY_SWAPMAX_MB=0 "$0" 64 -- python3 -c "$_hog" 2>/dev/null)"; _rc=$?
+      case "$_out" in *FINISHED*) echo "smoke-test: FAIL (over-budget job COMPLETED — 64MB ceiling not enforced at the run site; out='$_out')"; exit 1;; esac
+      # rc MUST be 137 (128+SIGKILL) — the SPECIFIC artifact of a cgroup-OOM. A bare `!= 0` also passes
+      # for a ulimit MemoryError (rc=1) or a systemd-run launch failure, so on a node that CLAIMS
+      # [cgroup] (capcheck true) but silently killed via a weaker path the label would be a lie. Pin the
+      # signal so the [cgroup] tag means what it says. (Mutant1 in the RED proof exposed this: strip the
+      # cgroup wrap → ulimit -v also kills python3 → `!= 0` stayed green under a false [cgroup] label.)
+      [ "$_rc" = 137 ] || { echo "smoke-test: FAIL (over-budget job rc=$_rc, expected 137 — not a cgroup-OOM SIGKILL; the [cgroup] path did not enforce via MemoryMax)"; exit 1; }
+      _lite='a=bytearray(48*1024*1024); print("OK", len(a))'         # 48MB under a 512MB ceiling → runs
+      _out="$(env $_base MESH_HEAVY_FORCE=1 MESH_HEAVY_MEMINFO="$_ample" MESH_HEAVY_SWAPMAX_MB=0 "$0" 512 -- python3 -c "$_lite" 2>/dev/null)"
+      case "$_out" in OK*) : ;; *) echo "smoke-test: FAIL (within-budget job wrongly killed — expected 'OK…', got '$_out')"; exit 1;; esac
+      _capmode="cgroup"
+    else
+      _capmode="skip(cgroup binds, no python3 to drive the alloc)"
+    fi
+  else
+    # the ceiling does NOT bind here (the env that reverted a1274ab) → the run path must WARN loudly and
+    # still run, never a silent weak cap. Uses `true`, so this leg needs no python3.
+    _err="$(env $_base MESH_HEAVY_FORCE=1 MESH_HEAVY_MEMINFO="$_ample" "$0" 128 -- true 2>&1 >/dev/null)"
+    case "$_err" in *"no cgroup memory ceiling"*) : ;; *) echo "smoke-test: FAIL (cgroup absent but fallback WHY not emitted; got '$_err')"; exit 1;; esac
+    _capmode="ulimit-fallback"
+  fi
+
+  echo "smoke-test: ok (arg-validate + passthrough/exit + stderr + budget-gate both ways + node-pressure-gate + accel-precursor-gate + FORCE-bypass + admit-preflight + mem-ceiling[$_capmode] + 2×1s-serialize=${_el}s)"
   exit 0
 fi
 
@@ -182,13 +258,39 @@ shift 2
 # ---- admission: defer-poll then refuse (unless forced) — single source of truth ----
 admit_gate "$budget" || exit "$?"
 
-# ---- serialize + renice, then exec ----
+# ---- serialize + renice, then run under a per-job memory ceiling ----
 nice_prefix
-# Shared advisory lock on fd 9 (no O_CLOEXEC → survives exec into the command, released on its exit).
+# Shared advisory lock on fd 9 (no O_CLOEXEC → survives into the command, released on its exit).
 # Degrade to unserialized-but-niced if the lock can't open or isn't acquired within LOCK_WAIT. The
-# fd-9 open's 2>/dev/null is SCOPED to the group so it never leaks onto the final exec (which would
+# fd-9 open's 2>/dev/null is SCOPED to the group so it never leaks onto the final run (which would
 # swallow the command's own stderr).
 if command -v flock >/dev/null 2>&1 && { exec 9>"$LOCK"; } 2>/dev/null; then
   flock -w "$LOCK_WAIT" 9 2>/dev/null || true
 fi
+
+# ENFORCE the budget as a CEILING, not just an admission precondition (chat-review/heavy-run-budget-
+# is-admission-not-cap, 2026-07-17). admit_gate above only checks the budget FITS the node's headroom;
+# with no per-job cap an admitted job that under-declared balloons past it and OOMs the WHOLE node —
+# live receipt: a 2500MB-budget grind reached 18.9GB anon-RSS (7.6×) at 14:39:55, node-wide OOM + a
+# swap treadmill. Run the job in a transient cgroup scope capped at its declared budget so a runaway is
+# cgroup-OOM-killed ALONE at its budget while every sibling process survives. Default swap ceiling 0 →
+# the budget is a strict TOTAL ceiling (no treadmill); MESH_HEAVY_SWAPMAX_MB grants a swap cushion for
+# a job that genuinely needs one. We RUN (not exec) so we can name the OOM on the way out; fd 9 stays
+# held by this shell for the job's lifetime, so serialization is preserved. --collect reaps the scope
+# unit on exit (no accumulating failed run-rN.scope). mem_cap_available PROBES the real BIND, so where
+# the ceiling would NOT actually constrain (undelegated controller / no user bus) we fall through to
+# the loud ulimit fallback instead of running a job we only BELIEVE is capped.
+swapmax="${MESH_HEAVY_SWAPMAX_MB:-0}"
+if mem_cap_available; then
+  systemd-run --user --scope -q --collect -p MemoryMax="${budget}M" -p MemorySwapMax="${swapmax}M" \
+    -- ${PRE[@]+"${PRE[@]}"} "$@"
+  rc=$?
+  [ "$rc" = 137 ] && echo "mesh-heavy-run: job hit its ${budget}MB memory ceiling and was cgroup-OOM-killed (rc=137) — the declared budget is too small for this job; raise it (or set MESH_HEAVY_SWAPMAX_MB for a swap cushion)" >&2
+  exit "$rc"
+fi
+# FALLBACK where no cgroup memory ceiling can BIND (systemd-run / user-manager / delegated controller
+# absent — e.g. bare cron with no user bus): approximate the ceiling with ulimit -v (address space,
+# KB). Weaker than a cgroup RSS cap, so say so LOUDLY — a silent weak cap is worse than a loud one.
+echo "mesh-heavy-run: no cgroup memory ceiling available — falling back to ulimit -v ${budget}MB (address-space cap, not RSS)" >&2
+ulimit -v $((budget * 1024)) 2>/dev/null || echo "mesh-heavy-run: ulimit -v unavailable too — running nice+serialized but UNCAPPED" >&2
 exec ${PRE[@]+"${PRE[@]}"} "$@"
