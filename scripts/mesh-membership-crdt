@@ -1,0 +1,258 @@
+#!/usr/bin/env bash
+# mesh-membership-crdt — a convergent, Byzantine-anchored membership set for the flat mesh.
+#
+# STUDY (idea-queue 'Byzantine agreement', 2026-07-16): the mesh has NO central membership registry
+# (vpn-hub retired; topology = flat Tailscale reachability + gossiped trace). Every node forms its OWN
+# view of "who is a member" from local probes (mesh-nodestate: a LEASE, not a cached flag). Two problems
+# fall straight out of that:
+#   (1) CONVERGENCE — N nodes gossiping N partial views must agree on one membership set regardless of
+#       message order/loss/duplication, with no coordinator. That is exactly what a state-based CRDT
+#       (a join-semilattice with a commutative/associative/idempotent merge) guarantees.
+#   (2) ANCHORED STABILITY / BYZANTINE TOLERANCE — a member must NOT be evicted because ONE node missed
+#       one ping (the nodestate flap: mesh-home sole path deauths every ~14min; a partitioned or faulty
+#       node sees everyone as "gone"). Eviction must require AGREEMENT among a quorum of distinct
+#       observers. Below quorum the member stays "anchored" — present, uncontested by a lone dissenter.
+#
+# THE CRDT — an add-wins OR-Set with quorum-gated removal ("Anchored OR-Set"):
+#   per element (node id):
+#     adds[elem]              = set of unique dots  (author:counter)          — grow-only (union on merge)
+#     rem_votes[elem][dot]    = set of AUTHORS who have observed that dot gone — grow-only (union on merge)
+#   a dot is TOMBSTONED iff (distinct voters for it) >= Q   (Q distinct observers agree it is gone)
+#   present(elem)            iff some dot in adds[elem] is NOT tombstoned
+#   merge(a,b)               = union adds, union rem_votes-per-dot  -> pure set-unions
+#
+# Merge is set-union only => commutative + associative + idempotent => STRONG EVENTUAL CONSISTENCY:
+# any two nodes that have seen the same set of updates compute the identical membership, in any order.
+# present() is a deterministic pure function of the joined state, so convergence of state => convergence
+# of the derived membership. Quorum Q is the anchor: a lone (partitioned/Byzantine) remove-vote can
+# never reach Q, so it cannot evict — while a genuinely-departed node, seen gone by Q distinct peers,
+# is tombstoned everywhere. Re-join works by ADD-WINS: a fresh dot (new counter) that no one has voted
+# gone makes the element present again (the "online-wins across duplicate tailnet entries" rule that
+# mesh-nodestate already applies, generalised to N observers and made order-independent).
+#
+#   mesh-membership-crdt --test            CRDT laws (comm/assoc/idem) + the anchor property, RED-first
+#   mesh-membership-crdt demo              build views from real mesh-nodestate + a transient dissenter,
+#                                          merge them, show the anchor holding a member the dissenter dropped
+#   mesh-membership-crdt merge a.json b..  merge state files (or '-' for stdin) -> convergent state on stdout
+#   mesh-membership-crdt members [state]   print present members of a state file (default: stdin)
+#
+# STUDY artifact — invoked on demand, not a scheduled reflex.
+# orphan-ok: study/experiment tool (idea-queue 'Byzantine agreement') — on-demand, intentionally unwired.
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+
+# Quorum: how many DISTINCT observers must agree a dot is gone before it is tombstoned. Q=2 means a lone
+# node can never evict (the anchor); raise it on a larger fleet for stronger Byzantine tolerance.
+MEMBERSHIP_QUORUM="${MEMBERSHIP_QUORUM:-2}"
+
+PYF="$(mktemp "${TMPDIR:-/tmp}/mesh-crdt-XXXXXX.py")" || exit 1
+trap 'rm -f "$PYF"' EXIT
+
+# Quoted heredoc — protects apostrophes/backticks/$ inside the python from the shell.
+cat > "$PYF" <<'PY'
+import json, sys, random, itertools
+
+# ---- the Anchored OR-Set: state is pure JSON, merge is pure set-union ------------------------------
+# state = {"elements": { elem: {"adds": [[author,counter],...],
+#                               "rem":  { "author:counter": [voter,...] }}}}
+# dots are serialised "author:counter" (JSON has no tuple keys); author/voter are node ids (strings).
+
+def _dot(author, counter): return "%s:%d" % (author, counter)
+
+def empty(): return {"elements": {}}
+
+def add(state, elem, author, counter):
+    """Observe elem present, tagged by (author,counter). A NEW counter is a fresh dot = re-join."""
+    e = state["elements"].setdefault(elem, {"adds": [], "rem": {}})
+    d = [author, counter]
+    if d not in e["adds"]:
+        e["adds"].append(d)
+    return state
+
+def vote_remove(state, elem, dot, voter):
+    """A voter observed `dot` gone. One vote; eviction needs QUORUM distinct voters (see present())."""
+    e = state["elements"].setdefault(elem, {"adds": [], "rem": {}})
+    voters = e["rem"].setdefault(dot, [])
+    if voter not in voters:
+        voters.append(voter)
+    return state
+
+def merge(a, b):
+    """Join two states: union of adds, union of per-dot voter sets. Commutative/associative/idempotent."""
+    out = {"elements": {}}
+    for elem in set(a["elements"]) | set(b["elements"]):
+        ea = a["elements"].get(elem, {"adds": [], "rem": {}})
+        eb = b["elements"].get(elem, {"adds": [], "rem": {}})
+        adds = []
+        for d in ea["adds"] + eb["adds"]:
+            if d not in adds: adds.append(d)
+        rem = {}
+        for src in (ea["rem"], eb["rem"]):
+            for dot, voters in src.items():
+                cur = rem.setdefault(dot, [])
+                for v in voters:
+                    if v not in cur: cur.append(v)
+        out["elements"][elem] = {"adds": adds, "rem": rem}
+    return out
+
+def present(state, elem, quorum):
+    """elem is a member iff some add-dot is NOT tombstoned. A dot is tombstoned iff >=quorum distinct
+    voters agree it is gone. Below quorum the dot (and so the member) is ANCHORED — stays present."""
+    e = state["elements"].get(elem)
+    if not e: return False
+    for author, counter in e["adds"]:
+        d = _dot(author, counter)
+        voters = e["rem"].get(d, [])
+        if len(set(voters)) < quorum:      # this add is still live (not enough agreement to evict)
+            return True
+    return False
+
+def members(state, quorum):
+    return sorted(el for el in state["elements"] if present(state, el, quorum))
+
+# ---- canonical form so equal states compare equal regardless of insertion order -------------------
+def canon(state):
+    return json.dumps({el: {"adds": sorted(v["adds"]),
+                            "rem": {d: sorted(set(vs)) for d, vs in v["rem"].items()}}
+                       for el, v in state["elements"].items()},
+                      sort_keys=True)
+
+# ---- a random state generator for the law tests ---------------------------------------------------
+def rand_state(rng, authors, elems):
+    s = empty()
+    for _ in range(rng.randint(3, 12)):
+        elem = rng.choice(elems); author = rng.choice(authors); counter = rng.randint(0, 3)
+        add(s, elem, author, counter)
+    for _ in range(rng.randint(0, 10)):
+        elem = rng.choice(elems); voter = rng.choice(authors)
+        author = rng.choice(authors); counter = rng.randint(0, 3)
+        vote_remove(s, elem, _dot(author, counter), voter)
+    return s
+
+def selftest(quorum):
+    rng = random.Random(20260716)   # seeded -> the gate is reproducible, never flaky
+    authors = ["mesh-home", "ideapad", "phaedra", "server"]
+    elems = ["nodeA", "nodeB", "nodeC", "nodeD"]
+    fails = []
+
+    # LAW 1 idempotence: merge(a,a) == a
+    for _ in range(200):
+        a = rand_state(rng, authors, elems)
+        if canon(merge(a, a)) != canon(a): fails.append("idempotence"); break
+
+    # LAW 2 commutativity: merge(a,b) == merge(b,a)
+    for _ in range(200):
+        a = rand_state(rng, authors, elems); b = rand_state(rng, authors, elems)
+        if canon(merge(a, b)) != canon(merge(b, a)): fails.append("commutativity"); break
+
+    # LAW 3 associativity: merge(merge(a,b),c) == merge(a,merge(b,c))
+    for _ in range(200):
+        a = rand_state(rng, authors, elems); b = rand_state(rng, authors, elems); c = rand_state(rng, authors, elems)
+        if canon(merge(merge(a, b), c)) != canon(merge(a, merge(b, c))): fails.append("associativity"); break
+
+    # CONVERGENCE: every permutation-fold of the same update set yields the SAME members
+    updates = [rand_state(rng, authors, elems) for _ in range(5)]
+    baseline = None
+    for perm in itertools.permutations(updates):
+        acc = empty()
+        for u in perm: acc = merge(acc, u)
+        m = tuple(members(acc, quorum))
+        if baseline is None: baseline = m
+        elif m != baseline: fails.append("convergence"); break
+
+    # ANCHOR PROPERTY — the load-bearing claim. Exercised RED-first by the caller via MEMBERSHIP_QUORUM:
+    #   nodeX added by mesh-home; a LONE dissenter (ideapad, partitioned) votes it gone.
+    #   at quorum>=2 the member is ANCHORED (present). At quorum==1 it MUST evict — that is the red state
+    #   the --test harness drives, proving the anchor is a real gate, not decoration.
+    s = empty(); add(s, "nodeX", "mesh-home", 0)
+    vote_remove(s, "nodeX", _dot("mesh-home", 0), "ideapad")     # 1 distinct voter
+    anchored = present(s, "nodeX", quorum)
+    if quorum >= 2 and not anchored: fails.append("anchor:lone-dissenter-evicted")
+    if quorum == 1 and anchored:     fails.append("anchor:quorum1-should-evict")
+    # quorum reached -> genuine departure IS evicted (two distinct peers agree)
+    vote_remove(s, "nodeX", _dot("mesh-home", 0), "phaedra")     # 2nd distinct voter
+    if quorum <= 2 and present(s, "nodeX", quorum): fails.append("anchor:quorum-reached-not-evicted")
+    # ADD-WINS re-join -> a fresh dot no one voted gone revives the member
+    add(s, "nodeX", "mesh-home", 1)
+    if not present(s, "nodeX", quorum): fails.append("readd:fresh-dot-did-not-revive")
+
+    return fails
+
+cmd = sys.argv[1]
+Q = int(sys.argv[2])
+
+if cmd == "selftest":
+    fails = selftest(Q)
+    if fails:
+        print("FAIL: " + ", ".join(fails)); sys.exit(1)
+    print("ok: CRDT laws (idempotence, commutativity, associativity, convergence) + "
+          "anchor (lone-dissenter held, quorum-reached evicted, add-wins re-join) — quorum=%d" % Q)
+    sys.exit(0)
+
+if cmd == "merge":
+    acc = empty()
+    for p in sys.argv[3:]:
+        raw = sys.stdin.read() if p == "-" else open(p).read()
+        acc = merge(acc, json.loads(raw))
+    print(json.dumps(acc, indent=2)); sys.exit(0)
+
+if cmd == "members":
+    raw = sys.stdin.read() if (len(sys.argv) < 4 or sys.argv[3] == "-") else open(sys.argv[3]).read()
+    for m in members(json.loads(raw), Q): print(m)
+    sys.exit(0)
+
+if cmd == "demo":
+    # VIEW 1 — this node's REAL view from mesh-nodestate on stdin: everything it currently calls online
+    # (or self) is a member it observes present; stale/offline it simply does not add (absence != vote).
+    view_home = empty()
+    counter = 0
+    online_here = []
+    for line in sys.stdin.read().splitlines():
+        if ":" not in line: continue
+        name, st = line.rsplit(":", 1); name = name.strip(); st = st.strip()
+        if st == "online":
+            add(view_home, name, "mesh-home", counter); online_here.append(name); counter += 1
+    # VIEW 2 — a PARTITIONED peer (ideapad) that, through its own transient outage, sees the FIRST online
+    # node as gone and votes to remove it. A naive last-writer or single-observer scheme would evict it.
+    view_peer = json.loads(json.dumps(view_home))   # peer had seen the same adds...
+    dissent = None
+    if online_here:
+        dissent = online_here[0]
+        for author, cnt in view_home["elements"][dissent]["adds"]:
+            vote_remove(view_peer, dissent, _dot(author, cnt), "ideapad")   # ideapad's lone remove vote
+    merged = merge(view_home, view_peer)
+    print("real online (mesh-home view): %s" % ", ".join(online_here or ["<none>"]))
+    print("partitioned peer (ideapad) voted GONE: %s" % (dissent or "<none>"))
+    print("quorum Q = %d" % Q)
+    print("converged members after merge: %s" % ", ".join(members(merged, Q) or ["<none>"]))
+    if dissent:
+        held = dissent in members(merged, Q)
+        print("ANCHOR: %s held present despite the lone dissenter = %s "
+              "(a 2nd distinct observer would be needed to evict)" % (dissent, held))
+    sys.exit(0)
+
+sys.stderr.write("usage: mesh-membership-crdt {--test|demo|merge <f...>|members [f]}\n"); sys.exit(2)
+PY
+
+case "${1:---help}" in
+  --test)
+    # RED-first proof the anchor is a real gate: at quorum=1 a lone dissenter MUST evict (the q==1 branch
+    # of selftest asserts exactly that); at the real quorum the same lone vote must be ANCHORED. Both must
+    # pass their own expectations. If the anchor logic were dead, one of the two would fail.
+    q1="$(python3 "$PYF" selftest 1 2>&1)"; r1=$?
+    q2="$(python3 "$PYF" selftest "$MEMBERSHIP_QUORUM" 2>&1)"; r2=$?
+    if [ "$r2" -ne 0 ]; then echo "smoke-test: FAIL (quorum=$MEMBERSHIP_QUORUM) — $q2"; exit 1; fi
+    if [ "$r1" -ne 0 ]; then echo "smoke-test: FAIL (anchor gate inconsistent at quorum=1) — $q1"; exit 1; fi
+    echo "smoke-test: ok"; echo "$q2"
+    exit 0 ;;
+  demo)
+    mesh-nodestate 2>/dev/null | python3 "$PYF" demo "$MEMBERSHIP_QUORUM" ;;
+  merge)
+    shift; python3 "$PYF" merge "$MEMBERSHIP_QUORUM" "$@" ;;
+  members)
+    shift; python3 "$PYF" members "$MEMBERSHIP_QUORUM" "${1:--}" ;;
+  --help|-h)
+    sed -n '2,40p' "$0" ;;
+  *)
+    echo "usage: mesh-membership-crdt {--test|demo|merge <f...>|members [f]}" >&2; exit 2 ;;
+esac
