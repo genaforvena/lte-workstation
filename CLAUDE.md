@@ -206,6 +206,18 @@ freshly-cleared session's context — so the mind wakes already holding its own 
 auto-read is the whole loop; skip the write and the read has nothing). The file survives `/clear`
 and `/compact`; it is intentionally stale-on-reboot (reboot is clean reincarnation).
 
+**`mesh-clear <window>` — the gated `/clear`** (machinery landed; the coverage-model layer is
+pending the models mind's classifier bench). It refuses to `/clear` unless a handoff exists, is
+**fresh** (younger than `MESH_CLEAR_FRESH_SECS`, default 900s — an hours-old handoff never passes,
+the lease-freshness trap), **and** a tiny local model confirms the handoff **covers** the recent
+pane scrollback. It is strictly **fail-safe**: model unsure / unreachable / non-affirmative →
+BLOCK, never auto-clear (a false "all-ok → clear" loses the thread irreversibly, same rule as the
+mesh no-faked-all-clear). `--auto` extracts a handoff verbatim from the scrollback (never invents a
+next-step) then re-gates. NOTE (2026-07-18): no currently-available local model discriminates
+coverage (`qwen2.5:3b` always-NO; `gemma4:e2b` emits Thinking… → parse trap), so today the gate
+**over-blocks** — safe but not yet usable for enforcement; swap the winner in via
+`MESH_CLEAR_MODEL` once the models bench delivers it.
+
 ## Self-feeding (autonomous operation)
 
 Every channel is a 2-pane window (top = data, bottom = mind); the mind pane IS the autonomous
@@ -348,7 +360,7 @@ index** (`mesh-tools` grouped · `mesh-tools <category>` · `--search <term>` ·
 categories below name the load-bearing tools — run `mesh-tools <category>` (or read the doc) for the
 rest and the full contracts.
 
-- **Coordinate / drive:** `mesh-tell` (`--peek`) · `mesh-watch` (`--until`/`--change`) · `mesh-chat` · `mesh-claim` (`--check`) · `mesh-minds` · `mesh-trace` · `mesh-textin` · `mesh-handoff` (pre-`/clear` work-state → durable file + SessionStart-hook restore).
+- **Coordinate / drive:** `mesh-tell` (`--peek`) · `mesh-watch` (`--until`/`--change`) · `mesh-chat` · `mesh-claim` (`--check`) · `mesh-minds` · `mesh-trace` · `mesh-textin` · `mesh-handoff` (pre-`/clear` work-state → durable file + SessionStart-hook restore) · `mesh-clear` (the gated `/clear` — fail-safe tiny-model freshness+coverage gate; model pending models bench).
 - **Perceive (sensorium):** `mesh-location` · `mesh-body-motion` · `mesh-light` · `mesh-tamper` · `mesh-body-context` · `mesh-presence`(+`-fuse`/`-trends`/`-delta`) · `mesh-arrivals` · `mesh-find` · `mesh-lan-newdevice`/`mesh-lan-health` · `mesh-wifi-link`/`mesh-wifi-motion` · `mesh-room-sense` · `mesh-say`/`mesh-act` · `mesh-voice-rx`/`mesh-voice-tx`/`mesh-tg-typing` · `mesh-tg-roz`/`mesh-roz-channel` · `mesh-tg-update` · `mesh-watchtower` · `mesh-cam-watch` · `mesh-face-recognize` · `mesh-overhear`/`mesh-room`/`mesh-room-trace` (the room "third party": ambient rolling transcript on the mic+Bose node + the room mind's read/say verbs) · `mesh-irq-rate` (kernel interrupt activity, sampled on demand). Perception is re-observed live, never stored (decays on reboot).
 - **Fusion / derived state:** `mesh-situation` · `mesh-perimeter` · `mesh-sensorium` · `mesh-stress` · `mesh-operator-home`/`mesh-operator-state` · `mesh-home-state`/`mesh-household-state` · `mesh-ambient-clock` · `mesh-sense-monitor`. Honest-fusion rule: an unreachable input renders UNKNOWN/partial, never a faked all-clear.
 - **Sound studio (records → grind):** `mesh-records` (the ARCHIVIST: keeps + measures every record the mesh makes before its organ prunes it — the room ear self-prunes hourly, soundscape keeps 2d, so the corpus a mind was handed was already gone; the ledger `~/.mesh/records.log` outlives the audio) · `mesh-sound-reflex` (the GRINDER: derives each recipe from the record's MEASURED character, repelled from recent renders by combo distance, bg-grinds via `mesh-room-music`, pokes the mind only on drop/walked-out/outlier/degenerate) · `mesh-soundscape --measure <wav>` (the one measure tract — never add a second librosa analyzer) · `mesh-room-music` (owns the grind invocation + `room-music-params.log`).

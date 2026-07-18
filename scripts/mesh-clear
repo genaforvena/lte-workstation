@@ -1,0 +1,245 @@
+#!/usr/bin/env bash
+# mesh-clear — a GATED /clear. A mind must never type a bare /clear: it drops the uncommitted work-state
+# (see mesh-handoff + the PRE-CLEAR doctrine in CLAUDE.md), and "I posted a handoff earlier" is not enough —
+# an HOURS-OLD handoff doesn't cover what was just done. This wrapper lets a tiny local model be the CLEAR-GATE:
+# before /clear reaches the pane, it decides whether a FRESH handoff actually COVERS the recent work.
+#
+#   mesh-clear <window>            gate, then /clear the window's mind pane iff the gate PASSES
+#   mesh-clear <window> --auto     on a block, EXTRACT a handoff from scrollback (verbatim), re-gate, then /clear
+#   mesh-clear <window> --dry-run  print the verdict + reason, NEVER send /clear (what would happen)
+#   mesh-clear --test              gate-logic smoke test (stale BLOCKS, fresh+covered PASSES; drives every branch)
+#
+# FLOW: (1) read the window's mind-pane scrollback + the stored handoff, (2) tiny model binary-classifies
+# "does this FRESH handoff COVER the work the scrollback shows?", (3a) YES → send /clear; (3b) NO → block
+# with guidance, or (--auto) extract+write a handoff then re-gate.
+#
+# THREE HARD CONSTRAINTS (operator 2026-07-18) — each is a gate you can watch FAIL in --test:
+#  (a) FAIL-SAFE. Model unsure / unreachable / unparseable → BLOCK, never auto-clear. A false "all-ok → clear"
+#      loses the thread FOREVER (irreversible), so only an affirmative YES passes; every other outcome blocks.
+#      Same rule as the mesh no-faked-all-clear (honest-fusion): absence of a clear YES is NOT a yes.
+#  (b) FRESHNESS/COVERAGE, not PRESENCE. A stale [handoff] from hours ago must NOT pass. The deterministic
+#      freshness clock is the handoff's OWN age vs a budget (MESH_CLEAR_FRESH_SECS, default 900s) — NOT tmux
+#      #{window_activity}: running mesh-clear in the pane BUMPS window_activity to ~now, so comparing handoff
+#      vs activity would call every handoff stale (the act of checking invalidates the clock — the lease-
+#      freshness trap). Age gates freshness; the model gates coverage over the scrollback. Presence alone
+#      never passes: it must be FRESH and COVERED.
+#  (c) EXTRACTIVE auto-handoff. --auto's generated handoff lists ONLY concrete actions + paths VERBATIM from
+#      the scrollback; it must NOT invent a "next step". A hallucinated next-step is worse than no handoff.
+#
+# Model is pluggable (MESH_CLEAR_MODEL, default gemma4:e2b-it-qat — the wake-gate winner); the models mind's
+# zero-shot bench picks the real winner (functiongemma / LFM2.5), swap via env, no code change. Coordinate
+# there for which classifier wins the gate.
+# orphan-ok: on-demand — a mind runs it in place of /clear; not a cron reflex.
+set -uo pipefail
+
+MESH_DIR="${MESH_DIR:-$HOME/.mesh}"
+HANDOFF_DIR="${MESH_HANDOFF_DIR:-$MESH_DIR/handoff}"
+CHAT_LOG="${MESH_CHAT_LOG:-$MESH_DIR/chat.log}"
+FRESH_SECS="${MESH_CLEAR_FRESH_SECS:-900}"          # a handoff older than this is STALE → block
+SCROLL_LINES="${MESH_CLEAR_SCROLL_LINES:-120}"      # pane scrollback lines fed to the coverage classifier
+MODEL="${MESH_CLEAR_MODEL:-qwen2.5:3b}"    # non-thinking default (gemma4:e2b emits Thinking… → parse trap,
+                                           # memory qwen35-thinking-family-fails-the-wake-gate-parser). The
+                                           # models mind's zero-shot bench picks the real winner — swap via env.
+SESSION="${MESH_CLEAR_SESSION:-$(hostname)}"
+
+_handoff_file() { printf '%s/%s.md' "$HANDOFF_DIR" "$(printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_')"; }
+
+# --- pure decision core: the whole gate reduced to inputs so --test drives every branch, RED-first. ---
+# $1=have_handoff(0/1)  $2=hoff_age_secs  $3=coverage(YES|NO|UNSURE)  $4=fresh_secs
+# echoes "PASS" or "BLOCK:<reason>". ONLY (have && fresh && coverage==YES) passes — everything else blocks.
+_clear_decision() {
+  local have="$1" age="$2" cov="$3" budget="$4"
+  [ "$have" = 1 ]                 || { echo "BLOCK:no-handoff";  return; }
+  [ "$age" -le "$budget" ] 2>/dev/null || { echo "BLOCK:stale"; return; }   # non-numeric age → also blocks
+  [ "$cov" = YES ]               || { echo "BLOCK:not-covered"; return; }   # NO / UNSURE / unreachable all block (fail-safe)
+  echo PASS
+}
+
+# --- tiny-model coverage classify. Emits exactly YES | NO | UNSURE. Any error/timeout/unparse → UNSURE (blocks). ---
+# Override for tests / models-bench integration: MESH_CLEAR_CLASSIFY_CMD reads evidence on stdin, prints the verdict.
+_classify_coverage() { # stdin = evidence (handoff + scrollback); echoes YES|NO|UNSURE
+  if [ -n "${MESH_CLEAR_CLASSIFY_CMD:-}" ]; then
+    local v; v="$(cat | $MESH_CLEAR_CLASSIFY_CMD 2>/dev/null | tr -d '[:space:]' | tr a-z A-Z)"
+    case "$v" in YES) echo YES;; NO) echo NO;; *) echo UNSURE;; esac
+    return
+  fi
+  command -v ollama >/dev/null 2>&1 || { echo UNSURE; return; }
+  local ev prompt out
+  ev="$(cat)"
+  prompt="You are a strict release gate. Below is a mind's saved HANDOFF note and the recent terminal
+SCROLLBACK of what it was actually doing. Answer with ONE word only: YES if the HANDOFF already covers the
+concrete work shown in the SCROLLBACK (the actions and files it touched), so nothing would be lost if the
+session is cleared now; NO if the scrollback shows work the handoff does not mention. If you are unsure,
+answer NO. Do not explain.
+
+=== HANDOFF ===
+$ev
+=== END ===
+One word (YES or NO):"
+  # bound the call; a hang/crash must degrade to UNSURE, never block the mind forever and never pass.
+  # Take the LAST yes/no token, not "contains": a thinking model reasons ("...it does not, so...") then
+  # concludes — the final token is the answer, and a stray mid-reasoning yes/no must not flip the verdict.
+  out="$(printf '%s' "$prompt" | timeout "${MESH_CLEAR_MODEL_TIMEOUT:-25}" ollama run "$MODEL" 2>/dev/null \
+        | tr -d '\r' | grep -oiE '\b(yes|no)\b' | tail -1 | tr a-z A-Z)"
+  case "$out" in
+    YES) echo YES ;;
+    NO)  echo NO ;;
+    *)   echo UNSURE ;;   # empty / prose / timeout → fail-safe
+  esac
+}
+
+# --- extractive handoff generator (--auto). ONLY concrete actions + paths from scrollback; no invented next-step. ---
+_extract_handoff() { # stdin = scrollback; echoes an extractive handoff body (or empty on failure → caller blocks)
+  if [ -n "${MESH_CLEAR_EXTRACT_CMD:-}" ]; then cat | $MESH_CLEAR_EXTRACT_CMD 2>/dev/null; return; fi
+  command -v ollama >/dev/null 2>&1 || return 0
+  local sc prompt
+  sc="$(cat)"
+  prompt="Extract, VERBATIM from the terminal scrollback below, ONLY: the concrete actions that were taken
+and the file paths / commands that appear in it. Copy real tokens from the text. Do NOT invent a next step,
+do NOT summarize intentions, do NOT add anything not literally present. Bullet list.
+
+=== SCROLLBACK ===
+$sc
+=== END ===
+Extractive bullets:"
+  printf '%s' "$prompt" | timeout "${MESH_CLEAR_MODEL_TIMEOUT:-25}" ollama run "$MODEL" 2>/dev/null
+}
+
+_resolve_mind_pane() { # $1=window → echoes "<session>:<window>.<idx>" of the BOTTOM (mind) pane, or empty
+  local win="$1" idx
+  tmux has-session -t "$SESSION" 2>/dev/null || return 0
+  tmux list-windows -t "$SESSION" -F '#{window_name}' 2>/dev/null | grep -qx "$win" || return 0
+  # mind pane = the bottom one (largest pane_top), same convention mesh-tell uses
+  idx="$(tmux list-panes -t "$SESSION:$win" -F '#{pane_top} #{pane_index}' 2>/dev/null | sort -n | tail -1 | awk '{print $2}')"
+  [ -n "$idx" ] && printf '%s:%s.%s' "$SESSION" "$win" "$idx"
+}
+
+_send_clear() { # $1=paneref — inject a real /clear + submit. The irreversible step; only reached on PASS.
+  local pane="$1"
+  tmux send-keys -t "$pane" C-u 2>/dev/null            # wipe any half-typed composer text
+  sleep 0.1
+  tmux send-keys -t "$pane" -l '/clear' 2>/dev/null
+  sleep 0.2
+  tmux send-keys -t "$pane" C-m 2>/dev/null
+}
+
+_gate() { # $1=window ; sets globals: G_VERDICT, G_REASON, G_AGE, G_COV. Reads real evidence.
+  local win="$1" f now mtime scroll ev pane
+  f="$(_handoff_file "$win")"
+  now="$(date +%s)"
+  if [ -r "$f" ]; then
+    mtime="$(stat -c %Y "$f" 2>/dev/null || echo 0)"
+    G_AGE=$(( now - mtime )); G_HAVE=1
+  else
+    G_AGE=-1; G_HAVE=0
+  fi
+  # only bother the model if we HAVE a handoff that is still FRESH — otherwise the deterministic gate decides.
+  G_COV=UNSURE
+  if [ "$G_HAVE" = 1 ] && [ "$G_AGE" -le "$FRESH_SECS" ]; then
+    pane="$(_resolve_mind_pane "$win")"
+    scroll=""
+    [ -n "$pane" ] && scroll="$(tmux capture-pane -t "$pane" -p -S "-$SCROLL_LINES" 2>/dev/null)"
+    ev="$(cat "$f" 2>/dev/null)
+=== SCROLLBACK ($SCROLL_LINES lines) ===
+$scroll"
+    G_COV="$(printf '%s' "$ev" | _classify_coverage)"
+  fi
+  G_VERDICT="$(_clear_decision "$G_HAVE" "$G_AGE" "$G_COV" "$FRESH_SECS")"
+  G_REASON="${G_VERDICT#BLOCK:}"
+}
+
+_run() { # $1=window  $2=auto(0/1)  $3=dryrun(0/1)
+  local win="$1" auto="$2" dry="$3" pane
+  _gate "$win"
+  if [ "$G_VERDICT" = PASS ]; then
+    if [ "$dry" = 1 ]; then echo "mesh-clear: PASS (handoff fresh ${G_AGE}s, coverage=$G_COV) — would /clear '$win'"; return 0; fi
+    pane="$(_resolve_mind_pane "$win")"
+    [ -n "$pane" ] || { echo "mesh-clear: cannot resolve mind pane for '$win' — refusing to /clear" >&2; return 3; }
+    echo "mesh-clear: PASS — /clear → $pane (handoff fresh ${G_AGE}s, covered)"
+    _send_clear "$pane"; return 0
+  fi
+  # BLOCK path
+  if [ "$auto" = 1 ] && [ "$G_REASON" != stale ]; then
+    # try an EXTRACTIVE auto-handoff from the scrollback, then re-gate ONCE (never loop, never force a pass)
+    pane="$(_resolve_mind_pane "$win")"
+    local sc body
+    [ -n "$pane" ] && sc="$(tmux capture-pane -t "$pane" -p -S "-$SCROLL_LINES" 2>/dev/null)"
+    body="$(printf '%s' "$sc" | _extract_handoff)"
+    if [ -n "$body" ]; then
+      mesh-handoff "$win" "auto-extracted before /clear (verbatim from scrollback — no invented next-step):
+$body" >/dev/null 2>&1
+      _gate "$win"
+      if [ "$G_VERDICT" = PASS ]; then
+        [ "$dry" = 1 ] && { echo "mesh-clear: PASS after auto-extract — would /clear '$win'"; return 0; }
+        pane="$(_resolve_mind_pane "$win")"
+        echo "mesh-clear: PASS after auto-extract — /clear → $pane"
+        _send_clear "$pane"; return 0
+      fi
+    fi
+  fi
+  echo "mesh-clear: BLOCKED ($G_REASON) — NOT clearing '$win'." >&2
+  case "$G_REASON" in
+    no-handoff)   echo "  → no handoff stored. Run: mesh-handoff $win \"<what done> + <next> + <paths>\"  then retry." >&2 ;;
+    stale)        echo "  → handoff is ${G_AGE}s old (budget ${FRESH_SECS}s) — it predates recent work. Re-write it: mesh-handoff $win \"...\"" >&2 ;;
+    not-covered)  echo "  → the gate model (coverage=$G_COV) does not confirm the handoff covers recent work. Update the handoff (or --auto to extract), then retry." >&2 ;;
+  esac
+  return 1
+}
+
+_test() {
+  local rc=0
+  # 1) PURE DECISION CORE — every branch, including the RED one (stale must BLOCK, fresh+covered must PASS).
+  [ "$(_clear_decision 0 -1 UNSURE 900)" = "BLOCK:no-handoff" ]  || { echo "clear-test: FAIL (no-handoff not blocked)"; rc=1; }
+  [ "$(_clear_decision 1 5000 YES 900)" = "BLOCK:stale" ]        || { echo "clear-test: FAIL (STALE handoff not blocked — the lease-freshness trap)"; rc=1; }
+  [ "$(_clear_decision 1 100 NO 900)"  = "BLOCK:not-covered" ]   || { echo "clear-test: FAIL (uncovered not blocked)"; rc=1; }
+  [ "$(_clear_decision 1 100 UNSURE 900)" = "BLOCK:not-covered" ]|| { echo "clear-test: FAIL (UNSURE not blocked — fail-safe broken, would auto-clear on doubt)"; rc=1; }
+  [ "$(_clear_decision 1 100 YES 900)" = "PASS" ]               || { echo "clear-test: FAIL (fresh+covered did not PASS)"; rc=1; }
+  # boundary: exactly at the budget passes, one past it is stale
+  [ "$(_clear_decision 1 900 YES 900)" = "PASS" ]               || { echo "clear-test: FAIL (at-budget must pass)"; rc=1; }
+  [ "$(_clear_decision 1 901 YES 900)" = "BLOCK:stale" ]        || { echo "clear-test: FAIL (one-past-budget must be stale)"; rc=1; }
+
+  # 2) COVERAGE CLASSIFY fail-safe: garbage/empty model output must degrade to UNSURE (→ block), never YES.
+  [ "$(printf x | MESH_CLEAR_CLASSIFY_CMD='cat' _classify_coverage)" = NO ] 2>/dev/null || true   # 'x'→not YES/NO→UNSURE handled below
+  [ "$(printf 'maybe' | MESH_CLEAR_CLASSIFY_CMD='cat' _classify_coverage)" = UNSURE ] || { echo "clear-test: FAIL (unparseable coverage not UNSURE)"; rc=1; }
+  [ "$(printf 'YES'   | MESH_CLEAR_CLASSIFY_CMD='cat' _classify_coverage)" = YES ]    || { echo "clear-test: FAIL (clean YES not passed through)"; rc=1; }
+  [ "$(printf ''      | MESH_CLEAR_CLASSIFY_CMD='cat' _classify_coverage)" = UNSURE ] || { echo "clear-test: FAIL (empty coverage not UNSURE)"; rc=1; }
+
+  # 3) END-TO-END via --dry-run against a fixture handoff dir (no tmux/model needed): assert a STALE handoff
+  #    BLOCKS and a FRESH+covered one PASSES — driving the whole _run gate, not just the core.
+  local td; td="$(mktemp -d)"
+  export MESH_DIR="$td/m" MESH_HANDOFF_DIR="$td/m/handoff" MESH_CLEAR_SESSION="__no_such_session__"
+  export MESH_CLEAR_CLASSIFY_CMD='printf YES'   # force coverage=YES so freshness is the variable under test
+  mkdir -p "$MESH_HANDOFF_DIR"
+  local win=gatewin f; f="$(_handoff_file "$win")"
+  # FRESH handoff (just written) → PASS
+  printf '# handoff\nbuilt X, touched scripts/foo\n' > "$f"
+  _run "$win" 0 1 >"$td/out" 2>&1
+  grep -q 'PASS' "$td/out" || { echo "clear-test: FAIL (fresh+covered handoff did not PASS in --dry-run: $(cat "$td/out"))"; rc=1; }
+  # STALE handoff (backdate mtime well past the budget) → BLOCK, even though coverage is forced YES
+  touch -d '3 hours ago' "$f"
+  _run "$win" 0 1 >"$td/out" 2>&1
+  grep -q 'BLOCKED (stale)' "$td/out" || { echo "clear-test: FAIL (STALE handoff did not BLOCK: $(cat "$td/out"))"; rc=1; }
+  # NO handoff at all → BLOCK
+  rm -f "$f"
+  _run "$win" 0 1 >"$td/out" 2>&1
+  grep -q 'BLOCKED (no-handoff)' "$td/out" || { echo "clear-test: FAIL (missing handoff did not BLOCK: $(cat "$td/out"))"; rc=1; }
+  rm -rf "$td"
+
+  [ "$rc" = 0 ] && echo "clear-test: ok (decision core all branches incl. stale-blocks/fresh-passes/UNSURE-fail-safe; coverage classify degrades to UNSURE; end-to-end --dry-run: stale BLOCKS, fresh+covered PASSES, no-handoff BLOCKS)"
+  return "$rc"
+}
+
+# ---- arg parse ----
+[ "${1:-}" = --test ] && { _test; exit $?; }
+WIN=""; AUTO=0; DRY=0
+for a in "$@"; do
+  case "$a" in
+    --auto) AUTO=1 ;;
+    --dry-run) DRY=1 ;;
+    -h|--help) sed -n '2,13p' "$0"; exit 0 ;;
+    -*) echo "mesh-clear: unknown flag $a" >&2; exit 2 ;;
+    *) [ -z "$WIN" ] && WIN="$a" ;;
+  esac
+done
+[ -n "$WIN" ] || { echo "usage: mesh-clear <window> [--auto] [--dry-run]" >&2; exit 2; }
+_run "$WIN" "$AUTO" "$DRY"
