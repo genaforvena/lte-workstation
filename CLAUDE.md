@@ -206,17 +206,23 @@ freshly-cleared session's context — so the mind wakes already holding its own 
 auto-read is the whole loop; skip the write and the read has nothing). The file survives `/clear`
 and `/compact`; it is intentionally stale-on-reboot (reboot is clean reincarnation).
 
-**`mesh-clear <window>` — the gated `/clear`** (machinery landed; the coverage-model layer is
-pending the models mind's classifier bench). It refuses to `/clear` unless a handoff exists, is
-**fresh** (younger than `MESH_CLEAR_FRESH_SECS`, default 900s — an hours-old handoff never passes,
-the lease-freshness trap), **and** a tiny local model confirms the handoff **covers** the recent
-pane scrollback. It is strictly **fail-safe**: model unsure / unreachable / non-affirmative →
-BLOCK, never auto-clear (a false "all-ok → clear" loses the thread irreversibly, same rule as the
-mesh no-faked-all-clear). `--auto` extracts a handoff verbatim from the scrollback (never invents a
-next-step) then re-gates. NOTE (2026-07-18): no currently-available local model discriminates
-coverage (`qwen2.5:3b` always-NO; `gemma4:e2b` emits Thinking… → parse trap), so today the gate
-**over-blocks** — safe but not yet usable for enforcement; swap the winner in via
-`MESH_CLEAR_MODEL` once the models bench delivers it.
+**`mesh-clear <window>` — the gated `/clear`** (machinery landed; coverage model benched + set). It
+refuses to `/clear` unless a handoff exists, is **fresh** (younger than `MESH_CLEAR_FRESH_SECS`,
+default 900s — an hours-old handoff never passes, the lease-freshness trap), **and** a tiny local
+model confirms the handoff **covers** the recent pane scrollback. It is strictly **fail-safe**: model
+unsure / unreachable / non-affirmative → BLOCK, never auto-clear (a false "all-ok → clear" loses the
+thread irreversibly, same rule as the mesh no-faked-all-clear). `--auto` extracts a handoff verbatim
+from the scrollback (never invents a next-step) then re-gates. COVERAGE MODEL (2026-07-18, 91c435d):
+`gemma4:e2b-it-qat` is the benched winner and the default — the ONLY local candidate that
+*discriminates* coverage (`mesh-model-bench coverage`, ledger `~/.mesh/model-bench.log`: false-YES
+0/7, over-block 4/7, read-ok). Every qwen — old `qwen2.5:3b` (the prior default) AND current-gen
+`qwen3.5:2b`/`4b` — is DEGENERATE always-NO (over-block 7/7), which is why the gate over-blocked
+before. The earlier "`gemma4:e2b` emits Thinking… → parse trap" was OUR handling bug (the same
+thinking-family class as the qwen3.5 wake parser), fixed by `--think=false` in `_classify_coverage`
+— **not** a model ceiling. The gate is over-blocking-but-safe (permits ~43% of covered clears, loses
+zero threads); swap the winner via `MESH_CLEAR_MODEL` when the bench moves. Scoring is asymmetric by
+the fail-safe doctrine: a false-YES (clearing an UNCOVERED handoff) is the irreversible error and
+DISQUALIFIES a model (UNSAFE); over-blocking is the recoverable, rankable one.
 
 ## Self-feeding (autonomous operation)
 
