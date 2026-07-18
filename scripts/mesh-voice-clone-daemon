@@ -1,0 +1,248 @@
+#!/home/mesh-home/.venv-ai/bin/python
+"""mesh-voice-clone-daemon — warm XTTS-v2 daemon that speaks in the OPERATOR'S cloned voice.
+
+The mesh's voice is the operator's own voice. Cold XTTS load is ~12-25s (measured), so
+"all speech" is only usable if the model stays WARM: this daemon loads xtts_v2 ONCE, precomputes
+the operator's conditioning latents ONCE from the reference wavs, then serves text->wav over a
+Unix socket at ~0.7-1.7s per line (measured, GPU). Clients: mesh-voice-say (the primitive every
+speech organ delegates to).
+
+Protocol (newline-terminated request, single line):
+    <out_wav_path>\t<text>\n
+Reply (single line):
+    OK\t<out_wav_path>\t<audio_secs>\n     synth ok, 24kHz mono PCM wav at out_wav_path
+    ERR\t<message>\n                       synth failed (caller falls back to piper — LOUDLY)
+
+Env:
+    MESH_CLONE_SOCK    unix socket path   (default ~/.mesh/voice-clone/xtts.sock)
+    MESH_CLONE_REFS    ':'-joined ref wavs (default: operator-ref + front/usb multi-mic)
+    MESH_CLONE_LANG    xtts language      (default ru)
+    MESH_CLONE_LOG     log file           (default ~/.mesh/voice-clone/daemon.log)
+
+--test : offline contract check (imports, refs exist, socket path writable) — does NOT load the
+         model or synthesize (that is the LIVE gate in mesh-voice-say --test). exit 0 ok / 2 n/a.
+"""
+import os, sys, socket, threading, time, traceback
+
+HOME = os.path.expanduser("~")
+MESH = os.path.join(HOME, ".mesh")
+CLONE_DIR = os.path.join(MESH, "voice-clone")
+SOCK = os.environ.get("MESH_CLONE_SOCK", os.path.join(CLONE_DIR, "xtts.sock"))
+LANG = os.environ.get("MESH_CLONE_LANG", "auto")  # "auto" → per-request Cyrillic/Latin detect
+LOGF = os.environ.get("MESH_CLONE_LOG", os.path.join(CLONE_DIR, "daemon.log"))
+DEFAULT_REFS = ":".join([
+    os.path.join(MESH, "voiceref", "operator-ref.wav"),
+    os.path.join(MESH, "voiceref", "front-235334.wav"),
+    os.path.join(MESH, "voiceref", "usb-235334.wav"),
+])
+REFS = [p for p in os.environ.get("MESH_CLONE_REFS", DEFAULT_REFS).split(":") if p]
+
+
+def log(msg):
+    line = f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {msg}"
+    try:
+        with open(LOGF, "a") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+    print(line, flush=True)
+
+
+def selftest():
+    # offline contract only — never loads the model here (that is the live gate downstream)
+    refs_ok = [p for p in REFS if os.path.isfile(p) and os.path.getsize(p) > 1000]
+    if not refs_ok:
+        print(f"smoke-test: n/a (no operator reference wavs — {REFS})")
+        return 2
+    try:
+        _install_isin_shim()  # xtts_v2 needs it at TTS-import time, even for a dry contract check
+        import TTS  # noqa: F401
+        import soundfile  # noqa: F401
+    except Exception as e:
+        print(f"smoke-test: n/a (TTS/torch/soundfile not importable: {e})")
+        return 2
+    d = os.path.dirname(SOCK) or "."
+    if not os.path.isdir(d):
+        try:
+            os.makedirs(d, exist_ok=True)
+        except Exception as e:
+            print(f"smoke-test: FAIL (socket dir not creatable: {e})")
+            return 1
+    if not os.access(d, os.W_OK):
+        print(f"smoke-test: FAIL (socket dir not writable: {d})")
+        return 1
+    print(f"smoke-test: ok ({len(refs_ok)}/{len(REFS)} refs, TTS importable, sock dir writable)")
+    return 0
+
+
+# ── model (loaded once, at startup) ──────────────────────────────────────────────────────────
+_model = None
+_gpt = None
+_spk = None
+_lock = threading.Lock()  # GPU is single-writer; serialize synth
+
+
+def _install_isin_shim():
+    # xtts_v2 predates transformers' isin_mps_friendly; the low-level inference path calls it with
+    # KEYWORDS (elements=, test_elements=) while other paths call positionally — accept both, or the
+    # first m.inference() dies "unexpected keyword argument 'elements'". (learned 2026-07-18.)
+    import torch
+    import transformers.pytorch_utils as pu
+    if getattr(pu, "_mesh_isin_shim", False):
+        return
+    def _isin(elements=None, test_elements=None, *a, **k):
+        if elements is None and a:
+            elements = a[0]
+        if test_elements is None and len(a) > 1:
+            test_elements = a[1]
+        return torch.isin(elements, test_elements)
+    pu.isin_mps_friendly = _isin
+    pu._mesh_isin_shim = True
+
+
+def load_model():
+    global _model, _gpt, _spk
+    _install_isin_shim()
+    import torch
+    import torch.serialization as ts
+    from TTS.tts.configs.xtts_config import XttsConfig
+    from TTS.tts.models.xtts import XttsAudioConfig, XttsArgs
+    from TTS.config.shared_configs import BaseDatasetConfig
+    ts.add_safe_globals([XttsConfig, XttsAudioConfig, XttsArgs, BaseDatasetConfig])
+    from TTS.api import TTS
+    # DEVICE: default CPU on purpose. The RTX 3060's 12GB is already carrying the load-bearing
+    # senses (gigaam + note3 STT daemons, ollama vision/dispatch models ~10.8/12GB resident); a
+    # 2GB always-warm XTTS is a BURSTY consumer and pinning it in VRAM OOM-cascades the room ear
+    # (measured 2026-07-18: cuda load died CUDA-OOM with 11MB free). CPU synth is ~2.3x realtime
+    # (5-13s/line) — slower but fully DECOUPLED: TTS never starves a sense, a sense never starves
+    # TTS. Set MESH_CLONE_DEVICE=cuda only after reserving headroom on the GPU.
+    dev = os.environ.get("MESH_CLONE_DEVICE", "cpu")
+    if dev == "cuda" and not torch.cuda.is_available():
+        dev = "cpu"
+    if dev == "cpu":
+        try:
+            torch.set_num_threads(int(os.environ.get("MESH_CLONE_THREADS", "12")))
+        except Exception:
+            pass
+    t0 = time.time()
+    tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(dev)
+    _model = tts.synthesizer.tts_model
+    log(f"model loaded on {dev} in {time.time()-t0:.1f}s")
+    refs_ok = [p for p in REFS if os.path.isfile(p)]
+    if not refs_ok:
+        raise RuntimeError(f"no operator reference wavs found: {REFS}")
+    t0 = time.time()
+    _gpt, _spk = _model.get_conditioning_latents(audio_path=refs_ok)
+    log(f"operator conditioning latents computed from {len(refs_ok)} refs in {time.time()-t0:.1f}s")
+
+
+def _split(text, limit=200):
+    # XTTS low-level inference has no auto-split; break long text on sentence boundaries so each
+    # chunk stays under the model's context, then concatenate the wavs.
+    import re
+    text = text.strip()
+    if len(text) <= limit:
+        return [text] if text else []
+    parts, cur = [], ""
+    for tok in re.split(r"(?<=[.!?…])\s+", text):
+        if len(cur) + len(tok) + 1 <= limit:
+            cur = (cur + " " + tok).strip()
+        else:
+            if cur:
+                parts.append(cur)
+            cur = tok
+    if cur:
+        parts.append(cur)
+    return parts or [text[:limit]]
+
+
+def _detect_lang(text):
+    # xtts is cross-lingual: the operator's ru-conditioned voice can speak either language, but the
+    # LANGUAGE code must match the TEXT or prosody garbles. Cyrillic-majority → ru, else → en. LANG
+    # env (default ru) only forces it when set explicitly to something other than "auto".
+    if LANG != "auto":
+        return LANG
+    cyr = sum(1 for c in text if "Ѐ" <= c <= "ӿ")
+    lat = sum(1 for c in text if ("a" <= c.lower() <= "z"))
+    return "en" if lat > cyr else "ru"
+
+
+def synth(out_path, text):
+    import numpy as np
+    import soundfile as sf
+    chunks = _split(text)
+    if not chunks:
+        raise ValueError("empty text")
+    lang = _detect_lang(text)
+    wavs = []
+    with _lock:
+        for ch in chunks:
+            o = _model.inference(ch, lang, _gpt, _spk)
+            wavs.append(np.asarray(o["wav"], dtype="float32"))
+    audio = np.concatenate(wavs) if len(wavs) > 1 else wavs[0]
+    tmp = out_path + ".tmp.wav"
+    sf.write(tmp, audio, 24000)
+    os.replace(tmp, out_path)
+    return len(audio) / 24000.0
+
+
+def handle(conn):
+    try:
+        conn.settimeout(120)
+        buf = b""
+        while b"\n" not in buf:
+            chunk = conn.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+        line = buf.split(b"\n", 1)[0].decode("utf-8", "replace")
+        if "\t" not in line:
+            conn.sendall(b"ERR\tmalformed request (want <out>\\t<text>)\n")
+            return
+        out_path, text = line.split("\t", 1)
+        out_path = out_path.strip()
+        try:
+            t0 = time.time()
+            secs = synth(out_path, text)
+            log(f"synth ok {secs:.1f}s audio in {time.time()-t0:.2f}s -> {out_path}  «{text[:60]}»")
+            conn.sendall(f"OK\t{out_path}\t{secs:.2f}\n".encode())
+        except Exception as e:
+            log(f"synth ERR: {e}\n{traceback.format_exc()}")
+            conn.sendall(f"ERR\t{e}\n".encode())
+    except Exception as e:
+        log(f"handle ERR: {e}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def serve():
+    os.makedirs(os.path.dirname(SOCK), exist_ok=True)
+    if os.path.exists(SOCK):
+        os.unlink(SOCK)
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(SOCK)
+    os.chmod(SOCK, 0o660)
+    srv.listen(8)
+    log(f"listening on {SOCK}")
+    # readiness marker: a sibling file the client/health can stat without opening the socket
+    try:
+        open(SOCK + ".ready", "w").write(str(int(time.time())))
+    except Exception:
+        pass
+    while True:
+        conn, _ = srv.accept()
+        threading.Thread(target=handle, args=(conn,), daemon=True).start()
+
+
+def main():
+    if "--test" in sys.argv[1:]:
+        sys.exit(selftest())
+    load_model()
+    serve()
+
+
+if __name__ == "__main__":
+    main()
