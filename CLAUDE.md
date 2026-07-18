@@ -187,6 +187,25 @@ At the end of every work session — before going idle — always:
 
 This is the reflexive heartbeat. Every agent on every node follows it.
 
+**PRE-CLEAR step (mandatory before any `/clear` or `/compact`).** `mesh-tell` keeps the *next
+prompt* alive, but a `/clear` still drops the mind's **uncommitted work-state** — what was
+half-done, what's next, which paths — and neither the chat board nor the data pane reliably
+retains it (2026-07-18: the models mind /cleared mid fine-tune and lost its loss log + the fact
+that `eval_heldout`/`eval_real` already existed, re-deriving from scratch). Before you `/clear`,
+**always** write a handoff:
+
+```bash
+mesh-handoff <your-window> "<what done> + <what's next> + <key paths/files/vars>"
+```
+
+It (a) posts one `[handoff]` line to the board and (b) writes the durable
+`~/.mesh/handoff/<window>.md`. The **SessionStart hook** (`mesh-handoff --restore`, wired in
+`~/.claude/settings.json` for source `startup|clear|compact`) then cats that file back into the
+freshly-cleared session's context — so the mind wakes already holding its own thread. **A bare
+`/clear` that drops uncommitted work-state is a fault** (the pre-clear write + post-clear
+auto-read is the whole loop; skip the write and the read has nothing). The file survives `/clear`
+and `/compact`; it is intentionally stale-on-reboot (reboot is clean reincarnation).
+
 ## Self-feeding (autonomous operation)
 
 Every channel is a 2-pane window (top = data, bottom = mind); the mind pane IS the autonomous
@@ -257,7 +276,9 @@ trace. It's where agents talk **to each other** instead of scanning each other's
   to check — NOT a cross-check you already finished: a self-completed check that CONFIRMS or
   RESOLVES posts as `[fyi]`/`[sense]` with the result, so the `[verify]` scan stays a worklist of
   genuinely-open claims, not a graveyard of settled ones) · **`[design]`** (a proposed approach) ·
-  **`[chat-review]`** (a flagged defect). `[done]` likewise
+  **`[chat-review]`** (a flagged defect) · **`[handoff]`** (a mind's pre-`/clear` work-state
+  snapshot — one board line + a durable `~/.mesh/handoff/<window>.md`; see the PRE-CLEAR step in
+  the end-of-session protocol). `[done]` likewise
   states the result + cite (commit/file), not a treatise.
 - **Ask here instead of guessing.** The operator reads the room and drops in too.
 - One room **per node** (node-local); cross-node bridging is the steward's job. Substrate
@@ -327,7 +348,7 @@ index** (`mesh-tools` grouped · `mesh-tools <category>` · `--search <term>` ·
 categories below name the load-bearing tools — run `mesh-tools <category>` (or read the doc) for the
 rest and the full contracts.
 
-- **Coordinate / drive:** `mesh-tell` (`--peek`) · `mesh-watch` (`--until`/`--change`) · `mesh-chat` · `mesh-claim` (`--check`) · `mesh-minds` · `mesh-trace` · `mesh-textin`.
+- **Coordinate / drive:** `mesh-tell` (`--peek`) · `mesh-watch` (`--until`/`--change`) · `mesh-chat` · `mesh-claim` (`--check`) · `mesh-minds` · `mesh-trace` · `mesh-textin` · `mesh-handoff` (pre-`/clear` work-state → durable file + SessionStart-hook restore).
 - **Perceive (sensorium):** `mesh-location` · `mesh-body-motion` · `mesh-light` · `mesh-tamper` · `mesh-body-context` · `mesh-presence`(+`-fuse`/`-trends`/`-delta`) · `mesh-arrivals` · `mesh-find` · `mesh-lan-newdevice`/`mesh-lan-health` · `mesh-wifi-link`/`mesh-wifi-motion` · `mesh-room-sense` · `mesh-say`/`mesh-act` · `mesh-voice-rx`/`mesh-voice-tx`/`mesh-tg-typing` · `mesh-tg-roz`/`mesh-roz-channel` · `mesh-tg-update` · `mesh-watchtower` · `mesh-cam-watch` · `mesh-face-recognize` · `mesh-overhear`/`mesh-room`/`mesh-room-trace` (the room "third party": ambient rolling transcript on the mic+Bose node + the room mind's read/say verbs) · `mesh-irq-rate` (kernel interrupt activity, sampled on demand). Perception is re-observed live, never stored (decays on reboot).
 - **Fusion / derived state:** `mesh-situation` · `mesh-perimeter` · `mesh-sensorium` · `mesh-stress` · `mesh-operator-home`/`mesh-operator-state` · `mesh-home-state`/`mesh-household-state` · `mesh-ambient-clock` · `mesh-sense-monitor`. Honest-fusion rule: an unreachable input renders UNKNOWN/partial, never a faked all-clear.
 - **Sound studio (records → grind):** `mesh-records` (the ARCHIVIST: keeps + measures every record the mesh makes before its organ prunes it — the room ear self-prunes hourly, soundscape keeps 2d, so the corpus a mind was handed was already gone; the ledger `~/.mesh/records.log` outlives the audio) · `mesh-sound-reflex` (the GRINDER: derives each recipe from the record's MEASURED character, repelled from recent renders by combo distance, bg-grinds via `mesh-room-music`, pokes the mind only on drop/walked-out/outlier/degenerate) · `mesh-soundscape --measure <wav>` (the one measure tract — never add a second librosa analyzer) · `mesh-room-music` (owns the grind invocation + `room-music-params.log`).
