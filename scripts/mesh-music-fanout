@@ -1,0 +1,237 @@
+#!/usr/bin/env bash
+# mesh-music-fanout — extend the music-session reflex to REMOTE mics: hear the operator's music on
+# every mic the mesh has, not just mesh-home's local ear.
+#
+# Operator 2026-07-17: "listen to mac mic too, i usually play closer to that mic" + "generally this
+# music detection and automix when recording done should be from all mics mesh have."
+#
+# The LOCAL ear (mesh-home webcam mic) is already handled by mesh-music-session reading records.log.
+# This tool covers the REMOTE mics: per source, each tick it CAPTURES a short chunk, NORMALIZES it
+# (remote mics run far quieter than the local ear — the raw mac capture measured -53 dBFS, below
+# soundscape's silence floor; loudnorm brings it into measurable range without touching rhythm),
+# MEASURES it with the mesh's one analyzer (mesh-soundscape), appends a records.log-FORMAT line to a
+# PER-SOURCE ledger, and drives the SAME mesh-music-session core with per-source env (MS_SOURCE +
+# MESH_MS_LEDGER/STATE/REC_DIR). The core classifies, runs its session machine, archives, and on END
+# grinds K mixes + delivers to the operator's TG tagged with which mic heard it. No core changes.
+#
+# HONEST FUSION: an unreachable/asleep mic or an empty/silent capture yields NO ledger line — the
+# source's session simply doesn't advance. Never a faked measure, never a fake all-clear. A capture
+# that returns empty from a REACHABLE mic is a HOLLOW sense and is dropped (exit-2 semantics inside).
+#
+# CADENCE vs GAP (load-bearing): remote captures are SPARSE (one per fanout tick, minutes apart),
+# unlike the local ear's ~2/min. So the per-source MS_GAP (no-music -> session END) MUST exceed the
+# capture cadence, or a session would END between every capture even during continuous music. Default
+# cadence */2 + per-source MS_GAP=300 (needs ~2 consecutive silent/absent captures to end).
+#
+#   mesh-music-fanout            one tick: capture -> normalize -> measure -> feed core, per source
+#   mesh-music-fanout --status   per-source session state
+#   mesh-music-fanout --setup-mac  (re)deploy+compile the macmic recorder on the iMac (idempotent)
+#   mesh-music-fanout --test     sandboxed: a stub capture drives the real measure+core to a session;
+#                                an unreachable/empty source advances nothing (honest n/a)
+#
+# Tunables (env): MF_SOURCES="mac" (space list) · MF_CHUNK=12 (capture seconds) · MF_MAC_SSH · per-source
+#   session floors passed to the core: MF_GAP=300 · MF_ONSET=3 · MF_K=3 · MF_CAP=120 (see mesh-music-session)
+#
+# reflex-cadence: */2 * * * *
+set -uo pipefail
+export PATH="/usr/bin:$HOME/.local/bin:$PATH"
+export LC_ALL=C.UTF-8
+MESH="${MESH_DIR:-$HOME/.mesh}"
+[ -f "$MESH/nodes" ] && . "$MESH/nodes" 2>/dev/null || true
+
+SOURCES="${MF_SOURCES:-mac}"
+CHUNK="${MF_CHUNK:-12}"
+MAC_SSH="${MF_MAC_SSH:-ilya@192.168.8.214}"      # iMac-Rozalia, LAN (role: organ)
+MAC_BIN="${MF_MAC_BIN:-\$HOME/.mesh-mac/macmic}"  # persistent path on the mac (\$HOME expands there)
+WORK="${MF_WORK:-$MESH/mic-fanout}"              # per-source rec dirs + ledgers live here
+LOG="${MF_LOG:-$MESH/music-fanout.log}"
+LOCK="${MF_LOCK:-$WORK/.lock}"
+CORE="${MF_CORE:-mesh-music-session}"
+# per-source session floors handed to the core
+GAP="${MF_GAP:-300}"; ONSET="${MF_ONSET:-3}"; K="${MF_K:-3}"; CAP="${MF_CAP:-120}"
+# capture override for --test: a stub that writes a wav to $1 (secs $2) or exits non-zero for n/a
+CAPTURE_CMD="${MF_CAPTURE_CMD:-}"
+SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=8 -o BatchMode=yes"
+
+now(){ echo "${MF_NOW:-$(date +%s)}"; }
+ts_utc(){ date -u +%FT%H:%MZ; }
+log(){ printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" >> "$LOG" 2>/dev/null || true; }
+hash8(){ sha1sum "$1" 2>/dev/null | cut -c1-8; }
+
+# ── capture: write a NORMALIZED mono 22050 wav for <source> to $out; return 0 (wrote) / 2 (n/a) ────
+# Every remote capture is wrapped in `timeout -s KILL` HERE (leaked recorders pile GBs on a mic —
+# see the ear-stale-lease lesson). loudnorm normalizes the quiet remote level; a still-silent result
+# (soundscape MEASURE none downstream) simply produces no ledger line.
+capture_source(){ # $1=source  $2=out.wav
+  local src="$1" out="$2" tmpm4a tmpraw rc
+  tmpm4a="$WORK/.cap-$src.m4a"; tmpraw="$WORK/.cap-$src.raw.wav"
+  rm -f "$out" "$tmpm4a" "$tmpraw"
+  if [ -n "$CAPTURE_CMD" ]; then
+    # test/override hook: the stub writes a raw wav to $tmpraw (or fails = n/a)
+    "$CAPTURE_CMD" "$tmpraw" "$CHUNK" || return 2
+  else
+    case "$src" in
+      mac)
+        # record on the mac (macmic self-bounds; the ssh is KILL-timed from here), then pull the m4a
+        timeout -s KILL $((CHUNK+20)) ssh $SSH_OPTS "$MAC_SSH" "$MAC_BIN /tmp/mf-cap.m4a $CHUNK" >/dev/null 2>&1 || { log "mac: capture n/a (unreachable/asleep/failed)"; return 2; }
+        timeout -s KILL 25 scp $SSH_OPTS "$MAC_SSH:/tmp/mf-cap.m4a" "$tmpm4a" >/dev/null 2>&1 || { log "mac: pull n/a"; return 2; }
+        [ -s "$tmpm4a" ] || { log "mac: empty capture (hollow) -> n/a"; return 2; }
+        ffmpeg -v error -y -i "$tmpm4a" -ac 1 -ar 22050 "$tmpraw" >/dev/null 2>&1 || return 2
+        ;;
+      *) log "$src: no capture verb wired yet -> n/a"; return 2 ;;
+    esac
+  fi
+  [ -s "$tmpraw" ] || return 2
+  # normalize to a consistent target so the quiet remote level clears the analyzer's silence floor
+  ffmpeg -v error -y -i "$tmpraw" -af loudnorm=I=-16:TP=-1 -ac 1 -ar 22050 "$out" >/dev/null 2>&1 || { cp -f "$tmpraw" "$out"; }
+  rm -f "$tmpm4a" "$tmpraw"
+  [ -s "$out" ] || return 2
+  return 0
+}
+
+# ── measure a wav into a records.log-format line the core's classifier parses verbatim ───────────
+# mesh-soundscape --measure emits: MEASURE off=.. dur=.. score=.. label=.. beats=.. dyn=.. act=..
+# rich=.. tone=.. move=.. cent=.. rms=.. total=..  (or "MEASURE none" for near-silent/unmeasurable).
+# We map dur->win and reuse score/beats/dyn/act/rich/move/cent. total dur -> the record's dur field.
+mfield(){ sed -n "s/.* $1=\\([^ ]*\\).*/\\1/p" <<<"$2"; }   # pull key=value from a MEASURE line
+measure_line(){ # $1=wav  $2=source  $3=id  -> prints the ledger line, or returns 1 if unmeasurable
+  local wav="$1" src="$2" id="$3" m
+  m="$(mesh-soundscape --measure "$wav" 2>/dev/null | grep '^MEASURE ' | head -1)"
+  [ -n "$m" ] || return 1
+  case "$m" in *"MEASURE none"*) return 1;; esac
+  local dur win score beats dyn act rich move cent label total
+  win="$(mfield dur "$m")"; score="$(mfield score "$m")"; beats="$(mfield beats "$m")"; dyn="$(mfield dyn "$m")"
+  act="$(mfield act "$m")"; rich="$(mfield rich "$m")"; move="$(mfield move "$m")"; cent="$(mfield cent "$m")"
+  label="$(mfield label "$m")"; total="$(mfield total "$m")"; dur="${total:-$win}"
+  [ -n "$win" ] && [ -n "$beats" ] && [ -n "$score" ] && [ -n "$rich" ] || return 1
+  printf '%s %s %s dur=%s win=%s score=%s beats=%s [%s] dyn=%s act=%s rich=%s move=%s cent=%s -> pending\n' \
+    "$(ts_utc)" "$src" "$id" "$dur" "$win" "$score" "$beats" "${label:-na}" \
+    "${dyn:-0}" "${act:-0}" "${rich:-0}" "${move:-0}" "${cent:-0}"
+}
+
+# ── one source, one tick: capture -> archive wav -> measure -> ledger -> drive the core ──────────
+tick_source(){ # $1=source
+  local src="$1"
+  local recdir="$WORK/records-$src" ledger="$WORK/records-$src.log" state="$WORK/.session-$src.json"
+  mkdir -p "$recdir"
+  local wav="$recdir/.pending.wav"
+  if ! capture_source "$src" "$wav"; then return 0; fi   # honest n/a — no ledger line
+  # Each capture is a DISTINCT event: id = content hash + a per-capture nonce (nanotime+pid). A pure
+  # content hash collapses two captures that happen to be byte-identical (a stuck mic replaying one
+  # buffer, or a deterministic source) into one record — and the core's line-id anchor then can't
+  # tell them apart, so the session never advances. The nonce guarantees a fresh record per capture.
+  local id line; id="$(printf '%s' "$(hash8 "$wav")-$(date +%s%N)-$$" | sha1sum | cut -c1-8)"
+  [ -n "$id" ] || return 0
+  # name the archived wav so the core's archive_wav (ls REC_DIR/*-<id>.wav) finds it
+  local dst="$recdir/$(date -u +%Y%m%d-%H%M%S)-$src-$id.wav"
+  mv -f "$wav" "$dst"
+  line="$(measure_line "$dst" "$src" "$id")" || { log "$src: unmeasurable (silent after norm) -> n/a"; rm -f "$dst"; return 0; }
+  printf '%s\n' "$line" >> "$ledger"
+  # trim the per-source ledger (line-id anchored core tolerates prune -> resync to end)
+  tail -n 500 "$ledger" > "$ledger.tmp" 2>/dev/null && mv -f "$ledger.tmp" "$ledger"
+  log "$src: fed [$(awk '{print $6" "$7}' <<<"$line")] id=$id"
+  # drive the SAME core with per-source paths + cadence-aware floors
+  MS_SOURCE="$src" MS_GAP="$GAP" MS_ONSET="$ONSET" MS_K="$K" MS_CAP="$CAP" \
+  MESH_MS_LEDGER="$ledger" MESH_MS_STATE="$state" MESH_MS_REC_DIR="$recdir" \
+  MESH_MS_ARCHIVE_ROOT="${MESH_MS_ARCHIVE_ROOT:-$MESH/music-sessions}" MESH_MS_NOW="${MF_NOW:-}" \
+    "$CORE" --tick >/dev/null 2>&1 || true
+}
+
+tick(){
+  mkdir -p "$WORK"
+  local src
+  for src in $SOURCES; do tick_source "$src"; done
+}
+
+# ══ dispatch ═════════════════════════════════════════════════════════════════════════════════════
+case "${1:-}" in
+  --status)
+    echo "sources: $SOURCES  (chunk ${CHUNK}s, cadence */2, per-source GAP=${GAP}s ONSET=$ONSET)"
+    for src in $SOURCES; do
+      st="$WORK/.session-$src.json"
+      if [ -f "$st" ]; then
+        echo "  $src: $(MESH_MS_STATE="$st" MS_SOURCE="$src" "$CORE" --status 2>/dev/null | awk -F': *' '/^state/{s=$2}/^run/{r=$2}/^start/{st=$2}END{printf "state=%s run=%s start=%s",s,r,st}')"
+      else
+        echo "  $src: no state yet"
+      fi
+    done
+    exit 0 ;;
+
+  --setup-mac)
+    # (re)deploy + compile the macmic recorder on the iMac from the genome source (idempotent).
+    SRC="$(command -v macmic.swift 2>/dev/null || echo "$HOME/lte-workstation/scripts/macmic.swift")"
+    [ -f "$SRC" ] || SRC="$(dirname "$0")/macmic.swift"
+    [ -f "$SRC" ] || { echo "setup-mac: macmic.swift not found"; exit 1; }
+    timeout -s KILL 20 scp $SSH_OPTS "$SRC" "$MAC_SSH:/tmp/macmic.swift" >/dev/null 2>&1 || { echo "setup-mac: scp failed (mac unreachable/asleep)"; exit 2; }
+    timeout -s KILL 90 ssh $SSH_OPTS "$MAC_SSH" 'cd /tmp && swiftc -O macmic.swift -o macmic && mkdir -p ~/.mesh-mac && cp -f macmic ~/.mesh-mac/macmic && chmod +x ~/.mesh-mac/macmic && echo ok' 2>&1
+    exit $? ;;
+
+  --test)
+    tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+    fail(){ echo "TEST FAIL: $*"; exit 1; }
+    # reassign the globals the functions read (frozen from env at load) so the test never touches
+    # live files or a live mac (same trap as mesh-music-session --test).
+    WORK="$tmp/work"; LOG="$tmp/log"; LOCK="$tmp/lock"
+    SOURCES="stub"; CHUNK=12; GAP=300; ONSET=3; K=3
+    export MESH_MS_ARCHIVE_ROOT="$tmp/sessions"
+    export MESH_MS_SYNC=1 MESH_MS_TG_DRYRUN=1
+    # This test asserts the FANOUT mechanics (capture->normalize->measure->feed->session), not the
+    # classifier floors (those are proven in mesh-music-session --test). Relax the core's rich/score
+    # floors so any MEASURED rhythmic record classifies as music; keep the beats floor honest.
+    export MS_MIN_RICH=0 MS_MIN_SCORE=0 MS_MIN_DENSITY=0.5 MS_MIN_BEATS=4
+    mkdir -p "$WORK"
+    # the core must be the REAL one on PATH (or the sibling copy); resolve to a full path
+    CORE="$(command -v "$CORE" 2>/dev/null || echo "$(dirname "$0")/mesh-music-session")"
+    [ -x "$CORE" ] || fail "core $CORE not executable"
+
+    # a stub capture that emits a real music-like tone wav (rhythmic) so the REAL measure+classify run
+    musicstub="$tmp/musicstub"; cat > "$musicstub" <<STUB
+#!/usr/bin/env bash
+# \$1=out wav  \$2=secs — a rhythmic noise-burst click track (4 Hz): percussive onsets -> beats,
+# so mesh-soundscape measures beats>=4 and the record classifies as music.
+ffmpeg -v error -y -f lavfi -i "aevalsrc='(2*random(0)-1)*lt(mod(t\,0.25)\,0.03)':s=22050:d=\$2" -ac 1 "\$1" >/dev/null 2>&1
+STUB
+    chmod +x "$musicstub"
+    # an n/a stub that always fails (unreachable/empty mic)
+    nastub="$tmp/nastub"; printf '#!/usr/bin/env bash\nexit 2\n' > "$nastub"; chmod +x "$nastub"
+
+    echo "gate 1: a reachable music source is measured, fed, and STARTs a session at onset"
+    CAPTURE_CMD="$musicstub"
+    # first tick primes the core's anchor (cold-start resync) — as in live
+    MF_NOW=$(date -u -d '2026-07-17T12:00Z' +%s) tick
+    for mn in 12:02 12:04 12:06 12:08; do
+      MF_NOW=$(date -u -d "2026-07-17T${mn}Z" +%s) tick
+    done
+    lines="$(wc -l < "$WORK/records-stub.log" 2>/dev/null || echo 0)"
+    [ "$lines" -ge 4 ] || fail "each reachable-music tick must append a ledger line (got $lines)"
+    music="$(grep -c 'rich=0\.[5-9]' "$WORK/records-stub.log" 2>/dev/null || echo 0)"
+    state="$(MESH_MS_STATE="$WORK/.session-stub.json" MS_SOURCE=stub "$CORE" --status 2>/dev/null | awk -F': *' '/^state/{print $2}')"
+    [ "$state" = active ] || fail "sustained music from a mic must START a session (state=$state, music-lines=$music)"
+
+    echo "gate 2: an unreachable/empty mic advances NOTHING (honest n/a — no ledger line)"
+    rm -rf "$WORK/records-na"* "$WORK/.session-na.json"
+    CAPTURE_CMD="$nastub"; SOURCES="na"
+    MF_NOW=$(date -u -d '2026-07-17T13:00Z' +%s) tick
+    MF_NOW=$(date -u -d '2026-07-17T13:02Z' +%s) tick
+    [ ! -s "$WORK/records-na.log" ] || fail "an n/a mic must NOT append ledger lines"
+    [ ! -f "$WORK/.session-na.json" ] || fail "an n/a mic must NOT create session state"
+
+    echo "gate 3: the measure->ledger line is parseable by the core's classifier (has win/beats/score/rich)"
+    l="$(head -1 "$WORK/records-stub.log")"
+    for f in win beats score rich; do
+      grep -q " $f=[0-9]" <<<"$l" || fail "ledger line missing $f= field: $l"
+    done
+
+    echo "smoke-test: ok — capture->normalize->measure->core session start, honest n/a, parseable ledger"
+    exit 0 ;;
+
+  ""|--tick)
+    mkdir -p "$WORK"
+    exec 9>"$LOCK"
+    flock -n 9 || { echo "music-fanout: another tick holds the lock"; exit 0; }
+    tick
+    exit 0 ;;
+
+  *)
+    echo "usage: mesh-music-fanout [--tick] | --status | --setup-mac | --test"; exit 1 ;;
+esac

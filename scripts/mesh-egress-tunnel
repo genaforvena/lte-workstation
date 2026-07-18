@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# mesh-egress-tunnel — health of THIS node's OWN public egress through its wg-mesh CONSUMER tunnel
+# (mesh-home -> phaedra). Distinct lane from its two neighbours, and the distinction is the whole point:
+#   - mesh-vpn-health   = the OFFERER path (is the VPN service live for the FRIENDS we serve?)
+#   - mesh-egress-health= egress QUALITY/geo (is the exit country right, is anthropic 403-blocked?)
+#   - THIS             = is my public egress actually RIDING the phaedra tunnel, or did it SILENTLY
+#                        fall back to the router's NL VPN? (the 2026-07-18 persistence gap: wg-mesh
+#                        comes up but the fwmark policy route doesn't stick → egress quietly reverts
+#                        to 194.147.115.17 while every other signal stays green.)
+#
+# The verdict is EARNED by a real artifact: a marked curl to an echo-IP service. If it returns the
+# phaedra egress → the tunnel is up AND the policy route is intact (one probe proves both). If it
+# returns the router IP → FALLBACK (route missing). If it returns nothing → DOWN (tunnel/blackhole).
+# The curl is cached (TTL, default 60s) so a per-frame dash caller pays one probe/minute, not one/frame.
+#
+# Read-only by default. `--heal` re-applies the (idempotent) policy route — the persistence fix path.
+# orphan-ok: on-demand + dash-rendered; a self-heal reflex can wire --heal later (persistence TODO).
+set -uo pipefail
+
+M="$HOME/.mesh"
+PHAEDRA_EGRESS="${MESH_WG_EGRESS_IP:-38.49.216.141}"   # phaedra's ISP-facing IP (what the world sees)
+WG_IF="${MESH_WG_IF:-wg-mesh}"
+RULE_PRIO="${MESH_WG_RULE_PRIO:-5200}"
+RT_TABLE="${MESH_WG_RT_TABLE:-200}"
+FWMARK="${MESH_WG_FWMARK:-0x40000}"
+FWMASK="${MESH_WG_FWMASK:-0xff0000}"
+CACHE="$M/.egress-tunnel-ip.cache"
+CACHE_TTL="${MESH_EGRESS_TUNNEL_TTL:-60}"
+IP_URL="${MESH_EGRESS_IP_URL:-https://api.ipify.org}"
+
+now(){ date +%s; }
+
+# --- cached egress-IP probe: the load-bearing artifact. Only re-curls when the cache is older than
+#     CACHE_TTL, so dash frames are cheap. The curl is MARKED traffic (public dest) → it exercises the
+#     exact path we are judging. Empty result (timeout/blackhole) is preserved as "" (DOWN), never faked.
+egress_ip(){
+  local age=99999
+  [ -f "$CACHE" ] && age=$(( $(now) - $(stat -c %Y "$CACHE" 2>/dev/null || echo 0) ))
+  if [ "$age" -lt "$CACHE_TTL" ]; then cat "$CACHE"; return; fi
+  local ip; ip=$(timeout 20 curl -s --max-time 18 "$IP_URL" 2>/dev/null | tr -dc '0-9.')
+  # write even when empty (a blackhole is a real, current reading — don't serve a stale green over it)
+  printf '%s' "$ip" > "$CACHE.$$.tmp" 2>/dev/null && mv -f "$CACHE.$$.tmp" "$CACHE" 2>/dev/null
+  printf '%s' "$ip"
+}
+
+# --- cheap local diagnostics (no network) ---
+rule_present(){ ip rule show 2>/dev/null | grep -q "^${RULE_PRIO}:.*fwmark ${FWMARK}.*lookup ${RT_TABLE}"; }
+route_present(){ ip route show table "$RT_TABLE" 2>/dev/null | grep -q "default dev ${WG_IF}"; }
+iface_up(){ ip link show "$WG_IF" 2>/dev/null | grep -q 'state UNKNOWN\|state UP\|LOWER_UP'; }
+handshake_age(){ # seconds since last wg handshake, or -1 if unreadable/never
+  local hs; hs=$(sudo -n wg show "$WG_IF" latest-handshakes 2>/dev/null | awk 'NR==1{print $2}')
+  [ -n "$hs" ] && [ "$hs" -gt 0 ] 2>/dev/null && echo $(( $(now) - hs )) || echo -1
+}
+
+apply_route(){ # idempotent — the persistence fix. Marking + masq live in the wg conf PostUp / are
+                # already present; this restores ONLY the policy route that fails to stick on reboot.
+  sudo -n ip route replace default dev "$WG_IF" table "$RT_TABLE" 2>/dev/null
+  ip rule show 2>/dev/null | grep -q "^${RULE_PRIO}:.*fwmark ${FWMARK}.*lookup ${RT_TABLE}" \
+    || sudo -n ip rule add priority "$RULE_PRIO" fwmark "${FWMARK}/${FWMASK}" lookup "$RT_TABLE" 2>/dev/null
+}
+
+verdict(){ # -> "OK|FALLBACK|DOWN|BLIND<tab>detail"
+  local ip; ip="$(egress_ip)"
+  if [ "$ip" = "$PHAEDRA_EGRESS" ]; then
+    printf 'OK\tegress %s via %s (tunnel up, policy route intact)' "$ip" "$WG_IF"
+  elif [ -z "$ip" ]; then
+    printf 'DOWN\tno egress — marked traffic blackholed (tunnel down or route to a dead %s)' "$WG_IF"
+  else
+    # a real IP that ISN'T phaedra = the silent regression this tool exists to catch
+    printf 'FALLBACK\tegress %s — NOT phaedra (%s); policy route missing → fell back off-tunnel' "$ip" "$PHAEDRA_EGRESS"
+  fi
+}
+
+case "${1:-}" in
+  --test)
+    fail(){ echo "smoke-test: FAIL ($1)"; exit 1; }
+    command -v ip   >/dev/null 2>&1 || fail "no ip"
+    command -v curl >/dev/null 2>&1 || fail "no curl"
+    # the classifier must map each raw egress reading to the RIGHT verdict word — assert all three
+    # arms against injected IPs (no live curl), so a future edit that collapses FALLBACK into OK fails here.
+    t(){ MESH_EGRESS_TUNNEL_TTL=999999; printf '%s' "$2" > "$CACHE"; local v; v=$(verdict | cut -f1)
+         [ "$v" = "$3" ] || fail "classify $1: egress '$2' → got '$v', want '$3'"; }
+    t phaedra  "$PHAEDRA_EGRESS" OK
+    t router   "194.147.115.17"  FALLBACK
+    t blackhole ""               DOWN
+    rm -f "$CACHE"
+    echo "smoke-test: ok (classifier OK/FALLBACK/DOWN all asserted)"; exit 0 ;;
+  --heal)
+    before="$(verdict)"
+    apply_route
+    rm -f "$CACHE"   # force a fresh probe past the cache
+    after="$(verdict)"
+    printf 'heal: before=%s\n      after =%s\n' "$(printf '%s' "$before" | tr '\t' ' ')" "$(printf '%s' "$after" | tr '\t' ' ')"
+    printf '%s' "$after" | grep -q '^OK' && exit 0 || exit 1 ;;
+  --pane|"")
+    # one compact block for the vpn dash top pane
+    v="$(verdict)"; tag="${v%%$'\t'*}"; detail="${v#*$'\t'}"
+    ha="$(handshake_age)"
+    case "$ha" in -1) hs="unreadable";; *) hs="$((ha))s ago";; esac
+    mark="✓"; [ "$tag" = OK ] || mark="✗"
+    printf '  %s %-8s %s\n' "$mark" "$tag" "$detail"
+    printf '    tunnel: %s %s · handshake %s · rule %s%s · table %s %s\n' \
+      "$WG_IF" "$(iface_up && echo up || echo DOWN)" "$hs" \
+      "$RULE_PRIO" "$(rule_present && echo ✓ || echo ' MISSING')" \
+      "$RT_TABLE" "$(route_present && echo ✓ || echo 'MISSING')"
+    [ "$tag" = OK ] || printf '    → heal: mesh-egress-tunnel --heal (re-applies fwmark %s → table %s default dev %s)\n' "$FWMARK" "$RT_TABLE" "$WG_IF" ;;
+  --verdict) verdict; echo ;;
+  *) echo "usage: mesh-egress-tunnel [--pane|--verdict|--heal|--test]"; exit 2 ;;
+esac
