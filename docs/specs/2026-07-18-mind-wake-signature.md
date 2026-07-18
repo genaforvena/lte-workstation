@@ -1,46 +1,56 @@
-# Spec: mind-wake reactor fires on a STABLE state signature, not telemetry noise
+# Spec: SMART / mind-defined wake diff in the reactor (data panes untouched)
 
-**Operator 2026-07-18 (via tg), URGENT ("сделать надо макс быстро").** Owner: genome.
+**Operator 2026-07-18 (via tg), URGENT.** Owner: genome.
+**CORRECTED 2026-07-18** after the first draft (WAKE-SIG emitted by dashes) was REJECTED.
 
-## Problem (empirical)
-`mesh-pane-consume <ch> --interval N` is the mind-wake reactor: diff-gate the top DATA pane, wake the
-MIND pane only on a change ("капельки/droplets", operator 2026-06-25). It is running & diff-gated for
-every mind (kept alive by `mesh-liveness-loop`→`mesh-consume-all`, not cron). But `~/.mesh/pane-consume.log`
-shows vpn waking every ~2h (= its `--interval` 7200s), bruno every ~4h — while one honest
-`08:34 vpn: pane unchanged — no wake (droplet held)` proves the gate itself works.
+## Hard constraint (operator, emphatic)
+> "не меняем топ пейны ради починки миндов! … это НЕ проблема данных (НЕ ТРОГАЙТЕ), а того как
+> диспатчить. и критично: не диспатч данных сырых, а призыв прочитать свой пейн."
 
-Root cause: `pane_sig()` hashes the whole pane after `strip_volatile()`, which strips only
-clocks / `N ago` / `age N` / `as of` / `refresh Ns` — **NOT live numerics** (latency `7.75→8.1ms`, byte
-counters, handshake-age variants) that fill telemetry-rich panes. So the mind wakes on numeric JIGGLE,
-not a meaningful state change. This is the operator's "кроны в vpn/bruno не по диффу топ-пейна."
+- **DO NOT touch the top/data panes or any `mesh-dash` role.** The data is sacred and stays byte-for-byte.
+- The fix lives ENTIRELY in the **dispatch/reactor** (`mesh-pane-consume`).
+- The reactor already sends the mind **no raw data — only an invitation to read its own pane.** Keep that
+  exactly; it is correct.
 
-Operator's model (confirmed): **minds wake ONLY on a change in the data they watch.** Sensor/producer
-crons that FILL the panes are correct and STAY — this is ONLY the mind-wake path.
+## Problem (unchanged, empirical)
+`mesh-pane-consume` wakes a mind only when its top pane's `strip_volatile`'d content changes. But
+`strip_volatile` removes only clocks/ages, NOT live numerics (latency `7.75→8.1ms`, byte counters), so
+vpn/bruno minds wake on numeric JIGGLE every interval (log: vpn ~2h = its `--interval`, one honest
+`droplet held` proves the gate works). The diff is too DUMB — it treats telemetry noise as a change.
 
-## Fix
-Each `mesh-dash` role emits a **stable wake-signature** — a line carrying ONLY mind-relevant STATE
-(verdicts UP/DOWN, peer/task presence, counts that matter), never volatile telemetry (latency ms, bytes,
-per-frame ages). The reactor hashes the **wake-signature**, not the whole pane.
+## Fix — the diff becomes SMART and/or MIND-DEFINED, all inside the reactor
+Two layers, both in `mesh-pane-consume`'s `pane_sig()` / comparison. The pane is captured as today; only
+the reactor's INTERNAL copy (never shown to anyone) is filtered before hashing.
 
-Preferred mechanism (explicit, per-role — the dash knows what's meaningful):
-- Each dash prints a machine-readable trailer line, e.g. `WAKE-SIG: vpn=UP peers=16 egress=OK` (one line,
-  stable across frames unless STATE changes).
-- `pane_sig()` extracts `WAKE-SIG:` if present and hashes ONLY that; falls back to the current
-  `strip_volatile | sha1sum` for panes that don't yet emit one (incremental rollout, no big-bang).
+1. **SMART-BY-DEFAULT.** Extend the pre-hash normalization to also neutralize telemetry jiggle:
+   unit-bearing numerics (`[0-9.]+ ?ms`, `[0-9.]+ ?[KMG]?B(/s)?`, bare floats in a `key=NN.N` telemetry
+   position). A latency/byte change alone no longer changes the hash. Keep meaningful discrete changes
+   (a verdict word UP↔DOWN, an integer count like `peers=16→15`) — those still wake. This is a smarter
+   `strip_volatile`, NOT a change to pane content.
 
-Alternative (cheaper, riskier — may mask a meaningful count): extend `strip_volatile` to strip
-unit-bearing numerics (`[0-9.]+ms`, `[0-9]+ ?B|KB|MB`, `[0-9]+[KMG]?B/s`). Do NOT rely on this alone.
+2. **MIND-DEFINED wake-rule (the mind OWNS what wakes it).** Optional per-channel rule file the MIND
+   writes and tunes live: `~/.mesh/wake-rule/<channel>` (gitignored, mind-owned, node-local).
+   - Format: one `grep -E` pattern per line = the SIGNIFICANT lines this mind watches. When the file
+     exists, the reactor keeps ONLY matching lines from its internal capture, then hashes those.
+     (A leading `-` on a line = an EXCLUDE pattern: drop matching lines. Include + exclude compose.)
+   - No file → the SMART-BY-DEFAULT normalization above applies to the whole pane.
+   - The mind changes its own rule at any time (self-tuning): e.g. vpn writes
+     `echo 'vpn=|peers=|egress=|DOWN|UP' > ~/.mesh/wake-rule/vpn` so only a real verdict/peer change wakes
+     it; latency lines are simply never in the hashed set.
+   - The reactor logs which mode it used per wake (`rule` vs `smart-default`) to `pane-consume.log`.
 
-## Gate (must be RED-first)
-`mesh-pane-consume --test` extension: build a pane frame with a jiggling latency + a stable `WAKE-SIG`,
-prove two frames with different latency but same WAKE-SIG hash **equal** (no wake); flip the verdict in
-WAKE-SIG and prove they **differ** (wake). Mirror the existing strip_volatile test (mesh-pane-consume
-~L144-148). Verify RED against the current whole-pane hash, GREEN after.
+## Gate (RED-first, in `mesh-pane-consume --test`)
+- Two frames differing ONLY in a latency value → SAME sig under smart-default → NO wake. (RED against
+  today's whole-pane hash.)
+- Two frames differing in a verdict word (UP→DOWN) → DIFFERENT sig → WAKE.
+- With a `wake-rule` present: a change on a NON-matching line → NO wake; a change on a matching line →
+  WAKE. Prove the rule file is actually consulted (drive a temp `MESH_WAKE_RULE_DIR`).
+- Keep the existing strip_volatile timestamp-quiet + real-change tests green.
 
-## Scope & order
-1. Reactor core: `mesh-pane-consume` `pane_sig()` prefers `WAKE-SIG:` when present. + `--test` gate.
-2. Emit `WAKE-SIG:` from `mesh-dash` for **vpn** and **bruno** first (the reported offenders), verify
-   via `~/.mesh/pane-consume.log` that they stop waking on jiggle.
-3. Roll `WAKE-SIG:` to every remaining mind-channel dash role (minds/senses/health/chat/room/sound/models).
-
-Sensor/producer crons: UNTOUCHED. Deploy each change to `~/.local/bin` + keep `scripts/` in sync.
+## Scope & order (max fast)
+1. `mesh-pane-consume`: smart-default numeric normalization + `~/.mesh/wake-rule/<channel>` support in
+   `pane_sig()` + `--test` gate. Deploy to `~/.local/bin`, keep `scripts/` in sync.
+2. Verify vpn+bruno stop waking on jiggle via `~/.mesh/pane-consume.log` (they should now hold droplets
+   through numeric-only frames). Optionally seed their `wake-rule` files.
+3. NO dash changes. NO sensor/producer cron changes. Data panes untouched — verify by diffing a pane
+   capture before/after (must be identical).
