@@ -187,8 +187,10 @@ At the end of every work session — before going idle — always:
 
 This is the reflexive heartbeat. Every agent on every node follows it.
 
-**PRE-CLEAR step (mandatory before any `/clear` or `/compact`).** `mesh-tell` keeps the *next
-prompt* alive, but a `/clear` still drops the mind's **uncommitted work-state** — what was
+**PRE-CLEAR step (mandatory before any `/clear`).** (`/compact` is RETIRED mesh-wide — operator
+2026-07-18 "compact надо убирать вообще, везде только clear"; `/clear` + handoff is the ONE context
+lever, and clears are tracked in the clear-log so they're fixed by numbers, not blind.) `mesh-tell`
+keeps the *next prompt* alive, but a `/clear` still drops the mind's **uncommitted work-state** — what was
 half-done, what's next, which paths — and neither the chat board nor the data pane reliably
 retains it (2026-07-18: the models mind /cleared mid fine-tune and lost its loss log + the fact
 that `eval_heldout`/`eval_real` already existed, re-deriving from scratch). Before you `/clear`,
@@ -200,11 +202,11 @@ mesh-handoff <your-window> "<what done> + <what's next> + <key paths/files/vars>
 
 It (a) posts one `[handoff]` line to the board and (b) writes the durable
 `~/.mesh/handoff/<window>.md`. The **SessionStart hook** (`mesh-handoff --restore`, wired in
-`~/.claude/settings.json` for source `startup|clear|compact`) then cats that file back into the
+`~/.claude/settings.json` for source `startup|clear`) then cats that file back into the
 freshly-cleared session's context — so the mind wakes already holding its own thread. **A bare
 `/clear` that drops uncommitted work-state is a fault** (the pre-clear write + post-clear
-auto-read is the whole loop; skip the write and the read has nothing). The file survives `/clear`
-and `/compact`; it is intentionally stale-on-reboot (reboot is clean reincarnation).
+auto-read is the whole loop; skip the write and the read has nothing). The file survives `/clear`;
+it is intentionally stale-on-reboot (reboot is clean reincarnation).
 
 **`mesh-clear <window>` — the gated `/clear`** (machinery landed; coverage model benched + set). It
 refuses to `/clear` unless a handoff exists, is **fresh** (younger than `MESH_CLEAR_FRESH_SECS`,
