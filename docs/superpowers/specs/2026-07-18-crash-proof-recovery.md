@@ -1,9 +1,30 @@
 # Crash-proof mind recovery — treat `/clear` as a crash
 
 **Operator ask (2026-07-18):** "make sure we indeed treat `/clear` as a crash and easily
-recover without losing work." Scope decision: **full crash-proof** — recovery must lose at
-most one cadence of work on ANY context death: `/clear`, `/compact`, OOM, `kill -9`, engine
-death, **reboot**.
+recover without losing work" — refined: **"no context death nor bloat it should be."** Scope
+decision: **full crash-proof** — recovery must lose at most one cadence of work on ANY context
+death: `/clear`, `/compact`, OOM, `kill -9`, engine death, **reboot**.
+
+## The twin invariant: no death, no bloat
+
+Context has two failure modes and they pull AGAINST each other:
+- **death** — a `/clear`/crash loses the working thread (what we've been building).
+- **bloat** — context grows until it degrades, the very thing `/clear` exists to relieve.
+
+The cure for bloat is to clear aggressively (every idle edge, `mesh-mind-recycle`). The risk
+of clearing aggressively is death. **So the crash-proof recovery below is not a side project —
+it is the ENABLER that makes aggressive anti-bloat clearing safe.** Without durable recovery,
+aggressive clearing loses work (why aggressive-clear was blocked — minds 7d ~84% + handoff-
+capture); with it, the mind can clear at every idle edge and never lose the thread. Both halves
+must hold at once:
+1. **anti-death** — P1/P2 make any death recoverable (below).
+2. **anti-bloat** — P3 (`mesh-mind-recycle`) clears at every busy→idle edge, gated by
+   `mesh-clear`, so context never accumulates past a working set.
+3. **the recovery artifacts must not themselves bloat** — the restored SessionStart context is
+   a TERSE bounded handoff (a state summary, capped), never a raw scrollback dump; a wake that
+   re-injects a wall of transcript just re-bloats the fresh context and defeats the recycle.
+   `refs/wip/<win>` is a single moving ref (not an accumulating history); handoff files are
+   overwrite-one-file, not append.
 
 ## Why the current machinery is not enough
 
@@ -53,9 +74,14 @@ thread to restore.
   scrollback) becomes the sole real barrier. Verify coverage still discriminates against an
   auto-snapshot (it asserts the handoff COVERS the scrollback; a shallow auto extract must
   still be able to FAIL coverage). If it can't, the snapshot has defeated the gate.
+- **Bounded (anti-bloat):** the snapshot is a TERSE state summary with a hard size cap (a few
+  lines: what-done / next / key paths+refs) — NEVER the raw scrollback. The restore re-injects
+  it into a fresh session; a fat handoff re-bloats the context the recycle just relieved. Gate
+  asserts the emitted `additionalContext` stays under the cap even from a huge scrollback.
 - **RED-first gate:** scrollback with work-state + NO manual handoff → `--snapshot` writes a
   handoff drawn from the scrollback → `--restore` carries it. A fresher manual handoff is NOT
-  overwritten. Coverage still fails on a deliberately-uncovering snapshot.
+  overwritten. Coverage still fails on a deliberately-uncovering snapshot. Output stays under
+  the size cap even when the scrollback is 100× it.
 
 ### P3 — build `mesh-mind-recycle`: enforce the gate on every clear  ·  owner genome
 Build the spec'd driver: clear on every busy→idle edge, gated by `mesh-clear`; loop-prevention
@@ -77,5 +103,8 @@ should land after P1/P2 so the enforced clears already benefit from continuous d
 drills each prong as it lands, then the whole chain end-to-end.
 
 ## The one-line invariant
-**No context death — graceful or violent — loses more than one cadence of work, and no
-recovery step depends on the dying mind having cooperated first.**
+**No context death and no context bloat:** no death — graceful or violent — loses more than one
+cadence of work, no recovery step depends on the dying mind cooperating first, AND the mind
+clears at every idle edge so context never bloats — with the recovery bounded (terse handoff,
+single WIP ref) so it never re-bloats what the clear relieved. Death and bloat are one problem;
+recovery is what lets us clear aggressively without losing the thread.
