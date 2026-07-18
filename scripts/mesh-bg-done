@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+# mesh-bg-done — fire a background batch's DELIVERY and flip its manifest status. Called from the
+# batch's OWN completion path (the detached `... &` job), NOT the mind — so delivery happens even
+# after the mind /cleared. Pairs with mesh-bg-register (writes the manifest) + mesh-clear (gates on it).
+#
+# See mesh-bg-register for the full manifest contract (FOUR terminal states). This tool consumes it:
+#   DELIVER path (batch produced output that should ship):
+#     1. flip status → done-undelivered  (durable "delivery pending" — a crash between here and success
+#        leaves it done-undelivered, which BLOCKS mesh-clear = fail-safe, retryable; never silently lost)
+#     2. run the manifest's on-done command (bash -c, mind ABSENT)
+#     3. on success → status=delivered ; on failure → status STAYS done-undelivered (gate keeps blocking)
+#   NO-DELIVER path (--no-deliver: batch completed with nothing to ship — empty grind, rc 124/75/137):
+#     flip status → done-nodeliver directly, run NO command. PASSES the gate. This is what keeps a
+#     routine ear grind / an OOM-kill from wedging every /clear forever (the stale-lease trap).
+#
+#   mesh-bg-done <manifest-path>              deliver + flip, by explicit manifest file
+#   mesh-bg-done <window> <batch>             deliver + flip, by window/batch (resolves the path)
+#   mesh-bg-done <...> --no-deliver           nothing to ship → status=done-nodeliver (PASSES), no on-done
+#   mesh-bg-done <...> --on-done-override <c> use <c> instead of the manifest's on-done (rare; testing)
+#   mesh-bg-done --test
+# orphan-ok: on-demand library tool — a batch's completion path calls it; not a cron reflex.
+set -uo pipefail
+
+MESH_DIR="${MESH_DIR:-$HOME/.mesh}"
+BG_DIR="${MESH_BG_DIR:-$MESH_DIR/bg}"
+
+_slug() { printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'; }
+_manifest_path() { printf '%s/%s/%s.manifest' "$BG_DIR" "$(_slug "$1")" "$(_slug "$2")"; }
+_mf_get() { grep -m1 "^$2=" "$1" 2>/dev/null | cut -d= -f2-; }   # field value = rest of line (keeps '=')
+
+# rewrite the manifest with a new status + bumped updated, every other field preserved verbatim.
+_set_status() { # $1=file $2=newstatus
+  local f="$1" new="$2" tmp="$1.tmp.$$" now
+  now="$(date +%s)"
+  tmp="$f.tmp.$$"
+  {
+    while IFS= read -r line; do
+      case "$line" in
+        status=*)  printf 'status=%s\n'  "$new" ;;
+        updated=*) printf 'updated=%s\n' "$now" ;;
+        *) printf '%s\n' "$line" ;;
+      esac
+    done < "$f"
+  } > "$tmp" && mv -f "$tmp" "$f"
+}
+
+_done() { # $1=manifest-file  $2=on-done-override(optional)  $3=no-deliver(0/1)
+  local f="$1" override="${2:-}" nodeliver="${3:-0}" ondone status
+  [ -r "$f" ] || { echo "mesh-bg-done: no manifest at $f" >&2; return 2; }
+  status="$(_mf_get "$f" status)"
+  if [ "$status" = delivered ] || [ "$status" = done-nodeliver ]; then
+    echo "mesh-bg-done: already terminal ($status) ($f) — no-op"; return 0
+  fi
+  # NO-DELIVER: batch had nothing to ship (empty/near-empty grind, rc 124/75/137). Mark done-nodeliver
+  # (PASSES the gate) and run NO command — this is what stops a routine grind wedging every /clear.
+  if [ "$nodeliver" = 1 ]; then
+    _set_status "$f" done-nodeliver
+    echo "mesh-bg-done: nothing to deliver → done-nodeliver ($(_mf_get "$f" target)) → $f"
+    return 0
+  fi
+  ondone="$override"; [ -n "$ondone" ] || ondone="$(_mf_get "$f" on-done)"
+  [ -n "$ondone" ] || { echo "mesh-bg-done: manifest has no on-done command ($f)" >&2; return 2; }
+  # 1) mark delivery pending BEFORE running it — a crash mid-delivery must leave the gate blocking.
+  _set_status "$f" done-undelivered
+  # 2) run the delivery with the mind absent. Its own stdout/stderr flow through.
+  if bash -c "$ondone"; then
+    _set_status "$f" delivered
+    echo "mesh-bg-done: delivered ($(_mf_get "$f" target)) → $f"
+    return 0
+  else
+    local rc=$?
+    echo "mesh-bg-done: on-done FAILED rc=$rc — manifest stays done-undelivered (retryable, gate blocks) → $f" >&2
+    return "$rc"
+  fi
+}
+
+_test() {
+  local rc=0 td; td="$(mktemp -d)"
+  BG_DIR="$td/m/bg"; export MESH_DIR="$td/m" MESH_BG_DIR="$BG_DIR"
+  # Build a REAL manifest via mesh-bg-register (cross-checks the writer/reader share one format —
+  # if register's layout drifts from what _mf_get reads, this test goes red).
+  local reg; reg="$(command -v mesh-bg-register || echo "$(dirname "$0")/mesh-bg-register")"
+  local marker="$td/delivered.flag"
+  local f; f="$("$reg" sound grind-d1 --target operator-TG --on-done "touch $marker")"
+  [ -r "$f" ] || { echo "bg-done-test: FAIL (register did not produce a manifest)"; rc=1; }
+
+  # RED-anchor: with the mind ABSENT (this is a bare shell, no tmux/mind), delivery must still fire.
+  [ ! -e "$marker" ] || { echo "bg-done-test: FAIL (marker existed before delivery)"; rc=1; }
+  _done "$f" "" >/dev/null 2>&1 || { echo "bg-done-test: FAIL (delivery returned nonzero)"; rc=1; }
+  [ -e "$marker" ] || { echo "bg-done-test: FAIL (on-done did NOT fire with mind absent)"; rc=1; }
+  grep -qx 'status=delivered' "$f" || { echo "bg-done-test: FAIL (status not flipped to delivered)"; rc=1; }
+
+  # idempotent: a second call on a delivered manifest is a no-op (does not re-fire on-done)
+  rm -f "$marker"
+  _done "$f" "" >/dev/null 2>&1
+  [ ! -e "$marker" ] || { echo "bg-done-test: FAIL (re-fired on-done on an already-delivered manifest)"; rc=1; }
+
+  # FAILURE path: a failing on-done must LEAVE status done-undelivered (retryable, gate keeps blocking)
+  local f2; f2="$("$reg" sound grind-d2 --target operator-TG --on-done 'exit 7')"
+  _done "$f2" "" >/dev/null 2>&1; local drc=$?
+  [ "$drc" = 7 ] || { echo "bg-done-test: FAIL (failing on-done did not propagate rc, got $drc)"; rc=1; }
+  grep -qx 'status=done-undelivered' "$f2" || { echo "bg-done-test: FAIL (failed delivery not left done-undelivered: $(_mf_get "$f2" status))"; rc=1; }
+
+  # NO-DELIVER path: nothing to ship → done-nodeliver, and on-done must NOT run (would ship nothing)
+  local ndmark="$td/nd.flag"
+  local f4; f4="$("$reg" sound grind-nd --target operator-TG --on-done "touch $ndmark")"
+  _done "$f4" "" 1 >/dev/null 2>&1 || { echo "bg-done-test: FAIL (--no-deliver returned nonzero)"; rc=1; }
+  grep -qx 'status=done-nodeliver' "$f4" || { echo "bg-done-test: FAIL (--no-deliver did not set done-nodeliver: $(_mf_get "$f4" status))"; rc=1; }
+  [ ! -e "$ndmark" ] || { echo "bg-done-test: FAIL (--no-deliver RAN the on-done command)"; rc=1; }
+  # done-nodeliver is terminal: a later deliver attempt is a no-op (does not re-run on-done)
+  _done "$f4" "" 0 >/dev/null 2>&1
+  [ ! -e "$ndmark" ] || { echo "bg-done-test: FAIL (deliver re-fired on a done-nodeliver manifest)"; rc=1; }
+
+  # on-done value containing '=' survives the round-trip and executes correctly
+  local f3; f3="$("$reg" sound grind-d3 --target op --on-done "touch $td/eq.flag && X=1 true")"
+  _done "$f3" "" 0 >/dev/null 2>&1 || { echo "bg-done-test: FAIL (on-done with = failed)"; rc=1; }
+  [ -e "$td/eq.flag" ] || { echo "bg-done-test: FAIL (on-done with = did not run)"; rc=1; }
+
+  # resolve by window/batch too
+  grep -qx 'status=delivered' "$(MESH_BG_DIR="$td/m/bg" _manifest_path sound grind-d1)" \
+    || { echo "bg-done-test: FAIL (window/batch path resolve mismatch)"; rc=1; }
+
+  rm -rf "$td"
+  [ "$rc" = 0 ] && echo "bg-done-test: ok (delivers with mind ABSENT, flips running→delivered; failure leaves done-undelivered+propagates rc; --no-deliver→done-nodeliver w/o firing on-done; idempotent on delivered+done-nodeliver; on-done keeps '=')"
+  return "$rc"
+}
+
+# ---- arg parse ----
+[ "${1:-}" = --test ] && { _test; exit $?; }
+OVERRIDE=""; NODELIVER=0; POS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --no-deliver) NODELIVER=1; shift ;;
+    --on-done-override) OVERRIDE="${2:-}"; shift 2 ;;
+    -h|--help) sed -n '2,22p' "$0"; exit 0 ;;
+    -*) echo "mesh-bg-done: unknown flag $1" >&2; exit 2 ;;
+    *) POS+=("$1"); shift ;;
+  esac
+done
+case "${#POS[@]}" in
+  1) F="${POS[0]}" ;;
+  2) F="$(_manifest_path "${POS[0]}" "${POS[1]}")" ;;
+  *) echo "usage: mesh-bg-done <manifest-path> | <window> <batch> [--no-deliver] [--on-done-override <cmd>]" >&2; exit 2 ;;
+esac
+_done "$F" "$OVERRIDE" "$NODELIVER"
