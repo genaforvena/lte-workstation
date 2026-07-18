@@ -31,12 +31,21 @@
 # so there is one extractive path, not a second copy. The reasoner is pluggable (MESH_CANARY_MIND_CMD);
 # --test drives everything with deterministic stubs so the gate needs no live model.
 #
-# orphan-ok: on-demand measurement instrument (mind-recycle spec §Sequencing) — run manually / sampled,
-#            not a cron reflex. It ships BEFORE the recycler and needs no recycler to run.
+# reflex-cadence: 17 4 * * *
+# reflex-args: --canary
+#   The daily canary sweep FEEDS the ledger the audit reads. The mind-recycle spec (§Sequencing) wants a
+#   WEEK of numbers, not one manual snapshot — left on-demand, the ledger froze at N=12 while mesh-clear-audit
+#   kept reading it every 5min as authoritative. Now a sweep runs daily; --report stamps LAST_TS so the audit
+#   can FLAG a FROZEN ledger (dead canary cron → stale → not authoritative), the twin of its 'meter-absent'
+#   guard. Still runnable on demand; the cron sweep spends via mesh-relay (~16 reasoner calls/run). A 2-day
+#   audit staleness budget tolerates one missed daily run before flagging.
 set -uo pipefail
 
 MESH_DIR="${MESH_DIR:-$HOME/.mesh}"
-LEDGER="${MESH_CLEAR_LOSS_LOG:-$MESH_DIR/clear-loss.log}"
+# Ledger path is ~/.mesh/clear-loss.log — named literally here so mesh-autowire's journal-collision guard
+# (greps the source for .mesh/<stem>.log) routes the cron STDOUT journal to clear-loss.cron.log, NOT this
+# ledger (a stdout redirect INTO the ledger would double-count every canary row printed to progress).
+LEDGER="${MESH_CLEAR_LOSS_LOG:-$MESH_DIR/clear-loss.log}"   # == $HOME/.mesh/clear-loss.log
 CORPUS="${MESH_CLEAR_LOSS_CORPUS:-}"        # optional external corpus file (pipe-sep, see below); else built-in
 
 # --- reasoner: reads a full prompt on stdin, emits the mind's response on stdout ---
@@ -113,6 +122,13 @@ _canary() { # [--task-type T] [--n K]
     *) shift ;;
   esac; done
   mkdir -p "$(dirname "$LEDGER")"
+  # BATCH-ATOMIC: stage every row to a temp file and flush the WHOLE batch to the real ledger in ONE
+  # append at the very end. A canary run makes many slow reasoner calls; the old per-row `tee -a "$LEDGER"`
+  # meant an interrupted run (timeout/kill) left a PARTIAL batch that skewed --report (and any audit that
+  # read it mid-run). Now the ledger is untouched until the run completes; an interrupted run appends nothing.
+  _CANARY_TMP="$(mktemp "${TMPDIR:-/tmp}/clear-loss.XXXXXX")" || { echo "mesh-clear-loss: mktemp failed" >&2; return 1; }
+  trap 'rm -f "${_CANARY_TMP:-}"' EXIT
+  trap 'rm -f "${_CANARY_TMP:-}"; exit 143' INT TERM   # interrupted → discard the partial batch, ledger untouched
   local corpus ran=0
   corpus="$( [ -n "$CORPUS" ] && cat "$CORPUS" || _builtin_corpus )"
   local rep
@@ -126,13 +142,15 @@ _canary() { # [--task-type T] [--n K]
       local res; res="$(_run_canary_line "$line")"
       # res = "task_type recycled control id"
       set -- $res
-      printf '%s canary tt=%s recycled=%s control=%s id=%s\n' "$rep" "$1" "$2" "$3" "$4" | tee -a "$LEDGER"
+      # progress to stdout + STAGE to temp (NOT the live ledger); flushed atomically below on success.
+      printf '%s canary tt=%s recycled=%s control=%s id=%s\n' "$rep" "$1" "$2" "$3" "$4" | tee -a "$_CANARY_TMP"
       ran=$((ran+1))
     done <<EOF
 $corpus
 EOF
   done
   [ "$ran" -gt 0 ] || { echo "mesh-clear-loss: no canaries ran (task-type filter '$want_tt' matched nothing)" >&2; return 2; }
+  cat "$_CANARY_TMP" >> "$LEDGER"      # single append — the batch lands whole or not at all
   echo "mesh-clear-loss: ran $ran canary arm-pairs → $LEDGER (see --report)"
 }
 
@@ -141,6 +159,7 @@ _report() {
   [ -f "$LEDGER" ] || { echo "mesh-clear-loss: no ledger yet ($LEDGER)"; return 0; }
   awk '
     /canary/ {
+      last_ts=$1                                  # newest row wins (ledger is append-chronological) → freshness stamp
       for (i=1;i<=NF;i++) {
         if ($i ~ /^tt=/)        { tt=substr($i,4) }
         else if ($i ~ /^recycled=/) { rec=substr($i,10) }
@@ -160,6 +179,12 @@ _report() {
       }
       if (nall>0) {
         printf "%-10s %6d %8.2f %8.2f %+8.2f\n","ALL",nall,rf_all/nall,cf_all/nall,(rf_all-cf_all)/nall
+        # MACHINE FIELDS — stable, position-independent tokens for programmatic readers (mesh-clear-audit).
+        # The human table above is for eyes; a parser that greps the "first number" of the flattened table
+        # would read a SAMPLE COUNT, not the cost. COST_ALL=/N_ALL= are the contract. Do not remove.
+        # LAST_TS = newest ledger row timestamp — the FRESHNESS half of the contract. mesh-clear-audit reads
+        # it to distinguish a live meter from a frozen one (a dead canary cron → LAST_TS ages out → stale → FLAG).
+        printf "COST_ALL=%+.2f N_ALL=%d LAST_TS=%s\n", (rf_all-cf_all)/nall, nall, last_ts
         printf "\nCOST = failrate(recycled) − failrate(control) = clear-loss in dropped directives.\n"
         printf "Same reasoner both arms; absolute rate is reasoner-dependent, the DIFFERENTIAL is the honest number.\n"
       }
@@ -204,7 +229,29 @@ _test() {
   printf 'T canary tt=x recycled=FAIL control=PASS id=a\nT canary tt=x recycled=PASS control=PASS id=b\n' >"$tl"
   local costline; costline="$(MESH_CLEAR_LOSS_LOG="$tl" _report | awk '$1=="x"{print $5}')"
   [ "$costline" = "+0.50" ] || { echo "test: FAIL (--report COST arithmetic: expected +0.50 for 1/2 recycled-fail, got '$costline')"; rc=1; }
+  # (4b) MACHINE FIELDS — --report MUST emit stable COST_ALL=/N_ALL= tokens (the audit contract). RED-first:
+  # a "first number in the flattened table" parser would read the sample count, not the cost — these tokens fix that.
+  local rep_flat; rep_flat="$(MESH_CLEAR_LOSS_LOG="$tl" _report | tr '\n' ' ')"
+  printf '%s' "$rep_flat" | grep -Eq 'COST_ALL=\+0\.50( |$)' || { echo "test: FAIL (--report missing/incorrect COST_ALL=+0.50, got: $rep_flat)"; rc=1; }
+  printf '%s' "$rep_flat" | grep -Eq 'N_ALL=2( |$)' || { echo "test: FAIL (--report missing/incorrect N_ALL=2, got: $rep_flat)"; rc=1; }
+  # (4d) FRESHNESS FIELD — --report MUST stamp LAST_TS=<newest row ts> so the audit can flag a FROZEN ledger.
+  # RED-first: without LAST_TS the audit cannot tell a live meter from one that stopped growing (the stale-
+  # ledger hollow-green, twin of meter-absent). The fixture rows carry timestamp field 'T' → LAST_TS=T.
+  printf '%s' "$rep_flat" | grep -Eq 'LAST_TS=T( |$)' || { echo "test: FAIL (--report missing LAST_TS freshness stamp, got: $rep_flat)"; rc=1; }
   rm -f "$tl"
+
+  # (4c) BATCH-ATOMICITY — a canary run must NOT append to the live ledger incrementally; the whole batch
+  # lands in ONE flush at the end (so an interrupted run leaves the ledger untouched, not a partial batch).
+  # RED-first: under the old per-row `tee -a "$LEDGER"` the mid-run ledger count would be >0. The reasoner
+  # stub records the live ledger's line-count on every call; all samples must be 0 (nothing written mid-run).
+  local al; al="$(mktemp)"; local probe; probe="$(mktemp)"; : >"$al"; : >"$probe"
+  local atomic_stub='cat >/dev/null 2>&1; wc -l < "'"$al"'" 2>/dev/null | tr -d " " >> "'"$probe"'"; echo x >> "'"$probe"'"; echo ok'
+  MESH_CLEAR_LOSS_LOG="$al" MESH_CANARY_MIND_CMD="$atomic_stub" MESH_CLEAR_LOSS_EXTRACT_CMD='cat' \
+    _canary --task-type naming --n 2 >/dev/null 2>&1
+  # every recorded mid-run ledger count must be 0 (grep for any nonzero line-count sample → leak)
+  if grep -Eq '^[1-9]' "$probe"; then echo "test: FAIL (canary appended to the live ledger MID-run — not batch-atomic)"; rc=1; fi
+  [ "$(grep -c 'canary' "$al" 2>/dev/null)" = "2" ] || { echo "test: FAIL (batch-atomic flush wrong: expected 2 rows in ledger, got $(grep -c canary "$al" 2>/dev/null))"; rc=1; }
+  rm -f "$al" "$probe"
 
   # (5) reuse seam: a lib-mode-capable mesh-clear sources WITHOUT running its main and exposes the
   # extractor. If the mesh-clear on PATH predates the MESH_CLEAR_LIB_ONLY guard, this WARNs (redeploy
@@ -235,7 +282,7 @@ _test() {
   [ "$(printf 'curl http://billing-v2/health' | _verify "$re_name")" = PASS ] \
     || { echo "test: FAIL (naming predicate false-positive on the v2 alias)"; rc=1; }
 
-  [ "$rc" = 0 ] && echo "clear-loss-test: ok (verify binary+SKIP; arm-wiring KNOWN-DROPPED calibration: control PASS / recycled FAIL on lossy handoff / recycled PASS on faithful handoff; --report COST differential; mesh-clear reuse seam; corpus predicates discriminate — no hollow lookahead gate)"
+  [ "$rc" = 0 ] && echo "clear-loss-test: ok (verify binary+SKIP; arm-wiring KNOWN-DROPPED calibration: control PASS / recycled FAIL on lossy handoff / recycled PASS on faithful handoff; --report COST differential + COST_ALL/N_ALL/LAST_TS machine fields; batch-atomic canary — no mid-run ledger writes; mesh-clear reuse seam; corpus predicates discriminate — no hollow lookahead gate)"
   return "$rc"
 }
 
