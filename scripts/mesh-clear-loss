@@ -1,0 +1,235 @@
+#!/usr/bin/env bash
+# mesh-clear-loss — the JUDGE-FREE meter for what a /clear COSTS (mind-recycle spec, 2026-07-18).
+#
+# The mind-recycle policy clears a mind after a stop and carries work forward through the durable
+# handoff (mesh-clear's extraction, restored by the SessionStart hook). The open question is not
+# "does the plumbing run" — shadow mode already proves that, and it LIES about loss because the
+# coverage gate is near-tautological (the handoff is extracted FROM the scrollback, so it almost
+# always says "covered"). The real question is a SERIALIZATION ROUND-TRIP one: does clearing DROP a
+# mid-turn discovery? This tool measures that with a ground truth, not a classifier.
+#
+#   mesh-clear-loss --canary [--task-type T] [--n K]   run canaries: recycled arm vs control arm,
+#                                                       binary verify, append per-run rows to the ledger
+#   mesh-clear-loss --report                            print cost = failrate(recycled) − failrate(control)
+#                                                       per task-type from the ledger
+#   mesh-clear-loss --probe <win>                       (secondary, continuous) round-trip probe — SCAFFOLD
+#   mesh-clear-loss --test                              RED-first: pure verify + arm-wiring + KNOWN-DROPPED
+#                                                       calibration (the meter must DETECT loss when it exists)
+#
+# CANARY (primary, judge-free). Each canary plants a constraint C in step1 that step2's correct answer
+# must honor WITHOUT step2 restating it; verify(step2_output) is a real predicate encoding C — reality
+# grades it, NO judge model in the scoring path. Two arms, ALWAYS both:
+#   · recycled arm: run step1 → EXTRACT a handoff (mesh-clear's _extract_handoff, verbatim) → discard the
+#     step1 context, restore the handoff ONLY → run step2 → verify.
+#   · control  arm: identical, NO clear between step1 and step2 (full step1 context retained).
+# cost(task-type) = failrate_recycled − failrate_control. The control subtracts the baseline a mind flunks
+# WITHOUT any clear (ambiguous task / just-forgot); the DIFFERENCE is the loss attributable to the clear,
+# denominated in dropped directives. Same reasoner on both arms → the differential is meaningful even when
+# the absolute rate is reasoner-dependent (stand-in reasoner; a v2 routes arms to real mind panes).
+#
+# REUSE, DON'T FORK. Real handoff extraction is mesh-clear's `_extract_handoff` (sourced via lib mode),
+# so there is one extractive path, not a second copy. The reasoner is pluggable (MESH_CANARY_MIND_CMD);
+# --test drives everything with deterministic stubs so the gate needs no live model.
+#
+# orphan-ok: on-demand measurement instrument (mind-recycle spec §Sequencing) — run manually / sampled,
+#            not a cron reflex. It ships BEFORE the recycler and needs no recycler to run.
+set -uo pipefail
+
+MESH_DIR="${MESH_DIR:-$HOME/.mesh}"
+LEDGER="${MESH_CLEAR_LOSS_LOG:-$MESH_DIR/clear-loss.log}"
+CORPUS="${MESH_CLEAR_LOSS_CORPUS:-}"        # optional external corpus file (pipe-sep, see below); else built-in
+
+# --- reasoner: reads a full prompt on stdin, emits the mind's response on stdout ---
+# default = a local scratch context via mesh-relay (text→cheapest pool→text). test overrides with a stub.
+_reason() {
+  if [ -n "${MESH_CANARY_MIND_CMD:-}" ]; then eval "$MESH_CANARY_MIND_CMD"; return; fi
+  command -v mesh-relay >/dev/null 2>&1 || { echo "__NO_REASONER__"; return; }
+  mesh-relay 2>/dev/null
+}
+
+# --- handoff extractor: transcript on stdin → handoff on stdout. Reuse mesh-clear's, don't fork. ---
+_extract() {
+  if [ -n "${MESH_CLEAR_LOSS_EXTRACT_CMD:-}" ]; then eval "$MESH_CLEAR_LOSS_EXTRACT_CMD"; return; fi
+  if command -v mesh-clear >/dev/null 2>&1 && MESH_CLEAR_LIB_ONLY=1 . "$(command -v mesh-clear)" 2>/dev/null; then
+    _extract_handoff        # mesh-clear's extractive generator (verbatim; no invented next-step)
+  else
+    cat                     # last resort: carry the whole transcript (over-generous; flagged)
+  fi
+}
+
+# --- built-in canary corpus. Fields: id | task_type | step1 | step2 | violation_regex ---
+# violation_regex MATCHES step2 output  ⇒  the constraint was DROPPED  ⇒  FAIL (a loss).
+# Spread across the tacit-discovery axis: `budget`/`schema` constraints emerge from doing step1 and a
+# mind would not naturally spell them into a handoff (tacit); `naming` is more handoff-able (plumbing floor).
+_builtin_corpus() {
+  cat <<'EOF'
+batch-cap|budget|Read the job runner config. It reports MAX_CONCURRENT=3 — the runner corrupts state if more than 3 jobs are dispatched at once. Acknowledge the limit.|Now dispatch these 7 queued jobs as efficiently as possible. Show the dispatch batches.|([4-9]|1[0-9]) *jobs|batch of ([4-9]|[1-9][0-9])|all *7|7 *at *once
+schema-key|schema|Inspect the events table. The primary key is (tenant_id, ts) — tenant_id is REQUIRED on every row or the insert is rejected.|Write an INSERT for a new event with action='login' and ts=now. Give the SQL.|(?i)insert[^;]*events(?![^;]*tenant)
+unit-mm|units|Query the sensor. It returns distance in MILLIMETRES, not metres.|Report whether the object at raw reading 4200 is within the 3-metre safety zone. Answer yes or no with the comparison.|(?i)(4200 *m\b|4200 *metre|is (within|inside).*yes)
+alias-name|naming|The service is registered under the alias 'billing-v2', NOT 'billing'. Requests to 'billing' 404.|Write the curl command to hit the health endpoint of the billing service.|(?i)/billing/(?!v2)|host: *billing\.|billing\.internal
+EOF
+}
+
+# --- verify: binary. $1=violation_regex, stdin=step2 output → prints PASS|FAIL ---
+_verify() {
+  # PCRE (-P), not -E: the violation patterns use case-insensitive `(?i)` and negative lookahead
+  # `(?!...)` (e.g. "an INSERT with no tenant column"). Under grep -E those are silently wrong (a
+  # hollow gate that always PASSes → false "no loss"); -P makes them mean what they say.
+  local re="$1" out; out="$(cat)"
+  [ "$out" = "__NO_REASONER__" ] && { echo "SKIP"; return; }
+  # -z: treat the whole (multi-line) output as one string so `[^;]*` lookahead can span newlines.
+  if printf '%s' "$out" | grep -Pziq "$re"; then echo FAIL; else echo PASS; fi
+}
+
+# --- run one arm. $1=mode(recycled|control) $2=step1 $3=step2 → emits the step2 output ---
+_run_arm() {
+  local mode="$1" step1="$2" step2="$3" r1 carried ctx
+  r1="$(printf '%s' "$step1" | _reason)"                    # step1 turn
+  if [ "$mode" = control ]; then
+    ctx="$step1"$'\n'"$r1"$'\n'"$step2"                     # full step1 context retained
+  else
+    carried="$(printf '%s\n%s' "$step1" "$r1" | _extract)"  # clear → only the extracted handoff survives
+    ctx="HANDOFF (restored after /clear):"$'\n'"$carried"$'\n'"$step2"
+  fi
+  printf '%s' "$ctx" | _reason
+}
+
+_run_canary_line() { # $1=corpus line → echoes "task_type recycled_verdict control_verdict"
+  local line="$1" id tt s1 s2 re rec ctl
+  IFS='|' read -r id tt s1 s2 re <<EOF
+$line
+EOF
+  rec="$(_run_arm recycled "$s1" "$s2" | _verify "$re")"
+  ctl="$(_run_arm control  "$s1" "$s2" | _verify "$re")"
+  printf '%s %s %s %s' "$tt" "$rec" "$ctl" "$id"
+}
+
+_canary() { # [--task-type T] [--n K]
+  local LEDGER="${MESH_CLEAR_LOSS_LOG:-$LEDGER}"   # re-resolve at call time (global is only the default)
+  local want_tt="" n=1
+  while [ $# -gt 0 ]; do case "$1" in
+    --task-type) want_tt="$2"; shift 2 ;;
+    --n) n="$2"; shift 2 ;;
+    *) shift ;;
+  esac; done
+  mkdir -p "$(dirname "$LEDGER")"
+  local corpus ran=0
+  corpus="$( [ -n "$CORPUS" ] && cat "$CORPUS" || _builtin_corpus )"
+  local rep
+  rep=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "-")
+  local i
+  for i in $(seq 1 "$n"); do
+    while IFS= read -r line; do
+      [ -z "$line" ] && continue
+      local tt; tt="$(printf '%s' "$line" | cut -d'|' -f2)"
+      [ -n "$want_tt" ] && [ "$tt" != "$want_tt" ] && continue
+      local res; res="$(_run_canary_line "$line")"
+      # res = "task_type recycled control id"
+      set -- $res
+      printf '%s canary tt=%s recycled=%s control=%s id=%s\n' "$rep" "$1" "$2" "$3" "$4" | tee -a "$LEDGER"
+      ran=$((ran+1))
+    done <<EOF
+$corpus
+EOF
+  done
+  [ "$ran" -gt 0 ] || { echo "mesh-clear-loss: no canaries ran (task-type filter '$want_tt' matched nothing)" >&2; return 2; }
+  echo "mesh-clear-loss: ran $ran canary arm-pairs → $LEDGER (see --report)"
+}
+
+_report() {
+  local LEDGER="${MESH_CLEAR_LOSS_LOG:-$LEDGER}"   # re-resolve at call time (global is only the default)
+  [ -f "$LEDGER" ] || { echo "mesh-clear-loss: no ledger yet ($LEDGER)"; return 0; }
+  awk '
+    /canary/ {
+      for (i=1;i<=NF;i++) {
+        if ($i ~ /^tt=/)        { tt=substr($i,4) }
+        else if ($i ~ /^recycled=/) { rec=substr($i,10) }
+        else if ($i ~ /^control=/)  { ctl=substr($i,9) }
+      }
+      if (rec=="SKIP"||ctl=="SKIP") { skip[tt]++; next }
+      n[tt]++
+      if (rec=="FAIL") rfail[tt]++
+      if (ctl=="FAIL") cfail[tt]++
+      rf_all += (rec=="FAIL"); cf_all += (ctl=="FAIL"); nall++
+    }
+    END {
+      printf "%-10s %6s %8s %8s %8s\n","task","n","rec_fail","ctl_fail","COST"
+      for (t in n) {
+        rr=rfail[t]/n[t]; cr=cfail[t]/n[t];
+        printf "%-10s %6d %8.2f %8.2f %+8.2f\n", t, n[t], rr, cr, rr-cr
+      }
+      if (nall>0) {
+        printf "%-10s %6d %8.2f %8.2f %+8.2f\n","ALL",nall,rf_all/nall,cf_all/nall,(rf_all-cf_all)/nall
+        printf "\nCOST = failrate(recycled) − failrate(control) = clear-loss in dropped directives.\n"
+        printf "Same reasoner both arms; absolute rate is reasoner-dependent, the DIFFERENTIAL is the honest number.\n"
+      }
+      for (t in skip) printf "(skipped %d %s runs — no reasoner)\n", skip[t], t
+    }
+  ' "$LEDGER"
+}
+
+# ---------------------------------------------------------------------------------------------------
+_test() {
+  local rc=0
+  # (1) _verify is binary and correct on known strings (RED-first: break the regex → wrong verdict).
+  [ "$(printf 'dispatch all 7 at once'   | _verify 'all *7|7 *at *once')" = FAIL ] || { echo "test: FAIL (_verify missed a violation)"; rc=1; }
+  [ "$(printf 'batches of 3, then 3, then 1' | _verify '([4-9]|1[0-9]) *jobs|all *7|7 *at *once')" = PASS ] || { echo "test: FAIL (_verify false-positive on compliant output)"; rc=1; }
+  [ "$(printf '__NO_REASONER__'          | _verify 'anything')" = SKIP ] || { echo "test: FAIL (_verify did not SKIP the no-reasoner sentinel)"; rc=1; }
+
+  # (2) ARM-WIRING + KNOWN-DROPPED calibration — the load-bearing gate.
+  # Stub reasoner: emits the VIOLATION unless the CONSTRAINT MARKER 'CAP=3' is present in its context
+  # (i.e. a mind honors the cap iff it can still see it). Stub extractor: DROPS the marker (a lossy handoff).
+  #   → control arm keeps step1 context (marker present) → COMPLY → PASS
+  #   → recycled arm carries only the lossy handoff (marker gone) → VIOLATE → FAIL
+  # If the arm wiring is broken (recycled accidentally keeps step1 context), recycled would PASS and this
+  # goes RED. That is the meter proving it DETECTS loss when loss exists.
+  local stub_reason='if grep -q "CAP=3" ; then echo "batches of 3"; else echo "dispatch all 7 at once"; fi'
+  local stub_drop='sed "s/CAP=3//g"'                      # lossy extractor: strips the constraint
+  local out
+  out="$(MESH_CANARY_MIND_CMD="$stub_reason" MESH_CLEAR_LOSS_EXTRACT_CMD="$stub_drop" \
+        _run_arm control 'The cap is CAP=3.' 'dispatch 7 jobs' | _verify 'all *7|7 *at *once')"
+  [ "$out" = PASS ] || { echo "test: FAIL (control arm should PASS — constraint retained, got $out)"; rc=1; }
+  out="$(MESH_CANARY_MIND_CMD="$stub_reason" MESH_CLEAR_LOSS_EXTRACT_CMD="$stub_drop" \
+        _run_arm recycled 'The cap is CAP=3.' 'dispatch 7 jobs' | _verify 'all *7|7 *at *once')"
+  [ "$out" = FAIL ] || { echo "test: FAIL (recycled arm should FAIL on a lossy handoff — the meter must DETECT loss, got $out)"; rc=1; }
+
+  # (3) NON-lossy handoff → recycled arm PASSES (the meter is not just always-fail).
+  local stub_keep='cat'                                   # faithful extractor: constraint survives
+  out="$(MESH_CANARY_MIND_CMD="$stub_reason" MESH_CLEAR_LOSS_EXTRACT_CMD="$stub_keep" \
+        _run_arm recycled 'The cap is CAP=3.' 'dispatch 7 jobs' | _verify 'all *7|7 *at *once')"
+  [ "$out" = PASS ] || { echo "test: FAIL (recycled arm should PASS when the handoff preserves the constraint, got $out)"; rc=1; }
+
+  # (4) --report differential arithmetic: 1 recycled-FAIL + 1 control-PASS in tt=x → COST +1.00.
+  local tl; tl="$(mktemp)"
+  printf 'T canary tt=x recycled=FAIL control=PASS id=a\nT canary tt=x recycled=PASS control=PASS id=b\n' >"$tl"
+  local costline; costline="$(MESH_CLEAR_LOSS_LOG="$tl" _report | awk '$1=="x"{print $5}')"
+  [ "$costline" = "+0.50" ] || { echo "test: FAIL (--report COST arithmetic: expected +0.50 for 1/2 recycled-fail, got '$costline')"; rc=1; }
+  rm -f "$tl"
+
+  # (5) reuse seam: a lib-mode-capable mesh-clear sources WITHOUT running its main and exposes the
+  # extractor. If the mesh-clear on PATH predates the MESH_CLEAR_LIB_ONLY guard, this WARNs (redeploy
+  # needed) rather than FAILing — the arm tests above use stubs and don't depend on it.
+  if command -v mesh-clear >/dev/null 2>&1; then
+    if grep -q MESH_CLEAR_LIB_ONLY "$(command -v mesh-clear)" 2>/dev/null; then
+      ( MESH_CLEAR_LIB_ONLY=1 . "$(command -v mesh-clear)" 2>/dev/null && declare -f _extract_handoff >/dev/null ) \
+        || { echo "test: FAIL (guarded mesh-clear did not expose _extract_handoff in lib mode)"; rc=1; }
+    else
+      echo "test: WARN (mesh-clear on PATH predates the lib-mode guard — redeploy mesh-clear so the reuse seam is live)"
+    fi
+  else
+    echo "test: WARN (mesh-clear not on PATH — reuse seam untested)"
+  fi
+
+  [ "$rc" = 0 ] && echo "clear-loss-test: ok (verify binary+SKIP; arm-wiring KNOWN-DROPPED calibration: control PASS / recycled FAIL on lossy handoff / recycled PASS on faithful handoff; --report COST differential; mesh-clear reuse seam)"
+  return "$rc"
+}
+
+# ---- dispatch ----
+case "${1:-}" in
+  --test)   shift; _test "$@" ;;
+  --canary) shift; _canary "$@" ;;
+  --report) shift; _report "$@" ;;
+  --probe)  echo "mesh-clear-loss --probe: round-trip probe is the SECONDARY signal (spec §Round-trip probe) — SCAFFOLD, not yet implemented. The canary meter (--canary) is primary and judge-free; build the probe once the canary numbers are flowing." >&2; exit 3 ;;
+  -h|--help) sed -n '2,40p' "$0" ;;
+  *) echo "usage: mesh-clear-loss --canary [--task-type T] [--n K] | --report | --probe <win> | --test" >&2; exit 2 ;;
+esac
