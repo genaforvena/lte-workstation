@@ -1,0 +1,270 @@
+#!/usr/bin/env bash
+# mesh-cap — DERIVABLE CAPABILITY TOKENS (study 'microkernel' / LiberSystem / seL4, idea-queue
+# 2026-07-17T04:23:01Z). The missing half of the mesh's capability system: mesh-organ's `# cap-allow:`
+# header (2026-07-18 STUDY 'capability security') is a STATIC allow-list — a caller is either in the
+# list or not. seL4/L4/CapROS/LiberSystem have a richer primitive: a cap is a TOKEN you can DERIVE,
+# minting a strictly weaker child cap from a parent (the one-way subset ratchet), and the kernel is
+# the only minting authority (so tokens are unforgeable). This tool brings that to bash.
+#
+# THE MODEL:
+#   - A CAPABILITY = a signed token carrying {grantor, rights[], depth, optional for-target}.
+#   - UNFORGEABILITY: the token is HMAC-SHA256'd against a per-node secret (~/.mesh/cap-secret,
+#     0600, generated from /dev/urandom on first use). The secret is the "kernel" — without it you
+#     cannot mint, alter, or forge a token. To forge a cap you would need to read the 0600 secret
+#     file, which is the strongest unforgeability analog available in userspace bash. We are honest
+#     about the gap: a process with the secret's read-permission CAN forge (root, or uid-owner);
+#     seL4 closes this at the kernel boundary, we close it at the file boundary.
+#   - SUBSET RATCHET (the seL4 'mint' rule): derive(parent, R) requires R ⊆ parent.R — derived
+#     rights must be a subset. You can drop rights, you can NEVER add them. Refused (exit 3) otherwise.
+#   - DEPTH RATCHET: each token has a depth counter (root default 8); derive decrements; refuses
+#     at 0. Prevents infinite cap-merchant chains (a real CapROS concern — delegated authority
+#     shouldn't propagate forever without re-authorization).
+#   - LINEAGE: each token carries parent-hash (ROOT for minted) + grantor + issued-at, so a chain
+#     is auditable post-hoc. inspect() prints it.
+#   - SCOPE: per-NODE only (each node = own kernel/secret). A token minted on mesh-home is INVALID
+#     on imozerov — deliberate. Cross-node caps are a different design (federated minting).
+#
+# CONSUMER PATTERN (additive — does NOT touch mesh-organ):
+#   token="$(mesh-cap mint --rights=genome,read --for=camera-cap)"
+#   mesh-cap verify "$token" --action=read && echo ALLOWED || echo DENIED
+#   child="$(mesh-cap derive "$token" --rights=read)"   # drop 'genome' right, keep 'read'
+#
+# EXIT CODES (the mesh's honest-unavailable doctrine):
+#   0  ok (mint emitted / verify passed / inspect printed)
+#   1  usage / smoke-FAIL
+#   2  n/a (no secret, organ absent — caller's invocation gate passes through)
+#   3  DENY (forged / escalated / depth-exhausted / wrong-action — the cap-system refusal)
+#
+#   mesh-cap mint --rights=<r,...> [--for=<target>] [--max-depth=N] [--as=<grantor>]
+#   mesh-cap derive <parent> --rights=<r,...> [--for=<target>] [--as=<grantor>]
+#   mesh-cap verify <token> --action=<r>        # exit 0 ok / 3 denied / 2 n/a
+#   mesh-cap inspect <token>                    # decoded metadata, NO auth check (read-only)
+#   mesh-cap --test
+#
+# STDLIB ONLY. System python3 has no numpy here — and this tool uses none (json/hmac/hashlib/base64/
+# os/urandom are all stdlib). The signing primitive is deliberately in python3 not bash because bash
+# has no native HMAC; the bash half is arg-parse + file mgmt + exit-code mapping (the unix shell's
+# actual job).
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+
+MESH="${MESH_DIR:-$HOME/.mesh}"
+SECRET="$MESH/cap-secret"
+[ -d "$MESH" ] || mkdir -p "$MESH"
+
+# ensure_secret: idempotent — generate 32 random bytes (256-bit) from /dev/urandom if absent.
+# 0600 so only the uid-owner can read it (the unforgeability boundary). NEVER overwrite an existing
+# one: losing the secret invalidates every outstanding token (loud break, not silent).
+ensure_secret(){
+  [ -f "$SECRET" ] && return 0
+  head -c 32 /dev/urandom > "$SECRET" || { echo "mesh-cap: cannot write $SECRET (no /dev/urandom?)" >&2; exit 2; }
+  chmod 600 "$SECRET" || true
+}
+
+# pyeval: run the cap-engine python (read from heredoc) with the secret + args on argv.
+# Stdin = the engine script. Argv: $1=mode, then mode-specific args. The secret is passed via
+# env var (MESH_CAP_SECRET) so it never appears in ps/cmdline output (process-list leakage).
+pyeval(){ MESH_CAP_SECRET="$(cat "$SECRET" 2>/dev/null | base64)" python3 - "$@" <<'PYEOF'; }
+import sys, os, json, hmac, hashlib, base64, time
+SECRET = base64.b64decode(os.environ.get("MESH_CAP_SECRET","")) if os.environ.get("MESH_CAP_SECRET") else b""
+def die(msg, rc): sys.stderr.write(f"mesh-cap: {msg}\n"); sys.exit(rc)
+def sign(payload_b64):
+    mac = hmac.new(SECRET, payload_b64.encode(), hashlib.sha256).digest()
+    return base64.urlsafe_b64encode(mac).decode().rstrip("=")
+def verify_sig(payload_b64, sig_b64):
+    expect = sign(payload_b64)
+    return hmac.compare_digest(expect, sig_b64)
+def emit(tok):
+    payload = json.dumps(tok, sort_keys=True, separators=(",", ":")).encode()
+    p = base64.urlsafe_b64encode(payload).decode().rstrip("=")
+    return f"{p}.{sign(p)}"
+def parse(tok):
+    if not tok or "." not in tok: die("malformed token (no '.')", 3)
+    p, s = tok.rsplit(".", 1)
+    if not verify_sig(p, s): die("FORGED — signature mismatch (token altered, or minted under a different node-secret)", 3)
+    try: pad = p + "=" * (-len(p) % 4); return json.loads(base64.urlsafe_b64decode(pad))
+    except Exception as e: die(f"malformed payload: {e}", 3)
+def H(tok): return hashlib.sha256(tok.encode()).hexdigest()[:12]   # short lineage hash
+
+mode = sys.argv[1] if len(sys.argv) > 1 else ""
+if not SECRET and mode not in ("--help","-h",""):
+    # n/a path: no secret + not the help arm. Caller's gate (exit 2 = honest n/a) passes through.
+    die("no secret (organ-absent — call `mesh-cap mint` once to generate one)", 2)
+
+if mode in ("--help","-h",""):
+    print("usage: mesh-cap mint|derive|verify|inspect|--test  (see header for full contract)"); sys.exit(0)
+
+if mode == "inspect":
+    tok = sys.argv[2] if len(sys.argv) > 2 else ""
+    t = parse(tok)   # verifies sig — forged → exit 3 here
+    print(f"grantor : {t.get('g','?')}")
+    print(f"rights  : {','.join(t.get('r',[]))}")
+    print(f"depth   : {t.get('d','?')}")
+    print(f"for     : {t.get('f','-')}")
+    print(f"parent  : {t.get('p','?')}")
+    print(f"thash   : {H(tok)}")
+    print(f"issued  : {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(t.get('t',0)))}")
+    sys.exit(0)
+
+if mode == "mint":
+    rights, for_, depth, grantor = set(), None, 8, None
+    a = sys.argv[2:]
+    i = 0
+    while i < len(a):
+        if a[i].startswith("--rights="): rights = {r.strip() for r in a[i][9:].split(",") if r.strip()}
+        elif a[i].startswith("--for="): for_ = a[i][6:]
+        elif a[i].startswith("--max-depth="): depth = int(a[i][12:])
+        elif a[i].startswith("--as="): grantor = a[i][5:]
+        else: die(f"mint: unknown arg '{a[i]}'", 1)
+        i += 1
+    if not rights: die("mint: --rights=<r,...> required", 1)
+    grantor = grantor or os.environ.get("MESH_CALLER") or "unknown"
+    tok = {"v":1, "g":grantor, "r":sorted(rights), "d":depth, "f":for_, "t":int(time.time()), "p":"ROOT"}
+    print(emit(tok)); sys.exit(0)
+
+if mode == "derive":
+    if len(sys.argv) < 3: die("derive: <parent-token> required", 1)
+    parent_tok = sys.argv[2]
+    pt = parse(parent_tok)   # forged → exit 3
+    rights, for_, grantor = set(), None, None
+    a = sys.argv[3:]
+    i = 0
+    while i < len(a):
+        if a[i].startswith("--rights="): rights = {r.strip() for r in a[i][9:].split(",") if r.strip()}
+        elif a[i].startswith("--for="): for_ = a[i][6:]
+        elif a[i].startswith("--as="): grantor = a[i][5:]
+        else: die(f"derive: unknown arg '{a[i]}'", 1)
+        i += 1
+    if not rights: die("derive: --rights=<r,...> required (subset of parent)", 1)
+    parent_rights = set(pt.get("r", []))
+    # SUBSET RATCHET (seL4 mint rule): derived rights MUST be ⊆ parent rights.
+    if not rights.issubset(parent_rights):
+        extra = rights - parent_rights
+        die(f"REFUSED — escalation: requested rights {{{','.join(sorted(extra))}}} not in parent {{{','.join(sorted(parent_rights))}}} (cap derivation is a one-way ratchet, seL4 mint rule)", 3)
+    # DEPTH RATCHET: a depth-0 cap cannot propagate further (re-authorization required).
+    if pt.get("d", 0) <= 0:
+        die(f"REFUSED — depth-exhausted (parent depth=0; delegate from a fresh root or raise --max-depth at mint)", 3)
+    grantor = grantor or os.environ.get("MESH_CALLER") or pt.get("g", "unknown")
+    tok = {"v":1, "g":grantor, "r":sorted(rights), "d":pt["d"]-1, "f":for_ or pt.get("f"),
+           "t":int(time.time()), "p":H(parent_tok)}
+    print(emit(tok)); sys.exit(0)
+
+if mode == "verify":
+    if len(sys.argv) < 3: die("verify: <token> required", 1)
+    tok = sys.argv[2]
+    action = None
+    a = sys.argv[3:]
+    i = 0
+    while i < len(a):
+        if a[i].startswith("--action="): action = a[i][9:].strip()
+        elif a[i].startswith("--for="):
+            # optional target-binding check: a cap minted --for=X only verifies for that target.
+            t = parse(tok)   # already verified above? no — parse here for the for_ check path
+            if t.get("f") and t.get("f") != a[i][6:]:
+                die(f"DENY — for-target mismatch (cap bound to '{t.get('f')}', asked for '{a[i][6:]}')", 3)
+        else: die(f"verify: unknown arg '{a[i]}'", 1)
+        i += 1
+    if not action: die("verify: --action=<r> required", 1)
+    t = parse(tok)   # forged → exit 3
+    rights = set(t.get("r", []))
+    if action in rights: sys.exit(0)
+    die(f"DENY — action '{action}' not in cap rights {{{','.join(sorted(rights))}}}", 3)
+
+die(f"unknown mode '{mode}' (try: mint, derive, verify, inspect, --test)", 1)
+PYEOF
+
+# ─────────── --test (RED-first; mutation-verified; temp HOME so it writes no real artifacts) ─────
+[ "${1:-}" = "--test" ] && {
+  command -v python3 >/dev/null 2>&1 || { echo "smoke-test: FAIL (no python3)"; exit 1; }
+  tmp="$(mktemp -d)" || { echo "smoke-test: FAIL (mktemp)"; exit 1; }
+  trap 'rm -rf "$tmp"' EXIT
+  mkdir -p "$tmp/.mesh"
+  echo "=== T1: mint emits a parseable signed token ==="
+  tok="$(HOME="$tmp" MESH_CALLER=genome "$0" mint --rights=genome,read,write --for=camera-cap)"
+  [ -n "$tok" ] && [ "$(printf '%s' "$tok" | tr -cd '.' | wc -c)" = 1 ] \
+    || { echo "smoke-test: FAIL (mint did not emit a '<payload>.<sig>' token)"; exit 1; }
+
+  echo "=== T2: verify ok for action IN rights ==="
+  HOME="$tmp" "$0" verify "$tok" --action=read 2>/dev/null || { echo "smoke-test: FAIL (verify read should be exit 0)"; exit 1; }
+
+  echo "=== T3: verify DENY for action NOT in rights ==="
+  HOME="$tmp" "$0" verify "$tok" --action=admin 2>/dev/null; rc=$?
+  [ "$rc" = 3 ] || { echo "smoke-test: FAIL (verify admin should DENY exit 3, got rc=$rc)"; exit 1; }
+
+  echo "=== T4: derive with SUBSET rights succeeds (the seL4 mint rule) ==="
+  child="$(HOME="$tmp" MESH_CALLER=tg "$0" derive "$tok" --rights=read 2>/dev/null)" \
+    || { echo "smoke-test: FAIL (derive subset {read} from {genome,read,write} should succeed)"; exit 1; }
+  [ -n "$child" ] || { echo "smoke-test: FAIL (derive emitted empty token)"; exit 1; }
+
+  echo "=== T5: derived child has the SUBSET only (not parent's full rights) ==="
+  HOME="$tmp" "$0" verify "$child" --action=read 2>/dev/null || { echo "smoke-test: FAIL (child should still verify read)"; exit 1; }
+  HOME="$tmp" "$0" verify "$child" --action=write 2>/dev/null; rc=$?
+  [ "$rc" = 3 ] || { echo "smoke-test: FAIL (child verify write should DENY — 'write' was dropped at derive); got rc=$rc"; exit 1; }
+
+  echo "=== T6: derive with NON-subset rights is REFUSED (escalation gate) ==="
+  HOME="$tmp" "$0" derive "$tok" --rights=admin 2>/dev/null; rc=$?
+  [ "$rc" = 3 ] || { echo "smoke-test: FAIL (derive {admin} from {genome,read,write} should REFUSE exit 3 — escalation); got rc=$rc"; exit 1; }
+
+  echo "=== T7: FORGED token (tampered payload, stale sig) is REJECTED ==="
+  # Tamper: flip one char in the payload half, keep the sig half.
+  tampered="$(printf '%s' "$tok" | sed 's/^./X/')"
+  HOME="$tmp" "$0" verify "$tampered" --action=read 2>/dev/null; rc=$?
+  [ "$rc" = 3 ] || { echo "smoke-test: FAIL (tampered payload should be rejected as FORGED exit 3); got rc=$rc"; exit 1; }
+
+  echo "=== T8: token minted under a DIFFERENT secret (different 'kernel') is REJECTED ==="
+  tmp2="$(mktemp -d)"; mkdir -p "$tmp2/.mesh"
+  HOME="$tmp2" "$0" mint --rights=read >/dev/null 2>&1   # generate tmp2's own secret
+  HOME="$tmp2" "$0" verify "$tok" --action=read 2>/dev/null; rc=$?
+  [ "$rc" = 3 ] || { echo "smoke-test: FAIL (token from a different node-secret should be FORGED exit 3 — per-node scope); got rc=$rc"; exit 1; }
+  rm -rf "$tmp2"
+
+  echo "=== T9: depth ratchet — derive exhausts, refuses at 0 ==="
+  shallow="$(HOME="$tmp" "$0" mint --rights=r --max-depth=1)"
+  d1="$(HOME="$tmp" "$0" derive "$shallow" --rights=r 2>/dev/null)" || { echo "smoke-test: FAIL (first derive from depth=1 should succeed)"; exit 1; }
+  HOME="$tmp" "$0" derive "$d1" --rights=r 2>/dev/null; rc=$?
+  [ "$rc" = 3 ] || { echo "smoke-test: FAIL (derive from depth-0 token should REFUSE exit 3 — depth-exhausted); got rc=$rc"; exit 1; }
+
+  echo "=== T10: for-target binding — cap verifies for its bound target, DENY for another ==="
+  bound="$(HOME="$tmp" "$0" mint --rights=read --for=camera-cap)"
+  HOME="$tmp" "$0" verify "$bound" --action=read --for=camera-cap 2>/dev/null || { echo "smoke-test: FAIL (cap should verify for its bound --for target)"; exit 1; }
+  HOME="$tmp" "$0" verify "$bound" --action=read --for=mic-cap 2>/dev/null; rc=$?
+  [ "$rc" = 3 ] || { echo "smoke-test: FAIL (cap should DENY for a different --for target); got rc=$rc"; exit 1; }
+
+  echo "=== T11: lineage — inspect shows parent chain (ROOT for minted, hash for derived) ==="
+  ins="$(HOME="$tmp" "$0" inspect "$child" 2>/dev/null)" || { echo "smoke-test: FAIL (inspect should succeed on valid child token)"; exit 1; }
+  printf '%s' "$ins" | grep -q '^parent  : [0-9a-f]\{12\}$' || { echo "smoke-test: FAIL (child's parent should be a 12-hex hash of the parent token); got: $(printf '%s' "$ins" | grep ^parent)"; exit 1; }
+  insroot="$(HOME="$tmp" "$0" inspect "$tok" 2>/dev/null)"
+  printf '%s' "$insroot" | grep -q '^parent  : ROOT$' || { echo "smoke-test: FAIL (minted token's parent should be 'ROOT')"; exit 1; }
+
+  echo "=== T12: secret file is 0600 (the unforgeability boundary) ==="
+  [ "$(stat -c '%a' "$tmp/.mesh/cap-secret" 2>/dev/null)" = "600" ] \
+    || { echo "smoke-test: FAIL (cap-secret should be 0600 so only the uid-owner can read it; got $(stat -c '%a' "$tmp/.mesh/cap-secret" 2>/dev/null))"; exit 1; }
+
+  echo "=== T13: honest n/a — no secret + verify = exit 2 (caller's gate passes through) ==="
+  tmp3="$(mktemp -d)"; mkdir -p "$tmp3/.mesh"
+  HOME="$tmp3" "$0" verify "fake.token" --action=read 2>/dev/null; rc=$?
+  [ "$rc" = 2 ] || { echo "smoke-test: FAIL (no-secret verify should exit 2 honest-n/a — the organ-absent doctrine); got rc=$rc"; exit 1; }
+  rm -rf "$tmp3"
+
+  echo "smoke-test: ok (13 gates: mint/verify/deny/subset/escalation/forged/cross-secret/depth/target-binding/lineage/perm/honest-na)"
+  exit 0
+}
+
+# ─────────── dispatch (only when NOT --test) ────────────────────────────────────────────────────
+case "${1:-}" in
+  mint|derive)
+    # WRITE op: auto-create the per-node secret if absent (idempotent — never overwrites).
+    ensure_secret
+    pyeval "$@"
+    exit $? ;;
+  verify|inspect)
+    # READ op: do NOT auto-create. If no secret exists, the cap system is organ-absent on this node
+    # → honest exit 2 (caller's invocation gate passes through). A read op that mints the secret as
+    # a side-effect would be the silent-fallback doctrine's exact trap (a forged token looks "real"
+    # against a fresh secret). The secret is the kernel-authority; you don't mint a kernel by asking.
+    [ -f "$SECRET" ] || { echo "mesh-cap: no secret ($SECRET) — cap system organ-absent on this node (run 'mesh-cap mint' to initialize)" >&2; exit 2; }
+    pyeval "$@"
+    exit $? ;;
+  "") echo "usage: mesh-cap mint|derive|verify|inspect|--test  (see header)" >&2; exit 1 ;;
+  *)  echo "mesh-cap: unknown mode '${1:-}' (try: mint, derive, verify, inspect, --test)" >&2; exit 1 ;;
+esac
