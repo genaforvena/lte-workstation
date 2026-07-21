@@ -9,8 +9,9 @@
 #   mesh-wip-commit                 (reflex) per active mind window with a DIRTY worktree → snapshot to refs/wip/<window>
 #   mesh-wip-commit --show <win>    print the wip snapshot's stat + diff vs its parent (what would be recovered)
 #   mesh-wip-commit --restore <win> reconstruct the change: apply the wip delta into a CLEAN worktree, else emit a patch
+#   mesh-wip-commit --landed <win>  predicate: exit 0 = the wip delta is fully in HEAD (landed) · 1 = not · 2 = no ref
 #   mesh-wip-commit --list          list every refs/wip/* ref with its age + one-line subject
-#   mesh-wip-commit --test          RED-first smoke test (capture incl. untracked · HEAD/index/branch untouched · clean=no ref · no churn · restore)
+#   mesh-wip-commit --test          RED-first smoke test (capture incl. untracked · HEAD/index/branch untouched · clean=no ref · no churn · restore · landed-prune vs lost-work-keep)
 #
 # reflex-cadence: */5 * * * *
 #
@@ -96,9 +97,36 @@ _apply_ref() { # $1=toplevel $2=window $3=commit $4=tree
   return 0
 }
 
+# LANDED predicate: is the wip delta already in HEAD? True iff every path the snapshot touched is
+# byte-identical between the snapshot and HEAD — the mesh-land flow (wip → [done] → steward lands →
+# tree clean). Patch-id matching (git cherry) is wrong here: mesh-land splits one wip snapshot into
+# per-tool commits, so no single commit patch-matches. Blob equality on the touched set is the claim.
+# Conservative by design: a path edited AGAIN after landing reads NOT-landed (ref kept — safe, stale).
+# rc 0 = landed · 1 = not landed · 2 = no ref/error.
+_landed() { # $1=toplevel $2=window
+  local top="$1" win="$2" ref
+  ref="refs/wip/$(_safe_ref "$win")"
+  git -C "$top" rev-parse -q --verify "$ref" >/dev/null 2>&1 || return 2
+  # NUL-safe path list → ONE `git diff --quiet <ref> HEAD -- <paths>` over the touched set.
+  # xargs maps the diff's rc=1 (differs) to 123; only a clean 0 means every touched path landed.
+  git -C "$top" diff --name-only -z "$ref^" "$ref" 2>/dev/null \
+    | xargs -0 -r git -C "$top" diff --quiet "$ref" HEAD -- 2>/dev/null
+  [ $? -eq 0 ] && return 0 || return 1
+}
+
+# Prune ONE landed ref (rc 0=pruned, 1=kept). Never deletes on mere tree-cleanliness — a clean tree
+# with an UNLANDED ref is the lost-work case (crash/discard) where the ref is the ONLY copy.
+_prune_landed_ref() { # $1=toplevel $2=window
+  local top="$1" win="$2"
+  _landed "$top" "$win" || return 1
+  git -C "$top" update-ref -d "refs/wip/$(_safe_ref "$win")" 2>/dev/null || return 1
+  printf '%s: pruned refs/wip/%s (delta landed in HEAD — stale recovery pointer)\n' "$LOG_PREFIX" "$(_safe_ref "$win")"
+  return 0
+}
+
 # ── the reflex: iterate mind windows, snapshot dirty worktrees, dedup commits across shared trees ─
 _run() {
-  local win top rc n_new=0 n_clean=0 n_same=0 out commit tree
+  local win top rc n_new=0 n_clean=0 n_same=0 n_pruned=0 out commit tree
   declare -A wt_commit wt_tree wt_clean   # per-toplevel: the single commit/tree minted this pass
   tmux has-session -t "$SESSION" 2>/dev/null || { echo "$LOG_PREFIX: no session '$SESSION' — nothing to snapshot"; return 0; }
   while read -r win; do
@@ -112,7 +140,13 @@ _run() {
         *) echo "$LOG_PREFIX: ERROR snapshotting worktree $top" >&2; wt_clean[$top]=1 ;;
       esac
     fi
-    if [ -n "${wt_clean[$top]:-}" ]; then n_clean=$((n_clean+1)); continue; fi
+    if [ -n "${wt_clean[$top]:-}" ]; then
+      n_clean=$((n_clean+1))
+      # a LANDED snapshot on a clean tree is a stale recovery pointer (the handoff would tell a
+      # reincarnated mind to restore work HEAD already carries, and the apply fails) — prune it.
+      _prune_landed_ref "$top" "$win" && n_pruned=$((n_pruned+1))
+      continue
+    fi
     _apply_ref "$top" "$win" "${wt_commit[$top]}" "${wt_tree[$top]}"; rc=$?
     case "$rc" in
       0) n_new=$((n_new+1)); printf '%s: snapshot %s -> %s (%s)\n' "$LOG_PREFIX" "$win" "$(git -C "$top" rev-parse --short refs/wip/$(_safe_ref "$win"))" "$top" ;;
@@ -120,7 +154,7 @@ _run() {
       *) echo "$LOG_PREFIX: ERROR update-ref refs/wip/$win" >&2 ;;
     esac
   done < <(_mind_windows)
-  echo "$LOG_PREFIX: $n_new new · $n_same unchanged · $n_clean clean ($(date -u +%H:%M:%SZ))"
+  echo "$LOG_PREFIX: $n_new new · $n_same unchanged · $n_clean clean · $n_pruned pruned-landed ($(date -u +%H:%M:%SZ))"
   return 0
 }
 
@@ -145,6 +179,13 @@ _restore() { # $1=window — reconstruct the uncommitted work. Non-invasive: onl
   ref="refs/wip/$(_safe_ref "$win")"
   top="$(_repo_for_ref)"
   git -C "$top" rev-parse -q --verify "$ref" >/dev/null 2>&1 || { echo "mesh-wip-commit --restore: no snapshot at $ref" >&2; exit 1; }
+  if _landed "$top" "$win"; then
+    # restoring a landed delta would fail `git apply` with a bare rc=3 (the content is already in
+    # HEAD) — say what actually happened and retire the stale pointer instead.
+    echo "mesh-wip-commit --restore: nothing to restore — $ref's delta already landed in HEAD ($(git -C "$top" diff --name-only "$ref^" "$ref" 2>/dev/null | tr '\n' ' ')); pruning the stale ref"
+    git -C "$top" update-ref -d "$ref" 2>/dev/null || true
+    exit 0
+  fi
   mkdir -p "$WIP_DIR"
   patch="$WIP_DIR/$(_safe_ref "$win").patch"
   git -C "$top" diff "$ref^..$ref" > "$patch"
@@ -233,8 +274,31 @@ _test() {
     echo "wip-test: FAIL (wip delta does not apply to a clean tree)"; rc=1
   fi
 
+  # ── LANDED lifecycle (task wip-ref-stale-after-landing 2026-07-21): a wip whose delta HEAD now
+  #    carries (the mesh-land flow) is a STALE recovery pointer — it must read landed, prune, and
+  #    --restore must say so instead of dying on a raw git-apply rc=3. A clean tree with an
+  #    UNLANDED ref (work discarded/lost from the tree) is the crash-safety case — always KEPT.
+  local self; self="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+  git -C "$repo" add -A >/dev/null 2>&1; git -C "$repo" commit -qm "land the wip (as mesh-land would)"
+  _landed "$repo" "testwin" || { echo "wip-test: FAIL (fully-landed wip delta not detected by _landed)"; rc=1; }
+  _prune_landed_ref "$repo" "winA" >/dev/null || { echo "wip-test: FAIL (prune of a landed ref did not run)"; rc=1; }
+  git -C "$repo" rev-parse -q --verify refs/wip/winA >/dev/null 2>&1 && { echo "wip-test: FAIL (landed ref survived the prune — stale pointer persists)"; rc=1; }
+  # --restore on a landed ref: honest no-op exit 0 naming the landing, ref retired — never an apply-fail rc=3
+  local rout rrc
+  rout="$(cd "$repo" && MESH_WIP_DIR="$td/wipdir" bash "$self" --restore testwin 2>&1)"; rrc=$?
+  [ "$rrc" = 0 ] || { echo "wip-test: FAIL (--restore of a landed ref must exit 0, got rc=$rrc: $rout)"; rc=1; }
+  printf '%s' "$rout" | grep -q 'already landed' || { echo "wip-test: FAIL (--restore of a landed ref must SAY the delta landed, got: $rout)"; rc=1; }
+  git -C "$repo" rev-parse -q --verify refs/wip/testwin >/dev/null 2>&1 && { echo "wip-test: FAIL (--restore of a landed ref did not retire it)"; rc=1; }
+  # lost-work KEEP: snapshot new work, then discard it from the tree — clean tree, delta NOT in HEAD.
+  printf 'LOST-%s\n' "$$" > "$repo/lost.txt"
+  _snapshot_worktree "$repo" "winC" >/dev/null
+  rm -f "$repo/lost.txt"                                  # the ref is now the ONLY copy
+  _landed "$repo" "winC" && { echo "wip-test: FAIL (discarded-not-landed wip read as landed — prune would destroy the only copy)"; rc=1; }
+  _prune_landed_ref "$repo" "winC" >/dev/null 2>&1 && { echo "wip-test: FAIL (prune deleted an UNLANDED ref)"; rc=1; }
+  git -C "$repo" rev-parse -q --verify refs/wip/winC >/dev/null 2>&1 || { echo "wip-test: FAIL (unlanded ref gone — crash safety net destroyed)"; rc=1; }
+
   rm -rf "$td"
-  [ "$rc" = 0 ] && echo "wip-test: ok (untracked+tracked captured · HEAD/branch/index/worktree untouched · clean=no-ref · no-churn on re-run · delta restores)"
+  [ "$rc" = 0 ] && echo "wip-test: ok (untracked+tracked captured · HEAD/branch/index/worktree untouched · clean=no-ref · no-churn on re-run · delta restores · landed ref reads/prunes/restores honestly · unlanded ref KEPT)"
   exit "$rc"
 }
 
@@ -242,6 +306,7 @@ case "${1:-}" in
   --test)     _test ;;
   --show)     [ -n "${2:-}" ] || { echo "usage: mesh-wip-commit --show <window>" >&2; exit 2; }; _show "$2" ;;
   --restore)  [ -n "${2:-}" ] || { echo "usage: mesh-wip-commit --restore <window>" >&2; exit 2; }; _restore "$2" ;;
+  --landed)   [ -n "${2:-}" ] || { echo "usage: mesh-wip-commit --landed <window>" >&2; exit 2; }; _landed "$(_repo_for_ref)" "$2"; exit $? ;;
   --list)     _list ;;
   ""|--run)   _run ;;
   -h|--help)  sed -n '2,20p' "$0"; exit 0 ;;
