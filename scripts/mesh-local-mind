@@ -5,8 +5,14 @@
 #
 #   mesh-local-mind '<prompt>'           infer with default/auto-detected model
 #   mesh-local-mind --model <m> '<p>'   use specific model
+#   mesh-local-mind --no-think '<p>'    suppress thinking (payload "think": false — makes
+#                                       qwen3.5-family viable: its reasoning otherwise overflows
+#                                       num_ctx → done=length → EMPTY .response on heavy prompts)
 #   mesh-local-mind --list              list available models
 #   echo '<p>' | mesh-local-mind        read prompt from stdin
+#
+# MESH_LOCAL_MIND_THINK=false          env equivalent of --no-think (for callers that can't
+#                                      change argv plumbing, e.g. a relay pool hop)
 #
 # Server lifecycle: if ollama isn't running, attempts auto-start (background).
 # Called by other mesh tools as the local-inference primitive.
@@ -178,17 +184,91 @@ smoke_test() {
     else
         echo "smoke-test: ok (ollama installed but NO model — run: $OLLAMA_BIN pull qwen2.5:3b)"
     fi
+    nothink_gate || return 1
     return 0
+}
+
+# no-think contract gate: drive the REAL tool end-to-end at a recording stub server (no ollama
+# needed — runs on every node) and assert the payload the tool actually sends. Three legs:
+# --no-think → "think": false present · unflagged → NO think key (legacy payload untouched) ·
+# MESH_LOCAL_MIND_THINK=false env → same as the flag. Payloads parsed as JSON, never grepped.
+nothink_gate() {
+    local td rec port pid out leg
+    td="$(mktemp -d)" || { echo "smoke-test: FAIL (no-think: mktemp)"; return 1; }
+    rec="$td/payloads"
+    python3 - "$rec" >"$td/port" 2>/dev/null <<'PYEOF' &
+import json, sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+rec = sys.argv[1]
+class H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200); self.send_header('Content-Type','application/json'); self.end_headers()
+        self.wfile.write(json.dumps({'models':[{'name':'stub:1b'}]}).encode())
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers.get('Content-Length', 0)))
+        with open(rec, 'ab') as f: f.write(body + b'\n')
+        self.send_response(200); self.send_header('Content-Type','application/json'); self.end_headers()
+        self.wfile.write(json.dumps({'response':'stub-ok'}).encode())
+    def log_message(self, *a): pass
+srv = HTTPServer(('127.0.0.1', 0), H)
+print(srv.server_address[1], flush=True)
+srv.serve_forever()
+PYEOF
+    pid=$!
+    local waited=0
+    while [ ! -s "$td/port" ] && [ "$waited" -lt 50 ]; do sleep 0.1; waited=$((waited+1)); done
+    port="$(cat "$td/port" 2>/dev/null)"
+    [ -n "$port" ] || { kill "$pid" 2>/dev/null; rm -rf "$td"; echo "smoke-test: FAIL (no-think: stub server did not start)"; return 1; }
+
+    _leg() { # $1=leg-name $2=expected-think(json: false|absent) then argv... ; env prepared by caller
+        local name="$1" want="$2"; shift 2
+        : >"$rec"
+        out="$(env -u MESH_LOCAL_MIND_MODEL -u MESH_LOCAL_MIND_THINK OLLAMA_URL="http://127.0.0.1:$port" "$@" 2>/dev/null)"
+        [ "$out" = "stub-ok" ] || { echo "smoke-test: FAIL (no-think/$name: expected stub-ok, got '$out')"; return 1; }
+        python3 - "$rec" "$want" <<'PYEOF2' 2>"$td/assert-err" || { echo "smoke-test: FAIL (no-think/$name: $(tail -1 "$td/assert-err"))"; return 1; }
+import json, sys
+lines = [l for l in open(sys.argv[1], 'rb').read().split(b'\n') if l.strip()]
+assert len(lines) == 1, f"expected 1 payload, got {len(lines)}"
+d = json.loads(lines[0])
+assert d.get('model') == 'stub:1b', f"model: {d.get('model')!r}"
+assert d.get('prompt') == 'ping', f"prompt: {d.get('prompt')!r}"
+want = sys.argv[2]
+if want == 'false':
+    assert d.get('think') is False and 'think' in d, f"think: {d.get('think')!r}"
+else:
+    assert 'think' not in d, f"think key present: {d.get('think')!r}"
+PYEOF2
+    }
+    local rc=0
+    _leg flag   false  "$0" --no-think --model stub:1b 'ping'            || rc=1
+    [ "$rc" -eq 0 ] && { _leg legacy absent "$0" --model stub:1b 'ping'  || rc=1; }
+    [ "$rc" -eq 0 ] && { _leg env    false  env MESH_LOCAL_MIND_THINK=false "$0" --model stub:1b 'ping' || rc=1; }
+    kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+    rm -rf "$td"
+    [ "$rc" -eq 0 ] && echo "smoke-test: ok (no-think contract: flag/env set think:false, legacy payload untouched)"
+    return "$rc"
 }
 
 # --- argument parsing ---
 MODEL_ARG=""
+# think suppression: "false" → payload carries "think": false (a thinking-family model answers
+# directly instead of overflowing num_ctx with reasoning — the qwen3.5 empty-.response trap);
+# unset/anything-else → the key is ABSENT and the payload is byte-identical to the legacy one.
+# ollama 0.32 accepts think:false on non-thinking models too (probed live 2026-07-21), so the
+# flag is safe regardless of which model pick_model lands on.
+THINK_MODE="${MESH_LOCAL_MIND_THINK:-}"
 case "${1:-}" in
     --list)    list_models; exit 0 ;;
     --install) install_ollama "${2:-}"; exit $? ;;
     --test)    smoke_test; exit $? ;;
-    --model)   MODEL_ARG="${2:-}"; shift 2 ;;
 esac
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --model)    [ $# -ge 2 ] || die "--model needs a value"; MODEL_ARG="$2"; shift 2 ;;
+        --no-think) THINK_MODE="false"; shift ;;
+        *) break ;;
+    esac
+done
 
 # prompt: positional arg or stdin
 if [ $# -gt 0 ]; then
@@ -202,6 +282,18 @@ fi
 [ -z "${PROMPT// /}" ] && die "empty prompt"
 
 # --- infer ---
+# ONE payload builder for BOTH transports (HTTP + SSH) — the think rule asserted here is asserted
+# everywhere (a rule asserted at one call site is not asserted).
+build_payload() { # $1=model $2=prompt → request JSON on stdout, honoring THINK_MODE
+    python3 -c "
+import json, sys
+d = {'model': sys.argv[1], 'prompt': sys.argv[2], 'stream': False}
+if sys.argv[3] == 'false':
+    d['think'] = False
+print(json.dumps(d))
+" "$1" "$2" "${THINK_MODE:-}"
+}
+
 ensure_server
 
 # SSH transport: reach the remote mind's LOCALHOST ollama API over authenticated SSH (the API is
@@ -209,7 +301,7 @@ ensure_server
 # pick_model can't query the down-local here, so use the explicit/env/default model.
 if [ -n "$SSH_MIND_PEER" ]; then
     MODEL="${MODEL_ARG:-${DEFAULT_MODEL:-qwen2.5:3b}}"
-    req="$(python3 -c "import json,sys;print(json.dumps({'model':sys.argv[1],'prompt':sys.argv[2],'stream':False}))" "$MODEL" "$PROMPT")"
+    req="$(build_payload "$MODEL" "$PROMPT")"
     resp="$(printf '%s' "$req" | ssh -o BatchMode=yes -o ConnectTimeout=8 "$SSH_MIND_PEER" 'curl -sf -m 120 http://localhost:11434/api/generate -d @-' 2>/dev/null)" \
         || die "SSH inference to the shared mind ($SSH_MIND_PEER) failed"
     printf '%s' "$resp" | python3 -c "
@@ -228,10 +320,7 @@ fi
 
 RESPONSE="$(curl -sf -X POST "$OLLAMA_URL/api/generate" \
     -H 'Content-Type: application/json' \
-    -d "$(python3 -c "
-import json, sys
-print(json.dumps({'model': sys.argv[1], 'prompt': sys.argv[2], 'stream': False}))
-" "$MODEL" "$PROMPT")" 2>/dev/null)" || die "API call failed — is ollama running?"
+    -d "$(build_payload "$MODEL" "$PROMPT")" 2>/dev/null)" || die "API call failed — is ollama running?"
 
 python3 -c "
 import json, sys
