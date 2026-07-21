@@ -21,6 +21,14 @@ Pure arithmetic — the ideal first thing to move off shell into a stack machine
   the ROM. The gate *logic* is in the ROM; the shim only marshals inputs and maps the
   verdict to exit 0 / 1.
 - **`lease-fixtures`** — `name cadence lease` rows (stand-in for the live cron + lease decls).
+- **`mesh-lease-audit`** — the **load-bearing live resolver** (the fixtures stand-in was a mock).
+  It gates the WHOLE live reflex set through the same ROM: for every reflex that self-declares a
+  `# reflex-cadence:` header it resolves two *independent* integers — **cadence** from the header
+  (what the reflex says it runs at) and **lease** from `mesh-reflex-health`'s `eff_maxage` (what
+  its liveness watchdog tolerates) — and hands them to the ROM. See "Live audit" below.
+- **`band-gate.tal` / `band-gate.rom` / `mesh-band-gate`** — a **second gate CLASS**: a compound
+  two-edged boundary `lo ≤ value ≤ hi`, RED past either edge. Proves the ROM pattern generalizes
+  beyond lease's single `≥` comparison. See "Second gate class" below.
 - **`src/`, `build.sh`** — vendored Uxn toolchain (`uxnasm` + `uxncli`, MIT, Devine Lu
   Linvega et al.). `build.sh` compiles the ~26 KB emulator **per platform**; the ROM it runs
   is identical everywhere.
@@ -50,6 +58,55 @@ regression) — and watch the two gates disagree:
 Seen RED-first: the ROM truth table asserts the boundary is inclusive (`1800` OK, `1799`
 RED, `1801` OK) and that `lease==cadence` goes RED; corrupting the ROM's `#0002 MUL2` → `#0001`
 makes the bug config wrongly pass, proving the ROM does the arithmetic, not a constant.
+
+## Live audit (`mesh-lease-audit`) — the resolver made load-bearing
+
+The pilot's first cut resolved `(cadence, lease)` from the static `lease-fixtures` mock.
+`mesh-lease-audit` replaces that with the **live genome**: it sources `mesh-reflex-health`
+(one authority — the shared `cron_stride_from_fields` + `eff_maxage`, never a duplicated
+parse), resolves every `# reflex-cadence:` header (242 in `scripts/`), and gates each pair
+through `lease-gate.rom`.
+
+```sh
+./mesh-lease-audit          # -> "lease-audit: clean — 201 reflex(es) gated, ... (35 un-derivable skipped)"
+./mesh-lease-audit --list   # also print every resolved (name cad lease OK/RED) row
+```
+
+**Why a healthy fleet audits CLEAN, and that is honest.** `eff_maxage`'s `@auto` derives
+`lease = cadence × 2` **by design** — the maxage-from-cadence machinery
+(`mesh-reflex-health`, chat-review 2026-06-24) exists precisely to make `lease < 2·cadence`
+impossible to express by accident. So the live audit finds **zero** violations. This is not a
+dud gate — it is a **regression guard**, not a bug-finder:
+
+- the day `eff_maxage`'s `s*2` is edited to `s*1`, **every** reflex here flips RED;
+- the day a watchdog lease is hardcoded to a literal below `2·cadence` (the
+  `a-lease-must-exceed-its-producers-cadence` memory), **that** reflex flips RED.
+
+The 35 skipped reflexes carry list-crons (`17,47 …`) or `# reflex-cadence: none` — no single
+derivable cadence — and are honestly excluded, never silently passed. `test-lease-audit` is
+the RED-first proof for the **wiring** (not just the ROM): it points the audit at a
+`mesh-reflex-health` whose `eff_maxage` multiplier is broken (`s*1`) and asserts the audit
+flips from clean(0) to violation(1) on the same reflex, then that the real genome is clean.
+
+## Second gate class (`band-gate` — a compound boundary predicate)
+
+To show the ROM pattern is not a one-off, a **structurally different** gate is ported: a
+two-edged band `lo ≤ value ≤ hi` (RED past *either* edge), vs. lease's single ratio `≥`.
+Same portable-artifact story — a 165-byte ROM, byte-identical everywhere; the shim is I/O only.
+
+```sh
+./bin/uxnasm band-gate.tal band-gate.rom
+./mesh-band-gate 20 55 80                       # -> OK  (within band)
+./mesh-band-gate 20 92 80                       # -> RED (above the band)
+./mesh-band-gate --name battery 92 band-fixtures # resolve [lo,hi] for a named band, gate the value
+./test-band-gate                                # RED-first proof
+```
+
+`test-band-gate` proves both edges are real arithmetic, not a constant: it corrupts each
+`GTH2` comparison in turn (to a no-op) and demands a genuinely out-of-band value then *wrongly*
+passes — so the uncorrupted ROM's RED is the lo edge AND the hi edge, not one of them. Real mesh
+use of a two-edged window: a Li-ion longevity band (20–80%), an NVMe thermal window, a healthy
+PSI range (`band-fixtures`).
 
 ## Portability (same ROM, two architectures)
 
