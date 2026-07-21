@@ -13,38 +13,53 @@
 # last confirmed consensus (marked "(held)") instead of blanking or flapping to a minority
 # report — the actual noise-reduction this study set out for.
 #
-# Usage:
-#   printf 'worker|opinion\n...' | mesh-vote <topic>       # one round, prints consensus line
-#   printf 'worker|opinion\n...' | mesh-vote <topic> --json
-#   mesh-vote --test
+# STUDY(Raft / Paxos consensus, 2026-07-21) addendum: the cluster algorithm is now CONFIGURABLE.
+#   --algo bft         (default) the reputation-weighted BFT plurality above (2/3 weight quorum).
+#   --algo multipaxos  Multi-Paxos over the round stream: a stable LEADER (distinguished
+#                      proposer) proposes its own opinion as the value for the NEXT LOG SLOT;
+#                      the round's workers are the acceptors — an agreeing opinion is an accept,
+#                      a dissent is a nack. Majority (> n/2 of the round's acceptors) accepts ->
+#                      the value is CHOSEN for that slot and appended to a per-topic append-only
+#                      log. Phase 1 (prepare: ballot+1 + leader election from the plurality
+#                      partition) runs ONLY on leader change — steady-state slots are
+#                      accept-only, which is the Multi-Paxos optimization over vanilla Paxos.
+#                      A leader that loses its majority is DEPOSED: nothing is chosen (safety
+#                      holds — held output, log untouched), and the next round runs phase 1 at
+#                      a strictly higher ballot. Crash-fault model (simple majority) vs bft's
+#                      2/3 Byzantine quorum — that tradeoff is why the algorithm is selectable.
 #
-# State: ~/.mesh/vote-state/<topic>.json — {reputation: {worker: 0..1}, last_consensus, last_confidence}
-# Small in-tree STUDY prototype (idea-queue byzantine-consensus, 2026-07-08) — not wired into any
-# dash/cron; a real integration (e.g. mesh-dash rendering a topic's vote) is a separate step.
+# Usage:
+#   printf 'worker|opinion\n...' | mesh-vote <topic> [--json] [--algo bft|multipaxos]
+#   mesh-vote --test
+# Env: MESH_VOTE_ALGO=bft|multipaxos (default bft; the --algo flag wins).
+#
+# State: ~/.mesh/vote-state/<topic>.json —
+#   bft:        {reputation: {worker: 0..1}, last_consensus, last_confidence}
+#   multipaxos: {paxos: {ballot, leader, slot, log: [{slot,ballot,value}...], last_chosen}}
+# Small in-tree STUDY prototype (idea-queue byzantine-consensus 2026-07-08 + raft-paxos
+# 2026-07-18) — not wired into any dash/cron; a real integration is a separate step.
 set -uo pipefail
 QUORUM=0.66
 
 _run() {
-  local topic="$1" state_dir="$HOME/.mesh/vote-state" state_file json_mode="${2:-0}" votes_file
+  local topic="$1" state_dir="$HOME/.mesh/vote-state" state_file json_mode="${2:-0}" algo="${3:-bft}" votes_file
   mkdir -p "$state_dir" 2>/dev/null
   state_file="$state_dir/$topic.json"
   # heredoc (below) occupies python's stdin, so the caller's piped votes must be captured to a
   # file FIRST — otherwise the vote data is silently lost under the heredoc redirect.
   votes_file="$(mktemp)" || { echo "mesh-vote: FAIL (mktemp)" >&2; return 1; }
   cat > "$votes_file"
-  python3 - "$state_file" "$json_mode" "$QUORUM" "$votes_file" << 'PYEOF'
+  python3 - "$state_file" "$json_mode" "$QUORUM" "$votes_file" "$algo" << 'PYEOF'
 import sys, json, os
 
-state_file, json_mode, quorum, votes_file = sys.argv[1], sys.argv[2] == "1", float(sys.argv[3]), sys.argv[4]
+state_file, json_mode, quorum, votes_file, algo = \
+    sys.argv[1], sys.argv[2] == "1", float(sys.argv[3]), sys.argv[4], sys.argv[5]
 
 try:
     with open(state_file) as f:
         state = json.load(f)
 except (FileNotFoundError, ValueError):
     state = {}
-reputation = state.get("reputation", {})
-last_consensus = state.get("last_consensus")
-last_confidence = state.get("last_confidence", 0.0)
 
 votes = {}  # worker -> opinion
 with open(votes_file) as vf:
@@ -59,48 +74,103 @@ for line in vote_lines:
     if worker and opinion:
         votes[worker] = opinion
 
-if not votes:
-    out = {"topic": None, "consensus": last_consensus, "confidence": last_confidence,
-           "quorum_reached": False, "held": True, "n": 0, "error": "no votes"}
-else:
-    tally = {}
-    for worker, opinion in votes.items():
-        w = reputation.get(worker, 0.5)
-        tally[opinion] = tally.get(opinion, 0.0) + w
-    total_weight = sum(reputation.get(w, 0.5) for w in votes)
-    winner, winner_weight = max(tally.items(), key=lambda kv: kv[1])
-    confidence = (winner_weight / total_weight) if total_weight > 0 else 0.0
-    quorum_reached = confidence >= quorum
-
-    if quorum_reached:
-        for worker in votes:
-            agreed = 1.0 if votes[worker] == winner else 0.0
-            prev = reputation.get(worker, 0.5)
-            reputation[worker] = max(0.05, min(1.0, prev * 0.9 + agreed * 0.1))
-        consensus, out_confidence, held = winner, confidence, False
-    else:
-        # split round: no clear truth signal, don't reward/penalize reputations —
-        # hold the last confirmed consensus instead of flapping to a minority report
-        consensus, out_confidence, held = last_consensus, last_confidence, True
-
-    state["reputation"] = reputation
-    state["last_consensus"] = consensus
-    state["last_confidence"] = out_confidence
+def save():
     with open(state_file, "w") as f:
         json.dump(state, f)
 
-    out = {"consensus": consensus, "confidence": round(out_confidence, 3),
-           "quorum_reached": quorum_reached, "held": held, "n": len(votes),
-           "reputation": {k: round(v, 3) for k, v in reputation.items()}}
+if algo == "multipaxos":
+    px = state.get("paxos", {"ballot": 0, "leader": None, "slot": 0, "log": [], "last_chosen": None})
+    if not votes:
+        out = {"algo": "multipaxos", "consensus": px.get("last_chosen"), "chosen": False,
+               "held": True, "n": 0, "error": "no votes"}
+        text = f"NO VOTES (0) — holding: {px.get('last_chosen') or 'UNKNOWN'}"
+    else:
+        n = len(votes)
+        majority = n // 2 + 1
+        phase1 = False
+        if not px["leader"] or px["leader"] not in votes:
+            # PHASE 1 (prepare): new ballot; elect the proposer from the plurality partition
+            # (deterministic: biggest partition, ties by opinion then worker name) so a lone
+            # permanent dissenter can never re-elect itself into a livelock.
+            tally = {}
+            for o in votes.values():
+                tally[o] = tally.get(o, 0) + 1
+            best = sorted(tally.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
+            px["leader"] = sorted(w for w, o in votes.items() if o == best)[0]
+            px["ballot"] += 1
+            phase1 = True
+        leader = px["leader"]
+        proposed = votes[leader]
+        accepts = sum(1 for o in votes.values() if o == proposed)
+        if accepts >= majority:
+            # CHOSEN: append-only — a decided slot is never rewritten (Paxos safety)
+            px["log"].append({"slot": px["slot"], "ballot": px["ballot"], "value": proposed})
+            slot_decided = px["slot"]
+            px["slot"] += 1
+            px["last_chosen"] = proposed
+            chosen = True
+        else:
+            # liveness lost under this leader — depose; next round runs phase 1 at ballot+1.
+            # Nothing is chosen and the log is untouched: safety over availability.
+            px["leader"] = None
+            chosen = False
+        state["paxos"] = px
+        save()
+        out = {"algo": "multipaxos", "consensus": proposed if chosen else px["last_chosen"],
+               "chosen": chosen, "held": not chosen, "ballot": px["ballot"], "leader": leader,
+               "phase1": phase1, "accepts": accepts, "n": n,
+               "slot": slot_decided if chosen else px["slot"]}
+        if chosen:
+            p1 = " (phase1)" if phase1 else ""
+            text = f"{proposed} — chosen slot={slot_decided} ballot={px['ballot']} leader={leader} accepts={accepts}/{n}{p1}"
+        else:
+            text = (f"{px['last_chosen'] or 'UNKNOWN'} — held (no majority: accepts {accepts}/{n}, "
+                    f"leader {leader} deposed) ballot={px['ballot']}")
+else:
+    reputation = state.get("reputation", {})
+    last_consensus = state.get("last_consensus")
+    last_confidence = state.get("last_confidence", 0.0)
+
+    if not votes:
+        out = {"topic": None, "consensus": last_consensus, "confidence": last_confidence,
+               "quorum_reached": False, "held": True, "n": 0, "error": "no votes"}
+        text = f"NO VOTES (0) — holding: {last_consensus or 'UNKNOWN'}"
+    else:
+        tally = {}
+        for worker, opinion in votes.items():
+            w = reputation.get(worker, 0.5)
+            tally[opinion] = tally.get(opinion, 0.0) + w
+        total_weight = sum(reputation.get(w, 0.5) for w in votes)
+        winner, winner_weight = max(tally.items(), key=lambda kv: kv[1])
+        confidence = (winner_weight / total_weight) if total_weight > 0 else 0.0
+        quorum_reached = confidence >= quorum
+
+        if quorum_reached:
+            for worker in votes:
+                agreed = 1.0 if votes[worker] == winner else 0.0
+                prev = reputation.get(worker, 0.5)
+                reputation[worker] = max(0.05, min(1.0, prev * 0.9 + agreed * 0.1))
+            consensus, out_confidence, held = winner, confidence, False
+        else:
+            # split round: no clear truth signal, don't reward/penalize reputations —
+            # hold the last confirmed consensus instead of flapping to a minority report
+            consensus, out_confidence, held = last_consensus, last_confidence, True
+
+        state["reputation"] = reputation
+        state["last_consensus"] = consensus
+        state["last_confidence"] = out_confidence
+        save()
+
+        out = {"consensus": consensus, "confidence": round(out_confidence, 3),
+               "quorum_reached": quorum_reached, "held": held, "n": len(votes),
+               "reputation": {k: round(v, 3) for k, v in reputation.items()}}
+        tag = "(held, no quorum)" if held else "(quorum)"
+        text = f"{consensus} — confidence {out['confidence']*100:.0f}% {tag} n={len(votes)}"
 
 if json_mode:
     print(json.dumps(out))
 else:
-    if out.get("error"):
-        print(f"NO VOTES ({out['n']}) — holding: {out['consensus'] or 'UNKNOWN'}")
-    else:
-        tag = "(held, no quorum)" if out["held"] else "(quorum)"
-        print(f"{out['consensus']} — confidence {out['confidence']*100:.0f}% {tag} n={out['n']}")
+    print(text)
 PYEOF
 }
 
@@ -144,17 +214,87 @@ case "${1:-}" in
     printf '%s' "$outj" | grep -q '"consensus": "up"' || {
       echo "smoke-test: FAIL (json mode missing consensus field: $outj)"; exit 1; }
 
+    # ---- multipaxos algorithm option ----
+    # Slot 0: fresh topic -> phase 1 (ballot 1) + leader elected from the plurality partition
+    # (all agree -> lexicographically-first worker a), value chosen by 3/3 majority.
+    mp1="$(printf 'a|blue\nb|blue\nc|blue\n' | HOME="$tmp" "$0" ptopic --algo multipaxos 2>&1)" || {
+      echo "smoke-test: FAIL (paxos slot0 failed: $mp1)"; exit 1; }
+    printf '%s' "$mp1" | grep -q '^blue — chosen slot=0 ballot=1 leader=a accepts=3/3 (phase1)' || {
+      echo "smoke-test: FAIL (paxos slot0 expected phase1 + chosen at ballot 1: $mp1)"; exit 1; }
+
+    # Slot 1, same leader alive: the Multi-Paxos optimization — NO phase 1, ballot UNCHANGED,
+    # slot advances. (MESH_VOTE_ALGO env must route the algorithm too, so use it here.)
+    mp2="$(printf 'a|green\nb|green\nc|green\n' | HOME="$tmp" MESH_VOTE_ALGO=multipaxos "$0" ptopic 2>&1)" || {
+      echo "smoke-test: FAIL (paxos slot1 failed: $mp2)"; exit 1; }
+    printf '%s' "$mp2" | grep -q '^green — chosen slot=1 ballot=1 leader=a accepts=3/3$' || {
+      echo "smoke-test: FAIL (paxos steady-state slot must skip phase1 and keep ballot=1: $mp2)"; exit 1; }
+
+    # Leader a crashes (absent from the round) -> phase 1 re-runs: ballot strictly higher,
+    # new leader from the live plurality (b), slot 2 chosen.
+    mp3="$(printf 'b|red\nc|red\n' | HOME="$tmp" "$0" ptopic --algo multipaxos 2>&1)" || {
+      echo "smoke-test: FAIL (paxos failover failed: $mp3)"; exit 1; }
+    printf '%s' "$mp3" | grep -q '^red — chosen slot=2 ballot=2 leader=b accepts=2/2 (phase1)' || {
+      echo "smoke-test: FAIL (leader crash must raise the ballot and elect a new leader: $mp3)"; exit 1; }
+
+    # Leader b loses its majority (proposes red, 1/3 accepts) -> NOTHING chosen (safety: held
+    # output, log untouched), leader deposed.
+    mp4="$(printf 'b|red\nc|blue\nd|blue\n' | HOME="$tmp" "$0" ptopic --algo multipaxos 2>&1)" || {
+      echo "smoke-test: FAIL (paxos minority round failed: $mp4)"; exit 1; }
+    printf '%s' "$mp4" | grep -q '^red — held (no majority: accepts 1/3, leader b deposed) ballot=2' || {
+      echo "smoke-test: FAIL (minority proposal must hold + depose, never choose: $mp4)"; exit 1; }
+
+    # Next round after depose: phase 1 at ballot 3, leader from the blue plurality (c), chosen.
+    mp5="$(printf 'b|blue\nc|blue\nd|blue\n' | HOME="$tmp" "$0" ptopic --algo multipaxos 2>&1)" || {
+      echo "smoke-test: FAIL (paxos re-election failed: $mp5)"; exit 1; }
+    printf '%s' "$mp5" | grep -q '^blue — chosen slot=3 ballot=3 leader=b accepts=3/3 (phase1)' || {
+      echo "smoke-test: FAIL (post-depose round must re-elect at a higher ballot: $mp5)"; exit 1; }
+
+    # Log invariants from the REAL state artifact (not the printed lines): append-only,
+    # contiguous slots 0..3, non-decreasing ballots, and the held round wrote no entry.
+    HOME="$tmp" python3 - << 'PYCHK' || { echo "smoke-test: FAIL (paxos log invariants violated)"; exit 1; }
+import json, os, sys
+with open(os.path.expanduser("~/.mesh/vote-state/ptopic.json")) as f:
+    log = json.load(f)["paxos"]["log"]
+assert [e["slot"] for e in log] == [0, 1, 2, 3], f"slots not contiguous: {log}"
+ballots = [e["ballot"] for e in log]
+assert ballots == sorted(ballots), f"ballot regressed: {ballots}"
+assert [e["value"] for e in log] == ["blue", "green", "red", "blue"], f"log rewritten: {log}"
+PYCHK
+
+    # --json carries the algo + chosen fields
+    mpj="$(printf 'a|up\nb|up\n' | HOME="$tmp" "$0" pjson --json --algo multipaxos 2>&1)" || {
+      echo "smoke-test: FAIL (paxos json failed: $mpj)"; exit 1; }
+    printf '%s' "$mpj" | grep -q '"algo": "multipaxos"' && printf '%s' "$mpj" | grep -q '"chosen": true' || {
+      echo "smoke-test: FAIL (paxos json missing algo/chosen: $mpj)"; exit 1; }
+
+    # Unknown algo must refuse loudly, not silently fall back to bft
+    if printf 'a|x\n' | HOME="$tmp" "$0" badalgo --algo raft >/dev/null 2>&1; then
+      echo "smoke-test: FAIL (unknown --algo must be rejected)"; exit 1
+    fi
+
     echo "smoke-test: ok"
     exit 0
     ;;
-  ""|--json)
-    echo "usage: mesh-vote <topic> [--json]  (opinions on stdin as worker|opinion)" >&2
+  ""|--json|--algo)
+    echo "usage: mesh-vote <topic> [--json] [--algo bft|multipaxos]  (opinions on stdin as worker|opinion)" >&2
     exit 1
     ;;
   *)
     topic="$1"; shift
     json_mode=0
-    [ "${1:-}" = --json ] && json_mode=1
-    _run "$topic" "$json_mode"
+    algo="${MESH_VOTE_ALGO:-bft}"
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --json) json_mode=1 ;;
+        --algo) shift; algo="${1:-}" ;;
+        *) echo "mesh-vote: unknown arg '$1'" >&2; exit 1 ;;
+      esac
+      shift
+    done
+    case "$algo" in
+      bft|multipaxos) ;;
+      *) echo "mesh-vote: unknown algo '$algo' (bft|multipaxos)" >&2; exit 1 ;;
+    esac
+    _run "$topic" "$json_mode" "$algo"
     ;;
 esac
