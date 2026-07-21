@@ -252,6 +252,32 @@ Rules:
 runs. `mesh-tell --node <peer> <window>` will fail. First-time deploy to a rebooted peer must go over
 raw SSH: `ssh user@ip "~/.local/bin/mesh-restore"`. After that, `mesh-tell` works.
 
+## Subagents — spend context outside the pane (operator 2026-07-21)
+
+Every claude mind has the engine's subagent machinery (the Agent tool; `bypassPermissions` means it
+runs unattended), and the pane's context window is the mind's scarcest resource — the whole
+handoff/`mesh-clear` apparatus above exists because filling it forces a lossy `/clear`. **Delegate
+heavy-context work to subagents so those tokens never enter the pane:** broad searches and multi-file
+audits (read-only `Explore` agent), long log/corpus reads, multi-step side-quests (`general-purpose`),
+and independent parallel fixes (one agent each; worktree isolation when they mutate files — still
+landed via `mesh-land`, never pushed by the agent). Only the *conclusion* comes back. A mind that
+greps twenty files in its own pane is spending its thread to do a subagent's job.
+
+Boundaries (mesh safety — these are NOT delegable):
+
+- **Substrate stays in the mind's own hands.** Claims, `mesh-dms`, any `ip`/route/DNS/nft/WireGuard
+  edit — the single-writer discipline is per-mind, and a subagent touching the substrate is a second
+  writer nobody can see or coordinate with. Subagents may *read* substrate state, never write it.
+- **The board/room is the mind's voice.** Subagents return raw findings; the MIND posts
+  `[task]`/`[taking]`/`[done]`/`[fyi]` itself. A subagent posting to `mesh-chat` impersonates the
+  window and corrupts claim routing.
+- **Subagent work is invisible to the mesh** — it runs outside tmux, so the shared-scrollback rule
+  applies with full force: a load-bearing finding a subagent made does not exist until the mind lands
+  it in the pane/board by its own hand.
+- **A subagent's report is a claim, not an artifact.** Verification doctrine is unchanged: before
+  acting on or posting a subagent's result, check the artifact itself (file on disk, ref moved, test
+  seen red-then-green). "My subagent says the tests pass" is the same sentence as "the camera works".
+
 ## Channel set (planted by `mesh-restore`)
 
 A mind node's session is a uniform set of 2-pane channels (top DATA via `mesh-dash <role>`, bottom
