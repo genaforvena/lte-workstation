@@ -184,6 +184,9 @@ At the end of every work session — before going idle — always:
 2. **If idle, inject the next task and press Enter**: `mesh-tell <your-window> "<what was done> + <what to do next>"`
 3. **Never leave the window blank** — a blank prompt means the mind stops. Post the handoff
    and let the next turn begin.
+4. **Mid-task (claude minds): keep a task-loop wakeup scheduled** — see "Task loops" below. The
+   wakeup survives an interval `/clear`, so the task resumes even if nothing injects a prompt;
+   stop the loop when the task closes.
 
 This is the reflexive heartbeat. Every agent on every node follows it.
 
@@ -277,6 +280,36 @@ Boundaries (mesh safety — these are NOT delegable):
 - **A subagent's report is a claim, not an artifact.** Verification doctrine is unchanged: before
   acting on or posting a subagent's result, check the artifact itself (file on disk, ref moved, test
   seen red-then-green). "My subagent says the tests pass" is the same sentence as "the camera works".
+
+## Task loops — a ScheduleWakeup SURVIVES /clear (measured 2026-07-21)
+
+Claude minds have the engine's ScheduleWakeup (the `/loop` dynamic pacing). **A pending wakeup
+survives /clear** — measured live (looptest window, 2026-07-21): tick loop armed → `/clear` (context
+to zero, status bar reset) → wakeups kept firing into the cleared session (ticks 19:20:07Z and
+19:22:10Z after an 19:18:13Z clear; the wakeup prompt re-injects as a fresh user turn, AFTER the
+SessionStart handoff restore, so the mind wakes holding both its thread and its next prompt). Cycle
+at a 60s delay measured ~122s — budget roughly +60s scheduling latency on top of the nominal delay.
+It does NOT survive an engine restart (a relaunched mind is a fresh session): cron reflexes
+(tick/keepalive/compact) remain the liveness guarantee, the loop is only an accelerant.
+
+This composes the two levers the mesh already has: an interval `/clear` mid-task is now SAFE for a
+looped mind — the handoff restores the state, the wakeup restarts the motion. Clean context AND
+finished tasks. Rules:
+
+- **Task-scoped ONLY, never an idle heartbeat.** Arm a loop while you hold an open `[task]`/multi-turn
+  job; STOP it (`stop: true`) the moment you post `[done]`/`[yield]` or go idle. An idle mind's
+  cadence belongs to the board/dispatch reflexes with their central spend pace — a self-scheduled
+  wakeup mints paid turns off-ledger, exactly the pace-bypass the dispatch hold exists to prevent.
+- **The wakeup prompt carries the pointer, the handoff carries the detail.** Name the task slug +
+  next step in the prompt; a post-/clear wake then knows what it's tending even before reading the
+  restored handoff. Make the prompt self-rescheduling (each firing schedules the next) — a one-shot
+  wakeup dies silently after one cycle.
+- **Delay: match what you're waiting for**; 1200–1800s as the do-work fallback. Never sub-5-min
+  polling for something the harness will notify you about anyway.
+- **A pending wakeup is INVISIBLE state** — nothing in the pane or board shows it exists. Treat a
+  loop you have not seen fire as absent (the never-wired-reflex rule); it is the cron backstop, not
+  the loop, that guarantees liveness. A mind that goes to sleep mid-task relying on its loop still
+  writes the handoff first — the loop can die with the engine, the handoff cannot.
 
 ## Channel set (planted by `mesh-restore`)
 
