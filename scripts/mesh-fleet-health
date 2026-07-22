@@ -108,6 +108,35 @@ ssh_reachable() {
   ssh "${opts[@]}" "${user}@${ip}" 'true' 2>/dev/null < /dev/null
 }
 
+# --- local-starvation guard against the faked all-DOWN -------------------
+# EVERY reachability verdict here is a LOCAL probe (ssh ConnectTimeout=6 / ping -W1). When THIS box
+# is under a CPU burst (load1 ~44, the operator's "it keeps killing my ssh"), our own ssh/ping starve
+# and time out — so a failed probe is NOT evidence the peer is down, it's evidence WE couldn't ask.
+# Branding every peer UNREACHABLE/OFFLINE then poisons the dash FLEET pane (and its cache) with a
+# fleet-wide outage that is really just local starvation (health@ 2026-07-22, false-alarm 3x/session).
+# This is the inverse of the honest-fusion rule: never a faked all-DOWN either. A peer that ANSWERS is
+# still trusted (the positive is reliable); only the negative is downgraded to UNKNOWN(load).
+
+# local_starved [injected_load] -> 1 if load1 > threshold, else 0. Threshold = MESH_LOAD_GATE_MAX or
+# nproc*0.9 (same convention mesh-load-gate uses for the operator's ssh-starvation tuning), but WITHOUT
+# its shed-log side effect (fleet-health still RUNS — it only downgrades the verdict, it is not shed).
+# Load unreadable -> 0 (NOT starved): fail toward the honest DOWN, never mask a real outage on a bad read.
+local_starved() {
+  local l1 thr nproc
+  l1="${MESH_FLEET_FORCE_LOAD:-$(awk '{print $1}' /proc/loadavg 2>/dev/null)}"
+  printf '%f' "$l1" >/dev/null 2>&1 || { echo 0; return; }
+  nproc="$(nproc 2>/dev/null)"; [ "${nproc:-0}" -gt 0 ] 2>/dev/null || nproc=1
+  thr="${MESH_LOAD_GATE_MAX:-$(awk -v n="$nproc" 'BEGIN{printf "%.1f", n*0.9}')}"
+  [ "$(awk "BEGIN{print ($l1 > $thr) ? 1 : 0}")" = 1 ] && echo 1 || echo 0
+}
+
+# down_label <natural:UNREACHABLE|OFFLINE> <starved:0|1> -> the honest DOWN verdict. Starved -> the
+# negative is untrustworthy, render UNKNOWN(load); calm -> the natural DOWN stands. Pure, unit-tested.
+down_label() {
+  local natural="$1" starved="$2"
+  if [ "$starved" = 1 ]; then echo "UNKNOWN(load)"; else echo "$natural"; fi
+}
+
 # --- fetch local card ----------------------------------------------------
 fetch_local() {
   mesh-card 2>/dev/null | grep -E "^  (power|vitals|upstream|default-egress|minds):"
@@ -162,6 +191,14 @@ if [ "${1:-}" = "--test" ]; then
     echo 'OK 2026-07-05T00:00:00Z peers=3 direct=3 relay=0 offline=0 | a=direct b=direct c=direct' > "$_pf"; touch "$_pf"
     path_quality_line "$_pf" | grep -qE '^PATH: OK .*relay=0' || { rm -f "$_pf"; echo "smoke-test: FAIL (all-direct must render plain OK line)"; exit 1; }
     rm -f "$_pf"
+    # Starvation guard: a failed LOCAL probe under a CPU burst must NOT be branded a faked all-DOWN.
+    down_label UNREACHABLE 0 | grep -qx 'UNREACHABLE'   || { echo "smoke-test: FAIL (calm: honest UNREACHABLE must survive)"; exit 1; }
+    down_label OFFLINE 0     | grep -qx 'OFFLINE'       || { echo "smoke-test: FAIL (calm: honest OFFLINE must survive)"; exit 1; }
+    down_label UNREACHABLE 1 | grep -qx 'UNKNOWN(load)' || { echo "smoke-test: FAIL (starved: UNREACHABLE must downgrade to UNKNOWN, not a faked DOWN)"; exit 1; }
+    down_label OFFLINE 1     | grep -qx 'UNKNOWN(load)' || { echo "smoke-test: FAIL (starved: OFFLINE must downgrade to UNKNOWN)"; exit 1; }
+    [ "$(MESH_FLEET_FORCE_LOAD=999 local_starved)" = 1 ] || { echo "smoke-test: FAIL (load 999 must read STARVED)"; exit 1; }
+    [ "$(MESH_FLEET_FORCE_LOAD=0.1 local_starved)" = 0 ] || { echo "smoke-test: FAIL (load 0.1 must read calm)"; exit 1; }
+    [ "$(MESH_FLEET_FORCE_LOAD=abc local_starved)" = 0 ] || { echo "smoke-test: FAIL (unreadable load must fail toward calm/honest-DOWN)"; exit 1; }
     # Artifact test: fetch_local() must return non-empty card fields (self-scan, no SSH needed).
     # Catches the hollow class: mesh-card broken/absent → empty local row silently (no failure).
     local_card="$(fetch_local 2>/dev/null)"
@@ -172,7 +209,9 @@ fi
 
 # --- main -----------------------------------------------------------------
 . "$HOME/.mesh/nodes" 2>/dev/null   # MESH_ROLES + MESH_NODES — role-aware MINDS column (off-mesh)
+STARVED="$(local_starved)"          # 1 = local CPU burst; the DOWN verdicts below become UNKNOWN(load)
 echo "=== mesh-fleet-health $(ts) ==="
+[ "$STARVED" = 1 ] && echo "⚠ LOCAL LOAD HIGH (load1=$(awk '{print $1}' /proc/loadavg 2>/dev/null)) — reachability probe UNRELIABLE; non-answers shown as UNKNOWN(load), NOT down"
 echo
 print_row "NODE" "REACHABLE" "POWER" "VITALS" "UPSTREAM" "MINDS" "EGRESS-DEV"
 print_row "--------------------" "----------" "------------" "--------" "--------" "----------------------" "----------"
@@ -218,11 +257,11 @@ while IFS='|' read -r host ts_ip online; do
         print_row "$host" "LAN-ping" "-" "-" "-" "(no-ssh)" "-"; shown=1; break
       fi
     done
-    [ -n "$shown" ] || print_row "$host" "OFFLINE" "-" "-" "-" "-" "-"
+    [ -n "$shown" ] || print_row "$host" "$(down_label OFFLINE "$STARVED")" "-" "-" "-" "-" "-"
     continue
   fi
 
-  addr=$(resolve_addr "$pname" "$ts_ip") || { print_row "$host" "UNREACHABLE" "-" "-" "-" "-" "-"; continue; }
+  addr=$(resolve_addr "$pname" "$ts_ip") || { print_row "$host" "$(down_label UNREACHABLE "$STARVED")" "-" "-" "-" "-" "-"; continue; }
   user=$(peer_user "$pname")
   port=$(peer_port "$pname")
 
@@ -243,7 +282,7 @@ while IFS='|' read -r host ts_ip online; do
       if [ "${rtemp:-0}" -gt 0 ] 2>/dev/null; then rvit="$((rtemp/1000))C/ld${rload:-?}"; else rvit="reachable"; fi
       print_row "$host" "NO-CARD" "-" "$rvit" "-" "-" "-"
     else
-      print_row "$host" "UNREACHABLE" "-" "-" "-" "-" "-"
+      print_row "$host" "$(down_label UNREACHABLE "$STARVED")" "-" "-" "-" "-" "-"
     fi
     continue
   fi
@@ -277,7 +316,7 @@ for n in ${MESH_NODES:-}; do
          | sed -E 's/.*load average[s]?:[[:space:]]*//' | awk '{print $1}' | tr -d ,)
     print_row "$label" "yes(LAN)" "-" "${ld:+ld$ld}" "-" "(off-mesh)" "-"
   else
-    print_row "$label" "UNREACHABLE" "-" "-" "-" "-" "-"
+    print_row "$label" "$(down_label UNREACHABLE "$STARVED")" "-" "-" "-" "-" "-"
   fi
 done
 rm -f "$peers_file"
