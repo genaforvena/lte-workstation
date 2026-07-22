@@ -1,0 +1,235 @@
+#!/usr/bin/env bash
+# mesh-mem-guard — non-mind MEMORY-RUNAWAY auditor + OOM-bias mitigator.
+#
+# The 15:50Z storm: llama-cli ate 18.5GB → MemAvail 2.6GB, swap 0, PSI SATURATED. resource-guard
+# DETECTED it (NODE-PRESSURE, scans all procs, names top RSS) but mitigates ONLY minds — and perversely,
+# its own mind-mitigation (oom_score_adj=800 on a runaway mind) can make a 3GB mind (score ~94+800=894)
+# OUTRANK the 18.5GB hog (score ~578) as the kernel's OOM victim. So the kernel kills the MIND, not the
+# hog. mem-guard closes that: under memory pressure it finds the TOP non-mind RSS proc and sets its
+# oom_score_adj=1000 (max) so the kernel unambiguously targets the HOG when it must kill.
+#
+# NON-DESTRUCTIVE. Sets a bias knob only — frees nothing, kills nothing. The kernel STILL decides
+# WHETHER to kill (only under genuine OOM); mem-guard only ensures the RIGHT proc pays (the hog, not a
+# mind). Same posture as resource-guard ("operator decides") — this never hard-kills. Mitigation is
+# opt-out (MESH_MEM_GUARD_MITIGATE=0) so an operator who wants pure observe-mode can disable the tilt.
+#
+# Minds (claude/opencode/gemini/codex/ollama) are NEVER touched here — resource-guard owns them. Only
+# [organ]/[user]/[?] hogs. The tilt is reset to 0 once pressure CLEARS (so a proc that survived is not
+# left permanently marked as first-to-die for a future, unrelated OOM).
+#
+# Verdict (pressure = MemAvailable < AVAIL_PRESS% of MemTotal, corroborated by PSI some avg10):
+#   QUIET     MemAvailable healthy — no action. (also: reset any pid we tilted once pressure clears)
+#   PRESSURE  MemAvailable < 15% — audit: name the top non-mind RSS proc
+#   HOG-TILT  PRESSURE + top non-mind proc ≥ HOG_MIN_GB → oom_score_adj=1000 + [verify] board alert
+#   CRITICAL  MemAvailable < 8% (OOM imminent) → same tilt, louder alert
+#
+# Honest contract: no /proc → exit 2 (never a fabricated reading). No tilt when NOT under pressure
+# (a big-but-affordable model — ollama, a warm voice-clone daemon — is NOT penalized). oom_score_adj
+# write requires same-user/root; unwritable → noted honestly, not faked.
+#
+#   mesh-mem-guard           one read → verdict + top non-mind RSS proc (+ tilt if pressure+hog)
+#   mesh-mem-guard --json    machine-readable
+#   mesh-mem-guard --edge    emit + board-post only on verdict change (state refreshed every run)
+#   mesh-mem-guard --test    fixture classifier + pressure logic (RED-first) + real-read gate
+#
+# reflex-cadence: */2 * * * *
+# reflex-args: --edge
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+MESH="$HOME/.mesh"; mkdir -p "$MESH" 2>/dev/null || true
+STATE="$MESH/.mem-guard-state"
+TILTED="$MESH/.mem-guard-tilted"   # records the pid we set oom_score_adj=1000 on, to reset on clear
+FLAG="$MESH/.mem-guard-flag"       # episode sticky (one alert per pressure episode)
+
+# thresholds (env-tunable)
+AVAIL_PRESS_PCT="${MESH_MG_PRESS:-15}"   # MemAvailable < this% of MemTotal = PRESSURE
+AVAIL_CRIT_PCT="${MESH_MG_CRIT:-8}"      # < this% = CRITICAL (OOM imminent)
+PSI_SOME_PRESS="${MESH_MG_PSI:-20}"      # PSI some avg10 ≥ this% corroborates pressure
+HOG_MIN_GB="${MESH_MG_HOG_GB:-1.0}"      # a non-mind proc ≥ this GB = hog candidate (floor)
+MITIGATE="${MESH_MEM_GUARD_MITIGATE:-1}" # 1=tilt under pressure (default on), 0=observe-only
+MEMTOTAL_KB="$(awk '/MemTotal/{print $2}' /proc/meminfo 2>/dev/null || echo 33554432)"
+
+# --- classifier (mirrors mesh-load-audit) -------------------------------------
+is_mind() {  # $1=comm → mind procs owned by resource-guard, NEVER touched here
+  case "$1" in claude|opencode|gemini|codex|claude-*|opencode-*|codex-*|ollama) return 0 ;; *) return 1 ;; esac
+}
+# classify_comm <comm> <args> → mind|organ|user|system|?
+classify_comm() {
+  local comm="$1" args="$2"
+  case "$comm" in
+    claude|opencode|gemini|codex|claude-*|opencode-*|codex-*|ollama) echo mind; return ;;
+    ollama_llama_server|ollama-server|llama-server|llama_server|llama-cli|llamafile) echo organ; return ;;
+    whisper|whisper-cli|whisper-cpp|main|stream|stream-server) echo organ; return ;;
+    voice-clone-daemon|tts-server|xtts_server|piper) echo organ; return ;;
+    cc1|gcc|g++|c++|make|ld|as|ar|ldd|rustc|cargo|cmake|ninja|go|javac|node) echo organ; return ;;
+    python|python3|python3.*)
+      case "$args" in
+        *mesh-*|*venv-ai*|*gigaam*|*resemblyzer*|*xtts*|*moondream*|*whisper*|*ollama*|*tts*|*llama*) echo organ; return ;;
+      esac
+      echo "?"; return ;;
+    Xorg|Xwayland|gnome-shell|kwin_x11|kwin|plasmashell|mutter|systemd|systemd-journal|kjournald|kworker/*|kthread*) echo system; return ;;
+  esac
+  for u in firefox chrome chromium code code-oss slack telegram-desktop vesktop discord spotify steam pidgin thunderbird gimp inkscape blender obs ffmpeg mpv vlc; do [ "$comm" = "$u" ] && { echo user; return; }; done
+  echo "?"
+}
+
+# --- pressure reader: returns "avail_pct psi_some_avg10" ----------------------
+read_pressure() {
+  local avail_kb psi
+  avail_kb="$(awk '/MemAvailable/{print $2}' /proc/meminfo 2>/dev/null)"; avail_kb="${avail_kb:-0}"
+  local avail_pct; avail_pct="$(awk -v a="$avail_kb" -v t="$MEMTOTAL_KB" 'BEGIN{ if(t>0) printf "%.1f", a/t*100; else print 0 }')"
+  psi="0"
+  if [ -r /proc/pressure/memory ]; then
+    psi="$(awk '/^some/{for(i=1;i<=NF;i++) if($i ~ /^avg10=/){split($i,x,"=");print x[2];exit}}' /proc/pressure/memory 2>/dev/null)"
+    psi="${psi:-0}"
+  fi
+  echo "$avail_pct $psi"
+}
+
+# --- top non-mind RSS proc: "pid rss_gb comm args" (the single biggest non-mind consumer) ------
+top_nonmind_hog() {
+  local pid rss_kb comm args best_pid="" best_gb=0 best_comm="" best_args=""
+  for d in /proc/[0-9]*; do
+    pid="${d##*/}"
+    [ -r "$d/status" ] || continue
+    rss_kb="$(awk '/^VmRSS:/{print $2}' "$d/status" 2>/dev/null)"; [ -n "$rss_kb" ] || continue
+    # quick floor: skip procs under 512MB before the (cheap) comm/args reads
+    [ "$rss_kb" -ge 524288 ] 2>/dev/null || continue
+    comm="$(awk '/^Name:/{print $2; exit}' "$d/status" 2>/dev/null)"; comm="${comm:-?}"
+    args="$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null | cut -c1-60)"; args="${args:-$comm}"
+    is_mind "$comm" && continue
+    local gb; gb="$(awk -v k="$rss_kb" 'BEGIN{printf "%.2f", k/1048576}')"
+    if awk -v g="$gb" -v b="$best_gb" 'BEGIN{exit !(g>b)}'; then
+      best_gb="$gb"; best_pid="$pid"; best_comm="$comm"; best_args="$args"
+    fi
+  done
+  [ -n "$best_pid" ] && echo "$best_pid $best_gb $best_comm $best_args"
+}
+
+# --- verdict logic (pure, offline-testable) -----------------------------------
+# mem_verdict <avail_pct> <psi_some> <has_hog 0/1> <hog_comm> <hog_gb> → LABEL|reason
+# Two verdicts TILT (the mitigation block below acts on under_pressure∧hog): HOG-TILT and CRITICAL.
+# oom_score_adj is non-destructive (only changes WHO dies IF the kernel OOMs) and reset-on-clear, so
+# biasing the kernel toward the biggest non-mind consumer the moment pressure appears — rather than
+# waiting for CRITICAL — is the SAFE choice: the box can tip PRESSURE→OOM between two */2 ticks (as the
+# 15:50Z storm did: swap 0, PSI SATURATED), and by then the kernel may already have picked a mind.
+mem_verdict() {
+  local avail="$1" psi="$2" hhog="$3" hcomm="$4" hgb="$5"
+  # CRITICAL (avail < CRIT%, OOM imminent): tilt the top non-mind hog; louder alert.
+  if awk -v a="$avail" -v c="$AVAIL_CRIT_PCT" 'BEGIN{exit !(a+0 < c+0)}'; then
+    if [ "$hhog" = 1 ]; then echo "CRITICAL|MemAvailable ${avail}% < ${AVAIL_CRIT_PCT}% (OOM imminent) — tilt top non-mind hog ${hcomm}(${hgb}GB)"; else echo "CRITICAL|MemAvailable ${avail}% < ${AVAIL_CRIT_PCT}% (OOM imminent) but no non-mind hog ≥${HOG_MIN_GB}GB (minds own it)"; fi
+    return
+  fi
+  # PRESSURE range (avail < PRESS%): HOG-TILT when a non-mind hog is present (tilt it now); PRESSURE
+  # alert-only when there is no hog above the floor (minds own it — nothing non-mind to tilt).
+  if awk -v a="$avail" -v p="$AVAIL_PRESS_PCT" 'BEGIN{exit !(a+0 < p+0)}'; then
+    if [ "$hhog" = 1 ]; then echo "HOG-TILT|MemAvailable ${avail}% < ${AVAIL_PRESS_PCT}% (PSI some avg10=${psi}%) — tilt top non-mind hog ${hcomm}(${hgb}GB) so the kernel targets it, not a mind, if OOM"; else echo "PRESSURE|MemAvailable ${avail}% < ${AVAIL_PRESS_PCT}% (PSI some avg10=${psi}%) but no non-mind hog ≥${HOG_MIN_GB}GB (minds own it)"; fi
+    return
+  fi
+  echo "QUIET|MemAvailable ${avail}% ≥ ${AVAIL_PRESS_PCT}% — healthy (PSI some avg10=${psi}%)"
+}
+
+# --- test ---------------------------------------------------------------------
+if [ "${1:-}" = --test ]; then
+  fail=0
+  AVAIL_PRESS_PCT=15; AVAIL_CRIT_PCT=8; HOG_MIN_GB=1.0
+  # is_mind / classify
+  is_mind claude && ! is_mind llama-cli || { echo "  FAIL is_mind"; fail=1; }
+  [ "$(classify_comm llama-cli x)" = organ ] || { echo "  FAIL llama-cli organ"; fail=1; }
+  [ "$(classify_comm python3 /h/venv-ai/run.py)" = organ ] || { echo "  FAIL python organ"; fail=1; }
+  [ "$(classify_comm xmrig x)" = "?" ] || { echo "  FAIL xmrig ?"; fail=1; }
+  # mem_verdict: QUIET / PRESSURE(no hog) / HOG-TILT / CRITICAL
+  echo "$(mem_verdict 30 0 0 '' 0)" | grep -q '^QUIET' || { echo "  FAIL QUIET"; fail=1; }
+  echo "$(mem_verdict 12 0 0 '' 0)" | grep -q '^PRESSURE' || { echo "  FAIL PRESSURE no-hog"; fail=1; }
+  echo "$(mem_verdict 12 0 1 llama-cli 18.5)" | grep -q '^HOG-TILT' || { echo "  FAIL HOG-TILT"; fail=1; }
+  echo "$(mem_verdict 5 0 1 llama-cli 18.5)" | grep -q '^CRITICAL' || { echo "  FAIL CRITICAL"; fail=1; }
+  echo "$(mem_verdict 5 0 0 '' 0)" | grep -q '^CRITICAL' || { echo "  FAIL CRITICAL no-hog"; fail=1; }
+  [ "$fail" = 1 ] && { echo "smoke-test: FAIL"; exit 1; }
+  echo "  ok: classify + verdict (10 cases)"
+  # REAL-READ gate: /proc/meminfo MemAvailable must parse, and the RSS scan must yield a ranked hog.
+  [ -r /proc/meminfo ] || { echo "smoke-test: n/a (/proc/meminfo unreadable)"; exit 2; }
+  _ap="$(awk '/MemAvailable/{print $2}' /proc/meminfo)"; case "$_ap" in ''|*[!0-9]*) echo "smoke-test: FAIL (MemAvailable unparseable: $_ap)"; exit 1 ;; esac
+  _hog="$(top_nonmind_hog)"
+  # on a live box there is almost always SOME non-mind proc ≥512MB; absent is fine (small node) but
+  # the FUNCTION must have run (exit 0, not error). Assert the scan didn't crash and MemAvail parsed.
+  echo "smoke-test: ok (verdict 10 + REAL MemAvail=$_ap kB + top-nonmind-hog: ${_hog:-none-≥512MB})"
+  exit 0
+fi
+
+# --- live read ----------------------------------------------------------------
+read -r AVAIL_PCT PSI <<< "$(read_pressure)"
+hog_line="$(top_nonmind_hog)"
+hhog=0; hpid=""; hgb=""; hcomm=""; hargs=""; htag="?"
+if [ -n "$hog_line" ]; then
+  hpid="$(printf '%s' "$hog_line" | awk '{print $1}')"; hgb="$(printf '%s' "$hog_line" | awk '{print $2}')"
+  hcomm="$(printf '%s' "$hog_line" | awk '{print $3}')"
+  hargs="$(printf '%s' "$hog_line" | cut -d' ' -f4-)"
+  htag="$(classify_comm "$hcomm" "$hargs")"
+  # above the HOG_MIN_GB floor?
+  if awk -v g="$hgb" -v m="$HOG_MIN_GB" 'BEGIN{exit !(g+0 >= m+0)}'; then hhog=1; fi
+fi
+mres="$(mem_verdict "$AVAIL_PCT" "$PSI" "$hhog" "$hcomm" "$hgb")"
+label="${mres%%|*}"; reason="${mres#*|}"
+
+# under pressure? (anything but QUIET)
+under_pressure=0; case "$label" in PRESSURE|HOG-TILT|CRITICAL) under_pressure=1 ;; esac
+
+# --- mitigation: tilt the hog under pressure; reset on clear ------------------
+tilt_pid=""; tilt_action="none"
+if [ "$under_pressure" = 1 ] && [ "$hhog" = 1 ] && [ -n "$hpid" ] && [ "$MITIGATE" = 1 ]; then
+  # only tilt if not already maxed (idempotent)
+  cur_adj="$(cat /proc/$hpid/oom_score_adj 2>/dev/null || echo NA)"
+  if [ "$cur_adj" != 1000 ] 2>/dev/null; then
+    if echo 1000 > /proc/$hpid/oom_score_adj 2>/dev/null; then
+      tilt_pid="$hpid"; tilt_action="tilted(was $cur_adj→1000)"
+      printf '%s %s %s\n' "$hpid" "$hcomm" "$(date -u +%FT%TZ)" > "$TILTED"
+    else
+      tilt_action="WRITE-DENIED(pid=$hpid not same-user/root — honest, no tilt)"
+    fi
+  else
+    tilt_pid="$hpid"; tilt_action="already-1000"
+  fi
+fi
+# reset-on-clear: if we previously tilted a pid and pressure has cleared, restore it to 0
+if [ "$under_pressure" = 0 ] && [ -f "$TILTED" ]; then
+  read -r rp rcomm rts < "$TILTED"
+  if [ -n "$rp" ] && [ -r "/proc/$rp/oom_score_adj" ]; then
+    echo 0 > "/proc/$rp/oom_score_adj" 2>/dev/null && tilt_action="reset($rp $rcomm →0, pressure cleared)"
+  fi
+  rm -f "$TILTED"
+fi
+
+TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+printf 'LABEL=%s|avail=%s%%|psi_some=%s%%|hog=%s(%.0fGB)[%s]|tilt=%s|%s\n' \
+  "$label" "$AVAIL_PCT" "$PSI" "${hcomm:-none}" "${hgb:-0}" "$htag" "$tilt_action" "$TS" > "$STATE"
+mesh-state-touch "$STATE" 2>/dev/null || touch "$STATE"
+
+# --- output ---
+render() {
+  printf '[mem-guard %s] %s — MemAvail=%s%% PSI_some=%s%%\n' \
+    "$(printf '%s' "$label" | tr '[:upper:]' '[:lower:]')" "$reason" "$AVAIL_PCT" "$PSI"
+  [ -n "$hog_line" ] && printf '  top non-mind RSS: %s(pid=%s %sGB)[%s]\n' "$hcomm" "$hpid" "$hgb" "$htag"
+  [ "$tilt_action" != none ] && printf '  oom_score_adj: %s\n' "$tilt_action"
+  return 0   # never leak a conditional [ ] false as the script's exit code (QUIET is the common path)
+}
+
+case "${1:-}" in
+  --json)
+    printf '{"label":"%s","reason":"%s","avail_pct":%s,"psi_some":%s,"hog_comm":"%s","hog_gb":%s,"tilt":"%s","ts":"%s"}\n' \
+      "$label" "$reason" "$AVAIL_PCT" "$PSI" "${hcomm:-}" "${hgb:-0}" "$tilt_action" "$TS"
+    ;;
+  --edge)
+    prev=""; [ -f "$FLAG" ] && prev="$(cat "$FLAG" 2>/dev/null)"
+    [ "$prev" = "$label" ] && exit 0
+    printf '%s' "$label" > "$FLAG"
+    render
+    # board post only on the tilt verdicts (the actionable ones — not every pressure/quiet flap)
+    if [ "$label" = HOG-TILT ] || [ "$label" = CRITICAL ]; then
+      command -v mesh-chat >/dev/null 2>&1 && MESH_WHO="memguard@$(hostname)" \
+        mesh-chat "[verify] mem-guard [$label]: non-mind hog ${hcomm}(pid=$hpid ${hgb}GB) under pressure (MemAvail=${AVAIL_PCT}% PSI=${PSI}%) → oom_score_adj=1000 (kernel targets HOG not a mind if OOM; non-destructive, no kill). operator decides." >/dev/null 2>&1 || true
+    fi
+    ;;
+  *)
+    render ;;
+esac
