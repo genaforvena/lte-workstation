@@ -1,0 +1,163 @@
+#!/usr/bin/env bash
+# mesh-pull — reboot-durable background downloads (registered manifest + relaunch-until-done)
+# reflex-cadence: 17 * * * *
+# reflex-args: --resume
+#
+# The systemd-run transient trap: an ad-hoc `systemd-run --user curl…` unit dies at
+# shutdown/reboot and NOTHING relaunches it — the curl-pull-* model downloads sat dead
+# ~11.5h on 2026-07-22 (stopped 07-21T21:48:58Z at poweroff, resumed only when a mind
+# noticed), board task models/systemd-run-transient-not-reboot-persistent. A pull
+# registered here survives: the manifest in ~/.mesh/pulls.d/ outlives the process, and
+# `--resume` (mesh-restore @reboot + the hourly reflex line above) relaunches every
+# registered pull that is neither done nor currently running, until its command exits 0.
+#
+# The COMMAND must be resume-safe (idempotent restart): curl -C -, curl-pull.sh (per-file
+# .ok markers), rsync --partial. mesh-pull guarantees the relaunch, not the resumption.
+#
+#   mesh-pull add <name> [--paused] -- <cmd> [args…]   register (+ launch unless --paused)
+#   mesh-pull --resume            relaunch every incomplete registered pull (idempotent:
+#                                 skips done + currently-running; loud per launch)
+#   mesh-pull run <name>          run the command in foreground; rc=0 marks the pull done
+#                                 (this is what the unit execs — not for hand use)
+#   mesh-pull status              per pull: RUNNING / DONE / STALLED (registered, not running)
+#   mesh-pull drop <name>         deregister (does not stop a running unit)
+#   mesh-pull --test              hermetic smoke test (sandboxed MESH_DIR; exit 2 if no
+#                                 systemd user bus — honest n/a, not a fake green)
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+# cron has no XDG session env; systemd-run --user needs both (memory heavy-run-cron-xdg)
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"
+
+MESH_DIR="${MESH_DIR:-$HOME/.mesh}"
+PULLS="$MESH_DIR/pulls.d"
+PLOG="$MESH_DIR/pull.log"
+SELF="$(readlink -f "$0")"
+
+plog(){ echo "$(date -u +%FT%TZ) $*" >> "$PLOG"; }
+unit_of(){ echo "mesh-pull-$1"; }
+manifest_of(){ echo "$PULLS/$1.pull"; }
+
+# manifest = header line + one argv element per line (args with embedded newlines unsupported)
+read_cmd(){ # <name> -> CMD array via global
+  local m; m="$(manifest_of "$1")"
+  [ -f "$m" ] || return 1
+  mapfile -t CMD < <(tail -n +2 "$m")
+  [ "${#CMD[@]}" -ge 1 ]
+}
+
+running(){ systemctl --user is-active --quiet "$(unit_of "$1")" 2>/dev/null; }
+
+launch(){ # <name> — real systemd unit so it shows in systemctl; LOUD fallback, never silent
+  local n="$1" u; u="$(unit_of "$n")"
+  # --setenv: the user manager does NOT inherit this shell's env — without it the unit
+  # child resolves the default ~/.mesh and a MESH_DIR override (incl. the sandboxed --test)
+  # silently reads the wrong manifest dir
+  if systemd-run --user --collect --unit "$u" --setenv MESH_DIR="$MESH_DIR" \
+       "$SELF" run "$n" >/dev/null 2>&1; then
+    plog "launch $n unit=$u"
+  else
+    setsid nohup "$SELF" run "$n" >> "$PLOG" 2>&1 &
+    echo "$!" > "$PULLS/$n.pid"
+    echo "mesh-pull: systemd-run unavailable — FALLBACK setsid pid=$! for $n" >&2
+    plog "launch $n FALLBACK-setsid pid=$!"
+  fi
+}
+
+case "${1:-}" in
+add)
+  shift; name="${1:?usage: mesh-pull add <name> [--paused] -- <cmd> [args…]}"; shift
+  paused=0; [ "${1:-}" = "--paused" ] && { paused=1; shift; }
+  [ "${1:-}" = "--" ] && shift
+  [ $# -ge 1 ] || { echo "mesh-pull add: no command given" >&2; exit 1; }
+  mkdir -p "$PULLS"
+  m="$(manifest_of "$name")"
+  [ -f "$m" ] && { echo "mesh-pull: '$name' already registered ($m)" >&2; exit 1; }
+  { echo "# mesh-pull v1"; printf '%s\n' "$@"; } > "$m"
+  plog "add $name paused=$paused cmd=$*"
+  echo "registered $name"
+  [ "$paused" -eq 1 ] || launch "$name"
+  ;;
+run)
+  name="${2:?usage: mesh-pull run <name>}"
+  read_cmd "$name" || { echo "mesh-pull run: no manifest for '$name'" >&2; exit 1; }
+  "${CMD[@]}"; rc=$?
+  if [ "$rc" -eq 0 ]; then
+    mv "$(manifest_of "$name")" "$PULLS/$name.done"
+    plog "done $name rc=0"
+  else
+    plog "exit $name rc=$rc (still registered — --resume will relaunch)"
+  fi
+  rm -f "$PULLS/$name.pid"
+  exit "$rc"
+  ;;
+--resume)
+  shopt -s nullglob; launched=0
+  for m in "$PULLS"/*.pull; do
+    n="$(basename "$m" .pull)"
+    running "$n" && continue
+    # setsid-fallback launches have no unit; honour their pidfile
+    if [ -f "$PULLS/$n.pid" ] && kill -0 "$(cat "$PULLS/$n.pid")" 2>/dev/null; then continue; fi
+    echo "resume: relaunching $n"
+    launch "$n"; launched=$((launched+1))
+  done
+  echo "resume: $launched relaunched"
+  ;;
+status)
+  shopt -s nullglob; any=0
+  for m in "$PULLS"/*.pull "$PULLS"/*.done; do
+    any=1; n="$(basename "$m")"; n="${n%.pull}"; n="${n%.done}"
+    case "$m" in
+    *.done) echo "DONE     $n" ;;
+    *)      if running "$n" || { [ -f "$PULLS/$n.pid" ] && kill -0 "$(cat "$PULLS/$n.pid")" 2>/dev/null; }
+            then echo "RUNNING  $n"
+            else echo "STALLED  $n (registered, not running — --resume relaunches)"
+            fi ;;
+    esac
+  done
+  [ "$any" -eq 1 ] || echo "no pulls registered"
+  ;;
+drop)
+  name="${2:?usage: mesh-pull drop <name>}"
+  rm -f "$(manifest_of "$name")" "$PULLS/$name.done" "$PULLS/$name.pid"
+  plog "drop $name"; echo "dropped $name"
+  ;;
+--test)
+  # systemd user bus is the launch organ — absent means n/a, never a fake green
+  systemd-run --user --collect --unit "mesh-pull-selftest-$$" true >/dev/null 2>&1 \
+    || { echo "n/a: no systemd user bus (launch organ absent)"; exit 2; }
+  t="$(mktemp -d)"; trap 'rm -rf "$t"' EXIT
+  export MESH_DIR="$t"; PULLS="$t/pulls.d"; PLOG="$t/pull.log"
+  src="$t/src.bin"; head -c 4096 /dev/urandom > "$src"
+  fail(){ echo "FAIL: $*" >&2; exit 1; }
+  wait_done(){ # <name> <dst> — the artifact: bytes on disk + manifest flipped to .done
+    local i; for i in $(seq 1 50); do
+      [ -f "$PULLS/$1.done" ] && [ -f "$2" ] && cmp -s "$src" "$2" && return 0
+      sleep 0.2
+    done; return 1
+  }
+  # 1) add → launches → real curl pulls real bytes → done-marked
+  "$SELF" add "t$$a" -- curl -sS -o "$t/dst-a" "file://$src" >/dev/null || fail "add rc"
+  wait_done "t$$a" "$t/dst-a" || fail "add: pull did not complete+done-mark (unit path)"
+  # 2) paused registration is STALLED, then --resume relaunches it to completion
+  "$SELF" add "t$$b" --paused -- curl -sS -o "$t/dst-b" "file://$src" >/dev/null || fail "add --paused rc"
+  st="$("$SELF" status)"
+  grep -q "STALLED  t$$b" <<<"$st" || fail "paused pull not STALLED in status: $st"
+  out="$("$SELF" --resume)" || fail "--resume rc"
+  grep -q "relaunching t$$b" <<<"$out" || fail "--resume did not relaunch the stalled pull"
+  wait_done "t$$b" "$t/dst-b" || fail "resume: pull did not complete+done-mark"
+  # 3) done pulls are not relaunched (idempotence)
+  out="$("$SELF" --resume)"
+  grep -q "0 relaunched" <<<"$out" || fail "--resume relaunched a done pull: $out"
+  grep -q "DONE" <<<"$("$SELF" status)" || fail "status lost the done pulls"
+  # 4) failing command stays registered (so --resume keeps trying)
+  "$SELF" add "t$$c" --paused -- false >/dev/null
+  "$SELF" --resume >/dev/null; sleep 1
+  [ -f "$PULLS/t$$c.pull" ] || fail "failed pull was done-marked"
+  echo "mesh-pull --test: PASS"
+  ;;
+*)
+  sed -n '2,36p' "$0" | sed 's/^# \{0,1\}//'
+  exit 1
+  ;;
+esac

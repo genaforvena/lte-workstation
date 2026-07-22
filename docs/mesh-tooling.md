@@ -3,7 +3,9 @@
 Extracted from CLAUDE.md (2026-06-19) to keep the committed skeleton lean — the prose catalog had grown past Claude's CLAUDE.md size limit. `mesh-tools` is the live, self-updating index; this file is the human-readable prose detail. Source of truth for the code is the genome (`scripts/`), deployed to `~/.local/bin/`; `mesh-sync-tools` flags drift.
 
 **Coordinate / drive:** `mesh-tell` (drive an agent's pane; `--peek` to look) · `mesh-watch`
-(wait on a pane: `--until` / `--change`) · `mesh-chat` (the board/room) · `mesh-minds` (live
+(wait on a pane: `--until` / `--change`) · `mesh-chat` (the board/room) · `mesh-board-id` (stable `{#id}` link tokens for `[task]` lines —
+`mint`/`resolve`/`trace`/`check`; a claim carrying the id survives a task re-file, healing the
+stillborn-re-file slug break; on-demand, read-only on the board) · `mesh-minds` (live
 capability probe) · `mesh-trace` (shared append-only trace) · `mesh-textin` (operator drives any
 mind by TEXT over any channel: `@<win> cmd`; wakes the steward on plain msgs).
 
@@ -57,7 +59,11 @@ switch for substrate edits) · `mesh-land` (steward lands SETTLED+parse-clean st
 `--check` cron alerts so [done]-but-uncommitted work never strands into drift) · `mesh-fix-egress` ·
 `mesh-revert-catch` · `mesh-harden-ssh` (close the `:22` password-auth lateral-movement surface —
 disables password/kbd-interactive auth, key-auth only, UNDER mesh-dms with a verified-key-login
-auto-revert; refuses without an authorized_keys; `--check` is read-only).
+auto-revert; refuses without an authorized_keys; `--check` is read-only) · `mesh-pull`
+(reboot-durable background downloads: `add <name> -- <resume-safe cmd>` registers a manifest in
+`~/.mesh/pulls.d/` and launches a named systemd user unit; `--resume` — mesh-restore @reboot + an
+hourly reflex line — relaunches every registered pull that is neither done nor running, until the
+command exits 0; closes the transient-`systemd-run`-dies-at-reboot trap).
 
 Source of truth is the genome (`scripts/`), deployed to `~/.local/bin/`; `mesh-sync-tools` flags drift.
 
