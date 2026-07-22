@@ -24,7 +24,14 @@
 # suppresses quoted-in-output false positives.
 
 # quota / rate-limit / credits wall → mind is UP for liveness but DEAD for work
-MESH_RL_RE='hit your (usage|session) limit|usage limit reached|rate.?limit(ed|[ _.-]?(reach|exceed|error|hit|wall|block))|429|too many requests|quota.*(exhaust|exceed)|out of credits|purchase more credits|upgrade to (pro|team)|try again (at|later|in)|resets? (at )?[0-9]|overloaded'
+# 429 needs HTTP/error CONTEXT, never the bare digits: a mind's own rendered statusline shows
+# token cache-deltas like '+429' (and any larger number can contain 429), which satisfied the old
+# bare '429' alternative purely by digit coincidence → a genuine 1800s pane shed off telemetry
+# (live-reproduced 2026-07-22, mesh-home:sound; chat-review/rl-token-429-matches-statusline-telemetry).
+# The 429 segment is deliberately BRACE-FREE ([^..]?x3, not {0,3}): consumers embed this string in
+# their inline `: "${MESH_RL_RE:=...}"` fallbacks, where a literal `}` TRUNCATES the default — keep
+# every copy textually identical so the fallbacks can't silently diverge.
+MESH_RL_RE='hit your (usage|session) limit|usage limit reached|rate.?limit(ed|[ _.-]?(reach|exceed|error|hit|wall|block))|(error|status|code|http)[^0-9a-z]?[^0-9a-z]?[^0-9a-z]?429([^0-9]|$)|too many requests|quota.*(exhaust|exceed)|out of credits|purchase more credits|upgrade to (pro|team)|try again (at|later|in)|resets? (at )?[0-9]|overloaded'
 
 # auth / context wall → a real steward action (not just route-elsewhere)
 MESH_AUTH_RE='login.*required|oauth.*required|please (log|sign) ?in|authentication required|100% context (used|left)|context (full|exhausted)|/login'
@@ -40,7 +47,7 @@ export MESH_RL_RE MESH_AUTH_RE MESH_GATE_RE
 # those count only on a TERSE banner line. (operator FP 2026-06-15: a mind read RATE-LIMITED — and
 # was SHED — off its own 150-char summary "rate-limit walls cascading" / a design doc literally
 # containing "RATE-LIMITED".) Banner-SHAPE decides state, not keyword presence.
-MESH_STRONG_RL_RE='hit your (usage|session) limit|usage limit reached|too many requests|429|out of credits|purchase more credits|upgrade to (pro|team)'
+MESH_STRONG_RL_RE='hit your (usage|session) limit|usage limit reached|too many requests|(error|status|code|http)[^0-9a-z]?[^0-9a-z]?[^0-9a-z]?429([^0-9]|$)|out of credits|purchase more credits|upgrade to (pro|team)'
 MESH_RL_BANNER_MAXLEN=100   # an engine banner is terse; a mind's prose is long-form
 export MESH_STRONG_RL_RE MESH_RL_BANNER_MAXLEN
 # rl_is_walled — stdin: the bottom pane lines. Returns 0 iff a GENUINE quota wall banner is present.
@@ -273,6 +280,8 @@ if [ "${1:-}" = --test ] && [ "${BASH_SOURCE[0]}" = "${0}" ]; then
   ck "$MESH_RL_RE" match "You've hit your usage limit. Upgrade or try again at 6:03 PM." "usage-limit+try-again"
   ck "$MESH_RL_RE" match "· resets 6:03 PM"                  "resets-bullet"
   ck "$MESH_RL_RE" match "Error: 429 Too Many Requests"      "429+too-many"
+  ck "$MESH_RL_RE" match "HTTP 429"                           "http-429"
+  ck "$MESH_RL_RE" match "Request failed with status code 429" "status-code-429"
   ck "$MESH_RL_RE" match "quota exceeded"                    "quota-exceeded"
   ck "$MESH_RL_RE" match "You're out of credits"            "out-of-credits"
   ck "$MESH_RL_RE" match "Purchase more credits to continue" "purchase-credits"
@@ -286,6 +295,9 @@ if [ "${1:-}" = --test ] && [ "${BASH_SOURCE[0]}" = "${0}" ]; then
   ck "$MESH_RL_RE" no "editing rate_card.py"                 "rate_card-filename"
   ck "$MESH_RL_RE" no "spam fixed by rate-limit patch (1329d22)" "rate-limit-patch-prose"
   ck "$MESH_RL_RE" no "all systems nominal"                  "nominal"
+  ck "$MESH_RL_RE" no "+429"                                 "bare-cache-delta-429 (statusline telemetry)"
+  ck "$MESH_RL_RE" no "tok 14290 cached"                     "429-inside-larger-number"
+  ck "$MESH_STRONG_RL_RE" no "+429"                          "STRONG: bare-cache-delta-429"
   echo "MESH_AUTH_RE — login/context, distinct from quota:"
   ck "$MESH_AUTH_RE" match "Please login to continue"        "login-required"
   ck "$MESH_AUTH_RE" match "100% context used"               "context-full"
@@ -324,6 +336,7 @@ if [ "${1:-}" = --test ] && [ "${BASH_SOURCE[0]}" = "${0}" ]; then
   ckw clear  "summary-prose quota"    "Noted but no action: rate-limit walls cascading (09:56-10:05) are designed thermal/quota backpressure via channel-keepalive, not a fault — just fewer hands during cooldown."
   ckw clear  "task-text about RL"     "on a rate-limited claude worker auto-re-routes to an idle FREE-engine worker. Propose the trigger (mind-state RATE-LIMITED → re-dispatch its open task) plus de-dup."
   ckw clear  "input-box quota draft"  "❯ should we retry after we hit the usage limit?"
+  ckw clear  "statusline cache-delta +429" "main · 41% ctx · +429 cache tokens"
   ckw clear  "STALE banner + idle footer" "$(printf '⎿  You'"'"'ve hit your session limit · resets 2:20pm (Europe/Moscow)\n   /upgrade to increase your usage limit.\n✻ Worked for 1s\n❯ \n  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents')"
   ckw clear  "STALE banner + spinner"     "$(printf '⎿  You'"'"'ve hit your session limit · resets 2:20pm\n✻ Cogitating… (12s · esc to interrupt)')"
   echo "weather_field — honest-fusion: fresh state parses, stale/absent/malformed renders UNKNOWN:"
