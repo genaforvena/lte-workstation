@@ -1,0 +1,330 @@
+#!/usr/bin/env bash
+# mesh-load-audit — WHO is eating CPU/GPU right now, and is it JUNK?
+#
+# The 2026-07-22 runaway episode: mesh-home's CPU + RTX 3060 were pegged by junk processes.
+# mesh-resource-guard only MITIGATES minds (^(claude|opencode|gemini|codex|ollama)$ → renice/oom_adj);
+# for non-mind procs it NAMES top-RSS on NODE-PRESSURE but never a global CPU ranking, never GPU
+# compute-apps. mesh-vram-watch checks `ollama ps` only — a non-ollama CUDA proc is invisible. So a
+# whisper/synth/python hog burns the box and the only signals are pressure (RSS-sorted, names no CPU
+# culprit) and after-the-fact OOM kills (mesh-kill-events). This tool is the missing AUDITOR: one read
+# that lists the top instantaneous-CPU procs + the GPU compute-apps, classifies each, and names junk.
+#
+# Observe-only. NEVER kills (operator doctrine: resource-guard mitigates minds; the operator decides
+# on the rest). This surfaces so the operator/minds can decide.
+#
+# CPU: accurate INSTANTANEOUS % via a 2-sample /proc/[pid]/stat delta (the same method
+#      resource-guard uses for minds, but over ALL procs). `ps` pcpu is a LIFETIME average — it
+#      underreports a hog that spun up 30s ago (the exact junk case), so it is NOT used for ranking.
+# GPU: nvidia-smi --query-compute-apps (pid,process_name,used_memory) + utilization.gpu. A proc
+#      holding GPU compute that is NOT a known organ (ollama/whisper/voice-clone/venv-ai) = suspect.
+#
+# Classification of each proc (comm + args):
+#   [mind]   claude|opencode|gemini|codex
+#   [organ]  a known mesh workload: ollama/llama_server, whisper(.cpp/main), node/python running
+#            mesh-* or venv-ai (gigaam/resemblyzer/xtts/moondream), voice-clone-daemon, build tools
+#            (cc1/gcc/g++/make/ld/rustc/cargo/ninja — genome builds)
+#   [user]   an allowlisted interactive app (firefox/chromium/code/telegram-desktop/... — env-tunable)
+#   [system] kernel/DE/Xorg/systemd (expected baseline, not load)
+#   [?]      none of the above — the AUDIT surface; operator judges if junk
+#
+# Verdict (primary = worst axis; load1 from /proc/loadavg is the busy ground-truth):
+#   QUIET        load1 < busy×nproc (0.7) — box has capacity
+#   MIND-LOAD    busy AND top CPU proc is [mind] (legit mesh work)
+#   ORGAN-LOAD   busy AND top CPU proc is [organ] (a known workload — build/inference)
+#   USER-LOAD    busy AND top CPU proc is [user] (operator's own app)
+#   JUNK-LOAD    busy AND top CPU proc is [?] — NOT a known mind/organ/user → ALERT
+#   FANOUT       busy AND no single proc dominates (top pcpu < dom×nproc) — many small / IO-wait
+# GPU axis (independent):
+#   GPU-IDLE     util < gpu_busy (30)
+#   GPU-ORGAN    util≥gpu_busy AND compute-apps all known organs (busy, expected)
+#   GPU-UNKNOWN  util≥gpu_busy AND a compute-app is [?] → ALERT
+#   GPU-ZOMBIE   util≥gpu_busy AND zero compute-apps (orphan/driver wedge) → ALERT
+#
+# Honest contract: no /proc → exit 2 (never a fabricated ranking). nvidia-smi absent → GPU axis is
+# UNAVAILABLE (honest partial), the CPU audit still stands — this tool is useful on a non-GPU node.
+#
+#   mesh-load-audit           one read → verdict + top-N CPU + GPU compute-apps
+#   mesh-load-audit --top N   show N top CPU procs (default 6)
+#   mesh-load-audit --json    machine-readable
+#   mesh-load-audit --edge    emit only on verdict change (state still refreshed every run)
+#   mesh-load-audit --test    fixture classifier (RED-first) + real-read gate
+#
+# reflex-cadence: */2 * * * *
+# reflex-args: --edge
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+MESH="$HOME/.mesh"; mkdir -p "$MESH" 2>/dev/null || true
+STATE="$MESH/.load-audit-state"
+FLAG="$MESH/.load-audit-flag"   # episode sticky (avoid a re-post every cycle on a lingering junk proc)
+
+# thresholds (env-tunable)
+NPROC="$(nproc 2>/dev/null || echo 1)"
+BUSY_L1_MUL="${MESH_LA_BUSY:-0.7}"      # load1 ≥ this×nproc = BUSY
+DOM_CPU_PCT="${MESH_LA_DOM:-20}"        # a single proc ≥ this% = dominates (else FANOUT)
+GPU_BUSY_UTIL="${MESH_LA_GPU_BUSY:-30}" # gpu util ≥ this = "busy"
+SAMPLE_DUR="${MESH_LA_DUR:-0.3}"        # /proc 2-sample window (s)
+TOPN=6
+[ "${1:-}" = "--top" ] && { TOPN="${2:-6}"; shift 2; }
+# operator-allowlisted interactive apps (comm), env-extendable
+USER_APPS="${MESH_LA_USER_APPS:-firefox chrome chromium code code-oss slack telegram-desktop vesktop discord spotify steam pidgin thunderbird gimp inkscape blender obs ffmpeg mpv vlc}"
+CLK="$(getconf CLK_TCK 2>/dev/null || echo 100)"
+
+# --- classifier (pure, offline-testable) --------------------------------------
+# classify_comm <comm> <args> → mind|organ|user|system|?
+classify_comm() {
+  local comm="$1" args="$2"
+  case "$comm" in
+    claude|opencode|gemini|codex|claude-*|opencode-*|codex-*) echo mind; return ;;
+    # mesh organs
+    ollama|ollama_llama_server|ollama-server|llama-server|llama_server|llamafile) echo organ; return ;;
+    whisper|whisper-cli|whisper-cpp|main|stream|stream-server) echo organ; return ;;
+    voice-clone-daemon|tts-server|xtts_server|piper) echo organ; return ;;
+    # build tools (genome compiles)
+    cc1|gcc|g++|c++|make|ld|as|ar|ldd|rustc|cargo|cmake|ninja|go|javac|node) echo organ; return ;;
+    # python: organ only if its args name a mesh/venv-ai workload, else ? (generic python = suspect)
+    python|python3|python3.*)
+      case "$args" in
+        *mesh-*|*venv-ai*|*gigaam*|*resemblyzer*|*xtts*|*moondream*|*whisper*|*ollama*|*tts*) echo organ; return ;;
+      esac
+      echo "?"; return ;;
+    # X/display/system baseline (never counts as load)
+    Xorg|Xwayland|gnome-shell|kwin_x11|kwin|plasmashell|mutter|systemd|systemd-journal|kjournald|kworker/*|rcu_*|migration/*|ksoftirqd/*|watchdog/*) echo system; return ;;
+  esac
+  # allowlisted user apps
+  for u in $USER_APPS; do [ "$comm" = "$u" ] && { echo user; return; }; done
+  echo "?"
+}
+
+# classify a GPU compute-app process name (ollama/python known; anything else suspect).
+# nvidia-smi returns the FULL PATH (/usr/local/lib/ollama/llama-server, /home/u/.venv-ai/bin/python),
+# so match on the BASENAME — else a path never starts with "ollama"/"python" and every organ reads [?]
+# (a false GPU-UNKNOWN alarm the moment util>30% during normal inference — caught from the live log).
+# classify_gpuproc <name> → organ|?
+classify_gpuproc() {
+  local n="$1" base
+  base="${n##*/}"   # basename
+  case "$base" in
+    ollama*|llama*|python|python[0-9]*|python3.*|whisper*|xtts*|_conmon|conmon|main) echo organ ;;
+    *) echo "?" ;;
+  esac
+}
+
+# cpu_verdict <busy01> <top_comm> <top_tag> <top_cpu> <nproc> → LABEL|reason  (pure)
+cpu_verdict() {
+  local busy="$1" tcomm="$2" ttag="$3" tcpu="$4" nproc="$5"
+  [ "$busy" = 1 ] || { echo "QUIET|load below ${BUSY_L1_MUL}×nproc (nproc=$nproc); top=${tcomm}[${ttag}] ${tcpu}%"; return; }
+  # no single proc dominates → fan-out / IO-wait
+  local dom_thr; dom_thr="$(awk "BEGIN{print $DOM_CPU_PCT+0}")"
+  if [ "$(awk "BEGIN{print ($tcpu < $dom_thr)?1:0}")" = 1 ]; then
+    echo "FANOUT|busy but no single proc ≥${dom_thr}% — many small procs / IO-wait (top=${tcomm}[${ttag}] ${tcpu}%)"
+    return
+  fi
+  case "$ttag" in
+    mind)   echo "MIND-LOAD|top CPU=${tcomm}[mind] ${tcpu}% (legit mesh work)" ;;
+    organ)  echo "ORGAN-LOAD|top CPU=${tcomm}[organ] ${tcpu}% (known workload — build/inference)" ;;
+    user)   echo "USER-LOAD|top CPU=${tcomm}[user] ${tcpu}% (operator app: $tcomm)" ;;
+    system) echo "ORGAN-LOAD|top CPU=${tcomm}[system] ${tcpu}%" ;;
+    *)      echo "JUNK-LOAD|top CPU=${tcomm}[?] ${tcpu}% — NOT a known mind/organ/user (investigate)" ;;
+  esac
+}
+
+# gpu_verdict <util> <vram_used_mb> <vram_total_mb> <compute_apps_str> → LABEL|reason (pure)
+# compute_apps_str: "" (none) or "name(tag)[..] " joined
+gpu_verdict() {
+  local util="$1" vused="$2" vtot="$3" apps="$4"
+  # no nvidia-smi on this node
+  [ "$util" = "UNAVAILABLE" ] && { echo "GPU-UNAVAILABLE|no nvidia-smi (no dGPU / driver down) — CPU audit stands alone"; return; }
+  local busy_thr; busy_thr="$(awk "BEGIN{print $GPU_BUSY_UTIL+0}")"
+  if [ "$(awk "BEGIN{print ($util < $busy_thr)?1:0}")" = 1 ]; then
+    local vpct="-"; [ -n "$vtot" ] && [ "$vtot" -gt 0 ] 2>/dev/null && vpct="$(awk "BEGIN{printf \"%.0f\", $vused/$vtot*100}")"
+    echo "GPU-IDLE|util=${util}% < ${busy_thr}% (vram ${vused}/${vtot}MiB ${vpct}%)"
+    return
+  fi
+  # busy: classify the compute-apps (tags are bracketed: name[?] / name[organ])
+  [ -n "$apps" ] || { echo "GPU-ZOMBIE|util=${util}% but ZERO compute-apps (orphan/driver wedge — no PID holds it)"; return; }
+  case "$apps" in
+    *"[?]"*) echo "GPU-UNKNOWN|util=${util}% held by suspect proc(s): ${apps%% } — not a known organ (ollama/whisper/voice-clone)" ;;
+    *)       echo "GPU-ORGAN|util=${util}% by known organ(s): ${apps%% } (busy, expected)" ;;
+  esac
+}
+
+# --- test ---------------------------------------------------------------------
+if [ "${1:-}" = --test ]; then
+  fail=0
+  # classify_comm: mind / organ(python organ-path) / organ(build) / user / system / ?(generic python) / ?(unknown)
+  [ "$(classify_comm claude 'x')" = mind ] || { echo "  FAIL mind"; fail=1; }
+  [ "$(classify_comm ollama 'x')" = organ ] || { echo "  FAIL ollama"; fail=1; }
+  [ "$(classify_comm python3 '/home/u/venv-ai/gigaam/run.py')" = organ ] || { echo "  FAIL python-venv-ai"; fail=1; }
+  [ "$(classify_comm python3 '/usr/bin/something')" = "?" ] || { echo "  FAIL generic-python should be ?"; fail=1; }
+  [ "$(classify_comm cc1 'x')" = organ ] || { echo "  FAIL cc1 build"; fail=1; }
+  [ "$(classify_comm firefox 'x')" = user ] || { echo "  FAIL firefox user"; fail=1; }
+  [ "$(classify_comm Xorg 'x')" = system ] || { echo "  FAIL Xorg system"; fail=1; }
+  [ "$(classify_comm rogueminer 'x')" = "?" ] || { echo "  FAIL unknown should be ?"; fail=1; }
+  # classify_gpuproc: must take the BASENAME of a full path (real nvidia-smi output)
+  [ "$(classify_gpuproc ollama-runner)" = organ ] || { echo "  FAIL gpu ollama (bare)"; fail=1; }
+  [ "$(classify_gpuproc /usr/local/lib/ollama/llama-server)" = organ ] || { echo "  FAIL gpu ollama (full path)"; fail=1; }
+  [ "$(classify_gpuproc /home/u/.venv-ai/bin/python)" = organ ] || { echo "  FAIL gpu venv-ai python (full path)"; fail=1; }
+  [ "$(classify_gpuproc /opt/xmrig)" = "?" ] || { echo "  FAIL gpu xmrig should be ?"; fail=1; }
+  # cpu_verdict: QUIET / MIND-LOAD / JUNK-LOAD / FANOUT
+  echo "$(cpu_verdict 0 foo mind 10 8)" | grep -q '^QUIET' || { echo "  FAIL cpu QUIET"; fail=1; }
+  echo "$(cpu_verdict 1 claude mind 240 8)" | grep -q '^MIND-LOAD' || { echo "  FAIL cpu MIND-LOAD"; fail=1; }
+  echo "$(cpu_verdict 1 rogueminer '?' 160 8)" | grep -q '^JUNK-LOAD' || { echo "  FAIL cpu JUNK-LOAD"; fail=1; }
+  echo "$(cpu_verdict 1 cc1 organ 95 8)" | grep -q '^ORGAN-LOAD' || { echo "  FAIL cpu ORGAN-LOAD"; fail=1; }
+  echo "$(cpu_verdict 1 foo mind 5 8)" | grep -q '^FANOUT' || { echo "  FAIL cpu FANOUT (no dominator)"; fail=1; }
+  # gpu_verdict: IDLE / ORGAN / UNKNOWN / ZOMBIE / UNAVAILABLE
+  echo "$(gpu_verdict 10 6700 12000 'ollama[organ] ')" | grep -q '^GPU-IDLE' || { echo "  FAIL gpu IDLE"; fail=1; }
+  echo "$(gpu_verdict 80 6700 12000 'ollama[organ] ')" | grep -q '^GPU-ORGAN' || { echo "  FAIL gpu ORGAN"; fail=1; }
+  echo "$(gpu_verdict 80 6700 12000 'xmrig[?] ')" | grep -q '^GPU-UNKNOWN' || { echo "  FAIL gpu UNKNOWN"; fail=1; }
+  echo "$(gpu_verdict 80 6700 12000 '')" | grep -q '^GPU-ZOMBIE' || { echo "  FAIL gpu ZOMBIE"; fail=1; }
+  echo "$(gpu_verdict UNAVAILABLE 0 0 '')" | grep -q '^GPU-UNAVAILABLE' || { echo "  FAIL gpu UNAVAILABLE"; fail=1; }
+  [ "$fail" = 1 ] && { echo "smoke-test: FAIL"; exit 1; }
+  echo "  ok: classify (cpu/gpu, 18 cases)"
+  # REAL-READ gate: the /proc 2-sample must yield ≥1 ranked row with a numeric pcpu (a gate you have
+  # not seen FAIL is not a gate — if /proc vanishes the auditor must go UNAVAILABLE, not green).
+  if [ ! -r /proc/loadavg ]; then echo "smoke-test: n/a (/proc/loadavg unreadable); classify-logic ok"; exit 2; fi
+  _T1="$(mktemp)"; _T2="$(mktemp)"
+  _ticks() { cat /proc/[0-9]*/stat 2>/dev/null | awk '{ pid=$1; sub(/^[0-9]+ \(/,"",$0); n=index($0,")"); comm=substr($0,1,n-1); rest=substr($0,n+2); split(rest,a," "); print pid"\t"comm"\t"(a[12]+a[13]) }'; }
+  _ticks > "$_T1"; sleep 0.3; _ticks > "$_T2"
+  _nrows="$(awk -v t1="$_T1" 'BEGIN{}' </dev/null; awk -v dur=0.3 -v clk="$CLK" 'FNR==NR{t[$1]=$3;next} ($1 in t){d=$3-t[$1]; if(d>0) c++} END{print c+0}' "$_T1" "$_T2")"
+  rm -f "$_T1" "$_T2"
+  [ "$_nrows" -gt 0 ] 2>/dev/null || { echo "smoke-test: FAIL (real /proc 2-sample yielded 0 ranked rows — auditor hollow)"; exit 1; }
+  # GPU real-read: note-only (a non-GPU node still passes — CPU audit is the core)
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    _u="$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null | head -1)"
+    case "$_u" in ''|*[!0-9]*) echo "smoke-test: FAIL (nvidia-smi present but util unparseable: '$_u')"; exit 1 ;; esac
+    echo "smoke-test: ok (classify 18 + REAL /proc=$_nrows procs + REAL gpu util=${_u}%)"
+  else
+    echo "smoke-test: ok (classify 18 + REAL /proc=$_nrows procs; GPU axis UNAVAILABLE — no nvidia-smi)"
+  fi
+  exit 0
+fi
+
+# --- live CPU read: 2-sample /proc delta over ALL procs -----------------------
+sample_ticks() {  # echo "pid<TAB>comm<TAB>ticks(utime+stime)"
+  cat /proc/[0-9]*/stat 2>/dev/null | awk '{ pid=$1; sub(/^[0-9]+ \(/,"",$0); n=index($0,")"); comm=substr($0,1,n-1); rest=substr($0,n+2); split(rest,a," "); print pid"\t"comm"\t"(a[12]+a[13]) }'
+}
+T1="$(mktemp)"; T2="$(mktemp)"; trap 'rm -f "$T1" "$T2"' EXIT
+sample_ticks > "$T1"; sleep "$SAMPLE_DUR"; sample_ticks > "$T2"
+# rank by instantaneous CPU%; fields: pid comm pcpu rss_mb etime args  (args/rss/etime filled below)
+mapfile -t TOP < <(awk -v dur="$SAMPLE_DUR" -v clk="$CLK" '
+  FNR==NR { t[$1]=$3; next }
+  ($1 in t) { d=$3-t[$1]; if(d>0) printf "%d\t%s\t%.1f\n", $1, $2, d*100.0/(dur*clk) }
+' "$T1" "$T2" | sort -t$'\t' -k3 -rn | head -"$TOPN")
+
+# enrich each top pid with rss/etime/args + classification
+top_line() {
+  local pid="$1" comm="$2" cpu="$3" rss etime args tag
+  if [ -r "/proc/$pid/status" ]; then rss="$(awk '/^VmRSS:/{print int($2/1024)}' /proc/$pid/status 2>/dev/null)"; fi; rss="${rss:-?}"
+  if [ -r "/proc/$pid/stat" ]; then
+    # field 22 = starttime; etime = now - (starttime/clk + boot). Cheap: use /proc/uptime + stat fields.
+    _clk="$CLK"
+    _st="$(awk '{print $22}' /proc/$pid/stat 2>/dev/null)"
+    _boot="$(awk '{print $1}' /proc/uptime 2>/dev/null)"
+    [ -n "$_st" ] && [ -n "$_boot" ] && etime="$(awk -v st="$_st" -v b="$_boot" -v c="$_clk" 'BEGIN{ s=b-st/c; if(s<0)s=0; d=int(s/86400); h=int((s%86400)/3600); m=int((s%3600)/60); if(d>0)printf "%dd%02dh",d,h; else if(h>0)printf "%dh%02dm",h,m; else printf "%dm",m }')"
+  fi
+  etime="${etime:-?}"
+  # args (read cmdline, NUL→space, truncate)
+  args="$(tr '\0' ' ' < /proc/$pid/cmdline 2>/dev/null | cut -c1-60)"; args="${args:-$comm}"
+  tag="$(classify_comm "$comm" "$args")"
+  printf '%s[pid=%s cpu=%s%% rss=%sMB etime=%s] %s' "$comm" "$pid" "$cpu" "$rss" "$etime" "$tag"
+}
+
+# top proc for the verdict
+if [ "${#TOP[@]}" -gt 0 ]; then
+  IFS=$'\t' read -r _ top_comm top_cpu <<< "${TOP[0]}"
+  top_args="$(tr '\0' ' ' < "/proc/$(printf '%s' "${TOP[0]}" | cut -f1)/cmdline" 2>/dev/null | cut -c1-60)"; top_args="${top_args:-$top_comm}"
+  top_tag="$(classify_comm "$top_comm" "$top_args")"
+else
+  top_comm=none; top_cpu=0; top_tag=system
+fi
+
+# busy? (load1 ground truth)
+l1="$(awk '{print $1}' /proc/loadavg 2>/dev/null)"; l1="${l1:-0}"
+busy="$(awk -v l="$l1" -v n="$NPROC" -v m="$BUSY_L1_MUL" 'BEGIN{print (l>=m*n)?1:0}')"
+
+cres="$(cpu_verdict "$busy" "$top_comm" "$top_tag" "$top_cpu" "$NPROC")"
+cpu_label="${cres%%|*}"; cpu_reason="${cres#*|}"
+
+# --- live GPU read ------------------------------------------------------------
+gpu_util=UNAVAILABLE; gpu_vused=""; gpu_vtot=""; gpu_apps=""
+if command -v nvidia-smi >/dev/null 2>&1; then
+  # one query-gpu call + one query-compute-apps call
+  read -r gpu_util gpu_vused gpu_vtot < <(nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ' | tr ',' ' ')
+  case "$gpu_util" in ''|*[!0-9]*) gpu_util=UNAVAILABLE ;; esac
+  if [ "$gpu_util" != UNAVAILABLE ]; then
+    while IFS=',' read -r gpid gname gmem; do
+      [ -n "${gpid:-}" ] || continue
+      gn="$(printf '%s' "$gname" | tr -d ' ')"; gt="$(classify_gpuproc "$gn")"
+      gpu_apps+="${gn}[${gt}] "
+    done < <(nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader,nounits 2>/dev/null)
+  fi
+fi
+gres="$(gpu_verdict "$gpu_util" "${gpu_vused:-0}" "${gpu_vtot:-0}" "$gpu_apps")"
+gpu_label="${gres%%|*}"; gpu_reason="${gres#*|}"
+
+# --- aggregate label (worst axis) --------------------------------------------
+# priority: any alert axis > MIND/ORGAN/USER-LOAD > QUIET. Alerts = JUNK-LOAD, GPU-UNKNOWN, GPU-ZOMBIE.
+alert=0
+case "$cpu_label" in JUNK-LOAD) alert=1 ;; esac
+case "$gpu_label" in GPU-UNKNOWN|GPU-ZOMBIE) alert=1 ;; esac
+if [ "$alert" = 1 ]; then
+  # pick the most actionable as the headline
+  case "$cpu_label" in JUNK-LOAD) label="$cpu_label" ;; *) label="$gpu_label" ;; esac
+elif [ "$busy" = 1 ]; then
+  label="$cpu_label"
+else
+  # not busy on CPU; headline reflects GPU if it is busy, else QUIET
+  case "$gpu_label" in GPU-IDLE|GPU-UNAVAILABLE) label="QUIET" ;; *) label="$gpu_label" ;; esac
+fi
+
+TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+# top-procs summary for the state (compact)
+topsum=""
+for row in "${TOP[@]}"; do
+  IFS=$'\t' read -r pid pcomm pcpu <<< "$row"
+  topsum+="$(top_line "$pid" "$pcomm" "$pcpu"); "
+done
+# state line (dash reads this): LABEL|load1|nproc|cpu=...|gpu=...|top=...|junk=...|ts
+printf 'CPU=%s|GPU=%s|load1=%s|nproc=%s|cpu=%s|gpu=%s|top=%s|%s\n' \
+  "$cpu_label" "$gpu_label" "$l1" "$NPROC" "$cpu_reason" "$gpu_reason" "${topsum%; }" "$TS" > "$STATE"
+mesh-state-touch "$STATE" 2>/dev/null || touch "$STATE"
+
+# --- output ---
+render() {
+  printf '[load-audit %s] CPU=%s (%s) | GPU=%s (%s) | load1=%s/%dc\n' \
+    "$(printf '%s' "$label" | tr '[:upper:]' '[:lower:]')" "$cpu_label" "$cpu_reason" "$gpu_label" "$gpu_reason" "$l1" "$NPROC"
+  if [ "${#TOP[@]}" -gt 0 ]; then
+    printf '  top CPU:\n'
+    for row in "${TOP[@]}"; do
+      IFS=$'\t' read -r pid pcomm pcpu <<< "$row"
+      printf '    %s\n' "$(top_line "$pid" "$pcomm" "$pcpu")"
+    done
+  fi
+  if [ "$gpu_util" != UNAVAILABLE ] && [ -n "$gpu_apps" ]; then
+    printf '  GPU compute-apps: %s\n' "${gpu_apps%% }"
+  fi
+}
+
+case "${1:-}" in
+  --json)
+    printf '{"label":"%s","cpu_label":"%s","cpu_reason":"%s","gpu_label":"%s","gpu_reason":"%s","load1":%s,"nproc":%s,"ts":"%s"}\n' \
+      "$label" "$cpu_label" "$cpu_reason" "$gpu_label" "$gpu_reason" "$l1" "$NPROC" "$TS"
+    ;;
+  --edge)
+    # emit + board-post only on verdict CHANGE (sticky flag so a lingering junk proc = one episode)
+    prev=""; [ -f "$FLAG" ] && prev="$(cat "$FLAG" 2>/dev/null)"
+    [ "$prev" = "$label" ] && exit 0
+    printf '%s' "$label" > "$FLAG"
+    out="$(render)"
+    printf '%s\n' "$out"
+    # board post only on ALERT verdicts (so the operator/minds see it in mesh-chat)
+    if [ "$alert" = 1 ]; then
+      _hl="loadaudit@$(hostname)"
+      command -v mesh-chat >/dev/null 2>&1 && MESH_WHO="$_hl" \
+        mesh-chat "[verify] load-audit ALERT [$label]: CPU=$cpu_label · GPU=$gpu_label · top=${top_comm}[${top_tag}] ${top_cpu}% · load1=$l1/$NPROC — runaway/junk proc, not a known mind/organ. Investigate & decide (observe-only, no auto-kill)." >/dev/null 2>&1 || true
+    fi
+    ;;
+  *)
+    render ;;
+esac
