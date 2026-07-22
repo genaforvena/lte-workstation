@@ -19,6 +19,10 @@
 # Tier-2 (face-recognition wake) hooks in here: if MISHA_FACE=1 and the operator's reference photo is
 # present, an operator-face detection also confirms (the camera SAW the operator, not just motion).
 #
+# Tier-1.75 (2026-07-22): mesh-room-trace's RECENT verdict (proximity/light-pheromone lingering
+# after room-sense itself flapped away from PRESENT) is a second, broader persistence check —
+# see room_trace_confirm_active below for why only RECENT is safe to use here, never OCCUPIED.
+#
 #   mesh-misha-gate             assess now; exit 0=confirmed, 1=not (reason on stderr)
 #   mesh-misha-gate --json      print {confirmed, verdict, confidence, reason} and exit 0/1
 #   mesh-misha-gate --test      synthetic state assertions (no sensors, no network)
@@ -68,6 +72,37 @@ state_confirm_active(){
   [ -n "$lastev" ] || return 1
   [ "$lastev" -le $(( t0 + 240 )) ] 2>/dev/null || return 1
   return 0
+}
+
+# TIER-1.75 (2026-07-22, CONNECTION fusion mesh-room-trace × mesh-room): state_confirm_active
+# above is a SINGLE-signal persistence check — it re-reads room-sense's OWN log/events to see if a
+# PRESENT+high session is "still open", so it is blind whenever room-sense itself flaps away from
+# PRESENT (the exact phase-alignment lottery it was built to survive, just one layer up: now the
+# flap closes the session instead of just missing one sample). mesh-room-trace already fuses THREE
+# independent signals (room-sense + proximity + light-pheromone) into a temporal occupancy verdict
+# built for precisely this "was this room occupied recently" question — reuse it as a broader
+# fallback instead of hand-rolling a second bespoke persistence check.
+#
+# SAFETY: use ONLY room-trace's RECENT verdict, NEVER its OCCUPIED verdict. room-trace's OCCUPIED
+# branch fires whenever room-sense's raw label is PRESENT — it reads only the LABEL field
+# (`_read_state` cuts at the first `|`) and never looks at CONFIDENCE, because room-trace's own
+# consumers don't need that distinction. But this gate's entire reason to exist is "PRESENT alone
+# isn't enough — audio-only readings reach PRESENT at confidence=medium and must never confirm."
+# Wiring OCCUPIED in here would let that exact audio-medium reading back in through a side door.
+# RECENT is safe from this: by construction it only fires in the branch where room != PRESENT,
+# decided purely by proximity/light-pheromone (see mesh-room-trace's `_fuse`) — signals the audio
+# classifier never touches, independent of whatever room-sense's own label currently says.
+# MISHA_TRACE_CONFIRM=0 opts out.
+room_trace_confirm_active(){
+  [ "${MISHA_TRACE_CONFIRM:-1}" = 1 ] || return 1
+  command -v mesh-room-trace >/dev/null 2>&1 || return 1
+  local out verdict
+  out="$(MESH_STATE_DIR="$MESH" timeout 10 mesh-room-trace --json 2>/dev/null)" || return 1
+  [ -n "$out" ] || return 1
+  verdict="$(printf '%s' "$out" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("verdict",""))
+except Exception: print("")' 2>/dev/null)"
+  [ "$verdict" = "RECENT" ]
 }
 
 # ---- --test: drive the decision fn with synthetic JSON (no sensor run) ----
@@ -127,7 +162,31 @@ PY
   sed -i 's/confidence=high/confidence=medium/' "$stmp/room-sense.log"
   state_confirm_active && { echo "  [FAIL] non-high persisted confirm must not pass the bar"; fail=1; } || echo "  [PASS] persisted medium confidence → not confirmed"
   rm -rf "$stmp"
-  [ "$fail" = 0 ] && { echo "smoke-test: ok (HIGH+PRESENT, open face-window, or open persisted PRESENT+high session confirms; audio-medium/EMPTY/UNCERTAIN/lapsed-face/closed-session stay dormant)"; exit 0; }
+  # TIER-1.75 room-trace fallback: drives the REAL mesh-room-trace binary against synthetic state
+  if command -v mesh-room-trace >/dev/null 2>&1; then
+    ttmp="$(mktemp -d)"; MESH="$ttmp"
+    # RECENT: room empty but a device lingers (proximity NEAR) → room-trace says RECENT → confirms
+    printf 'EMPTY\n' > "$ttmp/.room-sense.state"
+    printf 'NEAR\n' > "$ttmp/.proximity.state"
+    room_trace_confirm_active && echo "  [PASS] room-trace RECENT (proximity lingers) → confirmed" || { echo "  [FAIL] room-trace RECENT should confirm"; fail=1; }
+    # OCCUPIED must NOT confirm here even though room-trace itself reports OCCUPIED: room-trace's
+    # OCCUPIED reads only room-sense's raw PRESENT label, blind to confidence — exactly the
+    # audio-medium reading this gate must never accept. This is the regression lock for that.
+    printf 'PRESENT\n' > "$ttmp/.room-sense.state"
+    printf 'OUT_OF_RANGE\n' > "$ttmp/.proximity.state"
+    rm -f "$ttmp/.light-pheromone" "$ttmp/.light-transitions"
+    room_trace_confirm_active && { echo "  [FAIL] room-trace OCCUPIED must NOT confirm via TIER-1.75 (confidence-blind side door)"; fail=1; } || echo "  [PASS] room-trace OCCUPIED → not confirmed (only RECENT may)"
+    # VACANT must not confirm
+    printf 'EMPTY\n' > "$ttmp/.room-sense.state"
+    room_trace_confirm_active && { echo "  [FAIL] room-trace VACANT must not confirm"; fail=1; } || echo "  [PASS] room-trace VACANT → not confirmed"
+    # opt-out
+    printf 'NEAR\n' > "$ttmp/.proximity.state"
+    MISHA_TRACE_CONFIRM=0 room_trace_confirm_active && { echo "  [FAIL] MISHA_TRACE_CONFIRM=0 must opt out"; fail=1; } || echo "  [PASS] MISHA_TRACE_CONFIRM=0 → opted out"
+    rm -rf "$ttmp"
+  else
+    echo "  [SKIP] TIER-1.75 room-trace tests (mesh-room-trace not on PATH)"
+  fi
+  [ "$fail" = 0 ] && { echo "smoke-test: ok (HIGH+PRESENT, open face-window, open persisted PRESENT+high session, or room-trace RECENT confirms; audio-medium/EMPTY/UNCERTAIN/lapsed-face/closed-session/room-trace-OCCUPIED-or-VACANT stay dormant)"; exit 0; }
   echo "smoke-test: FAIL"; exit 1
 fi
 
@@ -180,6 +239,12 @@ fi
 # TIER-1.5: a confirmed PRESENT+high session that is still open (see state_confirm_active).
 if state_confirm_active; then
   [ "${1:-}" = "--json" ] && printf '{"confirmed":true,"verdict":"PRESENT","confidence":"high","reason":"persisted confirmation — room-sense PRESENT+high session still open"}\n'
+  exit 0
+fi
+
+# TIER-1.75: room-trace RECENT (see room_trace_confirm_active above for why never OCCUPIED here).
+if room_trace_confirm_active; then
+  [ "${1:-}" = "--json" ] && printf '{"confirmed":true,"verdict":"RECENT","confidence":"","reason":"room-trace RECENT — proximity/light-pheromone show lingering occupancy room-sense alone missed"}\n'
   exit 0
 fi
 
