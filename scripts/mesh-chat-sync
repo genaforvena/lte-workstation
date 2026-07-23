@@ -150,6 +150,59 @@ commit_converged(){ # $1 pristine-snapshot $2 candidate → installs candidate (
   } 9>>"$LOCKF"
 }
 
+# ── HLC RECEIVE-MERGE + FUTURE-REPAIR SLACK (chat-review/hlc-causal-order, 2026-07-23) ───────────
+# mesh-chat's stamps are now a Hybrid Logical Clock (send: l := max(l_prev+1, pt), counter folded
+# into the seconds so the format stays byte-stable — see mesh-chat's hlc_stamp header). This file
+# carries the RECEIVE half of the algorithm: after a converged board is installed, adopt its newest
+# stamp into ~/.mesh/hlc (l := max(l, max_merged, pt)) so this node's next post stamps strictly
+# after everything it has seen — a [taking] can never sort before the [task] it answers, across any
+# peer clock skew. NOTE this does not contradict the why-not-LWW/vector-clocks block above: the
+# board is still a G-Set (union merge, nothing discarded); HLC only fixes the SORT KEY so converged
+# order respects happens-before — O(1) state (one integer), not O(N) vector.
+# CAP CONTRACT (mesh-chat's hlc_stamp header is canonical): receive adoption cap (60s, here) <
+# send mint cap (90s, mesh-chat) < repair slack (120s, repair_future). Receive strictly below send
+# is load-bearing — a stamp adopted at exactly this cap must still leave +1-bump headroom, else the
+# send clamp lands the answer ON the adopted stamp and the causal order is erased.
+HLCF="$MESH/hlc"
+HLC_RECV_CAP="${MESH_HLC_RECV_CAP:-60}"
+hlc_receive(){ # l := max(l, newest converged stamp, wall), clamped to wall+cap; under the board lock
+  local pt l top max_e
+  pt=$(date +%s)
+  top="$(grep -aE '^[0-9]{4}-' "$LOG" 2>/dev/null | grep -av '^0000-' | tail -1 | awk '{print $1}')"
+  max_e=0
+  [ -n "$top" ] && { max_e="$(date -d "$top" +%s 2>/dev/null)"; case "$max_e" in ''|*[!0-9]*|-*) max_e=0 ;; esac; }
+  {
+    flock -w 2 8 2>/dev/null || true
+    l="$(cat "$HLCF" 2>/dev/null)"; case "$l" in ''|*[!0-9]*) l=0 ;; esac
+    [ "$max_e" -gt "$l" ] && l="$max_e"
+    [ "$pt" -gt "$l" ] && l="$pt"
+    [ "$l" -gt $(( pt + HLC_RECV_CAP )) ] && l=$(( pt + HLC_RECV_CAP ))   # an anomalous far-future peer stamp is never adopted (beyond-slack ones get REPAIRED anyway)
+    printf '%s' "$l" > "$HLCF" 2>/dev/null || true
+  } 8>>"$LOCKF"
+}
+
+# repair_future — rewrite provably-fabricated future stamps (the 2026-06-11 class) to yesterday,
+# with a SLACK window: a today-line up to now+slack is a legit HLC bump (send drift cap 60s < slack
+# 120s by contract — see mesh-chat), NOT a fabrication. Shared by the main flow and --test (one
+# definition, no embedded mirror to rot apart). When now+slack crosses midnight the today/now
+# string-compare inverts, so the repair PASSES THROUGH that round (≤2min/day; next round catches
+# any real fabrication). MESH_CHATSYNC_NOW_EPOCH pins the clock for deterministic tests only.
+repair_future(){ # stdin → stdout
+  local slack="${MESH_CHATSYNC_FUTURE_SLACK:-120}"
+  local nowe="${MESH_CHATSYNC_NOW_EPOCH:-$(date +%s)}"
+  local today yday cmpd cmpt
+  today="$(date -u -d "@$nowe" +%F)"; yday="$(date -u -d "@$(( nowe - 86400 ))" +%F)"
+  cmpd="$(date -u -d "@$(( nowe + slack ))" +%F)"; cmpt="$(date -u -d "@$(( nowe + slack ))" +%H:%M:%S)"
+  if [ "$cmpd" != "$today" ]; then cat; return 0; fi
+  awk -v today="$today" -v yday="$yday" -v now="$cmpt" '{
+    if ($0 ~ "^" today "T[0-2][0-9]:[0-5][0-9]:[0-5][0-9]Z") {
+      t = substr($0, length(today) + 2, 8)
+      if (t > now) { print yday "T" substr($0, length(today) + 2); next }
+    }
+    print
+  }'
+}
+
 board_snapshot(){ # hourly-throttled rotating durable copy of $1 (default $LOG); prune to newest SNAP_KEEP
   local src="${1:-$LOG}" now last=0
   [ -s "$src" ] || return 0
@@ -233,13 +286,7 @@ mesh-doctor: stray tool-output junk
 EOF
   out="$(
     sed -E "s/^([0-9]{2}:[0-9]{2}:[0-9]{2}Z) /0000-00-00T\\1 /" "$tmp/.mesh/chat.log" \
-      | awk -v today="$(date -u +%F)" -v yday="$(date -u -d yesterday +%F)" -v now="$(date -u +%H:%M:%S)" '{
-          if ($0 ~ "^" today "T[0-2][0-9]:[0-5][0-9]:[0-5][0-9]Z") {
-            t = substr($0, length(today) + 2, 8)
-            if (t > now) { print yday "T" substr($0, length(today) + 2); next }
-          }
-          print
-        }' \
+      | repair_future \
       | grep -E '^[0-9]{4}-|^[0-9]{2}:' \
       | LC_ALL=C sort -u | tail -3000
   )" || { echo "smoke-test: FAIL (merge dry-run failed)"; exit 1; }
@@ -340,6 +387,46 @@ EOF
   commit_converged "$tmp/race-snap" "$tmp/race-cand"
   _el=$(( SECONDS - _t0 )); wait "$_hold" 2>/dev/null
   [ "$_el" -ge 1 ] || { echo "smoke-test: FAIL (race: commit did not wait on the held board lock (elapsed ${_el}s) — flock not serializing)"; exit 1; }
+  # ── HLC RECEIVE-MERGE + FUTURE-REPAIR SLACK (chat-review/hlc-causal-order, 2026-07-23) ──────────
+  # mesh-chat now stamps with an HLC (send: l := max(l_prev+1, pt)) so same-second posts order
+  # causally; the RECEIVE half lives here: after converging, adopt the newest merged stamp into
+  # ~/.mesh/hlc so this node's NEXT post stamps after everything it has seen (a [taking] can never
+  # sort before the [task] it answers, even across peer clock skew). A legit HLC stamp can sit a
+  # few seconds AHEAD of wall — so the future-repair must carry a slack window (120s, ≥2× the send
+  # drift cap) instead of branding every future-second today-line a fabrication.
+  # (a) repair_future unit, fixed epoch so legs are deterministic at any real time of day:
+  _re="$(date -u -d '2026-01-15T12:00:00Z' +%s)"
+  _rout="$(printf '2026-01-15T12:01:00Z  a@n  ::  within-slack\n2026-01-15T14:00:00Z  b@n  ::  beyond-slack\n2026-01-14T23:00:00Z  c@n  ::  past-line\n' | MESH_CHATSYNC_NOW_EPOCH="$_re" repair_future)"
+  echo "$_rout" | grep -q '^2026-01-15T12:01:00Z  a@n  ::  within-slack$' || { echo "smoke-test: FAIL (repair_future: a +60s stamp — a legit HLC bump — was repaired away; slack window dead)"; exit 1; }
+  echo "$_rout" | grep -q '^2026-01-14T14:00:00Z  b@n  ::  beyond-slack$' || { echo "smoke-test: FAIL (repair_future: a +2h fabricated stamp was NOT rewritten to yesterday): $_rout"; exit 1; }
+  echo "$_rout" | grep -q '^2026-01-14T23:00:00Z  c@n  ::  past-line$'    || { echo "smoke-test: FAIL (repair_future: a past line was touched)"; exit 1; }
+  #     midnight guard: when now+slack crosses the date line the today/now string-compare inverts —
+  #     repair must PASS THROUGH untouched (next round catches any real fabrication), never rewrite.
+  _rm="$(date -u -d '2026-01-15T23:59:30Z' +%s)"
+  _rout="$(printf '2026-01-15T14:00:00Z  b@n  ::  beyond-slack\n' | MESH_CHATSYNC_NOW_EPOCH="$_rm" repair_future)"
+  echo "$_rout" | grep -q '^2026-01-15T14:00:00Z' || { echo "smoke-test: FAIL (repair_future: midnight window must pass through, not rewrite): $_rout"; exit 1; }
+  # (b) WIRING drive — the real main flow (no peers, HOME sandbox): a near-future line survives the
+  #     round with its stamp intact, and the converged board's newest stamp lands in ~/.mesh/hlc.
+  _hw="$(mktemp -d)"; mkdir -p "$_hw/.mesh"
+  _nf="$(date -u -d '+60 seconds' +%Y-%m-%dT%H:%M:%SZ)"; _nfe="$(date -d "$_nf" +%s)"
+  printf '%s  peer@n  ::  [task] hlc-wiring-canary\n' "$_nf" > "$_hw/.mesh/chat.log"
+  HOME="$_hw" MESH_CHAT_PEERS= MESH_NODES= MESH_ROLES= bash "$0" >/dev/null 2>&1
+  grep -q "^$_nf  peer@n  ::  \[task\] hlc-wiring-canary$" "$_hw/.mesh/chat.log" \
+    || { echo "smoke-test: FAIL (main flow: a +60s HLC stamp did not survive the round intact — slack not wired: $(grep hlc-wiring-canary "$_hw/.mesh/chat.log"))"; rm -rf "$_hw"; exit 1; }
+  _hl="$(cat "$_hw/.mesh/hlc" 2>/dev/null || echo 0)"
+  [ "${_hl:-0}" -ge "$_nfe" ] 2>/dev/null \
+    || { echo "smoke-test: FAIL (main flow: receive-merge did not adopt the newest converged stamp into hlc state: got '$_hl', want >=$_nfe)"; rm -rf "$_hw"; exit 1; }
+  # (c) the CAUSAL GUARANTEE end-to-end: a post made AFTER the merge (the [taking] answering that
+  #     future-stamped [task]) must stamp strictly after it — cross-tool via the sibling mesh-chat.
+  _mc="$(dirname "$0")/mesh-chat"
+  if [ -x "$_mc" ]; then
+    MESH_DIR="$_hw/.mesh" MESH_WHO="hlcsync@test" "$_mc" "[taking] hlcsync: hlc-wiring-canary" >/dev/null 2>&1
+    _ta="$(grep -a 'taking\] hlcsync' "$_hw/.mesh/chat.log" | awk '{print $1}')"
+    _tae="$(date -d "$_ta" +%s 2>/dev/null || echo 0)"
+    [ "$_tae" -gt "$_nfe" ] 2>/dev/null \
+      || { echo "smoke-test: FAIL (causal guarantee: the [taking] answering a future-stamped [task] stamped $_ta (epoch $_tae), not AFTER $_nf (epoch $_nfe) — it would sort BEFORE its task)"; rm -rf "$_hw"; exit 1; }
+  fi
+  rm -rf "$_hw"
   echo "smoke-test: ok"
   exit 0
 fi
@@ -414,16 +501,11 @@ rm -f "$tmp.peer"
 # planner chased ghost steward-pushes for a tick). Unknown date stays visibly unknown; legacy
 # lines sort before all dated lines as an "earlier era".
 sed -i -E "s/^([0-9]{2}:[0-9]{2}:[0-9]{2}Z) /0000-00-00T\1 /" "$tmp" 2>/dev/null || true
-# repair provably-future stamps from peers still carrying the 2026-06-11 fabrication: a line
-# dated today with a time AFTER now cannot be today's — it is yesterday's (see mesh-board-timerepair).
+# repair provably-future stamps from peers still carrying the 2026-06-11 fabrication: a line dated
+# today with a time BEYOND now+slack cannot be today's — it is yesterday's (see mesh-board-
+# timerepair). Within-slack future stamps are legit HLC bumps and stay (repair_future header).
 # Self-healing merge: peers converge via their own genome pull; we never write to them.
-awk -v today="$(date -u +%F)" -v yday="$(date -u -d yesterday +%F)" -v now="$(date -u +%H:%M:%S)" '{
-  if ($0 ~ "^" today "T[0-2][0-9]:[0-5][0-9]:[0-5][0-9]Z") {
-    t = substr($0, length(today) + 2, 8)
-    if (t > now) { print yday "T" substr($0, length(today) + 2); next }
-  }
-  print
-}' "$tmp" > "$tmp.r" && mv "$tmp.r" "$tmp"
+repair_future < "$tmp" > "$tmp.r" && mv "$tmp.r" "$tmp"
 # drop board junk so it can't re-merge from a peer. INVARIANT, not an enumeration: a board line
 # starts with a digit (2026-…T dated, 0000- sentinel, or legacy HH:MMZ era). Everything else —
 # manifesto "—" lines, undated [task]@, table rows "|…", stray tool output ("mesh-…", "NODE …") —
@@ -450,7 +532,11 @@ if shrink_refused "$pre_valid" "$new_valid"; then
     echo "$_now_sh" > "$SHRINK_STATE" 2>/dev/null || true
   fi
 else
-  commit_converged "$tmp.snap" "$LOG.new" || rm -f "$LOG.new"
+  if commit_converged "$tmp.snap" "$LOG.new"; then
+    hlc_receive   # adopt the newest converged stamp so the next local post orders after it
+  else
+    rm -f "$LOG.new"
+  fi
 fi
 rm -f "$tmp" "$tmp.snap"
 board_snapshot "$LOG"   # board-durability: hourly-throttled rotating durable copy of the converged board
