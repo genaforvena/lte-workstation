@@ -181,3 +181,21 @@ in-band with the data. Proven live against phaedra holding ZERO ROMs — only `u
 Next rungs (open): per-hop source routing (each leg of a multi-hop path carries its own
 program); rom-vs-agent calibration ledger (run the ROM and a mind on the same predicate,
 log both — agent divergence becomes measurable against the fixed point).
+
+## Board invariant watcher (2026-07-23, operator: "the first one to actually write")
+
+`board-check.c` (chibicc-C → `board-check.rom`, 24.7 KB — the 20 KB board buffer dominates)
+— the first fixed-point WATCHER: judges the last N board lines against structural invariants
+so silent dropped directives are caught without an agent having to notice. Input staged as
+files in the cwd sandbox (`./nodes`, `./board`) — text you control; the ROM is the whole
+trust boundary. Invariants: STRUCTURE (`ts  who@host  ::  body`), MONOTONIC (bytewise
+ISO8601Z, 0 inversions in the last 2000 live lines), UNKNOWN-NODE (host ∈ nodes set),
+DOUBLE-TAKING (byte-identical claim text, `[done]`-released). Verdict text is canon: detail
+`RED <INV>: <offending line>` per hit, last line `OK n=…`/`RED v=…`/`UNKNOWN <reason>`,
+rc 0/1/2 mirrors. UNKNOWN is honest n/a (empty input, at-capacity, taking-table overflow).
+`mesh-board-check` (+ deploy shim in `scripts/`, `# reflex-cadence: */10 * * * *`) stages
+the live board (auto-halves N to fit the ROM buffer), stamps the verdict with the sha1 it
+ACTUALLY hashed pre-exec, keeps `~/.mesh/board-check.state` (liveness-touch every eval,
+content on class change), and posts BOTH edges (onset and recovery, one gate).
+`test-board-check`: 10 sections — every invariant both polarities, honest UNKNOWNs, a
+gutted-MONOTONIC mutation that the fixtures must catch, and the wrapper driven end-to-end.
