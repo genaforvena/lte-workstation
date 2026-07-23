@@ -158,9 +158,26 @@ in-band with the data. Proven live against phaedra holding ZERO ROMs — only `u
   One hop: `mesh-uxn-hop --pack filter.rom < text | ssh node mesh-uxn-hop`
 - **`rot13.tal`/`rot13.rom`** (106 B) — the canonical pipe-stage payload; also documents the
   console idiom for stream filters (stdin type 1, EOF type 4 → halt `#80`).
-- **`test-uxn-hop`** — RED-first suite: pack byte-accounting, shipped-code execution,
-  hop composition (double-rot13 identity), loud malformed/truncated failure with empty
-  stdout, rc propagation (`#81`→1), fresh-empty-cwd containment.
+- **`test-uxn-hop`** — RED-first suite (11 asserts): pack byte-accounting, shipped-code
+  execution, hop composition (double-rot13 identity), loud malformed/truncated failure with
+  empty stdout, rc propagation (`#81`→1), fresh-empty-cwd containment, sha1 declaration,
+  tamper refusal, stamp correctness (declared and legacy-undeclared).
+- **Run-time hash verification (the fixed-point doctrine, operator 2026-07-23):** a ROM is
+  the mesh's first FIXED POINT — behavior decided once at commit time, in a system where
+  everything else re-infers per tick. That only holds if the hash is VERIFIED AT RUN TIME,
+  not claimed: `--pack` declares the ROM's sha1 in the header (`uxp1 <n> <sha1>`), the
+  receiving hop hashes what it ACTUALLY got before executing a byte — declared≠actual is a
+  loud rc-65 refusal, and `UXN_HOP_STAMP=1` appends `hop: rom sha1=<actual> declared=<…>
+  rc=<n>` to stderr so the verdict is stamped by the execution site with what it really ran.
+  (Undeclared legacy headers run but stamp `declared=none` — visible, never silent. The
+  tamper test is instructive: a corrupted rot13.rom ran SILENTLY with rc=0 and empty output
+  — identical wrongness is indistinguishable from consensus, hence verify-then-execute.)
+- **`route.tal`/`route.rom`** (263 B) — the prefix router: first payload line = the prefix
+  (config travels in-band too), then each line starting with it → stdout, rest → stderr.
+  Two output channels over one ssh pipe, demuxed by shipped code; `test-uxn-route` covers
+  demux, exact-prefix, empty-prefix, mid-prefix reject replay, EOF partial, and riding the
+  hop. Proven live against phaedra with the stamp confirming the executed sha1.
 
-Next rungs (open): prefix-router ROM (stdout/stderr as two channels); hop chaining with
-per-hop ROMs (source routing where each leg carries its own program).
+Next rungs (open): per-hop source routing (each leg of a multi-hop path carries its own
+program); rom-vs-agent calibration ledger (run the ROM and a mind on the same predicate,
+log both — agent divergence becomes measurable against the fixed point).
