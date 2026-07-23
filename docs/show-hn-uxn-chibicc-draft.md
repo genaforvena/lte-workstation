@@ -13,7 +13,7 @@
 
 **Show HN: I compile C to a 468-byte ROM that runs identically on x86 and ARM** (77 chars)
 
-Alt: **Show HN: A C compiler for a 133-byte virtual stack machine (Uxn)** (66)
+Alt: **Show HN: A C compiler for a 134-byte virtual stack machine (Uxn)** (66)
 
 ### Post body
 
@@ -32,8 +32,8 @@ architecture, forever. The whole emulator is ~26 KB of C89 with no deps
 beyond libc.
 
 First I wrote the gate by hand in Uxntal (the assembly): 44 lines,
-**133 bytes**. It reads two numbers, checks `lease ≥ 2 × cadence`, prints
-`OK` or `RED`. Then I pushed that exact 133-byte file to an old Android
+**134 bytes**. It reads two numbers, checks `lease ≥ 2 × cadence`, prints
+`OK` or `RED`. Then I pushed that exact ROM to an old Android
 phone over SSH and ran it there — same bytes, same verdicts, a 32-bit ARM
 core executing the same ROM as the x86 workstation.
 
@@ -75,14 +75,23 @@ review, at 3.5× the size (still 0.7% of the address space). chibicc's own
 toolchain.
 
 **The catch (there's always a catch).** Uxn had an ISA change in 2022.
-chibicc emits the *modern* ISA (immediate jump opcodes). The Uxn
-toolchain I'd already vendored is the *older* one — its assembler rejects
-chibicc's output and its emulator hangs on the resulting ROM (an opcode
-misdecodes, no crash, just a timeout). The good news: old ROMs run fine on
-the modern emulator. So adopting chibicc means swapping the vendored
-toolchain, not rewriting anything. I haven't done that yet — I documented
-it and stopped, because smuggling a toolchain swap into an eval is how you
-ship a regression.
+chibicc emits the *modern* ISA (immediate jump opcodes). The toolchain I'd
+vendored was the *older* one — its assembler rejected chibicc's output and
+its emulator hung on the resulting ROM (an opcode misdecodes, no crash,
+just a timeout). The good news: old ROMs run fine on the modern emulator,
+so adopting chibicc means swapping the vendored toolchain, not rewriting
+anything. I did the swap.
+
+And the swap immediately paid for itself by breaking something invisibly.
+The old ROMs halted with `#01`; under the modern emulator that maps to
+exit code 1. The audit that runs the gate is a shell script sourced into
+an environment with `pipefail` on — so the moment the ROM exited 1, the
+whole audit *died silently*. No error, no verdict, no trace that it had
+ever run. The ROM was correct; the convention was the bug. The fix was a
+one-byte change — ROMs now halt `#80` and the verdict reader fails loud on
+anything unexpected — but a silent death under `pipefail` is the kind of
+thing you only find by actually doing the migration and watching the test
+suite go quietly empty.
 
 **Why bother?** These gates are "organs" — small programs that each
 enforce one invariant — in a mesh of agents running across old hardware.
@@ -112,7 +121,7 @@ pre/post-2022 migration?
 | | hand (`lease-gate.tal`) | C (`lease-gate.c`) |
 |---|---|---|
 | lines | 44 | 29 |
-| ROM size | 133 B | 468 B |
+| ROM size | 134 B | 468 B |
 | authorship | stack juggling | plain C |
 | `% of 64 KB` | 0.20% | 0.72% |
 
@@ -124,7 +133,7 @@ compiler emit all of that. Both hit the same 16-bit `int` wrap ceiling
 ### The cross-architecture verification
 
 `build.sh` compiles `uxncli` per platform; the ROM is never rebuilt. The
-same 133-byte (hand) / 468-byte (C) file is pushed to the Note3
+same 134-byte (hand) / 468-byte (C) file is pushed to the Note3
 (armeabi-v7a) via `verify-note3.sh` and executed with matching verdicts.
 That's the portability claim made concrete: one artifact, two ISAs,
 identical behavior.
@@ -145,7 +154,7 @@ self-matching `grep` gates: a gate you haven't seen *fail* is not a gate.
 - **No:** preprocessor (use host `cc -P -E`), 32/64-bit ints, floats,
   function pointers, VLAs, bit-fields, struct-by-value.
 
-`main(argc, argv)` pulls in a support routine (468 B vs 133 B). A custom
+`main(argc, argv)` pulls in a support routine (468 B vs 134 B). A custom
 `on_console` handler is the lean path when size matters.
 
 ### Repro
