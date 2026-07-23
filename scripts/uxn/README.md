@@ -199,3 +199,20 @@ ACTUALLY hashed pre-exec, keeps `~/.mesh/board-check.state` (liveness-touch ever
 content on class change), and posts BOTH edges (onset and recovery, one gate).
 `test-board-check`: 10 sections — every invariant both polarities, honest UNKNOWNs, a
 gutted-MONOTONIC mutation that the fixtures must catch, and the wrapper driven end-to-end.
+
+## Calibration ledger (2026-07-23 — the oracle use of the fixed point)
+
+`mesh-rom-calibrate` (+ deploy shim, `# reflex-cadence: 7 6 * * *`) runs BOTH
+implementations of a predicate on identical inputs — the ROM (16-bit, via
+`mesh-rom-gate`) and native shell arithmetic (64-bit, a genuinely different
+implementation) — and appends every pair to `~/.mesh/rom-calibration.log`,
+each line stamped with the sha1 of the ROM actually hashed. Doctrine: under
+the same ROM, DISAGREEMENT isolates cleanly to the implementations and posts
+`[chat-review]` loudly; AGREEMENT is weak evidence and logs silently. This
+keeps the N-version diversity signal alive that ROM uniformity destroys.
+v1 predicate: lease-vs-cadence over the same rows `mesh-lease-audit --list`
+resolves. Known divergence domain, provable live: the ROM's 16-bit parse wraps
+at 65536 — `--pair 900 67335` reads lease as 1799 → rom=RED shell=OK DIVERGE
+(the test suite drives this REAL split, not a mock). First live fleet run:
+208 pairs, 0 diverged. `test-rom-calibrate`: 6 sections; the verdict logic was
+mutated to always-AGREE and the suite seen RED (fixtures discriminate).
