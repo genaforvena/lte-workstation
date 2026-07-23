@@ -127,3 +127,40 @@ under the modern toolchain 2026-07-23, sha1 `442120b…` host==device).
 - **Runtime:** ~0.66 ms/run (process spawn + emulator boot + ROM eval), RSS ~1.5 MB, x86;
   measured on the pre-swap emulator, same order of magnitude on the modern one.
 - **Emulator:** `uxncli` ~42 KB, `uxnasm` ~21 KB, C89, no deps beyond libc.
+
+## Predicate-engine lane (2026-07-23, operator-approved spec)
+
+Design: `docs/superpowers/specs/2026-07-23-uxn-predicate-engine-design.md`. **Doctrine: a new
+pure predicate defaults to a ROM gate run via `mesh-rom-gate`; self-grep gates remain banned;
+plumbing stays shell.** The lane's moving parts:
+
+- **`scripts/mesh-rom-gate`** (deployed) — the ONE runner: `mesh-rom-gate <rom> args…` prints the
+  ROM's verdict TEXT, rc `0` (not RED) / `1` (RED) / `2` (n/a LOUD — engine/ROM absent or broken;
+  never a fake verdict). Bare names resolve to `scripts/uxn/<name>.rom`. Consumers keep their
+  inline compare as the explicit rc=2 fallback and stamp `src=rom|inline-fallback`.
+- **`mesh-lease-audit`** — wired into cron via the `scripts/mesh-lease-audit` deploy shim
+  (`# reflex-cadence: 41 5 * * *`); its wired `--test` runs the full `test-lease-audit` suite.
+- **`chibicc/`** — vendored C→uxntal compiler (provenance in `build.sh`); `./build.sh --chibicc`
+  builds it, `./cc-rom.sh <src.c> <out.rom>` compiles a gate, `./test-chibicc` is the truth-table
+  vendor gate (RED-first, byte-identity informational only).
+
+## Hop lane — ROM-as-packet over ssh (2026-07-23, operator spike → tool)
+
+Transport stays ssh/tailscale; uxn is the **mobile-code layer**: the program travels
+in-band with the data. Proven live against phaedra holding ZERO ROMs — only `uxncli`
+(43 KB) + `mesh-uxn-hop` (3 KB) — with two different behaviors through the same channel.
+
+- **`mesh-uxn-hop`** — the packet runner. Format `uxp1 <rom_bytes>\n + <rom raw> + <payload…>`.
+  `--pack <rom>` builds a packet from stdin payload; bare invocation receives one, runs the
+  shipped ROM on the payload in a FRESH EMPTY tempdir (uxncli's file device is cwd-sandboxed,
+  `file_check_sandbox`), propagates the ROM's exit code, and fails LOUD (rc 65) on any
+  malformed/truncated packet — never a silent passthrough.
+  One hop: `mesh-uxn-hop --pack filter.rom < text | ssh node mesh-uxn-hop`
+- **`rot13.tal`/`rot13.rom`** (106 B) — the canonical pipe-stage payload; also documents the
+  console idiom for stream filters (stdin type 1, EOF type 4 → halt `#80`).
+- **`test-uxn-hop`** — RED-first suite: pack byte-accounting, shipped-code execution,
+  hop composition (double-rot13 identity), loud malformed/truncated failure with empty
+  stdout, rc propagation (`#81`→1), fresh-empty-cwd containment.
+
+Next rungs (open): prefix-router ROM (stdout/stderr as two channels); hop chaining with
+per-hop ROMs (source routing where each leg carries its own program).
