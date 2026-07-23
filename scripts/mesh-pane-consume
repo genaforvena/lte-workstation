@@ -35,7 +35,7 @@
 set -uo pipefail
 export PATH="$HOME/.local/bin:$PATH"
 S="$(hostname)"
-LOG="$HOME/.mesh/pane-consume.log"   # ops heartbeat ONLY (wake/skip events) — never stream content
+LOG="${MESH_PANE_CONSUME_LOG:-$HOME/.mesh/pane-consume.log}"   # ops heartbeat ONLY (wake/skip events) — never stream content; override so probes never write the live log a watchdog reads (guardian 09f7914)
 ts(){ date -u +%FT%TZ; }
 
 # Mind pane = the BOTTOM pane (largest pane_top) of the channel window.
@@ -66,7 +66,9 @@ wake_msg(){ # content-free re: the stream — carries NO stream data/diff; only 
   printf '%s' "[$ch consume] Read your live state NOW — run this yourself: mesh-dash --once $role  \
 (one-shot, returns immediately; do NOT run it without --once — that is the pane's infinite render loop and will hang your turn). \
 That output IS your full UNFILTERED state stream — you own the filter, the source does not gate. Then take ONE concrete action on it, \
-or post exactly one terse [idle] line naming the real current state. Never answer 'awaiting data stream' — your state is that command's output."
+or post exactly one terse [idle] line naming the real current state. Never answer 'awaiting data stream' — your state is that command's output. \
+Last: PREDICT your pane — run mesh-wake-expect $ch '<egrep pattern>' ... naming the line-shapes you expect to churn harmlessly before your next real wake; \
+a change your prediction fully covers will NOT wake you (bounded by TTL + a deaf-guard), an unpredicted line always will. Sharpen it each wake."
 }
 
 # strip_volatile — remove per-frame CHROME so an unchanged pane hashes stably. Strips ONLY timestamp/
@@ -150,22 +152,76 @@ apply_wake_rule(){
 # wake_mode — which diff layer applies for <channel>: an explicit mind-owned rule, or the smart default.
 wake_mode(){ [ -f "$WAKE_RULE_DIR/$1" ] && echo rule || echo smart-default; }
 
-# sig_of — <channel> on stdin=frame → stable signature. rule file → select lines then normalize+hash;
-# else normalize whole frame + hash. The pure core of pane_sig (hermetic — --test feeds frames directly).
-sig_of(){
-  local ch="$1" rf="$WAKE_RULE_DIR/$1" buf
-  buf="$(cat)"
-  if [ -f "$rf" ]; then
-    printf '%s\n' "$buf" | apply_wake_rule "$rf" | smart_normalize | sha1sum | awk '{print $1}'
-  else
-    printf '%s\n' "$buf" | smart_normalize | sha1sum | awk '{print $1}'
-  fi
+# norm_of — <channel> on stdin=frame → the reactor's normalized INTERNAL copy (rule-filtered then
+# smart-normalized, or smart-normalized whole). Never shown to anyone; the pure core both the sig and
+# the predictive gate below diff against (hermetic — --test feeds frames directly).
+norm_of(){
+  local ch="$1"; local rf="$WAKE_RULE_DIR/$ch"   # two statements: local expands its words BEFORE assigning, $ch would be unbound
+  if [ -f "$rf" ]; then apply_wake_rule "$rf" | smart_normalize; else smart_normalize; fi
 }
 
-# pane_sig — stable signature of a channel's DATA pane (.0). Captures as today (pane untouched); filters
-# the INTERNAL copy via sig_of. A failed capture yields the empty-input hash (still stable). || true keeps
-# pipefail from tripping on an empty pane.
-pane_sig(){ tmux capture-pane -t "$S:$1.0" -p 2>/dev/null | sig_of "$1" || true; }
+# sig_of — <channel> on stdin=frame → stable signature (hash of the normalized internal copy).
+sig_of(){ norm_of "$1" | sha1sum | awk '{print $1}'; }
+
+# pane_norm — normalized internal copy of a channel's DATA pane (.0). Captures as today (pane untouched).
+# || true keeps pipefail from tripping on an empty pane.
+pane_norm(){ tmux capture-pane -t "$S:$1.0" -p 2>/dev/null | norm_of "$1" || true; }
+
+# ── PREDICTIVE wake gate (operator 2026-07-23: "every mind should be improving its reflexes to predict
+# next top pane state … wake only if prediction does not match reality"). Motivating measurement (board
+# [fyi] 2026-07-23): at the slow consume tempo the change-gate is VACUOUS — 110-239 WOKE vs 0-10
+# no-change skips per channel over the whole log; over a 3-8h interval every pane drifts, so "changed?"
+# always answers yes. The upgrade: change-gated → SURPRISE-gated. After handling a wake the MIND writes
+# an EXPECTATION for its channel (mesh-wake-expect <chan> — grep -E patterns over NORMALIZED lines it
+# PREDICTS will churn). On the next change the reactor diffs the normalized frames; if every changed
+# line matches the prediction, the wake is HELD (reality matched the mind's model — no surprise, no
+# turn). Any unpredicted line still wakes. Strictly FAIL-TOWARD-WAKING (the mesh's fail-safe doctrine —
+# a mind that over-sleeps loses real events irreversibly, an extra wake costs one turn):
+#   - no expectation file / no `# expires:` header / EXPIRED (TTL, default 24h) → plain change-gate;
+#   - a malformed pattern (grep rc>1) → every changed line counts as surprise → wake;
+#   - DEAF-GUARD: at most $MESH_WAKE_DEAF_CAP consecutive holds (default 2), then wake regardless —
+#     an over-broad prediction (`.`) can silence at most cap+1 intervals, never forever;
+#   - the previous frame lives ONLY in the daemon's memory (ephemerality doctrine: no stream content
+#     on disk; decays with the process like scrollback decays on reboot). --once has no prediction.
+WAKE_EXPECT_DIR="${MESH_WAKE_EXPECT_DIR:-$HOME/.mesh/wake-expect}"
+DEAF_CAP="${MESH_WAKE_DEAF_CAP:-2}"
+
+expect_fresh(){ # <channel> → 0 iff an expectation exists and is unexpired (header written by mesh-wake-expect)
+  local f="$WAKE_EXPECT_DIR/$1" exp
+  [ -f "$f" ] || return 1
+  exp="$(sed -nE 's/^# expires: ([0-9]+)$/\1/p' "$f" | head -1)"
+  [ -n "$exp" ] || return 1
+  [ "$(date +%s)" -lt "$exp" ]
+}
+
+surprise_of(){ # <channel> <prev_norm> <cur_norm> → prints the UNPREDICTED changed lines (empty = fully predicted)
+  local ch="$1" prev="$2" cur="$3" changed pats out rc
+  local f="$WAKE_EXPECT_DIR/$ch"   # separate statement: local expands its words before assigning $ch
+  changed="$(comm -3 <(printf '%s\n' "$prev" | sort -u) <(printf '%s\n' "$cur" | sort -u) | sed 's/^\t//')"
+  [ -n "$changed" ] || return 0
+  pats="$(sed -E '/^[[:space:]]*($|#)/d' "$f" 2>/dev/null)"
+  [ -n "$pats" ] || { printf '%s\n' "$changed"; return 0; }
+  out="$(printf '%s\n' "$changed" | grep -vE -f <(printf '%s\n' "$pats") 2>/dev/null)"; rc=$?
+  case "$rc" in
+    0) printf '%s\n' "$out" ;;
+    1) : ;;                            # every changed line predicted
+    *) printf '%s\n' "$changed" ;;     # broken pattern → fail toward waking
+  esac
+}
+
+gate_decision(){ # <channel> <prev_norm> <cur_norm> <consec_holds> → HOLD | WAKE:deaf | WAKE:surprise:<n> | WAKE:plain
+  local ch="$1" prev="$2" cur="$3" supp="$4" sur
+  if [ -n "$prev" ] && expect_fresh "$ch"; then
+    sur="$(surprise_of "$ch" "$prev" "$cur")"
+    if [ -z "$sur" ]; then
+      if [ "$supp" -lt "$DEAF_CAP" ]; then echo HOLD; else echo WAKE:deaf; fi
+    else
+      echo "WAKE:surprise:$(printf '%s\n' "$sur" | grep -c .)"
+    fi
+  else
+    echo WAKE:plain
+  fi
+}
 
 consume_once(){ # <channel> <dry> [<deliver-to>] -> 0 if a wake was sent/would-be-sent
   # <deliver-to> (window-set-consolidation 2026-07-20): diff/name <channel>'s dash, but idle-gate and
@@ -314,7 +370,53 @@ if [ "${1:-}" = --test ]; then
   [ "$(wake_mode nope-no-rule)" = smart-default ] || { echo "smoke-test: FAIL (wake_mode must report 'smart-default' with no rule file)"; exit 1; }
   WAKE_RULE_DIR="$_wr_saved"; rm -rf "$_wr_tmp" "$_wr_empty"
   unset -f mind_idle mesh-tell 2>/dev/null || true
-  echo "smoke-test: ok (diff-gated wake; chrome stripped so panes quiet; real deltas still wake; mind owns the filter + DEAD-SHELL: a refused mesh-tell send logs REFUSED not a false WOKE claim + SMART-DEFAULT neutralizes telemetry jiggle, keeps discrete/integer changes + MIND-DEFINED wake-rule consulted, include/exclude compose)"; exit 0
+  # ── PREDICTIVE wake gate (operator 2026-07-23 "predict next top pane state, wake only on mismatch").
+  # Hermetic: temp expect dir; frames fed directly. Every branch of the fail-toward-waking contract is
+  # asserted — the irreversible failure here is a mind that SLEEPS through a real change.
+  _we_saved="${WAKE_EXPECT_DIR}"; _we_tmp="$(mktemp -d)"; WAKE_EXPECT_DIR="$_we_tmp"
+  _now="$(date +%s)"
+  # 5) expect_fresh: absent → stale; no expires header → stale; expired → stale; future → fresh.
+  expect_fresh nofile && { echo "smoke-test: FAIL (expect_fresh: absent file must read stale)"; exit 1; }
+  printf 'somepattern\n' > "$_we_tmp/hdrless"
+  expect_fresh hdrless && { echo "smoke-test: FAIL (expect_fresh: a file without '# expires:' must read stale — never trust an unbounded prediction)"; exit 1; }
+  printf '# expires: %s\nsomepattern\n' "$((_now - 10))" > "$_we_tmp/old"
+  expect_fresh old && { echo "smoke-test: FAIL (expect_fresh: an EXPIRED expectation must read stale)"; exit 1; }
+  printf '# expires: %s\nsomepattern\n' "$((_now + 600))" > "$_we_tmp/live"
+  expect_fresh live || { echo "smoke-test: FAIL (expect_fresh: a future-expiry expectation must read fresh)"; exit 1; }
+  # 6) surprise_of: a fully-PREDICTED change → empty; an UNPREDICTED line → surfaced; a BROKEN regex →
+  #    every changed line is a surprise (fail toward waking, never toward sleeping).
+  printf '# expires: %s\n^queue depth [0-9]+$\n' "$((_now + 600))" > "$_we_tmp/pch"
+  _p=$'state=UP\nqueue depth 4'
+  _c1=$'state=UP\nqueue depth 9'
+  _c2=$'state=DOWN\nqueue depth 9'
+  s="$(surprise_of pch "$_p" "$_c1")"
+  [ -z "$s" ] || { echo "smoke-test: FAIL (surprise_of: a fully-predicted change must be empty, got: $s)"; exit 1; }
+  s="$(surprise_of pch "$_p" "$_c2")"
+  printf '%s' "$s" | grep -q 'state=DOWN' || { echo "smoke-test: FAIL (surprise_of: the unpredicted state=DOWN line must surface, got: $s)"; exit 1; }
+  printf '# expires: %s\n[broken(\n' "$((_now + 600))" > "$_we_tmp/bad"
+  s="$(surprise_of bad "$_p" "$_c1")"
+  [ -n "$s" ] || { echo "smoke-test: FAIL (surprise_of: a broken pattern must fail TOWARD WAKING — all changed lines out, got empty)"; exit 1; }
+  # 7) gate_decision: HOLD under cap → WAKE:deaf at cap; WAKE:surprise on mismatch; WAKE:plain with no
+  #    expectation or no previous frame (first pass / --once).
+  d="$(gate_decision pch "$_p" "$_c1" 0)"
+  [ "$d" = HOLD ] || { echo "smoke-test: FAIL (gate_decision: predicted change under cap must HOLD, got: $d)"; exit 1; }
+  d="$(gate_decision pch "$_p" "$_c1" "$DEAF_CAP")"
+  [ "$d" = WAKE:deaf ] || { echo "smoke-test: FAIL (gate_decision: at $DEAF_CAP consecutive holds the deaf-guard must wake, got: $d)"; exit 1; }
+  d="$(gate_decision pch "$_p" "$_c2" 0)"
+  case "$d" in WAKE:surprise:*) : ;; *) echo "smoke-test: FAIL (gate_decision: an unpredicted line must WAKE:surprise, got: $d)"; exit 1;; esac
+  d="$(gate_decision noexpect "$_p" "$_c1" 0)"
+  [ "$d" = WAKE:plain ] || { echo "smoke-test: FAIL (gate_decision: no expectation must fall back to the plain change-gate, got: $d)"; exit 1; }
+  d="$(gate_decision pch "" "$_c1" 0)"
+  [ "$d" = WAKE:plain ] || { echo "smoke-test: FAIL (gate_decision: no previous frame (first pass) must WAKE:plain, got: $d)"; exit 1; }
+  # 8) the wake message must TEACH the reflex — name mesh-wake-expect so every engine learns to predict.
+  case "$(wake_msg senses)" in *"mesh-wake-expect senses"*) : ;; *) echo "smoke-test: FAIL (wake msg must name mesh-wake-expect <chan> — the predictive reflex is mesh doctrine, taught on every wake)"; exit 1;; esac
+  WAKE_EXPECT_DIR="$_we_saved"; rm -rf "$_we_tmp"
+  echo "smoke-test: ok (diff-gated wake; chrome stripped so panes quiet; real deltas still wake; mind owns the filter + DEAD-SHELL: a refused mesh-tell send logs REFUSED not a false WOKE claim + SMART-DEFAULT neutralizes telemetry jiggle, keeps discrete/integer changes + MIND-DEFINED wake-rule consulted, include/exclude compose + PREDICTIVE gate: predicted changes hold, surprises/expiry/broken-pattern/deaf-guard all wake)"; exit 0
+fi
+
+if [ "${1:-}" = --expect-check ]; then   # cross-tool contract probe (mesh-wake-expect --test drives it)
+  ch="${2:?usage: mesh-pane-consume --expect-check <channel>}"
+  if expect_fresh "$ch"; then echo "fresh"; exit 0; else echo "stale-or-absent"; exit 1; fi
 fi
 
 ch="${1:?usage: mesh-pane-consume <channel> [--interval N] [--once] [--dry] [--deliver <win>]}"; shift || true
@@ -331,17 +433,32 @@ tmux has-session -t "$S" 2>/dev/null || { echo "mesh-pane-consume: no tmux sessi
 tmux list-windows -t "$S" -F '#{window_name}' 2>/dev/null | grep -qx "$ch" || { echo "mesh-pane-consume: no window '$ch'" >&2; exit 1; }
 
 if [ "$ONCE" = 1 ]; then consume_once "$ch" "$DRY" "${DELIVER:-$ch}"; exit 0; fi
-echo "$(ts) consume start ch=$ch interval=${INTERVAL}s dry=$DRY (diff-gated)" >> "$LOG"
-# DIFF-GATED loop: re-invite the mind ONLY when the data pane's stripped signature changed (the droplet
-# falls only on a real change). First pass always wakes (baseline / spawn-moment read). prev_sig is
-# advanced ONLY when consume_once actually delivered (idle+woke / dry-idle) — if the mind was BUSY,
-# keep prev_sig so the pending change is retried next pass instead of being silently dropped.
-prev_sig=""
+echo "$(ts) consume start ch=$ch interval=${INTERVAL}s dry=$DRY (diff-gated, predictive)" >> "$LOG"
+# DIFF-GATED + PREDICTIVE loop: re-invite the mind ONLY when the data pane's normalized signature
+# changed AND the change is not fully covered by the mind's own expectation (gate_decision above).
+# First pass always wakes (baseline / spawn-moment read). prev_sig/prev_frame advance when consume_once
+# delivered (idle+woke / dry-idle) — if the mind was BUSY, keep them so the pending change is retried
+# next pass instead of silently dropped. A HOLD also advances them (the change is accounted for by the
+# prediction) and bumps the deaf-guard counter; any wake resets it.
+prev_sig=""; prev_frame=""; supp=0
 while :; do
-  cur_sig="$(pane_sig "$ch")"
+  cur_frame="$(pane_norm "$ch")"
+  cur_sig="$(printf '%s\n' "$cur_frame" | sha1sum | awk '{print $1}')"
   if [ "$cur_sig" != "$prev_sig" ]; then
-    echo "$(ts) $ch: change detected [$(wake_mode "$ch")] — waking" >> "$LOG"
-    if consume_once "$ch" "$DRY" "${DELIVER:-$ch}"; then prev_sig="$cur_sig"; fi
+    verdict="$(gate_decision "$ch" "$prev_frame" "$cur_frame" "$supp")"
+    case "$verdict" in
+      HOLD)
+        supp=$((supp+1)); prev_sig="$cur_sig"; prev_frame="$cur_frame"
+        echo "$(ts) $ch: change fully PREDICTED — wake held (expect-gate, $supp/$DEAF_CAP consecutive holds)" >> "$LOG"
+        sleep "$INTERVAL"; continue ;;
+      WAKE:deaf)
+        echo "$(ts) $ch: deaf-guard — $supp consecutive predicted holds, waking anyway [$(wake_mode "$ch")]" >> "$LOG" ;;
+      WAKE:surprise:*)
+        echo "$(ts) $ch: SURPRISE (${verdict##*:} unpredicted line(s)) [$(wake_mode "$ch")] — waking" >> "$LOG" ;;
+      *)
+        echo "$(ts) $ch: change detected [$(wake_mode "$ch")] — waking" >> "$LOG" ;;
+    esac
+    if consume_once "$ch" "$DRY" "${DELIVER:-$ch}"; then prev_sig="$cur_sig"; prev_frame="$cur_frame"; supp=0; fi
   else
     echo "$(ts) $ch: pane unchanged — no wake (droplet held)" >> "$LOG"
   fi
