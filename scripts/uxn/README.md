@@ -122,7 +122,9 @@ under the modern toolchain 2026-07-23, sha1 `442120b…` host==device).
 
 ## Measurements
 
-- **ROM:** 134 bytes (0.21% of the 64 KB Uxn address space).
+- **ROM:** 200 bytes (0.31% of the 64 KB Uxn address space; was 134 B before the
+  2026-07-23 domain-honesty guards — parse-overflow + cad>32767 now answer NA/#82,
+  never a wrapped verdict; the Note3 byte-identity sha 442120b predates this).
 - **Shim:** ~20 lines of logic.
 - **Runtime:** ~0.66 ms/run (process spawn + emulator boot + ROM eval), RSS ~1.5 MB, x86;
   measured on the pre-swap emulator, same order of magnitude on the modern one.
