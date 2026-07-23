@@ -218,3 +218,20 @@ at 65536 — `--pair 900 67335` reads lease as 1799 → rom=RED shell=OK DIVERGE
 (the test suite drives this REAL split, not a mock). First live fleet run:
 208 pairs, 0 diverged. `test-rom-calibrate`: 6 sections; the verdict logic was
 mutated to always-AGREE and the suite seen RED (fixtures discriminate).
+
+## Lisp spike — the expression is DATA (2026-07-23, operator-requested)
+
+`lisp-eval.c` (chibicc-C → `lisp-eval.rom`, 3.9 KB) — micro s-expression evaluator:
+reader + eval over naturals 0..65535. The expression arrives as argv DATA and the fixed
+point runs it — homoiconicity on the ROM: the logic the mesh ships around is text, not a
+rebuild. Ops: `+ *` variadic, `- /` binary, `< > <= >= =` → 1/0, lazy `if` (only the
+taken branch evaluates — `(if 1 7 (/ 1 0))` → 7). NA/#82 honesty carried over from
+lease-gate: literal/`+`/`*` overflow, `-` underflow, `/0`, unknown op, bad parens/arity,
+input >512 B, nesting >24 all answer `NA` rc=2 + reason on stderr — never a wrapped value.
+Step 2 landed with it: lease-gate expressed AS an s-expr the evaluator runs —
+`(if (>= <lease> (* 2 <cad>)) 1 0)` passes the EVAL.md 5-row truth table, and the two
+calibrate-caught wrap rows (`900/67335`, `33000/60000`) answer NA instead of the false
+verdicts the 16-bit wrap once produced. `test-lisp-eval`: core + gate tables on both the
+fresh build and the committed ROM; RED-first via an inverted-`>=` mutant that must fail
+the same table. Authoring gotcha: string literals must be ASCII — chibicc emits non-ASCII
+bytes as broken labels (`uxnasm: Label unknown: ffffffe2` from an em dash).
