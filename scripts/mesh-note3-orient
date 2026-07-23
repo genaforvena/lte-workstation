@@ -1,0 +1,296 @@
+#!/usr/bin/env bash
+# reflex-cadence: 0-59/5 * * * *
+# reflex-args: --edge
+# mesh-note3-orient — the Note3's HAL Orientation sensor (android.sensor.orientation, sensorcat
+# type 3) as a phone-POSTURE sense: FACE_UP / FACE_DOWN / UPRIGHT / TILTED, via the SAME
+# adb->sensorcat relay mesh-note3-mag/ambient/baro use (sensorcat is a native ASensorManager
+# client, ~/.mesh/note3/, that REGISTERS a real listener so the SSP actually samples).
+#
+# WHY THIS IS NEW (not a dup of mesh-note3-motion): motion reads the RAW accelerometer sysfs
+# node and EXPLICITLY refuses face-up/down semantics — its header (lines 18-22) states "verifying
+# axis-to-physical-orientation mapping would need hands in the craft room... the verdict stays in
+# the sensor's own coordinate frame (raw vector + Euclidean delta) rather than a fabricated 'face
+# up/down' label". Type 3 IS that mapping: the HAL fuses accel+mag into calibrated azimuth/pitch/
+# roll with a DEFINED physical meaning (pitch=0 -> screen up flat, pitch=~±180 -> screen down,
+# |pitch|~90 -> upright). So orient answers the question motion deliberately could not: which
+# physical face of the phone points up right now. This fills a real gap — a deliberate FACE-DOWN
+# flip (privacy gesture / cam-cover) that mesh-note3-prox catches only conditionally (the prox
+# sensor reads NEAR only when the screen faces a surface within ~5cm) and motion can't name at
+# all. Proven LIVE twice + again at wire-time: `adb shell '/data/local/tmp/sensorcat --secs 2 3'`
+# -> `SENSOR|Orientation Sensor|3|<az>|<pitch>|<roll>|<ns-tick>` with a FRESH tick every read.
+#
+# CLASSIFIER (Android legacy TYPE_ORIENTATION convention — pitch is rotation about X, 0=flat):
+#   pitch ≈ 0      -> FACE_UP   (screen faces the ceiling, device flat)      [|pitch| <  flat]
+#   pitch ≈ ±180   -> FACE_DOWN (screen faces the floor/surface)            [|pitch| >= flip]
+#   |pitch| ≈ 90   -> UPRIGHT   (device on an edge / vertical)              [lo <= |pitch| <= hi]
+#   otherwise      -> TILTED    (leaning, or flat-but-propped-on-an-edge)   [catch-all]
+# Roll refines the flat case: flat (|pitch|<flat) but |roll|>=roll_flat is TILTED (propped), not
+# FACE_UP. Thresholds have >=30deg gaps so read noise does not flap the class. All env-overridable.
+#
+# SELF-CAL REST BASELINE: the phone's habitual resting posture is auto-seeded from the first
+# classified read (no manual setup) and stored in .note3-orient-rest; `--cal-rest` re-baselines
+# to the current posture for when hands ARE in the room. The edge reports a posture-class TRANSITION
+# (the FLIP), and the output flags whether the phone has DEPARTED its rest posture — the privacy/
+# cam-cover gesture is precisely "departed FACE_UP rest -> FACE_DOWN". This makes the headline
+# signal robust to the exact label-to-face convention: even if the Note3's default-landscape axis
+# offset means pitch=0 is not literally screen-up, a transition FROM the calibrated rest TO a
+# different class is still a genuine, detectable reorientation.
+#
+# Honest contract: adb/ssh unreachable OR the sensor line unparsable -> UNREACHABLE, exit 2,
+# never fake a reading. A HAL event tick identical to the prior poll -> FROZEN (sensorcat is a live
+# listener so this is unlikely, but a stuck cache must NOT be reported as a fresh posture change);
+# FROZEN never posts a board transition (it carries no new posture information).
+#
+#   mesh-note3-orient               one-shot: posture class + az/pitch/roll + rest/departed
+#   mesh-note3-orient --json        machine-readable
+#   mesh-note3-orient --edge        debounced; board post ONLY on a posture-class transition
+#   mesh-note3-orient --cal-rest    set the current posture as the rest baseline, then exit
+#   mesh-note3-orient --test        fixture-driven classifier smoke test + live adb read-gate
+#
+# Exit: 0 = assessed · 2 = adb body unreachable (honest n/a, never faked)
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+[ -f "$HOME/.mesh/nodes" ] && [ -z "${MESH_SKIP_NODES_SOURCE:-}" ] && . "$HOME/.mesh/nodes"
+
+MESH="${MESH_DIR:-$HOME/.mesh}"; mkdir -p "$MESH" 2>/dev/null || true
+STATE="$MESH/.note3-orient-state"        # "class|az|pitch|roll|tick|ts"
+EDGE_STATE="$MESH/.note3-orient-edge"    # last POSTED board class — for --edge dedup
+REST_STATE="$MESH/.note3-orient-rest"    # the self-calibrated rest posture class
+
+# Note3 body is the SAME adb->sensorcat relay mesh-note3-mag/ambient/baro use; falls back to the
+# baro node vars so a single ~/.mesh/nodes entry covers every Note3-body sense.
+NOTE3_ADB_NODE="${MESH_NOTE3_ADB_NODE:-${MESH_BARO_ADB_NODE:-}}"
+NOTE3_ADB_SERIAL="${MESH_NOTE3_ADB_SERIAL:-${MESH_BARO_ADB_SERIAL:-}}"
+
+# Classifier thresholds (degrees). Defaults leave >=30deg margins between every band.
+PITCH_FLAT="${MESH_NOTE3_ORIENT_PITCH_FLAT:-30}"     # |pitch| below this (flat) -> FACE_UP/TILTED
+PITCH_FLIP="${MESH_NOTE3_ORIENT_PITCH_FLIP:-150}"    # |pitch| at/above this -> FACE_DOWN (~±180)
+UPRIGHT_LO="${MESH_NOTE3_ORIENT_UPRIGHT_LO:-60}"     # |pitch| in [lo,hi] -> UPRIGHT (~vertical)
+UPRIGHT_HI="${MESH_NOTE3_ORIENT_UPRIGHT_HI:-120}"
+ROLL_FLAT="${MESH_NOTE3_ORIENT_ROLL_FLAT:-30}"       # flat + |roll|>=this -> TILTED (propped)
+
+# parse_orient <stdin: raw sensorcat SENSOR| lines> -> "az,pitch,roll,tick" (empty on no-match).
+# Strips the \r adb shell appends to each line (CRLF) from every field — without it the \r on <tick>
+# fails the validation regex below and a LIVE reachable read silently reads as empty (caught live
+# 2026-07-23). Pure function — no I/O — directly testable on a fixture blob incl. a CRLF line.
+parse_orient() {
+  awk -F'|' '$1=="SENSOR" && $3=="3" {
+    gsub(/[\r ]/,"",$4); gsub(/[\r ]/,"",$5); gsub(/[\r ]/,"",$6); gsub(/[\r ]/,"",$7);
+    printf "%s,%s,%s,%s", $4, $5, $6, $7; exit }'
+}
+
+# note3_orient_raw — live "az,pitch,roll,tick" from sensorcat type 3 (Orientation). Empty + rc1 on
+# any failure (adb down, ssh down, sensor line absent/malformed). Test override:
+# NOTE3_ORIENT_RAW_OVERRIDE skips the network entirely (clean comma value, no adb/CRLF path).
+note3_orient_raw() {
+  local out
+  if [ -n "${NOTE3_ORIENT_RAW_OVERRIDE:-}" ]; then
+    out="$NOTE3_ORIENT_RAW_OVERRIDE"
+  else
+    local ser=""; [ -n "$NOTE3_ADB_SERIAL" ] && ser="-s $NOTE3_ADB_SERIAL"
+    local raw
+    if [ "$NOTE3_ADB_NODE" = local ]; then
+      mesh-note3-tool-install sensorcat >/dev/null 2>&1
+      raw="$(timeout 20 adb $ser shell '/data/local/tmp/sensorcat --secs 2 3' 2>/dev/null)"
+    else
+      [ -z "$NOTE3_ADB_NODE" ] && return 1
+      raw="$(timeout 30 ssh -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new \
+        "$NOTE3_ADB_NODE" "adb $ser shell '/data/local/tmp/sensorcat --secs 2 3'" </dev/null 2>/dev/null)"
+    fi
+    [ -n "$raw" ] || return 1
+    out="$(printf '%s\n' "$raw" | parse_orient)"
+  fi
+  printf '%s' "$out" | grep -qE '^-?[0-9]+\.?[0-9]*,-?[0-9]+\.?[0-9]*,-?[0-9]+\.?[0-9]*,[0-9]+$' || return 1
+  printf '%s' "$out"
+}
+
+# classify <pitch> <roll> <pitch_flat> <pitch_flip> <upright_lo> <upright_hi> <roll_flat>
+#   -> one of FACE_UP|FACE_DOWN|UPRIGHT|TILTED. Pure function — no I/O — directly testable.
+classify() {
+  python3 -c "
+import sys
+pitch=float(sys.argv[1]); roll=float(sys.argv[2])
+flat=float(sys.argv[3]); flip=float(sys.argv[4]); lo=float(sys.argv[5]); hi=float(sys.argv[6]); rflat=float(sys.argv[7])
+ap=abs(pitch); ar=abs(roll)
+if ap>=flip: print('FACE_DOWN')
+elif ap<flat: print('FACE_UP' if ar<rflat else 'TILTED')
+elif lo<=ap<=hi: print('UPRIGHT')
+else: print('TILTED')
+" "$2" "$3" "$4" "$5" "$6" "$7" "$8"
+}
+
+# is_relay_run <arg1> <adb_node> -> rc0 when this is a SCHEDULED --edge poll on a RELAY node
+# (adb_node is a non-empty remote host, i.e. NOT "local"). A relay reaches the SAME physical Note3
+# by SSH-ing to the direct-adb owner, so its cron poll is pure redundancy — a double board post +
+# divergence from racing the same on-change HAL — with zero added resilience (the relay read
+# already fails whenever the owner is down). The direct-adb owner (adb_node="local") is the sole
+# scheduled poster; on-demand reads (no-arg/--json) stay available from any node. Pure — testable.
+is_relay_run() { [ "$1" = --edge ] && [ -n "$2" ] && [ "$2" != local ]; }
+
+# ─── --test: fixture-driven classifier + live adb read-gate ──────────────────────────────
+if [ "${1:-}" = --test ]; then
+  command -v python3 >/dev/null 2>&1 || { echo "smoke-test: FAIL (no python3)"; exit 1; }
+  _f=0
+
+  # ── classifier: each posture band + the roll refinement + band boundaries ──
+  r="$(classify "" 0 0 "$PITCH_FLAT" "$PITCH_FLIP" "$UPRIGHT_LO" "$UPRIGHT_HI" "$ROLL_FLAT")"
+  [ "$r" = FACE_UP ]   || { echo "  FAIL: flat pitch=0 roll=0 must be FACE_UP, got '$r'"; _f=1; }
+  r="$(classify "" 5 10 "$PITCH_FLAT" "$PITCH_FLIP" "$UPRIGHT_LO" "$UPRIGHT_HI" "$ROLL_FLAT")"
+  [ "$r" = FACE_UP ]   || { echo "  FAIL: small flat tilt (pitch=5 roll=10) must be FACE_UP, got '$r'"; _f=1; }
+  r="$(classify "" -179.9 80.4 "$PITCH_FLAT" "$PITCH_FLIP" "$UPRIGHT_LO" "$UPRIGHT_HI" "$ROLL_FLAT")"
+  [ "$r" = FACE_DOWN ] || { echo "  FAIL: pitch near ±180 (=-179.9) must be FACE_DOWN, got '$r'"; _f=1; }
+  r="$(classify "" 179 -80 "$PITCH_FLAT" "$PITCH_FLIP" "$UPRIGHT_LO" "$UPRIGHT_HI" "$ROLL_FLAT")"
+  [ "$r" = FACE_DOWN ] || { echo "  FAIL: pitch=179 must be FACE_DOWN, got '$r'"; _f=1; }
+  r="$(classify "" 90 10 "$PITCH_FLAT" "$PITCH_FLIP" "$UPRIGHT_LO" "$UPRIGHT_HI" "$ROLL_FLAT")"
+  [ "$r" = UPRIGHT ]   || { echo "  FAIL: |pitch|=90 (vertical) must be UPRIGHT, got '$r'"; _f=1; }
+  r="$(classify "" -90 0 "$PITCH_FLAT" "$PITCH_FLIP" "$UPRIGHT_LO" "$UPRIGHT_HI" "$ROLL_FLAT")"
+  [ "$r" = UPRIGHT ]   || { echo "  FAIL: pitch=-90 must be UPRIGHT, got '$r'"; _f=1; }
+  r="$(classify "" 45 10 "$PITCH_FLAT" "$PITCH_FLIP" "$UPRIGHT_LO" "$UPRIGHT_HI" "$ROLL_FLAT")"
+  [ "$r" = TILTED ]    || { echo "  FAIL: leaning pitch=45 (30-60 band) must be TILTED, got '$r'"; _f=1; }
+  r="$(classify "" 130 0 "$PITCH_FLAT" "$PITCH_FLIP" "$UPRIGHT_LO" "$UPRIGHT_HI" "$ROLL_FLAT")"
+  [ "$r" = TILTED ]    || { echo "  FAIL: pitch=130 (120-150 band) must be TILTED, got '$r'"; _f=1; }
+  r="$(classify "" 10 50 "$PITCH_FLAT" "$PITCH_FLIP" "$UPRIGHT_LO" "$UPRIGHT_HI" "$ROLL_FLAT")"
+  [ "$r" = TILTED ]    || { echo "  FAIL: flat-but-rolled (pitch=10 roll=50) must be TILTED, got '$r'"; _f=1; }
+
+  # ── parse gate: malformed / wrong-type sensorcat lines must be rejected, never accepted ──
+  NOTE3_ORIENT_RAW_OVERRIDE="not,an,orient,x" note3_orient_raw >/dev/null 2>&1 && { echo "  FAIL: malformed raw must be rejected"; _f=1; }
+  NOTE3_ORIENT_RAW_OVERRIDE="111.142,-179.969,80.393,1529862461157676" note3_orient_raw >/dev/null 2>&1 || { echo "  FAIL: well-formed raw must be accepted"; _f=1; }
+  # parse from a real multi-line sensorcat blob: must pick type 3, ignore other types
+  _blob='SENSOR|Orientation Sensor|3|111.142|-179.969|80.393|1529862461157676
+SENSOR|Magnetic Field|2|63.3|-6.9|102.1|243818847577501'
+  _parsed="$(printf '%s\n' "$_blob" | parse_orient)"
+  [ "$_parsed" = "111.142,-179.969,80.393,1529862461157676" ] || { echo "  FAIL: parse_orient must extract type-3 az,pitch,roll,tick, got '$_parsed'"; _f=1; }
+  # ── CRLF regression (adb shell appends \r): the REAL parse_orient must strip it — drive the
+  #    function directly on a \r-terminated line, not a copy (caught live 2026-07-23: the \r on
+  #    <tick> failed validation and a reachable read silently read as empty) ──
+  _cp="$(printf 'SENSOR|Orientation Sensor|3|111.142|-179.969|80.393|1529862461157676\r\n' | parse_orient)"
+  [ "$_cp" = "111.142,-179.969,80.393,1529862461157676" ] || { echo "  FAIL: parse_orient must strip adb CRLF (\\r), got '$_cp'"; _f=1; }
+
+  # ── relay-node gate (is_relay_run): scheduled --edge on a RELAY skips; owner + on-demand don't ──
+  is_relay_run --edge imozerov@100.125.157.75 || { echo "  FAIL: --edge on a relay node must skip"; _f=1; }
+  is_relay_run --edge local                    && { echo "  FAIL: --edge on the direct-adb owner must NOT skip"; _f=1; }
+  is_relay_run --edge ''                        && { echo "  FAIL: --edge with no adb node must NOT skip (n/a path handles it)"; _f=1; }
+  is_relay_run --json imozerov@100.125.157.75  && { echo "  FAIL: on-demand --json from a relay must NOT skip"; _f=1; }
+  is_relay_run '' imozerov@100.125.157.75      && { echo "  FAIL: on-demand no-arg from a relay must NOT skip"; _f=1; }
+
+  # ── board-edge integration: a class transition posts EXACTLY one line; same-class + FROZEN post none ──
+  _edge_run() { NOTE3_ORIENT_RAW_OVERRIDE="$2" MESH_DIR="$1" MESH_SKIP_NODES_SOURCE=1 \
+      MESH_NOTE3_ORIENT_BOARD="$1/chat.log" MESH_NOTE3_ADB_NODE=local MESH_BARO_ADB_NODE='' "$0" --edge >/dev/null 2>&1; }
+  # (a) seed rest + settle on FACE_UP, then FLIP to FACE_DOWN -> exactly one board line
+  _sa="$(mktemp -d)"; : > "$_sa/chat.log"
+  _edge_run "$_sa" "10,2,5,1000"      # FACE_UP (seed rest=FACE_UP, seed edge, no post)
+  _edge_run "$_sa" "12,3,6,2000"      # FACE_UP (same class, no post)
+  [ -s "$_sa/chat.log" ] && { echo "  FAIL: same-class reads must post 0 lines: $(cat "$_sa/chat.log")"; _f=1; }
+  _edge_run "$_sa" "179,5,80,3000"    # FACE_DOWN (transition -> 1 post)
+  _nb="$(grep -c 'note3-orient' "$_sa/chat.log" 2>/dev/null)"
+  [ "$_nb" = 1 ] || { echo "  FAIL: FACE_UP->FACE_DOWN must post exactly 1 line, got $_nb: $(cat "$_sa/chat.log")"; _f=1; }
+  _edge_run "$_sa" "178,6,79,4000"    # FACE_DOWN (same, no post)
+  _nb="$(grep -c 'note3-orient' "$_sa/chat.log" 2>/dev/null)"
+  [ "$_nb" = 1 ] || { echo "  FAIL: same-class FACE_DOWN must not add a line, got $_nb"; _f=1; }
+  # (b) FROZEN (identical tick) must NOT post a transition even when the class label would change
+  _edge_run "$_sa" "179,5,80,4000"    # identical tick=4000 -> FROZEN, no post (class same anyway here)
+  _nb="$(grep -c 'note3-orient' "$_sa/chat.log" 2>/dev/null)"
+  [ "$_nb" = 1 ] || { echo "  FAIL: FROZEN read must not post, got $_nb"; _f=1; }
+  # (c) rest baseline auto-seeded + departed flag
+  _rest="$(cat "$_sa/.note3-orient-rest" 2>/dev/null)"
+  [ "$_rest" = FACE_UP ] || { echo "  FAIL: rest baseline must auto-seed to first class FACE_UP, got '$_rest'"; _f=1; }
+  rm -rf "$_sa" 2>/dev/null || true
+
+  # ── live adb read-gate (mesh-land treats exit 2 = honest n/a as a pass) ──
+  if [ -z "$NOTE3_ADB_NODE" ]; then
+    [ "$_f" = 0 ] || { echo "smoke-test: FAIL (classifier contract violated)"; exit 1; }
+    echo "smoke-test: n/a (MESH_NOTE3_ADB_NODE/MESH_BARO_ADB_NODE unset — Note3 body not configured on this node)"
+    exit 2
+  fi
+  _live="$(note3_orient_raw)"
+  if [ -z "$_live" ]; then
+    [ "$_f" = 0 ] || { echo "smoke-test: FAIL (classifier contract violated)"; exit 1; }
+    echo "smoke-test: n/a (adb body unreachable — Note3 orientation sense unavailable)"
+    exit 2
+  fi
+  _az="$(echo "$_live" | cut -d, -f1)"; _pitch="$(echo "$_live" | cut -d, -f2)"; _roll="$(echo "$_live" | cut -d, -f3)"
+  _ok="$(python3 -c "
+import sys
+az=float(sys.argv[1]); pitch=float(sys.argv[2]); roll=float(sys.argv[3])
+print(1 if (0<=az<360 and -180<=pitch<=180 and -180<=roll<=180) else 0)
+" "$_az" "$_pitch" "$_roll" 2>/dev/null)"
+  [ "$_ok" = 1 ] || { echo "  FAIL: live orientation out of plausible range: $_live"; _f=1; }
+  _lclass="$(classify "" "$_pitch" "$_roll" "$PITCH_FLAT" "$PITCH_FLIP" "$UPRIGHT_LO" "$UPRIGHT_HI" "$ROLL_FLAT")"
+  case "$_lclass" in FACE_UP|FACE_DOWN|UPRIGHT|TILTED) :;; *) echo "  FAIL: live read must classify to a posture, got '$_lclass'"; _f=1;; esac
+  [ "$_f" = 0 ] || { echo "smoke-test: FAIL (classify/parse/live-read contract violated)"; exit 1; }
+  echo "smoke-test: ok (9 classifier + parse-gate + type-3-select + 5 relay-gate + board-edge/rest integration + LIVE adb read $_live -> $_lclass)"
+  exit 0
+fi
+
+# ─── relay-node gate: only the direct-adb owner runs the scheduled --edge poll (see is_relay_run) ─
+if is_relay_run "${1:-}" "$NOTE3_ADB_NODE"; then
+  echo "note3-orient: relay-skip (adb owner=$NOTE3_ADB_NODE; scheduled poll deferred to the direct-adb owner — no double board post)"
+  exit 0
+fi
+
+# ─── live read ───────────────────────────────────────────────────────────
+raw="$(note3_orient_raw)"
+if [ -z "$raw" ]; then
+  echo "note3-orient: UNREACHABLE (adb body offline/unreadable/sensor line absent)" >&2
+  [ "${1:-}" = --json ] && printf '{"verdict":"UNREACHABLE"}\n'
+  exit 2
+fi
+az="$(echo "$raw" | cut -d, -f1)"; pitch="$(echo "$raw" | cut -d, -f2)"; roll="$(echo "$raw" | cut -d, -f3)"
+tick="$(echo "$raw" | cut -d, -f4)"
+
+class="$(classify "" "$pitch" "$roll" "$PITCH_FLAT" "$PITCH_FLIP" "$UPRIGHT_LO" "$UPRIGHT_HI" "$ROLL_FLAT")"
+
+# FROZEN guard: sensorcat is a live listener so a fresh tick is expected every read; an identical
+# ns-tick vs the prior poll means the cache did not advance -> FROZEN, not a fresh posture change.
+ptick=""
+if [ -f "$STATE" ]; then
+  IFS='|' read -r _pclass _paz _ppitch _proll ptick _pts < "$STATE" 2>/dev/null || true
+fi
+if [ -n "$ptick" ] && [ "$tick" = "$ptick" ]; then
+  verdict=FROZEN
+else
+  verdict="$class"
+fi
+ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+printf '%s|%s|%s|%s|%s|%s\n' "$verdict" "$az" "$pitch" "$roll" "$tick" "$ts" > "$STATE"
+mesh-state-touch "$STATE" 2>/dev/null || touch "$STATE" 2>/dev/null || true   # ran-live liveness, independent of value-changed
+
+# rest baseline: auto-seed on first read; --cal-rest re-baselines explicitly
+if [ "${1:-}" = --cal-rest ]; then
+  printf '%s\n' "$class" > "$REST_STATE"
+  printf 'note3-orient: rest baseline set to %s (az=%s pitch=%s roll=%s)\n' "$class" "$az" "$pitch" "$roll"
+  exit 0
+fi
+rest=""; [ -f "$REST_STATE" ] && rest="$(cat "$REST_STATE" 2>/dev/null)"
+if [ -z "$rest" ]; then
+  rest="$class"; printf '%s\n' "$rest" > "$REST_STATE"   # self-cal: first observed posture becomes rest
+fi
+departed="at-rest"; [ "$verdict" != "$rest" ] && [ "$verdict" != FROZEN ] && departed="DEPARTED"
+
+case "${1:-}" in
+  --json)
+    printf '{"verdict":"%s","class":"%s","azimuth":%s,"pitch":%s,"roll":%s,"rest":"%s","departed":"%s","ts":"%s"}\n' \
+      "$verdict" "$class" "$az" "$pitch" "$roll" "$rest" "$departed" "$ts"
+    ;;
+  --edge)
+    prev_posted=""; [ -f "$EDGE_STATE" ] && prev_posted="$(cat "$EDGE_STATE" 2>/dev/null)"
+    if [ -z "$prev_posted" ]; then
+      printf '%s\n' "$verdict" > "$EDGE_STATE"          # seed the edge; nothing to post from a first read
+    elif [ "$verdict" != "$prev_posted" ] && [ "$verdict" != FROZEN ]; then
+      board="${MESH_NOTE3_ORIENT_BOARD:-$MESH/chat.log}"
+      ts_board="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+      _extra=""; [ "$departed" = DEPARTED ] && _extra=" — departed rest($rest)"
+      printf '%s  note3-orient@%s  ::  [note3-orient] %s (was %s; pitch=%s roll=%s%s)\n' \
+        "$ts_board" "$(hostname)" "$verdict" "$prev_posted" "$pitch" "$roll" "$_extra" >> "$board" 2>/dev/null || true
+      printf '%s\n' "$verdict" > "$EDGE_STATE"
+    fi
+    printf 'note3-orient: %s (class=%s pitch=%s roll=%s rest=%s %s)\n' "$verdict" "$class" "$pitch" "$roll" "$rest" "$departed"
+    ;;
+  *)
+    printf 'note3-orient: %s (class=%s az=%s pitch=%s roll=%s rest=%s %s)\n' \
+      "$verdict" "$class" "$az" "$pitch" "$roll" "$rest" "$departed"
+    ;;
+esac
+exit 0
