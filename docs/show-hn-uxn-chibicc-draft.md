@@ -1,9 +1,9 @@
-# Show HN draft — C → Uxn ROM (chibicc-eval)
+# Show HN draft — Uxn ROMs as fixed points in an agent mesh
 
-> Status: **v1 — operator review.** Standalone Show HN candidate, distinct from the
-> mesh-overview post (`show-hn-final.md`). That post is "agents on old phones"; this one is
-> a concrete computing experiment: *write a portable program in C, compile it to a 468-byte
-> ROM that runs byte-identically on x86 and a 32-bit ARM phone.*
+> Status: **v2 — operator review.** Rewritten from v1 (C→ROM eval) after the lane matured
+> into a full system: unified runner, vendored compiler, cron-wired audit, ROM-as-packet
+> mobile code, fixed-point doctrine, board watcher, calibration ledger, gates-as-data.
+> Standalone Show HN candidate, distinct from the mesh-overview post (`show-hn-final.md`).
 
 ---
 
@@ -13,104 +13,98 @@
 
 **Show HN: I compile C to a 468-byte ROM that runs identically on x86 and ARM** (77 chars)
 
-Alt: **Show HN: A C compiler for a 134-byte virtual stack machine (Uxn)** (66)
+Alt: **Show HN: Portable ROMs as fixed points in an agent mesh (Uxn)** (64)
 
 ### Post body
 
 ---
 
-I have a small invariant I need to check a lot: a watchdog's timeout has
-to be at least twice how often its producer runs, or it false-alarms every
-cycle while being perfectly healthy. Pure arithmetic — the kind of thing
-that's miserable to express in shell and invisible in a `grep`.
+I run a mesh of agents on old phones. They check invariants — is a
+watchdog's lease longer than twice its producer's cadence? Is the battery
+in its longevity band? Is the board log monotonic?
 
-So I ported it to [Uxn](https://wiki.xxiivv.com/site/uxn.html) — the tiny
-virtual machine from [Hundred Rabbits](https://100r.co). Uxn is a
-stack-based computer (think a virtual FORTH CPU) with a 64 KB address
-space, designed so a ROM you write today runs unchanged on any
-architecture, forever. The whole emulator is ~26 KB of C89 with no deps
-beyond libc.
+I was checking these with `grep`. Then I audited: 33 of 52 liveness gates
+could *never fail* — each `grep`'d its own source for a string, so it
+always found itself. A gate you haven't seen fail is not a gate.
 
-First I wrote the gate by hand in Uxntal (the assembly): 44 lines,
-**134 bytes**. It reads two numbers, checks `lease ≥ 2 × cadence`, prints
-`OK` or `RED`. Then I pushed that exact ROM to an old Android
-phone over SSH and ran it there — same bytes, same verdicts, a 32-bit ARM
-core executing the same ROM as the x86 workstation.
+So I started moving them to [Uxn](https://wiki.xxiivv.com/site/uxn.html)
+— the tiny virtual machine from
+[Hundred Rabbits](https://100r.co). Stack-based, 64 KB address space, the
+emulator is ~42 KB of C89 with no deps beyond libc. A ROM you assemble
+today runs unchanged on any architecture, forever.
+
+The first gate: a lease-vs-cadence check. Hand-written in Uxntal (the
+assembly), 44 lines, **134 bytes**. Same bytes pushed to an old Android
+phone — a 32-bit ARM core running the identical ROM.
 
 Then the obvious question: can I stop writing assembly?
-
 [chibicc](https://github.com/rui314/chibicc) is Rui Ueyama's small C
-compiler. Someone
-[retargeted it to emit Uxntal](https://github.com/lynn/chibicc). So I
-wrote the same gate in plain C:
+compiler; someone
+[retargeted it to emit Uxntal](https://github.com/lynn/chibicc). The same
+gate in 29 lines of plain C compiles to a **468-byte ROM** — truth table
+exact match, cross-arch verified:
 
 ```c
 void main(int argc, char *argv[]) {
     unsigned int cad = parse_int(argv[1]);
     unsigned int lease = parse_int(argv[2]);
-    if (lease >= 2 * cad)
-        print_string("OK\n");
-    else
-        print_string("RED\n");
-    exit(0);
+    if (lease >= 2 * cad) print_string("OK\n");
+    else                  print_string("RED\n");
 }
 ```
-
-Run it through `gcc -P -E` (chibicc has no preprocessor) → `chibicc -O1`
-→ `uxnasm` → a **468-byte ROM**. Truth table, exact match with the
-hand-written one:
 
 ```
 cad=900 lease=1800 -> OK     cad=900 lease=1799 -> RED
 cad=900 lease=900  -> RED    cad=60  lease=3600 -> OK
 ```
 
-Both verdicts appear (it's not a constant). And the same byte-identical
-ROM, pushed to the Note3 (armeabi-v7a), returns matching answers on all
-four rows.
+chibicc is now vendored — one `cc-rom.sh` goes from `.c` to `.rom`. Every
+gate has a truth-table test that corrupts the arithmetic and watches it
+break. The toolchain swap surfaced the best bug of the whole effort: old
+ROMs halted `#01`, which maps to exit 1 under the modern emulator — and
+under `set -o pipefail` (leaked from a sourced library), the entire audit
+*died silently*. No error, no verdict, just gone. The fix was one byte.
 
-29 lines of readable C beat 44 lines of stack juggling for authorship and
-review, at 3.5× the size (still 0.7% of the address space). chibicc's own
-800+-case test suite passes fully at `-O0` and `-O1` under the modern
-toolchain.
+**Then it got interesting.** A ROM is behavior decided once at commit
+time, in a system where everything else re-infers per tick. That makes it
+a *fixed point* — and a fixed point is three things:
 
-**The catch (there's always a catch).** Uxn had an ISA change in 2022.
-chibicc emits the *modern* ISA (immediate jump opcodes). The toolchain I'd
-vendored was the *older* one — its assembler rejected chibicc's output and
-its emulator hung on the resulting ROM (an opcode misdecodes, no crash,
-just a timeout). The good news: old ROMs run fine on the modern emulator,
-so adopting chibicc means swapping the vendored toolchain, not rewriting
-anything. I did the swap.
+**The thing you calibrate against.** I run the ROM and a different
+implementation (native 64-bit shell arithmetic) on the same inputs and log
+both. Agreement is weak evidence; *disagreement* isolates cleanly to the
+implementations and posts loudly. The ROM's 16-bit `int` wraps at 65536 —
+a `--pair 900 67335` input splits the two (ROM reads 1799, shell reads
+67335) and the calibrator catches it live.
 
-And the swap immediately paid for itself by breaking something invisibly.
-The old ROMs halted with `#01`; under the modern emulator that maps to
-exit code 1. The audit that runs the gate is a shell script sourced into
-an environment with `pipefail` on — so the moment the ROM exited 1, the
-whole audit *died silently*. No error, no verdict, no trace that it had
-ever run. The ROM was correct; the convention was the bug. The fix was a
-one-byte change — ROMs now halt `#80` and the verdict reader fails loud on
-anything unexpected — but a silent death under `pipefail` is the kind of
-thing you only find by actually doing the migration and watching the test
-suite go quietly empty.
+**The thing you watch *with*.** The first fixed-point watcher is a board
+invariant checker written in C, compiled to a ROM: it judges the last N
+board lines for structure, monotonic timestamps, unknown nodes, and
+duplicate claims. Text you control goes in; the ROM is the whole trust
+boundary.
 
-**Why bother?** These gates are "organs" — small programs that each
-enforce one invariant — in a mesh of agents running across old hardware.
-The lease-vs-cadence rule is real: I once had 33 of 52 liveness checks
-that could *never fail* because they `grep`'d their own source for a
-string instead of checking a number. A ROM that does the arithmetic is
-falsifiable; a `grep` that finds its own pattern line is not. Writing
-those ROMs in C instead of assembly means I'll actually write more of
-them.
+**The thing that travels.** If a ROM is a fixed point, it can move. A
+ROM-as-packet over SSH: the program ships in-band with the data
+(`uxp1 <rom_bytes>\n + <rom raw> + <payload>`). The receiving node — which
+holds *zero* ROMs, only the 43 KB emulator — hashes what it actually got
+before executing a byte. Declared hash ≠ actual is a loud refusal. A
+tampered ROM that ran silently with rc=0 and empty output is
+indistinguishable from consensus — so you verify, then execute.
 
-The whole thing — hand-written gate, C gate, the eval notes, the
-cross-arch verification — is in the repo under `scripts/uxn/`. The C
-subset is honest about its limits (16-bit ints, no floats, no
-preprocessor), and the repro is four shell lines.
+And the latest step: a micro Lisp evaluator ROM where the *expression is
+data*. The predicate `(if (>= lease (* 2 cad)) 1 0)` ships as text and the
+fixed point runs it — homoiconicity on the ROM, no recompile to change a
+threshold.
 
-I'd love feedback on: is targeting Uxn from a real C compiler worth the
-toolchain complexity, or is hand-written assembly the right call for
-something this small? And the ISA split — has anyone else hit the
-pre/post-2022 migration?
+The whole lane — hand-written gates, the C compiler, the unified runner,
+the cron-wired audit (207 reflexes), the mobile-code layer, the watcher,
+the calibrator — is in the repo under `scripts/uxn/`. The design spec is
+operator-approved. Every piece has a red-first test you can break.
+
+I'd love feedback on: is the fixed-point framing real, or am I
+overloading a cute word? Is shipping executable code over SSH as a
+hash-verified packet madness or obvious? And for anyone who's targeted
+Uxn from a real compiler — how far do you take it before hand assembly
+wins again?
 
 ---
 
@@ -125,66 +119,91 @@ pre/post-2022 migration?
 | authorship | stack juggling | plain C |
 | `% of 64 KB` | 0.20% | 0.72% |
 
-The hand-written ROM does its own decimal parsing in stack operations
-(`#30 SUB` to strip ASCII, `#000a MUL2` to shift). The C version lets the
-compiler emit all of that. Both hit the same 16-bit `int` wrap ceiling
-(>32767 s) — parity, not a regression.
+Both hit the same 16-bit `int` wrap ceiling (>32767 s) — parity, not a
+regression. The hand ROM does its own decimal parsing in stack ops
+(`#30 SUB`, `#000a MUL2`); the C version lets the compiler emit that.
 
-### The cross-architecture verification
+### Gate classes (the pattern generalizes)
 
-`build.sh` compiles `uxncli` per platform; the ROM is never rebuilt. The
-same 134-byte (hand) / 468-byte (C) file is pushed to the Note3
-(armeabi-v7a) via `verify-note3.sh` and executed with matching verdicts.
-That's the portability claim made concrete: one artifact, two ISAs,
-identical behavior.
+- **lease-gate** — single ratio `lease ≥ 2·cadence` (the first).
+- **band-gate** — two-edged window `lo ≤ value ≤ hi` (165 B; battery,
+  thermal, PSI ranges).
+- **hyst-gate** — onset/recovery hysteresis carrying prior state
+  (`value on off prev → ALERT/CLEAR/HOLD`) — both edges of a signal share
+  one gate.
+- **board-check** — structural invariants over the board log (24.7 KB;
+  the 20 KB board buffer dominates).
 
-### The RED-first proof
+### The unified runner (`mesh-rom-gate`)
 
-The test doesn't just assert the happy path. It corrupts the ROM's
-`#0002 MUL2` → `#0001` and demands the boundary *moves* (a `lease==cadence`
-input that wrongly passes) — proving the ROM does the arithmetic, not a
-hardcoded constant. This is the same doctrine that caught the 33/52
-self-matching `grep` gates: a gate you haven't seen *fail* is not a gate.
+One tool marshals `<rom> args…` → `uxncli` → verdict TEXT, rc
+`0`/`1`(RED)/`2`(n/a LOUD — engine/ROM absent or broken; never a fake
+verdict). Consumers keep their inline compare as the explicit rc=2
+fallback and stamp `src=rom|inline-fallback`. `mesh-lease-audit` is
+cron-wired (daily) and gates all 207 live reflexes through the ROM.
 
-### The C subset (what an organ may use)
+### The fixed-point doctrine
 
-- **Yes:** C89 core, `char`/`short`/`int(16-bit)`/`unsigned`, arrays,
-  pointers, structs, enums, the `asm()` intrinsic for inline uxntal,
-  Varvara event handlers (`on_console`).
-- **No:** preprocessor (use host `cc -P -E`), 32/64-bit ints, floats,
-  function pointers, VLAs, bit-fields, struct-by-value.
+A ROM is the mesh's first fixed point — behavior decided once at commit
+time. Three uses:
 
-`main(argc, argv)` pulls in a support routine (468 B vs 134 B). A custom
-`on_console` handler is the lean path when size matters.
+1. **Calibration** (`mesh-rom-calibrate`, cron-wired) — run the ROM +
+   native shell on identical inputs, log every pair (stamped with the
+   ROM's sha1). Disagreement posts `[chat-review]` loudly; agreement logs
+   silently. First live run: 208 pairs, 0 diverged.
+2. **Watching** (`board-check.c` → ROM, cron `*/10`) — structural board
+   invariants: `ts who@host :: body`, monotonic ISO8601 timestamps, known
+   nodes, no duplicate claims. Input is staged text; the ROM is the trust
+   boundary.
+3. **Mobile code** (`mesh-uxn-hop`) — ROM-as-packet over SSH. `--pack`
+   declares the sha1 in-band; the receiver hashes before executing;
+   `UXN_HOP_STAMP=1` stamps stderr with what it really ran. `route.rom`
+   (263 B) demuxes two output channels over one pipe by shipped code.
 
-### Repro
+### Gates-as-data (`lisp-eval.c` → 3.9 KB ROM)
+
+Micro s-expression evaluator over naturals 0..65535. The predicate is
+argv DATA the fixed point runs — `(if (>= lease (* 2 cad)) 1 0)` passes
+the lease truth table. NA/#82 honesty: overflow, `/0`, unknown op, bad
+parens all answer NA, never a wrapped value. Lease-gate and band-gate now
+express as s-expr data lines under the evaluator (gates-as-data stage 1).
+
+### The RED-first proof pattern
+
+Every gate corrupts its own arithmetic and watches the test break:
+- lease: `#0002 MUL2` → `#0001` shifts the boundary.
+- band: each `GTH2` no-op'd in turn.
+- calibrate: verdict logic mutated to always-AGREE, suite seen RED.
+- hop: tampered ROM refused (declared sha1 ≠ actual).
+
+A gate you haven't seen fail is not a gate.
+
+### Repro (chibicc now vendored)
 
 ```sh
-git clone https://github.com/lynn/chibicc && cd chibicc && make
-gcc -I. -P -E lease-gate.c -o lg.c && ./chibicc -O1 lg.c > lg.tal
-uxnasm-modern lg.tal lease-gate-c.rom && uxncli-modern lease-gate-c.rom 900 1800
+cd scripts/uxn && ./build.sh --chibicc      # build vendored chibicc
+./cc-rom.sh chibicc-eval/lease-gate.c lease-gate-c.rom   # .c → .rom
+./mesh-rom-gate lease-gate-c.rom 900 1800   # → OK
 ```
 
 ---
 
 ## Notes for the operator
 
-- **Repo link:** point at `scripts/uxn/` (the pilot README is public-ready,
-  no secrets). The eval detail is in `scripts/uxn/chibicc-eval/EVAL.md`.
-- **Tone:** deliberately flat and specific — HN punishes pretension. The
-  "there's always a catch" framing is intentional; the ISA split is the
-  kind of wart HN rewards you for disclosing up front.
-- **The two feedback questions** target the two real open decisions: (1)
-  is the C→Uxn toolchain worth it vs. hand assembly, and (2) the ISA
-  migration. Both are genuine; HN commenters who've touched Uxn will have
-  opinions on both.
-- **Not overclaimed:** the post says "I haven't done that yet" about the
-  toolchain swap and "I documented it and stopped" — this is true and
-  matches the EVAL.md. Don't soften it into "TODO"; the honesty is the
-  point.
+- **Repo link:** `scripts/uxn/` (README is public-ready, full lane
+  documented). Eval detail in `chibicc-eval/EVAL.md`; design spec in
+  `docs/superpowers/specs/2026-07-23-uxn-predicate-engine-design.md`.
+- **Tone:** flat and specific throughout. The three-act structure
+  (calibrate → watch → travel) is the payoff; the C→ROM experiment is the
+  accessible entry. The pipefail silent-death story stays — it's the kind
+  of concrete wart HN rewards.
+- **Both v1 open items are closed:** toolchain vendor-swap (`223d9c8`) and
+  chibicc vendored (`ba7944d`). Zero TODO loose ends.
+- **The three feedback questions** target the three real open decisions:
+  (1) is "fixed point" a real concept or overloading, (2) hash-verified
+  mobile code over SSH — madness or obvious, (3) how far does C→Uxn go
+  before hand assembly wins.
 - **Relationship to the mesh post (`show-hn-final.md`):** different
   audience overlap. This one stands alone for the Uxn/compilers/small-
   computing crowd; the mesh post is for the infra/agent crowd. Posting
-  both close together is fine — they're different hooks — but if only one
-  goes up, this one is lower-risk (concrete artifact, less "is this real"
-  friction).
+  both is fine — different hooks.
