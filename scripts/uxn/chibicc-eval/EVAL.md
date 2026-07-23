@@ -65,10 +65,21 @@ answered OK to everything; caught by the truth table before it saw RED).
 For **gate-class organs** (arithmetic predicates, the pilot's whole point): yes — 29 lines
 of readable C beat 44 lines of stack-machine uxntal for authorship and review, at 3.5× ROM
 size (still 0.7 % of the address space). Hand uxntal remains right for size-critical or
-vector-heavy ROMs. **Not adopted into the build yet:** wiring it means (a) vendoring the
-modern toolchain + re-verifying the two existing ROMs' RED-first suites under it, and
-(b) vendoring chibicc (or documenting a pinned clone) — filed as a follow-up decision, not
-smuggled into this eval.
+vector-heavy ROMs. Wiring it means (a) vendoring the
+modern toolchain + re-verifying the two existing ROMs' RED-first suites under it —
+**DONE 2026-07-23** (vendor-swap: modern uxnasm+uxncli in `../src/`, both `.tal` re-assembled,
+all three suites green, Note3 re-verified byte-identical sha1 `442120b…`; the swap surfaced the
+halt-convention trap below) — and
+(b) vendoring chibicc (or documenting a pinned clone) — still open; the repro clone below is the
+pinned source for now.
+
+**Halt-convention trap (found by the swap's own suites):** the old-ISA ROMs ended `#01 #0f DEO`
+("any nonzero state halts"); modern uxncli's exit code is `state & 0x7f`, so that read as **exit 1
+on every run**. `mesh-lease-audit` sources `mesh-reflex-health`, whose `set -uo pipefail` leaks
+into the audit shell, so the verdict pipeline "failed" and `set -e` killed the audit **silently**
+(rc=1, zero bytes on both streams). Fixed: ROMs halt `#80` (exit 0 = "a verdict was rendered";
+the verdict itself is TEXT), and `rom_verdict` fails LOUD on a nonzero pipeline. A sourced file's
+shell options are part of its interface.
 
 ## Repro
 

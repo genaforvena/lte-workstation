@@ -9,4 +9,14 @@ THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
 WITH REGARD TO THIS SOFTWARE.
 */
 
-Uint8 datetime_dei(Uint8 addr);
+#define CONSOLE_STD 0x1
+#define CONSOLE_ARG 0x2
+#define CONSOLE_EOA 0x3
+#define CONSOLE_END 0x4
+
+int console_input(int c, int type);
+void console_arguments(int i, int argc, char **argv);
+Uint8 console_dei(Uint8 addr);
+void console_deo(Uint8 addr);
+
+extern int console_vector;

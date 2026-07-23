@@ -1,7 +1,7 @@
 #include "uxn.h"
 
 /*
-Copyright (u) 2022 Devine Lu Linvega, Andrew Alderwick, Andrew Richards
+Copyright (u) 2022-2024 Devine Lu Linvega, Andrew Alderwick, Andrew Richards
 
 Permission to use, copy, modify, and distribute this software for any
 purpose with or without fee is hereby granted, provided that the above
@@ -11,127 +11,84 @@ THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
 WITH REGARD TO THIS SOFTWARE.
 */
 
-/* clang-format off */
+#define OPC(opc, init, body) {\
+	case 0x00|opc: {const int _2=0,_r=0;init body;} break;\
+	case 0x20|opc: {const int _2=1,_r=0;init body;} break;\
+	case 0x40|opc: {const int _2=0,_r=1;init body;} break;\
+	case 0x60|opc: {const int _2=1,_r=1;init body;} break;\
+	case 0x80|opc: {const int _2=0,_r=0,k=uxn.wst.ptr;init uxn.wst.ptr=k;body;} break;\
+	case 0xa0|opc: {const int _2=1,_r=0,k=uxn.wst.ptr;init uxn.wst.ptr=k;body;} break;\
+	case 0xc0|opc: {const int _2=0,_r=1,k=uxn.rst.ptr;init uxn.rst.ptr=k;body;} break;\
+	case 0xe0|opc: {const int _2=1,_r=1,k=uxn.rst.ptr;init uxn.rst.ptr=k;body;} break;\
+}
 
-/*	a,b,c: general use.  bs: byte/short bool. src, dst: stack ptrs, swapped in return mode.
-	pc: program counter. sp: ptr to src stack ptr. kptr: "keep" mode copy of src stack ptr.
-	x,y: macro in params. d: macro in device. j,k,dev: macro temp variables. o: macro out param. */
+/* Microcode */
 
-#define PUSH8(s, x) { if(s->ptr == 0xff) { errcode = 2; goto err; } s->dat[s->ptr++] = (x); }
-#define PUSH16(s, x) { if((j = s->ptr) >= 0xfe) { errcode = 2; goto err; } k = (x); s->dat[j] = k >> 8; s->dat[j + 1] = k; s->ptr = j + 2; }
-#define PUSH(s, x) { if(bs) { PUSH16(s, (x)) } else { PUSH8(s, (x)) } }
-#define POP8(o) { if(!(j = *sp)) { errcode = 0; goto err; } o = (Uint16)src->dat[--j]; *sp = j; }
-#define POP16(o) { if((j = *sp) <= 1) { errcode = 0; goto err; } o = src->dat[j - 1]; o += src->dat[j - 2] << 8; *sp = j - 2; }
-#define POP(o) { if(bs) { POP16(o) } else { POP8(o) } }
-#define POKE(x, y) { if(bs) { u->ram[(x)] = (y) >> 8; u->ram[(x) + 1] = (y); } else { u->ram[(x)] = y; } }
-#define PEEK16(o, x) { o = (u->ram[(x)] << 8) + u->ram[(x) + 1]; }
-#define PEEK(o, x) { if(bs) { PEEK16(o, x) } else { o = u->ram[(x)]; } }
-#define DEVR(o, d, x) { dev = (d); o = dev->dei(dev, (x) & 0x0f); if(bs) { o = (o << 8) + dev->dei(dev, ((x) + 1) & 0x0f); } }
-#define DEVW8(x, y) { dev->dat[(x) & 0xf] = y; dev->deo(dev, (x) & 0x0f); }
-#define DEVW(d, x, y) { dev = (d); if(bs) { DEVW8((x), (y) >> 8); DEVW8((x) + 1, (y)); } else { DEVW8((x), (y)) } }
-#define WARP(x) { if(bs) pc = (x); else pc += (Sint8)(x); }
-#define LIMIT 0x40000 /* around 3 ms */
+#define JMI a = uxn.ram[pc] << 8 | uxn.ram[pc + 1], pc += a + 2;
+#define REM if(_r) uxn.rst.ptr -= 1 + _2; else uxn.wst.ptr -= 1 + _2;
+#define INC(s) uxn.s.dat[uxn.s.ptr++]
+#define DEC(s) uxn.s.dat[--uxn.s.ptr]
+#define JMP(x) { if(_2) pc = x; else pc += (Sint8)x; }
+#define PO1(o) { o = _r ? DEC(rst) : DEC(wst);}
+#define PO2(o) { if(_r) o = DEC(rst), o |= DEC(rst) << 8; else o = DEC(wst), o |= DEC(wst) << 8; }
+#define POx(o) { if(_2) PO2(o) else PO1(o) }
+#define PU1(i) { if(_r) INC(rst) = i; else INC(wst) = i; }
+#define RP1(i) { if(_r) INC(wst) = i; else INC(rst) = i; }
+#define PUx(i) { if(_2) { c = (i); PU1(c >> 8) PU1(c) } else PU1(i) }
+#define GET(o) { if(_2) PO1(o[1]) PO1(o[0]) }
+#define PUT(i) { PU1(i[0]) if(_2) PU1(i[1]) }
+#define DEI(i,o) o[0] = emu_dei(i); if(_2) o[1] = emu_dei(i + 1); PUT(o)
+#define DEO(i,j) emu_deo(i, j[0]); if(_2) emu_deo(i + 1, j[1]);
+#define PEK(i,o,m) o[0] = uxn.ram[i]; if(_2) o[1] = uxn.ram[(i + 1) & m]; PUT(o)
+#define POK(i,j,m) uxn.ram[i] = j[0]; if(_2) uxn.ram[(i + 1) & m] = j[1];
 
 int
-uxn_eval(Uxn *u, Uint16 pc)
+uxn_eval(Uint16 pc)
 {
-	unsigned int a, b, c, j, k, bs, instr, errcode;
-	unsigned int limit = LIMIT;
-	Uint8 kptr, *sp;
-	Stack *src, *dst;
-	Device *dev;
-	if(!pc || u->dev[0].dat[0xf]) return 0;
-	while((instr = u->ram[pc++])) {
-		if(!limit--) {
-			if(!uxn_interrupt()) {
-				errcode = 6;
-				goto timeout;
-			}
-			limit = LIMIT;
-		}
-		/* Return Mode */
-		if(instr & 0x40) {
-			src = &u->rst; dst = &u->wst;
-		} else {
-			src = &u->wst; dst = &u->rst;
-		}
-		/* Keep Mode */
-		if(instr & 0x80) {
-			kptr = src->ptr;
-			sp = &kptr;
-		} else {
-			sp = &src->ptr;
-		}
-		/* Short Mode */
-		bs = instr & 0x20 ? 1 : 0;
-		switch(instr & 0x1f) {
-		/* Stack */
-		case 0x00: /* LIT */ PEEK(a, pc) PUSH(src, a) pc += 1 + bs; break;
-		case 0x01: /* INC */ POP(a) PUSH(src, a + 1) break;
-		case 0x02: /* POP */ POP(a) break;
-		case 0x03: /* NIP */ POP(a) POP(b) PUSH(src, a) break;
-		case 0x04: /* SWP */ POP(a) POP(b) PUSH(src, a) PUSH(src, b) break;
-		case 0x05: /* ROT */ POP(a) POP(b) POP(c) PUSH(src, b) PUSH(src, a) PUSH(src, c) break;
-		case 0x06: /* DUP */ POP(a) PUSH(src, a) PUSH(src, a) break;
-		case 0x07: /* OVR */ POP(a) POP(b) PUSH(src, b) PUSH(src, a) PUSH(src, b) break;
-		/* Logic */
-		case 0x08: /* EQU */ POP(a) POP(b) PUSH8(src, b == a) break;
-		case 0x09: /* NEQ */ POP(a) POP(b) PUSH8(src, b != a) break;
-		case 0x0a: /* GTH */ POP(a) POP(b) PUSH8(src, b > a) break;
-		case 0x0b: /* LTH */ POP(a) POP(b) PUSH8(src, b < a) break;
-		case 0x0c: /* JMP */ POP(a) WARP(a) break;
-		case 0x0d: /* JCN */ POP(a) POP8(b) if(b) WARP(a) break;
-		case 0x0e: /* JSR */ POP(a) PUSH16(dst, pc) WARP(a) break;
-		case 0x0f: /* STH */ POP(a) PUSH(dst, a) break;
-		/* Memory */
-		case 0x10: /* LDZ */ POP8(a) PEEK(b, a) PUSH(src, b) break;
-		case 0x11: /* STZ */ POP8(a) POP(b) POKE(a, b) break;
-		case 0x12: /* LDR */ POP8(a) PEEK(b, pc + (Sint8)a) PUSH(src, b) break;
-		case 0x13: /* STR */ POP8(a) POP(b) c = pc + (Sint8)a; POKE(c, b) break;
-		case 0x14: /* LDA */ POP16(a) PEEK(b, a) PUSH(src, b) break;
-		case 0x15: /* STA */ POP16(a) POP(b) POKE(a, b) break;
-		case 0x16: /* DEI */ POP8(a) DEVR(b, &u->dev[a >> 4], a) PUSH(src, b) break;
-		case 0x17: /* DEO */ POP8(a) POP(b) DEVW(&u->dev[a >> 4], a, b) break;
-		/* Arithmetic */
-		case 0x18: /* ADD */ POP(a) POP(b) PUSH(src, b + a) break;
-		case 0x19: /* SUB */ POP(a) POP(b) PUSH(src, b - a) break;
-		case 0x1a: /* MUL */ POP(a) POP(b) PUSH(src, (Uint32)b * a) break;
-		case 0x1b: /* DIV */ POP(a) POP(b) if(a == 0) { errcode = 4; goto err; } PUSH(src, b / a) break;
-		case 0x1c: /* AND */ POP(a) POP(b) PUSH(src, b & a) break;
-		case 0x1d: /* ORA */ POP(a) POP(b) PUSH(src, b | a) break;
-		case 0x1e: /* EOR */ POP(a) POP(b) PUSH(src, b ^ a) break;
-		case 0x1f: /* SFT */ POP8(a) POP(b) c = b >> (a & 0x0f) << ((a & 0xf0) >> 4); PUSH(src, c) break;
+	unsigned int a, b, c, x[2], y[2], z[2], step;
+	if(!pc || uxn.dev[0x0f]) return 0;
+	for(step = STEP_MAX; step; step--) {
+		switch(uxn.ram[pc++]) {
+		/* BRK */ case 0x00: return 1;
+		/* JCI */ case 0x20: if(DEC(wst)) { JMI break; } pc += 2; break;
+		/* JMI */ case 0x40: JMI break;
+		/* JSI */ case 0x60: c = pc + 2; INC(rst) = c >> 8; INC(rst) = c; JMI break;
+		/* LI2 */ case 0xa0: INC(wst) = uxn.ram[pc++]; /* fall-through */
+		/* LIT */ case 0x80: INC(wst) = uxn.ram[pc++]; break;
+		/* L2r */ case 0xe0: INC(rst) = uxn.ram[pc++]; /* fall-through */
+		/* LIr */ case 0xc0: INC(rst) = uxn.ram[pc++]; break;
+		/* INC */ OPC(0x01,POx(a),PUx(a + 1))
+		/* POP */ OPC(0x02,REM   ,{})
+		/* NIP */ OPC(0x03,GET(x) REM   ,PUT(x))
+		/* SWP */ OPC(0x04,GET(x) GET(y),PUT(x) PUT(y))
+		/* ROT */ OPC(0x05,GET(x) GET(y) GET(z),PUT(y) PUT(x) PUT(z))
+		/* DUP */ OPC(0x06,GET(x),PUT(x) PUT(x))
+		/* OVR */ OPC(0x07,GET(x) GET(y),PUT(y) PUT(x) PUT(y))
+		/* EQU */ OPC(0x08,POx(a) POx(b),PU1(b == a))
+		/* NEQ */ OPC(0x09,POx(a) POx(b),PU1(b != a))
+		/* GTH */ OPC(0x0a,POx(a) POx(b),PU1(b > a))
+		/* LTH */ OPC(0x0b,POx(a) POx(b),PU1(b < a))
+		/* JMP */ OPC(0x0c,POx(a),JMP(a))
+		/* JCN */ OPC(0x0d,POx(a) PO1(b),if(b) JMP(a))
+		/* JSR */ OPC(0x0e,POx(a),RP1(pc >> 8) RP1(pc) JMP(a))
+		/* STH */ OPC(0x0f,GET(x),RP1(x[0]) if(_2) RP1(x[1]))
+		/* LDZ */ OPC(0x10,PO1(a),PEK(a, x, 0xff))
+		/* STZ */ OPC(0x11,PO1(a) GET(y),POK(a, y, 0xff))
+		/* LDR */ OPC(0x12,PO1(a),PEK(pc + (Sint8)a, x, 0xffff))
+		/* STR */ OPC(0x13,PO1(a) GET(y),POK(pc + (Sint8)a, y, 0xffff))
+		/* LDA */ OPC(0x14,PO2(a),PEK(a, x, 0xffff))
+		/* STA */ OPC(0x15,PO2(a) GET(y),POK(a, y, 0xffff))
+		/* DEI */ OPC(0x16,PO1(a),DEI(a, x))
+		/* DEO */ OPC(0x17,PO1(a) GET(y),DEO(a, y))
+		/* ADD */ OPC(0x18,POx(a) POx(b),PUx(b + a))
+		/* SUB */ OPC(0x19,POx(a) POx(b),PUx(b - a))
+		/* MUL */ OPC(0x1a,POx(a) POx(b),PUx(b * a))
+		/* DIV */ OPC(0x1b,POx(a) POx(b),PUx(a ? b / a : 0))
+		/* AND */ OPC(0x1c,POx(a) POx(b),PUx(b & a))
+		/* ORA */ OPC(0x1d,POx(a) POx(b),PUx(b | a))
+		/* EOR */ OPC(0x1e,POx(a) POx(b),PUx(b ^ a))
+		/* SFT */ OPC(0x1f,PO1(a) POx(b),PUx(b >> (a & 0xf) << (a >> 4)))
 		}
 	}
-	return 1;
-
-err:
-	/* set 1 in errcode if it involved the return stack instead of the working stack */
-	/*        (stack overflow & ( opcode was STH / JSR )) ^ Return Mode */
-	errcode |= ((errcode >> 1 & ((instr & 0x1e) == 0x0e)) ^ instr >> 6) & 1;
-timeout:
-	return uxn_halt(u, errcode, pc - 1);
-}
-
-/* clang-format on */
-
-int
-uxn_boot(Uxn *u, Uint8 *ram)
-{
-	Uint32 i;
-	char *cptr = (char *)u;
-	for(i = 0; i < sizeof(*u); i++)
-		cptr[i] = 0x00;
-	u->ram = ram;
-	return 1;
-}
-
-Device *
-uxn_port(Uxn *u, Uint8 id, Uint8 (*deifn)(Device *d, Uint8 port), void (*deofn)(Device *d, Uint8 port))
-{
-	Device *d = &u->dev[id];
-	d->u = u;
-	d->dei = deifn;
-	d->deo = deofn;
-	return d;
+	return 0;
 }

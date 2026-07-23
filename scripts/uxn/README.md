@@ -15,7 +15,7 @@ Pure arithmetic — the ideal first thing to move off shell into a stack machine
 - **`lease-gate.tal`** — the gate, 44 lines of uxntal. Reads `cadence` then `lease` as
   newline-terminated argv tokens, parses decimal in-ROM, computes `lease ≥ 2·cadence`,
   prints `OK` / `RED`, halts.
-- **`lease-gate.rom`** — assembled, **133 bytes**. This is the portable artifact.
+- **`lease-gate.rom`** — assembled, **134 bytes**. This is the portable artifact.
 - **`mesh-lease-gate`** — the host shim (**~20 lines of logic**). Resolves a reflex's
   `(cadence, lease)` from a fixtures table (or `--pair a b`) and hands the two integers to
   the ROM. The gate *logic* is in the ROM; the shim only marshals inputs and maps the
@@ -30,8 +30,13 @@ Pure arithmetic — the ideal first thing to move off shell into a stack machine
   two-edged boundary `lo ≤ value ≤ hi`, RED past either edge. Proves the ROM pattern generalizes
   beyond lease's single `≥` comparison. See "Second gate class" below.
 - **`src/`, `build.sh`** — vendored Uxn toolchain (`uxnasm` + `uxncli`, MIT, Devine Lu
-  Linvega et al.). `build.sh` compiles the ~26 KB emulator **per platform**; the ROM it runs
-  is identical everywhere.
+  Linvega et al.). **Modern post-2022 ISA** (JCI/JMI/JSI) — vendor-swapped 2026-07-23 from
+  `~rabbits/uxn` (uxnasm from `archive/`, uxncli+core from `src/` @ `43453d7`; provenance in
+  `build.sh`) so chibicc-compiled ROMs run (`chibicc-eval/EVAL.md`); the pre-2022-ISA
+  toolchain it replaced lives in git history. `build.sh` compiles the ~42 KB emulator **per
+  platform**; the ROM it runs is identical everywhere. Halt convention is modern: ROMs end
+  with `#80 #0f DEO` (exit code = `state & 0x7f` = 0 when a verdict was rendered) — the
+  verdict itself is TEXT (`OK`/`RED`), never the exit code.
 
 ## Build & run
 
@@ -112,11 +117,13 @@ PSI range (`band-fixtures`).
 
 `build.sh` on each node compiles its own `uxncli`; **`lease-gate.rom` is never rebuilt**.
 See `verify-note3.sh` for the aarch/armhf cross-build + push + on-device run that executes
-the identical 133-byte ROM on the Note3 (armeabi-v7a) with matching verdicts.
+the identical 134-byte ROM on the Note3 (armeabi-v7a) with matching verdicts (re-verified
+under the modern toolchain 2026-07-23, sha1 `442120b…` host==device).
 
 ## Measurements
 
-- **ROM:** 133 bytes (0.20% of the 64 KB Uxn address space).
+- **ROM:** 134 bytes (0.21% of the 64 KB Uxn address space).
 - **Shim:** ~20 lines of logic.
-- **Runtime:** ~0.66 ms/run (process spawn + emulator boot + ROM eval), RSS ~1.5 MB, x86.
-- **Emulator:** `uxncli` ~26 KB, `uxnasm` ~21 KB, C89, no deps beyond libc.
+- **Runtime:** ~0.66 ms/run (process spawn + emulator boot + ROM eval), RSS ~1.5 MB, x86;
+  measured on the pre-swap emulator, same order of magnitude on the modern one.
+- **Emulator:** `uxncli` ~42 KB, `uxnasm` ~21 KB, C89, no deps beyond libc.

@@ -1,5 +1,5 @@
 /*
-Copyright (c) 2022 Devine Lu Linvega, Andrew Alderwick
+Copyright (c) 2022-2025 Devine Lu Linvega, Andrew Alderwick
 
 Permission to use, copy, modify, and distribute this software for any
 purpose with or without fee is hereby granted, provided that the above
@@ -9,13 +9,12 @@ THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
 WITH REGARD TO THIS SOFTWARE.
 */
 
-typedef struct SystemDevice {
-	Device device;
-	struct UxnScreen *screen;
-} SystemDevice;
+#define BANKS 0x10
+#define BANKS_CAP BANKS * 0x10000
 
-void system_inspect(Uxn *u);
+int system_error(char *msg, const char *err);
+int system_boot(Uint8 *ram, char *rom_path, int has_args);
+int system_reboot(int soft);
 
-Uint8 system_dei(Device *d, Uint8 port);
-void system_deo(Device *d, Uint8 port);
-void system_deo_special(Device *d, Uint8 port);
+Uint8 system_dei(Uint8 addr);
+void system_deo(Uint8 addr);

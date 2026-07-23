@@ -13,7 +13,7 @@ adb get-state >/dev/null 2>&1 || { echo "no adb device"; exit 2; }
 
 # 1) static armhf emulator (bionic has no glibc loader; static = pure-syscall, runs under the Android kernel)
 "$CROSS" -std=c89 -O2 -static -DNDEBUG -o /tmp/uxncli.armhf \
-    src/uxncli.c src/uxn.c src/devices/system.c src/devices/file.c src/devices/datetime.c
+    src/uxncli.c src/uxn.c src/devices/system.c src/devices/console.c src/devices/file.c src/devices/datetime.c
 echo "cross-built /tmp/uxncli.armhf ($(wc -c </tmp/uxncli.armhf)b, $(file -b /tmp/uxncli.armhf | cut -d, -f1-2))"
 
 # 2) push the emulator + the UNMODIFIED rom
