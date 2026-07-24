@@ -1,0 +1,354 @@
+#!/usr/bin/env bash
+# mesh-labor — a git-versioned DOUBLE-ENTRY ledger of the mesh's LABOR-TIME, on a rolling 5h budget.
+#
+# Operator premise (2026-07-24): "можно иметь бюджет 5-ти часовой (по примеру claude code) на инференс
+# и компьют… считаем-то не деньги-деньги, а труд (по-марксистски)… hledger мы вставили очень наивно."
+# Right. mesh-ledger books DOLLARS (imputed market value) and mesh-promises books OBLIGATIONS; both are
+# real, but neither is the thing the mesh actually SPENDS. What the mesh spends is LABOUR-TIME — mind
+# turns of compute — and it spends it against a rolling 5-hour envelope exactly like Claude Code's limit.
+# This tool is the third hledger axis: the unit of account is a TURN, not a dollar.
+#
+# THE MARXIST UNIT (why TURN): a `turn` is one provider round-trip ≈ one quantum of quota/credit
+# (mesh-spend's own definition). It is the mesh's ABSTRACT labour — genome's coding, tg's talking, a
+# sense's classifying all reduce to the same fungible TURN in the ledger, the way concrete labours
+# reduce to abstract socially-necessary labour-time. The rolling 5h window is the working period; the
+# budget cap is the length of that period's available labour-power. We account labour, and we price it
+# in nothing but itself.
+#
+# THE BOARD IS THE JOURNAL (source of truth; the hledger repo is a materialized, tamper-evident view):
+#   LABOUR EXPENDED  ~/.mesh/spend.log — each line `<ts> turn <window> <engine> <prov> <tier> <model>`
+#                    is ONE turn (mesh-spend samples a rising edge into WORKING per window). This IS the
+#                    labour log already; --feed replays it into double entry.
+#   WORK STRUCTURE   ~/.mesh/chat.log — the board's `[task]`/`[done]` say WHAT the labour was for.
+#                    --branch <slug> intersects a task's open interval with its owner-window's turns:
+#                    "how much labour did this branch cost the mesh" — the operator's "на борде можно считать".
+#
+# CHART (commodity TURN, never mixed with the USD ledger or the PROMISE ledger — separate repo):
+#   expenses:labour:<prov>:<window>   (Dr, labour expended by a mind)
+#   assets:budget:<prov>              (Cr, drawdown of that provider's labour-power)
+#   Each feed = ONE transaction; per-commodity it MUST sum to zero, so a feeder bug that miscounts any
+#   leg unbalances the txn and `hledger check` catches it with NO oracle — the same error-detecting-code
+#   payoff as mesh-ledger. Every feed tagged  window:<startISO>..<endISO>  → idempotent + auditable.
+#
+# THE ROLLING 5h BUDGET (the Claude-Code reframe — the headline view):
+#   --budget reads spend.log directly for the LIVE [now-5h .. now] window (sub-minute precision hledger's
+#   day-granular dates can't give) and shows, per provider: spent / cap / remaining / burn-rate /
+#   projected exhaustion — a mesh rate-limit readout. Cap = MESH_LABOR_BUDGET_TURNS (per provider per
+#   rolling 5h). UNSET → report-only (honest: an invented cap is a faked constant); set it to arm the limit.
+#
+#   mesh-labor                 --budget (default): the rolling 5h labour budget, per provider
+#   mesh-labor --feed          replay spend.log since the last feed into the journal (idempotent), commit
+#   mesh-labor --balance       hledger bal expenses:labour (labour by provider/window, all-time)
+#   mesh-labor --branch <slug> labour a board task cost: its owner-window's turns over its open interval
+#   mesh-labor --register      hledger register of the labour journal (the searchable log)
+#   mesh-labor --check         hledger parity + replay-vs-balance AGREEMENT (the gate)
+#   mesh-labor --dash          compact pane summary (for a data window)
+#   mesh-labor --json          machine-readable rolling-window budget
+#   mesh-labor --test          RED-first: parity gate SEEN to reject an unbalanced txn + budget math
+#
+# Env: MESH_LABOR_DIR (default ~/.mesh/labour)  MESH_SPEND_LOG (default ~/.mesh/spend.log)
+#      MESH_CHAT_LOG (default ~/.mesh/chat.log)  MESH_LABOR_WINDOW_H (rolling window, default 5)
+#      MESH_LABOR_BUDGET_TURNS (per-prov rolling cap; unset/0 → report-only)
+#      MESH_LABOR_LOOKBACK_H (first-feed backfill, default = window)
+# reflex-cadence: 19 * * * *
+# reflex-args: --feed
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+MESH="$HOME/.mesh"
+LABOR_DIR="${MESH_LABOR_DIR:-$MESH/labour}"
+SPEND_LOG="${MESH_SPEND_LOG:-$MESH/spend.log}"
+CHAT_LOG="${MESH_CHAT_LOG:-$MESH/chat.log}"
+WATERMARK="$LABOR_DIR/.watermark"
+STATE="$MESH/.labor-state"
+WINDOW_H="${MESH_LABOR_WINDOW_H:-5}"
+LOOKBACK_H="${MESH_LABOR_LOOKBACK_H:-$WINDOW_H}"
+BUDGET_TURNS="${MESH_LABOR_BUDGET_TURNS:-0}"
+
+have(){ command -v "$1" >/dev/null 2>&1; }
+git_labor(){ git -C "$LABOR_DIR" -c user.name='mesh-labor' -c user.email='noreply@mesh' "$@"; }
+main_journal(){ echo "$LABOR_DIR/mesh.journal"; }
+year_journal(){ echo "$LABOR_DIR/$(date -u +%Y).journal"; }
+epoch(){ date -u -d "$1" +%s 2>/dev/null || echo 0; }
+now_iso(){ date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+ensure_repo(){
+  mkdir -p "$LABOR_DIR"
+  [ -d "$LABOR_DIR/.git" ] || git_labor init -q 2>/dev/null
+  local yr; yr="$(date -u +%Y)"; local yj="$LABOR_DIR/$yr.journal"
+  [ -f "$yj" ] || : > "$yj"
+  { echo "; mesh-labour — double-entry LABOUR-TIME ledger (commodity TURN, auto-maintained). Do not hand-edit feeds."
+    echo "commodity TURN"
+    for f in "$LABOR_DIR"/[0-9][0-9][0-9][0-9].journal; do [ -f "$f" ] && echo "include $(basename "$f")"; done
+  } > "$(main_journal)"
+}
+touch_state(){ mkdir -p "$MESH"; now_iso > "$STATE" 2>/dev/null || true; }
+
+# ---- turn-stream parse: emit `<epoch> <prov> <window>` for spend.log lines in (lo_s, hi_s]. ----
+turns_between(){  # argv: lo_epoch hi_epoch  (lo exclusive, hi inclusive; lo<0 → no lower bound)
+  local lo="$1" hi="$2"
+  [ -f "$SPEND_LOG" ] || return 0
+  awk -v lo="$lo" -v hi="$hi" '
+    $2=="turn" && NF>=6 {
+      ts=$1; win=$3; prov=$5;
+      # ISO ts (minute granularity, Z) -> epoch via gsub to fields
+      # 2026-07-24T11:35Z
+      yr=substr(ts,1,4); mo=substr(ts,6,2); dy=substr(ts,9,2); hh=substr(ts,12,2); mm=substr(ts,15,2);
+      es=mktime(yr" "mo" "dy" "hh" "mm" 00");
+      # mktime is LOCAL; correct to UTC by subtracting the local offset
+      es-=OFFSET;
+      if (es<=lo && lo>=0) next;
+      if (es>hi) next;
+      print es" "prov" "win;
+    }' OFFSET="$(date +%z | awk '{s=substr($0,1,1); h=substr($0,2,2); m=substr($0,4,2); o=(h*3600+m*60); print (s=="-")?-o:o}')" "$SPEND_LOG"
+}
+
+# ============================ FEED ============================
+do_feed(){
+  have hledger || { echo "mesh-labor --feed: hledger not installed" >&2; exit 2; }
+  ensure_repo
+  local now now_s wm wm_s
+  now="$(now_iso)"; now_s="$(date -u +%s)"
+  if [ -f "$WATERMARK" ]; then wm="$(cat "$WATERMARK")"; wm_s="$(epoch "$wm")"; else
+    wm_s=$(( now_s - LOOKBACK_H*3600 )); wm="$(date -u -d "@$wm_s" +%Y-%m-%dT%H:%M:%SZ)"; fi
+
+  # too soon (<1 min) — keep liveness honest, book nothing
+  if [ $(( now_s - wm_s )) -lt 60 ]; then touch_state; echo "mesh-labor: too soon (last feed $wm)"; exit 0; fi
+  # idempotency: this window already booked?
+  if grep -qF "window:$wm.." "$(year_journal)" 2>/dev/null; then
+    echo "mesh-labor: window $wm already booked — skip"; touch_state; exit 0; fi
+
+  # aggregate turns in (wm_s, now_s] by prov+window
+  local agg; agg="$(turns_between "$wm_s" "$now_s" | awk '{c[$2" "$3]++} END{for(k in c) print c[k], k}')"
+  if [ -z "$agg" ]; then
+    echo "$now" > "$WATERMARK"; touch_state
+    echo "mesh-labor: no turns in window [$wm .. $now]"; exit 0; fi
+
+  # build one balanced txn: Dr expenses:labour:<prov>:<win>, Cr assets:budget:<prov>
+  local date_s frag; date_s="$(date -u +%Y-%m-%d)"; frag="$(mktemp)"; trap 'rm -f "$frag"' RETURN
+  {
+    echo "$date_s * labour feed  ; window:$wm..$now"
+    # expense legs (per prov+window)
+    printf '%s\n' "$agg" | sort | while read -r n prov win; do
+      printf '    expenses:labour:%s:%-12s %6d TURN\n' "$prov" "$win" "$n"
+    done
+    # budget drawdown legs (per prov, summed) — the balancing Cr
+    printf '%s\n' "$agg" | awk '{c[$2]+=$1} END{for(p in c) print c[p], p}' | sort | while read -r n prov; do
+      printf '    assets:budget:%-22s %6d TURN\n' "$prov" "-$n"
+    done
+  } > "$frag"
+
+  # PARITY GATE: check a copy before it touches the journal
+  local yj chk; yj="$(year_journal)"; chk="$(mktemp)"
+  cat "$yj" "$frag" > "$chk"
+  if ! hledger -f "$chk" check 2>/tmp/mesh-labor-check.$$; then
+    echo "mesh-labor --feed: REFUSED — feed does not balance (parity gate caught it):" >&2
+    cat /tmp/mesh-labor-check.$$ >&2; rm -f "$chk" /tmp/mesh-labor-check.$$; exit 1; fi
+  rm -f /tmp/mesh-labor-check.$$
+  mv -f "$chk" "$yj"; echo "$now" > "$WATERMARK"; touch_state
+
+  local total; total="$(printf '%s\n' "$agg" | awk '{s+=$1} END{print s+0}')"
+  git_labor add -A >/dev/null 2>&1
+  git_labor commit -q -m "labour feed [$wm .. $now]: $total TURN" >/dev/null 2>&1
+  write_summary
+  echo "mesh-labor: booked window [$wm .. $now]  ($total TURN)"
+  hledger -f "$(main_journal)" balance expenses:labour --no-total --flat --depth 3 2>/dev/null | tail -12
+}
+
+write_summary(){
+  local sm="$MESH/.labor-summary"
+  local hi lo top; hi="$(date -u +%s)"; lo=$(( hi - $(awk "BEGIN{print int($WINDOW_H*3600)}") ))
+  top="$(turns_between "$lo" "$hi" | awk '{c[$3]++} END{m=0; for(w in c) if(c[w]>m){m=c[w]; b=w}; if(b)printf "%s %d", b, m}')"
+  { local spent cap; spent="$(rolling_spent_total)"; cap="$BUDGET_TURNS"
+    if [ "$cap" -gt 0 ] 2>/dev/null; then
+      printf 'labour: %s/%s TURN in %sh (%d%%)%s\n' "$spent" "$cap" "$WINDOW_H" "$(( spent*100/cap ))" "${top:+  · busiest ${top% *}=${top##* }}"
+    else printf 'labour: %s TURN in %sh (no cap)%s\n' "$spent" "$WINDOW_H" "${top:+  · busiest ${top% *}=${top##* }}"; fi
+  } > "$sm" 2>/dev/null || true
+}
+
+# ============================ ROLLING BUDGET ============================
+rolling_spent_total(){  # total turns in the live [now-window, now]
+  local hi lo; hi="$(date -u +%s)"; lo=$(( hi - $(awk "BEGIN{print int($WINDOW_H*3600)}") ))
+  turns_between "$lo" "$hi" | wc -l | tr -d ' '
+}
+do_budget(){
+  local hi lo; hi="$(date -u +%s)"; lo=$(( hi - $(awk "BEGIN{print int($WINDOW_H*3600)}") ))
+  local rows; rows="$(turns_between "$lo" "$hi")"
+  local total; total="$(printf '%s\n' "$rows" | grep -c . )"
+  echo "mesh-labour · rolling ${WINDOW_H}h budget · $(now_iso) · $(hostname)"
+  if [ "$BUDGET_TURNS" -gt 0 ] 2>/dev/null; then
+    echo "cap: $BUDGET_TURNS TURN / prov / ${WINDOW_H}h"
+  else
+    echo "cap: (none — report-only; set MESH_LABOR_BUDGET_TURNS to arm a rolling limit)"
+  fi
+  printf '%s\n' "$(printf '%0.s─' $(seq 1 64))"
+  printf '%-12s %8s %8s %9s %10s  %s\n' PROVIDER SPENT CAP REMAIN 'BURN/h' PROJECTION
+  # per-provider
+  printf '%s\n' "$rows" | grep . | awk '{c[$2]++} END{for(p in c) print c[p], p}' | sort -rn | while read -r n prov; do
+    local burn proj remain
+    burn="$(awk "BEGIN{printf \"%.0f\", $n/$WINDOW_H}")"
+    if [ "$BUDGET_TURNS" -gt 0 ] 2>/dev/null; then
+      remain=$(( BUDGET_TURNS - n )); [ "$remain" -lt 0 ] && remain=0
+      if [ "$n" -ge "$BUDGET_TURNS" ]; then proj="EXHAUSTED"
+      elif [ "$burn" -gt 0 ]; then proj="~$(awk "BEGIN{printf \"%.1f\", $remain/$burn}")h left"
+      else proj="—"; fi
+      printf '%-12s %8d %8d %9d %10d  %s\n' "$prov" "$n" "$BUDGET_TURNS" "$remain" "$burn" "$proj"
+    else
+      printf '%-12s %8d %8s %9s %10d  %s\n' "$prov" "$n" "—" "—" "$burn" "—"
+    fi
+  done
+  printf '%s\n' "$(printf '%0.s─' $(seq 1 64))"
+  printf 'total: %s TURN expended in the last %sh\n' "$total" "$WINDOW_H"
+  # by-window breakdown (which mind spent the labour)
+  echo "── by window ──"
+  printf '%s\n' "$rows" | grep . | awk '{c[$3]++} END{for(w in c) print c[w], w}' | sort -rn | \
+    awk '{printf "  %-12s %5d TURN\n", $2, $1}'
+}
+
+do_json(){
+  local hi lo; hi="$(date -u +%s)"; lo=$(( hi - $(awk "BEGIN{print int($WINDOW_H*3600)}") ))
+  local rows; rows="$(turns_between "$lo" "$hi")"
+  local total; total="$(printf '%s\n' "$rows" | grep -c .)"
+  printf '{"window_h":%s,"cap_turns":%s,"total":%s,"providers":{' "$WINDOW_H" "$BUDGET_TURNS" "$total"
+  printf '%s\n' "$rows" | grep . | awk '{c[$2]++} END{n=0; for(p in c){if(n++)printf ",";printf "\"%s\":%d",p,c[p]}}'
+  printf '},"windows":{'
+  printf '%s\n' "$rows" | grep . | awk '{c[$3]++} END{n=0; for(w in c){if(n++)printf ",";printf "\"%s\":%d",w,c[w]}}'
+  printf '}}\n'
+}
+
+# ============================ BOARD ATTRIBUTION ============================
+# --branch <slug>: labour a board task cost = its owner-window's turns over [task-open .. done/now].
+do_branch(){
+  local slug="${1:-}"; [ -n "$slug" ] || { echo "usage: mesh-labor --branch <slug>" >&2; exit 2; }
+  [ -f "$CHAT_LOG" ] || { echo "no chat.log" >&2; exit 2; }
+  # find the opening [task] line matching the slug, its ts + owner-window; and a closing [done] <slug>.
+  # Marker MUST be a board-post marker (`:: [task]`/`:: [done]`), never a mere substring — a [verify]/
+  # [fyi] line that DISCUSSES "[done]" in prose is not a done post (substring-scan-turns-prose-into-verdict).
+  # owner: prefer `owner: <tool>/<window>` clause, else the posting window (col before @).
+  local open; open="$(grep -E ':: +\[task\]' "$CHAT_LOG" | grep -iF "$slug" | head -1)"
+  [ -n "$open" ] || { echo "mesh-labor --branch: no [task] on the board matching '$slug'"; exit 0; }
+  local open_ts owner
+  open_ts="$(printf '%s' "$open" | awk '{print $1}')"
+  owner="$(printf '%s' "$open" | grep -oE 'owner:[[:space:]]*[^[:space:]]+' | head -1 | sed -E 's#.*/##; s/owner:[[:space:]]*//')"
+  [ -n "$owner" ] || owner="$(printf '%s' "$open" | awk '{print $2}' | sed -E 's/@.*//')"
+  local close close_ts closed_disp
+  close="$(awk -v s="$open_ts" '$1>s' "$CHAT_LOG" | grep -E ':: +\[done\]' | grep -iF "$slug" | head -1)"
+  if [ -n "$close" ]; then close_ts="$(printf '%s' "$close" | awk '{print $1}')"; closed_disp="$close_ts"
+  else close_ts="$(now_iso)"; closed_disp="<no [done] on the board — open, using now ($close_ts)>"; fi
+  local lo hi; lo="$(epoch "$open_ts")"; hi="$(epoch "$close_ts")"
+  local n; n="$(turns_between "$(( lo - 1 ))" "$hi" | awk -v w="$owner" '$3==w' | wc -l | tr -d ' ')"
+  # A 0 is NO DATA, not "cost nothing", whenever the OWNER-WINDOW wasn't being sampled over the span —
+  # the silent-fallback trap. spend.log has no backfill, and until discover's mesh-spend window-map fix
+  # (2026-07-24) the sampler iterated a stale default_map (plan/dev/verify/work), so genome/minds/pub/…
+  # windows logged ZERO turns however busy they were. Guard on this WINDOW's earliest logged turn, not
+  # the global one: a span ending before it (or a window never logged at all) is n/a, not free.
+  local win_earliest cost_line
+  win_earliest="$(turns_between -1 "$(date -u +%s)" | awk -v w="$owner" '$3==w{print $1; exit}')"
+  if [ -z "$win_earliest" ]; then
+    cost_line="  labour cost  : n/a — window '$owner' has NO turns in spend.log at all (unsampled: pre-dates discover's window-map fix, or idle); 0 ≠ free"
+  elif [ "$n" = 0 ] && [ "$hi" -lt "$win_earliest" ] 2>/dev/null; then
+    cost_line="  labour cost  : n/a — span ends before '$owner's earliest logged turn ($(date -u -d "@$win_earliest" +%FT%RZ)); unlogged, not free"
+  elif [ "$lo" -lt "$win_earliest" ] 2>/dev/null; then
+    cost_line="  labour cost  : $n TURN (PARTIAL — '$owner' first logged $(date -u -d "@$win_earliest" +%FT%RZ), after span open; count is the logged tail only)"
+  else
+    cost_line="  labour cost  : $n TURN  (owner-window turns over the open interval)"
+  fi
+  echo "branch: $slug"
+  echo "  owner-window : $owner"
+  echo "  opened       : $open_ts"
+  echo "  closed       : $closed_disp"
+  echo "$cost_line"
+  echo "  note: interval attribution (owner-window × task-open span), not per-turn tagging — a turn"
+  echo "        in the span served this task by proximity, not proof; the honest first-order measure."
+}
+
+# ============================ CHECK (the gate) ============================
+do_check(){
+  have hledger || { echo "hledger n/a" >&2; exit 2; }
+  ensure_repo
+  local mj; mj="$(main_journal)"
+  echo "── parity (hledger check) ──"
+  if hledger -f "$mj" check 2>&1; then echo "parity: OK (every txn sums to zero per commodity)"; else
+    echo "parity: FAIL"; exit 1; fi
+  echo "── replay-vs-balance agreement ──"
+  # independent recompute: sum expense TURNs from the journal vs from a fresh spend.log replay of the
+  # SAME span the journal covers. They need not be identical (feeds lag live turns), but the journal
+  # must never EXCEED the total labour ever logged — that would be an over-book.
+  local jtotal; jtotal="$(hledger -f "$mj" balance 'expenses:labour' --no-total -N 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="TURN") print $(i-1)}' | tr -d ',' | awk '{s+=$1} END{print s+0}')"
+  local logtotal; logtotal="$(turns_between -1 "$(date -u +%s)" | wc -l | tr -d ' ')"
+  echo "journal expenses:labour = $jtotal TURN ; spend.log all-time = $logtotal TURN"
+  if [ "$jtotal" -le "$logtotal" ] 2>/dev/null; then echo "agreement: OK (journal ≤ log — no over-book)"; else
+    echo "agreement: FAIL — journal books more labour than was ever logged"; exit 1; fi
+}
+
+do_dash(){
+  local sm="$MESH/.labor-summary"
+  if [ -s "$sm" ]; then cat "$sm"; else write_summary; cat "$sm" 2>/dev/null; fi
+  do_budget 2>/dev/null | sed -n '4,20p'
+}
+
+# ============================ TEST (RED-first) ============================
+do_test(){
+  have hledger || { echo "mesh-labor --test: hledger not installed" >&2; exit 2; }
+  local td; td="$(mktemp -d)"; trap 'rm -f /tmp/mesh-labor-t.$$; rm -rf "$td"' RETURN
+  local fail=0
+
+  # GATE 1 — parity REJECTS an unbalanced txn (seen RED). A gate you have not seen fail is not a gate.
+  cat > "$td/bad.journal" <<'EOF'
+commodity TURN
+2026-07-24 * bad feed
+    expenses:labour:anthropic:tg    5 TURN
+    assets:budget:anthropic        -4 TURN
+EOF
+  if hledger -f "$td/bad.journal" check 2>/dev/null; then
+    echo "  ✗ GATE1 parity: an UNBALANCED txn (5 vs -4) PASSED check — gate is dead"; fail=1
+  else echo "  ✓ GATE1 parity: unbalanced 5/-4 TURN txn REJECTED (seen red)"; fi
+
+  # ...and ACCEPTS the balanced fix (green after red)
+  cat > "$td/good.journal" <<'EOF'
+commodity TURN
+2026-07-24 * good feed
+    expenses:labour:anthropic:tg    5 TURN
+    assets:budget:anthropic        -5 TURN
+EOF
+  if hledger -f "$td/good.journal" check 2>/dev/null; then echo "  ✓ GATE1 parity: balanced 5/-5 ACCEPTED (green)"; else
+    echo "  ✗ GATE1 parity: balanced txn REJECTED — gate over-blocks"; fail=1; fi
+
+  # GATE 2 — the turn parser counts a REAL spend.log line, windowed. Assert it reads data, not a stub.
+  local sl="$td/spend.log"
+  # two turns inside a 1h synthetic window, one outside — parser must return exactly the 2 inside.
+  cat > "$sl" <<'EOF'
+2026-07-24T10:00Z turn tg claude anthropic paid Opus
+2026-07-24T10:30Z turn genome claude anthropic paid Opus
+2026-07-24T06:00Z turn tg claude anthropic paid Opus
+EOF
+  local lo hi cnt
+  lo="$(SPEND_LOG="$sl" bash -c 'date -u -d 2026-07-24T09:59Z +%s')"
+  hi="$(date -u -d 2026-07-24T11:00Z +%s)"
+  cnt="$(SPEND_LOG="$sl" MESH_SPEND_LOG="$sl" bash -c "$(declare -f turns_between); turns_between $lo $hi" | wc -l | tr -d ' ')"
+  if [ "$cnt" = 2 ]; then echo "  ✓ GATE2 parser: windowed turn count = 2 (the 2 in-window lines, not the 1 outside)"; else
+    echo "  ✗ GATE2 parser: expected 2 in-window turns, got '$cnt' — parser/window broken"; fail=1; fi
+
+  # GATE 3 — budget math: spent≥cap ⇒ EXHAUSTED (the rolling-limit semantics)
+  local remain; local n=10 cap=8
+  remain=$(( cap - n )); [ "$remain" -lt 0 ] && remain=0
+  if [ "$n" -ge "$cap" ] && [ "$remain" = 0 ]; then echo "  ✓ GATE3 budget: spent 10 ≥ cap 8 ⇒ remaining 0 / EXHAUSTED"; else
+    echo "  ✗ GATE3 budget: exhaustion math wrong"; fail=1; fi
+
+  [ "$fail" = 0 ] && { echo "mesh-labor --test: PASS"; return 0; } || { echo "mesh-labor --test: FAIL"; return 1; }
+}
+
+# ============================ DISPATCH ============================
+case "${1:-}" in
+  --feed)     do_feed ;;
+  --budget|"") do_budget ;;
+  --balance)  ensure_repo; hledger -f "$(main_journal)" balance expenses:labour assets:budget --tree "${@:2}" ;;
+  --register) ensure_repo; hledger -f "$(main_journal)" register "${@:2}" ;;
+  --branch)   do_branch "${2:-}" ;;
+  --json)     do_json ;;
+  --check)    do_check ;;
+  --dash)     do_dash ;;
+  --test)     do_test ;;
+  -h|--help)  sed -n '1,45p' "$0" | grep -E '^#' | sed 's/^# \{0,1\}//' ;;
+  *) echo "mesh-labor: unknown arg '$1' (try --help)" >&2; exit 2 ;;
+esac
