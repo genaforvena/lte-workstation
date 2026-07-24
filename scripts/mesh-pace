@@ -23,37 +23,85 @@
 #                           would hold. Never records — for callers that need the gap state without
 #                           consuming it (e.g. mesh-dispatch's idle-exposure tick).
 #   mesh-pace --status      show every key: last pass, age, effective gap, allow/skip now
+#   mesh-pace --eff-gap [base]  print the effective gap for a base given the current paid burn —
+#                           MIN_GAP when the window is cold, base×mult when hot. Handy to see why
+#                           dispatch is (or isn't) firing on events.
 #   mesh-pace --reset [key] forget last-pass for one key (or all) — next call passes immediately
 #   mesh-pace --test        smoke
+#
+# EVENT-DRIVEN WHEN COLD (operator 2026-07-24 «диспатч событийным, не крон-овым»): the reserve used
+# to only STRETCH the gap when burn was hot, so a nearly-empty paid window still held every board
+# event for the full flat GAP (18000s here) → the board was passive, owner-direct [task]s waited for
+# the next cron poll, minds "didn't wake". eff_gap now also SHRINKS: paid burn < MESH_PACE_COLD_BELOW
+# (7/h) → floor to MESH_PACE_MIN_GAP (60s), so the fsnotify board event fires the owner NOW while the
+# window has headroom, and the hot-stretch still protects the reserve once burn climbs. Burn is read
+# from the hledger labour ledger (mesh-labor --json), the same journal the board is.
 # orphan-ok: a GATE consulted by other reflexes (mesh-feed/mesh-dispatch), not itself cron-scheduled.
 set -uo pipefail
 [ -f "$HOME/.mesh/restore.env" ] && . "$HOME/.mesh/restore.env" 2>/dev/null || true
 
 GAP="${MESH_PACE_GAP:-900}"          # base min seconds between passes of a key (default 15 min)
 RESERVE="${MESH_PACE_RESERVE:-1}"    # 1 = stretch the gap when paid burn is hot; 0 = flat gap
+MIN_GAP="${MESH_PACE_MIN_GAP:-60}"   # COLD floor: when the paid window is barely touched, shrink the
+                                     # gap to THIS so a board event wakes the owner now, not on the
+                                     # next cron poll (operator 2026-07-24: диспатч событийным).
+COLD_BELOW="${MESH_PACE_COLD_BELOW:-7}"  # paid burn/h STRICTLY below this = cold → floor to MIN_GAP.
+                                     # 7 = the first hot-staircase step, so cold ends exactly where
+                                     # stretch begins — no flat-base band survives between them.
 DIR="$HOME/.mesh/pace"; mkdir -p "$DIR" 2>/dev/null || true
 now="$(date +%s)"
 
+# Paid burn RIGHT NOW, in turns/hour of the PAID provider over the rolling window. This is the one
+# signal both the cold-shrink and the hot-stretch key off. Primary source is the hledger labour
+# ledger (operator 2026-07-24 «диспатч через hledger, не рядом» — the pace governor reads the same
+# journal the board IS), falling back to mesh-quota's paid/1h, then to -1 = UNKNOWN. UNKNOWN is
+# NOT cold and NOT hot: eff_gap falls back to the gentle base, so a blind read never drains the
+# window nor freezes it. MESH_PACE_BURN_OVERRIDE short-circuits the probes (hermetic --test).
+paid_burn_per_h() {
+  if [ -n "${MESH_PACE_BURN_OVERRIDE:-}" ]; then echo "$MESH_PACE_BURN_OVERRIDE"; return; fi
+  local j n wh
+  # hledger labour ledger: {"window_h":5,"providers":{"anthropic":23,...}} → paid burn/h = n/window_h.
+  j="$(mesh-labor --json 2>/dev/null)" || j=""
+  if [ -n "$j" ]; then
+    n="$(printf '%s' "$j"  | grep -oE '"anthropic":[0-9]+' | grep -oE '[0-9]+' | head -1)"
+    wh="$(printf '%s' "$j" | grep -oE '"window_h":[0-9]+'  | grep -oE '[0-9]+' | head -1)"
+    if [ -n "$n" ] && [ -n "$wh" ] && [ "$wh" -gt 0 ]; then awk "BEGIN{printf \"%d\", $n/$wh}"; return; fi
+  fi
+  # fallback: mesh-quota prints "... paid 2/1h 11/5h ..." — pull the paid/1h figure.
+  local per1h
+  per1h="$(mesh-quota 2>/dev/null | grep -oE 'paid [0-9]+/1h' | grep -oE '[0-9]+' | head -1)"
+  [ -n "$per1h" ] && { echo "$per1h"; return; }
+  echo -1
+}
+
 # How hot is the paid window right now? Returns a multiplier >=1 applied to the base gap.
-# Cheap + robust: read the paid 1h burn that mesh-spend already samples to spend.log. The hotter the
-# recent paid burn, the longer we wait. No hard dependency — if the signal is absent, multiplier=1.
+# The hotter the recent paid burn, the longer we wait. Unknown burn (-1) → multiplier 1.
 burn_mult() {
   [ "$RESERVE" = 1 ] || { echo 1; return; }
-  local per1h
-  # mesh-quota prints e.g.  "burn (units...):  paid 2/1h 11/5h ..." — pull the paid/1h figure.
-  per1h="$(mesh-quota 2>/dev/null | grep -oE 'paid [0-9]+/1h' | grep -oE '[0-9]+' | head -1)"
-  [ -n "$per1h" ] || { echo 1; return; }
-  # Gentle staircase: <=6/h normal, 7-11 -> 1.5x, 12-17 -> 2x, >=18 -> 3x. Tuned for a ~5h window
+  local burn; burn="$(paid_burn_per_h)"
+  [ "$burn" -ge 0 ] 2>/dev/null || { echo 1; return; }
+  # Gentle staircase: <7/h normal, 7-11 -> 1.5x, 12-17 -> 2x, >=18 -> 3x. Tuned for a ~5h window
   # that should last ~5h: a steady ~6-9 paid round-trips/h keeps reserve; bursts get throttled.
-  if   [ "$per1h" -ge 18 ]; then echo 3
-  elif [ "$per1h" -ge 12 ]; then echo 2
-  elif [ "$per1h" -ge 7  ]; then echo 1.5
+  if   [ "$burn" -ge 18 ]; then echo 3
+  elif [ "$burn" -ge 12 ]; then echo 2
+  elif [ "$burn" -ge 7  ]; then echo 1.5
   else echo 1; fi
 }
 
-eff_gap() { # base_gap -> effective gap after the reserve multiplier
-  local base="$1" mult; mult="$(burn_mult)"
-  awk -v b="$base" -v m="$mult" 'BEGIN{printf "%d", b*m}'
+eff_gap() { # base_gap -> effective gap: SHRINK to MIN_GAP when cold, STRETCH by burn_mult when hot.
+  local base="$1" burn mult
+  [ "$RESERVE" = 1 ] || { echo "$base"; return; }   # reserve off → pure flat base, no shrink/stretch
+  burn="$(paid_burn_per_h)"
+  # COLD (paid burn strictly below COLD_BELOW, and a real reading — UNKNOWN=-1 is NOT cold): the
+  # window is barely touched, so a board event should wake the owner NOW. Floor to MIN_GAP, but
+  # NEVER inflate a caller's smaller explicit base — cold-shrink only ever shrinks.
+  if [ "$burn" -ge 0 ] 2>/dev/null && [ "$burn" -lt "$COLD_BELOW" ]; then
+    if [ "$base" -lt "$MIN_GAP" ]; then echo "$base"; else echo "$MIN_GAP"; fi
+    return
+  fi
+  # WARM/HOT (or UNKNOWN): stretch the gentle base to protect the reserve.
+  mult="$(burn_mult)"
+  awk -v b="$base" -v m="$mult" 'BEGIN{printf "%d\n", b*m}'
 }
 
 case "${1:-}" in
@@ -72,8 +120,29 @@ case "${1:-}" in
     "$0" "$k2" 1 >/dev/null 2>&1   # real gate records now
     "$0" --check "$k2" 999999 >/dev/null 2>&1 && { echo "smoke-test: FAIL (--check should report would-hold on a fresh record)"; rm -f "$DIR/$k2"; exit 1; }
     rm -f "$DIR/$k2"
-    echo "smoke-test: ok (gate passes when stale, skips when fresh; --check read-only; GAP=${GAP}s reserve=${RESERVE})"
+    # COLD-SHRINK / HOT-STRETCH (operator 2026-07-24: диспатч событийный — a cold window must release
+    # the slot in ~MIN_GAP, not the flat base, so the fsnotify board event wakes the owner NOW; a hot
+    # window still stretches to protect the reserve). Drive the burn deterministically via the override.
+    # RED before the cold-shrink existed: eff-gap of a big base returned the flat base regardless of burn.
+    eg_cold="$(MESH_PACE_BURN_OVERRIDE=0  MESH_PACE_RESERVE=1 "$0" --eff-gap 18000)"
+    [ "$eg_cold" = "$MIN_GAP" ] || { echo "smoke-test: FAIL (cold burn must floor eff-gap to MIN_GAP=$MIN_GAP, got $eg_cold)"; exit 1; }
+    eg_hot="$(MESH_PACE_BURN_OVERRIDE=20 MESH_PACE_RESERVE=1 "$0" --eff-gap 18000)"
+    [ "$eg_hot" = 54000 ] || { echo "smoke-test: FAIL (hot burn 20/h must stretch 18000x3=54000, got $eg_hot)"; exit 1; }
+    eg_unk="$(MESH_PACE_BURN_OVERRIDE=-1 MESH_PACE_RESERVE=1 "$0" --eff-gap 18000)"
+    [ "$eg_unk" = 18000 ] || { echo "smoke-test: FAIL (unknown burn must fall back to the gentle base 18000, got $eg_unk)"; exit 1; }
+    # BEHAVIOURAL: a key last-passed MIN_GAP+1s ago is RELEASED when cold but still HELD when hot —
+    # the operator's "released-slot by event, not by cron poll" made falsifiable. Old flat gap held both.
+    k3="__smoke_cold_$$"; echo "$((now - (MIN_GAP + 1)))" > "$DIR/$k3"
+    MESH_PACE_BURN_OVERRIDE=0  MESH_PACE_RESERVE=1 "$0" --check "$k3" 18000 >/dev/null 2>&1 || { echo "smoke-test: FAIL (cold: a slot idle >MIN_GAP must be RELEASED, not held to the base gap)"; rm -f "$DIR/$k3"; exit 1; }
+    MESH_PACE_BURN_OVERRIDE=20 MESH_PACE_RESERVE=1 "$0" --check "$k3" 18000 >/dev/null 2>&1 && { echo "smoke-test: FAIL (hot: same slot must still HOLD to protect the reserve)"; rm -f "$DIR/$k3"; exit 1; }
+    rm -f "$DIR/$k3"
+    echo "smoke-test: ok (gate passes when stale, skips when fresh; --check read-only; cold-shrink→MIN_GAP=${MIN_GAP}s, hot-stretch, unknown→base; GAP=${GAP}s reserve=${RESERVE})"
     exit 0 ;;
+
+  --eff-gap)
+    # debug/probe: print the effective gap for a base, given the current (or overridden) paid burn.
+    # Used by --test and handy operationally to see whether the window is cold (→MIN_GAP) or hot.
+    base="${2:-$GAP}"; eff_gap "$base"; exit 0 ;;
 
   --status)
     echo "mesh-pace · base GAP=${GAP}s reserve=${RESERVE} (mult=$(burn_mult)x) · as of $(date -u +%H:%MZ)"
@@ -108,12 +177,12 @@ case "${1:-}" in
     exit 0 ;;
 
   ""|-h|--help)
-    echo "usage: mesh-pace <key> [gap] | --check <key> [gap] | --status | --reset [key] | --test"
+    echo "usage: mesh-pace <key> [gap] | --check <key> [gap] | --status | --eff-gap [base] | --reset [key] | --test"
     echo "  knob: MESH_PACE_GAP (seconds, default 900) in ~/.mesh/restore.env — bigger = gentler"
     [ "${1:-}" = "" ] && exit 1 || exit 0 ;;
 
   -*)
-    echo "usage: mesh-pace <key> [gap] | --check <key> [gap] | --status | --reset [key] | --test"; exit 1 ;;
+    echo "usage: mesh-pace <key> [gap] | --check <key> [gap] | --status | --eff-gap [base] | --reset [key] | --test"; exit 1 ;;
 
   *)
     key="$1"
