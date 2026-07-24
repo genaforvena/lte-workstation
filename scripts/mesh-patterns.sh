@@ -132,28 +132,38 @@ export MESH_PERSON_RE MESH_FIXED_RE MESH_NOISE_RE
 #
 # Usage:
 #   pip="$(phone_reachable_ip 2>/dev/null)" || exit 2
-phone_reachable_ip() {
-  local port="${PHONE_SSH_PORT:-8022}"
-  local puser="${PHONE_USER:-u0_a380}"
-  local ip ts_ip
-  # 1. Tailscale IP (mesh-peer-addr)
-  ts_ip="$(mesh-peer-addr Redmi 2>/dev/null || mesh-peer-addr redmi 2>/dev/null || true)"
-  if [ -n "$ts_ip" ]; then
-    if timeout 4 ssh -p "$port" -o BatchMode=yes -o ConnectTimeout=3 \
-      -o StrictHostKeyChecking=accept-new "${puser}@${ts_ip}" 'echo ok' </dev/null >/dev/null 2>&1; then
-      PHONE_REACHABLE_IP="$ts_ip"; export PHONE_REACHABLE_IP; printf '%s\n' "$ts_ip"; return 0
-    fi
-  fi
-  # 2. LAN IPs
-  for ip in ${PHONE_LAN_IPS:-}; do
-    [ -n "$ip" ] || continue
-    if timeout 4 ssh -p "$port" -o BatchMode=yes -o ConnectTimeout=3 \
-      -o StrictHostKeyChecking=accept-new "${puser}@${ip}" 'echo ok' </dev/null >/dev/null 2>&1; then
-      PHONE_REACHABLE_IP="$ip"; export PHONE_REACHABLE_IP; printf '%s\n' "$ip"; return 0
-    fi
-  done
-  return 2
-}
+ phone_reachable_ip() {
+   local port="${PHONE_SSH_PORT:-8022}"
+   local puser="${PHONE_USER:-u0_a380}"
+   local ip ts_ip
+   # On failure, classify WHY (chat-review/Redmi-body-degraded, 2026-07-24): a silent KEY ROTATION
+   # (phone UP, sshd answered, our pubkey untrusted) read identically to a genuinely-OFFLINE phone
+   # for 8 days of degrade logs — zero signal to tell 'gone' from 'key rotated'. PHONE_REACH_FAIL:
+   #   offline (default)  = no route / timeout / refused (network-level: phone not answering)
+   #   auth-rejected      = sshd ANSWERED + rejected our key (phone UP; the key is the problem)
+   PHONE_REACH_FAIL=offline; export PHONE_REACH_FAIL
+   _probe() {  # <ip> → rc 0 reachable; on failure sets PHONE_REACH_FAIL + PHONE_REACH_LAST_IP
+     PHONE_REACH_LAST_IP="$1"; export PHONE_REACH_LAST_IP
+     local err rc
+     err="$(timeout 4 ssh -p "$port" -o BatchMode=yes -o ConnectTimeout=3 \
+       -o StrictHostKeyChecking=accept-new "${puser}@${1}" 'echo ok' </dev/null 2>&1 >/dev/null)"
+     rc=$?
+     [ "$rc" = 0 ] && return 0
+     printf '%s' "$err" | grep -qi 'Permission denied' && PHONE_REACH_FAIL=auth-rejected
+     return 1
+   }
+   # 1. Tailscale IP (mesh-peer-addr)
+   ts_ip="$(mesh-peer-addr Redmi 2>/dev/null || mesh-peer-addr redmi 2>/dev/null || true)"
+   if [ -n "$ts_ip" ]; then
+     if _probe "$ts_ip"; then PHONE_REACHABLE_IP="$ts_ip"; export PHONE_REACHABLE_IP; printf '%s\n' "$ts_ip"; return 0; fi
+   fi
+   # 2. LAN IPs
+   for ip in ${PHONE_LAN_IPS:-}; do
+     [ -n "$ip" ] || continue
+     if _probe "$ip"; then PHONE_REACHABLE_IP="$ip"; export PHONE_REACHABLE_IP; printf '%s\n' "$ip"; return 0; fi
+   done
+   return 2
+ }
 
 # ---- outdoor-weather honest-fusion (shared by mesh-therm-watch / mesh-mind-control / mesh-node-care) ----
 #
