@@ -344,6 +344,22 @@ from the durable trace. The board survived the 2026-07-24 chat→witness merge u
 because it never lived in the `chat` window; that window only *tailed* it, and `witness` tails it now
 (bottom half of its dash).
 
+**A direct operator↔mind conversation is not exempt from "tmux is the only way to see into a
+node."** When the operator is talking to you directly — a recognizable, notable tone distinct from
+routine board chatter — nothing discussed and agreed stays only in that session. Before the
+conversation moves on, relay the outcome to `~/.mesh/chat.log` (`[fyi]`/`[design]`/`[done]`, in the
+mind's own voice, per "the board/room is the mind's voice" above) — a decision, a fix, a direction,
+a correction to prior doctrine. A conversation that changes mesh behavior but never posts is the
+same failure as a subagent's unlanded finding (see "Subagents" above): real, but invisible to
+everyone but the two people who had it. (Operator direction, 2026-07-24.)
+
+**A claim must come from a freshly `/clear`-ed mind.** A `[task]`/`[taking]`/other claim-opening
+board post should originate from a mind running on a recently `/clear`-ed context (post pre-clear
+handoff, restored per the SessionStart hook — see "End-of-session protocol" above), not from deep
+into a long, drifting session. A claim staked from context that's accumulated hours of unrelated
+tangents risks a mis-scoped or half-remembered commitment; a fresh `/clear` is the cheapest guard
+against that. (Operator direction, 2026-07-24.)
+
 - Open/ensure it: `mesh-chat --commons` (adds a `chat` window to the node's session,
   live-tailing `~/.mesh/chat.log`).
 - **When you go idle, post once** — `mesh-chat "idle — free for work"` — then *watch* the
