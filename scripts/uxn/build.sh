@@ -41,6 +41,7 @@ if [ "${1:-}" = --rom ]; then
   ./bin/uxnasm arith32-test.tal arith32-test.rom
   ./bin/uxnasm net-echo.tal net-echo.rom
   ./bin/uxnasm fletcher16.tal fletcher16.rom
+  ./bin/uxnasm permcheck.tal permcheck.rom
   ./bin/uxnasm net-listen.tal net-listen.rom
   ./bin/uxnasm hop-dial.tal hop-dial.rom
   ./bin/uxnasm hop-serve.tal hop-serve.rom
