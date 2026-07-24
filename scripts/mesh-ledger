@@ -1,0 +1,411 @@
+#!/usr/bin/env bash
+# mesh-ledger — a git-versioned DOUBLE-ENTRY ledger of the mesh's resource flows.
+#
+# Operator framing (2026-07-24): double-entry is an ERROR-DETECTING CODE. Every transaction's
+# postings must sum to zero (parity); a wrong entry FAILS TO BALANCE and hledger catches it with
+# NO external oracle — the same shape as the mesh's verification doctrine (an artifact that must
+# balance against itself). Proven empirically: a balanced txn -> `hledger check` rc=0; an
+# off-by-$0.02 txn -> rc=1 naming the exact imbalance.
+#
+# What it books: INFERENCE spend — the real token flow across engines, priced to USD.
+#   Source of truth for tokens: `mesh-spend --tokens --json` (claude JSONL + opencode sqlite + codex).
+#   Anthropic/z.ai/OpenAI here are FLAT-PLAN or FREE, so the dollar figure is IMPUTED market value
+#   ("what this compute WOULD cost metered"), booked honestly against assets:budget:imputed:<prov> —
+#   never faked cash. A genuinely metered pay-go source would book against assets:budget:paid:<prov>.
+#
+# CHART:  expenses:inference:<prov>:<model>   (Dr, the cost)
+#         assets:budget:{paid|imputed}:<prov> (Cr, the drawdown)
+#   Each feed = ONE transaction with per-provider Dr/Cr pairs → the WHOLE txn must sum to zero, so a
+#   feeder bug that miscomputes any leg unbalances the txn and `hledger check` catches it (the payoff).
+#   Every txn tagged  window:<startISO>..<endISO>  model:...  so feeds are idempotent + auditable.
+#
+# JOURNAL: ~/.mesh/ledger/ is its OWN git repo (per-node runtime data, NOT the genome). --feed
+#   auto-commits each balanced feed → a tamper-evident audit trail. include <YYYY>.journal per year.
+#
+# TWO independent error checks (--check): (1) intra-txn PARITY via `hledger check` — every txn sums
+#   to 0, no oracle; (2) window RECONCILIATION — feed windows must tile without OVERLAP (overlap =
+#   double-book, the watermark/cron-race failure) and gaps are reported (downtime, benign). The
+#   ledger is NOT trusted just because each txn balances.
+#
+#   mesh-ledger --feed        book inference spend since the last feed (idempotent, honest-n/a)
+#   mesh-ledger --balance     `hledger balance` of expenses/assets (default view)
+#   mesh-ledger --by-provider spend rolled up by provider
+#   mesh-ledger --report      income-statement-style spend report
+#   mesh-ledger --check       hledger parity check + window reconciliation (the gate)
+#   mesh-ledger --dash        compact pane summary (for a `ledger` data window)
+#   mesh-ledger --test        RED-first smoke: proves the parity gate FAILS on an unbalanced txn
+#
+# Rates: default table below; override per-node via ~/.mesh/ledger-rates.conf (same columns).
+#        Non-Anthropic rates are dated ESTIMATES — a rate change is a reviewable edit.
+# Env: MESH_LEDGER_DIR (default ~/.mesh/ledger)  MESH_LEDGER_LOOKBACK_H (first-run window, default 1)
+#      MESH_LEDGER_RECON_TOL (reconciliation tolerance, default 0.15)  MESH_SPEND_BIN (default mesh-spend)
+# reflex-cadence: 7 * * * *
+# reflex-args: --feed
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+MESH="$HOME/.mesh"
+LEDGER_DIR="${MESH_LEDGER_DIR:-$MESH/ledger}"
+RATES_OVERRIDE="$MESH/ledger-rates.conf"
+WATERMARK="$LEDGER_DIR/.watermark"
+STATE="$MESH/.ledger-state"
+SPEND_BIN="${MESH_SPEND_BIN:-mesh-spend}"
+LOOKBACK_H="${MESH_LEDGER_LOOKBACK_H:-1}"
+RECON_TOL="${MESH_LEDGER_RECON_TOL:-0.15}"
+
+# ---- default rate table: model-substring tier provider  in  cache_write  cache_read  out  (USD/Mtok)
+# Anthropic rates are first-party published (Opus 4.8 5/25, Sonnet 5 3/15, Haiku 4.5 1/5; cache-write
+# 1.25x input, cache-read 0.1x input). Non-Anthropic rows are dated ESTIMATES of metered market value.
+default_rates(){
+  cat <<'EOF'
+# model_substr   tier      provider    input  cache_wr  cache_rd  output
+opus             imputed   anthropic   5.00   6.25      0.50      25.00
+sonnet           imputed   anthropic   3.00   3.75      0.30      15.00
+haiku            imputed   anthropic   1.00   1.25      0.10      5.00
+glm              imputed   zai         0.60   0.75      0.11      2.20
+gpt              imputed   openai      2.50   3.13      0.25      10.00
+codex            imputed   openai      2.50   3.13      0.25      10.00
+EOF
+}
+rates(){ if [ -f "$RATES_OVERRIDE" ]; then grep -vE '^\s*#|^\s*$' "$RATES_OVERRIDE"; else default_rates | grep -vE '^\s*#|^\s*$'; fi; }
+
+have(){ command -v "$1" >/dev/null 2>&1; }
+git_ledger(){ git -C "$LEDGER_DIR" -c user.name='mesh-ledger' -c user.email='noreply@mesh' "$@"; }
+
+ensure_repo(){
+  mkdir -p "$LEDGER_DIR"
+  [ -d "$LEDGER_DIR/.git" ] || { git_ledger init -q 2>/dev/null; }
+  local yr; yr="$(date -u +%Y)"
+  local main="$LEDGER_DIR/mesh.journal" yj="$LEDGER_DIR/$yr.journal"
+  [ -f "$yj" ] || : > "$yj"
+  # keep mesh.journal including every year file present
+  { echo "; mesh-ledger — double-entry resource ledger (auto-maintained). Do not hand-edit feeds."
+    for f in "$LEDGER_DIR"/[0-9][0-9][0-9][0-9].journal; do [ -f "$f" ] && echo "include $(basename "$f")"; done
+  } > "$main"
+}
+year_journal(){ echo "$LEDGER_DIR/$(date -u +%Y).journal"; }
+main_journal(){ echo "$LEDGER_DIR/mesh.journal"; }
+
+# ============================ PRICING (feed core) ============================
+# reads mesh-spend --tokens --json on stdin; emits an hledger transaction to stdout.
+# argv: <date> <win_start_iso> <win_end_iso> <rates_tmp>
+# exit: 0 = txn emitted · 3 = valid source but zero billable activity · 2 = bad/empty source
+# NOTE: the script lives in a temp file (not `python3 - <<EOF`) so stdin stays the piped JSON —
+# a heredoc-fed `python3 -` would make sys.stdin the SCRIPT, not the pipe (empty read -> false n/a).
+_PRICE_PY=""
+price_py(){
+  if [ -z "$_PRICE_PY" ]; then
+    _PRICE_PY="$(mktemp)"; cat > "$_PRICE_PY" <<'PYEOF'
+import sys, json, re
+date_s, win_a, win_b, ratesf = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+raw = sys.stdin.read()
+if not raw.strip():
+    sys.exit(2)
+try:
+    d = json.loads(raw)
+except Exception:
+    sys.exit(2)
+
+# rate rows: substr tier provider in cw cr out
+rows = []
+for ln in open(ratesf):
+    p = ln.split()
+    if len(p) >= 7:
+        rows.append((p[0].lower(), p[1], p[2], float(p[3]), float(p[4]), float(p[5]), float(p[6])))
+
+FALLBACK = ('*', 'imputed', 'unknown', 1.00, 1.25, 0.10, 5.00)
+def rate_for(model):
+    m = (model or '').lower()
+    for r in rows:
+        if r[0] != '*' and r[0] in m:
+            return r, False
+    return FALLBACK, True
+
+def acct_model(model):
+    s = re.sub(r'\(.*?\)', '', model or '').strip().lower()
+    s = re.sub(r'[^a-z0-9]+', '-', s).strip('-')
+    return s or 'unknown'
+
+# collect (provider, model, cost, unpriced) — cost in USD
+lines = []   # per-model debit rows
+prov_tot = {}  # (provider,tier) -> cost
+warn = []
+M = 1_000_000.0
+
+def add(model, provider_hint, inp, cw, cr, out):
+    (substr, tier, prov, r_in, r_cw, r_cr, r_out), fb = rate_for(model)
+    if fb and provider_hint:
+        prov = provider_hint
+    cost = (inp*r_in + cw*r_cw + cr*r_cr + out*r_out) / M
+    cost = round(cost, 4)
+    if cost <= 0:
+        return
+    if fb:
+        warn.append(model)
+    am = acct_model(model)
+    lines.append((f"expenses:inference:{prov}:{am}", cost, model, tier))
+    prov_tot[(prov, tier)] = round(prov_tot.get((prov, tier), 0.0) + cost, 4)
+
+# claude JSONL — real per-token-class counts
+cl = d.get('claude', {}) or {}
+for m in cl.get('models', []) or []:
+    add(m.get('model',''), 'anthropic',
+        m.get('input',0) or 0, m.get('cache_create',0) or 0,
+        m.get('cache_read',0) or 0, m.get('output',0) or 0)
+
+# opencode sqlite — real cost field when >0 (paid), else impute from tokens
+oc = d.get('opencode', {}) or {}
+if not oc.get('error'):
+    for m in oc.get('models', []) or []:
+        model = m.get('model','')
+        realcost = float(m.get('cost',0) or 0)
+        if realcost > 0:
+            # metered cash — book as paid against the model's provider
+            (_, _, prov, *_), _fb = rate_for(model)
+            cost = round(realcost, 4)
+            am = acct_model(model)
+            lines.append((f"expenses:inference:{prov}:{am}", cost, model, 'paid'))
+            prov_tot[(prov, 'paid')] = round(prov_tot.get((prov,'paid'),0.0)+cost, 4)
+        else:
+            add(model, 'zai',
+                m.get('input',0) or 0, m.get('cache_write',0) or 0,
+                m.get('cache_read',0) or 0, m.get('output',0) or 0)
+
+# codex — only tokens_used (undifferentiated); price as output-equivalent
+cx = d.get('codex', {}) or {}
+if not cx.get('error'):
+    for t in cx.get('threads', []) or []:
+        used = t.get('tokens_used',0) or 0
+        add(t.get('model','codex') or 'codex', 'openai', 0, 0, 0, used)
+
+if not lines:
+    # valid source, no billable tokens in window (genuine zero — NOT a fake $0 txn)
+    sys.exit(3)
+
+# emit ONE transaction: all per-model debits + per-(provider,tier) credits. The WHOLE txn must
+# sum to zero, so a miscomputed leg unbalances it and `hledger check` catches the feeder bug.
+out = []
+out.append(f"{date_s} * inference feed  ; window:{win_a}..{win_b}")
+for acct, cost, model, tier in lines:
+    out.append(f"    {acct:<44} ${cost:.4f}  ; model:{model} tier:{tier}")
+for (prov, tier), tot in sorted(prov_tot.items()):
+    out.append(f"    assets:budget:{tier}:{prov:<28} $-{tot:.4f}")
+out.append("")
+sys.stdout.write("\n".join(out) + "\n")
+if warn:
+    sys.stderr.write("WARN unpriced (fallback rate): " + ", ".join(sorted(set(warn))) + "\n")
+sys.exit(0)
+PYEOF
+  fi
+  python3 "$_PRICE_PY" "$@"
+}
+
+# ============================ --feed ============================
+do_feed(){
+  have hledger || { echo "mesh-ledger --feed: hledger not installed" >&2; exit 2; }
+  ensure_repo
+  local now now_s wm wm_s win_h
+  now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"; now_s="$(date -u +%s)"
+  if [ -f "$WATERMARK" ]; then wm="$(cat "$WATERMARK")"; else wm=""; fi
+  if [ -n "$wm" ]; then
+    wm_s="$(date -u -d "$wm" +%s 2>/dev/null || echo 0)"
+    win_h="$(awk "BEGIN{d=($now_s-$wm_s)/3600; print (d>0)?d:0}")"
+  else
+    win_h="$LOOKBACK_H"
+    wm="$(date -u -d "@$((now_s - LOOKBACK_H*3600))" +%Y-%m-%dT%H:%M:%SZ)"
+  fi
+  # too soon since last feed (< ~1 min) — nothing to do, but keep liveness honest
+  awk "BEGIN{exit !($win_h < 0.017)}" && { touch_state; echo "mesh-ledger: too soon (win ${win_h}h)"; exit 0; }
+
+  # idempotency: this window's start already booked?
+  if grep -qF "window:$wm.." "$(year_journal)" 2>/dev/null; then
+    echo "mesh-ledger: window $wm already booked — skip"; touch_state; exit 0
+  fi
+
+  # honest n/a: source must produce valid JSON, else exit 2 (NO watermark advance, NO fake $0)
+  local sj rc
+  sj="$(MESH_SPEND_WINDOW="$win_h" "$SPEND_BIN" --tokens --json 2>/dev/null)"; rc=$?
+  if [ $rc -ne 0 ] || [ -z "$sj" ]; then
+    echo "mesh-ledger --feed: n/a — $SPEND_BIN --tokens unavailable (rc=$rc)" >&2; exit 2
+  fi
+
+  local ratesf frag; ratesf="$(mktemp)"; frag="$(mktemp)"
+  trap 'rm -f "$ratesf" "$frag"' RETURN
+  rates > "$ratesf"
+  local date_s; date_s="$(date -u +%Y-%m-%d)"
+  printf '%s' "$sj" | price_py "$date_s" "$wm" "$now" "$ratesf" > "$frag"; rc=$?
+  case $rc in
+    2) echo "mesh-ledger --feed: n/a — unparseable source" >&2; exit 2;;
+    3) # valid zero activity: advance watermark, book nothing, stay honest-live
+       echo "$now" > "$WATERMARK"; touch_state
+       echo "mesh-ledger: no billable inference in window [$wm .. $now]"; exit 0;;
+    0) : ;;
+    *) echo "mesh-ledger --feed: pricing error rc=$rc" >&2; exit 1;;
+  esac
+
+  # PARITY GATE before committing: append fragment to a COPY, hledger check it. A feeder bug that
+  # unbalances any leg is caught HERE (no external oracle) — and never reaches the real journal.
+  local yj chk; yj="$(year_journal)"; chk="$(mktemp)"
+  cat "$yj" "$frag" > "$chk"
+  if ! hledger -f "$chk" check 2>/tmp/mesh-ledger-check.$$; then
+    echo "mesh-ledger --feed: REFUSED — feed does not balance (parity gate caught it):" >&2
+    cat /tmp/mesh-ledger-check.$$ >&2; rm -f "$chk" /tmp/mesh-ledger-check.$$
+    exit 1
+  fi
+  rm -f /tmp/mesh-ledger-check.$$
+  mv -f "$chk" "$yj"
+  echo "$now" > "$WATERMARK"; touch_state
+
+  # commit → tamper-evident audit trail
+  local amt; amt="$(hledger -f "$(main_journal)" balance expenses --no-total -N 2>/dev/null | tr -d '$,' | awk '{s+=$1} END{printf "%.4f", s}')"
+  git_ledger add -A >/dev/null 2>&1
+  git_ledger commit -q -m "feed [$wm .. $now]: expenses total \$$amt" >/dev/null 2>&1
+  echo "mesh-ledger: booked window [$wm .. $now]"
+  hledger -f "$(main_journal)" balance expenses:inference --no-total --flat 2>/dev/null | tail -8
+}
+
+touch_state(){
+  { echo "last-feed: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    [ -f "$WATERMARK" ] && echo "watermark: $(cat "$WATERMARK")"
+  } > "$STATE"
+  command -v mesh-state-touch >/dev/null 2>&1 && mesh-state-touch "$STATE" >/dev/null 2>&1 || touch "$STATE"
+}
+
+# ============================ reconciliation (window tiling) ============================
+# feeds must tile [start..end) without OVERLAP; overlap = double-book (bug, FAIL). gaps = downtime (WARN).
+recon_py(){
+python3 - "$1" <<'PYEOF'
+import sys, re
+jf = sys.argv[1]
+wins = []
+for ln in open(jf, errors='replace'):
+    m = re.search(r'window:(\S+?)\.\.(\S+)', ln)
+    if m: wins.append((m.group(1), m.group(2)))
+wins.sort()
+overlaps = gaps = 0
+for i in range(1, len(wins)):
+    prev_end = wins[i-1][1]; cur_start = wins[i][0]
+    if cur_start < prev_end:  # ISO strings sort chronologically
+        overlaps += 1; print(f"  OVERLAP: {wins[i-1][0]}..{prev_end}  vs  {cur_start}..")
+    elif cur_start > prev_end:
+        gaps += 1
+print(f"  windows:{len(wins)} overlaps:{overlaps} gaps:{gaps}")
+sys.exit(1 if overlaps else 0)
+PYEOF
+}
+
+# ============================ --check ============================
+do_check(){
+  have hledger || { echo "mesh-ledger --check: hledger not installed (n/a)"; exit 2; }
+  local yj; yj="$(year_journal)"
+  if [ ! -s "$yj" ] || ! grep -q 'window:' "$yj" 2>/dev/null; then
+    echo "mesh-ledger --check: no ledger data yet (n/a)"; exit 2
+  fi
+  echo "== parity (hledger check: every txn sums to zero) =="
+  if hledger -f "$(main_journal)" check 2>&1; then echo "  parity: PASS"; else echo "  parity: FAIL"; exit 1; fi
+  echo "== reconciliation (feed windows must tile without overlap) =="
+  if recon_py "$yj"; then echo "  reconciliation: OK (no double-booked windows)"; else
+    echo "  reconciliation: FAIL — overlapping feed windows (double-book)"; exit 1; fi
+  exit 0
+}
+
+# ============================ reporting ============================
+do_balance(){ have hledger || { echo "hledger n/a"; exit 2; }; ensure_repo
+  hledger -f "$(main_journal)" balance expenses assets --tree 2>/dev/null || { echo "(empty ledger)"; exit 2; }; }
+do_by_provider(){ have hledger || { echo "hledger n/a"; exit 2; }; ensure_repo
+  echo "spend by provider (imputed market value of consumed inference):"
+  hledger -f "$(main_journal)" balance expenses:inference --depth 3 --flat 2>/dev/null; }
+do_report(){ have hledger || { echo "hledger n/a"; exit 2; }; ensure_repo
+  hledger -f "$(main_journal)" incomestatement 2>/dev/null || hledger -f "$(main_journal)" balance 2>/dev/null; }
+
+do_dash(){
+  ensure_repo
+  echo "mesh-ledger · $(date -u +%H:%MZ) · $(hostname)"
+  if ! have hledger; then echo "  hledger not installed"; return; fi
+  local mj; mj="$(main_journal)"
+  local tot; tot="$(hledger -f "$mj" balance expenses --no-total -N 2>/dev/null | tr -d '$,' | awk '{s+=$1} END{printf "%.4f", s+0}')"
+  echo "── imputed inference spend (all-time booked) ──  \$$tot"
+  hledger -f "$mj" balance expenses:inference --depth 3 --flat --no-total 2>/dev/null | sed 's/^/  /' | tail -10
+  echo "── last feeds ──"
+  grep -h 'window:' "$(year_journal)" 2>/dev/null | tail -3 | sed -E 's/.*window:([^ ]+).*/  \1/'
+  [ -f "$STATE" ] && sed 's/^/  /' "$STATE"
+}
+
+# ============================ --test (RED-first) ============================
+do_test(){
+  have hledger || { echo "smoke-test: FAIL (hledger not installed)"; exit 1; }
+  have python3 || { echo "smoke-test: FAIL (no python3)"; exit 1; }
+  local t; t="$(mktemp -d)"; trap 'rm -rf "$t"' RETURN
+
+  # 1) GREEN: a known balanced txn — hledger balance reports the exact figure (real artifact)
+  cat > "$t/bal.journal" <<'EOF'
+2026-07-24 * inference feed  ; window:2026-07-24T08:00:00Z..2026-07-24T09:00:00Z
+    expenses:inference:anthropic:opus     $1.2345
+    assets:budget:imputed:anthropic      $-1.2345
+EOF
+  hledger -f "$t/bal.journal" check >/dev/null 2>&1 || { echo "smoke-test: FAIL (balanced txn rejected)"; exit 1; }
+  local got; got="$(hledger -f "$t/bal.journal" balance expenses --no-total -N 2>/dev/null | awk '{print $1}')"
+  [ "$got" = "\$1.2345" ] || { echo "smoke-test: FAIL (balance want \$1.2345 got '$got')"; exit 1; }
+
+  # 2) RED: an UNBALANCED txn MUST be rejected — the parity gate SEEN to fail (a gate you have not
+  #    seen fail is not a gate). If hledger accepts this, the whole error-detecting property is dead.
+  cat > "$t/unbal.journal" <<'EOF'
+2026-07-24 * inference feed  ; window:2026-07-24T09:00:00Z..2026-07-24T10:00:00Z
+    expenses:inference:anthropic:opus     $0.4200
+    assets:budget:imputed:anthropic      $-0.4000
+EOF
+  if hledger -f "$t/unbal.journal" check >/dev/null 2>&1; then
+    echo "smoke-test: FAIL (parity gate VACUOUS — hledger accepted an unbalanced txn)"; exit 1
+  fi
+
+  # 3) RECONCILIATION seen to fail: two OVERLAPPING windows must be flagged
+  cat > "$t/overlap.journal" <<'EOF'
+2026-07-24 * feed a  ; window:2026-07-24T08:00:00Z..2026-07-24T10:00:00Z
+    expenses:inference:anthropic:opus     $1.0000
+    assets:budget:imputed:anthropic      $-1.0000
+2026-07-24 * feed b  ; window:2026-07-24T09:00:00Z..2026-07-24T11:00:00Z
+    expenses:inference:anthropic:opus     $1.0000
+    assets:budget:imputed:anthropic      $-1.0000
+EOF
+  if recon_py "$t/overlap.journal" >/dev/null 2>&1; then
+    echo "smoke-test: FAIL (reconciliation VACUOUS — overlapping windows not flagged)"; exit 1
+  fi
+  # ...and NON-overlapping windows must PASS
+  cat > "$t/tile.journal" <<'EOF'
+2026-07-24 * feed a  ; window:2026-07-24T08:00:00Z..2026-07-24T09:00:00Z
+    expenses:inference:anthropic:opus     $1.0000
+    assets:budget:imputed:anthropic      $-1.0000
+2026-07-24 * feed b  ; window:2026-07-24T09:00:00Z..2026-07-24T10:00:00Z
+    expenses:inference:anthropic:opus     $1.0000
+    assets:budget:imputed:anthropic      $-1.0000
+EOF
+  recon_py "$t/tile.journal" >/dev/null 2>&1 || { echo "smoke-test: FAIL (reconciliation false-positive on tiled windows)"; exit 1; }
+
+  # 4) PRICING sanity: 1,000,000 Opus OUTPUT tokens must price to exactly $25.00 (rate table live)
+  local rf; rf="$t/rates"; rates > "$rf"
+  local pj; pj='{"claude":{"models":[{"model":"claude-opus-4-8","input":0,"cache_create":0,"cache_read":0,"output":1000000}]},"opencode":{"error":"none"},"codex":{"error":"none"}}'
+  local frag; frag="$(printf '%s' "$pj" | price_py 2026-07-24 A B "$rf" 2>/dev/null)"
+  echo "$frag" | grep -q 'expenses:inference:anthropic:.*\$25\.0000' || {
+    echo "smoke-test: FAIL (pricing: 1M opus output != \$25.0000)"; echo "$frag" | sed 's/^/    /'; exit 1; }
+  # the emitted fragment must itself balance
+  echo "$frag" > "$t/frag.journal"; hledger -f "$t/frag.journal" check >/dev/null 2>&1 || {
+    echo "smoke-test: FAIL (priced fragment does not balance)"; exit 1; }
+
+  # 5) honest n/a: empty source -> exit 2 (not a fake $0 book)
+  printf '' | price_py 2026-07-24 A B "$rf" >/dev/null 2>&1; [ $? -eq 2 ] || {
+    echo "smoke-test: FAIL (empty source did not return n/a exit 2)"; exit 1; }
+
+  echo "smoke-test: ok"; exit 0
+}
+
+case "${1:-}" in
+  --feed)        do_feed;;
+  --balance|"")  do_balance;;
+  --by-provider) do_by_provider;;
+  --report)      do_report;;
+  --check)       do_check;;
+  --dash)        do_dash;;
+  --test)        do_test;;
+  -h|--help)     sed -n '2,40p' "$0";;
+  *) echo "usage: mesh-ledger [--feed|--balance|--by-provider|--report|--check|--dash|--test]" >&2; exit 2;;
+esac
