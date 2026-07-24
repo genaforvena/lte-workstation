@@ -35,6 +35,7 @@ echo "built bin/uxnasm ($(wc -c <bin/uxnasm)b) bin/uxncli ($(wc -c <bin/uxncli)b
 if [ "${1:-}" = --rom ]; then
   ./bin/uxnasm lease-gate.tal lease-gate.rom
   ./bin/uxnasm band-gate.tal band-gate.rom
+  ./bin/uxnasm sense-gate.tal sense-gate.rom
   ./bin/uxnasm spearman.tal spearman.rom
   ./bin/uxnasm series-stats.tal series-stats.rom
   ./bin/uxnasm arith32-test.tal arith32-test.rom
