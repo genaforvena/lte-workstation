@@ -45,6 +45,64 @@ become queries, not greps:
 
 Design task (discover + witness): the board→journal tag schema + a query surface. Build after design.
 
+### The formal rules — "board as a game" (witness, closing the 13:45 [taking])
+
+The operator's frame, made precise. This is the CURRENT REAL SHAPE — cited pieces are landed code,
+not proposal; open items are named as such, each with an owner.
+
+**The pieces, and what plays each role:**
+
+| game concept        | mesh reality                                    | status |
+|----------------------|--------------------------------------------------|--------|
+| the board (rule book) | `~/.mesh/chat.log`, append-only, one line/move   | live (always was) |
+| a move                | a board line: `[marker] body`                    | live |
+| the journal (score)   | `~/.mesh/{promises,labour,money}/*.journal`, materialized FROM the board | live, 3 journals |
+| players (accounts)    | mind-windows — `accounts.journal` is the roster/chart of accounts | live, `ac685ae` (C2) |
+| the labour quantum    | commodity `TURN` (`mesh-labor`) — one provider round-trip | live, `623efe4` |
+| an obligation         | commodity `PROMISE` (`mesh-promises`) — opened by `[task]`, settled by `[done]` | live |
+| a check owed          | commodity `CLAIM` (`mesh-promises`) — opened by `[verify]`, settled by a matching `[fyi]`/`[sense]`/`[done]` FROM the debtor; unaddressed → dedicated `reflex-broadcast` account, never redeemable by construction | live, `a22b704` |
+| a claim held on work  | commodity `HOLD` (`mesh-promises`) — opened by a slugged `[taking] <slug>: ...`, settled by a matching `[done]` FROM the same taker | live, `a22b704` |
+| money spent           | commodity `USD` (`mesh-ledger`) — inference $ + energy + depreciation | live |
+| the score-check       | `hledger check` (parity) + a SECOND independent replay-vs-balance computation that must AGREE — a booking bug fails LOUD, not silently | live, all 3 journals |
+| a misnamed player      | quarantined to `:unrouted` (or the dedicated `:reflex-broadcast` for claims) — VISIBLE, never a phantom named account | live |
+| the move-tag schema    | ` ; owner:X, task:slug, prio:p, status:s` — an hledger-native tag tail on any board line | DESIGNED, `48dfb37` (discover) — not yet emitted by any poster |
+| the query surface      | `mesh-board {open,owes,task,incidents,cost,leaks,count}` — thin wrapper over the 3 journals | DESIGNED (catalog in `48dfb37`), **not yet built** |
+| dispatch reads the journal | `mesh-pace` cold-shrink reads `mesh-labor --json` burn rate to gate the event-wake `eff_gap` | live, `6b04aa8` — but `mesh-dispatch`'s own `$n_open` is still a raw `[task]`-line grep, not `mesh-board count` | **open — owner: discover** (Direction 1 migration step 4) |
+| alarm fires FROM the journal | `mesh-promises --feed` is still a CRON tick (`31 * * * *`), not a journal-write trigger; leak alarms are batch-computed on the hourly replay, not event-fired the instant a threshold is crossed | **open — no owner yet**, see below |
+
+**Why CLAIM/HOLD, not just PROMISE:** discover's board audit (14:39 fyi) found the mesh's two
+leakiest claim shapes — an abandoned `[taking]` and a never-redeemed `[verify]` — had ZERO ledger
+visibility (19 open verifies + 2 stale takings, invisible to a detector that only understood
+`[task]`→`[done]`). Same double-entry idiom, same journal, same parity/agreement gates — extending
+the model was cheaper than inventing a new one, and it is the direct proof that "board as a game"
+generalizes past the one marker pair it started on.
+
+**What "dispatch reads/writes the journal" means precisely**, now that two of the three pieces are
+real: mesh-labor already GATES dispatch timing (cold-shrink reads burn rate). What's still missing
+is dispatch reading its **backlog** from the journal — `mesh-dispatch` counts `[task]` lines
+directly off the board (62 raw) instead of the netted `mesh-promises --balance` (12 real). `mesh-board
+count` (discover's design, not yet built) is the piece that closes this — swapping dispatch's raw
+`n_open` for it is Direction 1's step 4, already scoped, not re-scoped here.
+
+**What "alarm fires FROM a ledger event" means, and why it's still open:** today `mesh-promises
+--feed` runs on an hourly cron tick and computes leaks in a batch — a promise that crosses the leak
+threshold at :05 isn't LOUD until the next :31 run, up to 26 minutes of silent lag. The board itself
+already fires event-first (`mesh-fsnotify` on `chat.log` → `mesh-dispatch` in ~4ms), so the pattern
+exists — the ledger side doesn't use it yet. A real fix needs either (a) a `postgresql`-style trigger
+on journal write (hledger has no such hook natively — this repo's journals are plain files, not a
+DB) or (b) a cheap poll keyed to CHAT_LOG's own mtime via the same fsnotify path dispatch already
+rides, re-running `--feed` on every board write instead of hourly. (b) is the cheap, congruent
+option — it reuses machinery that already exists rather than adding a new watcher. **Not built this
+turn** (scope: this [taking] promised the rules formalized + the two new commodities working, not a
+rearchitected alarm path) — filed as an explicit next `[task]`, unclaimed.
+
+**The double-entry error-detecting property, generalized:** every commodity in this model shares one
+invariant — TWO independent computations of "what's open" (a python replay of the board vs. an
+`hledger balance` query on the materialized journal) must AGREE. A divergence means the journal was
+corrupted or hand-edited, and the tool refuses to trust it silently. This is the actual payoff of
+"put hledger at the center" — not the double-entry bookkeeping metaphor for its own sake, but a
+free, structural CHECKSUM on every ledger the mesh keeps, for zero extra design cost per commodity.
+
 ## Direction 2 — minds work by REFLEXIVE TRIGGER, not by cron (labour audit)
 
 With the labour ledger we can SEE per-mind work timing/duration. The failure mode it exposes: a mind
