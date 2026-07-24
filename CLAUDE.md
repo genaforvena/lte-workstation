@@ -211,23 +211,32 @@ freshly-cleared session's context — so the mind wakes already holding its own 
 auto-read is the whole loop; skip the write and the read has nothing). The file survives `/clear`;
 it is intentionally stale-on-reboot (reboot is clean reincarnation).
 
-**`mesh-clear <window>` — the gated `/clear`** (machinery landed; coverage model benched + set). It
-refuses to `/clear` unless a handoff exists, is **fresh** (younger than `MESH_CLEAR_FRESH_SECS`,
-default 900s — an hours-old handoff never passes, the lease-freshness trap), **and** a tiny local
-model confirms the handoff **covers** the recent pane scrollback. It is strictly **fail-safe**: model
-unsure / unreachable / non-affirmative → BLOCK, never auto-clear (a false "all-ok → clear" loses the
-thread irreversibly, same rule as the mesh no-faked-all-clear). `--auto` extracts a handoff verbatim
-from the scrollback (never invents a next-step) then re-gates. COVERAGE MODEL (2026-07-18, 91c435d):
-`gemma4:e2b-it-qat` is the benched winner and the default — the ONLY local candidate that
-*discriminates* coverage (`mesh-model-bench coverage`, ledger `~/.mesh/model-bench.log`: false-YES
-0/7, over-block 4/7, read-ok). Every qwen — old `qwen2.5:3b` (the prior default) AND current-gen
-`qwen3.5:2b`/`4b` — is DEGENERATE always-NO (over-block 7/7), which is why the gate over-blocked
-before. The earlier "`gemma4:e2b` emits Thinking… → parse trap" was OUR handling bug (the same
-thinking-family class as the qwen3.5 wake parser), fixed by `--think=false` in `_classify_coverage`
-— **not** a model ceiling. The gate is over-blocking-but-safe (permits ~43% of covered clears, loses
-zero threads); swap the winner via `MESH_CLEAR_MODEL` when the bench moves. Scoring is asymmetric by
-the fail-safe doctrine: a false-YES (clearing an UNCOVERED handoff) is the irreversible error and
-DISQUALIFIES a model (UNSAFE); over-blocking is the recoverable, rankable one.
+**`mesh-clear <window>` — the `/clear` a mind types instead of a bare one.** It does exactly three
+things in order: **write a fresh handoff (`mesh-handoff --snapshot`) → `/clear` the pane → record the
+row**. There is no judgement in it — no model, no coverage classification, no freshness arithmetic,
+no `--auto` (2026-07-24, operator: *"давай избавимся от условных clear'ов и сделаем логику предельно
+простой — clear до и после взятия задачи с доски, никаких других условий, никаких llm-проверок"*).
+
+**Clear at the TASK BOUNDARY, and only there.** Before staking a `[taking]` and after posting
+`[done]` — the reflex fires the after-edge automatically (`mesh-mind-compact`'s post-claim trigger),
+and the before-edge needs nothing, because a mind that cleared when it closed its last task is
+already fresh when it claims the next. The old timer (45m idle) and context-% triggers are **gone by
+design**: both fired MID-TASK on a mind that simply had not finished, which is the only place a clear
+can drop uncommitted state — and precisely why the clear once needed a model to guess whether the
+handoff "covered" the work. Delete the arbitrary moment and the guess becomes unnecessary. A mind may
+still take a mid-task clear **by its own choice**; that is safe because the safety net is
+deterministic and already running: `mesh-handoff --snapshot` every 5 min (verbatim extraction, no
+invented next-step) plus the `refs/wip/<window>` commit beside it. Do not re-add a conditional clear
+without the operator — `mesh-mind-compact --test` and `mesh-clear --test` both go RED if one returns
+(the latter drives a poisoned `ollama` on PATH and fails if anything calls it).
+
+**The one thing that still refuses a clear is not a judgement — it is a fact on disk:** an unshipped
+DETACHED bg batch (`mesh-bg-register` manifest `running` / `done-undelivered`). A mind can launch work
+that delivers from its own completion path (`mesh-bg-done`), not from the mind; clearing mid-flight
+strands that delivery and no handoff un-strands it. `mesh-clear --gate <win>` exposes that scan alone
+for other launchers. (Its crash-reap still flips a dead-pid stale `running` → `crashed` so a died
+batch cannot wedge every future clear.) A clear whose handoff write could not run at all also fails —
+that is the procedure failing, not an extra gate.
 
 ## Self-feeding (autonomous operation)
 
@@ -473,7 +482,7 @@ index** (`mesh-tools` grouped · `mesh-tools <category>` · `--search <term>` ·
 categories below name the load-bearing tools — run `mesh-tools <category>` (or read the doc) for the
 rest and the full contracts.
 
-- **Coordinate / drive:** `mesh-tell` (`--peek`) · `mesh-watch` (`--until`/`--change`) · `mesh-chat` · `mesh-claim` (`--check`) · `mesh-minds` · `mesh-trace` · `mesh-textin` · `mesh-handoff` (pre-`/clear` work-state → durable file + SessionStart-hook restore) · `mesh-clear` (the gated `/clear` — fail-safe tiny-model freshness+coverage gate; model pending models bench) · `mesh-clear-log` (the LEDGER + `clear` dash window for every `/clear` — when · ctx% · tokens · handoff coverage · reason; written by mesh-mind-compact + mesh-clear so clears are fixed by numbers, not blind. `/compact` is RETIRED mesh-wide, operator 2026-07-18 — `/clear` is the sole context lever).
+- **Coordinate / drive:** `mesh-tell` (`--peek`) · `mesh-watch` (`--until`/`--change`) · `mesh-chat` · `mesh-claim` (`--check`) · `mesh-minds` · `mesh-trace` · `mesh-textin` · `mesh-handoff` (pre-`/clear` work-state → durable file + SessionStart-hook restore) · `mesh-clear` (the `/clear` a mind types: write handoff → clear → log; no model, no conditions except an unshipped bg batch — `--gate`) · `mesh-clear-log` (the LEDGER + `clear` dash window for every `/clear` — when · ctx% · tokens · handoff freshness · reason; written by mesh-mind-compact + mesh-clear so clears are fixed by numbers, not blind. `/compact` is RETIRED mesh-wide, operator 2026-07-18 — `/clear` is the sole context lever).
 - **Perceive (sensorium):** `mesh-location` · `mesh-body-motion` · `mesh-light` · `mesh-tamper` · `mesh-body-context` · `mesh-presence`(+`-fuse`/`-trends`/`-delta`) · `mesh-arrivals` · `mesh-find` · `mesh-lan-newdevice`/`mesh-lan-health` · `mesh-wifi-link`/`mesh-wifi-motion` · `mesh-room-sense` · `mesh-say`/`mesh-act` · `mesh-voice-say` (THE clone-synth primitive — text→the operator's OWN cloned voice via the warm `mesh-voice-clone-daemon`/xtts_v2; every speech organ (`mesh-note3-say` room voice, `mesh-voice-tx` TG voice) synthesizes through it, piper/ruslan is the LOUD fallback when the daemon is down) · `mesh-voice-rx`/`mesh-voice-tx`/`mesh-tg-typing` · `mesh-tg-roz`/`mesh-roz-channel` · `mesh-tg-update` · `mesh-watchtower` · `mesh-cam-watch` · `mesh-face-recognize` · `mesh-overhear`/`mesh-room`/`mesh-room-trace` (the room "third party": ambient rolling transcript on the mic+Bose node + the room mind's read/say verbs) · `mesh-irq-rate` (kernel interrupt activity, sampled on demand). Perception is re-observed live, never stored (decays on reboot).
 - **Fusion / derived state:** `mesh-situation` · `mesh-perimeter` · `mesh-sensorium` · `mesh-stress` · `mesh-operator-home`/`mesh-operator-state` · `mesh-home-state`/`mesh-household-state` · `mesh-ambient-clock` · `mesh-sense-monitor`. Honest-fusion rule: an unreachable input renders UNKNOWN/partial, never a faked all-clear.
 - **Sound studio (records → grind):** `mesh-records` (the ARCHIVIST: keeps + measures every record the mesh makes before its organ prunes it — the room ear self-prunes hourly, soundscape keeps 2d, so the corpus a mind was handed was already gone; the ledger `~/.mesh/records.log` outlives the audio) · `mesh-sound-reflex` (the GRINDER: derives each recipe from the record's MEASURED character, repelled from recent renders by combo distance, bg-grinds via `mesh-room-music`, pokes the mind only on drop/walked-out/outlier/degenerate) · `mesh-soundscape --measure <wav>` (the one measure tract — never add a second librosa analyzer) · `mesh-room-music` (owns the grind invocation + `room-music-params.log`).

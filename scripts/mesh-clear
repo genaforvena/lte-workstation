@@ -1,82 +1,66 @@
 #!/usr/bin/env bash
-# mesh-clear — a GATED /clear. A mind must never type a bare /clear: it drops the uncommitted work-state
-# (see mesh-handoff + the PRE-CLEAR doctrine in CLAUDE.md), and "I posted a handoff earlier" is not enough —
-# an HOURS-OLD handoff doesn't cover what was just done. This wrapper lets a tiny local model be the CLEAR-GATE:
-# before /clear reaches the pane, it decides whether a FRESH handoff actually COVERS the recent work.
+# mesh-clear — the /clear a mind types instead of a bare /clear. It does ONE thing in one order:
 #
-#   mesh-clear <window>            gate, then /clear the window's mind pane iff the gate PASSES
-#   mesh-clear <window> --auto     on a block, EXTRACT a handoff from scrollback (verbatim), re-gate, then /clear
-#   mesh-clear <window> --dry-run  print the verdict + reason, NEVER send /clear (what would happen)
-#   mesh-clear --test              gate-logic smoke test (stale BLOCKS, fresh+covered PASSES; drives every branch)
+#     write a fresh handoff  →  /clear the pane  →  record the row
 #
-# FLOW: (1) read the window's mind-pane scrollback + the stored handoff, (2) tiny model binary-classifies
-# "does this FRESH handoff COVER the work the scrollback shows?", (3a) YES → send /clear; (3b) NO → block
-# with guidance, or (--auto) extract+write a handoff then re-gate.
+# There is NO judgement in it. No model, no coverage classification, no freshness arithmetic, no
+# --auto re-gate. (Operator direction, 2026-07-24: "get rid of the conditional clears and make this
+# logic dead simple".)
 #
-# THREE HARD CONSTRAINTS (operator 2026-07-18) — each is a gate you can watch FAIL in --test:
-#  (a) FAIL-SAFE. Model unsure / unreachable / unparseable → BLOCK, never auto-clear. A false "all-ok → clear"
-#      loses the thread FOREVER (irreversible), so only an affirmative YES passes; every other outcome blocks.
-#      Same rule as the mesh no-faked-all-clear (honest-fusion): absence of a clear YES is NOT a yes.
-#  (b) FRESHNESS/COVERAGE, not PRESENCE. A stale [handoff] from hours ago must NOT pass. The deterministic
-#      freshness clock is the handoff's OWN age vs a budget (MESH_CLEAR_FRESH_SECS, default 900s) — NOT tmux
-#      #{window_activity}: running mesh-clear in the pane BUMPS window_activity to ~now, so comparing handoff
-#      vs activity would call every handoff stale (the act of checking invalidates the clock — the lease-
-#      freshness trap). Age gates freshness; the model gates coverage over the scrollback. Presence alone
-#      never passes: it must be FRESH and COVERED.
-#  (c) EXTRACTIVE auto-handoff. --auto's generated handoff lists ONLY concrete actions + paths VERBATIM from
-#      the scrollback; it must NOT invent a "next step". A hallucinated next-step is worse than no handoff.
+#   mesh-clear <window>            write handoff, /clear that window's mind pane, log it
+#   mesh-clear <window> --dry-run  print what would happen; writes nothing, clears nothing
+#   mesh-clear --gate <window>     query ONLY the bg-delivery backstop (for other launchers)
+#   mesh-clear --test              smoke test (drives the real flow; asserts NO model is consulted)
 #
-# Model is pluggable (MESH_CLEAR_MODEL, default gemma4:e2b-it-qat — the wake-gate winner); the models mind's
-# zero-shot bench picks the real winner (functiongemma / LFM2.5), swap via env, no code change. Coordinate
-# there for which classifier wins the gate.
+# WHY THE MODEL GATE IS GONE. The old gate asked a tiny LLM "does this handoff COVER the recent
+# work?" and blocked on anything short of an affirmative YES. That question only ever mattered
+# because clears happened at ARBITRARY moments — a 45-minute timer, a context %, a stuck poll —
+# i.e. in the MIDDLE of a task, where uncommitted work-state genuinely could be lost. Move the clear
+# to the TASK BOUNDARY and the question answers itself:
+#   · before a mind stakes a [taking], the previous task is already closed — nothing is in flight;
+#   · after it posts [done], the artifact IS the commit + the board line, not the context.
+# and for the mid-task clear a mind chooses to take, the safety net is already built and DETERMINISTIC:
+# `mesh-handoff --snapshot` runs every 5 minutes, extracts the pane verbatim, and parks the worktree at
+# refs/wip/<window> (mesh-wip-commit). That is what actually rescues a thread — measured, not judged.
+# The model added a second, WORSE copy of that guarantee: it permitted only ~43% of covered clears
+# (over-block 4/7 on its own bench) and cost a GPU call per clear. A gate that duplicates a
+# deterministic guarantee, less reliably, is not a safety feature — it is a coin flip in the path.
+#
+# THE ONE CONDITION THAT REMAINS is not a judgement, it is a fact on disk: an unshipped DETACHED
+# batch (bg manifest `running` / `done-undelivered`). A mind may launch work that delivers from its
+# OWN completion path (mesh-bg-done), not from the mind; clearing mid-flight strands that delivery,
+# and no handoff un-strands it. That scan reads files and compares pids — no model, no scrollback.
+#
+# HANDOFF WRITE, NOT HANDOFF CHECK. mesh-clear no longer asks whether a handoff exists — it WRITES
+# one (mesh-handoff --snapshot, extractive + capped + clobber-protected), then clears. A clear whose
+# handoff write could not run at all is a clear that drops state, so that is a hard failure of the
+# procedure, not an extra gate.
 # orphan-ok: on-demand — a mind runs it in place of /clear; not a cron reflex.
 set -uo pipefail
 
 MESH_DIR="${MESH_DIR:-$HOME/.mesh}"
 HANDOFF_DIR="${MESH_HANDOFF_DIR:-$MESH_DIR/handoff}"
 BG_DIR="${MESH_BG_DIR:-$MESH_DIR/bg}"                # bg-task delivery manifests (mesh-bg-register/-done)
-CHAT_LOG="${MESH_CHAT_LOG:-$MESH_DIR/chat.log}"
-# The freshness budget is a CALIBRATED constant: env > uxn threshold-ledger (gates-as-data,
-# row clear-fresh fresh=…) > inline 900. The ledger read is pure data (mesh-sexpr-gate
-# --const, naturals-only); a missing genome checkout / corrupt value falls back inline, so
-# deployed copies degrade to the old behaviour, never to a broken gate. Recalibrating the
-# budget is a diff on scripts/uxn/threshold-ledger, not on this script.
-_ledger_const() { # <gate> <k> <fallback> — resolve a calibrated constant, naturals-only
-  local repo="${MESH_REPO:-$HOME/lte-workstation}" led v=""
-  led="${MESH_THRESHOLD_LEDGER:-$repo/scripts/uxn/threshold-ledger}"
-  [ -f "$led" ] && [ -x "$repo/scripts/uxn/mesh-sexpr-gate" ] \
-    && v="$(MESH_SEXPR_GATES="$led" "$repo/scripts/uxn/mesh-sexpr-gate" --const "$1" "$2" 2>/dev/null)"
-  case "$v" in ''|*[!0-9]*) v="$3" ;; esac
-  printf '%s\n' "$v"
-}
-FRESH_SECS="${MESH_CLEAR_FRESH_SECS:-$(_ledger_const clear-fresh fresh 900)}"   # a handoff older than this is STALE → block
-SCROLL_LINES="${MESH_CLEAR_SCROLL_LINES:-120}"      # pane scrollback lines fed to the coverage classifier
-MODEL="${MESH_CLEAR_MODEL:-gemma4:e2b-it-qat}"  # BENCHED WINNER (2026-07-18, mesh-model-bench coverage,
-                                           # ledger ~/.mesh/model-bench.log). It is the ONLY candidate that
-                                           # DISCRIMINATES coverage: false-YES 0/7 (never clears an uncovered
-                                           # handoff — safe) and over-block 4/7 (conservative but usable,
-                                           # permits real clears). Every qwen — old 2.5:3b (the prior default)
-                                           # AND current 3.5:2b/4b — is DEGENERATE always-NO (over-block 7/7),
-                                           # which is why the gate over-blocked before. The old "gemma4:e2b →
-                                           # parse trap" note was OUR bug (the Thinking… leak), fixed by
-                                           # --think=false in _classify_coverage above — not a model ceiling.
-                                           # Fail-safe stands: on a node without this model the call degrades
-                                           # to UNSURE → block. Swap the winner via env when the bench moves.
 SESSION="${MESH_CLEAR_SESSION:-$(hostname)}"
+# the handoff writer lives in _write_handoff and is resolved AT CALL TIME (never a load-time global:
+# a `MESH_CLEAR_HANDOFF_CMD=… mesh-clear …` prefix — which is how --test drives the real flow against a
+# stub — cannot rebind a var already expanded at source time). NEVER a model: mesh-handoff --snapshot is
+# deterministic extraction (it deliberately does not call one — a model per window would thrash the GPU
+# the senses need).
 
 _handoff_file() { printf '%s/%s.md' "$HANDOFF_DIR" "$(printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_')"; }
 
-# --- LAYER-2 BACKSTOP: bg-task delivery gate. A mind may launch a DETACHED batch (mesh-sound-reflex's
+# --- THE ONLY BLOCKER: bg-task delivery. A mind may launch a DETACHED batch (mesh-sound-reflex's
 # grind `... &`) that delivers from its OWN completion path via mesh-bg-done, NOT the mind. If the mind
 # /clears mid-batch, that delivery must not be stranded. mesh-bg-register writes a manifest per detached
 # task under ~/.mesh/bg/<window>/; this scans them. FIVE states (see mesh-bg-register): the gate BLOCKS
 # on `running` (batch in flight) and `done-undelivered` (real output that never shipped), and PASSES on
 # `delivered`, `done-nodeliver` and `crashed` (nothing to strand / nothing left that COULD deliver).
-# Same fail-safe spirit as the coverage gate:
-# uncertainty about unshipped work → block. Sets globals G_BG_VERDICT (OK | BLOCK:bg-undelivered |
-# BLOCK:bg-running) and G_BG_DETAIL (the offending "<batch>:<status>" list). Sets globals rather than
-# echoing so callers read them WITHOUT a subshell — a $(...) capture would strand G_BG_DETAIL and, under
-# set -u, blow up the later block message with an unbound-variable exit.
+# Uncertainty about UNSHIPPED WORK blocks — that is a fact about a file, not an opinion about coverage.
+# Sets globals G_BG_VERDICT (OK | BLOCK:bg-undelivered | BLOCK:bg-running) and G_BG_DETAIL (the offending
+# "<batch>:<status>" list). Sets globals rather than echoing so callers read them WITHOUT a subshell — a
+# $(...) capture would strand G_BG_DETAIL and, under set -u, blow up the later block message with an
+# unbound-variable exit.
 # CRASH-REAP (2026-07-21): a `running` manifest whose pid is DEAD and whose `updated` is older than
 # MESH_BG_CRASH_GRACE (default 300s) is a batch that died BEFORE mesh-bg-done ever ran — a crash
 # mid-delivery lands `done-undelivered` instead, because bg-done flips status FIRST. No surviving
@@ -124,76 +108,6 @@ _bg_scan() { # $1=window → sets G_BG_VERDICT, G_BG_DETAIL, G_BG_REAPED
   fi
 }
 
-# --- pure decision core: the whole gate reduced to inputs so --test drives every branch, RED-first. ---
-# $1=have_handoff(0/1)  $2=hoff_age_secs  $3=coverage(YES|NO|UNSURE)  $4=fresh_secs
-# echoes "PASS" or "BLOCK:<reason>". ONLY (have && fresh && coverage==YES) passes — everything else blocks.
-_clear_decision() {
-  local have="$1" age="$2" cov="$3" budget="$4"
-  [ "$have" = 1 ]                 || { echo "BLOCK:no-handoff";  return; }
-  [ "$age" -le "$budget" ] 2>/dev/null || { echo "BLOCK:stale"; return; }   # non-numeric age → also blocks
-  [ "$cov" = YES ]               || { echo "BLOCK:not-covered"; return; }   # NO / UNSURE / unreachable all block (fail-safe)
-  echo PASS
-}
-
-# --- tiny-model coverage classify. Emits exactly YES | NO | UNSURE. Any error/timeout/unparse → UNSURE (blocks). ---
-# Override for tests / models-bench integration: MESH_CLEAR_CLASSIFY_CMD reads evidence on stdin, prints the verdict.
-_classify_coverage() { # stdin = evidence (handoff + scrollback); echoes YES|NO|UNSURE
-  if [ -n "${MESH_CLEAR_CLASSIFY_CMD:-}" ]; then
-    local v; v="$(cat | $MESH_CLEAR_CLASSIFY_CMD 2>/dev/null | tr -d '[:space:]' | tr a-z A-Z)"
-    case "$v" in YES) echo YES;; NO) echo NO;; *) echo UNSURE;; esac
-    return
-  fi
-  command -v ollama >/dev/null 2>&1 || { echo UNSURE; return; }
-  local ev prompt out
-  ev="$(cat)"
-  prompt="You are a strict release gate. Below is a mind's saved HANDOFF note and the recent terminal
-SCROLLBACK of what it was actually doing. Answer with ONE word only: YES if the HANDOFF already covers the
-concrete work shown in the SCROLLBACK (the actions and files it touched), so nothing would be lost if the
-session is cleared now; NO if the scrollback shows work the handoff does not mention. If you are unsure,
-answer NO. Do not explain.
-
-=== HANDOFF ===
-$ev
-=== END ===
-One word (YES or NO):"
-  # bound the call; a hang/crash must degrade to UNSURE, never block the mind forever and never pass.
-  # --think=false GATES THE THINKING at the call, not the parser. A thinking-family model (gemma4:e2b,
-  # the qwen3.5 line) otherwise streams a "Thinking...\n1. Analyze...\n...done thinking." block BEFORE its
-  # verdict; that prose is full of stray yes/no tokens the parser can't tell from the answer, so e2b read as
-  # a coin (memory qwen35-thinking-family-fails-the-wake-gate-parser). It is NOT a model-ceiling loss —
-  # benched 2026-07-18, e2b reasons the coverage call correctly; the loss was ours, in handling. This is the
-  # exact fix the wake arm already ships (mesh-room-address / mesh-model-bench bench_wake pass --think=false),
-  # and it is a no-op on a non-thinking model (qwen2.5), so it is safe across every candidate. With the block
-  # gone, the LAST yes/no token IS the verdict — the tail-1 grep below is now reading a clean answer, not
-  # mining one out of reasoning. Any leftover prose with no yes/no still degrades to UNSURE → block (fail-safe).
-  out="$(printf '%s' "$prompt" | timeout "${MESH_CLEAR_MODEL_TIMEOUT:-25}" ollama run "$MODEL" --think=false 2>/dev/null \
-        | tr -d '\r' | grep -oiE '\b(yes|no)\b' | tail -1 | tr a-z A-Z)"
-  case "$out" in
-    YES) echo YES ;;
-    NO)  echo NO ;;
-    *)   echo UNSURE ;;   # empty / prose / timeout → fail-safe
-  esac
-}
-
-# --- extractive handoff generator (--auto). ONLY concrete actions + paths from scrollback; no invented next-step. ---
-_extract_handoff() { # stdin = scrollback; echoes an extractive handoff body (or empty on failure → caller blocks)
-  if [ -n "${MESH_CLEAR_EXTRACT_CMD:-}" ]; then cat | $MESH_CLEAR_EXTRACT_CMD 2>/dev/null; return; fi
-  command -v ollama >/dev/null 2>&1 || return 0
-  local sc prompt
-  sc="$(cat)"
-  prompt="Extract, VERBATIM from the terminal scrollback below, ONLY: the concrete actions that were taken
-and the file paths / commands that appear in it. Copy real tokens from the text. Do NOT invent a next step,
-do NOT summarize intentions, do NOT add anything not literally present. Bullet list.
-
-=== SCROLLBACK ===
-$sc
-=== END ===
-Extractive bullets:"
-  # --think=false here too: an extractive handoff polluted with a "Thinking..." preamble is not verbatim
-  # scrollback, and the block would land in the mind's durable handoff file. Same reason as the classifier.
-  printf '%s' "$prompt" | timeout "${MESH_CLEAR_MODEL_TIMEOUT:-25}" ollama run "$MODEL" --think=false 2>/dev/null
-}
-
 _resolve_mind_pane() { # $1=window → echoes "<session>:<window>.<idx>" of the BOTTOM (mind) pane, or empty
   local win="$1" idx
   tmux has-session -t "$SESSION" 2>/dev/null || return 0
@@ -203,7 +117,7 @@ _resolve_mind_pane() { # $1=window → echoes "<session>:<window>.<idx>" of the 
   [ -n "$idx" ] && printf '%s:%s.%s' "$SESSION" "$win" "$idx"
 }
 
-_send_clear() { # $1=paneref — inject a real /clear + submit. The irreversible step; only reached on PASS.
+_send_clear() { # $1=paneref — inject a real /clear + submit. The irreversible step.
   local pane="$1"
   tmux send-keys -t "$pane" C-u 2>/dev/null            # wipe any half-typed composer text
   sleep 0.1
@@ -212,163 +126,137 @@ _send_clear() { # $1=paneref — inject a real /clear + submit. The irreversible
   tmux send-keys -t "$pane" C-m 2>/dev/null
 }
 
-_gate() { # $1=window ; sets globals: G_VERDICT, G_REASON, G_AGE, G_COV, G_BG_DETAIL. Reads real evidence.
-  local win="$1" f now mtime scroll ev pane
-  # LAYER-2 FIRST: an unshipped detached delivery is a hard, independent block — it takes precedence
-  # over the handoff/coverage gate (a perfect handoff does not un-strand a grind that never delivered).
-  _bg_scan "$win"   # sets G_BG_VERDICT, G_BG_DETAIL (direct, no subshell)
-  if [ "$G_BG_VERDICT" != OK ]; then
-    G_HAVE=-1; G_AGE=-1; G_COV=n/a
-    G_VERDICT="$G_BG_VERDICT"; G_REASON="${G_BG_VERDICT#BLOCK:}"
-    return
-  fi
-  f="$(_handoff_file "$win")"
-  now="$(date +%s)"
-  if [ -r "$f" ]; then
-    mtime="$(stat -c %Y "$f" 2>/dev/null || echo 0)"
-    G_AGE=$(( now - mtime )); G_HAVE=1
-  else
-    G_AGE=-1; G_HAVE=0
-  fi
-  # only bother the model if we HAVE a handoff that is still FRESH — otherwise the deterministic gate decides.
-  G_COV=UNSURE
-  if [ "$G_HAVE" = 1 ] && [ "$G_AGE" -le "$FRESH_SECS" ]; then
-    pane="$(_resolve_mind_pane "$win")"
-    scroll=""
-    [ -n "$pane" ] && scroll="$(tmux capture-pane -t "$pane" -p -S "-$SCROLL_LINES" 2>/dev/null)"
-    ev="$(cat "$f" 2>/dev/null)
-=== SCROLLBACK ($SCROLL_LINES lines) ===
-$scroll"
-    G_COV="$(printf '%s' "$ev" | _classify_coverage)"
-  fi
-  G_VERDICT="$(_clear_decision "$G_HAVE" "$G_AGE" "$G_COV" "$FRESH_SECS")"
-  G_REASON="${G_VERDICT#BLOCK:}"
+# Write the handoff. rc from mesh-handoff --snapshot: 0=written · 4=kept a fresher MANUAL handoff ·
+# 6=kept the prior handoff (pane extracted hollow — never clobber with noise) · 5=nothing to snapshot
+# (pane unreachable/empty — nothing to lose). 0/4/5/6 all mean "the best available handoff is in
+# place"; anything else (tool absent, crash) means the write did NOT happen → the clear would drop
+# state, so it fails. Sets G_HOFF_RC + G_HOFF_NOTE.
+_write_handoff() { # $1=window
+  local win="$1" rc cmd
+  cmd="${MESH_CLEAR_HANDOFF_CMD:-mesh-handoff --snapshot}"   # resolved HERE, not at load time
+  G_HOFF_NOTE=""
+  # shellcheck disable=SC2086
+  $cmd "$win" >/dev/null 2>&1; rc=$?
+  G_HOFF_RC="$rc"
+  case "$rc" in
+    0) G_HOFF_NOTE="handoff written" ;;
+    4) G_HOFF_NOTE="kept fresher manual handoff" ;;
+    5) G_HOFF_NOTE="no scrollback to snapshot (nothing to lose)" ;;
+    6) G_HOFF_NOTE="kept prior handoff (pane extracted hollow)" ;;
+    *) G_HOFF_NOTE="handoff write FAILED (rc=$rc)"; return 1 ;;
+  esac
+  return 0
 }
 
-_run() { # $1=window  $2=auto(0/1)  $3=dryrun(0/1)
-  local win="$1" auto="$2" dry="$3" pane
-  _gate "$win"
-  if [ "$G_VERDICT" = PASS ]; then
-    if [ "$dry" = 1 ]; then echo "mesh-clear: PASS (handoff fresh ${G_AGE}s, coverage=$G_COV) — would /clear '$win'"; return 0; fi
-    pane="$(_resolve_mind_pane "$win")"
-    [ -n "$pane" ] || { echo "mesh-clear: cannot resolve mind pane for '$win' — refusing to /clear" >&2; return 3; }
-    echo "mesh-clear: PASS — /clear → $pane (handoff fresh ${G_AGE}s, covered)"
-    _send_clear "$pane"
-    command -v mesh-clear-log >/dev/null 2>&1 && mesh-clear-log --record "$win" "gated PASS cov=$G_COV" "?" "?" mesh-clear "?" >/dev/null 2>&1 || true
+_run() { # $1=window  $2=dryrun(0/1)
+  local win="$1" dry="$2" pane
+  _bg_scan "$win"
+  if [ "$G_BG_VERDICT" != OK ]; then
+    echo "mesh-clear: BLOCKED (${G_BG_VERDICT#BLOCK:}) — NOT clearing '$win'." >&2
+    case "$G_BG_VERDICT" in
+      BLOCK:bg-undelivered) echo "  → a detached bg-task produced output that has NOT shipped: $G_BG_DETAIL" >&2
+                            echo "    Let its delivery finish, or resolve each: mesh-bg-done $win <batch>  (deliver) | mesh-bg-done --no-deliver $win <batch>  (nothing to ship)." >&2 ;;
+      BLOCK:bg-running)     echo "  → a detached bg-task is still RUNNING: $G_BG_DETAIL — wait for its completion path (mesh-bg-done) before clearing." >&2 ;;
+    esac
+    return 1
+  fi
+  pane="$(_resolve_mind_pane "$win")"
+  if [ "$dry" = 1 ]; then
+    echo "mesh-clear: would write handoff (${MESH_CLEAR_HANDOFF_CMD:-mesh-handoff --snapshot} $win) then /clear ${pane:-<pane unresolved>}"
     return 0
   fi
-  # BLOCK path. A bg-delivery block is NEVER escapable by writing a handoff — it needs the delivery to
-  # resolve (mesh-bg-done) — so --auto must not try to extract past it.
-  if [ "$auto" = 1 ] && [ "$G_REASON" != stale ] && [ "$G_REASON" != bg-undelivered ] && [ "$G_REASON" != bg-running ]; then
-    # try an EXTRACTIVE auto-handoff from the scrollback, then re-gate ONCE (never loop, never force a pass)
-    pane="$(_resolve_mind_pane "$win")"
-    local sc body
-    [ -n "$pane" ] && sc="$(tmux capture-pane -t "$pane" -p -S "-$SCROLL_LINES" 2>/dev/null)"
-    body="$(printf '%s' "$sc" | _extract_handoff)"
-    if [ -n "$body" ]; then
-      mesh-handoff "$win" "auto-extracted before /clear (verbatim from scrollback — no invented next-step):
-$body" >/dev/null 2>&1
-      _gate "$win"
-      if [ "$G_VERDICT" = PASS ]; then
-        [ "$dry" = 1 ] && { echo "mesh-clear: PASS after auto-extract — would /clear '$win'"; return 0; }
-        pane="$(_resolve_mind_pane "$win")"
-        echo "mesh-clear: PASS after auto-extract — /clear → $pane"
-        _send_clear "$pane"
-        command -v mesh-clear-log >/dev/null 2>&1 && mesh-clear-log --record "$win" "gated PASS (auto-extract) cov=$G_COV" "?" "?" mesh-clear "?" >/dev/null 2>&1 || true
-        return 0
-      fi
-    fi
+  [ -n "$pane" ] || { echo "mesh-clear: cannot resolve mind pane for '$win' — refusing to /clear" >&2; return 3; }
+  if ! _write_handoff "$win"; then
+    echo "mesh-clear: NOT clearing '$win' — $G_HOFF_NOTE. A /clear without a handoff drops the thread." >&2
+    return 1
   fi
-  echo "mesh-clear: BLOCKED ($G_REASON) — NOT clearing '$win'." >&2
-  case "$G_REASON" in
-    no-handoff)   echo "  → no handoff stored. Run: mesh-handoff $win \"<what done> + <next> + <paths>\"  then retry." >&2 ;;
-    stale)        echo "  → handoff is ${G_AGE}s old (budget ${FRESH_SECS}s) — it predates recent work. Re-write it: mesh-handoff $win \"...\"" >&2 ;;
-    not-covered)  echo "  → the gate model (coverage=$G_COV) does not confirm the handoff covers recent work. Update the handoff (or --auto to extract), then retry." >&2 ;;
-    bg-undelivered) echo "  → a detached bg-task produced output that has NOT shipped: $G_BG_DETAIL" >&2
-                    echo "    Let its delivery finish, or resolve each: mesh-bg-done $win <batch>  (deliver) | mesh-bg-done --no-deliver $win <batch>  (nothing to ship)." >&2 ;;
-    bg-running)     echo "  → a detached bg-task is still RUNNING: $G_BG_DETAIL — wait for its completion path (mesh-bg-done) before clearing." >&2 ;;
-  esac
-  return 1
+  echo "mesh-clear: /clear → $pane ($G_HOFF_NOTE)"
+  _send_clear "$pane"
+  command -v mesh-clear-log >/dev/null 2>&1 && \
+    mesh-clear-log --record "$win" "task-boundary ($G_HOFF_NOTE)" "?" "?" mesh-clear "?" >/dev/null 2>&1 || true
+  return 0
 }
 
 _test() {
-  local rc=0
-  # 1) PURE DECISION CORE — every branch, including the RED one (stale must BLOCK, fresh+covered must PASS).
-  [ "$(_clear_decision 0 -1 UNSURE 900)" = "BLOCK:no-handoff" ]  || { echo "clear-test: FAIL (no-handoff not blocked)"; rc=1; }
-  [ "$(_clear_decision 1 5000 YES 900)" = "BLOCK:stale" ]        || { echo "clear-test: FAIL (STALE handoff not blocked — the lease-freshness trap)"; rc=1; }
-  [ "$(_clear_decision 1 100 NO 900)"  = "BLOCK:not-covered" ]   || { echo "clear-test: FAIL (uncovered not blocked)"; rc=1; }
-  [ "$(_clear_decision 1 100 UNSURE 900)" = "BLOCK:not-covered" ]|| { echo "clear-test: FAIL (UNSURE not blocked — fail-safe broken, would auto-clear on doubt)"; rc=1; }
-  [ "$(_clear_decision 1 100 YES 900)" = "PASS" ]               || { echo "clear-test: FAIL (fresh+covered did not PASS)"; rc=1; }
-  # boundary: exactly at the budget passes, one past it is stale
-  [ "$(_clear_decision 1 900 YES 900)" = "PASS" ]               || { echo "clear-test: FAIL (at-budget must pass)"; rc=1; }
-  [ "$(_clear_decision 1 901 YES 900)" = "BLOCK:stale" ]        || { echo "clear-test: FAIL (one-past-budget must be stale)"; rc=1; }
+  local rc=0 td; td="$(mktemp -d)"
+  export MESH_DIR="$td/m" MESH_HANDOFF_DIR="$td/m/handoff" MESH_BG_DIR="$td/m/bg"
+  HANDOFF_DIR="$MESH_HANDOFF_DIR"; BG_DIR="$MESH_BG_DIR"   # top-level eval predates these exports
+  mkdir -p "$HANDOFF_DIR"
+  export MESH_CLEAR_SESSION="__no_such_session__"          # no live pane: nothing can actually be cleared
 
-  # 2) COVERAGE CLASSIFY fail-safe: garbage/empty model output must degrade to UNSURE (→ block), never YES.
-  [ "$(printf x | MESH_CLEAR_CLASSIFY_CMD='cat' _classify_coverage)" = NO ] 2>/dev/null || true   # 'x'→not YES/NO→UNSURE handled below
-  [ "$(printf 'maybe' | MESH_CLEAR_CLASSIFY_CMD='cat' _classify_coverage)" = UNSURE ] || { echo "clear-test: FAIL (unparseable coverage not UNSURE)"; rc=1; }
-  [ "$(printf 'YES'   | MESH_CLEAR_CLASSIFY_CMD='cat' _classify_coverage)" = YES ]    || { echo "clear-test: FAIL (clean YES not passed through)"; rc=1; }
-  [ "$(printf ''      | MESH_CLEAR_CLASSIFY_CMD='cat' _classify_coverage)" = UNSURE ] || { echo "clear-test: FAIL (empty coverage not UNSURE)"; rc=1; }
-
-  # 3) END-TO-END via --dry-run against a fixture handoff dir (no tmux/model needed): assert a STALE handoff
-  #    BLOCKS and a FRESH+covered one PASSES — driving the whole _run gate, not just the core.
-  local td; td="$(mktemp -d)"
-  HANDOFF_DIR="$td/m/handoff"   # set the LIVE var too (top-level eval predates this export → would hit real ~/.mesh)
-  export MESH_DIR="$td/m" MESH_HANDOFF_DIR="$HANDOFF_DIR" MESH_CLEAR_SESSION="__no_such_session__"
-  export MESH_CLEAR_CLASSIFY_CMD='printf YES'   # force coverage=YES so freshness is the variable under test
-  mkdir -p "$MESH_HANDOFF_DIR"
+  # 1) NO MODEL IN THE PATH. The behavioural assertion that the gate is really gone: put a POISONED
+  #    `ollama` first on PATH which records every invocation, drive the whole flow, and assert the
+  #    marker never appears. A source-grep would only prove the string is absent (source text is not
+  #    behaviour); this proves nothing CALLS it. Seen red against the previous version, which consulted
+  #    the model on every fresh handoff.
+  local stub="$td/bin"; mkdir -p "$stub"
+  printf '#!/bin/sh\necho "$@" >> "%s/ollama.calls"\nexit 0\n' "$td" > "$stub/ollama"; chmod +x "$stub/ollama"
+  local oldpath="$PATH"; PATH="$stub:$PATH"
   local win=gatewin f; f="$(_handoff_file "$win")"
-  # FRESH handoff (just written) → PASS
   printf '# handoff\nbuilt X, touched scripts/foo\n' > "$f"
-  _run "$win" 0 1 >"$td/out" 2>&1
-  grep -q 'PASS' "$td/out" || { echo "clear-test: FAIL (fresh+covered handoff did not PASS in --dry-run: $(cat "$td/out"))"; rc=1; }
-  # STALE handoff (backdate mtime well past the budget) → BLOCK, even though coverage is forced YES
-  touch -d '3 hours ago' "$f"
-  _run "$win" 0 1 >"$td/out" 2>&1
-  grep -q 'BLOCKED (stale)' "$td/out" || { echo "clear-test: FAIL (STALE handoff did not BLOCK: $(cat "$td/out"))"; rc=1; }
-  # NO handoff at all → BLOCK
-  rm -f "$f"
-  _run "$win" 0 1 >"$td/out" 2>&1
-  grep -q 'BLOCKED (no-handoff)' "$td/out" || { echo "clear-test: FAIL (missing handoff did not BLOCK: $(cat "$td/out"))"; rc=1; }
+  MESH_CLEAR_HANDOFF_CMD='true' _run "$win" 1 >"$td/out" 2>&1
+  MESH_CLEAR_HANDOFF_CMD='true' _run "$win" 0 >>"$td/out" 2>&1
+  PATH="$oldpath"
+  [ -f "$td/ollama.calls" ] && { echo "clear-test: FAIL (a model WAS consulted — the gate is not actually gone: $(cat "$td/ollama.calls"))"; rc=1; }
 
-  # 4) BG-DELIVERY BACKSTOP — the layer-2 gate, all FOUR manifest states, with a fresh+covered handoff
-  #    present (coverage forced YES above) so the ONLY variable is the bg manifest. Drives REAL manifests
-  #    through mesh-bg-register/-done (cross-checks the shared format: if register/done drift from what
-  #    _bg_scan reads, these go red). running + done-undelivered BLOCK; done-nodeliver + delivered PASS.
-  BG_DIR="$td/m/bg"; export MESH_BG_DIR="$BG_DIR"
+  # 2) A STALE HANDOFF NO LONGER BLOCKS — the whole behavioural change, stated as a gate. Under the old
+  #    freshness arithmetic a 3-hour-old handoff was BLOCK:stale; now the clear rewrites it and proceeds.
+  touch -d '3 hours ago' "$f"
+  MESH_CLEAR_HANDOFF_CMD='true' _run "$win" 1 >"$td/out" 2>&1
+  grep -qi 'stale' "$td/out" && { echo "clear-test: FAIL (freshness arithmetic still in the path: $(cat "$td/out"))"; rc=1; }
+  grep -q 'would write handoff' "$td/out" || { echo "clear-test: FAIL (stale handoff did not proceed: $(cat "$td/out"))"; rc=1; }
+
+  # 3) THE HANDOFF IS WRITTEN, NOT CHECKED. Drive a stub writer and assert the CLEAR PATH invoked it —
+  #    a clear that skips the write is the fault the whole doctrine exists to prevent. (No live pane
+  #    here, so _run stops at pane-resolution; the write must already have been attempted or not — we
+  #    assert the ORDER explicitly below with a resolvable pane stub.)
+  _resolve_mind_pane() { printf 'fakesess:%s.1' "$1"; }   # override: pretend the pane exists
+  _send_clear() { echo "SENT_CLEAR $1" >> "$td/sent"; }   # override: never touch a real tmux
+  # stub WRITERS as real scripts: HANDOFF_CMD is word-split on expansion, so an inline `sh -c '…'`
+  # would shred into argv garbage — the seam takes a command NAME plus flags, not a shell snippet.
+  printf '#!/bin/sh\necho written >> "%s/hoff.calls"\n' "$td" > "$stub/hoff-ok";  chmod +x "$stub/hoff-ok"
+  printf '#!/bin/sh\nexit 9\n'                              > "$stub/hoff-fail"; chmod +x "$stub/hoff-fail"
+  MESH_CLEAR_HANDOFF_CMD="$stub/hoff-ok" _run "$win" 0 >"$td/out" 2>&1
+  [ -s "$td/hoff.calls" ] || { echo "clear-test: FAIL (handoff writer never invoked before /clear)"; rc=1; }
+  grep -q SENT_CLEAR "$td/sent" 2>/dev/null || { echo "clear-test: FAIL (/clear not sent on the happy path: $(cat "$td/out"))"; rc=1; }
+
+  # 4) A FAILED HANDOFF WRITE MUST ABORT THE CLEAR (the one non-bg failure that stops it).
+  : > "$td/sent"
+  MESH_CLEAR_HANDOFF_CMD="$stub/hoff-fail" _run "$win" 0 >"$td/out" 2>&1
+  [ $? = 0 ] && { echo "clear-test: FAIL (handoff write failure did not abort the clear)"; rc=1; }
+  grep -q SENT_CLEAR "$td/sent" 2>/dev/null && { echo "clear-test: FAIL (/clear SENT despite a failed handoff write)"; rc=1; }
+  grep -q 'rc=9' "$td/out" || { echo "clear-test: FAIL (handoff failure rc not reported: $(cat "$td/out"))"; rc=1; }
+
+  # 5) BG-DELIVERY BACKSTOP — the only remaining blocker, all states, through REAL manifests written by
+  #    mesh-bg-register/-done (so a drift in that shared format goes red here).
   local reg dn bw=bgwin bf; reg="$(command -v mesh-bg-register)"; dn="$(command -v mesh-bg-done)"
-  bf="$(_handoff_file "$bw")"; printf '# handoff\nbuilt Y, touched scripts/bar\n' > "$bf"
+  bf="$(_handoff_file "$bw")"; printf '# handoff\nbuilt Y\n' > "$bf"
   if [ -n "$reg" ] && [ -n "$dn" ]; then
-    # no manifest → PASS (handoff gate alone)
-    _run "$bw" 0 1 >"$td/out" 2>&1
-    grep -q 'PASS' "$td/out" || { echo "clear-test: FAIL (bg absent: fresh+covered did not PASS: $(cat "$td/out"))"; rc=1; }
-    # running → BLOCK bg-running
+    : > "$td/sent"
+    MESH_CLEAR_HANDOFF_CMD='true' _run "$bw" 0 >"$td/out" 2>&1
+    grep -q SENT_CLEAR "$td/sent" || { echo "clear-test: FAIL (no bg manifest: clear did not proceed: $(cat "$td/out"))"; rc=1; }
     "$reg" "$bw" b-run --target op --on-done 'true' >/dev/null
-    _run "$bw" 0 1 >"$td/out" 2>&1
+    : > "$td/sent"
+    MESH_CLEAR_HANDOFF_CMD='true' _run "$bw" 0 >"$td/out" 2>&1
     grep -q 'BLOCKED (bg-running)' "$td/out" || { echo "clear-test: FAIL (running manifest did not BLOCK: $(cat "$td/out"))"; rc=1; }
-    # done-undelivered → BLOCK bg-undelivered  (the RED case: real output that never shipped)
+    grep -q SENT_CLEAR "$td/sent" 2>/dev/null && { echo "clear-test: FAIL (/clear SENT despite a running bg batch)"; rc=1; }
     "$reg" "$bw" b-undel --target op --on-done 'true' >/dev/null
     "$dn" "$bw" b-undel --on-done-override 'exit 4' >/dev/null 2>&1   # delivery fails → done-undelivered
-    _run "$bw" 0 1 >"$td/out" 2>&1
+    MESH_CLEAR_HANDOFF_CMD='true' _run "$bw" 0 >"$td/out" 2>&1
     grep -q 'BLOCKED (bg-undelivered)' "$td/out" || { echo "clear-test: FAIL (done-undelivered did not BLOCK: $(cat "$td/out"))"; rc=1; }
-    # resolve b-undel via re-deliver (success) and clear the running one via --no-deliver → both terminal-PASS
-    "$dn" "$bw" b-undel --on-done-override 'true' >/dev/null 2>&1   # → delivered
-    "$dn" "$bw" b-run --no-deliver >/dev/null 2>&1                  # → done-nodeliver
-    _run "$bw" 0 1 >"$td/out" 2>&1
-    grep -q 'PASS' "$td/out" || { echo "clear-test: FAIL (delivered+done-nodeliver did not PASS: $(cat "$td/out"))"; rc=1; }
-    # --gate query flag (reads globals): OK on the now-terminal window, BLOCK when a fresh undelivered exists
+    "$dn" "$bw" b-undel --on-done-override 'true' >/dev/null 2>&1     # → delivered
+    "$dn" "$bw" b-run --no-deliver >/dev/null 2>&1                    # → done-nodeliver
+    : > "$td/sent"
+    MESH_CLEAR_HANDOFF_CMD='true' _run "$bw" 0 >"$td/out" 2>&1
+    grep -q SENT_CLEAR "$td/sent" || { echo "clear-test: FAIL (terminal manifests did not PASS: $(cat "$td/out"))"; rc=1; }
     _bg_scan "$bw"; [ "$G_BG_VERDICT" = OK ] || { echo "clear-test: FAIL (--gate scan not OK on terminal window: $G_BG_VERDICT)"; rc=1; }
-    "$reg" "$bw" b-x --target op --on-done 'true' >/dev/null; "$dn" "$bw" b-x --on-done-override 'exit 1' >/dev/null 2>&1
-    _bg_scan "$bw"; [ "$G_BG_VERDICT" = "BLOCK:bg-undelivered" ] || { echo "clear-test: FAIL (--gate scan did not BLOCK on undelivered: $G_BG_VERDICT)"; rc=1; }
-    "$dn" "$bw" b-x --on-done-override 'true' >/dev/null 2>&1     # resolve → back to terminal-only
 
-    # 5) CRASH-REAP — a `running` manifest whose pid is DEAD and whose updated is past the grace
-    #    window is a batch that died BEFORE mesh-bg-done ran: nothing will ever deliver it, so
-    #    blocking every future /clear on it is the stale-lease trap. The scan must flip it to
-    #    `crashed` (PASSES, loudly). A dead pid still INSIDE grace must keep BLOCKING (register/fork
-    #    race cover), as must a live pid regardless of age.
+    # 6) CRASH-REAP — a dead-pid `running` past the grace window must reap to `crashed` (else a died
+    #    batch wedges every future clear: the stale-lease trap). Inside grace, and a LIVE pid at any
+    #    age, must still BLOCK.
     local deadpid crashwin=bgcrash cm
     ( : ) & deadpid=$!; wait "$deadpid" 2>/dev/null   # a real, now-certainly-dead pid
-    bf="$(_handoff_file "$crashwin")"; printf '# handoff\nbuilt Z, touched scripts/baz\n' > "$bf"
+    printf '# handoff\nbuilt Z\n' > "$(_handoff_file "$crashwin")"
     "$reg" "$crashwin" b-crash --target op --on-done 'true' >/dev/null
     cm="$BG_DIR/$crashwin/b-crash.manifest"
     sed -i "s/^pid=.*/pid=$deadpid/" "$cm"
@@ -377,8 +265,6 @@ _test() {
     _bg_scan "$crashwin"
     [ "$G_BG_VERDICT" = OK ] || { echo "clear-test: FAIL (dead pid + stale updated did not reap→PASS: $G_BG_VERDICT)"; rc=1; }
     grep -q '^status=crashed$' "$cm" || { echo "clear-test: FAIL (reap did not persist status=crashed: $(grep '^status=' "$cm"))"; rc=1; }
-    _bg_scan "$crashwin"; [ "$G_BG_VERDICT" = OK ] || { echo "clear-test: FAIL (persisted crashed did not PASS on re-scan: $G_BG_VERDICT)"; rc=1; }
-    # live pid + ancient updated must still BLOCK (age alone never reaps a batch that is genuinely running)
     "$reg" "$crashwin" b-live --target op --on-done 'true' >/dev/null
     cm="$BG_DIR/$crashwin/b-live.manifest"
     sed -i "s/^pid=.*/pid=$$/; s/^updated=.*/updated=1/" "$cm"
@@ -388,22 +274,19 @@ _test() {
   fi
   rm -rf "$td"
 
-  [ "$rc" = 0 ] && echo "clear-test: ok (decision core all branches incl. stale-blocks/fresh-passes/UNSURE-fail-safe; coverage classify degrades to UNSURE; end-to-end --dry-run: stale BLOCKS, fresh+covered PASSES, no-handoff BLOCKS; bg-backstop 5 states: running+undelivered BLOCK, delivered+done-nodeliver+crashed PASS, crash-reap flips dead-pid+stale running→crashed but grace/live-pid still BLOCK, --gate query OK/BLOCK)"
+  [ "$rc" = 0 ] && echo "clear-test: ok (no model consulted — poisoned-ollama marker never written; stale handoff no longer blocks; handoff WRITTEN before /clear and a failed write aborts it; bg backstop: running+undelivered BLOCK, delivered+done-nodeliver PASS, crash-reap flips dead-pid+stale→crashed while grace/live-pid still BLOCK)"
   return "$rc"
 }
 
 # ---- lib mode ----
-# Another tool may `MESH_CLEAR_LIB_ONLY=1 source mesh-clear` to reuse its functions (_extract_handoff /
-# _classify_coverage) WITHOUT running the main dispatch — the DRY seam mesh-clear-loss uses so there is
-# ONE extractive path + one coverage classifier, never a second copy to rot. `return` fires only in the
-# sourced context; under normal execution the var is unset and this line is skipped.
+# Another tool may `MESH_CLEAR_LIB_ONLY=1 source mesh-clear` to reuse _bg_scan WITHOUT running the main
+# dispatch. (The extractive-handoff seam moved to mesh-handoff's _extract_terse when the model gate was
+# removed — mesh-clear-loss sources THAT now, so there is still exactly one extractor, not two.)
 [ -n "${MESH_CLEAR_LIB_ONLY:-}" ] && return 0 2>/dev/null
 
 # ---- arg parse ----
 [ "${1:-}" = --test ] && { _test; exit $?; }
-# observable artifact of the calibrated-constant resolution (env > ledger > inline 900)
-[ "${1:-}" = --fresh-budget ] && { printf '%s\n' "$FRESH_SECS"; exit 0; }
-# --gate <window>: run ONLY the bg-delivery backstop (no handoff/model, no /clear). For sound & other
+# --gate <window>: run ONLY the bg-delivery backstop (no handoff write, no /clear). For sound & other
 # launchers to ask "is a /clear safe for this window right now?". exit 0 = OK (no unshipped bg work),
 # 1 = BLOCK (prints the reason + offending manifests).
 if [ "${1:-}" = --gate ]; then
@@ -412,15 +295,14 @@ if [ "${1:-}" = --gate ]; then
   if [ "$G_BG_VERDICT" = OK ]; then echo "mesh-clear --gate: OK ($2) — no running/undelivered bg-task${G_BG_REAPED:+ (reaped crashed: $G_BG_REAPED)}"; exit 0; fi
   echo "mesh-clear --gate: ${G_BG_VERDICT#BLOCK:} ($2) — ${G_BG_DETAIL}" >&2; exit 1
 fi
-WIN=""; AUTO=0; DRY=0
+WIN=""; DRY=0
 for a in "$@"; do
   case "$a" in
-    --auto) AUTO=1 ;;
     --dry-run) DRY=1 ;;
-    -h|--help) sed -n '2,13p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
     -*) echo "mesh-clear: unknown flag $a" >&2; exit 2 ;;
     *) [ -z "$WIN" ] && WIN="$a" ;;
   esac
 done
-[ -n "$WIN" ] || { echo "usage: mesh-clear <window> [--auto|--dry-run|--gate]" >&2; exit 2; }
-_run "$WIN" "$AUTO" "$DRY"
+[ -n "$WIN" ] || { echo "usage: mesh-clear <window> [--dry-run] | --gate <window>" >&2; exit 2; }
+_run "$WIN" "$DRY"
