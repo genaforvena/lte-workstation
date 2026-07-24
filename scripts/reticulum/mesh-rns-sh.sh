@@ -79,9 +79,13 @@ case "${1:-}" in
   *)
     node="$1"; shift
     read -r rnsh_h rnx_h < <(lookup "$node") || { echo "mesh-rns-sh: unknown node '$node' (see --list; add to $REG)" >&2; exit 2; }
+    # ONE client identity for both channels: rnsh must identify with the SAME EXID as rnx, else the
+    # interactive shell presents rnsh's default (un-allowlisted) identity → "Identity not allowed"
+    # while one-shot rnx (which passes -i) works — the exact split the operator hit (2026-07-24).
+    [ -f "$EXID" ] || "$PY/rnid" -g "$EXID" >/dev/null 2>&1
     if [ "$#" -eq 0 ]; then
       [ -n "${rnsh_h:-}" ] || { echo "mesh-rns-sh: no rnsh hash for $node" >&2; exit 2; }
-      exec "$PY/rnsh" "$rnsh_h"                       # interactive shell
+      exec "$PY/rnsh" -i "$EXID" "$rnsh_h"            # interactive shell (identifies for -a auth)
     else
       [ -n "${rnx_h:-}" ] || { echo "mesh-rns-sh: no rnx hash for $node" >&2; exit 2; }
       exec "$PY/rnx" -i "$EXID" "$rnx_h" "$*"         # one-shot command (identifies for -a auth)
