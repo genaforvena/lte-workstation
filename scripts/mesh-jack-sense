@@ -1,0 +1,199 @@
+#!/usr/bin/env python3
+"""mesh-jack-sense — sense the node's ANALOG AUDIO JACKS (plug/unplug) as kernel events.
+
+# orphan-ok: on-demand + event-driven sense; --watch blocks on evdev, it is NOT a cron reflex
+
+The onboard HDA codec registers one evdev switch device per jack (Rear Mic / Front Mic /
+Line / Line Out {Front,Surround,CLFE} / Front Headphone). Each carries an EV_SW bit —
+SW_HEADPHONE_INSERT(2) · SW_MICROPHONE_INSERT(4) · SW_LINEOUT_INSERT(6) · SW_LINEIN_INSERT(13) —
+readable UNPRIVILEGED when the user is in the `input` group, and delivered as a kernel EVENT on
+change (no polling: --watch blocks in select()).
+
+Two things the mesh could not see before:
+  1. the OPERATOR'S HANDS on this machine — plugging a mic/headphones in is a physical act at the
+     box itself; no other sense on a headless node observes it.
+  2. a LATENT LOCAL AUDIO PATH appearing — this node has no local ear/voice (it borrows the Note3
+     over adb); a mic-insert event is the instant that stops being true.
+
+  mesh-jack-sense [--once]     print every jack + current state (rc 0; rc 2 if the node has none)
+  mesh-jack-sense --json       same, machine-readable
+  mesh-jack-sense --watch      block on the jack fds; print one line per plug/unplug event
+  mesh-jack-sense --test       LIVE gate: a real EVIOCGSW read of a real device (rc 2 = honest n/a)
+
+HONEST SCOPE: a state of `empty` on every jack is a real read, not a fault — it is what an
+unpopulated rear panel looks like. What is NOT yet verified is the board's detect WIRING: until a
+physical insert is observed flipping a bit, "detect capable" (the codec advertises Pincap Detect)
+is a claim about the codec, not proof the sense fires. That verification needs a human hand and a
+cable — it is stated here rather than assumed away.
+"""
+import fcntl
+import glob
+import json
+import os
+import select
+import sys
+import time
+
+SW_NAMES = {2: "HEADPHONE", 4: "MIC", 6: "LINEOUT", 13: "LINEIN"}
+# _IOC(_IOC_READ, 'E', 0x1b, 8) — EVIOCGSW(8): current state of every EV_SW bit
+EVIOCGSW = (2 << 30) | (8 << 16) | (0x45 << 8) | 0x1B
+EV_SW = 0x05
+# struct input_event on 64-bit: __kernel_ulong_t sec, usec; __u16 type, code; __s32 value
+EVENT_SIZE = 24
+
+MATCH = os.environ.get("MESH_JACK_MATCH", "HD-Audio")
+
+
+def discover():
+    """Every evdev device whose sysfs name matches the HDA jack family, with its event node."""
+    out = []
+    for d in sorted(glob.glob("/sys/class/input/input*")):
+        try:
+            with open(os.path.join(d, "name")) as f:
+                name = f.read().strip()
+        except OSError:
+            continue
+        if MATCH not in name:
+            continue
+        ev = sorted(os.path.basename(p) for p in glob.glob(os.path.join(d, "event*")))
+        if not ev:
+            continue
+        out.append({"name": name, "dev": "/dev/input/" + ev[0]})
+    return out
+
+
+def read_state(dev):
+    """Live EVIOCGSW read. Returns (bits, [labels]). Raises OSError on a real failure."""
+    fd = os.open(dev, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        buf = bytearray(8)
+        fcntl.ioctl(fd, EVIOCGSW, buf)
+    finally:
+        os.close(fd)
+    bits = int.from_bytes(buf, "little")
+    return bits, [v for k, v in SW_NAMES.items() if bits >> k & 1]
+
+
+def snapshot():
+    rows = []
+    for j in discover():
+        try:
+            bits, labels = read_state(j["dev"])
+            rows.append({**j, "bits": bits, "plugged": labels, "state": "plugged" if labels else "empty"})
+        except OSError as e:
+            # LOUD, never a silent fallback to a plausible "empty"
+            rows.append({**j, "bits": None, "plugged": [], "state": "unreadable", "error": str(e)})
+    return rows
+
+
+def cmd_once(as_json):
+    rows = snapshot()
+    if not rows:
+        print("mesh-jack-sense: n/a — no HDA jack switch devices on this node "
+              "(no onboard analog codec, or user not in the `input` group)", file=sys.stderr)
+        return 2
+    if as_json:
+        print(json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "jacks": rows}, indent=2))
+        return 0
+    bad = 0
+    for r in rows:
+        if r["state"] == "unreadable":
+            bad += 1
+            print(f"  {r['name']:36s} {r['dev']:20s} UNREADABLE: {r['error']}")
+        else:
+            tag = "PLUGGED: " + ",".join(r["plugged"]) if r["plugged"] else "empty"
+            print(f"  {r['name']:36s} {r['dev']:20s} SW=0x{r['bits']:04x}  {tag}")
+    n_plug = sum(1 for r in rows if r["plugged"])
+    print(f"  → {len(rows)} jack(s), {n_plug} populated"
+          + ("" if not bad else f", {bad} UNREADABLE"))
+    return 1 if bad and bad == len(rows) else 0
+
+
+def cmd_watch():
+    rows = snapshot()
+    if not rows:
+        print("mesh-jack-sense: n/a — no HDA jack switch devices on this node", file=sys.stderr)
+        return 2
+    fds = {}
+    for r in rows:
+        try:
+            fds[os.open(r["dev"], os.O_RDONLY)] = r
+        except OSError as e:
+            print(f"mesh-jack-sense: cannot watch {r['dev']}: {e}", file=sys.stderr)
+    if not fds:
+        return 2
+    for r in rows:
+        print(f"# baseline {r['name']}: {r['state']}"
+              + (" (" + ",".join(r["plugged"]) + ")" if r["plugged"] else ""), flush=True)
+    while True:
+        ready, _, _ = select.select(list(fds), [], [])
+        for fd in ready:
+            data = os.read(fd, EVENT_SIZE * 16)
+            for off in range(0, len(data) - EVENT_SIZE + 1, EVENT_SIZE):
+                _sec, _usec, etype, code, value = _unpack(data[off:off + EVENT_SIZE])
+                if etype != EV_SW:
+                    continue
+                label = SW_NAMES.get(code, f"SW{code}")
+                verb = "PLUGGED" if value else "UNPLUGGED"
+                print(f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} "
+                      f"{fds[fd]['name']}: {label} {verb}", flush=True)
+
+
+def _unpack(buf):
+    import struct
+    return struct.unpack("llHHi", buf)
+
+
+def cmd_test():
+    jacks = discover()
+    if not jacks:
+        print("smoke-test: n/a (exit 2) — no HDA jack switch devices here "
+              "(nodes without an onboard analog codec, or a user outside the `input` group)")
+        return 2
+    # REAL read of a REAL device — never a fixture. A jack device that exists but cannot be read
+    # is a FAIL, not an n/a: that is the difference between 'this node has no jacks' and
+    # 'this node has jacks and the sense is broken'.
+    ok = 0
+    for j in jacks:
+        try:
+            bits, _ = read_state(j["dev"])
+        except OSError as e:
+            print(f"smoke-test: FAIL — {j['dev']} ({j['name']}) exists but EVIOCGSW failed: {e}")
+            return 1
+        if not isinstance(bits, int) or bits < 0:
+            print(f"smoke-test: FAIL — {j['dev']} returned an unparseable switch state: {bits!r}")
+            return 1
+        ok += 1
+    # the watch path must be openable too, else --watch is a claim nobody exercised
+    try:
+        fd = os.open(jacks[0]["dev"], os.O_RDONLY)
+        os.close(fd)
+    except OSError as e:
+        print(f"smoke-test: FAIL — cannot open {jacks[0]['dev']} for --watch: {e}")
+        return 1
+    print(f"smoke-test: ok ({ok} jack device(s), live EVIOCGSW read on each, watch fd openable)")
+    return 0
+
+
+def main(argv):
+    arg = argv[1] if len(argv) > 1 else "--once"
+    if arg in ("-h", "--help"):
+        print(__doc__.strip())
+        return 0
+    if arg == "--test":
+        return cmd_test()
+    if arg == "--watch":
+        return cmd_watch()
+    if arg == "--json":
+        return cmd_once(True)
+    if arg == "--once":
+        return cmd_once(False)
+    print(f"mesh-jack-sense: unknown arg '{arg}' (see --help)", file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv))
+    except KeyboardInterrupt:
+        sys.exit(130)
