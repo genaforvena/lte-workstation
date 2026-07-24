@@ -69,12 +69,35 @@ caption_for(){ # $1=basename
   printf '%s' "новый микс: $bn"
 }
 
+# Read the Bot API's own verdict out of a sendAudio response body; echo "sent"/"FAIL:<why>".
+# curl rc=0 only means "an HTTP response came back" — a bad token, a wrong chat_id, a too-large file
+# or a rejected upload all answer 4xx with {"ok":false,"description":...} and rc=0. Reading rc alone
+# logged every one of those as DELIVERED (2026-07-24), which is a faked all-clear on the one fact
+# the ledger exists to record. An empty body (connection cut mid-response) is a failure too.
+api_verdict(){ # $1=response body
+  case "$1" in
+    '{"ok":true'*) echo "sent"; return 0 ;;
+    "") echo "FAIL:api-empty-response"; return 1 ;;
+    *) local d; d="$(sed -n 's/.*"description":"\([^"]*\)".*/\1/p' <<<"$1" | tr ' ' '-' | cut -c1-40)"
+       echo "FAIL:api-${d:-unparseable}"; return 1 ;;
+  esac
+}
+
 # send one render to the operator's TG; echo "sent"/"dryrun"/"FAIL:<why>"; never advances any state
 send_render(){ # $1=path
   local f="$1" bn note szmb tmp rc
+  # Read the dry-run knob at CALL time. `DRYRUN=${GD_DRYRUN:-0}` at load time cannot be rebound by a
+  # `GD_DRYRUN=1 tick` prefix — so the "sandboxed dry-run" --test was making REAL calls to
+  # api.telegram.org with the fixture's fake token on every gate (2026-07-24).
+  local dry="${GD_DRYRUN:-$DRYRUN}"
   bn="$(basename "$f")"
   note="$(caption_for "$bn")"
-  if [ "$DRYRUN" = 1 ]; then echo "dryrun"; return 0; fi
+  # GD_DRYRUN_FAIL=<basename> — test-only: make the dry-run report a TRANSIENT send failure for that
+  # render, so the watermark-hold can be driven without a real network fault.
+  if [ "$dry" = 1 ]; then
+    [ -n "${GD_DRYRUN_FAIL:-}" ] && [ "$bn" = "$GD_DRYRUN_FAIL" ] && { echo "FAIL:curl-6"; return 1; }
+    echo "dryrun"; return 0
+  fi
   [ -n "${BOT_TOKEN:-}" ] && [ -n "${CHAT_ID:-}" ] || { echo "FAIL:no-creds"; return 2; }
   szmb=$(( $(stat -c%s "$f" 2>/dev/null || echo 0) / 1024 / 1024 ))
   local sendf="$f"
@@ -88,12 +111,14 @@ send_render(){ # $1=path
       rm -f "$tmp" 2>/dev/null; echo "FAIL:reencode"; return 1
     fi
   fi
-  curl -s --max-time 120 "https://api.telegram.org/bot${BOT_TOKEN}/sendAudio" \
+  local body
+  body="$(curl -s --max-time 120 "https://api.telegram.org/bot${BOT_TOKEN}/sendAudio" \
     -F "chat_id=${CHAT_ID}" -F "audio=@${sendf};type=audio/mpeg" \
-    -F "title=$bn" -F "caption=$note" >/dev/null 2>&1
+    -F "title=$bn" -F "caption=$note" 2>/dev/null)"
   rc=$?
   [ "$sendf" != "$f" ] && rm -f "$sendf" 2>/dev/null
-  [ "$rc" = 0 ] && { echo "sent"; return 0; } || { echo "FAIL:curl-$rc"; return 1; }
+  [ "$rc" = 0 ] || { echo "FAIL:curl-$rc"; return 1; }
+  api_verdict "$body"
 }
 
 tick(){
@@ -117,7 +142,9 @@ tick(){
   fi
 
   # candidates: mtime newer than watermark AND settled (older than SETTLE). Sort by mtime ascending.
-  local sent=0 fail=0 skip=0 f mt res
+  # hold_mt: the oldest mtime among TRANSIENT failures this tick. The watermark may not advance past
+  # it, or those renders are dropped for good (see the advance below).
+  local sent=0 fail=0 skip=0 f mt res hold_mt=""
   while IFS= read -r f; do
     [ -n "$f" ] || continue
     mt=$(stat -c%Y "$f" 2>/dev/null || echo 0)
@@ -132,16 +159,32 @@ tick(){
         sent=$((sent+1)); log "delivered $bn"
         ;;
       *) fail=$((fail+1)); log "FAILED $bn ($res)"
-        # a hard failure that is NOT a transient send error (too-big) must not wedge the watermark:
-        # record it seen so we don't retry forever, but flag it.
-        case "$res" in FAIL:too-big-*) printf '%s FAIL %s(grind-deliver too-big) src=manual\n' "$(ts_utc)" "$bn" >> "$SENT_LOG";; esac
+        # PERMANENT failure (too-big): the file will never fit, so record it seen — retrying forever
+        # would wedge the watermark behind a render that can never ship.
+        # TRANSIENT failure (curl-*, reencode, no-creds): the NEXT tick must retry it, so hold the
+        # watermark at its mtime. Without this hold the unconditional advance below sweeps past a
+        # failed render and it is dropped SILENTLY AND FOREVER — measured 2026-07-24: a DNS blip
+        # (curl-6) failed 9 gong renders in one tick, the watermark advanced anyway, and all 9 were
+        # gone from the queue while the log said only "FAILED". The header promised "never silently
+        # dropped"; it was true for too-big and false for every transient error.
+        case "$res" in
+          FAIL:too-big-*) printf '%s FAIL %s(grind-deliver too-big) src=manual\n' "$(ts_utc)" "$bn" >> "$SENT_LOG";;
+          *) [ -z "$hold_mt" ] || [ "$mt" -lt "$hold_mt" ] && hold_mt="$mt";;
+        esac
         ;;
     esac
   done < <(list_renders | while IFS= read -r p; do printf '%s\t%s\n' "$(stat -c%Y "$p" 2>/dev/null)" "$p"; done | sort -n | cut -f2-)
 
-  # advance the watermark to the settle boundary (nothing newer than it was eligible this tick, so no skip)
-  echo "$settle_boundary" > "$WATERMARK"
-  [ "$((sent+fail+skip))" -gt 0 ] && log "tick: sent=$sent fail=$fail skip=$skip wm=$settle_boundary"
+  # advance the watermark to the settle boundary — but never PAST a render that failed transiently
+  # this tick, so it stays eligible next tick. Anything already shipped is de-duped by the ledger,
+  # so holding the watermark back can only retry, never double-send.
+  local newwm="$settle_boundary"
+  if [ -n "$hold_mt" ] && [ "$hold_mt" -le "$settle_boundary" ]; then
+    newwm=$((hold_mt - 1))
+    log "watermark HELD at $newwm — $fail transient failure(s) stay queued for the next tick"
+  fi
+  echo "$newwm" > "$WATERMARK"
+  [ "$((sent+fail+skip))" -gt 0 ] && log "tick: sent=$sent fail=$fail skip=$skip wm=$newwm"
   return 0
 }
 
@@ -227,7 +270,51 @@ case "${1:-}" in
     [ "$(cat "$WATERMARK")" = 1000 ] || fail "creds-absent must NOT advance the watermark"
     [ "$(grep -c 'sent ' "$SENT_LOG" 2>/dev/null)" = 0 ] || fail "creds-absent must send nothing"
 
-    echo "smoke-test: ok — seed-not-blast, ship-new-once, skip-ms-sent, defer-unsettled, honest-n/a"
+    echo "gate 6: a TRANSIENT send failure holds the watermark — the render ships on the NEXT tick"
+    # The regression this gates (2026-07-24): a DNS blip failed 9 renders in one tick and the
+    # unconditional watermark advance swept past all 9 — logged FAILED, then gone forever.
+    unset GD_DRYRUN_FAIL
+    # gate 5 deleted the env file and unset the creds — restore them, or tick() short-circuits at the
+    # honest-n/a check and this gate asserts nothing (it "passed" that way until 2026-07-24).
+    printf 'BOT_TOKEN=x\nCHAT_ID=y\n' > "$ENVF"; BOT_TOKEN=x; CHAT_ID=y
+    rm -f "$SENT_LOG"; : > "$SENT_LOG"
+    t6=$(date -u -d '2026-07-22 09:00:00' +%s)
+    echo $((t6 - 100)) > "$WATERMARK"
+    printf 'a\n' > "$OUTDIR/t6_early.mp3";  touch -d "@$((t6-60))" "$OUTDIR/t6_early.mp3"
+    printf 'b\n' > "$OUTDIR/t6_blip.mp3";   touch -d "@$((t6-50))" "$OUTDIR/t6_blip.mp3"
+    printf 'c\n' > "$OUTDIR/t6_later.mp3";  touch -d "@$((t6-40))" "$OUTDIR/t6_later.mp3"
+    # tick 1: the middle render fails transiently
+    GD_DRYRUN=1 GD_DRYRUN_FAIL=t6_blip.mp3 GD_NOW=$t6 tick
+    # a var-assignment PREFIX on a shell FUNCTION persists in the caller (unlike on an external
+    # command), so the fault knob must be unset explicitly or tick 2 "fails" for the harness's reason
+    unset GD_DRYRUN_FAIL
+    [ "$(grep -c 't6_blip.mp3' "$SENT_LOG" 2>/dev/null)" = 0 ] || fail "the failing render must not be logged sent"
+    wm6="$(cat "$WATERMARK")"
+    [ "$wm6" -lt "$((t6-50))" ] || fail "watermark must be held BEFORE the failed render's mtime (got $wm6, want < $((t6-50)))"
+    # tick 2: network back — it ships, and the ones that already went do NOT double-send
+    GD_DRYRUN=1 GD_NOW=$((t6+60)) tick
+    [ "$(grep -c 't6_blip.mp3' "$SENT_LOG" 2>/dev/null)" = 1 ] || fail "a transiently-failed render must ship on the next tick"
+    [ "$(grep -c 't6_early.mp3' "$SENT_LOG" 2>/dev/null)" = 1 ] || fail "holding the watermark must not double-send an already-shipped render"
+    [ "$(grep -c 't6_later.mp3' "$SENT_LOG" 2>/dev/null)" = 1 ] || fail "a render after the failed one must ship exactly once"
+
+    echo "gate 7: the Bot API's OWN verdict decides sent — curl rc=0 with {\"ok\":false} is NOT sent"
+    # Real sendAudio response bodies. Before 2026-07-24 every one of these logged as delivered,
+    # because the code read curl's exit code and never looked at what the API said.
+    v="$(api_verdict '{"ok":true,"result":{"message_id":1,"audio":{"file_id":"x"}}}')"
+    [ "$v" = "sent" ] || fail "an ok:true body must read as sent (got '$v')"
+    v="$(api_verdict '{"ok":false,"error_code":404,"description":"Not Found"}')"
+    case "$v" in FAIL:api-Not-Found) ;; *) fail "a bad-token 404 body must FAIL and name the cause (got '$v')";; esac
+    v="$(api_verdict '{"ok":false,"error_code":400,"description":"Bad Request: chat not found"}')"
+    case "$v" in FAIL:api-Bad-Request:*) ;; *) fail "a chat-not-found body must FAIL (got '$v')";; esac
+    v="$(api_verdict '')"
+    [ "$v" = "FAIL:api-empty-response" ] || fail "an empty body must FAIL, not pass (got '$v')"
+    # and the failure must be TRANSIENT-classed, i.e. it holds the watermark rather than being
+    # written off like too-big — otherwise gate 6's retry never covers a rejected upload
+    case "$(api_verdict '{"ok":false,"description":"Bad Request"}')" in
+      FAIL:too-big-*) fail "an API rejection must not be classed as the permanent too-big failure";;
+    esac
+
+    echo "smoke-test: ok — seed-not-blast, ship-new-once, skip-ms-sent, defer-unsettled, honest-n/a, retry-transient-fail, api-verdict"
     exit 0 ;;
 
   ""|--tick)
