@@ -1,0 +1,515 @@
+#!/usr/bin/env bash
+# mesh-promises — a DOUBLE-ENTRY LEAK DETECTOR for the mesh's board promises.
+#
+# Operator premise (2026-07-24): "hledger can count not only money spent but any sort of debts
+# (promises, claims, etc)." True — and not a hack: double-entry has ALWAYS tracked obligations, not
+# cash (the Mesopotamian tablets recorded grain OWED). A promise is a LIABILITY; keeping it is the
+# balancing posting; an obligation open-but-not-discharged is a NONZERO liability balance that does
+# not scroll off the board. That standing balance IS the leak detector.
+#
+# THE LEAK IT DETECTS: the mesh's most persistent failure class is the DROPPED PROMISE — a `[task]`
+# that never became `[done]`, a `[taking]` that aged into a phantom, a reflex promised and never
+# wired. The board (chat.log) has no mechanism to surface these: they scroll away and nobody is
+# looking (cf. CLAUDE.md "the OPERATOR noticed before any reflex did — none was looking"). This tool
+# replays the board into a promise ledger where an unkept promise is a STANDING, AGED, queryable
+# quantity — and posts LOUDLY when a fresh one crosses the leak threshold.
+#
+# MODEL (the board is the source of truth; the journal is a materialized, tamper-evident view):
+#   OPEN     a body-start `[task]` line → opens a promise, keyed by a derived slug, owner from the
+#            `owner: <tool>/<window>` clause (window after the slash) or else the posting window.
+#            Recurring same-key tasks dedup to ONE open promise (redmi-ssh-key posted 6x = 1 debt).
+#   KEEP     a later `[done]` that matches an open promise closes it. Match = leading-slug equality
+#            (the `[done] <slug>:` discipline) OR distinctive-token overlap (owner-preferred). A done
+#            matching no open promise is SELF-DIRECTED work (legitimate here), counted, never a phantom.
+#   LEAK     an open promise aged past the threshold with no keeping done. incident-tagged promises
+#            leak faster (MESH_PROMISE_LEAK_INCIDENT_H). This is the signal.
+#
+# DOUBLE-ENTRY (the error-detecting layer, same idiom as mesh-ledger):
+#   liabilities:promises:<owner>:<slug>   +1 PROMISE on open, -1 on keep   (Dr/Cr vs equity:promises)
+#   → `hledger bal liabilities:promises` = the CURRENT OPEN SET (balance 1 = open, 0 = kept).
+#   → `hledger check` = PARITY: every open/keep txn sums to zero; a booking bug FAILS with no oracle.
+#   → TWO independent computations must AGREE: the python board-replay open-count == the hledger
+#     balance (an error-detecting cross-check — a divergence means the journal was corrupted/edited).
+#   Commodity PROMISE lives in its OWN journal/repo (~/.mesh/promises/) — NEVER mixed with the USD
+#   ledger (mixing commodities makes `bal` multi-commodity noise; CLAUDE.md rule + my own last-turn call).
+#
+#   mesh-promises              leak report — open promises aged past threshold, by owner, with age
+#   mesh-promises --all        every open promise (any age) + match audit (which done kept which)
+#   mesh-promises --balance    hledger bal liabilities:promises (standing open obligations)
+#   mesh-promises --feed       rebuild journal from board, commit, post [fyi] on NEW leak (the cadence)
+#   mesh-promises --check      parity (hledger check) + replay-vs-balance AGREEMENT + no-negative gate
+#   mesh-promises --dash       compact pane summary
+#   mesh-promises --json       machine-readable open/leak set
+#   mesh-promises --test       RED-first: a gate SEEN to flag an aged-open promise, clear on keep,
+#                              and catch an over-discharge. A gate you have not seen FAIL is not a gate.
+#
+# Env: MESH_PROMISE_LEAK_H (default 24)  MESH_PROMISE_LEAK_INCIDENT_H (default 6)
+#      MESH_CHAT_LOG (default ~/.mesh/chat.log)  MESH_PROMISES_DIR (default ~/.mesh/promises)
+#      MESH_PROMISE_MIN_OVERLAP (default 1)  MESH_PROMISE_NO_POST (set → --feed never posts to board)
+# reflex-cadence: 31 * * * *
+# reflex-args: --feed
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+MESH="$HOME/.mesh"
+CHAT_LOG="${MESH_CHAT_LOG:-$MESH/chat.log}"
+PROM_DIR="${MESH_PROMISES_DIR:-$MESH/promises}"
+JOURNAL="$PROM_DIR/promises.journal"
+STATE="$MESH/.promises-state"          # last-known leaked keys (transition posting), + liveness mtime
+SUMMARY="$MESH/.promises-summary"       # cheap one-line for pane consumers
+LEAK_H="${MESH_PROMISE_LEAK_H:-24}"
+LEAK_INCIDENT_H="${MESH_PROMISE_LEAK_INCIDENT_H:-6}"
+MIN_OVERLAP="${MESH_PROMISE_MIN_OVERLAP:-1}"
+
+have(){ command -v "$1" >/dev/null 2>&1; }
+git_prom(){ git -C "$PROM_DIR" -c user.name='mesh-promises' -c user.email='noreply@mesh' "$@"; }
+ensure_repo(){ mkdir -p "$PROM_DIR"; [ -d "$PROM_DIR/.git" ] || git_prom init -q 2>/dev/null; }
+
+# ============================ core replay (python) ============================
+# The ONE parse. argv: <mode> <chat_log> <now_iso> <leak_h> <incident_h> <min_overlap> [journal_out]
+#   mode journal  → write hledger journal to <journal_out>, print open/leak summary to stdout
+#   mode report   → human leak report to stdout (exit 1 if any leak, 0 if none, 2 if no board)
+#   mode all      → every open promise + match audit
+#   mode json     → machine JSON of {open:[...], leaks:[...], kept:N, unkeyed_done:N}
+#   mode counts   → "open=<n> leak=<n>" (for the agreement cross-check)
+replay(){
+python3 - "$@" <<'PYEOF'
+import sys, re, json
+from datetime import datetime, timezone
+
+mode      = sys.argv[1]
+chat_log  = sys.argv[2]
+now_iso   = sys.argv[3]
+leak_h    = float(sys.argv[4])
+incid_h   = float(sys.argv[5])
+min_ov    = int(sys.argv[6])
+jout      = sys.argv[7] if len(sys.argv) > 7 else None
+
+def parse_ts(s):
+    try: return datetime.strptime(s.rstrip('Z'), '%Y-%m-%dT%H:%M:%S').replace(tzinfo=timezone.utc)
+    except Exception:
+        try: return datetime.strptime(s.rstrip('Z'), '%Y-%m-%dT%H:%M').replace(tzinfo=timezone.utc)
+        except Exception: return None
+
+now = parse_ts(now_iso) or datetime.now(timezone.utc)
+
+# a REAL board marker is anchored at the body start (memory board-marker-grep-must-anchor-to-body):
+#   <ts>  <who>@<node>  ::  [marker] body...
+LINE = re.compile(r'^(\S+)\s+([^\s@]+)@(\S+)\s+::\s+\[(task|taking|done)\]\s*(.*)$')
+
+STOP = set('''the and for with from into that this then than over live fixed done task tasks owner
+owners operator operators priority incident mesh node home step steps adds wire wired make makes made
+move moves moved scope scoped verify verified test tests testing green red line lines file files pane
+panes dash uncommitted land lands landed deploy deploys deployed commit commits committed pushed proven
+prove gate gates real reals when each both every none already round rounds restating blocked action now
+next also into onto only just still yet were was been being have has had will would should could may
+might must shall about above after again against all any are but can cast come does down else ever
+first give goes here into its like more most much must need needs new not off out per put ran run runs
+same seen sends sent she some such sure take takes than that them then they this thus told took upgrade
+use used uses using very want wants what when will with work works your fyi done fix fixes flag flags'''.split())
+
+def toks(s, cap=None):
+    out = []
+    for w in re.split(r'[^a-z0-9]+', (s or '').lower()):
+        if len(w) >= 4 and w not in STOP:
+            out.append(w)
+            if cap and len(out) >= cap: break
+    return out
+
+def sanitize(s):
+    s = re.sub(r'[^a-z0-9]+', '-', (s or '').lower()).strip('-')
+    return s[:40] or 'x'
+
+def lead(body):
+    # the promise's headline: up to the first ':' , '(' , '—' , ' - ' , or 'owner:'
+    b = re.split(r'\bowner:', body, 1)[0]
+    b = re.split(r'[:(]|—| - ', b, 1)[0]
+    b = b.strip()
+    # fallback: a headline that vanished (body led with ':' / '(') would sanitize to a shared 'x'
+    # key and MERGE distinct promises — use the body head instead so each keeps its own identity.
+    if len(b) < 4:
+        b = re.sub(r'\s+', ' ', body).strip()[:70]
+    return b
+
+def owner_of(body, who):
+    m = re.search(r'owner:\s*([^\s,;)]+)', body)
+    if m:
+        o = m.group(1).rstrip('.,;:)')               # strip trailing punctuation (owner: genome.)
+        return o.split('/')[-1] if '/' in o else o   # tool/window → window
+    return who
+
+def is_incident(body):
+    return bool(re.search(r'priority:\s*incident', body))
+
+# ---- collect chronological events ----
+events = []  # (ts, kind, who, owner, body)
+try:
+    fh = open(chat_log, errors='replace')
+except FileNotFoundError:
+    if mode == 'counts': print("open=0 leak=0")
+    elif mode == 'json': print(json.dumps({"open":[],"leaks":[],"kept":0,"unkeyed_done":0,"error":"no-board"}))
+    else: sys.stderr.write("mesh-promises: no board (%s)\n" % chat_log)
+    sys.exit(2)
+
+for ln in fh:
+    m = LINE.match(ln)
+    if not m: continue
+    ts_s, who, node, marker, body = m.groups()
+    ts = parse_ts(ts_s)
+    if ts is None: continue
+    # roll-call / digests quote task state in prose; they post [fyi], but guard the poster too
+    if who in ('roll-call',): continue
+    events.append((ts, marker, who, owner_of(body, who), body.strip()))
+events.sort(key=lambda e: e[0])
+
+# ---- replay ----
+# open promises keyed by derived slug. key = sanitized lead (dedup recurring same-lead tasks).
+opens = {}       # key -> dict(owner, ts, incident, lead, ktoks, episode)
+episodes = []    # (owner, slug, open_ts, close_ts|None, incident, lead)  — one per open→(keep|still-open)
+kept = 0
+unkeyed_done = 0
+audit = []       # (kept_slug, done_lead) for --all
+
+def best_match(dtoks, dlead_slug, downer):
+    # return the open key this done best keeps, or None
+    strong = [k for k,o in opens.items() if o['slug'] == dlead_slug]
+    if strong:
+        # leading-slug equality is the [done] <slug>: discipline — strongest signal
+        return sorted(strong, key=lambda k: opens[k]['ts'])[0]
+    best, best_score = None, 0
+    for k,o in opens.items():
+        ov = len(set(dtoks) & set(o['ktoks']))
+        if ov < min_ov: continue
+        score = ov + (1 if o['owner'] == downer else 0)
+        # require overlap>=2 when owners differ (weak single-token cross-owner match = likely false)
+        if o['owner'] != downer and ov < 2: continue
+        if score > best_score or (score == best_score and best is not None and o['ts'] < opens[best]['ts']):
+            best, best_score = k, score
+    return best
+
+for ts, marker, who, owner, body in events:
+    if marker == 'task':
+        hl = lead(body)
+        key = sanitize(hl)
+        if key in opens:                    # recurring re-post while still open → dedup
+            if is_incident(body): opens[key]['incident'] = True
+            continue
+        opens[key] = dict(owner=owner, ts=ts, incident=is_incident(body),
+                          lead=hl[:70], slug=key, ktoks=toks(hl, cap=8))
+    elif marker == 'done':
+        hl = lead(body)
+        dtoks = toks(body, cap=12)
+        k = best_match(dtoks, sanitize(hl), owner)
+        if k:
+            o = opens.pop(k)
+            episodes.append((o['owner'], o['slug'], o['ts'], ts, o['incident'], o['lead']))
+            kept += 1
+            audit.append((o['slug'], hl[:50]))
+        else:
+            unkeyed_done += 1
+    # [taking] is the in-the-moment lock (mesh-claim's job) — informational here, no state change
+
+# still-open promises become open-ended episodes
+open_list = []
+for k,o in opens.items():
+    episodes.append((o['owner'], o['slug'], o['ts'], None, o['incident'], o['lead']))
+    age_h = (now - o['ts']).total_seconds() / 3600.0
+    thr = incid_h if o['incident'] else leak_h
+    open_list.append(dict(owner=o['owner'], slug=o['slug'], lead=o['lead'],
+                          opened=o['ts'].strftime('%Y-%m-%dT%H:%M:%SZ'),
+                          age_h=round(age_h,1), incident=o['incident'],
+                          threshold_h=thr, leaked=age_h > thr))
+open_list.sort(key=lambda x: -x['age_h'])
+leaks = [x for x in open_list if x['leaked']]
+
+# ---- emit ----
+if mode == 'counts':
+    print("open=%d leak=%d" % (len(open_list), len(leaks)))
+    sys.exit(0)
+
+if mode == 'json':
+    print(json.dumps(dict(open=open_list, leaks=leaks, kept=kept, unkeyed_done=unkeyed_done,
+                          now=now.strftime('%Y-%m-%dT%H:%M:%SZ'))))
+    sys.exit(1 if leaks else 0)
+
+if mode == 'journal':
+    lines = ["; mesh-promises — double-entry promise ledger (auto-materialized from the board).",
+             "; commodity PROMISE. bal liabilities:promises = the current OPEN obligation set.",
+             "; DO NOT hand-edit — regenerated from chat.log each --feed.", ""]
+    # one txn per open, one per keep — netting in liabilities:promises:<owner>:<slug>
+    seq = 0
+    for owner, slug, ots, cts, incid, hl in sorted(episodes, key=lambda e: e[2]):
+        seq += 1
+        acct = "liabilities:promises:%s:%s" % (sanitize(owner), slug)
+        tag = "promise:%s owner:%s opened:%s%s" % (slug, owner,
+                ots.strftime('%Y-%m-%dT%H:%M:%SZ'), " priority:incident" if incid else "")
+        # TWO spaces min between account and amount — hledger's delimiter. A long (>pad) account with
+        # only ONE space folds the amount INTO the account name, so open/keep land in DIFFERENT
+        # mangled accounts and never net (parity still passes via inference — the silent trap).
+        lines.append("%s * promise opened: %s  ; %s" % (ots.strftime('%Y-%m-%d'), slug, tag))
+        lines.append("    %s  1 PROMISE" % acct)
+        lines.append("    %s  -1 PROMISE" % "equity:promises")
+        lines.append("")
+        if cts is not None:
+            lag = round((cts - ots).total_seconds()/3600.0, 1)
+            lines.append("%s * promise kept: %s  ; promise:%s kept:%s lag:%sh" % (
+                cts.strftime('%Y-%m-%d'), slug, slug, cts.strftime('%Y-%m-%dT%H:%M:%SZ'), lag))
+            lines.append("    %s  -1 PROMISE" % acct)
+            lines.append("    %s  1 PROMISE" % "equity:promises")
+            lines.append("")
+    if jout:
+        open(jout, 'w').write("\n".join(lines) + "\n")
+    print("open=%d leak=%d kept=%d unkeyed_done=%d" % (len(open_list), len(leaks), kept, unkeyed_done))
+    sys.exit(0)
+
+if mode == 'all':
+    print("mesh-promises · %d open promise(s) · %d kept · %d self-directed done(s) · %s" % (
+        len(open_list), kept, unkeyed_done, now.strftime('%H:%MZ')))
+    print("  %-10s %6s %3s  %s" % ("owner","age_h","!","promise"))
+    for x in open_list:
+        flag = "🔴" if x['leaked'] else ("‼" if x['incident'] else " ")
+        print("  %-10s %6.1f %3s  %s" % (x['owner'], x['age_h'], flag, x['lead']))
+    sys.exit(0)
+
+# mode report (default)
+if not leaks:
+    print("mesh-promises: no leaked promises (%d open, all within threshold; %d kept) · %s" % (
+        len(open_list), kept, now.strftime('%H:%MZ')))
+    sys.exit(0)
+print("mesh-promises: %d LEAKED promise(s) — made, not kept, aged past threshold:" % len(leaks))
+for x in leaks:
+    print("  🔴 %-10s  %5.1fh (>%.0fh%s)  %s" % (
+        x['owner'], x['age_h'], x['threshold_h'], " incident" if x['incident'] else "", x['lead']))
+sys.exit(1)
+PYEOF
+}
+
+now_iso(){ date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+# ============================ commands ============================
+do_report(){ replay report "$CHAT_LOG" "$(now_iso)" "$LEAK_H" "$LEAK_INCIDENT_H" "$MIN_OVERLAP"; }
+do_all(){    replay all    "$CHAT_LOG" "$(now_iso)" "$LEAK_H" "$LEAK_INCIDENT_H" "$MIN_OVERLAP"; }
+do_json(){   replay json   "$CHAT_LOG" "$(now_iso)" "$LEAK_H" "$LEAK_INCIDENT_H" "$MIN_OVERLAP"; }
+
+do_balance(){
+  have hledger || { echo "mesh-promises --balance: hledger not installed (n/a)"; exit 2; }
+  ensure_repo; do_materialize >/dev/null
+  [ -s "$JOURNAL" ] || { echo "(no promises booked yet)"; exit 2; }
+  echo "standing open obligations (bal liabilities:promises · 1 PROMISE = open, netted):"
+  hledger -f "$JOURNAL" balance liabilities:promises --no-total 2>/dev/null | grep -v ' 0 ' | sed 's/^/  /'
+}
+
+# materialize the journal from the board; echo the counts line
+do_materialize(){
+  ensure_repo
+  local tmp; tmp="$(mktemp)"
+  local counts; counts="$(replay journal "$CHAT_LOG" "$(now_iso)" "$LEAK_H" "$LEAK_INCIDENT_H" "$MIN_OVERLAP" "$tmp")"
+  mv -f "$tmp" "$JOURNAL"
+  echo "$counts"
+}
+
+do_check(){
+  have hledger || { echo "mesh-promises --check: hledger not installed (n/a)"; exit 2; }
+  ensure_repo
+  local counts; counts="$(do_materialize)"
+  [ -s "$JOURNAL" ] || { echo "mesh-promises --check: no promises yet (n/a)"; exit 2; }
+  echo "== parity (hledger check: every open/keep txn sums to zero) =="
+  if hledger -f "$JOURNAL" check 2>&1 | sed 's/^/  /'; then echo "  parity: PASS"; else echo "  parity: FAIL"; exit 1; fi
+  # no liability account may be NEGATIVE (a keep with no open = phantom over-discharge)
+  local neg; neg="$(hledger -f "$JOURNAL" balance liabilities:promises --no-total 2>/dev/null | grep -E '^\s*-[0-9]' | head)"
+  if [ -n "$neg" ]; then echo "  over-discharge: FAIL — negative liability (kept a promise never opened):"; echo "$neg" | sed 's/^/    /'; exit 1; fi
+  echo "  over-discharge: none (no negative liability)"
+  # AGREEMENT: two independent computations of the open count must match (error-detecting code).
+  local py_open hl_open
+  py_open="$(echo "$counts" | grep -oE 'open=[0-9]+' | cut -d= -f2)"
+  hl_open="$(hledger -f "$JOURNAL" balance liabilities:promises --no-total -N 2>/dev/null | awk '{s+=$1} END{printf "%d", s+0}')"
+  echo "== agreement (board replay open-count == hledger balance) =="
+  if [ "${py_open:-x}" = "${hl_open:-y}" ]; then echo "  agreement: PASS (replay=$py_open == hledger=$hl_open)"; else
+    echo "  agreement: FAIL — replay=$py_open != hledger=$hl_open (journal corrupted/edited)"; exit 1; fi
+  exit 0
+}
+
+write_summary(){
+  local counts="$1"
+  local open leak kept
+  open="$(echo "$counts" | grep -oE 'open=[0-9]+' | cut -d= -f2)"
+  leak="$(echo "$counts" | grep -oE 'leak=[0-9]+' | cut -d= -f2)"
+  kept="$(echo "$counts" | grep -oE 'kept=[0-9]+' | cut -d= -f2)"
+  printf 'promises: %s open · %s LEAKED · %s kept · as of %s\n' \
+    "${open:-?}" "${leak:-?}" "${kept:-?}" "$(date -u +%H:%MZ)" > "$SUMMARY"
+}
+
+do_feed(){
+  have hledger || { echo "mesh-promises --feed: hledger not installed" >&2; exit 2; }
+  [ -f "$CHAT_LOG" ] || { echo "mesh-promises --feed: no board — n/a" >&2; exit 2; }
+  ensure_repo
+  # FIRST-RUN suppression: a brand-new detector must not retroactively alarm every historical leak
+  # (that is the opposite of "rare and loud"). Seed state silently; alert only on leaks that appear
+  # AFTER the detector exists.
+  local first=0; [ -f "$STATE" ] || first=1
+  local counts; counts="$(do_materialize)"
+  # parity gate: refuse to commit a journal that does not balance (no oracle)
+  if ! hledger -f "$JOURNAL" check >/tmp/mesh-promises-check.$$ 2>&1; then
+    echo "mesh-promises --feed: REFUSED — journal does not balance:" >&2
+    cat /tmp/mesh-promises-check.$$ >&2; rm -f /tmp/mesh-promises-check.$$; exit 1
+  fi
+  rm -f /tmp/mesh-promises-check.$$
+  git_prom add -A >/dev/null 2>&1
+  git_prom commit -q -m "promises feed: $counts" >/dev/null 2>&1
+  write_summary "$counts"
+  # liveness-touch: mtime = ran-live (always), content = change-gated (below)
+  command -v mesh-state-touch >/dev/null 2>&1 && mesh-state-touch "$STATE" >/dev/null 2>&1 || touch "$STATE" 2>/dev/null
+
+  # transition posting: post [fyi] ONLY for NEWLY-leaked promises (rare + loud, never spam).
+  local jt; jt="$(mktemp)"; do_json > "$jt" 2>/dev/null
+  local newleaks
+  newleaks="$(python3 - "$jt" "$STATE" <<'PY'
+import sys, json
+jt, statef = sys.argv[1], sys.argv[2]
+try: leaks = json.load(open(jt)).get('leaks', [])
+except Exception: leaks = []
+cur = {("%s/%s" % (l['owner'], l['slug'])) for l in leaks}
+try: prev = set(x.strip() for x in open(statef) if x.strip() and not x.startswith('#'))
+except FileNotFoundError: prev = set()
+fresh = []
+for l in leaks:
+    k = "%s/%s" % (l['owner'], l['slug'])
+    if k not in prev:
+        fresh.append("%s (%s, %.0fh%s)" % (l['lead'], l['owner'], l['age_h'], " incident" if l['incident'] else ""))
+# rewrite state to the CURRENT leaked set (so a re-closed→re-opened promise re-alerts honestly)
+open(statef, 'w').write("# mesh-promises leaked keys (owner/slug), one per line\n" + "\n".join(sorted(cur)) + "\n")
+print("\n".join(fresh))
+PY
+)"
+  rm -f "$jt"
+  local n; n="$(echo "$counts" | grep -oE 'leak=[0-9]+' | cut -d= -f2)"
+  echo "mesh-promises: $counts"
+  if [ "$first" = 1 ]; then
+    echo "mesh-promises: first run — seeded ${n:-0} existing leak(s) silently; will alert only on NEW leaks"
+    newleaks=""
+  fi
+  if [ -n "$newleaks" ] && [ -z "${MESH_PROMISE_NO_POST:-}" ] && have mesh-chat; then
+    while IFS= read -r lk; do
+      [ -n "$lk" ] || continue
+      mesh-chat "[fyi] promise-leak: a board promise crossed the leak threshold unkept — $lk. Owner: pick it up or explicitly retire it. (mesh-promises)" >/dev/null 2>&1
+    done <<< "$newleaks"
+    echo "mesh-promises: posted $(echo "$newleaks" | grep -c .) new leak alert(s) to the board"
+  fi
+}
+
+do_dash(){
+  echo "mesh-promises · board promise leak detector · $(date -u +%H:%MZ) · $(hostname)"
+  local counts; counts="$(replay journal "$CHAT_LOG" "$(now_iso)" "$LEAK_H" "$LEAK_INCIDENT_H" "$MIN_OVERLAP" /dev/null 2>/dev/null)"
+  write_summary "$counts"
+  [ -f "$SUMMARY" ] && sed 's/^/  /' "$SUMMARY"
+  echo "── leaked (made, not kept, aged) ──"
+  do_report 2>/dev/null | grep '🔴' | head -8 | sed 's/^/  /'
+  do_report >/dev/null 2>&1 || true
+  echo "── oldest open (any age) ──"
+  do_all 2>/dev/null | tail -n +3 | head -6 | sed 's/^/  /'
+}
+
+# ============================ --test (RED-first) ============================
+do_test(){
+  have hledger || { echo "smoke-test: FAIL (hledger not installed)"; exit 1; }
+  have python3 || { echo "smoke-test: FAIL (no python3)"; exit 1; }
+  local t; t="$(mktemp -d)"; trap 'rm -rf "$t"' RETURN
+  export MESH_PROMISE_NO_POST=1
+  local NOW=2026-07-24T12:00:00Z
+
+  # a synthetic board: an OLD unkept task (should leak), a kept task, an incident, a self-directed done
+  cat > "$t/board" <<'EOF'
+2026-07-23T00:00:00Z  genome@n  ::  [task] wire the frobnicator reflex into cron. owner: genome
+2026-07-23T01:00:00Z  senses@n  ::  [task] calibrate the widget sensor axis. owner: senses/senses
+2026-07-23T02:00:00Z  senses@n  ::  [done] widget: calibrated the widget sensor axis, RED-first proven.
+2026-07-24T09:00:00Z  health@n  ::  [task] investigate uplink flap. owner: health priority:incident
+2026-07-24T05:00:00Z  pub@n     ::  [done] drafted a reply nobody asked for as self-directed work.
+EOF
+
+  # 1) RED SEEN: the frobnicator task (36h old, unkept) MUST be flagged a leak. If the detector does
+  #    not fire here, it detects nothing — a leak detector you have not seen fire is not one.
+  local rep rc; rep="$(replay report "$t/board" "$NOW" 24 6 1)"; rc=$?
+  echo "$rep" | grep -q 'frobnicator' || { echo "smoke-test: FAIL (aged unkept promise NOT flagged — VACUOUS detector)"; echo "$rep" | sed 's/^/    /'; exit 1; }
+  [ $rc -eq 1 ] || { echo "smoke-test: FAIL (report exit want 1 with leaks, got $rc)"; exit 1; }
+
+  # 2) the KEPT widget task MUST NOT be flagged (done matched it → cleared)
+  echo "$rep" | grep -q 'widget' && { echo "smoke-test: FAIL (kept promise flagged as leak — false positive)"; exit 1; }
+
+  # 3) incident MATURES FASTER: the 3h-old incident is NOT yet leaked at 6h, but IS at 2h threshold.
+  #    (capture-then-grep: report exits 1 when leaks exist, so a `report | grep` pipeline would return
+  #    report's exit under pipefail — a false verdict even when grep matches. Same family as the
+  #    pipefail-SIGPIPE trap. Grep the captured text, not the pipeline status.)
+  local r2 r6
+  r2="$(replay report "$t/board" "$NOW" 24 2 1)"
+  echo "$r2" | grep -q 'uplink' || { echo "smoke-test: FAIL (incident not flagged at tightened 2h threshold)"; exit 1; }
+  r6="$(replay report "$t/board" "$NOW" 24 6 1)"
+  echo "$r6" | grep -q 'uplink' && { echo "smoke-test: FAIL (3h incident leaked at 6h threshold — too eager)"; exit 1; }
+
+  # 4) GREEN: close the frobnicator, it must CLEAR (the transition a real leak detector must show)
+  cat > "$t/board2" <<'EOF'
+2026-07-23T00:00:00Z  genome@n  ::  [task] wire the frobnicator reflex into cron. owner: genome
+2026-07-23T06:00:00Z  genome@n  ::  [done] frobnicator: wired the frobnicator reflex into cron, autowired + --test green.
+EOF
+  local rc4; rc4="$(replay report "$t/board2" "$NOW" 24 6 1)"
+  echo "$rc4" | grep -q 'frobnicator' && { echo "smoke-test: FAIL (kept frobnicator still flagged — does not clear)"; exit 1; }
+
+  # 5) JOURNAL PARITY: the materialized journal must balance (double-entry error-detecting code)
+  local jf="$t/j.journal"
+  replay journal "$t/board" "$NOW" 24 6 1 "$jf" >/dev/null
+  hledger -f "$jf" check >/dev/null 2>&1 || { echo "smoke-test: FAIL (materialized journal does not balance)"; exit 1; }
+
+  # 6) AGREEMENT: board-replay open-count == hledger balance (two independent computations)
+  local py_open hl_open
+  py_open="$(replay counts "$t/board" "$NOW" 24 6 1 | grep -oE 'open=[0-9]+' | cut -d= -f2)"
+  hl_open="$(hledger -f "$jf" balance liabilities:promises --no-total -N 2>/dev/null | awk '{s+=$1} END{printf "%d", s+0}')"
+  [ "$py_open" = "$hl_open" ] || { echo "smoke-test: FAIL (agreement: replay open=$py_open != hledger=$hl_open)"; exit 1; }
+
+  # 7) OVER-DISCHARGE seen caught: a hand-forged journal that keeps a promise never opened must drive
+  #    a NEGATIVE liability — the parity/sanity gate must catch it (proves the check isn't decorative).
+  cat > "$t/bad.journal" <<'EOF'
+2026-07-24 * promise kept: ghost  ; promise:ghost
+    liabilities:promises:genome:ghost                -1 PROMISE
+    equity:promises                                   1 PROMISE
+EOF
+  local neg; neg="$(hledger -f "$t/bad.journal" balance liabilities:promises --no-total 2>/dev/null | grep -E '^\s*-[0-9]')"
+  [ -n "$neg" ] || { echo "smoke-test: FAIL (over-discharge gate VACUOUS — negative liability not visible)"; exit 1; }
+
+  # 8) marker discipline: a [task] token QUOTED mid-prose in an [fyi] digest must NOT open a promise
+  cat > "$t/board3" <<'EOF'
+2026-07-24T09:00:00Z  roll-call@n  ::  [fyi] digest: the [task] backlog is empty; nothing outstanding.
+2026-07-24T09:01:00Z  witness@n    ::  [idle] swept, green — the [task] queue quoted above is closed.
+EOF
+  local o3; o3="$(replay counts "$t/board3" "$NOW" 24 6 1)"
+  [ "$o3" = "open=0 leak=0" ] || { echo "smoke-test: FAIL (mid-prose [task] quote opened a phantom promise: $o3)"; exit 1; }
+
+  # 9) honest n/a: no board → exit 2 (not a fake all-clear)
+  replay report "$t/nope" "$NOW" 24 6 1 >/dev/null 2>&1; [ $? -eq 2 ] || { echo "smoke-test: FAIL (missing board did not return n/a exit 2)"; exit 1; }
+
+  # 10) LONG-ACCOUNT NETTING: a kept promise with a long owner:slug (account >48 chars) must NET to
+  #     zero per-account. The one-space-delimiter bug folded the amount into the account name, so
+  #     open/keep landed in DIFFERENT mangled accounts and NEVER netted (parity/agreement still
+  #     passed via hledger's inference — the silent trap). Assert the account is netted away entirely.
+  cat > "$t/board4" <<'EOF'
+2026-07-23T00:00:00Z  senses@n  ::  [task] chat-review-access-probe-blind-from-down-and-noise. owner: senses/senses
+2026-07-23T03:00:00Z  senses@n  ::  [done] chat-review-access-probe-blind-from-down-and-noise: fixed, RED-first proven.
+EOF
+  local jf4="$t/j4.journal"
+  replay journal "$t/board4" "$NOW" 24 6 1 "$jf4" >/dev/null
+  local resid; resid="$(hledger -f "$jf4" balance liabilities:promises --no-total 2>/dev/null | grep -c 'chat-review-access-probe')"
+  [ "$resid" = "0" ] || { echo "smoke-test: FAIL (long-account kept promise did NOT net to zero — $resid residual row(s), the one-space bug)"; hledger -f "$jf4" balance liabilities:promises 2>/dev/null | sed 's/^/    /'; exit 1; }
+
+  echo "smoke-test: ok"; exit 0
+}
+
+case "${1:-}" in
+  --feed)        do_feed;;
+  --report|"")   do_report;;
+  --all)         do_all;;
+  --balance)     do_balance;;
+  --json)        do_json;;
+  --check)       do_check;;
+  --dash)        do_dash;;
+  --test)        do_test;;
+  -h|--help)     sed -n '2,55p' "$0";;
+  *) echo "usage: mesh-promises [--report|--all|--balance|--feed|--check|--dash|--json|--test]" >&2; exit 2;;
+esac
