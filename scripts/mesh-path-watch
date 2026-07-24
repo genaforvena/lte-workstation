@@ -40,7 +40,7 @@ export PATH="$HOME/.local/bin:$PATH"
 STATE_DIR="${MESH_STATE_DIR:-$HOME/.mesh}"
 STATE="$STATE_DIR/.path-watch-state"          # one-line snapshot (consumers read this)
 MODES="$STATE_DIR/.path-watch-modes"          # per-peer "host mode relay_streak" (debounce memory)
-NETSTATE="$STATE_DIR/.path-watch-net"         # last netcheck "udp lat_alerted" (edge memory)
+NETSTATE="$STATE_DIR/.path-watch-net"         # edge memory: "udp lat lat_alert_epoch lat_alerted_val"
 TAPE="${MESH_PATH_WATCH_TAPE:-$STATE_DIR/path-watch.log}"
 CHAT="${MESH_PATH_WATCH_CHAT:-1}"
 SRC="${MESH_PATH_WATCH_SRC:-}"                # test fixture: status --json file
@@ -48,6 +48,8 @@ NETSRC="${MESH_PATH_WATCH_NETSRC:-}"          # test fixture: netcheck output fi
 DEBOUNCE="${MESH_PATH_DEBOUNCE:-2}"
 NET_INTERVAL="${MESH_PATH_NETCHECK_INTERVAL:-3600}"
 NET_OFF="${MESH_PATH_NETCHECK_OFF:-0}"        # tests set 1 to isolate the cheap lane
+LAT_COOLDOWN="${MESH_PATH_LAT_COOLDOWN:-3600}"  # suppress re-posts of the DERP-latency alert within this
+LAT_ESCALATE="${MESH_PATH_LAT_ESCALATE:-2}"     # …unless lat climbs to ≥this× the last-alerted lat
 
 mkdir -p "$STATE_DIR"
 TS="$(date -u +%FT%TZ)"
@@ -155,6 +157,20 @@ cheap_lane(){ # sets CHEAP_SUMMARY + ALERTS (globals); rc 2 = BLIND
   return 0
 }
 
+# lat_alert_due <lat> <base> <now> <last_alert_epoch> <last_alerted_lat> -> rc 0 = FIRE, 1 = suppress.
+# Pure/testable. The DERP-latency alert used to fire on EVERY heavy-lane pass where lat>2×base — a
+# degrading egress sits over threshold for hours, spamming the board (the udp sibling already has
+# edge-memory via prev_udp). Mirror mesh-therm-watch: fire only if over threshold AND (the cooldown has
+# elapsed since the last alert OR lat CLIMBED to ≥ESCALATE× the last-alerted lat — a real escalation
+# still gets through inside the cooldown).
+lat_alert_due(){
+  awk -v l="$1" -v b="$2" -v now="$3" -v le="$4" -v ll="$5" -v cd="$LAT_COOLDOWN" -v es="$LAT_ESCALATE" 'BEGIN{
+    if (!(l > 2*b)) exit 1                        # not over threshold → never fire
+    elapsed   = (le <= 0 || now - le >= cd)       # never-alerted (le=0) or cooldown expired → always fire
+    escalated = (ll > 0 && l >= es*ll)            # climbed past ESCALATE× the last-alerted lat
+    exit !(elapsed || escalated)
+  }'
+}
 heavy_lane(){ # netcheck → tape netweather + edge alerts; silent skip when not due/off
   [ "$NET_OFF" = 1 ] && return 0
   local last_ts now udp derp lat base nc prev_udp
@@ -171,20 +187,35 @@ heavy_lane(){ # netcheck → tape netweather + edge alerts; silent skip when not
   lat="$(printf '%s\n' "$nc" | grep -oE '\- [a-z]{3}: [0-9.]+ms' | head -1 | grep -oE '[0-9.]+' | head -1)"
   [ -n "$udp" ] || return 0
   printf '%s netweather udp=%s derp=%s lat_ms=%s\n' "$TS" "$udp" "${derp:--}" "${lat:--}" >> "$TAPE"
+  # NETSTATE fields: 1=udp 2=lat (existing readers: prev_udp here, batched-relay suppressor) ; 3=last
+  # latency-ALERT epoch 4=last-alerted lat (the cooldown/escalation memory). Read the memory BEFORE the
+  # overwrite below.
+  local last_lat_ep last_lat_val lat_post=0
   prev_udp="$(awk '{print $1}' "$NETSTATE" 2>/dev/null)"
+  last_lat_ep="$(awk '{print $3}' "$NETSTATE" 2>/dev/null)"; last_lat_ep="${last_lat_ep:-0}"
+  last_lat_val="$(awk '{print $4}' "$NETSTATE" 2>/dev/null)"; last_lat_val="${last_lat_val:-0}"
   if [ "$udp" = false ] && [ "$prev_udp" != false ]; then
     echo "[path-udp-blocked] $(hostname): netcheck UDP=false — ALL peer paths will silently relay via DERP (router-VPN/firewall change?)"
     board "[fyi] mesh-path-watch: $(hostname) netcheck UDP=false — every peer path degrades to DERP relay. Check router-VPN/firewall. Tape: ~/.mesh/path-watch.log"
   fi
-  # latency vs rolling median of the PRIOR samples (this line excluded — it's the candidate)
+  # latency vs rolling median of the PRIOR samples (this line excluded — it's the candidate); cooldown+
+  # escalation gated (chat-review/path-watch-derp-latency-no-cooldown) so a persistently-slow egress
+  # posts ONCE per cooldown, not every heavy-lane pass — but a real climb still escalates through.
   if [ -n "$lat" ]; then
     base="$(grep ' netweather ' "$TAPE" 2>/dev/null | head -n -1 | tail -24 | grep -oE 'lat_ms=[0-9.]+' | cut -d= -f2 | sort -n | awk '{a[NR]=$1} END{if(NR>=5) print (NR%2 ? a[int(NR/2)+1] : (a[NR/2]+a[NR/2+1])/2)}')"
-    if [ -n "$base" ] && awk -v l="$lat" -v b="$base" 'BEGIN{exit !(l > 2*b)}'; then
+    if [ -n "$base" ] && lat_alert_due "$lat" "$base" "$now" "$last_lat_ep" "$last_lat_val"; then
       echo "[path-derp-slow] $(hostname): DERP latency ${lat}ms > 2× baseline ${base}ms — egress tunnel degrading?"
       board "[fyi] mesh-path-watch: $(hostname) DERP latency ${lat}ms > 2× rolling baseline ${base}ms — router-VPN egress quality degrading (early warning for the Anthropic-access lifeline)"
+      lat_post=1
     fi
   fi
-  printf '%s %s\n' "$udp" "${lat:--}" > "$NETSTATE"
+  # On a fire, stamp the alert epoch+lat; else CARRY the prior memory forward — resetting it on a
+  # non-firing pass would clear the cooldown and let the very next pass re-post.
+  if [ "$lat_post" = 1 ]; then
+    printf '%s %s %s %s\n' "$udp" "${lat:--}" "$now" "$lat" > "$NETSTATE"
+  else
+    printf '%s %s %s %s\n' "$udp" "${lat:--}" "$last_lat_ep" "$last_lat_val" > "$NETSTATE"
+  fi
   return 0
 }
 
@@ -290,7 +321,19 @@ EOF
   { [ "$rc" = 0 ] && [ "${_bl2:-0}" = 0 ]; } \
     || { rm -rf "$_bd"; echo "smoke-test: FAIL (udp=false must suppress ALL per-peer board posts: rc=$rc lines=${_bl2:-0} board='$(cat "$_blog" 2>/dev/null)')"; exit 1; }
   rm -rf "$_bd"
-  echo "smoke-test: ok (live status --json real-read + baseline/debounce-2/once-only/recovery/offline/netcheck-udp-edge/BLIND/same-pass-batch/udp-false-suppress fixtures)"; exit 0
+  # ── DERP-latency COOLDOWN+ESCALATION (chat-review/path-watch-derp-latency-no-cooldown) ────────────
+  # lat_alert_due <lat> <base> <now> <last_alert_epoch> <last_alerted_lat>: rc0=fire, rc1=suppress.
+  # The task's RED-first sequence (lat=50/base=8 → one post; lat=200 escalates through cooldown; lat=50
+  # suppressed) + the two edges (cooldown-elapsed re-fires; below-2×-threshold never fires).
+  LAT_COOLDOWN=3600; LAT_ESCALATE=2; lf=0
+  lat_alert_due 50  8 1000 0    0   || { echo "  FAIL: lat-cooldown — first high-lat (no prior alert) must FIRE"; lf=1; }
+  lat_alert_due 50  8 1060 1000 50  && { echo "  FAIL: lat-cooldown — 2nd pass same lat within cooldown must SUPPRESS"; lf=1; }
+  lat_alert_due 200 8 1120 1000 50  || { echo "  FAIL: lat-cooldown — lat=200 (≥2×50) within cooldown must ESCALATE/FIRE"; lf=1; }
+  lat_alert_due 50  8 1180 1120 200 && { echo "  FAIL: lat-cooldown — lat=50 (<2×200) within cooldown must SUPPRESS"; lf=1; }
+  lat_alert_due 50  8 5000 1120 200 || { echo "  FAIL: lat-cooldown — cooldown elapsed (>3600s) must re-FIRE"; lf=1; }
+  lat_alert_due 10  8 9999 0    0   && { echo "  FAIL: lat-cooldown — lat=10 (<2×8) below threshold must NEVER fire"; lf=1; }
+  [ "$lf" = 0 ] || { echo "smoke-test: FAIL (DERP-latency cooldown/escalation regressed — see asserts above)"; exit 1; }
+  echo "smoke-test: ok (live status --json real-read + baseline/debounce-2/once-only/recovery/offline/netcheck-udp-edge/BLIND/same-pass-batch/udp-false-suppress + derp-lat-cooldown/escalate fixtures)"; exit 0
 fi
 
 if [ "${1:-}" = --status ]; then
