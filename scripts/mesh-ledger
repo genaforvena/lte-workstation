@@ -52,6 +52,14 @@ STATE="$MESH/.ledger-state"
 SPEND_BIN="${MESH_SPEND_BIN:-mesh-spend}"
 LOOKBACK_H="${MESH_LEDGER_LOOKBACK_H:-1}"
 RECON_TOL="${MESH_LEDGER_RECON_TOL:-0.15}"
+# --- phase 2: energy + capex ---
+POWER_LOG="${MESH_POWER_LOG:-$MESH/ledger-power.log}"   # OWN log (not the shared power.log, which
+                                                       # mesh-package-power/stress/sensorium own).
+                                                       # format: <ts> cpu_w=<W> gpu_w=<W>
+DEPR_WATERMARK="$LEDGER_DIR/.depr-watermark"
+CAPEX_OVERRIDE="$MESH/ledger-capex.conf"
+ELEC_RATE="${MESH_ELEC_RATE:-0.30}"                     # USD/kWh — REAL metered cash. Override per node.
+POWER_BIN="${MESH_POWER_BIN:-mesh-package-power}"       # CPU package watts (RAPL, --json)
 
 # ---- default rate table: model-substring tier provider  in  cache_write  cache_read  out  (USD/Mtok)
 # Anthropic rates are first-party published (Opus 4.8 5/25, Sonnet 5 3/15, Haiku 4.5 1/5; cache-write
@@ -68,6 +76,21 @@ codex            imputed   openai      2.50   3.13      0.25      10.00
 EOF
 }
 rates(){ if [ -f "$RATES_OVERRIDE" ]; then grep -vE '^\s*#|^\s*$' "$RATES_OVERRIDE"; else default_rates | grep -vE '^\s*#|^\s*$'; fi; }
+
+# ---- capex manifest: asset  cost_usd  purchase_date  life_years  (straight-line depreciation)
+# These are ESTIMATES (this node's hardware, approximate street prices/dates) — a real cost is a
+# reviewable edit to ~/.mesh/ledger-capex.conf. The DEPRECIATION MACHINERY is exact; the inputs are
+# the operator's to correct. Booked as expenses:depreciation:<asset> / assets:capital:<asset>.
+default_capex(){
+  cat <<'EOF'
+# asset      cost_usd  purchased    life_years
+gpu-rtx3060  300       2025-01-01   4
+nvme-boot    70        2025-01-01   5
+nvme-spare   25        2025-01-01   5
+chassis      600       2025-01-01   5
+EOF
+}
+capex(){ if [ -f "$CAPEX_OVERRIDE" ]; then grep -vE '^\s*#|^\s*$' "$CAPEX_OVERRIDE"; else default_capex | grep -vE '^\s*#|^\s*$'; fi; }
 
 have(){ command -v "$1" >/dev/null 2>&1; }
 git_ledger(){ git -C "$LEDGER_DIR" -c user.name='mesh-ledger' -c user.email='noreply@mesh' "$@"; }
@@ -222,29 +245,55 @@ do_feed(){
     echo "mesh-ledger: window $wm already booked — skip"; touch_state; exit 0
   fi
 
-  # honest n/a: source must produce valid JSON, else exit 2 (NO watermark advance, NO fake $0)
+  local ratesf frag date_s; ratesf="$(mktemp)"; frag="$(mktemp)"
+  trap 'rm -f "$ratesf" "$frag"' RETURN
+  rates > "$ratesf"; date_s="$(date -u +%Y-%m-%d)"
+  local inf_na=0 en_na=0 booked=0 depr_booked=0
+
+  # take one power sample now so the energy lane integrates a fresh reading in this window
+  do_sample_power >/dev/null 2>&1 || true
+
+  # ---- LANE 1: inference (mesh-spend --tokens). Independent honest-n/a: source down -> skip lane,
+  #      don't block energy. Valid-but-zero -> no txn (not a fake $0).
   local sj rc
   sj="$(MESH_SPEND_WINDOW="$win_h" "$SPEND_BIN" --tokens --json 2>/dev/null)"; rc=$?
   if [ $rc -ne 0 ] || [ -z "$sj" ]; then
-    echo "mesh-ledger --feed: n/a — $SPEND_BIN --tokens unavailable (rc=$rc)" >&2; exit 2
+    inf_na=1; echo "mesh-ledger: inference lane n/a ($SPEND_BIN --tokens rc=$rc)" >&2
+  else
+    printf '%s' "$sj" | price_py "$date_s" "$wm" "$now" "$ratesf" >> "$frag"; rc=$?
+    case $rc in
+      0) booked=1;;
+      3) : ;;                       # valid zero activity — book nothing, not n/a
+      *) inf_na=1; echo "mesh-ledger: inference lane n/a (pricing rc=$rc)" >&2;;
+    esac
   fi
 
-  local ratesf frag; ratesf="$(mktemp)"; frag="$(mktemp)"
-  trap 'rm -f "$ratesf" "$frag"' RETURN
-  rates > "$ratesf"
-  local date_s; date_s="$(date -u +%Y-%m-%d)"
-  printf '%s' "$sj" | price_py "$date_s" "$wm" "$now" "$ratesf" > "$frag"; rc=$?
+  # ---- LANE 2: energy (integrate power.log over the window -> kWh -> REAL cash). No samples -> n/a.
+  local efrag; efrag="$(energy_frag "$date_s" "$wm" "$now" "$win_h")"; rc=$?
   case $rc in
-    2) echo "mesh-ledger --feed: n/a — unparseable source" >&2; exit 2;;
-    3) # valid zero activity: advance watermark, book nothing, stay honest-live
-       echo "$now" > "$WATERMARK"; touch_state
-       echo "mesh-ledger: no billable inference in window [$wm .. $now]"; exit 0;;
-    0) : ;;
-    *) echo "mesh-ledger --feed: pricing error rc=$rc" >&2; exit 1;;
+    0) printf '%s\n' "$efrag" >> "$frag"; booked=1;;
+    3) : ;;                          # samples present but zero energy (unlikely) — skip
+    2) en_na=1;;                     # no samples in window — energy n/a
   esac
 
-  # PARITY GATE before committing: append fragment to a COPY, hledger check it. A feeder bug that
-  # unbalances any leg is caught HERE (no external oracle) — and never reaches the real journal.
+  # ---- LANE 3: hardware depreciation (daily, folded in). Own watermark [depr_wm .. now]; tag `depr:`.
+  local depr_wm dfrag
+  if [ -f "$DEPR_WATERMARK" ]; then depr_wm="$(cat "$DEPR_WATERMARK")"; else
+    depr_wm="$(date -u -d "@$(( now_s - ${MESH_LEDGER_DEPR_LOOKBACK_D:-1}*86400 ))" +%Y-%m-%dT%H:%M:%SZ)"; fi
+  dfrag="$(depr_frag "$date_s" "$depr_wm" "$now")"; rc=$?
+  if [ $rc -eq 0 ]; then printf '%s\n' "$dfrag" >> "$frag"; booked=1; depr_booked=1; fi
+
+  # both lanes n/a AND nothing settled -> honest n/a, no watermark advance
+  if [ "$inf_na" = 1 ] && [ "$en_na" = 1 ] && [ "$booked" = 0 ]; then
+    echo "mesh-ledger --feed: n/a — no source available this window" >&2; exit 2
+  fi
+  if [ "$booked" = 0 ]; then          # sources up, genuinely zero activity — advance, stay honest-live
+    echo "$now" > "$WATERMARK"; touch_state
+    echo "mesh-ledger: no billable activity in window [$wm .. $now]"; exit 0
+  fi
+
+  # PARITY GATE: append the combined fragment to a COPY, hledger check it. A feeder bug that
+  # unbalances any leg (inference OR energy) is caught HERE (no oracle) — never reaches the journal.
   local yj chk; yj="$(year_journal)"; chk="$(mktemp)"
   cat "$yj" "$frag" > "$chk"
   if ! hledger -f "$chk" check 2>/tmp/mesh-ledger-check.$$; then
@@ -254,14 +303,117 @@ do_feed(){
   fi
   rm -f /tmp/mesh-ledger-check.$$
   mv -f "$chk" "$yj"
-  echo "$now" > "$WATERMARK"; touch_state
+  echo "$now" > "$WATERMARK"; [ "$depr_booked" = 1 ] && echo "$now" > "$DEPR_WATERMARK"; touch_state
 
   # commit → tamper-evident audit trail
   local amt; amt="$(hledger -f "$(main_journal)" balance expenses --no-total -N 2>/dev/null | tr -d '$,' | awk '{s+=$1} END{printf "%.4f", s}')"
   git_ledger add -A >/dev/null 2>&1
   git_ledger commit -q -m "feed [$wm .. $now]: expenses total \$$amt" >/dev/null 2>&1
-  echo "mesh-ledger: booked window [$wm .. $now]"
-  hledger -f "$(main_journal)" balance expenses:inference --no-total --flat 2>/dev/null | tail -8
+  # cheap one-line summary for cheap consumers (the witness pane tails this — no live hledger there)
+  write_summary
+  echo "mesh-ledger: booked window [$wm .. $now]  (inference-na=$inf_na energy-na=$en_na)"
+  hledger -f "$(main_journal)" balance expenses --no-total --flat --depth 2 2>/dev/null | tail -8
+}
+
+# write ~/.mesh/.ledger-summary — ONE line, computed once per feed (the expensive hledger reads stay
+# on the hourly cadence; cheap pane consumers just cat this).
+write_summary(){
+  local mj; mj="$(main_journal)"
+  _s(){ hledger -f "$mj" balance "$1" --no-total -N 2>/dev/null | tr -d '$,' | awk '{s+=$1} END{printf "%.2f", s+0}'; }
+  printf 'ledger: inference(imputed) $%s · energy(cash) $%s · depreciation $%s · as of %s\n' \
+    "$(_s expenses:inference)" "$(_s expenses:energy)" "$(_s expenses:depreciation)" "$(date -u +%H:%MZ)" \
+    > "$MESH/.ledger-summary"
+}
+
+# ---- energy sampler (reflex */5): append one power sample. Records only REAL reads (na if a source
+#      is unreadable — never fabricated), so the feed integrates honest watts.
+do_sample_power(){
+  mkdir -p "$MESH"
+  local ts cpu gpu
+  ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  cpu="$("$POWER_BIN" --json 2>/dev/null | python3 -c 'import sys,json
+try:
+    w=json.load(sys.stdin).get("watts")
+    print(f"{float(w):.2f}" if w is not None else "na")
+except Exception: print("na")' 2>/dev/null)"; [ -z "$cpu" ] && cpu=na
+  gpu="$(nvidia-smi --query-gpu=power.draw --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')"
+  case "$gpu" in ''|*[!0-9.]*) gpu=na;; esac
+  printf '%s cpu_w=%s gpu_w=%s\n' "$ts" "$cpu" "$gpu" >> "$POWER_LOG"
+  # keep the log bounded (sliding window ~7d @ */5 ≈ 2000 lines)
+  local n; n=$(wc -l < "$POWER_LOG" 2>/dev/null || echo 0)
+  [ "$n" -gt 3000 ] && { tail -2500 "$POWER_LOG" > "$POWER_LOG.tmp" && mv -f "$POWER_LOG.tmp" "$POWER_LOG"; }
+  echo "mesh-ledger: power sample $ts cpu=${cpu}W gpu=${gpu}W"
+}
+
+# energy_frag <date> <wm_iso> <now_iso> <win_h> -> emits a balanced energy txn on stdout.
+# exit 0 = txn emitted · 2 = no samples in window (n/a) · 3 = samples but zero energy.
+energy_frag(){
+  local date_s="$1" wa="$2" wb="$3" wh="$4"
+  [ -f "$POWER_LOG" ] || return 2
+  awk -v wa="$wa" -v wb="$wb" -v wh="$wh" -v rate="$ELEC_RATE" -v date_s="$date_s" '
+    $1>=wa && $1<=wb {
+      for(i=2;i<=NF;i++){
+        if($i ~ /^cpu_w=/){v=substr($i,7); if(v!="na"){cs+=v; cn++}}
+        if($i ~ /^gpu_w=/){v=substr($i,7); if(v!="na"){gs+=v; gn++}}
+      }
+    }
+    END{
+      if(cn==0 && gn==0) exit 2
+      # avg watts over the sampled window, integrated across win_h hours -> kWh -> USD.
+      # Round EACH debit to 4dp, then credit = sum of the rounded debits (never round(sum)) so the
+      # txn balances to the penny — else the parity gate would (correctly) reject a rounding drift.
+      cwatt = (cn? cs/cn : 0); gwatt = (gn? gs/gn : 0)
+      ckwh = cwatt*wh/1000.0;  gkwh = gwatt*wh/1000.0
+      ccost = sprintf("%.4f", ckwh*rate)+0;  gcost = sprintf("%.4f", gkwh*rate)+0
+      credit = ccost + gcost
+      if(credit < 0.0001) exit 3
+      printf "%s * energy feed  ; window:%s..%s kwh:%.5f avg-cpu-w:%.1f avg-gpu-w:%.1f samples:%d\n", date_s, wa, wb, ckwh+gkwh, cwatt, gwatt, cn+gn
+      if(ccost>=0.0001) printf "    %-42s $%.4f  ; kwh:%.5f\n", "expenses:energy:cpu", ccost, ckwh
+      if(gcost>=0.0001) printf "    %-42s $%.4f  ; kwh:%.5f\n", "expenses:energy:gpu", gcost, gkwh
+      printf "    %-42s $-%.4f\n", "assets:budget:paid:electricity", credit
+      print ""
+      exit 0
+    }' "$POWER_LOG"
+}
+
+# depr_frag <date> <depr_wm_iso> <now_iso> -> straight-line hardware depreciation since depr_wm.
+# exit 0 = txn emitted · 2 = too soon (< MIN days) / no capex / no elapsed value. Tag `depr:` (NOT
+# `window:`) so it stays out of the feed-window reconciliation.
+depr_frag(){
+  local date_s="$1" dwm="$2" now="$3" min_d="${MESH_LEDGER_DEPR_MIN_DAYS:-1}"
+  local now_s dwm_s days; now_s="$(date -u -d "$now" +%s)"; dwm_s="$(date -u -d "$dwm" +%s 2>/dev/null || echo 0)"
+  days="$(awk "BEGIN{d=($now_s-$dwm_s)/86400; print (d>0)?d:0}")"
+  awk "BEGIN{exit !($days < $min_d)}" && return 2
+  local capexf; capexf="$(mktemp)"; capex > "$capexf"
+  awk -v date_s="$date_s" -v dwm="$dwm" -v now="$now" -v days="$days" '
+    { asset=$1; cost=$2+0; life=$4+0; if(life<=0) next
+      dep = sprintf("%.4f", (cost/(life*365.0))*days)+0
+      if(dep>=0.0001){ ax[++n]=asset; dx[n]=dep; tot+=dep } }
+    END{
+      if(n==0) exit 2
+      printf "%s * hardware depreciation  ; depr:%s..%s days:%.3f\n", date_s, dwm, now, days
+      for(i=1;i<=n;i++){
+        printf "    %-42s $%.4f\n", "expenses:depreciation:" ax[i], dx[i]
+        printf "    %-42s $-%.4f\n", "assets:capital:" ax[i], dx[i]
+      }
+      print ""
+      exit 0
+    }' "$capexf"
+  local rc=$?; rm -f "$capexf"; return $rc
+}
+
+do_depreciate(){  # manual/on-demand depreciation booking (also folded into --feed daily)
+  have hledger || { echo "hledger n/a"; exit 2; }; ensure_repo
+  local now dwm; now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  if [ -f "$DEPR_WATERMARK" ]; then dwm="$(cat "$DEPR_WATERMARK")"; else
+    dwm="$(date -u -d "@$(( $(date -u +%s) - ${MESH_LEDGER_DEPR_LOOKBACK_D:-1}*86400 ))" +%Y-%m-%dT%H:%M:%SZ)"; fi
+  local frag; frag="$(depr_frag "$(date -u +%Y-%m-%d)" "$dwm" "$now")"; rc=$?
+  [ $rc -eq 0 ] || { echo "mesh-ledger: no depreciation due (since $dwm)"; exit 0; }
+  local yj chk; yj="$(year_journal)"; chk="$(mktemp)"; cat "$yj" <(printf '%s\n' "$frag") > "$chk"
+  hledger -f "$chk" check >/dev/null 2>&1 || { echo "depreciation txn unbalanced — REFUSED" >&2; rm -f "$chk"; exit 1; }
+  mv -f "$chk" "$yj"; echo "$now" > "$DEPR_WATERMARK"
+  git_ledger add -A >/dev/null 2>&1; git_ledger commit -q -m "depreciation [$dwm .. $now]" >/dev/null 2>&1
+  echo "mesh-ledger: booked depreciation since $dwm"; printf '%s\n' "$frag" | sed 's/^/  /'
 }
 
 touch_state(){
@@ -277,19 +429,21 @@ recon_py(){
 python3 - "$1" <<'PYEOF'
 import sys, re
 jf = sys.argv[1]
-wins = []
+# anchored so `depr:` / `depr-window:` tags never match the FEED window tag; dedup identical windows
+# (inference + energy in ONE feed both carry the same window: that is one feed, not a double-book).
+wins = set()
 for ln in open(jf, errors='replace'):
-    m = re.search(r'window:(\S+?)\.\.(\S+)', ln)
-    if m: wins.append((m.group(1), m.group(2)))
-wins.sort()
+    m = re.search(r'(?<![\w-])window:(\S+?)\.\.(\S+)', ln)
+    if m: wins.add((m.group(1), m.group(2)))
+wins = sorted(wins)
 overlaps = gaps = 0
 for i in range(1, len(wins)):
     prev_end = wins[i-1][1]; cur_start = wins[i][0]
-    if cur_start < prev_end:  # ISO strings sort chronologically
+    if cur_start < prev_end:  # ISO strings sort chronologically; distinct windows that overlap = double-book
         overlaps += 1; print(f"  OVERLAP: {wins[i-1][0]}..{prev_end}  vs  {cur_start}..")
     elif cur_start > prev_end:
         gaps += 1
-print(f"  windows:{len(wins)} overlaps:{overlaps} gaps:{gaps}")
+print(f"  feed-windows:{len(wins)} overlaps:{overlaps} gaps:{gaps}")
 sys.exit(1 if overlaps else 0)
 PYEOF
 }
@@ -318,17 +472,81 @@ do_by_provider(){ have hledger || { echo "hledger n/a"; exit 2; }; ensure_repo
 do_report(){ have hledger || { echo "hledger n/a"; exit 2; }; ensure_repo
   hledger -f "$(main_journal)" incomestatement 2>/dev/null || hledger -f "$(main_journal)" balance 2>/dev/null; }
 
+# --by-mind: APPROXIMATE per-mind attribution of inference spend. Inference tokens are account-wide
+# (shared OAuth), so this is an ALLOCATION, not a measurement: each provider's booked $ is split
+# across minds by that engine's turn-share from spend.log. Directional only — labeled as such.
+do_by_mind(){
+  have hledger || { echo "hledger n/a"; exit 2; }; ensure_repo
+  local mj sl; mj="$(main_journal)"; sl="${MESH_SPEND_LOG:-$MESH/spend.log}"
+  # provider -> booked inference $ (all-time)
+  local provbal; provbal="$(hledger -f "$mj" balance expenses:inference --depth 3 --flat --no-total 2>/dev/null | tr -d '$,')"
+  python3 - "$sl" "${MESH_BYMIND_WINDOW_H:-24}" "$provbal" <<'PYEOF'
+import sys, re
+from datetime import datetime, timezone, timedelta
+sl, win_h, provbal = sys.argv[1], float(sys.argv[2]), sys.argv[3]
+# journal $ per provider
+prov_usd = {}
+for ln in provbal.splitlines():
+    m = re.search(r'([\d.]+)\s+expenses:inference:(\w+)', ln)
+    if m: prov_usd[m.group(2)] = prov_usd.get(m.group(2),0.0) + float(m.group(1))
+ENG2PROV = {'claude':'anthropic','opencode':'zai','codex':'openai'}
+# turns per (mind, provider) over the recent spend.log window
+now = datetime.now(timezone.utc); cut = now - timedelta(hours=win_h)
+turns = {}   # (mind,prov) -> count ; prov_turns -> total per prov
+provturn = {}
+try:
+    for ln in open(sl):
+        p = ln.split()
+        if len(p) < 6 or p[1] != 'turn': continue
+        try: dt = datetime.strptime(p[0].rstrip('Z'), '%Y-%m-%dT%H:%M').replace(tzinfo=timezone.utc)
+        except ValueError: continue
+        if dt < cut: continue
+        mind, eng = p[2], p[3]
+        prov = ENG2PROV.get(eng)
+        if not prov: continue
+        turns[(mind,prov)] = turns.get((mind,prov),0)+1
+        provturn[prov] = provturn.get(prov,0)+1
+except FileNotFoundError:
+    print("  (no spend.log — cannot attribute)"); sys.exit(0)
+print(f"mesh-ledger --by-mind · APPROXIMATE (account-wide tokens allocated by {win_h:.0f}h turn-share)")
+print(f"  {'mind':<10} {'$ inference (imputed)':>22}   breakdown")
+print("  "+"-"*58)
+mind_tot = {}
+mind_bd = {}
+for (mind,prov),n in turns.items():
+    share = n/provturn[prov] if provturn.get(prov) else 0
+    usd = share * prov_usd.get(prov,0.0)
+    mind_tot[mind] = mind_tot.get(mind,0.0)+usd
+    mind_bd.setdefault(mind,[]).append(f"{prov}:{usd:.2f}")
+for mind,tot in sorted(mind_tot.items(), key=lambda x:-x[1]):
+    print(f"  {mind:<10} {'$'+format(tot,'.4f'):>22}   {' '.join(mind_bd[mind])}")
+if not mind_tot: print("  (no attributable turns in window)")
+booked = sum(prov_usd.values())
+print("  "+"-"*58)
+print(f"  total booked inference: ${booked:.4f}  ·  attributed: ${sum(mind_tot.values()):.4f}")
+print("  NOTE: allocation, not a per-mind meter — shared OAuth makes tokens account-wide.")
+PYEOF
+}
+
 do_dash(){
   ensure_repo
-  echo "mesh-ledger · $(date -u +%H:%MZ) · $(hostname)"
+  echo "mesh-ledger · resource ledger · $(date -u +%H:%MZ) · $(hostname)"
   if ! have hledger; then echo "  hledger not installed"; return; fi
   local mj; mj="$(main_journal)"
-  local tot; tot="$(hledger -f "$mj" balance expenses --no-total -N 2>/dev/null | tr -d '$,' | awk '{s+=$1} END{printf "%.4f", s+0}')"
-  echo "── imputed inference spend (all-time booked) ──  \$$tot"
-  hledger -f "$mj" balance expenses:inference --depth 3 --flat --no-total 2>/dev/null | sed 's/^/  /' | tail -10
+  _sum(){ hledger -f "$mj" balance "$1" --no-total -N 2>/dev/null | tr -d '$,' | awk '{s+=$1} END{printf "%.4f", s+0}'; }
+  local inf en cap; inf="$(_sum expenses:inference)"; en="$(_sum expenses:energy)"; cap="$(_sum expenses:depreciation)"
+  printf "  inference(imputed) \$%s   energy(cash) \$%s   depreciation \$%s\n" "$inf" "$en" "$cap"
+  echo "── spend by category ──"
+  hledger -f "$mj" balance expenses --depth 3 --flat --no-total 2>/dev/null | sed 's/^/  /' | tail -12
+  # latest energy sample + rate
+  if [ -s "$POWER_LOG" ]; then
+    echo "── power (latest sample · rate \$$ELEC_RATE/kWh) ──"
+    tail -1 "$POWER_LOG" 2>/dev/null | sed 's/^/  /'
+  fi
   echo "── last feeds ──"
-  grep -h 'window:' "$(year_journal)" 2>/dev/null | tail -3 | sed -E 's/.*window:([^ ]+).*/  \1/'
+  grep -ho 'window:[^ ]*' "$(year_journal)" 2>/dev/null | tail -3 | sed 's/^/  /'
   [ -f "$STATE" ] && sed 's/^/  /' "$STATE"
+  write_summary   # keep the cheap one-line summary (witness pane tails it) fresh on any dash view
 }
 
 # ============================ --test (RED-first) ============================
@@ -395,17 +613,57 @@ EOF
   printf '' | price_py 2026-07-24 A B "$rf" >/dev/null 2>&1; [ $? -eq 2 ] || {
     echo "smoke-test: FAIL (empty source did not return n/a exit 2)"; exit 1; }
 
+  # 6) recon must NOT flag inference+energy sharing ONE feed window (identical windows = one feed)
+  cat > "$t/shared.journal" <<'EOF'
+2026-07-24 * inference feed  ; window:2026-07-24T08:00:00Z..2026-07-24T09:00:00Z
+    expenses:inference:anthropic:opus     $1.0000
+    assets:budget:imputed:anthropic      $-1.0000
+2026-07-24 * energy feed  ; window:2026-07-24T08:00:00Z..2026-07-24T09:00:00Z kwh:0.05
+    expenses:energy:gpu                   $0.0150
+    assets:budget:paid:electricity       $-0.0150
+2026-07-24 * hardware depreciation  ; depr:2026-07-23T09:00:00Z..2026-07-24T09:00:00Z days:1.0
+    expenses:depreciation:gpu             $0.2055
+    assets:capital:gpu                   $-0.2055
+EOF
+  recon_py "$t/shared.journal" >/dev/null 2>&1 || {
+    echo "smoke-test: FAIL (recon false-positive: inference+energy share one feed window)"; exit 1; }
+
+  # 7) ENERGY lane: a known 100W CPU sample over exactly 1h at $0.30/kWh must price to $0.0300
+  #    (0.100kWh * $0.30). Proves the energy integrator + parity, RED if the math drifts.
+  local pl="$t/power.log"
+  printf '2026-07-24T08:30:00Z cpu_w=100.00 gpu_w=na\n' > "$pl"
+  local ef; ef="$(POWER_LOG="$pl" ELEC_RATE=0.30 energy_frag 2026-07-24 2026-07-24T08:00:00Z 2026-07-24T09:00:00Z 1.0)"
+  echo "$ef" | grep -q 'expenses:energy:cpu.*\$0\.0300' || {
+    echo "smoke-test: FAIL (energy: 100W*1h@\$0.30 != \$0.0300)"; echo "$ef" | sed 's/^/    /'; exit 1; }
+  echo "$ef" > "$t/en.journal"; hledger -f "$t/en.journal" check >/dev/null 2>&1 || {
+    echo "smoke-test: FAIL (energy txn does not balance)"; exit 1; }
+  # energy n/a: no samples in window -> exit 2 (not a fake $0)
+  printf '2026-07-24T05:00:00Z cpu_w=100.00 gpu_w=na\n' > "$pl"
+  POWER_LOG="$pl" energy_frag 2026-07-24 2026-07-24T08:00:00Z 2026-07-24T09:00:00Z 1.0 >/dev/null 2>&1
+  [ $? -eq 2 ] || { echo "smoke-test: FAIL (energy: out-of-window samples did not return n/a exit 2)"; exit 1; }
+
+  # 8) DEPRECIATION lane: a $365 asset over 1-year life for exactly 1 day = $1.0000/day.
+  local cf="$t/capex.conf"; printf 'test-asset 365 2025-01-01 1\n' > "$cf"
+  local df; df="$(CAPEX_OVERRIDE="$cf" MESH_LEDGER_DEPR_MIN_DAYS=0 depr_frag 2026-07-24 2026-07-23T09:00:00Z 2026-07-24T09:00:00Z)"
+  echo "$df" | grep -q 'expenses:depreciation:test-asset.*\$1\.0000' || {
+    echo "smoke-test: FAIL (depreciation: \$365/1yr*1day != \$1.0000)"; echo "$df" | sed 's/^/    /'; exit 1; }
+  echo "$df" > "$t/dp.journal"; hledger -f "$t/dp.journal" check >/dev/null 2>&1 || {
+    echo "smoke-test: FAIL (depreciation txn does not balance)"; exit 1; }
+
   echo "smoke-test: ok"; exit 0
 }
 
 case "${1:-}" in
-  --feed)        do_feed;;
-  --balance|"")  do_balance;;
-  --by-provider) do_by_provider;;
-  --report)      do_report;;
-  --check)       do_check;;
-  --dash)        do_dash;;
-  --test)        do_test;;
-  -h|--help)     sed -n '2,40p' "$0";;
-  *) echo "usage: mesh-ledger [--feed|--balance|--by-provider|--report|--check|--dash|--test]" >&2; exit 2;;
+  --feed)         do_feed;;
+  --sample-power) do_sample_power;;
+  --depreciate)   do_depreciate;;
+  --balance|"")   do_balance;;
+  --by-provider)  do_by_provider;;
+  --by-mind)      do_by_mind;;
+  --report)       do_report;;
+  --check)        do_check;;
+  --dash)         do_dash;;
+  --test)         do_test;;
+  -h|--help)      sed -n '2,44p' "$0";;
+  *) echo "usage: mesh-ledger [--feed|--sample-power|--depreciate|--balance|--by-provider|--by-mind|--report|--check|--dash|--test]" >&2; exit 2;;
 esac
