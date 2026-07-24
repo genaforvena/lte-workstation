@@ -78,10 +78,99 @@ Not measurements: lines 41, 44, 45, 47, 48 (`PHONE_SSH_PORT` 8022, `-l 10`), 162
 307 (1200–1800s guidance), 317 ("10+ window sprawl"), 410 (`10.9.0.0/24`), 433 (retention
 "2d"), 435 ("0..1" as a named anti-pattern rather than a measurement).
 
+## Step 2 — a ROM behind the standing claims (2026-07-24)
+
+`series-stats.tal` + `mesh-series-stats` + `test-series-stats`, in the `mesh-spearman`
+shape: the ROM owns the reduction and its domain, a 64-bit twin cross-checks it, and the
+claim is re-derived from the live corpus rather than quoted.
+
+The ROM takes a threshold, `n`, and `n` **non-decreasing** integers and answers
+`min max med2 cnt sum mean1000`. Domain `1 <= n <= 2343`, every token `<= 9999`, values
+sorted; anything else is `NA` rc=2. Sorting is the host's job — the same split as spearman,
+where the host owns ranking and the ROM owns the formula — and the ROM *verifies* it, so a
+host that forgets to sort gets a refusal rather than a plausible wrong median.
+
+Three design points worth keeping:
+
+- **`med2` is twice the median, deliberately.** For even `n` the median is the mean of the
+  two central elements and can end in `.5`, which an integer ROM cannot say. Halving in the
+  host is exact; rounding in the ROM would be a lie the caller could not see.
+- **`mean1000` is rounded, not truncated** — the same bug spearman had, where truncation
+  cost exactly 1 in the last place and made the ROM disagree with its twin on 2 of 11 live
+  windows. A fourth fractional digit decides.
+- **The sum is why `arith32` is here.** 2343 values of 9999 sum to 23,427,657, nine times
+  past a 16-bit word. A 16-bit accumulator would not error; it would wrap, and the mean
+  would come back small and entirely believable.
+
+Gate: `test-series-stats` — 17 truth-table rows, `rom == source`, **5 source-mutants
+required RED** (sortedness guard defeated · per-token ceiling loosened · rounding →
+truncation · lower median index `(n-1)/2` → `n/2` · `cnt >= T` weakened to `> T`), the
+domain pinned from both sides, 8 random series against the 64-bit twin, the host required
+to refuse rather than silently window, and 3 double-word carries required to change the
+answer through the real reduction.
+
+**`n=255` is load-bearing in the carry section, not a round number.** `w-mul16` is reached
+here only through `n*place` in the mean's long division, and its low-word carry fires only
+for particular `n`: at `n=100` the partials do not overflow, the mutant answers identically,
+and the section reads green against a real bug. At `n=255 x 1000` they do overflow
+(`t0=59160` plus `(mid&0xff)<<8 = 64768` wraps), so the deleted carry costs 65536 and the
+quotient loop takes a different path. A carry test is only a test on inputs that *can* carry
+— the same lesson as step 1's, where the max-domain input turned out to be the weakest place
+to hunt a carry.
+
+### Result: claims 1–3 are now re-derived, and ROM == twin on every one
+
+```
+source: ~/.mesh/records.log (650 rows, mtime 2026-07-24T02:54:56Z)
+  act:               n=643  max=1.000  median=0.301  cnt(>=0.55)=24  mean=0.3256  [AGREE]
+  dyn:               n=643  max=1.000  median=0.134  cnt(>=0.5)=9    mean=0.1608  [AGREE]
+  move:              n=643  max=1.000  median=0.228  cnt(>=0.5)=57   mean=0.2627  [AGREE]
+  beats [score>=55]: n=33   max=26     median=6                      mean=6.515   [AGREE]
+  beats [score<55]:  n=617  max=44     median=7                      mean=9.729   [AGREE]
+```
+
+Claim 2 stays REFUTED (act reaches 1.000; 24 records clear 0.55). Claim 3's numbers stay
+STALE against the doctrine's n=29 figures. Claim 1's direction survives and its magnitude
+does not, exactly as step 1 found.
+
+### The finding step 2 actually produced: the corpus is a SLIDING WINDOW
+
+Step 1 measured at `n=651` and wrote that number into `CLAUDE.md`. **It is not
+reproducible, and it never will be.** `mesh-records` prunes `records.log` per organ to
+`LOG_KEEP` rows on every sweep (`scripts/mesh-records`, the `awk -v k="$LOG_KEEP"` block) —
+so the ledger is a per-organ sliding window, not an archive. The row count moves **down** as
+well as up, and the population itself turns over.
+
+Measured across ~25 minutes of one session today, with no intervention:
+
+| | first read | second read |
+|---|---|---|
+| ledger rows | 658 | 650 |
+| axis rows (`n`) | 651 | 643 |
+| `dyn` median | .135 | .134 |
+| `move` median | .228 | .228 |
+| `beats [score<55]` mean | 9.621 | 9.729 |
+| `beats [score<55]` n | 625 | 617 |
+
+This is the strongest argument the sweep has produced for the whole exercise. The doctrine's
+own bullet already says "rank against the live corpus, never pin a constant" — the sliding
+window makes that not merely good practice but the *only* option: **any `n=` quoted from
+this ledger is stale before the prose is committed.** So the standing claims should cite the
+gate and treat the printed figures as the gate's current answer, never as the claim itself.
+
+### Claims 4 and 5
+
+- **Claim 4** ("the gate permits ~43% of covered clears") — the *number* checks out, from
+  `~/.mesh/model-bench.log`: `gemma4:e2b-it-qat` scores error 0.571 on the coverage fixture,
+  i.e. 3 of 7 permitted = 42.9%. But its **subject does not**: that is a 7-row *fixture
+  bench*, while "of covered clears" reads as a rate over the live clear stream. The figure is
+  right and the sentence it sits in is broader than the measurement. Not refuted — mis-scoped.
+- **Claim 5** ("a 60s loop delay measured ~122s") — still unchecked. Measuring it costs two
+  scheduled wakeups, i.e. two paid turns, and the loop is task-scoped by doctrine. Listed
+  unchecked rather than quietly dropped.
+
 ## Next step
 
-A ROM per STANDING claim, in the `mesh-spearman` shape: the ROM owns the reduction and its
-domain, a 64-bit twin cross-checks it, and the claim is re-derived from the live corpus
-rather than quoted. Claims 4 and 5 need their source ledgers read first (`mesh-clear-log`
-and a fresh loop measurement respectively) — they are listed unchecked rather than quietly
-dropped.
+Step 3: wire `mesh-series-stats --claims` somewhere it is *read* — the drift it detects is
+only useful if something looks. The natural home is the sound-studio dash pane, since that
+is the role whose thresholds these numbers calibrate.

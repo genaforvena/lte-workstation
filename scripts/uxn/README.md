@@ -258,3 +258,46 @@ verdicts the 16-bit wrap once produced. `test-lisp-eval`: core + gate tables on 
 fresh build and the committed ROM; RED-first via an inverted-`>=` mutant that must fail
 the same table. Authoring gotcha: string literals must be ASCII — chibicc emits non-ASCII
 bytes as broken labels (`uxnasm: Label unknown: ffffffe2` from an em dash).
+
+## Reduce-a-series gate class (`spearman`, `series-stats`)
+
+A gate that answers a boundary predicate is a *decision*; a gate that reduces a whole
+series to one calibrated number is a *measurement*, and it is what makes the doctrine's
+quantitative claims checkable instead of quotable. Two ROMs are in the class.
+
+**`spearman.tal`** — Spearman rank correlation, `rho*1000`, integer, no floats. The HOST
+ranks (and therefore owns tie handling); the ROM owns the formula, the reduction and its
+domain. It used to stop at `n=58` and the full series was reduced by the awk twin instead
+— which meant the ROM was not doing the reduction and "reduce a series" was a demo.
+`arith32.tal` (double-word add/sub/cmp/mul on a 16-bit machine) lifted the ceiling to
+`n=2343`, chosen so `2*D` plus the largest possible `d^2` still fits 32 bits: no single
+accumulation step can wrap, which is what turns the per-value `sum(d^2) <= 2D` check from
+a hopeful guard into a complete one.
+
+**`series-stats.tal`** — order statistics. Given a threshold, `n`, and `n` non-decreasing
+integers it answers `min max med2 cnt sum mean1000`. `med2` is *twice* the median so the
+even-`n` case is exact rather than rounded; `mean1000` is rounded to nearest, not
+truncated. Sorting is the host's job and the ROM **verifies** it, so a host that forgets
+to sort gets `NA` rc=2 rather than a plausible median of a different question.
+
+Host: `mesh-series-stats --claims` re-derives every standing quantitative claim in
+`CLAUDE.md` from the live ledger, with the doctrine's own number printed beside it. The
+twin is N-version, not a re-read: it sorts with its own selection sort over the *unsorted*
+input and accumulates in 64-bit awk floats, so an AGREE is evidence about the arithmetic
+*and* the ordering.
+
+Gates: `test-spearman`, `test-series-stats`, `test-arith32`. Each rebuilds the ROM from
+mutated source and requires its truth table to fail — a table that cannot fail is not a
+table.
+
+Two carry lessons the class produced, both counter-intuitive and both measured:
+
+- **The max-domain input is the WEAKEST place to hunt a carry bug.** A lost high-word unit
+  is an error of `65536/D` in `rho`, and `D` grows as `n^3` — so at `n=200` it is 4.9e-2
+  (screaming), at `n=650` 1.4e-3 (just visible against the printed 1e-3), and at `n=2343`
+  3.1e-5, *below* the resolution the ROM prints. `test-arith32`'s primitive boundary table
+  is the authority for carry coverage; the end-to-end tests only pin the consequence.
+- **A carry test is only a test on inputs that CAN carry.** In `series-stats` the multiply
+  is reached only through `n*place`; at `n=100` the partials do not overflow and the
+  carry-deleted mutant answers *identically*. `n=255` is pinned in the suite for exactly
+  that reason.
