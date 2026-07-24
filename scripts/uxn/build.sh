@@ -28,6 +28,7 @@ echo "built bin/uxnasm ($(wc -c <bin/uxnasm)b) bin/uxncli ($(wc -c <bin/uxncli)b
 if [ "${1:-}" = --rom ]; then
   ./bin/uxnasm lease-gate.tal lease-gate.rom
   ./bin/uxnasm band-gate.tal band-gate.rom
+  ./bin/uxnasm spearman.tal spearman.rom
 fi
 if [ "${1:-}" = --chibicc ]; then
   $CC -std=c11 -O2 -fno-common -o bin/chibicc chibicc/src/*.c
