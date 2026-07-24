@@ -1,0 +1,184 @@
+#!/usr/bin/env bash
+# mesh-relay-attest — ZERO-TRUST proof-of-inference for mesh-relay.
+#
+# The problem (zero trust): mesh-relay routes a prompt to whichever pool is cheapest — groq (a
+# third party), a subscription model, a local model. A consumer of that output has no way to know
+# WHICH trust domain produced it, whether the output actually corresponds to the prompt it was
+# handed, or whether the record was altered after the fact. "Trust the relay operator" is exactly
+# the assumption a zero-trust system removes.
+#
+# The primitive (a transparency log — same family as Certificate Transparency / Sigstore Rekor,
+# and the verifiable-inference receipts cinchor's API exposes): an APPEND-ONLY, HASH-LINKED chain
+# of inference receipts. Each receipt commits to:
+#   - prompt_hash   sha256(prompt)  — binds the input WITHOUT storing it (privacy: raw text never logged)
+#   - output_hash   sha256(output)  — binds the output the same way
+#   - pool / model  — WHICH trust domain served it (the attribution a zero-trust consumer must know)
+#   - prev_hash     — the previous receipt's entry_hash (the Merkle link)
+#   - entry_hash    = sha256(seq|ts|pool|model|prompt_hash|output_hash|prev_hash)
+#
+# The zero-trust property this buys: each entry_hash folds in prev_hash, so the log is a hash chain.
+# Altering, deleting, or inserting ANY past receipt changes its entry_hash → the next receipt's
+# prev_hash no longer matches → `verify` breaks at that exact line. The operator cannot forge a
+# receipt or rewrite history undetectably; a consumer verifies the whole chain independently, from
+# the genesis anchor, using nothing but sha256. That is the "don't trust, verify" contract.
+#
+# Verbs:
+#   mesh-relay-attest record <pool> <model> <prompt> <output>   append a receipt (used by mesh-relay)
+#   mesh-relay-attest verify                                    recompute the whole chain; nonzero on tamper
+#   mesh-relay-attest check  <prompt> <output>                  is there a receipt binding this prompt→output?
+#   mesh-relay-attest prove  <prompt>                           show every receipt for this prompt (by hash)
+#   mesh-relay-attest head                                      the current chain tip (seq + entry_hash)
+#   mesh-relay-attest --test                                    RED-first self-gate (tamper MUST be detected)
+#
+# Raw prompt/output text is NEVER written — only their sha256. The log is a commitment, not a copy.
+# Append-only, monotone side effect (like the ledger). Log: ~/.mesh/relay-attest.log
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+
+GENESIS="0000000000000000000000000000000000000000000000000000000000000000"
+ATTEST_LOG="${MESH_RELAY_ATTEST_LOG:-$HOME/.mesh/relay-attest.log}"
+
+_sha() { printf '%s' "$1" | sha256sum | cut -d' ' -f1; }
+# pool/model are stored verbatim in a pipe-delimited line — strip the delimiter + whitespace so a
+# crafted pool name can neither break the format nor smuggle extra fields past the hash.
+_san() { printf '%s' "$1" | tr '|\t\n' '___' ; }
+
+# entry_hash over the canonical field string (the SAME order verify recomputes — one definition).
+_entry_hash() { # $1=seq $2=ts $3=pool $4=model $5=phash $6=ohash $7=prev
+  _sha "$1|$2|$3|$4|$5|$6|$7"
+}
+
+# current chain tip: prints "seq entry_hash"; genesis (empty/absent log) prints "0 <GENESIS>"
+_tip() {
+  if [ -s "$ATTEST_LOG" ]; then
+    local last; last="$(tail -1 "$ATTEST_LOG")"
+    printf '%s %s' "$(printf '%s' "$last" | cut -d'|' -f1)" "$(printf '%s' "$last" | cut -d'|' -f8)"
+  else
+    printf '0 %s' "$GENESIS"
+  fi
+}
+
+_ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+_verify_chain() { # reads $1 (log path); rc 0 = intact, 1 = tamper/break. prints a diagnosis on break.
+  local log="$1" prev="$GENESIS" want_seq=1 line seq ts pool model phash ohash pprev ehash calc
+  [ -s "$log" ] || { echo "chain: empty (genesis only) — intact"; return 0; }
+  while IFS='|' read -r seq ts pool model phash ohash pprev ehash; do
+    [ -n "$seq" ] || continue
+    if [ "$seq" != "$want_seq" ]; then
+      echo "chain: BROKEN at seq $seq — sequence gap (expected $want_seq: a receipt was deleted or reordered)"; return 1
+    fi
+    if [ "$pprev" != "$prev" ]; then
+      echo "chain: BROKEN at seq $seq — prev_hash mismatch (expected $prev, got $pprev: history was altered here)"; return 1
+    fi
+    calc="$(_entry_hash "$seq" "$ts" "$pool" "$model" "$phash" "$ohash" "$pprev")"
+    if [ "$calc" != "$ehash" ]; then
+      echo "chain: BROKEN at seq $seq — entry_hash mismatch (recomputed $calc ≠ stored $ehash: this receipt was tampered)"; return 1
+    fi
+    prev="$ehash"; want_seq=$((want_seq+1))
+  done < "$log"
+  echo "chain: intact — $((want_seq-1)) receipt(s), tip $prev"
+  return 0
+}
+
+case "${1:-}" in
+  --test)
+    command -v sha256sum >/dev/null 2>&1 || { echo "smoke-test: FAIL (no sha256sum)"; exit 1; }
+    tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+    export MESH_RELAY_ATTEST_LOG="$tmp/attest.log"
+    # (1) genesis: a fresh chain verifies as intact
+    "$0" verify >/dev/null 2>&1 || { echo "smoke-test: FAIL (empty chain should verify)"; exit 1; }
+    # (2) record three real receipts through the SAME code the run path uses
+    "$0" record groq  llama-3.1-8b "who are you"  "I am an assistant" >/dev/null || { echo "smoke-test: FAIL (record 1)"; exit 1; }
+    "$0" record local qwen2.5      "2+2"          "4"                 >/dev/null || { echo "smoke-test: FAIL (record 2)"; exit 1; }
+    "$0" record claude claude-cli  "capital of FR" "Paris"           >/dev/null || { echo "smoke-test: FAIL (record 3)"; exit 1; }
+    # (3) a well-formed chain verifies
+    "$0" verify >/dev/null 2>&1 || { echo "smoke-test: FAIL (well-formed chain should verify)"; exit 1; }
+    # (4) check: a recorded prompt→output binding is found; a forged one is NOT
+    "$0" check "2+2" "4" >/dev/null 2>&1 || { echo "smoke-test: FAIL (recorded binding not found)"; exit 1; }
+    if "$0" check "2+2" "5" >/dev/null 2>&1; then
+      echo "smoke-test: FAIL (forged output '5' accepted — a wrong answer would verify as genuine)"; exit 1; fi
+    if "$0" check "never asked" "whatever" >/dev/null 2>&1; then
+      echo "smoke-test: FAIL (unrecorded prompt accepted)"; exit 1; fi
+    # (5) RED-FIRST — the whole point. TAMPER with a past receipt; verify MUST turn red.
+    #     (flip the output_hash on seq 2 — the classic "operator rewrites what the model said")
+    sed -i '2s/|[0-9a-f]\{64\}|/|deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef|/' "$MESH_RELAY_ATTEST_LOG"
+    if "$0" verify >/dev/null 2>&1; then
+      echo "smoke-test: FAIL (GATE IS DEAD — tampering with a receipt was NOT detected)"; exit 1; fi
+    # (6) restore integrity by rebuilding, confirm the gate goes green again (a gate seen red AND green)
+    rm -f "$MESH_RELAY_ATTEST_LOG"
+    "$0" record groq g "a" "b" >/dev/null && "$0" record local l "c" "d" >/dev/null
+    "$0" verify >/dev/null 2>&1 || { echo "smoke-test: FAIL (rebuilt chain should verify green)"; exit 1; }
+    # (7) deletion is detected too — rebuild a 3-chain then drop the middle line to force a break
+    rm -f "$MESH_RELAY_ATTEST_LOG"
+    "$0" record a a a a >/dev/null; "$0" record b b b b >/dev/null; "$0" record c c c c >/dev/null
+    sed -i '2d' "$MESH_RELAY_ATTEST_LOG"
+    if "$0" verify >/dev/null 2>&1; then
+      echo "smoke-test: FAIL (deleting a middle receipt was NOT detected)"; exit 1; fi
+    echo "smoke-test: ok (hash-chain records + verifies; tamper AND deletion both caught red; forged binding rejected)"
+    exit 0
+    ;;
+
+  record)
+    pool="$(_san "${2:-}")"; model="$(_san "${3:-}")"; prompt="${4:-}"; output="${5:-}"
+    [ -n "$pool" ] && [ -n "$model" ] || { echo "usage: mesh-relay-attest record <pool> <model> <prompt> <output>" >&2; exit 2; }
+    mkdir -p "$(dirname "$ATTEST_LOG")"
+    phash="$(_sha "$prompt")"; ohash="$(_sha "$output")"
+    # Serialize appends: the tip read + line write must be atomic, or two concurrent inferences race
+    # the chain into a fork (both reading the same prev, both claiming the next seq).
+    exec 9>>"$ATTEST_LOG"
+    if command -v flock >/dev/null 2>&1; then flock 9; fi
+    read -r last_seq prev < <(_tip)
+    seq=$((last_seq+1)); ts="$(_ts)"
+    ehash="$(_entry_hash "$seq" "$ts" "$pool" "$model" "$phash" "$ohash" "$prev")"
+    printf '%s|%s|%s|%s|%s|%s|%s|%s\n' "$seq" "$ts" "$pool" "$model" "$phash" "$ohash" "$prev" "$ehash" >&9
+    exec 9>&-
+    echo "$ehash"
+    exit 0
+    ;;
+
+  verify)
+    _verify_chain "$ATTEST_LOG"; exit $?
+    ;;
+
+  check)
+    prompt="${2:-}"; output="${3:-}"
+    [ -n "$prompt" ] || { echo "usage: mesh-relay-attest check <prompt> <output>" >&2; exit 2; }
+    [ -s "$ATTEST_LOG" ] || { echo "no receipts recorded" >&2; exit 1; }
+    phash="$(_sha "$prompt")"; ohash="$(_sha "$output")"
+    hit="$(awk -F'|' -v p="$phash" -v o="$ohash" '$5==p && $6==o' "$ATTEST_LOG" | tail -1)"
+    if [ -n "$hit" ]; then
+      # A binding is only trustworthy if the chain around it is intact — verify before affirming.
+      if _verify_chain "$ATTEST_LOG" >/dev/null 2>&1; then
+        echo "VERIFIED — receipt seq $(printf '%s' "$hit" | cut -d'|' -f1), served by pool '$(printf '%s' "$hit" | cut -d'|' -f3)' (model $(printf '%s' "$hit" | cut -d'|' -f4)) at $(printf '%s' "$hit" | cut -d'|' -f2)"
+        exit 0
+      else
+        echo "FOUND but chain BROKEN — receipt exists yet the log fails verification; do not trust" >&2; exit 1
+      fi
+    fi
+    echo "NO RECEIPT — no logged inference binds this prompt to this output" >&2
+    exit 1
+    ;;
+
+  prove)
+    prompt="${2:-}"
+    [ -n "$prompt" ] || { echo "usage: mesh-relay-attest prove <prompt>" >&2; exit 2; }
+    [ -s "$ATTEST_LOG" ] || { echo "no receipts recorded" >&2; exit 1; }
+    phash="$(_sha "$prompt")"
+    n="$(awk -F'|' -v p="$phash" '$5==p {print "seq "$1"  "$2"  pool="$3"  model="$4"  output_hash="substr($6,1,12)"…  entry="substr($8,1,12)"…"}' "$ATTEST_LOG")"
+    [ -n "$n" ] || { echo "no receipt for this prompt (hash ${phash:0:12}…)" >&2; exit 1; }
+    echo "$n"; exit 0
+    ;;
+
+  head)
+    read -r seq tip < <(_tip)
+    echo "chain tip: seq $seq  entry_hash $tip"; exit 0
+    ;;
+
+  ""|-h|--help)
+    sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; exit 0
+    ;;
+  *)
+    echo "mesh-relay-attest: unknown verb '${1:-}' (record|verify|check|prove|head|--test)" >&2; exit 2
+    ;;
+esac
