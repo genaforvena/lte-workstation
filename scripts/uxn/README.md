@@ -184,6 +184,29 @@ Next rungs (open): per-hop source routing (each leg of a multi-hop path carries 
 program); rom-vs-agent calibration ledger (run the ROM and a mind on the same predicate,
 log both — agent divergence becomes measurable against the fixed point).
 
+## Body self-gate (stage 4c, 2026-07-24) — the first hop consumer outside this dir
+
+`mesh-body-gate` (+ deploy shim in `scripts/`, `# reflex-cadence: */30 * * * *`): the adb
+body (Note3) gates its OWN battery/thermal. Each firing reads the phone's sysfs
+(capacity, temp deci-°C), substitutes into threshold-ledger rows via
+`mesh-sexpr-gate --expr` (the packer's verb: the substituted expression WITHOUT local
+eval — pure data transform, needs no local engine), packs the pinned `lisp-eval.rom` +
+expression as ONE argv packet, and runs it on the phone under `busybox sh` + the on-device
+armhf `uxncli` — **the receiver is the byte-identical `mesh-uxn-hop` script** (strictly
+POSIX since 4c; test 15 pins that under plain `sh` — a bashism in a rarely-taken branch
+died `Bad substitution` instead of refusing loud). Recalibration = a consts diff in
+`threshold-ledger` travelling in-band on the next run; the phone is never edited.
+
+Pin chain, end to end: ledger `# evaluator-sha1:` (read via `mesh-sexpr-gate --pin`, the
+one reader) == the ROM packed == the sha1 the receiver verifies pre-exec == the stamp the
+execution site sends back. Any link broken = loud rc 2 — `test-body-gate` proves the
+pack-site link *pre-dial* (a mutant neutering that comparison survived the loose grep via
+the second pin gate, the stamp check — the sharpened leg pins refusal ORDER), the absent
+body (honest rc 2, no state), and a live round with real reads. Verdicts land in
+`~/.mesh/body-gate.state` (`src=rom-body sha1=<pin>`); `body-thermal`'s prev state feeds
+back from the state file, so both hysteresis edges run through the one ledger row on the
+body too.
+
 ## Board invariant watcher (2026-07-23, operator: "the first one to actually write")
 
 `board-check.c` (chibicc-C → `board-check.rom`, 24.7 KB — the 20 KB board buffer dominates)
