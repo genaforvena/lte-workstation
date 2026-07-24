@@ -115,16 +115,25 @@ PSI range (`band-fixtures`).
 
 ## Portability (same ROM, two architectures)
 
-`build.sh` on each node compiles its own `uxncli`; **`lease-gate.rom` is never rebuilt**.
-See `verify-note3.sh` for the aarch/armhf cross-build + push + on-device run that executes
-the identical 134-byte ROM on the Note3 (armeabi-v7a) with matching verdicts (re-verified
-under the modern toolchain 2026-07-23, sha1 `442120b…` host==device).
+**`lease-gate.rom` is never rebuilt** — only the emulator is per-platform. `build.sh` needs a
+host compiler, and *mesh-home is the only node that has one* (measured 2026-07-24: the Note3
+is armeabi-v7a with no `cc` and no Termux; phaedra, x86_64, has no `cc` either). So the
+distribution model is **cross-build on mesh-home + push the binary**, not a per-node build.
+See `verify-note3.sh` for the armhf cross-build + `adb push` + on-device run that executes the
+identical 200-byte ROM on the Note3 with matching verdicts — re-verified 2026-07-24 with the
+net device compiled in, sha1 `c767efd9…` host==device, and step 4 asserting the pushed
+emulator is net-capable (a net-blind build answers a plausible `NA`, so the assertion greps
+for the loud `net:` line, not for a verdict). Static-armhf limit, measured on-device: no
+hostname resolution (glibc NSS is absent under bionic) — address Note3 ROMs by numeric IP;
+it fails loud and distinguishably, "Temporary failure in name resolution" vs "Connection
+refused".
 
 ## Measurements
 
 - **ROM:** 200 bytes (0.31% of the 64 KB Uxn address space; was 134 B before the
   2026-07-23 domain-honesty guards — parse-overflow + cad>32767 now answer NA/#82,
-  never a wrapped verdict; the Note3 byte-identity sha 442120b predates this).
+  never a wrapped verdict). Note3 byte-identity re-verified against this ROM 2026-07-24:
+  sha1 `c767efd9…`, host==device.
 - **Shim:** ~20 lines of logic.
 - **Runtime:** ~0.66 ms/run (process spawn + emulator boot + ROM eval), RSS ~1.5 MB, x86;
   measured on the pre-swap emulator, same order of magnitude on the modern one.

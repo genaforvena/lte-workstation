@@ -1,7 +1,14 @@
 #!/usr/bin/env bash
 # build.sh — compile the vendored Uxn toolchain (uxnasm + uxncli) for THIS platform.
-# The emulator is per-platform (~30KB C); the ROM it runs is portable and byte-identical
-# everywhere. Run this once per node (x86 workstation, aarch64 Note3/Termux, …).
+# The emulator is per-platform (~56KB with the net device); the ROM it runs is portable and
+# byte-identical everywhere.
+#
+# THIS SCRIPT NEEDS A HOST COMPILER, AND MOST MESH NODES DO NOT HAVE ONE. Measured
+# 2026-07-24: the Note3 is armeabi-v7a with no cc/gcc/clang and no Termux; phaedra (x86_64)
+# has no cc either. build.sh has only ever run on mesh-home. The distribution model for
+# every other node is therefore CROSS-BUILD HERE + PUSH THE BINARY, not a per-node build —
+# see verify-note3.sh, which cross-builds a static armhf uxncli and adb-pushes it. Do not
+# re-state the old "run this once per node (aarch64 Note3/Termux)" claim; it was never true.
 #   ./build.sh            → bin/uxnasm, bin/uxncli
 #   ./build.sh --rom      → also re-assemble lease-gate.tal + band-gate.tal → .rom
 #   ./build.sh --chibicc  → also build the vendored C→uxntal compiler → bin/chibicc (host cc only)
