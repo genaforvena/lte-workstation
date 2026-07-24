@@ -246,7 +246,7 @@ mesh-tell --peek <window>                                        # read the pane
 
 Rules:
 - One window per channel; each mind both *thinks* and *runs its own ops* in its pane. Send prompts/ops
-  to the right channel (code work → `genome`; coordination → `chat`; etc. — see the channel set below).
+  to the right channel (code work → `genome`; coordination → `witness`; etc. — see the channel set below).
 - Use `mesh-tell --peek <window>` to read the output after a command lands.
 - This is the standard autonomous operation pattern — `mesh-restore` plants the channel set. No
   operator needed for routine ops.
@@ -318,14 +318,31 @@ MIND). The current set (operator 2026-06-17 re-org — collapsed from the old 10
 run on the mind node only): **`minds`** (claude — orchestration/allocation) · **`genome`** (claude —
 autonomous development of the codebase + its own build/deploy ops) · **`tg`** (claude — operator
 Telegram comms) · **`senses`** (opencode — keep + develop the senses) · **`health`** (opencode —
-node/fleet health, `check` dash role) · **`chat`** (opencode — board/room coordination). A node that
-declares no `minds:` on its card runs none of these (HANDS-OFF). Engines/commands are overridable per
-node via `MESH_*_CMD` in `~/.mesh/restore.env`; a lean node restricts the set via `MESH_MIND_CHANNELS`.
+node/fleet health, `check` dash role) · **`witness`** (opencode — self-measurement AND board/room
+coordination: `chat` was **merged into it** 2026-07-24, two blind observers of the same fact having
+contradicted each other 60s apart). A node that declares no `minds:` on its card runs none of these
+(HANDS-OFF). Engines/commands are overridable per node via `MESH_*_CMD` in `~/.mesh/restore.env`; a
+lean node restricts the set via `MESH_MIND_CHANNELS`, and a channel decommissioned on a node goes in
+`MESH_RETIRED_CHANNELS` (no window planted at all, not even the data-only placeholder).
+
+**Never hand-maintain a roster count beside the roster.** `mesh-restore`'s closing summary said
+"(15-channel set)" and was wrong in BOTH directions at once on 2026-07-24 — still listing `chat`,
+merged that morning, AND counting `diary models room bruno`, retired on that node — claiming 15
+channels on a node running 11. It now counts the `ensure_uniform_channel` calls that actually
+planted, and prints retired names so a decommission reads as deliberate absence rather than a gap.
+
+**`witness` carries TWO DUTY CLASSES and they are not interchangeable** — on the TAPE (top half) it
+is read-only and never writes a measurement; on the BOARD (bottom half) it ACTS: files `[task]` from
+chat-review, drives stuck strands to owners, and is `mesh-mind-control`'s `AGENTIC_FALLBACK`. A merge
+that leaves only the passive charter ends the active lane green and silent — the dead-lane shape.
 
 ## Chat room & idle coordination (`mesh-chat`)
 
-Each node has a `chat` tmux window — the agents' rendezvous, *separate* from the durable
-trace. It's where agents talk **to each other** instead of scanning each other's panes.
+**The rendezvous is the LOG, not a window.** `~/.mesh/chat.log` (written by `mesh-chat` from every
+window) is where agents talk **to each other** instead of scanning each other's panes — *separate*
+from the durable trace. The board survived the 2026-07-24 chat→witness merge untouched precisely
+because it never lived in the `chat` window; that window only *tailed* it, and `witness` tails it now
+(bottom half of its dash).
 
 - Open/ensure it: `mesh-chat --commons` (adds a `chat` window to the node's session,
   live-tailing `~/.mesh/chat.log`).
