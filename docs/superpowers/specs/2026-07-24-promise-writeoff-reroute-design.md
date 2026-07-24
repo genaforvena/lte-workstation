@@ -96,10 +96,24 @@ an explicit tag over derivation everywhere else in the codebase's stated convent
    doesn't exist anywhere; a written-off promise and a genuinely-kept one look identical in the
    ledger today.
 
-**`mesh-promises --reroute <promise|claim|hold> <owner-or-debtor-or-taker>/<slug> --owner <new-window> --reason "<text>"`**
+**`mesh-promises --reroute <promise|claim> <owner-or-debtor>/<slug> --owner <new-window> --reason "<text>"`**
 
-Same validated lookup and failure mode as writeoff. Posts *two* board lines so the audit trail
-threads on the board instead of silently vanishing:
+**`hold` is deliberately excluded from `--reroute`** — a correction found while grounding this spec
+against the actual replay code, not a simplification for its own sake. A promise's `owner:` and a
+claim's addressed debtor are both plain body text (`owner_of()`/`parse_addressed()` parse them from
+`body`) — *anyone* can post a `[task]`/`[verify]` naming any window, which is exactly what reroute's
+repost needs. A HOLD's `taker` is not body text — it's `holds[who]`, keyed by **who actually posted**
+the `[taking]` line (`taking_slug_and_rest()` is only ever called with the poster's own identity).
+`mesh-chat` posts as its caller; nothing can post `[taking]` *as* a different window without
+impersonating it, which CLAUDE.md explicitly forbids ("a subagent posting to mesh-chat impersonates
+the window and corrupts claim routing"). So a hold can't be reassigned by reposting — it can only be
+freed. `--reroute hold ...` is refused with a message pointing at the real fix: `--writeoff hold
+<taker>/<slug>`, then have the new window post its own `[taking] <slug>: ...` — which is the correct
+mechanism anyway, since taking a claim should always be a window's own deliberate act, not something
+an admin command does on its behalf.
+
+Same validated lookup and failure mode as writeoff. For `promise`/`claim`, posts *two* board lines so
+the audit trail threads on the board instead of silently vanishing:
 1. `[done] rerouted: <type> <owner>/<slug> — to <new-window> (<reason>)` — closes the old item via
    its own `equity:*:reroute` leg (distinct from both `kept` and `writeoff` — three distinguishable
    outcomes, not two).
@@ -133,8 +147,10 @@ a judgment call a heuristic must never make alone. So automation is split accord
 one master switch — `MESH_PROMISE_AUTOREACT=1` (default off, same opt-in shape as the existing
 `MESH_PROMISE_POST`) — evaluated once per `--feed` cycle, after the normal leak computation:
 
-**Auto-reroute (reversible → automatable, tightly gated).** A `--feed` run may perform the
-equivalent of `--reroute` itself when **all** of: (a) the item is `:unrouted`, (b) Component C's
+**Auto-reroute (reversible → automatable, tightly gated), promise/claim only — see Component B's
+hold exclusion.** A `--feed` run may perform the
+equivalent of `--reroute` itself when **all** of: (a) the item is a `:unrouted` promise or claim
+(never a hold — `--reroute` structurally can't apply to one), (b) Component C's
 suggested-owner is unambiguous — top charter-overlap score beats the runner-up by
 `MESH_PROMISE_AUTOREROUTE_MARGIN` (default 2) and clears an absolute floor
 `MESH_PROMISE_AUTOREROUTE_MIN` (default 3 overlapping tokens), (c) it is **not** `priority:incident`
@@ -197,6 +213,10 @@ New assertions added to the existing `do_test()` fixture set, each proving a rea
    `equity:promises:reroute`, distinguishable from both `kept` and `writeoff` counts.
 4. `--reroute --owner <non-roster-window>` is refused (same message as `--check`'s existing
    quarantine guidance), no board post issued.
+4b. `--reroute hold <taker>/<slug> --owner <new-window> --reason "..."` is refused outright (type
+   validation, before any lookup) with a message pointing at `--writeoff hold` instead — regression
+   guard for the poster-identity finding above; `--writeoff hold <taker>/<slug>` on the same fixture
+   still succeeds.
 5. Component A: a synthetic board with a non-roster `[taking]` taker and a non-roster `[verify]`
    debtor both surface `claim_unrouted=1 hold_unrouted=1` in `counts` mode (today's fixture only
    covers the promise case, per test 14 in the existing suite).
