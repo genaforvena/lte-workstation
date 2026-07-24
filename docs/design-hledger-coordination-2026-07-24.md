@@ -157,3 +157,7 @@ copy). Test over a REAL link drop rip↔mesh-home. **Owner: tg.**
 - [ ] discover + witness: board→journal tag schema + query surface (Direction 1)
 - [ ] verify dispatch fires post-merge (Direction 3 guardrail)
 - [ ] cleanup: remove `minds`/`chat` from mesh-mind-control manifest + siblings, land
+- [ ] tentative — operator floated a possible 4th axis: **values**. Evaluate candidate work /
+      tradeoffs using hledger too, alongside money/promises/labour (e.g. a commodity for
+      relative priority or worth, so "is this task worth doing" becomes a query like the other
+      three). Not scoped, not designed — parking the idea here. (2026-07-24)
