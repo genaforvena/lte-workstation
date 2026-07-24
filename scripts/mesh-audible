@@ -1,0 +1,331 @@
+#!/usr/bin/env bash
+# mesh-audible — CAN THIS NODE'S VOICE ACTUALLY BE HEARD? the missing sense under mesh-say.
+#
+# The mesh had an occupancy sense (is anyone in the room) and no AUDIBILITY sense (can they hear
+# it). So `mesh-say --deliver` routed a MUST-DELIVER line on occupancy alone: room OCCUPIED →
+# speak locally → straight into mesh-home's audio stack, whose only sink is an S/PDIF passthrough
+# with nothing on the far end. The line was lost and the trace said "said aloud". Same shape as the
+# Bose Revolve (sink enumerates while the speaker is POWERED OFF; pw-play rc=0; 15h of silence read
+# green) and as `delivered` being a claim about curl's exit code.
+#
+#   mesh-audible                 verdict + one-line reason. rc 0 PROVEN · 1 NO · 2 UNKNOWN
+#   mesh-audible --json          same, machine-readable
+#   mesh-audible --why           verdict + every input it looked at (the audit view)
+#   mesh-audible --prove [sec]   ACOUSTIC proof: play a probe while recording, require an RMS rise,
+#                                and only then write the proof ledger. Needs a working mic → honest
+#                                n/a (rc 2) where there is none. This is the ONLY thing that can
+#                                mint PROVEN.
+#   mesh-audible --test          RED-first verdict-table + ledger + prove-gating assertions. Silent.
+#
+# THE CONTRACT, and the whole point: **a structural read can only ever return NO or UNKNOWN, never
+# PROVEN.** Software cannot prove that air moved. A sink existing, a mixer at 72%, pw-play rc=0 are
+# claims about an interface, not about an amplifier. PROVEN comes from one place only: a recorded
+# acoustic rise in the ledger (or an explicit, LOUDLY-reported operator override). Consumers must
+# treat UNKNOWN as "route around", not as "probably fine" — that inversion is the entire bug.
+#
+# rc 2 (UNKNOWN) is therefore the COMMON case on a node with a digital or USB sink and no mic. That
+# is honest, not a defect: the caller still delivers the line, just over a channel it can verify.
+#
+# orphan-ok: on-demand sense, consumed by mesh-say --deliver (and any future voice organ); the proof
+# side needs a physically-present operator to power a speaker, so it is not cron-wireable.
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+usage(){ sed -n '2,/^[^#]/p' "$0" | sed -n 's/^# \?//p'; }
+case "${1:-}" in -h|--help) usage; exit 0 ;; esac
+
+LEDGER="${MESH_AUDIBLE_LOG:-$HOME/.mesh/audible.log}"
+PROOF_TTL="${MESH_AUDIBLE_PROOF_TTL:-86400}"   # a proof is about PHYSICAL state (is the speaker on) —
+                                               # it has no producer cadence to outlive, so it expires.
+ASOUND="${MESH_AUDIBLE_ASOUND:-/proc/asound}"
+RISE_MIN="${MESH_AUDIBLE_RISE:-3.0}"           # probe RMS / baseline RMS. Bose-vs-Note3 measured ~6.8.
+
+# ── inputs ────────────────────────────────────────────────────────────────────────────────────────
+# The sink list is read as RAW pactl TEXT through ONE parser. The test hook injects that same text,
+# so a fixture exercises the real parser instead of bypassing it (injected-fixture-bypasses-parser).
+sinks_raw(){
+  if [ -n "${MESH_AUDIBLE_SINKS_CMD:-}" ]; then eval "$MESH_AUDIBLE_SINKS_CMD" 2>/dev/null; return 0; fi
+  command -v pactl >/dev/null 2>&1 || return 0
+  pactl list short sinks 2>/dev/null || true
+}
+# auto_null / dummy sinks are PipeWire's "no device" placeholder — a sink that is by construction
+# inaudible. Filtering them here is what turns "a sink exists" into "an endpoint exists".
+real_sinks(){ sinks_raw | awk 'NF && $2 !~ /auto_null|dummy/ {print $2}'; }
+
+# The default sink is only meaningful if it is ONE OF the sinks we actually read. Asking `pactl info`
+# independently of the sink list was a real bug caught by this tool's own --test: with an injected
+# fixture the live default sink still won, so four verdict assertions passed VACUOUSLY (they happened
+# to expect the live node's answer). Membership also fixes the honest case — a default pointing at a
+# removed device is stale, and the first real sink is the better answer.
+default_sink(){
+  if [ -n "${MESH_AUDIBLE_DEFAULT_SINK:-}" ]; then printf '%s' "$MESH_AUDIBLE_DEFAULT_SINK"; return; fi
+  local d="" first
+  first="$(real_sinks | head -1)"
+  command -v pactl >/dev/null 2>&1 && [ -z "${MESH_AUDIBLE_SINKS_CMD:-}" ] \
+    && d="$(pactl info 2>/dev/null | sed -n 's/^Default Sink: *//p' | head -1)"
+  case "$d" in ""|*auto_null*|*dummy*) printf '%s' "$first"; return ;; esac
+  # keep it only if the sink list agrees it exists
+  if real_sinks | grep -qxF "$d"; then printf '%s' "$d"; else printf '%s' "$first"; fi
+}
+
+# An HDMI/DisplayPort sink has a REAL connection sense: the ELD reports whether a monitor answered.
+# All-zero across every ELD = no attached endpoint = provably inaudible over that path. Scanning all
+# cards rather than mapping the sink's own card is deliberate: it can only make the verdict KINDER
+# (we say NO strictly less often), never falsely optimistic in the other direction.
+hdmi_monitor_present(){
+  local f n
+  for f in "$ASOUND"/card*/eld*; do
+    [ -f "$f" ] || continue
+    n="$(sed -n 's/^monitor_present[[:space:]]*//p' "$f" 2>/dev/null | head -1)"
+    [ "${n:-0}" = 1 ] && return 0
+  done
+  return 1
+}
+
+# A ledger row: <iso> proof sink=<name> rise=<f> rms=<probe>/<base> node=<h>
+# Keyed on the SINK NAME, because that is what the proof is about — repoint the default sink at a
+# different device and the old proof says nothing about the new one.
+proof_age_for(){          # $1 sink → prints age in seconds, or nothing when unproven
+  local sink="$1" ts row now
+  [ -f "$LEDGER" ] || return 1
+  row="$(grep -F " proof sink=$sink " "$LEDGER" 2>/dev/null | tail -1)" || true
+  [ -n "$row" ] || return 1
+  ts="${row%% *}"
+  now="$(date -u +%s)"
+  local then; then="$(date -u -d "$ts" +%s 2>/dev/null)" || return 1
+  printf '%s' "$(( now - then ))"
+}
+
+# ── the verdict ───────────────────────────────────────────────────────────────────────────────────
+# Sets VERDICT / REASON. Order matters: proof first (it is the only PROVEN source), then the
+# structural reads, which are allowed to conclude NO or UNKNOWN and nothing else.
+decide(){
+  SINK="$(default_sink)"
+  local nsinks; nsinks="$(real_sinks | wc -l)"
+
+  # Operator override, per node in ~/.mesh/nodes. Deliberately LOUD: it names itself in the reason so
+  # an assumed-audible node can never look like a measured one (escape-hatch-after-imperative).
+  case "${MESH_AUDIBLE_ASSUME:-}" in
+    PROVEN) VERDICT=PROVEN; REASON="operator override MESH_AUDIBLE_ASSUME=PROVEN (ASSERTED, not measured; sink=${SINK:-none})"; return ;;
+    NO)     VERDICT=NO;     REASON="operator override MESH_AUDIBLE_ASSUME=NO"; return ;;
+  esac
+
+  if [ "$nsinks" = 0 ]; then
+    VERDICT=NO; REASON="no real sink (${SINK:+default=$SINK, }only auto_null/dummy or no pactl) — nothing can emit"; return
+  fi
+
+  local age; age="$(proof_age_for "$SINK")" || age=""
+  if [ -n "$age" ]; then
+    if [ "$age" -le "$PROOF_TTL" ]; then
+      VERDICT=PROVEN; REASON="acoustic proof for sink=$SINK, ${age}s old (ttl ${PROOF_TTL}s)"; return
+    fi
+    VERDICT=UNKNOWN; REASON="acoustic proof for sink=$SINK EXPIRED (${age}s > ttl ${PROOF_TTL}s) — speaker may have been powered off since"; return
+  fi
+
+  case "$SINK" in
+    *hdmi*|*HDMI*)
+      if hdmi_monitor_present; then
+        VERDICT=UNKNOWN; REASON="hdmi sink=$SINK, a monitor IS attached (ELD present) but its volume/amp is unknowable — run --prove"
+      else
+        VERDICT=NO; REASON="hdmi sink=$SINK and NO monitor on any ELD (monitor_present=0) — provably no endpoint"
+      fi ;;
+    *iec958*|*spdif*)
+      VERDICT=UNKNOWN; REASON="sink=$SINK is S/PDIF digital passthrough — it has NO connection sense at all, accepts every stream and emits nothing when unplugged" ;;
+    *usb*|*USB*)
+      VERDICT=UNKNOWN; REASON="sink=$SINK is USB — a USB speaker enumerates while POWERED OFF (Bose Revolve, 15h silent and green), so presence proves nothing" ;;
+    *analog*)
+      VERDICT=UNKNOWN; REASON="sink=$SINK is analog — a detected jack is a plug, not a powered amp; only --prove settles it" ;;
+    *)
+      VERDICT=UNKNOWN; REASON="sink=$SINK of unrecognised class — no structural read available" ;;
+  esac
+}
+
+rc_for(){ case "$1" in PROVEN) echo 0 ;; NO) echo 1 ;; *) echo 2 ;; esac; }
+
+# ── --prove: the only thing that can mint PROVEN ─────────────────────────────────────────────────
+# Play a probe tone at the default sink while recording from the default source; require the probe
+# window's RMS to exceed a silent baseline by RISE_MIN. Writes the ledger ONLY on a real rise. No
+# recorder, no player, or a flat-zero mic → rc 2 and NO ledger row: an unprovable node stays UNKNOWN
+# rather than being upgraded by the absence of evidence.
+rms_of(){ # $1 wav → prints integer RMS, or nothing
+  python3 - "$1" <<'PY' 2>/dev/null
+import sys, wave, struct, math
+try:
+    w = wave.open(sys.argv[1], 'rb')
+except Exception:
+    sys.exit(1)
+sw, n = w.getsampwidth(), w.getnframes()
+if n == 0 or sw not in (1, 2, 4):
+    sys.exit(1)
+raw = w.readframes(n)
+fmt = {1: 'b', 2: 'h', 4: 'i'}[sw]
+cnt = len(raw) // sw
+if cnt == 0:
+    sys.exit(1)
+vals = struct.unpack('<%d%s' % (cnt, fmt), raw[:cnt * sw])
+scale = {1: 256.0, 2: 1.0, 4: 1 / 65536.0}[sw]   # normalise toward 16-bit units
+print(int(math.sqrt(sum((v * scale) ** 2 for v in vals) / cnt)))
+PY
+}
+
+make_probe(){ # $1 out.wav, $2 seconds — a 440Hz tone, no external tool needed
+  python3 - "$1" "$2" <<'PY' 2>/dev/null
+import sys, wave, struct, math
+out, secs = sys.argv[1], float(sys.argv[2])
+sr = 48000
+w = wave.open(out, 'wb'); w.setnchannels(1); w.setsampwidth(2); w.setframerate(sr)
+w.writeframes(b''.join(struct.pack('<h', int(22000 * math.sin(2 * math.pi * 440 * i / sr)))
+                       for i in range(int(sr * secs))))
+w.close()
+PY
+}
+
+do_prove(){
+  local secs="${1:-3}" player recorder
+  for c in pw-play paplay aplay; do command -v "$c" >/dev/null 2>&1 && { player="$c"; break; }; done
+  for c in pw-record arecord; do command -v "$c" >/dev/null 2>&1 && { recorder="$c"; break; }; done
+  command -v python3 >/dev/null 2>&1 || { echo "mesh-audible --prove: n/a (no python3 to build/measure the probe)" >&2; exit 2; }
+  [ -n "${player:-}" ]   || { echo "mesh-audible --prove: n/a (no player: pw-play/paplay/aplay)" >&2; exit 2; }
+  [ -n "${recorder:-}" ] || { echo "mesh-audible --prove: n/a (no recorder — audibility is UNPROVABLE on a node with no mic)" >&2; exit 2; }
+  local sink; sink="$(default_sink)"
+  [ -n "$sink" ] || { echo "mesh-audible --prove: n/a (no sink to prove)" >&2; exit 2; }
+
+  local d; d="$(mktemp -d /tmp/mesh-audible-XXXXXX)"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$d'" EXIT
+  make_probe "$d/probe.wav" "$secs"
+  [ -s "$d/probe.wav" ] || { echo "mesh-audible --prove: FAIL (could not synthesize the probe)" >&2; exit 1; }
+
+  local rec_base rec_live
+  case "$recorder" in
+    pw-record) rec_base="pw-record --target=0 '$d/base.wav'"; rec_live="pw-record --target=0 '$d/live.wav'" ;;
+    arecord)   rec_base="arecord -q -f S16_LE -r 48000 -c 1 '$d/base.wav'"; rec_live="arecord -q -f S16_LE -r 48000 -c 1 '$d/live.wav'" ;;
+  esac
+  # baseline: record the room WITHOUT the probe
+  timeout "$((secs + 3))" bash -c "$rec_base" >/dev/null 2>&1 &
+  local rp=$!; sleep "$secs"; kill "$rp" 2>/dev/null; wait "$rp" 2>/dev/null || true
+  # live: record WHILE playing the probe
+  timeout "$((secs + 3))" bash -c "$rec_live" >/dev/null 2>&1 &
+  rp=$!
+  timeout "$((secs + 5))" "$player" "$d/probe.wav" >/dev/null 2>&1 || true
+  kill "$rp" 2>/dev/null; wait "$rp" 2>/dev/null || true
+
+  local base live
+  base="$(rms_of "$d/base.wav")"; live="$(rms_of "$d/live.wav")"
+  [ -n "$base" ] && [ -n "$live" ] || { echo "mesh-audible --prove: n/a (recorder produced no measurable audio — mic dead? cf. mesh-home webcam/ALC897)" >&2; exit 2; }
+  if [ "$base" = 0 ] && [ "$live" = 0 ]; then
+    echo "mesh-audible --prove: n/a (mic reads FLAT ZERO — this measures the mic, not the speaker; no proof written)" >&2; exit 2
+  fi
+  local rise; rise="$(python3 -c "b=max($base,1); print('%.2f' % ($live/b))" 2>/dev/null || echo 0)"
+  local ok; ok="$(python3 -c "print(1 if $rise >= $RISE_MIN else 0)" 2>/dev/null || echo 0)"
+  if [ "$ok" = 1 ]; then
+    mkdir -p "$(dirname "$LEDGER")"
+    printf '%s proof sink=%s rise=%s rms=%s/%s node=%s\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$sink" "$rise" "$live" "$base" "$(hostname)" >> "$LEDGER"
+    echo "mesh-audible --prove: PROVEN (sink=$sink rise=${rise}x rms=$live vs base=$base) → ledger"
+    exit 0
+  fi
+  mkdir -p "$(dirname "$LEDGER")"
+  printf '%s silent sink=%s rise=%s rms=%s/%s node=%s\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$sink" "$rise" "$live" "$base" "$(hostname)" >> "$LEDGER"
+  echo "mesh-audible --prove: SILENT — sink=$sink accepted the stream and the room did not change (rise ${rise}x < ${RISE_MIN}x). Speaker powered off / unplugged." >&2
+  exit 1
+}
+
+# ── --test ────────────────────────────────────────────────────────────────────────────────────────
+# RED-first and SILENT: never plays a probe (a smoke sweep must not make sound in a shared room), so
+# --prove is asserted by its GATING, and the verdict table by injected raw pactl text + a scratch
+# ledger. Every case below was watched fail against a deliberately broken decide().
+if [ "${1:-}" = --test ]; then
+  command -v python3 >/dev/null 2>&1 || { echo "smoke-test: n/a (no python3)"; exit 2; }
+  T="$(mktemp -d /tmp/mesh-audible-test-XXXXXX)"; trap 'rm -rf "$T"' EXIT
+  mkdir -p "$T/asound/card0"
+  run(){ MESH_AUDIBLE_LOG="$T/led.log" MESH_AUDIBLE_ASOUND="$T/asound" "$0" "$@" 2>/dev/null; }
+  vr(){ run --json | sed -n 's/.*"verdict": *"\([^"]*\)".*/\1/p'; }
+
+  # 1. no real sink → NO(1). auto_null must NOT read as an endpoint.
+  out="$(MESH_AUDIBLE_SINKS_CMD='printf "0\tauto_null\tPipeWire\ts16le\tSUSPENDED\n"' vr)"
+  [ "$out" = NO ] || { echo "smoke-test: FAIL (auto_null-only → expected NO, got '$out')"; exit 1; }
+  MESH_AUDIBLE_SINKS_CMD='printf "0\tauto_null\tPipeWire\ts16le\tSUSPENDED\n"' run >/dev/null; [ "$?" = 1 ] \
+    || { echo "smoke-test: FAIL (NO must exit 1)"; exit 1; }
+
+  # 2. S/PDIF → UNKNOWN(2), never PROVEN. This is mesh-home's live case and the reason the sense exists.
+  SP='printf "54\talsa_output.pci-0000_2d_00.4.iec958-stereo\tPipeWire\ts32le\tSUSPENDED\n"'
+  out="$(MESH_AUDIBLE_SINKS_CMD="$SP" vr)"
+  [ "$out" = UNKNOWN ] || { echo "smoke-test: FAIL (iec958 → expected UNKNOWN, got '$out')"; exit 1; }
+  MESH_AUDIBLE_SINKS_CMD="$SP" run >/dev/null; [ "$?" = 2 ] || { echo "smoke-test: FAIL (UNKNOWN must exit 2)"; exit 1; }
+
+  # 3. USB → UNKNOWN even though the sink is present and running (the Bose powered-off trap).
+  out="$(MESH_AUDIBLE_SINKS_CMD='printf "9\talsa_output.usb-Bose_Revolve-00.analog-stereo\tPipeWire\ts16le\tRUNNING\n"' vr)"
+  [ "$out" = UNKNOWN ] || { echo "smoke-test: FAIL (usb sink → expected UNKNOWN, got '$out')"; exit 1; }
+
+  # 4. HDMI with every ELD monitor_present=0 → NO; flip ONE ELD to 1 and the same input must go
+  #    UNKNOWN. Asserting both directions with a fresh artifact each way (a one-way gate is no gate).
+  HD='printf "7\talsa_output.pci-0000_01_00.1.hdmi-stereo\tPipeWire\ts16le\tSUSPENDED\n"'
+  printf 'monitor_present\t\t0\neld_valid\t\t0\n' > "$T/asound/card0/eld#0.0"
+  out="$(MESH_AUDIBLE_SINKS_CMD="$HD" vr)"
+  [ "$out" = NO ] || { echo "smoke-test: FAIL (hdmi + no monitor → expected NO, got '$out')"; exit 1; }
+  printf 'monitor_present\t\t1\neld_valid\t\t1\n' > "$T/asound/card0/eld#0.0"
+  out="$(MESH_AUDIBLE_SINKS_CMD="$HD" vr)"
+  [ "$out" = UNKNOWN ] || { echo "smoke-test: FAIL (hdmi + monitor attached → expected UNKNOWN, got '$out')"; exit 1; }
+
+  # 5. THE CORE CONTRACT: a ledger proof for THIS sink mints PROVEN(0) — and a proof for a DIFFERENT
+  #    sink must not, or the proof would be about the wrong device.
+  printf '%s proof sink=alsa_output.pci-0000_2d_00.4.iec958-stereo rise=6.80 rms=1500/220 node=t\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$T/led.log"
+  out="$(MESH_AUDIBLE_SINKS_CMD="$SP" vr)"
+  [ "$out" = PROVEN ] || { echo "smoke-test: FAIL (fresh proof for this sink → expected PROVEN, got '$out')"; exit 1; }
+  MESH_AUDIBLE_SINKS_CMD="$SP" run >/dev/null; [ "$?" = 0 ] || { echo "smoke-test: FAIL (PROVEN must exit 0)"; exit 1; }
+  out="$(MESH_AUDIBLE_SINKS_CMD='printf "9\talsa_output.usb-Other-00.analog-stereo\tPipeWire\ts16le\tRUNNING\n"' vr)"
+  [ "$out" = UNKNOWN ] || { echo "smoke-test: FAIL (proof is sink-keyed: other sink must stay UNKNOWN, got '$out')"; exit 1; }
+
+  # 6. An EXPIRED proof decays to UNKNOWN — the speaker may have been powered off meanwhile.
+  printf '%s proof sink=alsa_output.pci-0000_2d_00.4.iec958-stereo rise=6.80 rms=1500/220 node=t\n' \
+    "$(date -u -d '30 days ago' +%Y-%m-%dT%H:%M:%SZ)" > "$T/led.log"
+  out="$(MESH_AUDIBLE_SINKS_CMD="$SP" vr)"
+  [ "$out" = UNKNOWN ] || { echo "smoke-test: FAIL (expired proof → expected UNKNOWN, got '$out')"; exit 1; }
+
+  # 7. --prove must refuse to mint anything without a recorder, and must write NO ledger row. An
+  #    unprovable node stays UNKNOWN; absence of evidence must never read as evidence.
+  rm -f "$T/led.log"
+  pd="$T/pathstub"; mkdir -p "$pd"
+  for c in python3 date hostname mktemp sed awk grep printf timeout sleep kill wc cut getent bash; do
+    p="$(command -v "$c" 2>/dev/null)" && ln -sf "$p" "$pd/$c"
+  done
+  for c in pw-play paplay aplay; do p="$(command -v "$c" 2>/dev/null)" && ln -sf "$p" "$pd/$c"; done
+  po="$(PATH="$pd" MESH_AUDIBLE_LOG="$T/led.log" MESH_AUDIBLE_SINKS_CMD="$SP" "$0" --prove 1 2>&1)"; prc=$?
+  [ "$prc" = 2 ] || { echo "smoke-test: FAIL (--prove with no recorder must be n/a rc=2, got $prc: $po)"; exit 1; }
+  printf '%s' "$po" | grep -q 'no recorder' || { echo "smoke-test: FAIL (--prove n/a must NAME the missing recorder, got: $po)"; exit 1; }
+  [ -f "$T/led.log" ] && { echo "smoke-test: FAIL (--prove wrote a ledger row without proving anything)"; exit 1; }
+
+  # 8. The override is loud: PROVEN-by-assertion must SAY it was asserted, so it can never be read
+  #    back as a measurement.
+  out="$(MESH_AUDIBLE_ASSUME=PROVEN MESH_AUDIBLE_SINKS_CMD="$SP" run --why)"
+  printf '%s' "$out" | grep -q 'ASSERTED, not measured' \
+    || { echo "smoke-test: FAIL (MESH_AUDIBLE_ASSUME=PROVEN must self-identify as asserted, got: $out)"; exit 1; }
+
+  # 9. The live node read must work through the REAL parser (no fixture) and land in the contract.
+  lv="$("$0" --json 2>/dev/null | sed -n 's/.*"verdict": *"\([^"]*\)".*/\1/p')"
+  case "$lv" in PROVEN|NO|UNKNOWN) ;; *) echo "smoke-test: FAIL (live read gave '$lv', not a contract verdict)"; exit 1 ;; esac
+
+  echo "smoke-test: ok (9 assertions: no-sink/spdif/usb/hdmi-both-edges/proof-keyed/expiry/prove-gated-no-ledger/loud-override/live=$lv)"
+  exit 0
+fi
+
+decide
+case "${1:-}" in
+  --prove) shift; do_prove "${1:-3}" ;;
+  --json)  printf '{"verdict":"%s","rc":%s,"sink":"%s","reason":"%s","node":"%s","ts":"%s"}\n' \
+             "$VERDICT" "$(rc_for "$VERDICT")" "$SINK" "$REASON" "$(hostname)" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" ;;
+  --why)
+    echo "audibility: $VERDICT — $REASON"
+    echo "  default sink : ${SINK:-<none>}"
+    echo "  real sinks   : $(real_sinks | tr '\n' ' ')"
+    echo "  hdmi monitor : $(hdmi_monitor_present && echo present || echo absent)"
+    echo "  proof ledger : $LEDGER $([ -f "$LEDGER" ] && echo "($(wc -l < "$LEDGER") rows)" || echo '(none)')"
+    echo "  proof ttl    : ${PROOF_TTL}s"
+    ;;
+  ""|--verdict) echo "audibility: $VERDICT — $REASON" ;;
+  *) echo "usage: $0 [--json|--why|--prove [sec]|--test]" >&2; exit 2 ;;
+esac
+exit "$(rc_for "$VERDICT")"
