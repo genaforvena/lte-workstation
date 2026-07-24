@@ -22,7 +22,50 @@ REG="${MESH_RNS_NODES:-$HOME/.mesh/rns-nodes}"
 ALLOW="${MESH_RNS_ALLOWED:-$HOME/.mesh/rns-allowed}"
 EXID="$HOME/.mesh/rns-exec.id"
 
+# --- reconnect (interactive shell) tuning; overridable + injectable for --test ---
+RNSH_BIN="${MESH_RNSH_BIN:-$PY/rnsh}"   # the wrapped binary (a stub in --test)
+RNS_SLEEP="${MESH_RNS_SLEEP:-sleep}"    # replaced by `true` in --test to skip the countdown
+RNS_MAX="${MESH_RNS_RECONNECT_MAX:-20}" # reconnect budget after a drop before giving up
+RNS_STABLE="${MESH_RNS_STABLE_SECS:-30}" # a session that ran >= this long earns a FRESH budget
+# far-side default command for served rnsh: a persistent tmux so the shell (and any running
+# job) SURVIVES a link drop — reconnect re-attaches the same session, not a fresh shell.
+# Set MESH_RNS_TMUX="" to serve a plain login shell instead.
+RNS_TMUX="${MESH_RNS_TMUX-rns}"
+
 [ -x "$PY/rnx" ] || { echo "mesh-rns-sh: n/a — no rns venv at $PY" >&2; exit 2; }
+
+# new attempt counter for a session that just ended: a stable (long) session resets the budget to
+# 0, so a normally-solid link that drops now and then never exhausts its retries; a session that
+# died fast bumps the counter toward the cap. Pure + testable: echoes the new attempt number.
+_reconnect_attempt(){ # elapsed prev_attempt
+  if [ "${1:-0}" -ge "$RNS_STABLE" ]; then echo 0; else echo $(( ${2:-0} + 1 )); fi
+}
+# backoff seconds for an attempt: 1,2,4,8,16 (capped). Pure + testable.
+_backoff(){ local a="${1:-0}"; [ "$a" -gt 4 ] && a=4; echo $(( 1 << a )); }
+
+# the interactive shell as a reconnect LOOP (not exec): rnsh has no resume, and a dropped link
+# and a clean exit both surface as rc 0, so the ONLY trustworthy "the human wants out" signal is
+# them aborting the reconnect countdown (Ctrl-C) — everything else is treated as a recoverable
+# drop and re-dialled, bounded by the budget+backoff. Uses $RNSH_BIN/$RNS_SLEEP so --test can
+# drive the REAL loop against a controllable stub.
+_interactive_loop(){ # node rnsh_hash
+  local node="$1" hash="$2" attempt=0 start end elapsed rc d
+  while :; do
+    start="$(date +%s)"
+    "$RNSH_BIN" -i "$EXID" "$hash"; rc=$?
+    end="$(date +%s)"; elapsed=$(( end - start ))
+    attempt="$(_reconnect_attempt "$elapsed" "$attempt")"
+    if [ "$attempt" -ge "$RNS_MAX" ]; then
+      echo "mesh-rns-sh: link to $node ended (rc=$rc) — reconnect budget exhausted ($RNS_MAX). Giving up." >&2
+      return "$rc"
+    fi
+    d="$(_backoff "$attempt")"
+    echo "mesh-rns-sh: link to $node ended (rc=$rc) — reconnecting in ${d}s [attempt $attempt/$RNS_MAX] (Ctrl-C to quit)…" >&2
+    trap 'echo; echo "mesh-rns-sh: reconnect cancelled — bye." >&2; return 0' INT
+    "$RNS_SLEEP" "$d"
+    trap - INT
+  done
+}
 
 allowed_flags(){  # emit "-a h1 -a h2 …" from the allowlist (empty => caller decides)
   [ -f "$ALLOW" ] || return 0
@@ -39,8 +82,15 @@ serve(){
     nohup "$@" >"$HOME/.mesh/rns-$n.log" 2>&1 </dev/null & echo $! > "$p"; }
   # shellcheck disable=SC2086
   _up rnx  "$PY/rnx"  -l -i "$EXID" $af
-  # shellcheck disable=SC2086
-  _up rnsh "$PY/rnsh" -l $af
+  # rnsh listener serves a PERSISTENT tmux by default (survives link drops → reconnect re-attaches
+  # the same shell). The rnx one-shot listener above is untouched — commands still run directly.
+  if [ -n "$RNS_TMUX" ]; then
+    # shellcheck disable=SC2086
+    _up rnsh "$PY/rnsh" -l $af -- tmux new-session -A -s "$RNS_TMUX"
+  else
+    # shellcheck disable=SC2086
+    _up rnsh "$PY/rnsh" -l $af
+  fi
   sleep 3
   local rnxd rnshd
   rnxd=$("$PY/rnx" -i "$EXID" -p 2>/dev/null | awk '/Listening/{gsub(/[<>]/,"",$NF);print $NF}')
@@ -64,6 +114,20 @@ case "${1:-}" in
     _al="$(mktemp)"; printf 'aaaa\n# c\nbbbb\n' > "$_al"
     [ "$(ALLOW="$_al" allowed_flags)" = " -a aaaa -a bbbb" ] || { echo "test: FAIL (allowed_flags)"; fails=1; }
     rm -f "$_al"
+    # 3a) RECONNECT decision logic (pure): stable session resets budget, fast death bumps it.
+    [ "$( RNS_STABLE=30; _reconnect_attempt 40 5 )" = 0 ]  || { echo "test: FAIL (_reconnect_attempt: stable session must reset budget to 0)"; fails=1; }
+    [ "$( RNS_STABLE=30; _reconnect_attempt 2 5 )"  = 6 ]  || { echo "test: FAIL (_reconnect_attempt: fast death must bump budget)"; fails=1; }
+    [ "$(_backoff 0)" = 1 ] && [ "$(_backoff 3)" = 8 ] && [ "$(_backoff 9)" = 16 ] || { echo "test: FAIL (_backoff: expected 1,8,16 capped)"; fails=1; }
+    # 3b) RECONNECT LOOP (real control flow, stubbed binary): a stub that always "drops" (rc 1) must
+    #     be RE-INVOKED until the budget caps — exercising the actual loop, backoff-skip, and give-up,
+    #     not a mock of them. Asserts the wrapper re-dialled exactly RNS_MAX times then exited (no hang).
+    _cnt="$(mktemp)"; _stub="$(mktemp)"
+    printf '#!/usr/bin/env bash\necho x >> "%s"\nexit 1\n' "$_cnt" > "$_stub"; chmod +x "$_stub"
+    MESH_RNSH_BIN="$_stub" MESH_RNS_SLEEP=true MESH_RNS_RECONNECT_MAX=3 MESH_RNS_STABLE_SECS=999 \
+      timeout 10 bash "$0" --_loop testnode deadbeef >/dev/null 2>&1
+    _got="$(wc -l < "$_cnt" | tr -d ' ')"
+    [ "$_got" = 3 ] || { echo "test: FAIL (reconnect loop: stub re-invoked $_got times, expected 3=RNS_MAX)"; fails=1; }
+    rm -f "$_cnt" "$_stub"
     # 3) REAL-PATH: self-loop rnx round-trip through THIS node's own listener (needs rnsd+listener up).
     own_rnx="$(awk -v h="$(hostname)" '$1==h{print $3}' "$REG" 2>/dev/null)"
     if [ -n "$own_rnx" ] && [ -f "$HOME/.mesh/rns-rnx.pid" ] && kill -0 "$(cat "$HOME/.mesh/rns-rnx.pid" 2>/dev/null)" 2>/dev/null; then
@@ -74,6 +138,7 @@ case "${1:-}" in
       [ "$fails" = 0 ] && { echo "test: n/a — no local rnsd/rnx listener or registry (honest exit 2)"; exit 2; }
     fi
     [ "$fails" = 0 ] && { echo "test: ok"; exit 0; } || exit 1 ;;
+  --_loop)  _interactive_loop "${2:-testnode}" "${3:-deadbeef}" ;; # hidden: --test drives the real loop
   --serve)  serve ;;
   --list)   { echo "node       rnsh_hash                         rnx_hash"; cat "$REG" 2>/dev/null; } ;;
   *)
@@ -85,7 +150,7 @@ case "${1:-}" in
     [ -f "$EXID" ] || "$PY/rnid" -g "$EXID" >/dev/null 2>&1
     if [ "$#" -eq 0 ]; then
       [ -n "${rnsh_h:-}" ] || { echo "mesh-rns-sh: no rnsh hash for $node" >&2; exit 2; }
-      exec "$PY/rnsh" -i "$EXID" "$rnsh_h"            # interactive shell (identifies for -a auth)
+      _interactive_loop "$node" "$rnsh_h"; exit $?   # interactive shell w/ auto-reconnect on drop
     else
       [ -n "${rnx_h:-}" ] || { echo "mesh-rns-sh: no rnx hash for $node" >&2; exit 2; }
       exec "$PY/rnx" -i "$EXID" "$rnx_h" "$*"         # one-shot command (identifies for -a auth)
