@@ -301,3 +301,57 @@ Two carry lessons the class produced, both counter-intuitive and both measured:
   is reached only through `n*place`; at `n=100` the partials do not overflow and the
   carry-deleted mutant answers *identically*. `n=255` is pinned in the suite for exactly
   that reason.
+
+## Network device — step 1, CONNECT-only (0xd0, 2026-07-24)
+
+`src/devices/net.{c,h}` + `0xd0` cases in `uxncli.c`'s `emu_dei`/`emu_deo` + one more `.c`
+on the build line. The **port map is copied verbatim from uxn2** (`src/uxn2.c`, `enum
+network_ports`) so a ROM written for either emulator addresses the same ports: `d0` vector
+· `d2` addr · `d4` length · `d6` read · `d8` write · `da` state(DEI)/action(DEO) · `db`
+handle · `dd` bindaddr · `df` channel. URIs are **colon**-separated, not slashed:
+`tcp:host:port`.
+
+**Why the device, when the mesh already ships ROMs over ssh:** the pipe gives *transport*,
+the device gives **addressing**. With `mesh-uxn-hop` the shell wrapper picks the next hop
+and the far node needs bash; with the device the travelling ROM picks its own next hop and
+the far node needs only `uxncli`.
+
+**Why the implementation is not ported:** uxn2's endpoint is an `SDL_Thread` posting
+`SDL_PushEvent` into an event loop, and this `uxncli` has no pump — its main loop blocks
+on `fgetc(stdin)`. Ours is plain POSIX `getaddrinfo`+`connect`, blocking and synchronous:
+no vector, no threads. Blocking read/write on DEI/DEO needs neither.
+
+Scope is **outbound only**. `bindaddr`/`channel` exist so the map stays verbatim, but
+binding is refused loudly and reads `Unbound` — an unimplemented port that answered a
+plausible state would be an organ declared before it was armed. (Bind is step 2.)
+
+Guards, each because the alternative is a *believable* wrong answer rather than a crash:
+
+- **Every ram transfer is clamped to the page.** The length comes from the ROM; 0x2000
+  bytes at 0xf000 would otherwise write past the allocation. The clamp is loud.
+- **A failed connect never reads as Connected.** Every failure path closes the fd, zeroes
+  the handle, sets Disconnected and prints why.
+- **An unknown scheme is an error, not a default to tcp.** Guessing the transport renders
+  a failure as a plausible success.
+- **Every socket op is time-boxed** (`UXN_NET_TIMEOUT`, default 10s) — connect via
+  non-blocking + `select`, read/write via `SO_RCVTIMEO`/`SO_SNDTIMEO`. A wedged endpoint
+  is the stale-lease family: a hung emulator reads green to everything watching it,
+  because it never returns to say otherwise. **A timeout is not a disconnect** — length 0,
+  state stays Connected, so the ROM can retry; collapsing the two would make a slow peer
+  indistinguishable from a dead one.
+- **The state poll does not block** — `select` with a zero timeout (pure POSIX;
+  `MSG_DONTWAIT` is not), then one peeked byte to tell HasData from a closed peer.
+
+Gate: `test-net-device`, and its live leg is a **real two-node round trip** — mesh-home
+dials phaedra over tailscale, sends `ping-uxn-net`, and the far node's `tr a-z A-Z` answers
+`PING-UXN-NET`. A localhost round trip exercises the same three syscalls and proves nothing
+about addressing or the tailnet; it is the drives-only-stubs trap in its purest form. Peer
+unreachable → the suite exits 2 (honest n/a), never a fake pass. The other legs: ROM
+byte-identity across the rebuild (asserted by sha *and* by `git diff` being empty — this is
+an emulator change, no ROM was re-cut), an existing ROM answering identically under the new
+device cases, the three refusal paths, the connect deadline asserted as **wall clock**, bind
+refused, and two source-mutants required RED (unknown-scheme-silently-tcp, deadline-removed).
+
+`net-echo.tal` is the gate ROM: reads a URI and a payload from stdin, dials, writes, reads,
+prints the reply — the smallest program that can prove a round trip rather than mere
+reachability. It refuses with `NA` rc=2 on a failed connect, a short write, or an empty read.

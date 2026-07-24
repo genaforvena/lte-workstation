@@ -6,6 +6,7 @@
 #include "devices/console.h"
 #include "devices/file.h"
 #include "devices/datetime.h"
+#include "devices/net.h"
 
 /*
 Copyright (c) 2021-2025 Devine Lu Linvega, Andrew Alderwick
@@ -27,6 +28,7 @@ emu_dei(Uint8 addr)
 	switch(addr & 0xf0) {
 	case 0x00: return system_dei(addr);
 	case 0xc0: return datetime_dei(addr);
+	case 0xd0: return net_dei(addr);
 	}
 	return uxn.dev[addr];
 }
@@ -40,6 +42,7 @@ emu_deo(Uint8 addr, Uint8 value)
 	case 0x10: console_deo(addr); break;
 	case 0xa0: file_deo(addr); break;
 	case 0xb0: file_deo(addr); break;
+	case 0xd0: net_deo(addr); break;
 	}
 }
 

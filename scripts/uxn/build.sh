@@ -23,7 +23,8 @@ mkdir -p bin
 $CC -std=c89 -O2 -DNDEBUG -o bin/uxnasm src/uxnasm.c
 $CC -std=c89 -O2 -DNDEBUG -o bin/uxncli \
     src/uxncli.c src/uxn.c \
-    src/devices/system.c src/devices/console.c src/devices/file.c src/devices/datetime.c
+    src/devices/system.c src/devices/console.c src/devices/file.c src/devices/datetime.c \
+    src/devices/net.c
 echo "built bin/uxnasm ($(wc -c <bin/uxnasm)b) bin/uxncli ($(wc -c <bin/uxncli)b)"
 if [ "${1:-}" = --rom ]; then
   ./bin/uxnasm lease-gate.tal lease-gate.rom
@@ -31,6 +32,7 @@ if [ "${1:-}" = --rom ]; then
   ./bin/uxnasm spearman.tal spearman.rom
   ./bin/uxnasm series-stats.tal series-stats.rom
   ./bin/uxnasm arith32-test.tal arith32-test.rom
+  ./bin/uxnasm net-echo.tal net-echo.rom
 fi
 if [ "${1:-}" = --chibicc ]; then
   $CC -std=c11 -O2 -fno-common -o bin/chibicc chibicc/src/*.c
