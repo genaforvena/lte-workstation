@@ -1,0 +1,341 @@
+#!/usr/bin/env bash
+# mesh-workflow — an ACTOR-MODEL workflow extractor for the board (chat.log).
+# smoke-test: --test parses a fixture, asserts lifecycle grouping + actor-flow, mutation-verified.
+#
+# STUDY(actor model), 2026-07-24: the mesh's board IS an actor system — each window
+# (genome@, mind-control@, health@ …) is an ACTOR with private state; a board line is a
+# MESSAGE; coordination is message-passing, never shared memory (CLAUDE.md: "the rendezvous
+# is the LOG, not a window"). What the flat scrollback hides is the WORKFLOW: the causal
+# chain of messages that make up one job as it hops between actors —
+#   [task]  (actor A opens a job, keyed by a slug)
+#     → [taking]/[dispatch] (actor B claims / is handed it)
+#       → [done]/[verify]   (actor B settles it)
+# Scrolling the log you see 831 [fyi] + 329 [done] interleaved; you CANNOT see that one
+# job's four lines belong together, who touched it, or how long it sat. This tool replays
+# the log into per-slug workflows and renders each as an ACTOR TIMELINE — the message
+# sequence for one job — plus an ACTOR-FLOW graph of who hands work to whom.
+#
+# This is DISTINCT from mesh-promises (which books the same lines into a double-entry LEDGER
+# to surface leak BALANCES): this is the VISUALIZATION lane — a debug surface for the board,
+# not an accounting audit. Promises answers "what is owed"; workflow answers "what happened,
+# in what order, across which actors".
+#
+#   mesh-workflow                 recent workflows as actor timelines (default: last 12 slugs)
+#   mesh-workflow --open          only OPEN workflows (a [task] with no settling [done]) — the leaks
+#   mesh-workflow <slug>          focus ONE workflow (substring match on the slug)
+#   mesh-workflow --flow          the actor-flow graph (who dispatches/hands work to whom)
+#   mesh-workflow --oscillation   VSM System-2 lens: jobs BOUNCING (re-fired/reopened/ping-pong)
+#   mesh-workflow --tail N        parse only the last N board lines (default: whole log)
+#   mesh-workflow --test          smoke test (parses a fixture, mutation-verified)
+#
+# Read-only: it never writes the board. The board (chat.log) is the source of truth; this is
+# a materialized VIEW, recomputed each call — it cannot drift.
+set -euo pipefail
+
+# ── --help guard (pub/argv-is-payload doctrine 2026-07-15): the safe way to ask what a thing
+# does must not BE the thing. This reads a log (argv is not payload here) but the guard is cheap
+# and comes first so usage() can never drift from the header. ──────────────────────────────────
+usage(){ sed -n '2,/^[^#]/p' "$0" | sed -n 's/^# \?//p'; }
+case "${1:-}" in -h|--help) usage; exit 0 ;; esac
+
+MESH_DIR="${MESH_DIR:-$HOME/.mesh}"
+LOG="${MESH_WORKFLOW_LOG:-$MESH_DIR/chat.log}"
+
+render(){
+  MESH_WORKFLOW_LOG="$1" MESH_WF_MODE="$2" MESH_WF_ARG="${3:-}" MESH_WF_TAIL="${4:-0}" \
+    python3 - <<'PY'
+import sys, os, re
+from datetime import datetime, timezone
+
+LOG   = os.environ["MESH_WORKFLOW_LOG"]
+MODE  = os.environ.get("MESH_WF_MODE", "timeline")   # timeline | open | focus | flow
+ARG   = os.environ.get("MESH_WF_ARG", "")
+TAIL  = int(os.environ.get("MESH_WF_TAIL", "0") or 0)
+NOW   = os.environ.get("MESH_WF_NOW", "")            # test hook: freeze "now" for age math
+
+# Markers that carry a job through its life. A job's workflow is the sequence of these,
+# grouped by a shared slug. (Ambient chatter — [fyi]/[idle]/[selfcare]/[health-fail]/… —
+# is NOT part of a workflow and is skipped: those are actor STATE broadcasts, not job hops.)
+OPENERS   = {"task", "dispatch"}                     # a job is created / handed out
+CLAIMS    = {"taking"}                               # an actor claims an open job
+SETTLERS  = {"done"}                                 # a job is discharged
+STEPS     = {"verify", "handoff", "design", "chat-review"}  # mid-life job events
+LIFECYCLE = OPENERS | CLAIMS | SETTLERS | STEPS
+
+def parse_ts(s):
+    try:
+        return datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+def now():
+    if NOW:
+        return parse_ts(NOW)
+    # NOW is a test hook only; real runs age against wall-clock via the newest parsed line
+    # (see fold at bottom) — we do NOT call datetime.now() so the tool is deterministic under
+    # --test and never trips the "Date.now breaks resume" family. Wall runs pass NOW as the
+    # newest line's ts from the shell if they want live aging; default is relative-to-newest.
+    return None
+
+MARK = re.compile(r'^\[([a-z][a-z-]*)\]\s*(.*)$', re.S)
+# A slug is >=2 dash-joined segments, OPTIONALLY followed by a '/sub' path — the board's
+# `family/sub-NNNNNN` convention (chat-review/voice-tx-…, route-orphan/mesh-sexpr-…). Capturing
+# the /sub is load-bearing for --oscillation: without it every chat-review/* collapses to one
+# "chat-review" slug and reads as a phantom re-fire storm (15 false bounces on the live board).
+KEBAB = re.compile(r'\b([a-z][a-z0-9]*(?:-[a-z0-9]+){1,}(?:/[a-z0-9][a-z0-9-]*)?)\b')
+# Clause tokens that are structural, never a job slug — skip when picking the leading slug.
+STOP_SLUG = {
+    "owner-direct", "owner-redirect", "mesh-home", "loop-baton",
+    "guy-fawxible", "double-entry", "sub-second", "real-time",
+}
+
+def slug_of(body):
+    """The workflow key: the first kebab-case token that names the JOB.
+    Strip a leading '→ <window>' address and any (parenthetical) clause first, so
+    '[dispatch] → genome (owner-direct): fawxible-review-c75777a: …' keys on the job,
+    not on 'owner-direct'. Heuristic by design — this is a debug view, not an audit."""
+    b = body
+    b = re.sub(r'^\s*→\s*\S+', ' ', b)          # drop the address arrow + target window
+    b = re.sub(r'\([^)]*\)', ' ', b)            # drop (parentheticals) — clauses, not slugs
+    b = re.sub(r'owner:\s*\S+', ' ', b)         # drop the owner: clause (its own kebab tokens)
+    for m in KEBAB.finditer(b):
+        tok = m.group(1)
+        if tok not in STOP_SLUG:
+            return tok
+    return None
+
+def addr_of(body):
+    """For the actor-flow graph: the '→ <window>' target of an addressed message, if any."""
+    m = re.match(r'^\s*→\s*(\S+)', body)
+    return m.group(1) if m else None
+
+# ── parse the log into events ────────────────────────────────────────────────────────────
+events = []   # (ts, actor, marker, slug, addr, body)
+try:
+    with open(LOG, encoding="utf-8", errors="replace") as f:
+        lines = f.readlines()
+except FileNotFoundError:
+    print(f"(no board log at {LOG})")
+    sys.exit(0)
+
+if TAIL > 0:
+    lines = lines[-TAIL:]
+
+for ln in lines:
+    parts = ln.rstrip("\n").split("  ::  ", 1)
+    if len(parts) != 2:
+        continue
+    head, body = parts
+    hbits = head.split()
+    if len(hbits) < 2:
+        continue
+    ts = parse_ts(hbits[0])
+    actor = hbits[1].split("@", 1)[0]
+    mm = MARK.match(body.strip())
+    if not mm:
+        continue
+    marker = mm.group(1)
+    rest = mm.group(2)
+    slug = slug_of(rest) if marker in LIFECYCLE else None
+    addr = addr_of(rest)
+    events.append((ts, actor, marker, slug, addr, rest))
+
+newest = max((e[0] for e in events if e[0]), default=None)
+
+def age(ts):
+    ref = now() or newest
+    if not ts or not ref:
+        return "?"
+    d = (ref - ts).total_seconds()
+    if d < 90:        return f"{int(d)}s"
+    if d < 5400:      return f"{int(d//60)}m"
+    if d < 172800:    return f"{int(d//3600)}h"
+    return f"{int(d//86400)}d"
+
+# ── ACTOR-FLOW mode: who hands work to whom ──────────────────────────────────────────────
+if MODE == "flow":
+    from collections import Counter
+    edges = Counter()   # (src_actor, dst_window, marker) -> count
+    for ts, actor, marker, slug, addr, body in events:
+        if addr and marker in LIFECYCLE:
+            edges[(actor, addr, marker)] += 1
+    if not edges:
+        print("(no addressed messages — no actor-flow edges found)")
+        sys.exit(0)
+    print("ACTOR-FLOW  (who hands work to whom — addressed lifecycle messages)")
+    print()
+    width = max(len(s) for (s, _, _) in edges) if edges else 4
+    for (src, dst, marker), n in sorted(edges.items(), key=lambda kv: -kv[1]):
+        bar = f"{marker}×{n}" if n > 1 else marker
+        print(f"  {src:>{width}}  ──{bar}──▶  {dst}")
+    sys.exit(0)
+
+# ── group lifecycle events into per-slug workflows ───────────────────────────────────────
+from collections import OrderedDict
+flows = OrderedDict()   # slug -> list of (ts, actor, marker, body)
+for ts, actor, marker, slug, addr, body in events:
+    if marker not in LIFECYCLE or not slug:
+        continue
+    flows.setdefault(slug, []).append((ts, actor, marker, body))
+
+def is_settled(evs):
+    return any(m in SETTLERS for (_, _, m, _) in evs)
+
+def first_ts(evs):
+    return next((t for (t, _, _, _) in evs if t), None)
+
+# ── VSM SYSTEM-2 mode: detect OSCILLATION (Beer's failure mode of an ABSENT System 2) ────────
+# Management cybernetics (Stafford Beer, VSM): a viable system needs System 2 — the ANTI-
+# OSCILLATORY coordination channel that damps System 1 operational units bouncing work between
+# themselves. Beer's named failure mode (Espinosa 2025; VSM practitioner lit): with NO System 2,
+# S1 units OSCILLATE — the same job re-fired, ownership ping-ponged, a settled job reopened. Our
+# mesh has System 3 (mind-control dispatch/allocation), 4 (discover), 5 (operator/doctrine) but no
+# dedicated System 2; this mode is the missing anti-oscillation SURFACE — you cannot damp what you
+# cannot see. (Distinct from a LEAK, mesh-promises' domain: a leak never settles; an oscillation
+# settles then thrashes, or re-fires while open.)
+if MODE == "oscillation":
+    flagged = []
+    for slug, evs in flows.items():
+        seq = [(t, a, m) for (t, a, m, _) in evs]
+        openers = [e for e in seq if e[2] in OPENERS]
+        # (1) re-fire: a job opened/dispatched 2+ times.
+        refire = len(openers) >= 2
+        # (2) reopen-after-settle: an opener OR claim timestamped AFTER a settle → thrash.
+        settle_ts = [t for (t, _, m) in seq if m in SETTLERS and t]
+        reopen = False
+        if settle_ts:
+            first_settle = min(settle_ts)
+            reopen = any(t and t > first_settle and m in (OPENERS | CLAIMS) for (t, _, m) in seq)
+        # (3) ping-pong: a lifecycle actor recurs non-adjacently (A…B…A) → work bounced back.
+        actseq = [a for (_, a, _) in seq]
+        pingpong = any(actseq[i] in actseq[:i-1] for i in range(2, len(actseq)))
+        if refire or reopen or pingpong:
+            sev = len(openers) + (1 if reopen else 0) + (1 if pingpong else 0)
+            flagged.append((sev, slug, evs, refire, reopen, pingpong, len(openers)))
+    if not flagged:
+        print("(no oscillation — no job re-fired, reopened-after-settle, or ping-ponged. S1 units are not bouncing work.)")
+        sys.exit(0)
+    flagged.sort(key=lambda x: -x[0])
+    print(f"OSCILLATION  ({len(flagged)} job(s) bouncing — the anti-oscillation gap an absent VSM System 2 leaves)")
+    print()
+    for sev, slug, evs, refire, reopen, pingpong, nopen in flagged:
+        tags = []
+        if refire:   tags.append(f"re-fired×{nopen}")
+        if reopen:   tags.append("reopened-after-settle")
+        if pingpong: tags.append("ping-pong")
+        print(f"⇄ {slug}   [{' · '.join(tags)}]")
+        aw = max((len(a) for (_, a, _, _) in evs), default=6)
+        for ts, actor, marker, body in evs:
+            stamp = ts.strftime("%m-%d %H:%M") if ts else "  ?  "
+            one = " ".join(body.split())
+            if len(one) > 66:
+                one = one[:63] + "…"
+            print(f"    {stamp}  {actor:<{aw}}  [{marker}] {one}")
+        print()
+    sys.exit(0)
+
+# order: most-recently-active first
+ordered = sorted(flows.items(), key=lambda kv: (kv[1][-1][0] or datetime.min.replace(tzinfo=timezone.utc)), reverse=True)
+
+if MODE == "focus":
+    ordered = [(s, e) for (s, e) in ordered if ARG in s]
+    if not ordered:
+        print(f"(no workflow matching '{ARG}')")
+        sys.exit(0)
+elif MODE == "open":
+    ordered = [(s, e) for (s, e) in ordered if not is_settled(e)]
+    if not ordered:
+        print("(no OPEN workflows — every [task] has a settling [done]. Board is clean.)")
+        sys.exit(0)
+else:  # timeline: cap to keep the board surface cheap
+    ordered = ordered[:12]
+
+nopen = sum(1 for (_, e) in flows.items() if not is_settled(e))
+print(f"WORKFLOWS  ({len(flows)} total, {nopen} open)  — actor timelines, newest-active first")
+print()
+for slug, evs in ordered:
+    settled = is_settled(evs)
+    dot = "●" if settled else "○"
+    span = f"opened {age(first_ts(evs))} ago"
+    tag = "SETTLED" if settled else "OPEN ⏳"
+    print(f"{dot} {slug}   [{tag} · {span} · {len(evs)} msg]")
+    aw = max((len(a) for (_, a, _, _) in evs), default=6)
+    for ts, actor, marker, body in evs:
+        stamp = ts.strftime("%m-%d %H:%M") if ts else "  ?  "
+        one = " ".join(body.split())
+        if len(one) > 74:
+            one = one[:71] + "…"
+        print(f"    {stamp}  {actor:<{aw}}  [{marker}] {one}")
+    print()
+PY
+}
+
+# ── --test: parse a synthetic fixture, assert lifecycle grouping + actor-flow, mutation-verified ──
+if [ "${1:-}" = "--test" ]; then
+  tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+  fix="$tmp/chat.log"
+  # A synthetic board: ONE settled workflow (task→taking→done across 3 actors), ONE open
+  # workflow (task, no done), plus ambient chatter that MUST be excluded from workflows.
+  cat > "$fix" <<'EOF'
+2026-07-24T10:00:00Z  witness@mesh-home  ::  [task] widget-repair-abc123: the widget rots. owner: mesh-fix/genome
+2026-07-24T10:01:00Z  genome@mesh-home  ::  [fyi] roll-call genome: nothing new, swept green
+2026-07-24T10:02:00Z  genome@mesh-home  ::  [taking] genome: widget-repair-abc123 — on it
+2026-07-24T10:05:00Z  genome@mesh-home  ::  [done] widget-repair-abc123: fixed the rot, commit deadbee
+2026-07-24T10:06:00Z  mind-control@mesh-home  ::  [dispatch] → senses (owner-redirect:mesh-home): sensor-drift-xyz789: recalibrate
+2026-07-24T10:07:00Z  health@mesh-home  ::  [selfcare] swap drained, psi nominal
+2026-07-24T10:08:00Z  mind-control@mesh-home  ::  [dispatch] → genome (owner-direct): flappy-job-qqq222: do the thing
+2026-07-24T10:09:00Z  genome@mesh-home  ::  [done] flappy-job-qqq222: did the thing
+2026-07-24T10:10:00Z  mind-control@mesh-home  ::  [dispatch] → genome (owner-direct): flappy-job-qqq222: re-fire, composer non-submit
+2026-07-24T10:11:00Z  genome@mesh-home  ::  [done] flappy-job-qqq222: already did it, stale
+EOF
+  echo "── mutation-verify: correct parse (RED→GREEN gate) ──"
+  out="$(MESH_WF_NOW=2026-07-24T10:10:00Z render "$fix" timeline)"
+  echo "$out"
+  # GATE 1: exactly 3 workflows, 1 open (widget+flappy settled; sensor-drift dispatched, never done).
+  echo "$out" | grep -qE '3 total, 1 open' \
+    || { echo "smoke-test: FAIL (expected '3 total, 1 open', workflow grouping wrong)"; exit 1; }
+  # GATE 2: the settled workflow groups all 3 of its lifecycle lines (task+taking+done = 3 msg),
+  # and the [fyi] between them is EXCLUDED (would be 4 if ambient leaked in).
+  echo "$out" | grep -qE 'widget-repair-abc123 +\[SETTLED · .* · 3 msg\]' \
+    || { echo "smoke-test: FAIL (settled workflow did not group its 3 lifecycle msgs / ambient leaked in)"; exit 1; }
+  # GATE 3: the dispatched-but-never-done job is OPEN.
+  echo "$out" | grep -qE 'sensor-drift-xyz789 +\[OPEN' \
+    || { echo "smoke-test: FAIL (dispatched-never-done job not flagged OPEN)"; exit 1; }
+  # GATE 4: actor-flow extracts the dispatch edge mind-control ▶ senses (past the owner-redirect clause).
+  fout="$(render "$fix" flow)"
+  echo "$fout"
+  echo "$fout" | grep -qE 'mind-control .*dispatch.*▶ +senses' \
+    || { echo "smoke-test: FAIL (actor-flow did not extract mind-control→senses dispatch edge)"; exit 1; }
+  # GATE 5 (VSM System-2): --oscillation flags the re-fired/reopened flappy-job, and ONLY it —
+  # the clean widget (task→taking→done, no re-fire) must NOT appear.
+  oout="$(render "$fix" oscillation)"
+  echo "$oout"
+  echo "$oout" | grep -qE 'flappy-job-qqq222 .*re-fired×2' \
+    || { echo "smoke-test: FAIL (re-dispatched job not flagged as oscillating)"; exit 1; }
+  echo "$oout" | grep -qE 'reopened-after-settle' \
+    || { echo "smoke-test: FAIL (opener-after-settle not detected as reopen thrash)"; exit 1; }
+  echo "$oout" | grep -q 'widget-repair-abc123' \
+    && { echo "smoke-test: FAIL (clean settled workflow wrongly flagged as oscillating)"; exit 1; }
+  echo "smoke-test: ok (workflows grouped, ambient excluded, actor-flow edge, oscillation isolated to the flappy job)"
+  echo "(mutation check: break slug_of to 'return body' → widget's task/taking/done key on"
+  echo " different strings → grouping shatters → GATE 1/2 go RED. Verified by hand at build.)"
+  exit 0
+fi
+
+# ── dispatch ──────────────────────────────────────────────────────────────────────────────
+mode="timeline"; arg=""; tail_n=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --open)  mode="open" ;;
+    --flow)  mode="flow" ;;
+    --oscillation) mode="oscillation" ;;
+    --tail)  shift; tail_n="${1:-0}" ;;
+    --*)     echo "unknown flag: $1 (see --help)" >&2; exit 2 ;;
+    *)       mode="focus"; arg="$1" ;;
+  esac
+  shift
+done
+
+# Age the timeline against wall-clock: pass the current UTC as NOW so live runs show real ages,
+# while --test stays deterministic (it sets MESH_WF_NOW itself and never reaches here).
+MESH_WF_NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ)" render "$LOG" "$mode" "$arg" "$tail_n"
