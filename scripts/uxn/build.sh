@@ -41,6 +41,9 @@ if [ "${1:-}" = --rom ]; then
   ./bin/uxnasm arith32-test.tal arith32-test.rom
   ./bin/uxnasm net-echo.tal net-echo.rom
   ./bin/uxnasm net-listen.tal net-listen.rom
+  ./bin/uxnasm hop-dial.tal hop-dial.rom
+  ./bin/uxnasm hop-serve.tal hop-serve.rom
+  ./bin/uxnasm rot13-net.tal rot13-net.rom
 fi
 if [ "${1:-}" = --chibicc ]; then
   $CC -std=c11 -O2 -fno-common -o bin/chibicc chibicc/src/*.c

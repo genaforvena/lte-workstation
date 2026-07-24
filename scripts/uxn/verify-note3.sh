@@ -46,6 +46,8 @@ adb push /tmp/uxncli.armhf "$D/uxncli" >/dev/null
 adb push lease-gate.rom    "$D/lease-gate.rom" >/dev/null
 adb push net-echo.rom      "$D/net-echo.rom" >/dev/null
 adb push net-listen.rom    "$D/net-listen.rom" >/dev/null
+adb push hop-serve.rom     "$D/hop-serve.rom" >/dev/null
+adb push rot13-net.rom     "$D/rot13-net.rom" >/dev/null
 # prove byte-identity by pulling the on-device rom back and cmp'ing (Android shell has no sha1sum)
 adb pull "$D/lease-gate.rom" /tmp/rom.fromnote3 >/dev/null 2>&1
 if cmp -s lease-gate.rom /tmp/rom.fromnote3; then
@@ -125,5 +127,31 @@ else
   fi
 fi
 
-[ "$rc" = 0 ] && echo "verify-note3: ok — identical ROM, matching verdicts on armeabi-v7a, net device live at step >= 2, and the phone answered a real inbound connection" || echo "verify-note3: FAIL"
+# 6) THE HOP'S NET LANE, ON THE PHONE: mesh-home ships a ROM this phone has never seen and
+#    the phone's uxncli BECOMES it. hop-serve reads the packet off the socket, stages it at
+#    4000, relocates a position-independent copier to 8000 and jumps — the emulator is then
+#    running code that arrived a moment ago, still holding the caller's connection because
+#    the socket lives in the DEVICE and not in the 64 KB that was overwritten.
+#    This is the entire "the far node needs only uxncli" claim reduced to one artifact: no
+#    shell, no ssh, no mesh-uxn-hop on the phone — a static binary and a socket.
+#    The token is generated PER RUN, so a pass cannot come from a constant baked anywhere.
+if [ -z "${PHONE_IP:-}" ]; then
+  echo "note3  hop net lane: n/a — no wlan0 address (it did NOT run)"
+else
+  HTOK="$(head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+  hexp="$(printf 'Hello from mesh-home' | tr 'A-Za-z' 'N-ZA-Mn-za-m')"
+  adb shell "su -c 'cd $D && UXN_NET_TIMEOUT=15 ./uxncli hop-serve.rom tcp:$PHONE_IP:$((NPORT + 1)) $HTOK </dev/null'" >/tmp/note3-hop.out 2>&1 &
+  hpid=$!
+  sleep 3
+  printf 'Hello from mesh-home' | UXN_HOP_TOKEN="$HTOK" ./mesh-uxn-hop --pack-net rot13-net.rom >/tmp/note3-hop.pkt
+  hgot="$(UXN_NET_TIMEOUT=6 timeout 40 ./mesh-uxn-hop --dial "tcp:$PHONE_IP:$((NPORT + 1))" </tmp/note3-hop.pkt 2>/dev/null || true)"
+  wait "$hpid" 2>/dev/null || true
+  if [ "$hgot" = "$hexp" ]; then
+    echo "note3  HOP NET LANE: shipped rot13-net.rom over TCP and the PHONE's uxncli became it — '$hgot' (no shell on the far side)"
+  else
+    echo "note3  HOP NET LANE FAILED: want '$hexp', got '$hgot' (phone said: $(head -3 /tmp/note3-hop.out | tr '\n' ' '))"; rc=1
+  fi
+fi
+
+[ "$rc" = 0 ] && echo "verify-note3: ok — identical ROM, matching verdicts on armeabi-v7a, net device live at step >= 2, the phone answered a real inbound connection, and it ran a ROM that arrived over the socket" || echo "verify-note3: FAIL"
 exit $rc

@@ -438,3 +438,76 @@ binds and this host dials it** (`mesh-home → 192.168.8.184:47312`, the phone's
 answering `uxn:ping-from-mesh-home`, 2026-07-24). Presence is not capability; a build can
 carry the device and still not listen, and bind/accept is where a statically linked libc
 could plausibly differ from the host's.
+
+## The hop's NET LANE — a ROM that receives a ROM (2026-07-24)
+
+The hop's pipe lane ships code over ssh: `mesh-uxn-hop --pack filter.rom < text | ssh node
+mesh-uxn-hop`. The far node needs a shell, a key, an account, and this script. The net lane
+ships the same packet over the emulator's own `0xd0` device into a receiver that is **a ROM
+rather than a script**, and the far node needs none of those — only `uxncli`:
+
+```sh
+UXN_HOP_TOKEN=… mesh-uxn-hop --serve tcp:100.74.178.97:47311        # on the far node
+UXN_HOP_TOKEN=… mesh-uxn-hop --pack-net rot13-net.rom < text | \
+UXN_HOP_TOKEN=… mesh-uxn-hop --dial  tcp:100.74.178.97:47311        # here
+```
+
+**hop-serve becomes the packet.** It binds, accepts one caller, reads the `uxp1` header a
+**byte at a time** (a bulk read would swallow the front of the payload, and the payload
+belongs to the ROM it is about to become), reads exactly the declared ROM bytes, and then
+replaces itself: the packet is staged at `4000`, a **position-independent copier** —
+relative branches, zero-page parameters, an immediate `JMP2` — is relocated to `8000`, and
+the jump goes there; the copier copies the staged bytes down to `0100` and jumps into them.
+A copier that ran in place would overwrite itself mid-copy, and would do so **only** for
+ROMs big enough to reach it — corruption that scales with the payload and passes every
+small test.
+
+**The connection survives the swap**, and that is what makes the lane work at all: the
+socket lives in the emulator's device, not in the 64 KB being overwritten, and the selected
+channel lives in the device page. So the arriving ROM wakes up **holding a live inbound
+connection on channel 1** — it reads its payload there and writes its answer there. That is
+why `hop-serve` accepts mode `net` and nothing else: a pipe-lane ROM answers on the
+*console*, which on the serving node goes to a terminal the caller cannot see. Running it
+would look like a working hop with every answer dropped on the floor. The two lanes refuse
+each other **by name, in both directions** — the sh receiver refuses a net packet just as
+loudly.
+
+**What the lane gives up, said out loud.** The sh receiver hashes the ROM it received and
+refuses on a mismatch (hash-then-execute). A ROM cannot compute sha1 in a few hundred
+bytes, so `hop-serve` **cannot verify what it is about to run**. It demands a shared
+**token** instead — `UXN_HOP_TOKEN`, carried in the header, compared in the ROM — so
+reaching the port is not by itself permission to run code there. That is weaker than ssh's
+key auth and it is replayable by anyone who sees a packet. Hence: no default token ever
+(the wrapper refuses `--pack-net`/`--serve` without one), bind a **named tailnet address**
+rather than `*`, and the arriving ROM runs in a fresh empty dir — the file device's sandbox
+floor is the only containment left once the hash is gone. **One packet per invocation**, by
+construction rather than by policy: after the swap there is no `hop-serve` left to serve a
+second caller.
+
+**Nothing can half-close a uxn socket** (the uxn2 map has no shutdown port), so a finished
+peer is knowable only by one expired deadline. Both ROMs are therefore *patient for the
+first byte and impatient after it*: three deadlines waiting for an answer to start, one
+after it has begun. Keeping three throughout charged every hop three idle timeouts with the
+answer already in hand.
+
+Gate: `test-uxn-hop`, legs 16–24 — header shape · the token required with **nothing**
+produced when it is missing (the `$(…)` trap: an `exit` inside command substitution kills
+only the subshell, and the packet would have shipped with a blank token) · both lanes
+refusing each other by name · the round trip · a wrong token refused **pre-exec**, asserted
+by the artifact (the caller gets `NA`, not the transformation) · a valid token with the
+wrong lane · a truncated packet · an oversize ROM refused before a byte is read · two
+mutants required RED. There is deliberately **no** "mode check dropped" mutant: `match`
+advances the cursor on success, so removing the lane check also strands the token parse and
+the packet is refused for the other reason — a mutant whose damage is masked by the next
+check proves nothing, so that property is asserted directly instead.
+
+Live leg: **phaedra ships a ROM over tailscale** to this node's serve port and this node's
+`uxncli` becomes it. The dialer there is `socat`, not `uxncli` — phaedra has no compiler and
+no emulator pushed to it — so that leg honestly claims the **serve** side; the dial side is
+claimed by the local leg and by nothing else.
+
+And the payoff, on the oldest body in the mesh (`verify-note3.sh` step 6): mesh-home ships
+`rot13-net.rom` over TCP to a 2013 Note3 carrying **only a static `uxncli`** — no shell, no
+ssh, no `mesh-uxn-hop` — and the phone's emulator replaces itself with the arriving code and
+answers `Uryyb sebz zrfu-ubzr`. The token is generated per run, so the pass cannot come from
+a constant baked anywhere.
