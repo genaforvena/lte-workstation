@@ -21,6 +21,7 @@ PY="${RNS_PY:-$HOME/.venv-rns/bin}"
 REG="${MESH_RNS_NODES:-$HOME/.mesh/rns-nodes}"
 ALLOW="${MESH_RNS_ALLOWED:-$HOME/.mesh/rns-allowed}"
 EXID="$HOME/.mesh/rns-exec.id"
+PIDDIR="${MESH_RNS_PIDDIR:-$HOME/.mesh}"   # pid/log dir for the listeners (overridable so --test can drive _up)
 
 # --- reconnect (interactive shell) tuning; overridable + injectable for --test ---
 RNSH_BIN="${MESH_RNSH_BIN:-$PY/rnsh}"   # the wrapped binary (a stub in --test)
@@ -72,14 +73,35 @@ allowed_flags(){  # emit "-a h1 -a h2 …" from the allowlist (empty => caller d
   while read -r h _; do case "$h" in ""|\#*) ;; *) printf ' -a %s' "$h";; esac; done < "$ALLOW"
 }
 
+# IDEMPOTENT ON THE ARGUMENTS, NOT JUST ON A LIVE PID (2026-07-24 incident, task reticulum-rns-sh).
+# `--serve` used to return early whenever the pid file's process was alive. So when the listener's
+# command line CHANGED in the code — the persistent far-side tmux (`-- tmux new-session -A -s rns`)
+# landed at 13:48 — every 5-minute keepalive pass on a peer kept the OLD 10:12 listener alive
+# instead: a permanently green reflex tending an outdated organ, plain-shell far side, so a dropped
+# link had nothing to re-attach to and the operator's "still disconnects, no re-attach" was true on
+# a node whose keepalive said everything was fine. Liveness is not correctness. Compare the RUNNING
+# cmdline to the one we would start and restart on drift.
+# The comparison is a SUFFIX match, not equality: rnsh/rnx are python entry points, so /proc shows
+# `…/python3 …/rnsh -l -a …` while we invoke `…/rnsh -l -a …` — an equality test would never match
+# and would restart the listener on every single pass (a restart storm dressed as a fix).
+_up(){ local n="$1"; shift; local p="$PIDDIR/rns-$n.pid" pid have want
+  want="$*"
+  if [ -f "$p" ] && pid="$(cat "$p" 2>/dev/null)" && kill -0 "$pid" 2>/dev/null; then
+    have="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | sed 's/ *$//')"
+    case "$have" in
+      *"$want") return 0 ;;                       # running exactly what we would start → leave it
+      "") return 0 ;;                             # cmdline unreadable → do NOT churn a live listener
+      *) echo "mesh-rns-sh --serve: RESTARTING $n listener — its args are stale (running: $have)" >&2
+         kill "$pid" 2>/dev/null; sleep 1 ;;
+    esac
+  fi
+  nohup "$@" >"$PIDDIR/rns-$n.log" 2>&1 </dev/null & echo $! > "$p"; }
+
 serve(){
   [ -f "$EXID" ] || "$PY/rnid" -g "$EXID" >/dev/null 2>&1
   local af; af="$(allowed_flags)"
   # no allowlist yet → fail SAFE: refuse to open a no-auth shell to the whole RNS net
   [ -n "$af" ] || { echo "mesh-rns-sh --serve: REFUSING — $ALLOW empty (a listener with no -a is an open shell). Add trusted client identity hashes first." >&2; exit 2; }
-  _up(){ local n="$1"; shift; local p="$HOME/.mesh/rns-$n.pid"
-    if [ -f "$p" ] && kill -0 "$(cat "$p" 2>/dev/null)" 2>/dev/null; then return 0; fi
-    nohup "$@" >"$HOME/.mesh/rns-$n.log" 2>&1 </dev/null & echo $! > "$p"; }
   # shellcheck disable=SC2086
   _up rnx  "$PY/rnx"  -l -i "$EXID" $af
   # rnsh listener serves a PERSISTENT tmux by default (survives link drops → reconnect re-attaches
@@ -128,6 +150,26 @@ case "${1:-}" in
     _got="$(wc -l < "$_cnt" | tr -d ' ')"
     [ "$_got" = 3 ] || { echo "test: FAIL (reconnect loop: stub re-invoked $_got times, expected 3=RNS_MAX)"; fails=1; }
     rm -f "$_cnt" "$_stub"
+    # 2c) ARGS-DRIFT RESTART (the 2026-07-24 incident gate). A keepalive that returns early on a LIVE
+    #     pid keeps an outdated listener forever — that is how a peer served a plain-shell far side all
+    #     day while its 5-minute timer stayed green. Drive the REAL _up against a stub listener:
+    #       · same args      → the pid must NOT change (no restart storm; this is the falsifier for a
+    #                          naive equality check, since /proc prepends the interpreter path)
+    #       · changed args   → the pid MUST change and the old process MUST be dead
+    _pd="$(mktemp -d)"; _stub="$_pd/fakelistener"
+    printf '#!/usr/bin/env bash\nsleep 120   # NOT exec: exec would replace the cmdline and the drift check would read "sleep 120"\n' > "$_stub"; chmod +x "$_stub"
+    # start it the way python entry points appear in /proc: interpreter first, then the script+args
+    nohup bash "$_stub" -l -a AAAA -- tmux new-session -A -s rns >/dev/null 2>&1 </dev/null &
+    _p1=$!; echo "$_p1" > "$_pd/rns-fake.pid"; sleep 0.3
+    PIDDIR="$_pd" _up fake bash "$_stub" -l -a AAAA -- tmux new-session -A -s rns
+    _p2="$(cat "$_pd/rns-fake.pid")"
+    [ "$_p2" = "$_p1" ] || { echo "test: FAIL (args-drift: identical args RESTARTED the listener — suffix match broken, every keepalive pass would churn it)"; fails=1; }
+    PIDDIR="$_pd" _up fake bash "$_stub" -l -a AAAA   # the OLD (pre-tmux) arg set = a drift
+    _p3="$(cat "$_pd/rns-fake.pid")"
+    [ "$_p3" != "$_p2" ] || { echo "test: FAIL (args-drift: a STALE-args listener was left running — the incident's root cause)"; fails=1; }
+    kill -0 "$_p2" 2>/dev/null && { echo "test: FAIL (args-drift: old listener still alive after restart)"; fails=1; }
+    kill "$_p3" 2>/dev/null; pkill -f "$_stub" 2>/dev/null; rm -rf "$_pd"
+
     # 3) REAL-PATH: self-loop rnx round-trip through THIS node's own listener (needs rnsd+listener up).
     own_rnx="$(awk -v h="$(hostname)" '$1==h{print $3}' "$REG" 2>/dev/null)"
     if [ -n "$own_rnx" ] && [ -f "$HOME/.mesh/rns-rnx.pid" ] && kill -0 "$(cat "$HOME/.mesh/rns-rnx.pid" 2>/dev/null)" 2>/dev/null; then
