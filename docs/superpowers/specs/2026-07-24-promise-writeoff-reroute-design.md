@@ -46,7 +46,7 @@ call sites.
 
 ## Design
 
-Three components, all inside the existing `scripts/mesh-promises` — no new tool, no new journal.
+Four components, all inside the existing `scripts/mesh-promises` — no new tool, no new journal.
 
 ### Component A — uniform unrouted accounting (promises, claims, holds alike)
 
@@ -124,6 +124,47 @@ witness's coordination charter)`. This is advisory text only, printed in `--all`
 posts anything or changes routing on its own. It exists to make `--reroute`'s `--owner` argument a
 one-second decision instead of a guess.
 
+### Component D — confidence-gated auto-reaction (opt-in, `--feed` only)
+
+Operator direction: the tool should be able to *react* to leaks itself, not only report them — but
+not unconditionally. The dividing line is **reversibility**: an action that only reassigns or quiets
+noise can be undone by the next human who looks; a writeoff asserts "this doesn't matter," which is
+a judgment call a heuristic must never make alone. So automation is split accordingly, gated behind
+one master switch — `MESH_PROMISE_AUTOREACT=1` (default off, same opt-in shape as the existing
+`MESH_PROMISE_POST`) — evaluated once per `--feed` cycle, after the normal leak computation:
+
+**Auto-reroute (reversible → automatable, tightly gated).** A `--feed` run may perform the
+equivalent of `--reroute` itself when **all** of: (a) the item is `:unrouted`, (b) Component C's
+suggested-owner is unambiguous — top charter-overlap score beats the runner-up by
+`MESH_PROMISE_AUTOREROUTE_MARGIN` (default 2) and clears an absolute floor
+`MESH_PROMISE_AUTOREROUTE_MIN` (default 3 overlapping tokens), (c) it is **not** `priority:incident`
+(an incident always gets human eyes, no exceptions), (d) it has already sat unrouted past the normal
+leak threshold (humans get first crack; automation only picks up what nobody addressed in time).
+Posts the same two-line board trail as manual `--reroute`, with `(auto)` appended to the reason so
+board history can always tell an automated reroute from a deliberate one at a glance, under the
+tool's own auto-derived posting identity — never impersonating a mind window.
+
+**Auto-mute, not auto-writeoff, for structurally-undischargeable items (reflex-broadcast claims;
+holds/claims whose debtor/taker is a retired window).** These can never self-resolve and never will
+— repeating the same 🔴 every hourly cycle (live: the same 8 reflex-broadcast claims, one 134.9h old,
+re-alerted identically every `--feed` run) is pure noise, not signal. Once such an item has been open
+past `MESH_PROMISE_AUTOMUTE_H` (default 72h) **with zero human engagement** (no `[taking]`/`[fyi]`
+ever posted mentioning its slug — the existing STATE-file leak-transition tracking already has the
+data to check this), `--feed` stops re-emitting it into the leak-transition alert (`newleaks`) and
+`--dash`'s headline count, moving it into a distinct `muted` bucket. Critically: **muting is not
+closing** — it stays fully enumerated in `--all`/`--json`/`--check`, the liability stays open and
+nonzero in the ledger, nothing here touches `equity:*`. It only stops re-alerting on something that
+alerting has already proven cannot be fixed by alerting. A human/mind can always still `--writeoff`
+or `--reroute` it explicitly, which un-mutes it (that's a real resolution, not silence).
+
+**Never automated, regardless of settings:** `--writeoff` of any kind, any `priority:incident` item,
+and any reroute where the suggested owner is ambiguous or absent. These stay exactly as Component B
+describes — explicit, human/mind-initiated, one action at a time.
+
+This directly answers the operator's brief: the tool reacts to leaks on its own where reacting is
+safe and reversible (reroute, mute), and stays hands-off where reacting would require judgment it
+doesn't have (writeoff, incidents, ambiguous routing).
+
 ## What this does NOT do (explicitly out of scope)
 
 - **No new alarm timing.** Leak detection stays on the existing hourly `--feed` cron; event-driven
@@ -136,9 +177,11 @@ one-second decision instead of a guess.
   writeoff/reroute tooling here remain necessary regardless — they handle the pre-existing backlog
   and the ongoing "task turned out to need reassignment" case that grammar enforcement at write-time
   can't prevent (an owner can be valid at post-time and later retired, e.g. the `chat` hold).
-- **No auto-writeoff / auto-reroute.** Every resolution is an explicit, human/mind-initiated,
-  board-posted, audited action — never a cron-driven silent close. A silently-written-off promise is
-  exactly the kind of hidden liability CLAUDE.md's verification doctrine warns against.
+- **No auto-writeoff, ever.** Component D allows narrow, opt-in automation for *reversible* actions
+  (reroute, mute) only. Closing the book on a promise (writeoff) always stays an explicit,
+  human/mind-initiated, board-posted, audited action — a silently-written-off promise is exactly the
+  kind of hidden liability CLAUDE.md's verification doctrine warns against, and unlike a reroute or a
+  mute, a writeoff can't be un-done by the next person who happens to look.
 
 ## Testing (RED-first, extends the existing `--test` synthetic-board convention)
 
@@ -161,6 +204,22 @@ New assertions added to the existing `do_test()` fixture set, each proving a rea
    charter comment, and prints "none" (not a wrong guess) when no window's charter overlaps at all —
    asserting the no-match case doesn't fabricate a plausible-looking but arbitrary suggestion (same
    "no silent fallback that looks like success" doctrine as everywhere else in this codebase).
+7. Component D auto-reroute: `MESH_PROMISE_AUTOREACT=1`, an unrouted item with an unambiguous
+   suggested owner past the leak threshold → `--feed` reroutes it itself, board trail carries
+   `(auto)`; an otherwise-identical item that is `priority:incident` is left untouched (still open,
+   still `:unrouted`) — proving the incident carve-out actually blocks the path, not just documents it.
+8. Component D auto-reroute non-fire on ambiguity: two roster windows score equally (or within
+   `MESH_PROMISE_AUTOREROUTE_MARGIN`) on the same lead → no auto-reroute fires, item stays
+   `:unrouted` and unchanged.
+9. Component D auto-mute: a synthetic `reflex-broadcast` claim aged past `MESH_PROMISE_AUTOMUTE_H`
+   with no `[taking]`/`[fyi]` ever mentioning its slug stops appearing in the `--feed` transition
+   alert and `--dash` headline count on the *next* cycle, but still appears in `--all`/`--json`/
+   `--check` with its liability unchanged (nonzero, same account) — proving mute suppresses noise
+   without touching the ledger. A second synthetic claim of the same age that *does* have a prior
+   `[taking]` mention stays fully alerting (engagement resets the mute clock).
+10. Component D default-off: with `MESH_PROMISE_AUTOREACT` unset, none of the above fire — an
+    otherwise-qualifying unrouted item stays untouched through `--feed`, matching today's behavior
+    exactly (regression guard for nodes that never opt in).
 
 ## Open question for the operator
 
