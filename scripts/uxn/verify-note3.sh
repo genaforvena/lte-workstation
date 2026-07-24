@@ -34,11 +34,11 @@ NPORT="${NOTE3_NET_PORT:-47312}"
 command -v "$CROSS" >/dev/null || { echo "need $CROSS (apt install gcc-arm-linux-gnueabihf)"; exit 2; }
 adb get-state >/dev/null 2>&1 || { echo "no adb device"; exit 2; }
 
-# 1) static armhf emulator (bionic has no glibc loader; static = pure-syscall, runs under the Android kernel)
-"$CROSS" -std=c89 -O2 -static -DNDEBUG -o /tmp/uxncli.armhf \
-    src/uxncli.c src/uxn.c src/devices/system.c src/devices/console.c src/devices/file.c \
-    src/devices/datetime.c src/devices/net.c
-echo "cross-built /tmp/uxncli.armhf ($(wc -c </tmp/uxncli.armhf)b, $(file -b /tmp/uxncli.armhf | cut -d, -f1-2))"
+# 1) static armhf emulator (bionic has no glibc loader; static = pure-syscall, runs under the
+#    Android kernel). The compile line itself lives in cross-build.sh — ONE copy, shared with
+#    build.sh's host build via emu-sources, because this file having its own copy is how a
+#    device gets added to the emulator and silently never reaches the phone.
+./cross-build.sh armhf /tmp/uxncli.armhf || { echo "verify-note3: cross-build failed"; exit 2; }
 
 # 2) push the emulator + the UNMODIFIED rom
 D=/data/local/tmp

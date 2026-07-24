@@ -130,6 +130,45 @@ hostname resolution (glibc NSS is absent under bionic) — address Note3 ROMs by
 it fails loud and distinguishably, "Temporary failure in name resolution" vs "Connection
 refused".
 
+### The cross-build is now one line, and arm64 exists (2026-07-24)
+
+The compile line existed **twice** — `build.sh`'s host build and `verify-note3.sh`'s inline
+armhf build — and a third copy for arm64 is the shape this tree keeps finding: one copy gains
+a device, the others quietly do not, and the platforms disagree about what the emulator *is*.
+The translation units now live in **`emu-sources`** (`EMU_SRC`), sourced by both, and the
+cross line lives once in **`cross-build.sh`**:
+
+```
+./cross-build.sh arm64 [out] [--check]     aarch64-linux-gnu-gcc    — Android 8+ bodies
+./cross-build.sh armhf [out] [--check]     arm-linux-gnueabihf-gcc  — armeabi-v7a (Note3)
+```
+
+Static always (bionic has no glibc loader), which is what the sizes are about: host `uxncli`
+**56,856 b** dynamic · armhf static **674,652 b** · **arm64 static 1,013,392 b**. Still a
+single self-contained file to `adb push`, and the ROM it runs is unchanged.
+
+**`--check` drives the binary rather than describing it.** `file` says aarch64 and `-x` says
+executable, and neither is the claim — a build that links can still be net-BLIND, and that
+one is silent (`emu_dei` → 0 → Disconnected → `NA` rc=2, byte-identical to a real refusal).
+So three claims a wrong build cannot fake: it **computes** (the four-row lease-gate table,
+same verdicts as the host), it **identifies** the net device (action `d0`, at step ≥ 2), and
+it **accepts** a real inbound connection — the cross binary binds under `qemu-user` and the
+known-good host `uxncli` dials it with `net-echo.rom`, payload tokenised per run so no
+constant can produce a pass. No qemu and not that arch → **exit 2, honest n/a**, with the
+binary explicitly reported as built-but-not-run.
+
+RED-first, watched 2026-07-24: against a net-blind stub (`net_dei`/`net_deo` reduced to
+exactly `emu_dei`'s fallthrough) the compute rows stay green and step 2 goes red **naming
+itself** — `net device MISSING … (got: NODEV)` — instead of impersonating a refusal.
+
+Measured on arm64 the same day, all green: truth table matched, device present at step ≥ 2
+(bind refused loudly on `203.0.113.1`), and `uxn:ping-<token>` back off the aarch64 build's
+own listener. **What that does NOT claim:** the round trip is loopback under emulation, so it
+asserts the *mechanism* (bind/accept/read/write in a static aarch64 glibc) and nothing about
+addressing, and no aarch64 **device** has run it yet — that leg needs a phone on USB, and it
+is `verify-note3.sh`'s shape (cross-build → `adb push /data/local/tmp` → run under the real
+kernel) that will carry it. Built and driven ≠ deployed and verified.
+
 ## Measurements
 
 - **ROM:** 200 bytes (0.31% of the 64 KB Uxn address space; was 134 B before the
