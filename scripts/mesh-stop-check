@@ -1,0 +1,415 @@
+#!/usr/bin/env bash
+# mesh-stop-check — the STOP EDGE of the board signal. A Claude `Stop` hook that refuses to let a
+# mind go idle while it still owes the board something, or while a line addressed TO it landed after
+# it last spoke.
+#
+# Operator premise (2026-07-24): "check if chat.log was updated after stop of mind and ask to resolve."
+#
+# WHY THIS EDGE: the board-WRITE edge is already wired — mesh-fsnotify watches ~/.mesh/chat.log and
+# fires mesh-dispatch on every write. The MIND-STOP edge had no wire at all (~/.claude/settings.json
+# carried only SessionStart + PreToolUse). CLAUDE.md: "both edges of a signal need the same gate" —
+# a mind could stop one second after a [verify] addressed to it landed and nothing would notice until
+# the next cron tick. This closes that edge, event-driven, at the exact instant the mind tries to stop.
+#
+# WHY A HOOK AND NOT A NUDGE: re-injecting keystrokes into a stopping pane races the composer and has
+# no loop guard. The Stop hook's own `decision: block` + `reason` IS the continuation — the engine
+# feeds `reason` back as the next turn, and sets `stop_hook_active` on the following Stop so a second
+# block cannot fire from the same cluster. Loop prevention is structural, not a sleep.
+#
+#   mesh-stop-check                  hook mode — hook JSON on stdin, decision JSON on stdout
+#   mesh-stop-check --dry-run <win>  print the verdict + evidence for <win>, emit NOTHING, touch NOTHING
+#   mesh-stop-check --test           RED-first gates (synthetic board + state dir; real ones untouched)
+#
+# WHAT WAKES A MIND (both must survive the quiet-gates below):
+#   LIABILITY  an open promise/claim/hold owned by this window that mesh-promises reports as LEAKED
+#              (aged past its threshold). A within-threshold obligation is NOT a wake — it is not yet
+#              late, and waking on it would make every stop a wake.
+#   ADDRESSED  a board line landed AFTER this window's last post that is addressed to it: a
+#              `[dispatch] → <win>`, an `owner: …/<win>` clause, or the leading-address form the
+#              promise ledger already parses (`A→<win>: …` / bare `<win>: …`).
+#
+# QUIET-GATES (each one is a wake this tool deliberately does NOT make):
+#   (a) stop_hook_active → return success immediately. The engine sets it on the Stop that follows a
+#       block; honouring it is what keeps this from running the mind indefinitely. There is a harness
+#       cap behind it too (CLAUDE_CODE_STOP_HOOK_BLOCK_CAP) but a hook must not lean on someone else's
+#       backstop — [[a-rule-asserted-at-one-call-site-is-not-asserted]].
+#   (b) EVIDENCE DEDUP. The wake is keyed on a hash of the evidence, not on time. The same leaked slug
+#       and the same addressed lines never wake the same window twice — across sessions, across
+#       reboots. Board churn that does not CHANGE what this window owes is silent.
+#   (c) RATE CAP (MESH_STOPCHECK_MAX_PER_H, default 4/h/window). Belt to the dedup's braces: a window
+#       whose evidence legitimately churns still cannot be held awake indefinitely.
+#   (d) NOT-IN-TMUX / no window → success. A mind outside the session set owes the board nothing.
+#
+# It NEVER blocks on a bare `[idle]`/`[yield]` — those are the mind's own declaration, and re-waking
+# on a declaration is the false-wake storm shape ([[room-false-wake-storm]]). Only real liability or a
+# real address gets through.
+#
+# FAIL-SAFE DIRECTION IS *ALLOW THE STOP*: every error path (no board, mesh-promises absent or
+# erroring, unparseable stdin, tmux gone) returns success and lets the mind stop. A hook that blocks
+# on its own malfunction pins a mind awake forever, which is strictly worse than a missed wake — the
+# missed wake is caught by the next board write via mesh-fsnotify/mesh-dispatch. Opposite polarity to
+# mesh-clear, whose irreversible action makes BLOCK the safe default; here the irreversible-ish action
+# is the paid turn, so ALLOW is safe.
+#
+# orphan-ok: hook-invoked (settings.json Stop), not a cron reflex — it fires on the mind-stop edge.
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+
+MESH_DIR="${MESH_DIR:-$HOME/.mesh}"
+BOARD="${MESH_STOPCHECK_BOARD:-$MESH_DIR/chat.log}"
+STATE_DIR="${MESH_STOPCHECK_STATE:-$MESH_DIR/stop-check}"
+MAX_PER_H="${MESH_STOPCHECK_MAX_PER_H:-4}"
+LOG="${MESH_STOPCHECK_LOG:-$MESH_DIR/stop-check.log}"
+
+usage(){ sed -n '2,/^set -uo/p' "$0" | sed -n 's/^# \?//p'; }
+
+# Resolve the window this hook fires in. Same read mesh-handoff/mesh-chat use (#W = window name);
+# the Stop hook inherits TMUX_PANE from the mind's pane ([[sessionstart-hook-inherits-tmux-pane]]).
+_this_window() {
+  [ -n "${MESH_STOPCHECK_TEST_WINDOW:-}" ] && { printf '%s' "$MESH_STOPCHECK_TEST_WINDOW"; return 0; }
+  [ -n "${TMUX_PANE:-}" ] || return 0
+  tmux display-message -p -t "$TMUX_PANE" '#W' 2>/dev/null || true
+}
+
+# The promise ledger, as JSON. NON-ZERO EXIT IS NORMAL HERE: mesh-promises exits 1 when leaks exist,
+# which is exactly the case we care about — reading rc as failure would blind this tool to every leak
+# it was built to see. Only EMPTY output is a failure, and it degrades to "no liabilities" (fail-safe
+# allow), never to a block.
+_ledger_json() {
+  # MESH_STOPCHECK_LEDGER: a fixture ledger for --test. A fixture alone would only prove this tool
+  # agrees with ITSELF about field names, so --test ALSO drives the real mesh-promises output through
+  # the same parser ([[injected-fixture-bypasses-the-parser]]).
+  [ -n "${MESH_STOPCHECK_LEDGER:-}" ] && { cat "$MESH_STOPCHECK_LEDGER" 2>/dev/null || printf '%s' '{"open":[]}'; return 0; }
+  command -v mesh-promises >/dev/null 2>&1 || { printf '%s' '{"open":[]}'; return 0; }
+  local out; out="$(timeout 20 mesh-promises --json 2>/dev/null)"
+  case "$out" in '{'*) printf '%s' "$out" ;; *) printf '%s' '{"open":[]}' ;; esac
+}
+
+# ---- the analysis: window + board + ledger -> verdict JSON on stdout -------------------------------
+# Pure function of its inputs (no writes, no state) so --dry-run and --test drive the SAME code the
+# hook path drives — a gate that exercises a parallel copy asserts nothing.
+#
+# The ledger arrives as a FILE, not on stdin: python's stdin here is the heredoc that carries this
+# very program, so a piped ledger would be silently discarded — and worse, the unread pipe SIGPIPEs
+# the writer, which under `set -o pipefail` reads as a failed analysis and (fail-safe direction) a
+# silent ALLOW. That is a blind hook that always says "nothing owed". [[pipefail-turns-sigpipe-into-a-false-verdict]]
+_analyze() { # $1=window $2=ledger-json-file ; reads $BOARD
+python3 - "$1" "$BOARD" "$2" <<'PY'
+import json,re,sys,hashlib
+win, board, ledger_path = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    with open(ledger_path, encoding="utf-8") as fh: ledger = json.load(fh)
+except Exception: ledger = {"open": []}
+
+try:
+    with open(board, encoding="utf-8", errors="replace") as fh:
+        raw = [l.rstrip("\n") for l in fh if l.strip()]
+except OSError:
+    print(json.dumps({"wake": False, "why": "no board"})); raise SystemExit(0)
+
+SEP = "  ::  "
+rows = []
+for l in raw:
+    if SEP not in l: continue
+    head, body = l.split(SEP, 1)
+    parts = head.split()
+    actor = parts[1] if len(parts) > 1 else ""
+    rows.append({"ts": parts[0] if parts else "", "win": actor.split("@")[0], "body": body.strip()})
+
+# index of this window's last post; -1 (=> whole board is "new") when it has never posted
+last_mine = -1
+for i, r in enumerate(rows):
+    if r["win"] == win: last_mine = i
+
+MARK = re.compile(r"^\[[a-z-]+\]\s*")
+# `[dispatch] → health (free:opencode): …` — mind-control's routing form, arrow BEFORE the window.
+DISPATCH = re.compile(r"\[dispatch\]\s*(?:→|->)\s*([a-z0-9][a-z0-9_-]*)", re.I)
+# `owner: <tool>/<window>` or bare `owner: <window>` — CLAUDE.md's routing clause.
+OWNER = re.compile(r"owner:\s*(?:[^\s/]+/)?([a-z0-9][a-z0-9_-]*)", re.I)
+
+def addressee(body):
+    """The leading-address form the promise ledger already parses: `A→B: …` addresses B,
+    a bare `A: …` addresses A. Returns None when there is no leading address at all."""
+    b = MARK.sub("", body)
+    lead = b.split(":", 1)[0] if ":" in b else ""
+    if not lead or len(lead) > 60: return None
+    if "→" in lead or "->" in lead:
+        tail = re.split(r"→|->", lead)[-1]
+    elif "/" in lead:
+        tail = lead.rsplit("/", 1)[-1]
+    else:
+        tail = lead
+    tok = tail.strip().split()[0] if tail.strip() else ""
+    tok = tok.strip("()[]{},.").lower()
+    return tok or None
+
+def concerns(body):
+    m = DISPATCH.search(body)
+    if m and m.group(1).lower() == win: return "dispatch"
+    for m in OWNER.finditer(body):
+        if m.group(1).lower() == win: return "owner"
+    if addressee(body) == win: return "addressed"
+    return None
+
+addressed = []
+for r in rows[last_mine + 1:]:
+    if r["win"] == win:  # our own line (only reachable when we never "posted" by actor name)
+        continue
+    kind = concerns(r["body"])
+    if kind:
+        addressed.append({"ts": r["ts"], "from": r["win"], "kind": kind,
+                          "body": r["body"][:220]})
+
+# LEAKED liabilities owed by this window, across the WHOLE claim family — a [verify] owed and a
+# [taking] held leak exactly like a [task], and a detector blind to two of the three is blind to the
+# claims that drift longest (mesh-promises' own claim-family-leak lesson). Each family names its
+# debtor differently: promises `owner`, claims `debtor`, holds `taker`.
+# Within-threshold obligations are deliberately NOT a wake — not yet late is not owed-now.
+leaked = []
+for fam, key, label in (("open", "owner", "task"), ("claims", "debtor", "verify"), ("holds", "taker", "taking")):
+    for o in ledger.get(fam, []):
+        if str(o.get(key, "")).lower() == win and o.get("leaked") and not o.get("written_off"):
+            leaked.append(dict(o, _kind=label))
+
+wake = bool(leaked or addressed)
+# Evidence key = WHAT is owed, never WHEN it was checked. A wake repeats only when the debt changes.
+key = hashlib.sha256(json.dumps(
+    {"leaked": sorted(o.get("slug", "") for o in leaked),
+     "addressed": sorted(a["ts"] + a["body"][:120] for a in addressed)},
+    ensure_ascii=False, sort_keys=True).encode()).hexdigest()[:16]
+
+lines = []
+if leaked:
+    lines.append("You still owe the board %d LEAKED obligation(s) as %s:" % (len(leaked), win))
+    for o in leaked[:6]:
+        lines.append("  · [%s] %s (%s, open %.1fh, threshold %.0fh)%s"
+                     % (o["_kind"], o.get("lead") or o.get("slug"), o.get("slug"),
+                        o.get("age_h", 0), o.get("threshold_h", 0),
+                        " [incident]" if o.get("incident") else ""))
+if addressed:
+    lines.append("%d board line(s) addressed to %s landed after you last posted:" % (len(addressed), win))
+    for a in addressed[-6:]:
+        lines.append("  · %s %s@ (%s): %s" % (a["ts"], a["from"], a["kind"], a["body"]))
+if wake:
+    lines.append("")
+    lines.append("Resolve each: discharge it ([done] <slug>: … / [fyi] with the result), or if it is "
+                 "genuinely not yours or already settled, say so on the board so the ledger clears. "
+                 "Do NOT re-post the same claim. If nothing here is actionable right now, post one "
+                 "[idle] line stating why and stop.")
+
+print(json.dumps({"wake": wake, "key": key, "window": win,
+                  "leaked": len(leaked), "addressed": len(addressed),
+                  "reason": "\n".join(lines)}, ensure_ascii=False))
+PY
+}
+
+_json_field() { python3 -c 'import json,sys;print(json.load(sys.stdin).get(sys.argv[1],""))' "$1" 2>/dev/null; }
+
+# Ledger + analysis in one call, with the ledger materialised to a file (see _analyze). Echoes the
+# verdict JSON; empty on any failure — which the callers read as ALLOW.
+_verdict() { # $1=window
+  local lf; lf="$(mktemp)" || return 1
+  _ledger_json > "$lf"
+  _analyze "$1" "$lf"
+  rm -f "$lf"
+}
+
+# ---- dry-run ---------------------------------------------------------------------------------------
+if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then usage; exit 0; fi
+if [ "${1:-}" = "--dry-run" ]; then
+  W="${2:-$(_this_window)}"
+  [ -n "$W" ] || { echo "mesh-stop-check --dry-run: no window (pass one, or run inside tmux)" >&2; exit 2; }
+  V="$(_verdict "$W")"
+  case "$(printf '%s' "$V" | _json_field wake)" in
+    True) echo "mesh-stop-check: WOULD BLOCK ($W)"; printf '%s' "$V" | _json_field reason ;;
+    *)    echo "mesh-stop-check: would allow stop ($W) — nothing owed, nothing addressed" ;;
+  esac
+  exit 0
+fi
+
+# ---- hook mode -------------------------------------------------------------------------------------
+if [ "${1:-}" != "--test" ]; then
+  HOOK_IN="$(timeout 5 cat 2>/dev/null || true)"
+  # (a) already continuing from a stop hook — let it stop, unconditionally.
+  case "$HOOK_IN" in *'"stop_hook_active"'*'true'*) exit 0 ;; esac
+
+  WIN="$(_this_window)"
+  [ -n "$WIN" ] || exit 0                                    # (d) not in the session set
+  [ -r "$BOARD" ] || exit 0
+
+  VERDICT="$(_verdict "$WIN")" || exit 0
+  [ -n "$VERDICT" ] || exit 0
+  [ "$(printf '%s' "$VERDICT" | _json_field wake)" = "True" ] || exit 0
+
+  KEY="$(printf '%s' "$VERDICT" | _json_field key)"
+  mkdir -p "$STATE_DIR" 2>/dev/null || exit 0
+  SF="$STATE_DIR/$WIN.state"
+
+  # (b) evidence dedup + (c) rate cap, in one read of the window's own wake history.
+  NOW="$(date -u +%s)"
+  if [ -f "$SF" ]; then
+    while read -r wts wkey; do
+      [ "$wkey" = "$KEY" ] && exit 0                          # same debt, already woken on it
+    done < "$SF"
+    RECENT="$(awk -v now="$NOW" '$1 > now-3600' "$SF" 2>/dev/null | wc -l)"
+    [ "${RECENT:-0}" -ge "$MAX_PER_H" ] && exit 0
+  fi
+  printf '%s %s\n' "$NOW" "$KEY" >> "$SF"
+  tail -n 50 "$SF" > "$SF.tmp" 2>/dev/null && mv "$SF.tmp" "$SF" 2>/dev/null
+
+  printf '%s\t%s\tblock\t%s\tleaked=%s addressed=%s\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$WIN" "$KEY" \
+    "$(printf '%s' "$VERDICT" | _json_field leaked)" \
+    "$(printf '%s' "$VERDICT" | _json_field addressed)" >> "$LOG" 2>/dev/null || true
+
+  python3 -c 'import json,sys
+v=json.load(sys.stdin)
+print(json.dumps({"decision":"block","reason":v["reason"]}, ensure_ascii=False))' <<<"$VERDICT"
+  exit 0
+fi
+
+# ---- --test ----------------------------------------------------------------------------------------
+# Every gate drives the REAL hook path (this same file, hook mode) against a SYNTHETIC board + state
+# dir. It never touches ~/.mesh/chat.log or the real state — a --test that writes the artifact a human
+# reads forges the evidence it exists to check (CLAUDE.md, mesh-guardian 09f7914).
+FAIL=0
+T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
+export MESH_STOPCHECK_BOARD="$T/chat.log"
+export MESH_STOPCHECK_STATE="$T/state"
+export MESH_STOPCHECK_LOG="$T/stop-check.log"
+export MESH_STOPCHECK_TEST_WINDOW="testwin"
+REAL_BOARD="$MESH_DIR/chat.log"
+REAL_BOARD_SUM="$( [ -f "$REAL_BOARD" ] && md5sum "$REAL_BOARD" | cut -d' ' -f1 || echo none)"
+
+say(){ printf '  %s\n' "$*"; }
+ok(){ say "ok: $*"; }
+bad(){ say "FAIL: $*"; FAIL=1; }
+
+# a board with churn nobody addressed to us, then the lines we vary per gate
+_board(){ cat > "$MESH_STOPCHECK_BOARD"; }
+_run(){ printf '%s' "$1" | bash "$0"; }   # hook mode with given stdin JSON
+
+echo "mesh-stop-check --test"
+
+# G1 — an ADDRESSED line after our last post blocks, and the reason CARRIES it.
+_board <<'EOF'
+2026-07-24T10:00:00Z  testwin@h  ::  [idle] nothing new
+2026-07-24T10:01:00Z  doctor@h  ::  [doctor] 1 FAIL, 11 WARN — unrelated churn
+2026-07-24T10:02:00Z  discover@h  ::  [verify] discover→testwin: the jack-sense read path needs a hand
+EOF
+OUT="$(_run '{"stop_hook_active":false}')"
+if printf '%s' "$OUT" | grep -q '"decision": *"block"' && printf '%s' "$OUT" | grep -q 'jack-sense'; then
+  ok "addressed line after last post -> block, reason quotes it"
+else bad "addressed line did not produce a block carrying the line: $OUT"; fi
+
+# G1-RED — the SAME board with the address stripped must NOT block. This is the falsifier for G1:
+# without it, a tool that blocks unconditionally passes G1.
+sed -i 's/discover→testwin:/discover:/' "$MESH_STOPCHECK_BOARD"
+rm -rf "$MESH_STOPCHECK_STATE"
+OUT="$(_run '{"stop_hook_active":false}')"
+[ -z "$OUT" ] && ok "unaddressed churn only -> silent (the block is caused by the ADDRESS)" \
+              || bad "blocked on board churn addressed to nobody: $OUT"
+
+# G2 — stop_hook_active=true is honoured even with the FULL evidence of G1 present.
+sed -i 's/discover:/discover→testwin:/' "$MESH_STOPCHECK_BOARD"
+rm -rf "$MESH_STOPCHECK_STATE"
+OUT="$(_run '{"stop_hook_active":true}')"
+[ -z "$OUT" ] && ok "stop_hook_active=true -> success (no second block from one cluster)" \
+              || bad "blocked despite stop_hook_active=true — this is the infinite-wake loop: $OUT"
+
+# G3 — evidence dedup: identical evidence twice, second run silent.
+rm -rf "$MESH_STOPCHECK_STATE"
+first="$(_run '{"stop_hook_active":false}')"
+second="$(_run '{"stop_hook_active":false}')"
+{ [ -n "$first" ] && [ -z "$second" ]; } && ok "same evidence twice -> woken once (dedup by debt, not time)" \
+  || bad "dedup did not hold (first=${#first}B second=${#second}B)"
+
+# G3b — dedup is keyed on the DEBT: a NEW addressed line still gets through the same state file.
+printf '2026-07-24T10:05:00Z  senses@h  ::  [task] fix the thing owner: mesh-x/testwin\n' >> "$MESH_STOPCHECK_BOARD"
+third="$(_run '{"stop_hook_active":false}')"
+{ [ -n "$third" ] && printf '%s' "$third" | grep -q 'fix the thing'; } \
+  && ok "new debt after a dedup -> wakes again (dedup is not a mute)" \
+  || bad "a genuinely new addressed line was swallowed by the dedup state: $third"
+
+# G4 — rate cap. Feed distinct evidence past the cap and watch it go quiet.
+rm -rf "$MESH_STOPCHECK_STATE"; export MESH_STOPCHECK_MAX_PER_H=2
+n_blocked=0
+for i in 1 2 3 4; do
+  printf '2026-07-24T11:0%d:00Z  senses@h  ::  [task] distinct-%d owner: testwin\n' "$i" "$i" >> "$MESH_STOPCHECK_BOARD"
+  [ -n "$(_run '{"stop_hook_active":false}')" ] && n_blocked=$((n_blocked+1))
+done
+[ "$n_blocked" -le 2 ] && ok "rate cap held ($n_blocked block(s) with cap 2, 4 distinct debts)" \
+                       || bad "rate cap did not hold: $n_blocked blocks with cap 2"
+export MESH_STOPCHECK_MAX_PER_H=4
+
+# G5 — the emitted decision is VALID JSON with the fields the engine reads. A malformed hook payload
+# is silently ignored by the harness, which reads as "the mind owed nothing".
+rm -rf "$MESH_STOPCHECK_STATE"
+OUT="$(_run '{"stop_hook_active":false}')"
+if printf '%s' "$OUT" | python3 -c 'import json,sys;d=json.load(sys.stdin);assert d["decision"]=="block";assert len(d["reason"])>40' 2>/dev/null; then
+  ok "decision payload parses as JSON with decision=block + a non-trivial reason"
+else bad "emitted payload is not a parseable block decision: $OUT"; fi
+
+# G6 — a window with NO board presence and no debts allows the stop (fail-safe direction).
+rm -rf "$MESH_STOPCHECK_STATE"
+OUT="$(MESH_STOPCHECK_TEST_WINDOW=nosuchwindow _run '{"stop_hook_active":false}')"
+[ -z "$OUT" ] && ok "window with nothing owed -> allows the stop" || bad "blocked a window that owes nothing: $OUT"
+
+# G7 — every error path ALLOWS. An unreadable board must not pin a mind awake.
+OUT="$(MESH_STOPCHECK_BOARD="$T/does-not-exist" _run '{"stop_hook_active":false}')"
+[ -z "$OUT" ] && ok "missing board -> allows the stop (fail-safe is ALLOW, not BLOCK)" \
+              || bad "blocked on a missing board — a malfunction would pin the mind: $OUT"
+
+# G8 — LIABILITY half: a LEAKED [verify] owed by this window blocks even with a silent board, and the
+# reason names it. The board here has NOTHING addressed to us, so only the ledger can cause the block.
+cat > "$T/ledger.json" <<'EOF'
+{"open":[],
+ "claims":[{"debtor":"testwin","slug":"bose-voice-silent","lead":"Bose voice SILENT since 07-17",
+            "age_h":46.2,"threshold_h":12.0,"leaked":true,"written_off":false}],
+ "holds":[]}
+EOF
+_board <<'EOF'
+2026-07-24T10:00:00Z  testwin@h  ::  [idle] nothing new
+2026-07-24T10:01:00Z  doctor@h  ::  [doctor] 1 FAIL, 11 WARN — unrelated churn
+EOF
+rm -rf "$MESH_STOPCHECK_STATE"
+OUT="$(MESH_STOPCHECK_LEDGER="$T/ledger.json" _run '{"stop_hook_active":false}')"
+{ [ -n "$OUT" ] && printf '%s' "$OUT" | grep -q 'Bose voice SILENT' && printf '%s' "$OUT" | grep -q '\[verify\]'; } \
+  && ok "leaked [verify] owed by the window -> block naming it (claim family, not just [task])" \
+  || bad "a leaked claim owed by this window did not wake it: $OUT"
+
+# G8-RED — the SAME ledger with leaked:false must be silent. Falsifier for G8: without it, a tool that
+# wakes on ANY open obligation (not just late ones) passes G8 and then wakes on every single stop.
+sed -i 's/"leaked":true/"leaked":false/' "$T/ledger.json"
+rm -rf "$MESH_STOPCHECK_STATE"
+OUT="$(MESH_STOPCHECK_LEDGER="$T/ledger.json" _run '{"stop_hook_active":false}')"
+[ -z "$OUT" ] && ok "within-threshold obligation -> silent (the block is caused by the LEAK, not by openness)" \
+              || bad "woke on a not-yet-late obligation — every stop would be a wake: $OUT"
+
+# G9 — the parser agrees with the REAL producer, not only with the fixture. Take a window the LIVE
+# mesh-promises ledger reports as owing a leaked obligation and assert _analyze sees it. If the real
+# board currently has no leaked owner this is an honest n/a — never a silent pass.
+LIVE_OWNER="$(mesh-promises --json 2>/dev/null | python3 -c '
+import json,sys
+try: d=json.load(sys.stdin)
+except Exception: raise SystemExit(0)
+for fam,k in (("open","owner"),("claims","debtor"),("holds","taker")):
+    for o in d.get(fam,[]):
+        if o.get("leaked") and not o.get("written_off") and o.get(k) not in (None,"","reflex-broadcast"):
+            print(o[k]); raise SystemExit(0)' 2>/dev/null)"
+if [ -n "$LIVE_OWNER" ]; then
+  V="$(MESH_STOPCHECK_BOARD="$MESH_DIR/chat.log" bash "$0" --dry-run "$LIVE_OWNER" 2>/dev/null)"
+  printf '%s' "$V" | grep -q 'LEAKED obligation' \
+    && ok "real mesh-promises output parses through the same path (live owner: $LIVE_OWNER)" \
+    || bad "the live ledger reports $LIVE_OWNER owes a leak but _analyze does not see it — field-name drift vs the real producer"
+else
+  say "n/a: the live board currently reports no leaked non-broadcast obligation (nothing to cross-check)"
+fi
+
+# G10 — the test wrote NOTHING to the real board. [[a-tests-forged-artifact-mimics-a-flapping-sense]]
+NOW_SUM="$( [ -f "$REAL_BOARD" ] && md5sum "$REAL_BOARD" | cut -d' ' -f1 || echo none)"
+[ "$NOW_SUM" = "$REAL_BOARD_SUM" ] && ok "real chat.log untouched by --test" \
+                                   || bad "--test MUTATED the real board — it forges the artifact it checks"
+
+[ "$FAIL" = 0 ] && { echo "mesh-stop-check --test: ok"; exit 0; }
+echo "mesh-stop-check --test: FAIL"; exit 1
