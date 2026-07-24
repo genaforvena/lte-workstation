@@ -1,0 +1,372 @@
+#!/usr/bin/env bash
+# mesh-guitar-watch — catch the operator PLAYING GUITAR in the live mic-fanout captures, then
+# ship the original + a few grinds (close-loop / quantized / poly — NEVER rw) to his Telegram.
+#
+# WHY: the generic source-picker (mesh-sound-reflex, ranked by mesh-soundscape's dyn-heavy score)
+# never caught guitar — a strummed acoustic reads as TONAL + harmonically RICH + rhythmic + LOUD,
+# and the dyn/score ranker selects for one-shot transients instead (CLAUDE.md "check what your
+# ranker SELECTS FOR"). So this is a PURPOSE-BUILT detector with a guitar-shaped multi-axis gate,
+# not another score threshold. Operator ask 2026-07-24 ("it never catches me playing guitar …
+# if you found — make a reflex to look for it. first original then mix in warry modes but not rw,
+# prefer close loop").
+#
+# THE GATE (all four, AND) — calibrated on the operator's own 16:10–16:34Z session (n=20 captures):
+#   tone >= GW_TONE (0.85)  harmonic/tonal, not noise      | guitar takes: .917 / .940
+#   rich >= GW_RICH (0.45)  harmonic complexity, not a hum  | guitar takes: .627 / .453
+#   rms  >= GW_RMS  (0.10)  actually being PLAYED, not bleed | guitar takes: .149 / .125  (strongest axis)
+#   beats>= GW_BEATS (3)    strumming has rhythmic onsets    | guitar takes: 5 / 17
+# This cleanly split the 2 real guitar takes (score up to 86) from all ambient (max 36). Thresholds
+# are env-tunable AND every examined capture's axes are logged ($SCORE_LOG) so the gate can be
+# RE-CALIBRATED against the live corpus, never a pinned constant (CLAUDE.md "calibrate against the
+# REAL corpus"). The gate is LOUD-fail-safe: a capture that doesn't clear it is simply not shipped;
+# a MISS shows up as a near-threshold row in the score log, never as a silent drop.
+#
+# HONEST n/a (exit 2, never a faked all-clear): the mic-fanout dir absent, no new captures, or no TG
+# creds -> exit 2, watermark NOT advanced, nothing marked seen (a later run still catches the same
+# session). A reachable-but-empty capture dir is n/a, not "no guitar".
+#
+# ONE DELIVERY PER SESSION: the operator plays for minutes = many 3-min captures. Per tick this ships
+# only the SINGLE loudest new hit, then advances the watermark past EVERY capture examined this tick,
+# so a continuous session is one delivery (orig + 3 grinds), not one per capture.
+#
+# reflex-cadence: */15 * * * *
+set -uo pipefail
+export PATH="/usr/bin:$HOME/.local/bin:$PATH"
+export LC_ALL=C.UTF-8
+MESH="${MESH_DIR:-$HOME/.mesh}"
+
+CAPDIR="${GW_CAPDIR:-$MESH/mic-fanout/records-mac}"
+OUTDIR="${GW_OUTDIR:-$HOME/grainneukeln/output}"
+GNK="${GW_GNK:-$HOME/grainneukeln}"
+PY="${GW_PY:-$GNK/.venv/bin/python}"
+SENT_LOG="${GW_SENT_LOG:-$MESH/room-music-sent.log}"   # shared with mesh-grind-deliver -> no double-send
+SEEN_LOG="${GW_SEEN_LOG:-$MESH/guitar-watch.seen}"     # captures this reflex has already examined+shipped-from
+SCORE_LOG="${GW_SCORE_LOG:-$MESH/guitar-watch.scores}" # EVERY capture's axes -> the recalibration corpus
+WATERMARK="${GW_WATERMARK:-$MESH/guitar-watch.watermark}"
+STATE="${GW_STATE:-$MESH/.guitar-watch-state}"
+LOG="${GW_LOG:-$MESH/guitar-watch.log}"
+LOCK="${GW_LOCK:-$MESH/.guitar-watch.lock}"
+ENVF="${GW_ENVF:-$HOME/.config/remote-access/env}"
+SETTLE="${GW_SETTLE:-20}"          # a capture must be this many secs old (fully written) before measured
+
+# gate thresholds (env-tunable; defaults from the 2026-07-24 session calibration)
+GW_TONE="${GW_TONE:-0.85}"
+GW_RICH="${GW_RICH:-0.45}"
+GW_RMS="${GW_RMS:-0.10}"
+GW_BEATS="${GW_BEATS:-3}"
+
+# LONGER SOURCE (operator 2026-07-24 "it should be longer sources … songs that start and end silence
+# to silence"): a 12s fanout sample is only the DETECTION trigger. The SOURCE we grind is the whole
+# song, silence-bounded. Two ways, in order of preference:
+#   1. fresh long-record from the mac mic (he's likely still playing — the fanout just caught him),
+#      trimmed silence-to-silence.
+#   2. else concatenate the recent guitar-ish captures of this session into a longer medley.
+# Both are capped to CAP_SECS (< the ~65s grinder feed ceiling — CLAUDE.md "grind fails silently >~65s").
+MAC_SSH="${GW_MAC_SSH:-ilya@192.168.8.214}"
+MAC_BIN="${GW_MAC_BIN:-\$HOME/.mesh-mac/macmic}"
+SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=8 -o BatchMode=yes"
+LONG_SECS="${GW_LONG_SECS:-75}"    # fresh-record length (macmic self-bounds); a whole short song
+CAP_SECS="${GW_CAP_SECS:-55}"      # hard feed cap, safely under the ~65s grinder ceiling
+SESSION_MIN="${GW_SESSION_MIN:-45}"   # look back this many minutes to gather session captures for the medley
+MIN_SRC_SECS="${GW_MIN_SRC_SECS:-14}" # a source shorter than this -> not worth a 5-mix batch, use the sample
+SILENCE_TRIM="silenceremove=start_periods=1:start_threshold=-45dB:start_silence=0.15:stop_periods=1:stop_threshold=-45dB:stop_silence=0.25:detection=rms"
+N_MIXES="${GW_N_MIXES:-5}"         # diverse grinds per session
+GENERATOR="${GW_GENERATOR:-$HOME/.local/bin/mesh-grind-params.py}"
+
+ts_utc(){ date -u +%FT%TZ; }
+log(){ printf '%s %s\n' "$(ts_utc)" "$*" >> "$LOG" 2>/dev/null || true; }
+now(){ echo "${GW_NOW:-$(date +%s)}"; }
+
+# measure a wav -> "tone rich rms beats" (space-sep), or empty on failure
+measure_axes(){
+  local m; m=$(mesh-soundscape --measure "$1" 2>/dev/null) || return 1
+  [ -n "$m" ] || return 1
+  local tone rich rms beats
+  tone=$(printf '%s' "$m" | grep -oP 'tone=\K[0-9.]+')
+  rich=$(printf '%s' "$m" | grep -oP 'rich=\K[0-9.]+')
+  rms=$(printf '%s' "$m"  | grep -oP 'rms=\K[0-9.]+')
+  beats=$(printf '%s' "$m" | grep -oP 'beats=\K[0-9]+')
+  [ -n "$tone" ] && [ -n "$rich" ] && [ -n "$rms" ] && [ -n "$beats" ] || return 1
+  printf '%s %s %s %s\n' "$tone" "$rich" "$rms" "$beats"
+}
+
+# is-guitar? $1=tone $2=rich $3=rms $4=beats  -> rc 0 if clears the gate
+is_guitar(){
+  awk -v t="$1" -v r="$2" -v m="$3" -v b="$4" \
+      -v T="$GW_TONE" -v R="$GW_RICH" -v M="$GW_RMS" -v B="$GW_BEATS" \
+      'BEGIN{ exit !(t+0>=T && r+0>=R && m+0>=M && b+0>=B) }'
+}
+
+# ---- creds -----------------------------------------------------------------
+load_creds(){
+  [ -f "$ENVF" ] || return 1
+  set -a; . "$ENVF" 2>/dev/null; set +a
+  TOK="${BOT_TOKEN:-${TG_BOT_TOKEN:-}}"; CHAT="${CHAT_ID:-${TG_CHAT_ID:-}}"
+  [ -n "${TOK:-}" ] && [ -n "${CHAT:-}" ]
+}
+
+# send an audio file to the operator ($1=path $2=caption); marks it in the shared sent ledger. rc!=0 = fail
+send_audio(){
+  local f="$1" cap="$2" r
+  if [ "${GW_DRYRUN:-0}" = 1 ]; then echo "DRYRUN send: $(basename "$f") :: $cap"; echo " $(basename "$f")" >> "$SENT_LOG"; return 0; fi
+  r=$(curl -s --max-time 120 "https://api.telegram.org/bot${TOK}/sendAudio" \
+        -F chat_id="${CHAT}" -F audio=@"$f" -F caption="$cap" 2>/dev/null)
+  if printf '%s' "$r" | grep -q '"ok":true'; then
+    printf ' %s\n' "$(basename "$f")" >> "$SENT_LOG"; return 0
+  fi
+  log "sendAudio FAILED $(basename "$f"): $(printf '%s' "$r" | head -c 160)"; return 1
+}
+
+# duration of a wav/mp3 in seconds (0 on failure)
+dur_of(){ ffprobe -v error -show_entries format=duration -of csv=p=0 "$1" 2>/dev/null || echo 0; }
+
+# trim leading/trailing silence -> "silence to silence", then hard-cap to CAP_SECS. $1=in $2=out
+trim_and_cap(){
+  local in="$1" out="$2" tmp="${2%.wav}.trim.wav"
+  ffmpeg -v error -y -i "$in" -af "$SILENCE_TRIM" "$tmp" >/dev/null 2>&1 || return 1
+  local d; d=$(dur_of "$tmp")
+  if awk -v d="$d" -v c="$CAP_SECS" 'BEGIN{exit !(d+0>c)}'; then
+    ffmpeg -v error -y -i "$tmp" -t "$CAP_SECS" "$out" >/dev/null 2>&1 || return 1
+  else
+    mv "$tmp" "$out"
+  fi
+  rm -f "$tmp"
+  [ -s "$out" ]
+}
+
+# 1. fresh long-record from the mac mic, silence-trimmed. Prints path (or empty). Only USED if the
+#    result still clears the guitar gate (he's still playing) — else it's ambient/silence, discarded.
+capture_song(){
+  local out="$1" raw="$MESH/inbox/.gw-fresh.m4a" wav="$MESH/inbox/.gw-fresh.wav"
+  timeout -s KILL $((LONG_SECS+20)) ssh $SSH_OPTS "$MAC_SSH" "$MAC_BIN /tmp/gw-song.m4a $LONG_SECS" >/dev/null 2>&1 || { log "fresh-record: mac unreachable/asleep"; return 1; }
+  timeout -s KILL 30 scp $SSH_OPTS "$MAC_SSH:/tmp/gw-song.m4a" "$raw" >/dev/null 2>&1 || { log "fresh-record: pull failed"; return 1; }
+  [ -s "$raw" ] || return 1
+  ffmpeg -v error -y -i "$raw" -ac 1 -ar 22050 -af loudnorm=I=-16:TP=-1 "$wav" >/dev/null 2>&1 || return 1
+  trim_and_cap "$wav" "$out" || return 1
+  rm -f "$raw" "$wav"
+  printf '%s\n' "$out"
+}
+
+# 2. concatenate this session's guitar-ish captures (looser gate than DETECTION: any tonal+rhythmic
+#    material from the playing window) into one longer silence-trimmed medley. Prints path or empty.
+build_session_source(){
+  local out="$1" work="$MESH/inbox/.gw-medley"; rm -rf "$work"; mkdir -p "$work"
+  local wm_secs=$((SESSION_MIN*60)) idx=0 f m tone rms beats
+  # captures within the last SESSION_MIN, oldest-first (chronological song order)
+  while IFS= read -r f; do
+    m=$(mesh-soundscape --measure "$f" 2>/dev/null) || continue
+    tone=$(printf '%s' "$m"|grep -oP 'tone=\K[0-9.]+'); rms=$(printf '%s' "$m"|grep -oP 'rms=\K[0-9.]+'); beats=$(printf '%s' "$m"|grep -oP 'beats=\K[0-9]+')
+    awk -v t="$tone" -v r="$rms" -v b="$beats" 'BEGIN{exit !(t+0>=0.82 && r+0>=0.06 && b+0>=4)}' || continue
+    ffmpeg -v error -y -i "$f" -af "$SILENCE_TRIM" "$work/$(printf %03d $idx).wav" >/dev/null 2>&1 && idx=$((idx+1))
+  done < <(find "$CAPDIR" -type f -name '*.wav' -newermt "-${SESSION_MIN} min" 2>/dev/null | sort)
+  [ "$idx" -gt 0 ] || { rm -rf "$work"; return 1; }
+  ls "$work"/*.wav | sort | sed "s/^/file '/;s/$/'/" > "$work/list.txt"
+  ffmpeg -v error -y -f concat -safe 0 -i "$work/list.txt" -ac 1 -ar 22050 "$work/joined.wav" >/dev/null 2>&1 || { rm -rf "$work"; return 1; }
+  local d; d=$(dur_of "$work/joined.wav")
+  if awk -v d="$d" -v c="$CAP_SECS" 'BEGIN{exit !(d+0>c)}'; then
+    ffmpeg -v error -y -i "$work/joined.wav" -t "$CAP_SECS" "$out" >/dev/null 2>&1 || { rm -rf "$work"; return 1; }
+  else
+    cp "$work/joined.wav" "$out"
+  fi
+  rm -rf "$work"; [ -s "$out" ] && printf '%s\n' "$out"
+}
+
+# choose the SOURCE to grind: prefer a fresh long-record (if it's still guitar), else the session
+# medley, else the 12s detection sample. Prints "<path>\t<label>".
+select_source(){
+  local sample="$1" fresh="$MESH/inbox/guitar-song-fresh.wav" medley="$MESH/inbox/guitar-song-medley.wav" p axes
+  if p=$(capture_song "$fresh"); then
+    axes=$(measure_axes "$p")
+    if [ -n "$axes" ] && read -r t r m b <<<"$axes" && is_guitar "$t" "$r" "$m" "$b"; then
+      printf '%s\tсвежая запись, целиком (%.0fс)\n' "$p" "$(dur_of "$p")"; return 0
+    fi
+    log "fresh-record was not guitar (he stopped) — falling back to session medley"
+  fi
+  if p=$(build_session_source "$medley") && awk -v d="$(dur_of "$p")" -v m="$MIN_SRC_SECS" 'BEGIN{exit !(d+0>=m)}'; then
+    printf '%s\tсессия склеена (%.0fс)\n' "$p" "$(dur_of "$p")"; return 0
+  fi
+  printf '%s\tфрагмент (%.0fс)\n' "$sample" "$(dur_of "$sample")"; return 0
+}
+
+# grind $1=src with amc-token-ARRAY (remaining args) into OUTDIR -> prints new mp3 path or empty
+grind(){
+  local src="$1"; shift; local out d
+  mkdir -p "$OUTDIR"
+  ( cd "$GNK" && timeout 260 "$PY" main.py "$src" "$OUTDIR" amc "$@" ) >/dev/null 2>&1 || return 1
+  out=$(ls -t "$OUTDIR"/*.mp3 2>/dev/null | head -1)
+  [ -n "$out" ] && [ -s "$out" ] || return 1
+  d=$(dur_of "$out")
+  awk -v d="$d" 'BEGIN{exit !(d+0>=0.5)}' || { log "grind collapsed dur=$d"; return 1; }
+  printf '%s\n' "$out"
+}
+
+# human caption from an amc token list — names the knobs that actually turned (so each mix reads
+# as genuinely different, not "mix 3/5").
+caption_of(){
+  local n="$1"; shift; local -a a=("$@"); local i mode="" parts=""
+  for ((i=0;i<${#a[@]};i++)); do case "${a[i]}" in
+    m) mode="${a[i+1]}";;
+    lib) [ "${a[i-1]}" != m ] && parts+=" ${a[i+1]}";;
+    ek) parts+=" euclid${a[i+1]}/${a[i+3]}";;
+    l) parts+=" зерно${a[i+1]}";;
+    ss) parts+=" ss${a[i+1]}";;
+    s) [ "${a[i-1]}" != ss ] && parts+=" s${a[i+1]}";;
+    c) parts+=" ${a[i+1]}Hz";;
+    sw) parts+=" swing${a[i+1]}";;
+    rv) parts+=" реверс${a[i+1]}";;
+    w) parts+=" w${a[i+1]}";;
+  esac; done
+  case "$mode" in lib) mode="close loop";; q) mode="quantized";; poly) mode="poly";; esac
+  printf '%s/%s · %s ·%s' "$n" "$N_MIXES" "$mode" "$parts"
+}
+
+# process a detected guitar session: pick a LONGER source, ship it as original, then N DIVERSE grinds
+deliver_session(){
+  local sample="$1" tone="$2" rich="$3" rms="$4" beats="$5"
+  local base tstamp src label mp3
+  base=$(basename "$sample" .wav)
+  tstamp=$(printf '%s' "$base" | grep -oP '^\d{8}-\K\d{4}' | sed 's/\(..\)\(..\)/\1:\2/')
+  mkdir -p "$MESH/inbox"
+
+  IFS=$'\t' read -r src label < <(select_source "$sample")
+  log "source: $(basename "$src") ($label) for detection $base"
+
+  mp3="$MESH/inbox/guitar-orig-${tstamp/:/}.mp3"
+  ffmpeg -y -i "$src" -codec:a libmp3lame -q:a 2 "$mp3" >/dev/null 2>&1 || { log "orig encode failed"; return 1; }
+  send_audio "$mp3" "твоя гитара, поймал (${tstamp:-?}) — $label. дальше $N_MIXES намолов, все параметры крутятся разом, каждый другой. без rw." \
+    || { log "orig send failed"; return 1; }
+  log "shipped ORIGINAL from $(basename "$src") ($label)"
+
+  # diverse deterministic param sets keyed on the source basename
+  local key i=0 n=0 mode amc g cap
+  key=$(basename "$src" .wav)
+  while IFS=$'\t' read -r mode amc; do
+    i=$((i+1)); local -a A; read -ra A <<<"$amc"
+    g=$(grind "$src" "${A[@]}") || { log "grind $i ($mode) failed"; continue; }
+    cap=$(caption_of "$i" "${A[@]}")
+    send_audio "$g" "$cap" && { log "shipped mix $i: $cap"; n=$((n+1)); }
+  done < <("$GENERATOR" "$key" "$N_MIXES" 2>/dev/null || python3 "$GENERATOR" "$key" "$N_MIXES")
+  log "session $base delivered: original + $n/$N_MIXES diverse grinds"
+  return 0
+}
+
+# ---- --test ----------------------------------------------------------------
+# Real-read gate: a synthesized TONAL+rhythmic wav MUST clear the guitar gate, and a flat-noise wav
+# MUST NOT — proving the gate discriminates on REAL measured axes, not a stub. (CLAUDE.md: a gate you
+# have not seen FAIL is not a gate.)
+selftest(){
+  local tmp; tmp=$(mktemp -d); local rc=0
+  # 1. gate arithmetic: clears / rejects
+  is_guitar 0.90 0.60 0.15 8  || { echo "FAIL: guitar-shaped axes rejected"; rc=1; }
+  ! is_guitar 0.40 0.20 0.02 1 || { echo "FAIL: noise-shaped axes accepted"; rc=1; }
+  ! is_guitar 0.90 0.60 0.05 8 || { echo "FAIL: quiet (rms<floor) accepted"; rc=1; }
+  # 2. REAL measure: a tonal 220Hz+440Hz pluck-train must measure high tone; flat white noise low tone
+  if command -v ffmpeg >/dev/null 2>&1 && command -v mesh-soundscape >/dev/null 2>&1; then
+    ffmpeg -y -f lavfi -i "sine=frequency=220:duration=4" -af "tremolo=f=4:d=0.9" "$tmp/tone.wav" >/dev/null 2>&1
+    ffmpeg -y -f lavfi -i "anoisesrc=d=4:c=white:a=0.3" "$tmp/noise.wav" >/dev/null 2>&1
+    local ta na
+    ta=$(measure_axes "$tmp/tone.wav")  || { echo "FAIL: could not measure a real tonal wav (soundscape dead?)"; rc=1; }
+    na=$(measure_axes "$tmp/noise.wav") || { echo "FAIL: could not measure a real noise wav"; rc=1; }
+    if [ -n "$ta" ] && [ -n "$na" ]; then
+      local tt nt; tt=$(echo "$ta"|awk '{print $1}'); nt=$(echo "$na"|awk '{print $1}')
+      awk -v a="$tt" -v b="$nt" 'BEGIN{exit !(a+0>b+0)}' \
+        || { echo "FAIL: tonal wav did not measure higher tone than noise (tone $tt vs $nt)"; rc=1; }
+      echo "real-read: tonal tone=$tt > noise tone=$nt  (axes measured live, not stubbed)"
+    fi
+  else
+    echo "SKIP real-read: ffmpeg/mesh-soundscape absent (exit 2 territory on a live node)"
+  fi
+  # 3. DIVERSE generator: N param sets must be DETERMINISTIC yet DECORRELATED — no two mixes share the
+  #    same (l,ss,s) triple (the "readable straight line" the operator rejected), and rw NEVER appears.
+  if [ -x "$GENERATOR" ] || [ -f "$GENERATOR" ]; then
+    local g1 g2 rwcount triples uniq
+    g1=$("$GENERATOR" "selftest-key" 5 2>/dev/null || python3 "$GENERATOR" "selftest-key" 5)
+    g2=$("$GENERATOR" "selftest-key" 5 2>/dev/null || python3 "$GENERATOR" "selftest-key" 5)
+    [ "$g1" = "$g2" ] || { echo "FAIL: generator not deterministic"; rc=1; }
+    rwcount=$(printf '%s\n' "$g1" | grep -cw rw)
+    [ "$rwcount" = 0 ] || { echo "FAIL: generator emitted rw ($rwcount times) — operator forbade it"; rc=1; }
+    # extract each mix's (l ss s) and assert they aren't all identical
+    triples=$(printf '%s\n' "$g1" | grep -oP 'l \K\d+ ss [0-9.]+ s [0-9.]+' | sort)
+    uniq=$(printf '%s\n' "$triples" | sort -u | grep -c .)
+    [ "$uniq" -ge 4 ] || { echo "FAIL: generator monotonous — only $uniq/5 distinct (l,ss,s) triples"; rc=1; }
+    echo "generator: 5 mixes, $uniq distinct (l,ss,s), 0 rw, deterministic ✓"
+  else
+    echo "SKIP generator test: $GENERATOR absent"
+  fi
+  rm -rf "$tmp"
+  [ "$rc" = 0 ] && echo "mesh-guitar-watch: --test OK" || echo "mesh-guitar-watch: --test FAILED"
+  return $rc
+}
+
+case "${1:-}" in
+  -h|--help) sed -n '2,/^set -uo/p' "$0" | sed -n 's/^# \?//p' | sed '$d'; exit 0 ;;
+  --test)    selftest; exit $? ;;
+  --status)
+    wm=$([ -f "$WATERMARK" ] && cat "$WATERMARK" || echo 0)
+    echo "watermark=$wm ($([ "$wm" -gt 0 ] 2>/dev/null && date -d @"$wm" -u +%FT%TZ || echo unset))"
+    echo "capdir=$CAPDIR present=$([ -d "$CAPDIR" ] && echo yes || echo NO)"
+    echo "gate: tone>=$GW_TONE rich>=$GW_RICH rms>=$GW_RMS beats>=$GW_BEATS"
+    echo "recent scores:"; tail -6 "$SCORE_LOG" 2>/dev/null || echo "  (none yet)"
+    exit 0 ;;
+esac
+
+# ---- main tick -------------------------------------------------------------
+exec 9>"$LOCK" 2>/dev/null || true
+flock -n 9 || { log "another tick holds the lock; skip"; exit 0; }
+
+[ -d "$CAPDIR" ] || { echo "n/a: capture dir absent ($CAPDIR)"; exit 2; }
+
+WM=$([ -f "$WATERMARK" ] && cat "$WATERMARK" || echo 0)
+NOW=$(now); CUTOFF=$((NOW - SETTLE))
+
+# FIRST RUN (no watermark): seed to now WITHOUT shipping — never blast the backlog of old captures.
+if [ ! -f "$WATERMARK" ]; then
+  echo "$CUTOFF" > "$WATERMARK"
+  mesh-state-touch "$STATE" 2>/dev/null || touch "$STATE"
+  echo "seeded watermark to $CUTOFF (no backlog blast); exiting"
+  exit 0
+fi
+
+# new, settled captures since the watermark
+mapfile -t NEW < <(find "$CAPDIR" -type f -name '*.wav' -newermt "@$WM" ! -newermt "@$CUTOFF" 2>/dev/null | sort)
+if [ "${#NEW[@]}" -eq 0 ]; then
+  mesh-state-touch "$STATE" 2>/dev/null || touch "$STATE"   # ran live, just nothing new
+  echo "n/a: no new settled captures since watermark"; exit 2
+fi
+
+# measure each; log axes; track the loudest guitar hit
+best=""; best_rms=0; best_axes=""; maxmtime="$WM"
+for f in "${NEW[@]}"; do
+  mt=$(stat -c %Y "$f" 2>/dev/null || echo 0); [ "$mt" -gt "$maxmtime" ] && maxmtime="$mt"
+  grep -qF -- "$(basename "$f")" "$SEEN_LOG" 2>/dev/null && continue
+  axes=$(measure_axes "$f") || { log "measure failed $(basename "$f")"; continue; }
+  read -r tone rich rms beats <<<"$axes"
+  hit="-"; is_guitar "$tone" "$rich" "$rms" "$beats" && hit="GUITAR"
+  printf '%s %s tone=%s rich=%s rms=%s beats=%s %s\n' "$(ts_utc)" "$(basename "$f")" "$tone" "$rich" "$rms" "$beats" "$hit" >> "$SCORE_LOG"
+  echo "$(basename "$f")" >> "$SEEN_LOG"
+  if [ "$hit" = GUITAR ] && awk -v a="$rms" -v b="$best_rms" 'BEGIN{exit !(a+0>b+0)}'; then
+    best="$f"; best_rms="$rms"; best_axes="$axes"
+  fi
+done
+
+# advance watermark past everything examined -> one delivery per session
+echo "$maxmtime" > "$WATERMARK"
+mesh-state-touch "$STATE" 2>/dev/null || touch "$STATE"
+
+if [ -z "$best" ]; then
+  echo "no guitar in ${#NEW[@]} new capture(s) (gate: tone>=$GW_TONE rich>=$GW_RICH rms>=$GW_RMS beats>=$GW_BEATS)"
+  exit 0
+fi
+
+read -r btone brich brms bbeats <<<"$best_axes"
+if ! load_creds; then
+  # a guitar hit but no creds: DON'T mark it shipped, DON'T let the watermark swallow it -> re-catch next run
+  echo "$WM" > "$WATERMARK"
+  # un-see the winner so a creds-present run re-processes it
+  grep -vF -- "$(basename "$best")" "$SEEN_LOG" > "$SEEN_LOG.tmp" 2>/dev/null && mv "$SEEN_LOG.tmp" "$SEEN_LOG"
+  echo "n/a: guitar found ($(basename "$best")) but TG creds absent — deferred"; exit 2
+fi
+
+log "GUITAR detected: $(basename "$best") tone=$btone rich=$brich rms=$brms beats=$bbeats"
+deliver_session "$best" "$btone" "$brich" "$brms" "$bbeats"
+echo "delivered guitar session from $(basename "$best") (rms=$brms)"
