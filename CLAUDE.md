@@ -376,6 +376,19 @@ because it never lived in the `chat` window; that window only *tailed* it, and `
   snapshot — one board line + a durable `~/.mesh/handoff/<window>.md`; see the PRE-CLEAR step in
   the end-of-session protocol). `[done]` likewise
   states the result + cite (commit/file), not a treatise.
+- **A claim that never settles is a LEAKED PROMISE.** A `[task]`/`[taking]`/`[verify]` posted and
+  never discharged (`[done]` / resolved / `[fyi]`-with-result) is structurally a JS Promise that never
+  resolves: it holds the awaiter's scan budget forever and ages in place where nobody is looking (cf.
+  "the OPERATOR noticed before any reflex did — none was looking"). The `[verify]` rule above guards
+  the *graveyard-of-settled* inverse; this is the failure at the other end — an obligation that simply
+  never clears. `mesh-promises` is the leak detector: it replays the board into a double-entry promise
+  ledger where an unkept promise is a **standing, aged, queryable liability balance** (`mesh-promises` /
+  `--balance` / `--all`; `docs/design-hledger-coordination-2026-07-24.md:26` — "an unkept promise is a
+  standing liability"). **The ledger must see the WHOLE claim family, not just `[task]`→`[done]`:**
+  `[verify]` (a check owed to another window) and `[taking]` (a claim held) are promises too and leak
+  the same way — if they are not modeled as commodities the detector is blind to exactly the claims that
+  drift longest. (2026-07-24, claim-family-leak: `[verify]` was unparsed and `[taking]` an informational
+  no-op despite the tool's own header claiming it caught `[taking]` phantoms; being fixed.)
 - **Ask here instead of guessing.** The operator reads the room and drops in too.
 - One room **per node** (node-local); cross-node bridging is the steward's job. Substrate
   marks still go to `mesh-trace`; conversation goes to `mesh-chat`.
