@@ -121,9 +121,11 @@ is armeabi-v7a with no `cc` and no Termux; phaedra, x86_64, has no `cc` either).
 distribution model is **cross-build on mesh-home + push the binary**, not a per-node build.
 See `verify-note3.sh` for the armhf cross-build + `adb push` + on-device run that executes the
 identical 200-byte ROM on the Note3 with matching verdicts — re-verified 2026-07-24 with the
-net device compiled in, sha1 `c767efd9…` host==device, and step 4 asserting the pushed
-emulator is net-capable (a net-blind build answers a plausible `NA`, so the assertion greps
-for the loud `net:` line, not for a verdict). Static-armhf limit, measured on-device: no
+net device compiled in, sha1 `c767efd9…` host==device, step 4 asserting the pushed emulator
+is net-capable **at step ≥ 2** (via the identify probe — a net-blind build answers a
+plausible `NA`, so presence is never inferred from a refusal), and step 5 asserting the
+capability itself: the phone BINDS and mesh-home dials it, `uxn:ping-from-mesh-home` back
+over the LAN. Static-armhf limit, measured on-device: no
 hostname resolution (glibc NSS is absent under bionic) — address Note3 ROMs by numeric IP;
 it fails loud and distinguishably, "Temporary failure in name resolution" vs "Connection
 refused".
@@ -330,9 +332,10 @@ the far node needs only `uxncli`.
 on `fgetc(stdin)`. Ours is plain POSIX `getaddrinfo`+`connect`, blocking and synchronous:
 no vector, no threads. Blocking read/write on DEI/DEO needs neither.
 
-Scope is **outbound only**. `bindaddr`/`channel` exist so the map stays verbatim, but
-binding is refused loudly and reads `Unbound` — an unimplemented port that answered a
-plausible state would be an organ declared before it was armed. (Bind is step 2.)
+Step 1's scope was **outbound only**: `bindaddr`/`channel` existed so the map stayed
+verbatim, but binding was refused loudly and read `Unbound` — an unimplemented port that
+answered a plausible state would be an organ declared before it was armed. Step 2 arms it,
+below.
 
 Guards, each because the alternative is a *believable* wrong answer rather than a crash:
 
@@ -364,3 +367,74 @@ refused, and two source-mutants required RED (unknown-scheme-silently-tcp, deadl
 `net-echo.tal` is the gate ROM: reads a URI and a payload from stdin, dials, writes, reads,
 prints the reply — the smallest program that can prove a round trip rather than mere
 reachability. It refuses with `NA` rc=2 on a failed connect, a short write, or an empty read.
+
+## Network device — step 2, BIND (0xd0, 2026-07-24)
+
+The other half. With connect, a travelling ROM picks its own next hop but the far node
+still needs a shell to *answer*; with bind, the far node's `uxncli` **is** the thing that
+answers, so a hop needs a shell on neither end. `net-listen.tal` is the gate ROM: it takes
+one bind address on stdin, waits for a caller, reads what it sent, and replies with
+`uxn:` + those bytes.
+
+**Channels.** The `df` port SELECTS the endpoint every other port addresses: channel 0 is
+the outbound lane from step 1, channels 1–8 are inbound lanes fed by one listener. `dd/de`
+binds, action 1 unbinds. An out-of-range channel is refused where it is **written**, and
+addresses nothing — folding it to 0 would quietly serve the outbound lane to a ROM that
+asked for something else.
+
+**The state read on an inbound lane IS the accept**, and it is the one poll in this device
+that deliberately WAITS (up to `UXN_NET_TIMEOUT`). It is the vector-less equivalent of
+uxn2's arrival callback and the only place a ROM can learn a peer has come. A zero-timeout
+poll would be honest and would force every listening ROM into a spin loop burning a core to
+sit still. On expiry it answers **Bound** — "the listener is up, nobody called" — never
+Connected (there is no peer) and never Disconnected (the listener is fine). Consequence for
+ROM authors, learned the hard way while writing `net-listen.tal`: **do not check "did it
+bind?" by reading the state.** That read consumes the first wait and answers `Connected`
+the moment a caller arrives — reading a healthy bind as a failure. The wait loop already
+carries the whole answer: `6` nobody yet, `2`/`3` a caller, `4` the bind was refused.
+
+**The threat model changed, and saying so is part of the change.** Step 1 was an outbound
+call the node itself initiates — the same shape as the ssh hop the mesh already runs. A
+listener accepts whatever can reach the port, so the bind address is always **named by the
+ROM**: there is no default, any-address is the explicit `tcp:*:port` and nothing else, and
+a missing host stays an error. The convenient reading of "no host given" is the one that
+opens a port on every interface. `SO_REUSEADDR` is set (a restarting ROM must not wait out
+`TIME_WAIT`), `SO_REUSEPORT` deliberately is not — a second process silently sharing the
+port makes "someone else answered" unattributable.
+
+**Identify (action `d0` → `d002` in the length register).** On an emulator with no `0xd0`
+page, `emu_dei` falls through to `return uxn.dev[addr]` — bare memory, reading 0, and 0 is
+`Disconnected`. So *"this build has no network"* and *"the far node refused"* arrive at the
+ROM as the same byte; measured on the Note3, both gave `NA` rc 2 byte-identically. The
+probe is a write memory cannot fake, and ROMs compare it as an **ordering** — device `d0`,
+step ≥ what the ROM needs (`net-echo` needs 1, `net-listen` needs 2) — because pinning the
+whole word makes a ROM refuse every future step of its own device. Three outcomes are now
+distinct where they were one: `NODEV` silent = no device · `NODEV` + `net: unknown action`
+= device present but **too old** · `NA` + a loud `net:` line = a real refusal. Version skew
+reads as no-usable-device: fail-closed. Interop caveat, stated rather than hidden: uxn2
+does not know action `d0`, so a probing ROM reads "no device" on uxn2 even though it has
+one — wrong but fail-closed, and free for uxn2-targeted ROMs that never send the probe.
+
+Gate: `test-net-device`, now with **live legs in both directions** — mesh-home dials
+phaedra (`ping-uxn-net` → `PING-UXN-NET`), and phaedra dials **our** `net-listen.rom` on
+this node's tailscale address and gets `uxn:ping-from-peer`. The local accept leg is
+labelled as claiming the *mechanism only*; addressing is claimed over the tailnet or by
+nothing. The reply is **tagged** on purpose: an echo server, a stray `socat`, or a client
+reading its own buffer all produce the payload, and only the ROM produces `uxn:`. Refusals
+asserted by artifact rather than by message — bind on channel 0 is refused *and* the port
+is left dead; an unassignable address reads `Unbound`; `'*'` as a connect target is refused
+by name. Both deadlines (connect, accept) are asserted as **wall clock**. Four source
+mutants required RED, the two new ones being *accept-deadline-removed* (an uncalled
+listener that never returns is indistinguishable from a wedged emulator) and
+*bind-on-channel-0-silently-allowed*. Identify is gated by the only thing that can
+discriminate it: the same ROM on two emulators, the real one and a **net-blind stub** that
+is exactly `emu_dei`'s fallthrough.
+
+`verify-note3.sh` carries the phone's half. Step 4 no longer *infers* the device from a
+refused connect — the ambiguous byte identify exists to replace — it drives `net-listen.rom`
+against an unassignable address, so one run asserts device present · step ≥ 2 · and the
+bind refusal path on armhf. Step 5 is the artifact for the capability itself: **the phone
+binds and this host dials it** (`mesh-home → 192.168.8.184:47312`, the phone's own uxncli
+answering `uxn:ping-from-mesh-home`, 2026-07-24). Presence is not capability; a build can
+carry the device and still not listen, and bind/accept is where a statically linked libc
+could plausibly differ from the host's.

@@ -40,6 +40,7 @@ if [ "${1:-}" = --rom ]; then
   ./bin/uxnasm series-stats.tal series-stats.rom
   ./bin/uxnasm arith32-test.tal arith32-test.rom
   ./bin/uxnasm net-echo.tal net-echo.rom
+  ./bin/uxnasm net-listen.tal net-listen.rom
 fi
 if [ "${1:-}" = --chibicc ]; then
   $CC -std=c11 -O2 -fno-common -o bin/chibicc chibicc/src/*.c
