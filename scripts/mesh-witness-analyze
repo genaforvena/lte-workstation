@@ -1,0 +1,337 @@
+#!/usr/bin/env python3
+"""mesh-witness-analyze — the mesh reading its OWN self-measurement and speaking findings.
+
+mesh-witness WRITES the vital-signs ledger (~/.mesh/witness.log); nothing READ it. A human
+skimming the pane mis-reads it: the alarming-looking fractions (nodes 5/9, senses 6/17 fresh)
+are STRUCTURAL, not faults — 5/9 is the ceiling across the whole tape (router/phone/ds/ideapad
+are expected-down as mesh nodes), and '6/17 fresh' with dist 6f/8r/3a/0s/0u is HEALTHY (recent
+and aging are fine; the tool's own docstring warns the fresh-fraction alone lies). So this
+analyzer's whole job is to gate on the RIGHT signal, not the scary-looking one:
+
+  - senses  → gate on stale+unknown COUNT (from senses_dist), NEVER on the fresh fraction.
+  - nodes   → gate on the reached count dropping BELOW its recent floor / a NAMED newly-offline
+              node — NOT on the constant 5/9 ceiling.
+  - board   → gate on sustained staleness (board_age_s beyond band), not on quiet oscillation.
+  - minds   → gate on climbing ABOVE its recent band (a memory-pressure precursor / OOM leading
+              indicator), not on the absolute number.
+  - witness → if the newest ledger row is older than 2x the measure cadence, the WITNESS itself
+              stalled; its all-clear is untrustworthy. Notice that too.
+
+Edge-gated + deduped (macro-gate / edge-state discipline, like mesh-note3-mag): the set of
+ACTIVE findings is hashed into a signature; a run posts to the board ONLY when that signature
+CHANGES vs the last post (state: ~/.mesh/.witness-analyze.state). Steady state = SILENT. This
+keeps the shared board un-flooded — nothing is said unless the mesh's self-reading actually
+changed. Honest-fusion: a missing/unreadable source renders that check UNKNOWN (skipped), never
+a faked all-clear.
+
+Usage:  mesh-witness-analyze            # analyze; post to board iff findings-signature changed
+        mesh-witness-analyze --analyze  # same (explicit; the reflex mode)
+        mesh-witness-analyze --dry-run  # print what WOULD post + the gate decision; post nothing
+        mesh-witness-analyze --force    # post the current findings even if the signature is unchanged
+        mesh-witness-analyze --test     # smoke test (parses the ledger; posts nothing; exit 0)
+
+# reflex-cadence: */30 * * * *
+# reflex-args: --analyze
+"""
+import hashlib
+import os
+import re
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+
+# cron runs with a stripped PATH that omits ~/.local/bin — mesh-chat lives there. Prepend it so the
+# board post resolves under cron exactly as it does in an interactive shell (the mesh-witness scar).
+os.environ["PATH"] = os.path.expanduser("~/.local/bin") + ":" + os.environ.get("PATH", "/usr/bin:/bin")
+
+MESHDIR = os.path.expanduser("~/.mesh")
+LEDGER = os.path.join(MESHDIR, "witness.log")
+SENSEMAP = os.path.join(MESHDIR, "sense-map.txt")
+STATE = os.path.join(MESHDIR, ".witness-analyze.state")
+
+MEASURE_CADENCE_S = 120          # mesh-witness --measure runs every 2 min
+RECENT = 6                       # newest N rows = "now" (last ~12 min)
+BASELINE = 720                   # trailing window for bands (~24h at 2-min cadence)
+
+# thresholds (deliberately conservative — edge-gating + dedup already bound noise)
+SENSES_BAD_MIN = 2               # >= this many (stale+unknown) senses is worth saying
+BOARD_STALE_S = 900              # board silent > 15 min = sustained, not oscillation
+NODE_TOTAL = 9
+
+
+def read_rows(limit=BASELINE):
+    """Parse the last `limit` ledger rows into dicts. Honest: unreadable ledger -> []. """
+    try:
+        with open(LEDGER) as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return []
+    rows = []
+    for line in lines[-limit:]:
+        parts = line.split()
+        if not parts:
+            continue
+        row = {"ts": parts[0]}
+        for tok in parts[1:]:
+            if "=" in tok:
+                k, v = tok.split("=", 1)
+                row[k] = v
+        rows.append(row)
+    return rows
+
+
+def _int(v):
+    """'12' -> 12 ; 'UNKNOWN'/None/'4/9' -> None (fraction handled by callers)."""
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _frac_num(v):
+    """'5/9' -> 5 ; else None."""
+    if not v or "/" not in v:
+        return None
+    return _int(v.split("/", 1)[0])
+
+
+def parse_dist(v):
+    """'6f/8r/3a/0s/0u' -> {'f':6,'r':8,'a':3,'s':0,'u':0}. Robust to missing/UNKNOWN."""
+    out = {}
+    if not v:
+        return out
+    for m in re.finditer(r"(\d+)([a-z])", v):
+        out[m.group(2)] = int(m.group(1))
+    return out
+
+
+def offline_nodes():
+    """Names of nodes sense-map marks offline (for naming a real nodes-drop).
+
+    Unreadable map -> None (the caller then skips node-naming, honest-fusion). NOTE: we do NOT
+    infer a 'phantom-live sense via a dead transport' from the map's '[...-via-<host>]' tags —
+    verified 2026-07-17 that note3 reads FRESH via a working path while its map annotation still
+    says 'adb-via-ds' (ds offline): the sense is live, only the human-readable transport label is
+    stale. Alarming on that would wrongly invalidate a healthy sense. Transport-label staleness is
+    a cosmetic provenance drift, not a data fault — left out of the gate deliberately.
+    """
+    try:
+        with open(SENSEMAP) as f:
+            txt = f.read()
+    except OSError:
+        return None
+    offline = set()
+    for line in txt.splitlines():
+        m = re.match(r"\s+(\S.*?)\s{2,}(online|offline)\b", line)
+        if m and m.group(2) == "offline":
+            offline.add(m.group(1).strip())
+    return offline
+
+
+def household_state():
+    """mesh-household-state's token (ACTIVE/ASLEEP/AWAY/UNCERTAIN/UNKNOWN).
+
+    Honest-fusion: unreadable/error -> '' (NOT 'ASLEEP'). A board-stale alarm must be
+    suppressed only when the household is genuinely ASLEEP (a quiet board is intended at
+    night); an unreadable household sense must NOT silently swallow a real alarm, so it
+    returns '' which the caller treats as 'do not suppress' (fail-safe toward alerting).
+    """
+    try:
+        out = subprocess.run(["mesh-household-state"], capture_output=True,
+                             text=True, timeout=15)
+        m = re.search(r"household:\s*([A-Z_]+)", out.stdout)
+        return m.group(1) if m else ""
+    except (subprocess.SubprocessError, OSError):
+        return ""
+
+
+def board_stale_fires(board_age_s, household):
+    """Stale board is worth alarming ONLY when the household isn't ASLEEP.
+
+    A quiet board at night (house ASLEEP) is intended, not a fault — gate on
+    household-state!=ASLEEP so the silence alarm stops firing ~hour after house-ASLEEP
+    (false-alarm 2026-07-24 22:30, 46min post house-ASLEEP). household=='' (unreadable) does
+    NOT suppress: an unreadable household sense must not silently swallow a real alarm.
+    """
+    if board_age_s is None or board_age_s <= BOARD_STALE_S:
+        return False
+    return household != "ASLEEP"
+
+
+def analyze():
+    """Return (findings, context). findings = list of (sig, text); context for --dry-run."""
+    rows = read_rows()
+    ctx = {"rows": len(rows)}
+    if not rows:
+        return [("no-ledger", "witness ledger unreadable/empty — self-measurement blind")], ctx
+
+    findings = []
+    latest = rows[-1]
+    recent = rows[-RECENT:]
+
+    # --- witness liveness: is the ledger itself still being written? ---
+    try:
+        last_dt = datetime.strptime(latest["ts"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        age = (datetime.now(timezone.utc) - last_dt).total_seconds()
+        ctx["row_age_s"] = int(age)
+        if age > 2 * MEASURE_CADENCE_S:
+            findings.append(("witness-stale",
+                             f"witness ledger STALE — newest row {int(age)}s old (>2x cadence): "
+                             f"mesh-witness --measure may be dead; its all-clear is untrustworthy"))
+    except (KeyError, ValueError):
+        pass
+
+    # --- reflex verdict ---
+    if latest.get("reflex") not in (None, "OK"):
+        findings.append(("reflex", f"reflex-health = {latest.get('reflex')} (not OK)"))
+
+    # --- senses: gate on stale+unknown, NOT the fresh fraction ---
+    dist = parse_dist(latest.get("senses_dist"))
+    if dist:
+        bad = dist.get("s", 0) + dist.get("u", 0)
+        ctx["senses_bad"] = bad
+        if bad >= SENSES_BAD_MIN:
+            findings.append(("senses-bad",
+                             f"senses degraded: {bad} stale/unknown ({latest.get('senses_dist')}) "
+                             f"— unlike the healthy recent/aging fill, these are genuinely blind"))
+
+    # --- nodes: gate on dropping BELOW the recent floor, not the constant ceiling ---
+    node_now = _frac_num(latest.get("nodes"))
+    node_hist = [n for n in (_frac_num(r.get("nodes")) for r in rows[:-RECENT]) if n is not None]
+    ctx["nodes_now"] = node_now
+    if node_now is not None and node_hist:
+        floor = min(node_hist)
+        ctx["nodes_floor"] = floor
+        if node_now < floor:
+            offline = offline_nodes()
+            who = ""
+            if offline:
+                who = " — offline: " + ", ".join(sorted(offline))
+            findings.append(("nodes-drop",
+                             f"nodes reached {node_now}/{NODE_TOTAL} — a NEW low "
+                             f"(recent floor was {floor}/{NODE_TOTAL}){who}"))
+
+    # --- board staleness (sustained) — suppressed when the household is ASLEEP ---
+    ba = _int(latest.get("board_age_s"))
+    ctx["board_age_s"] = ba
+    hs = household_state() if (ba is not None and ba > BOARD_STALE_S) else ""
+    if hs:
+        ctx["household"] = hs
+    if board_stale_fires(ba, hs):
+        suffix = f" (household {hs})" if hs else ""
+        findings.append(("board-stale",
+                         f"board silent {ba}s (>{BOARD_STALE_S}s) — sustained posting/gossip gap{suffix}"))
+
+    # --- minds climbing above band (memory-pressure precursor) ---
+    minds_now = _int(latest.get("minds_live"))
+    minds_hist = [m for m in (_int(r.get("minds_live")) for r in rows[:-RECENT]) if m is not None]
+    ctx["minds_now"] = minds_now
+    if minds_now is not None and minds_hist:
+        band_max = max(minds_hist)
+        ctx["minds_band_max"] = band_max
+        if minds_now > band_max:
+            findings.append(("minds-high",
+                             f"minds_live {minds_now} above its recent band (max {band_max}) "
+                             f"— load/OOM-pressure precursor on the sole mind-home"))
+
+    return findings, ctx
+
+
+def signature(findings):
+    sigs = sorted(sig for sig, _ in findings)
+    return hashlib.sha1("|".join(sigs).encode()).hexdigest()[:12] if sigs else "clear"
+
+
+def load_state():
+    try:
+        with open(STATE) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def save_state(sig):
+    try:
+        with open(STATE, "w") as f:
+            f.write(sig)
+    except OSError:
+        pass
+
+
+def post(text):
+    env = dict(os.environ, MESH_WHO=f"witness-analyze@{os.uname().nodename}")
+    try:
+        subprocess.run(["mesh-chat", text], env=env, check=True,
+                       timeout=30, stdout=subprocess.DEVNULL)
+        return True
+    except (subprocess.SubprocessError, OSError) as e:
+        print(f"post failed: {e}", file=sys.stderr)
+        return False
+
+
+def compose(findings):
+    body = " | ".join(text for _, text in findings)
+    return f"[witness] self-reading: {body}"
+
+
+def main():
+    arg = sys.argv[1] if len(sys.argv) > 1 else "--analyze"
+
+    if arg == "--test":
+        rows = read_rows(limit=10)
+        if not rows:
+            print("smoke-test: WARN (ledger empty/unreadable) — analyzer parses, nothing to gate")
+        findings, _ = analyze()
+        signature(findings)                       # exercise the gate path
+        parse_dist("6f/8r/3a/0s/0u")              # exercise the dist parser
+
+        # household-gate unit (hermetic — no subprocess, no live board state). A quiet board at
+        # night is intended: ASLEEP suppresses; everything else (incl. unreadable '') must FIRE
+        # (fail-safe toward alerting — an unreadable household sense never swallows a real alarm).
+        gate_cases = [
+            (2000, "ASLEEP", False),    # night quiet — intended, suppress
+            (2000, "ACTIVE", True),     # alert hours — fires
+            (2000, "AWAY", True),       # away but silence still notable
+            (2000, "UNCERTAIN", True),  # don't suppress on uncertainty
+            (2000, "", True),           # unreadable household — MUST fire (fail-safe)
+            (500, "ACTIVE", False),     # not even stale
+            (None, "ACTIVE", False),    # no board-age reading
+        ]
+        for age, hh, expect in gate_cases:
+            got = board_stale_fires(age, hh)
+            if got != expect:
+                print(f"smoke-test: FAIL (board_stale_fires({age},{hh!r})={got}, expected {expect})")
+                sys.exit(1)
+
+        print(f"smoke-test: OK ({len(rows)} rows readable, {len(findings)} finding(s) computed, "
+              f"household-gate 7/7, no post)")
+        sys.exit(0)
+
+    findings, ctx = analyze()
+    sig = signature(findings)
+    prev = load_state()
+
+    if arg == "--dry-run":
+        print(f"ctx: {ctx}")
+        print(f"signature: {sig}  (prev: {prev or 'none'})  "
+              f"gate: {'WOULD POST' if sig != prev else 'suppressed (unchanged)'}")
+        if findings:
+            print("WOULD SAY:\n  " + compose(findings))
+        else:
+            print("WOULD SAY: (nothing — steady state)")
+        sys.exit(0)
+
+    force = arg == "--force"
+    if not findings:
+        save_state(sig)                            # remember 'clear' so recovery is an edge next time
+        sys.exit(0)
+    if sig == prev and not force:
+        sys.exit(0)                                # edge-gate: unchanged findings stay silent
+    if post(compose(findings)):
+        save_state(sig)
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
