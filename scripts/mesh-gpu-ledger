@@ -1,0 +1,199 @@
+#!/usr/bin/env bash
+# mesh-gpu-ledger — CHARGE LOCAL INFERENCE: per-organ GPU-time (ms) attributed to the organ that spent
+# it, from the driver's POST-MORTEM per-PID accounting ledger. mesh-labor prices CLOUD tokens in imputed
+# USD; gigaam / XTTS / ollama book $0 today while eating GPU-seconds on a contended device. This is the
+# missing charged lane: which organ spent the GPU, and how much, readable AFTER the process exits.
+#
+# THE SOURCE: `nvidia-smi --query-accounted-apps` — with Accounting Mode Enabled, every compute process
+# gets a pid+TIME(ms) entry RETAINED after it exits (driver ring, ~4000). Evidence + numbers:
+# ~/.mesh/knowledge/capability-gpu-per-process-accounting-postmortem-attribution-mesh-home-20260727.md
+#
+# THREE TRAPS (each a silent-fallback shape — enforced here, seen fail in --test):
+#  1. MODE-GATE. Accounting mode is driver state, not durable (survives no driver unload; boot-enable
+#     required). An EMPTY accounted list means "mode reset", INDISTINGUISHABLE from "GPU idle" unless the
+#     reader checks the mode first. So: assert accounting.mode==Enabled AND non-empty list, else render
+#     UNKNOWN — NEVER 0. (an-oracle-that-cannot-report-the-fault.)
+#  2. KEY ON TIME(ms), NOT gpu_utilization. Util is sampled; a real 679ms consumer reports 0% (sub-second
+#     work falls between samples). A util-keyed gate calls a real consumer idle — the beat-detector shape.
+#  3. NAME IS GONE POST-MORTEM. The accounted entry keeps ONLY the pid; the process name is gone once it
+#     exits, and pids recycle (ring 4000). So the pid->organ map must be captured WHILE THE PROCESS LIVES
+#     (--map, from /proc/<pid>/cmdline) and JOINED later (--read). Long-lived organs (ollama, voice-clone
+#     daemon, room-gigaam) are reliably captured; a one-shot sub-cadence job may miss the map and lands in
+#     the honest 'unattributed' bucket — never dropped, never faked onto another organ.
+#
+# MODES:
+#   mesh-gpu-ledger            --read: mode-gated per-organ GPU-ms report (+ appends a journal snapshot)
+#   mesh-gpu-ledger --map      capture live pid->organ into the ring (the reflex; run often)
+#   mesh-gpu-ledger --json     machine-readable --read
+#   mesh-gpu-ledger --test     RED-first: mode-gate/empty→UNKNOWN, ms-keyed (util=0 still counts), attribution
+#
+# reflex-cadence: */1 * * * *
+# reflex-args: --map
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+MESH="${MESH_DIR:-$HOME/.mesh}"
+PIDMAP="${MESH_GPU_PIDMAP:-$MESH/gpu-pidmap.tsv}"     # pid<TAB>organ<TAB>first_seen_epoch (ring)
+LOG="${MESH_GPU_LEDGER_LOG:-$MESH/gpu-ledger.log}"    # the journal: per-run per-organ ms snapshots
+RING_MAX="${MESH_GPU_PIDMAP_MAX:-4000}"              # match the driver accounting ring
+SMI="${MESH_NVIDIA_SMI:-nvidia-smi}"
+PROC="${MESH_GPU_PROC:-/proc}"                        # overridable for --test
+
+ts(){ date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+mode_enabled(){ [ "$("$SMI" --query-gpu=accounting.mode --format=csv,noheader 2>/dev/null | tr -d ' ')" = Enabled ]; }
+
+classify_organ(){ # <pid> -> organ label from its LIVE cmdline (trap 3: capture while alive)
+  local pid="$1" cl
+  cl="$(tr '\0' ' ' < "$PROC/$pid/cmdline" 2>/dev/null)"; cl="${cl% }"
+  [ -n "$cl" ] || { echo unknown; return; }
+  case "$cl" in
+    *gigaam*|*room-gigaam*)                 echo gigaam ;;
+    *xtts*|*voice-clone*|*voice_clone*|*mesh-voice*) echo xtts ;;
+    *ollama*|*llama-server*|*llama_server*) echo ollama ;;
+    *whisper*)                              echo whisper ;;
+    *venv-ai*|*.venv-ai*)                   echo venv-ai ;;
+    *) local leaf="${cl%% *}"; echo "other:$(basename "$leaf" 2>/dev/null || echo proc)" ;;
+  esac
+}
+
+do_map(){ # capture live compute-app pids -> organ, append new ones to the ring
+  mode_enabled || { echo "$(ts) gpu-map: accounting DISABLED — nothing captured (UNKNOWN, not 0)"; return 2; }
+  mkdir -p "$MESH"; touch "$PIDMAP"
+  local pid org n=0
+  while read -r pid; do
+    pid="${pid//[[:space:]]/}"; [ -n "$pid" ] || continue
+    grep -q "^$pid	" "$PIDMAP" 2>/dev/null && continue      # already mapped (keep first, tab-delimited)
+    org="$(classify_organ "$pid")"
+    printf '%s\t%s\t%s\n' "$pid" "$org" "$(date +%s)" >> "$PIDMAP"; n=$((n+1))
+  done < <("$SMI" --query-compute-apps=pid --format=csv,noheader 2>/dev/null)
+  # trim ring to the driver's own retention bound
+  if [ "$(wc -l < "$PIDMAP" 2>/dev/null || echo 0)" -gt "$RING_MAX" ]; then
+    tail -n "$RING_MAX" "$PIDMAP" > "$PIDMAP.tmp" && mv "$PIDMAP.tmp" "$PIDMAP"
+  fi
+  echo "$(ts) gpu-map: +$n new pid->organ (ring $(wc -l < "$PIDMAP" 2>/dev/null || echo 0))"
+}
+
+# emit "organ ms" lines (sorted desc) + a TOTAL, or a single UNKNOWN/IDLE token. rc: 0 data, 2 unknown.
+compute_read(){
+  if ! mode_enabled; then echo "GPU_LEDGER_UNKNOWN reason=accounting-mode-not-Enabled"; return 2; fi
+  local apps
+  apps="$("$SMI" --query-accounted-apps=pid,time --format=csv,noheader 2>/dev/null)"
+  # trap 1: empty list under Enabled = mode-reset, NOT idle → UNKNOWN, never 0
+  [ -n "$(printf '%s' "$apps" | tr -d '[:space:]')" ] || { echo "GPU_LEDGER_UNKNOWN reason=empty-accounted-list-mode-reset"; return 2; }
+  printf '%s\n' "$apps" | awk -F',' -v pm="$PIDMAP" '
+    BEGIN{ while((getline l < pm) > 0){ nf=split(l,a,"\t"); if(nf>=2) org[a[1]+0]=a[2] } }
+    {
+      pid=$1+0; t=$2; gsub(/[^0-9]/,"",t); ms=t+0        # trap 2: TIME(ms) column, util ignored
+      o=(pid in org)?org[pid]:"unattributed"
+      sum[o]+=ms; tot+=ms
+    }
+    END{
+      if(tot==0){ print "GPU_LEDGER_IDLE total_ms=0"; exit 0 }
+      for(o in sum) printf "%s %d\n", o, sum[o] | "sort -k2 -nr"
+      close("sort -k2 -nr")
+      printf "TOTAL %d\n", tot
+    }'
+}
+
+do_read(){
+  local out rc; out="$(compute_read)"; rc=$?
+  echo "$out"
+  # book a journal snapshot (the ledger's source of truth; hledger materialization is the next increment)
+  if [ "$rc" = 0 ]; then
+    mkdir -p "$MESH"
+    printf '%s gpu-ledger: %s\n' "$(ts)" "$(echo "$out" | tr '\n' ' ')" >> "$LOG"
+    [ "$(wc -l < "$LOG" 2>/dev/null || echo 0)" -gt 5000 ] && { tail -2500 "$LOG" > "$LOG.tmp" && mv "$LOG.tmp" "$LOG"; }
+  fi
+  return $rc
+}
+
+do_json(){
+  local out rc; out="$(compute_read)"; rc=$?
+  if [ "$rc" != 0 ]; then printf '{"status":"UNKNOWN","reason":"%s"}\n' "$(echo "$out" | sed 's/.*reason=//')"; return $rc; fi
+  echo "$out" | awk 'BEGIN{printf "{\"status\":\"OK\",\"organs\":{"}
+    !/^TOTAL/{printf "%s\"%s\":%d",(n++?",":""),$1,$2}
+    /^TOTAL/{t=$2}
+    END{printf "},\"total_ms\":%d}\n",t}'
+}
+
+do_test(){
+  local td; td="$(mktemp -d)"; trap 'rm -rf "$td"' RETURN
+  local fail=0
+  mkdir -p "$td/proc/900001" "$td/proc/900002"
+  printf 'python\0/home/x/.venv-ai/bin/gigaam-daemon\0' > "$td/proc/900001/cmdline"
+  printf 'ollama\0serve\0' > "$td/proc/900002/cmdline"
+
+  # a stub nvidia-smi whose behaviour is set by env: SMODE (mode) and SAPPS (accounted rows, ;-separated)
+  cat > "$td/smi" <<'EOF'
+#!/usr/bin/env bash
+for a in "$@"; do case "$a" in
+  --query-gpu=accounting.mode) echo "${SMODE:-Enabled}"; exit 0 ;;
+  --query-accounted-apps=*) [ -n "${SAPPS:-}" ] && printf '%s\n' "$SAPPS" | tr ';' '\n'; exit 0 ;;
+  --query-compute-apps=*) [ -n "${SLIVE:-}" ] && printf '%s\n' "$SLIVE" | tr ';' '\n'; exit 0 ;;
+esac; done
+EOF
+  chmod +x "$td/smi"
+  run(){ MESH_NVIDIA_SMI="$td/smi" MESH_GPU_PIDMAP="$td/pidmap" MESH_GPU_PROC="$td/proc" \
+         MESH_GPU_LEDGER_LOG="$td/gpu-ledger.log" MESH_DIR="$td" "$@"; }
+
+  # GATE 1 (trap 1) — mode Disabled ⇒ UNKNOWN, NOT 0/IDLE (seen red-then-green).
+  local o
+  o="$(SMODE=Disabled SAPPS='764032, 4115 ms' run bash "$0" --read 2>/dev/null)"
+  case "$o" in *GPU_LEDGER_UNKNOWN*mode-not-Enabled*) echo "  ✓ GATE1 mode-gate: Disabled ⇒ UNKNOWN (never a fake 0)";;
+    *) echo "  ✗ GATE1 mode-gate: Disabled should read UNKNOWN, got '$o'"; fail=1;; esac
+
+  # GATE 2 (trap 1) — mode Enabled but EMPTY list ⇒ UNKNOWN (mode-reset), never IDLE/0.
+  o="$(SMODE=Enabled SAPPS='' run bash "$0" --read 2>/dev/null)"
+  case "$o" in *GPU_LEDGER_UNKNOWN*empty-accounted-list*) echo "  ✓ GATE2 empty-list: Enabled+empty ⇒ UNKNOWN (reset≠idle)";;
+    *) echo "  ✗ GATE2 empty-list: empty accounted list should read UNKNOWN, got '$o'"; fail=1;; esac
+
+  # GATE 3 (trap 2) — a real consumer at 679ms/0% util is COUNTED, not dropped as idle (key on TIME).
+  #   pid 900002 is mapped to ollama; the row carries 0% util. Attribution must credit ollama 679ms.
+  printf '900002\tollama\t1\n' > "$td/pidmap"
+  o="$(SMODE=Enabled SAPPS='900002, 679 ms, 0 %' run bash "$0" --read 2>/dev/null)"
+  case "$o" in *"ollama 679"*) echo "  ✓ GATE3 ms-keyed: 679ms/0%util consumer COUNTED (util ignored)";;
+    *) echo "  ✗ GATE3 ms-keyed: 679ms job at 0% util was not counted, got '$o'"; fail=1;; esac
+
+  # GATE 4 (trap 3) — post-mortem attribution: an UNMAPPED pid lands in 'unattributed', never faked onto
+  #   a named organ; a MAPPED pid is credited to its organ. Both in one read.
+  printf '900001\tgigaam\t1\n' > "$td/pidmap"
+  o="$(SMODE=Enabled SAPPS='900001, 4115 ms, 67 %;555555, 1000 ms, 0 %' run bash "$0" --read 2>/dev/null)"
+  if printf '%s' "$o" | grep -q 'gigaam 4115' && printf '%s' "$o" | grep -q 'unattributed 1000'; then
+    echo "  ✓ GATE4 attribution: mapped pid→organ, unmapped→unattributed (no faked name)"
+  else echo "  ✗ GATE4 attribution: expected gigaam 4115 + unattributed 1000, got '$o'"; fail=1; fi
+
+  # GATE 5 (trap 3) — --map captures a LIVE pid's organ from its cmdline (the join's left side).
+  rm -f "$td/pidmap"
+  SLIVE='900001;900002' run bash "$0" --map >/dev/null 2>&1
+  if grep -q '^900001	gigaam	' "$td/pidmap" && grep -q '^900002	ollama	' "$td/pidmap"; then
+    echo "  ✓ GATE5 --map: live pids classified (gigaam, ollama) into the ring"
+  else echo "  ✗ GATE5 --map: cmdline classification failed — $(cat "$td/pidmap" 2>/dev/null)"; fail=1; fi
+
+  # GATE 6 — REAL hardware read (not a stub): if this node's accounting is Enabled and non-empty, a live
+  #   --read must yield a parseable per-organ ms line; where the organ is ABSENT (no GPU / mode off) exit 2
+  #   (honest n/a — mesh-land treats exit 2 as pass; reachability≠producing).
+  if mode_enabled; then
+    local real; real="$(compute_read)"; local rrc=$?
+    if [ "$rrc" = 0 ] && printf '%s' "$real" | grep -qE '^TOTAL [0-9]+$'; then
+      echo "  ✓ GATE6 real-read: live accounted ledger yields TOTAL ms ($(printf '%s' "$real" | grep '^TOTAL'))"
+    elif [ "$rrc" = 2 ]; then
+      echo "  ⚠ GATE6 real-read: accounting Enabled but list empty/reset — honest UNKNOWN";
+    else
+      echo "  ✗ GATE6 real-read: mode Enabled but no parseable TOTAL — got '$real'"; fail=1
+    fi
+  else
+    echo "  ⚠ GATE6 real-read: accounting mode not Enabled on this node — n/a (exit 2)"; rm -rf "$td"; trap - RETURN
+    [ "$fail" = 0 ] && exit 2 || { echo "mesh-gpu-ledger --test: FAIL"; exit 1; }
+  fi
+
+  [ "$fail" = 0 ] && { echo "mesh-gpu-ledger --test: PASS"; return 0; } || { echo "mesh-gpu-ledger --test: FAIL"; return 1; }
+}
+
+case "${1:---read}" in
+  --read|"") do_read ;;
+  --map)     do_map ;;
+  --json)    do_json ;;
+  --test)    do_test ;;
+  *) echo "usage: mesh-gpu-ledger [--read|--map|--json|--test]" >&2; exit 2 ;;
+esac

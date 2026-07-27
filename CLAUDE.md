@@ -434,7 +434,9 @@ dead-on-arrival orphan stays visible.
 - **Node-specific units (deploy where relevant):** `mesh-card-watchdog.{sh,service,timer}` ·
   `mtg-watchdog.{sh,service,timer}` · `bore-mtg.{sh,service,timer}` · `mesh-cam-watch.*` ·
   `mesh-tuner-eye.*` · `node-join-android.sh` · `mesh-phaedra-port80-fallback.service` (phaedra only) ·
-  `mesh-voice-clone.service` (GPU/venv-ai node only — warm XTTS daemon for the operator-voice clone)
+  `mesh-voice-clone.service` (GPU/venv-ai node only — warm XTTS daemon for the operator-voice clone) ·
+  `mesh-gpu-accounting.service` (GPU node only — root oneshot re-asserting per-process accounting mode at
+  boot; the durable source for `mesh-gpu-ledger`'s charged local-inference lane)
 - **Node-bound senses/reflexes (run only on the node whose organ they read — unwired elsewhere by design):**
   `mesh-phone-beacon2` · `mesh-sms-monitor` · `mesh-sms-rx` (phone BODY / Termux) · `mesh-tg-watchdog`
   (default-string's TG organ) · `mesh-tv-watch` (the TV-reachable node) · `mesh-wan-traffic` (GL-MT3000 router) ·
