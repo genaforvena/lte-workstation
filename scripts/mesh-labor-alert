@@ -1,0 +1,199 @@
+#!/usr/bin/env bash
+# mesh-labor-alert — TG the operator when the rolling-5h INFERENCE budget crosses 80% / 100% of its cap.
+# The budget is measured by mesh-labor (usd.spent vs usd.cap); the cap comes from MESH_LABOR_BUDGET_USD
+# in ~/.mesh/restore.env (unset/0 → report-only, nothing to alert). This reflex is the EDGE-TRIGGERED
+# operator notification on top of that meter — mesh-labor itself only reports, it never pings.
+#
+# reflex-cadence: */10 * * * *
+# Self-wires via mesh-autowire (after --test PASS). */10 = twice mesh-labor's own rolling recompute is
+# fine; the dedup below guarantees at most ONE TG per rising crossing, never one per 10-min run.
+#
+# DEDUP (edge-triggered, NOT level-triggered): the state file ~/.mesh/labor-alert.state holds the
+# CURRENT level (none|warn|cap). We TG only when the level RISES (none→warn, warn→cap, none→cap). When
+# burn falls back the state follows DOWN silently (no "recovered" TG), so the NEXT genuine crossing
+# re-alerts. State = current level always; TG iff rank(new) > rank(prev). That single invariant covers
+# every case (cap→warn drops the recorded level so a re-climb to cap fires again).
+#
+#   mesh-labor-alert            one check: edge-trigger the 80%/100% TG (dedup via state file)
+#   mesh-labor-alert --status   print the current level + spent/cap, NO TG, NO state mutation
+#   mesh-labor-alert --test     RED-FIRST smoke test (injected fake mesh-labor json; no live spend, no TG)
+#   exit 0 = ran (incl. report-only when no cap) · non-zero only on --test failure
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+
+# Cap + TG creds live in restore.env — source it (report-only if it's absent). set -a so the export
+# reaches the mesh-labor child (which reads MESH_LABOR_BUDGET_USD for usd.cap).
+set -a; . "$HOME/.mesh/restore.env" 2>/dev/null || true; set +a
+
+STATE="${MESH_LABOR_ALERT_STATE:-$HOME/.mesh/labor-alert.state}"   # bare none|warn|cap — this tool only
+WARN_PCT="${MESH_LABOR_ALERT_WARN_PCT:-80}"                        # first threshold
+CAP_PCT="${MESH_LABOR_ALERT_CAP_PCT:-100}"                         # second (limit) threshold
+
+round() { awk -v n="${1:-0}" 'BEGIN{printf "%.0f", n}'; }
+
+# level_for <spent> <cap> → none|warn|cap.  cap<=0 → none (no cap = nothing to alert). The threshold
+# comparison is done in float (awk) so an exactly-80% or exactly-100% reading lands ON the band.
+level_for() {
+  awk -v s="$1" -v c="$2" -v w="$WARN_PCT" -v k="$CAP_PCT" 'BEGIN{
+    if (c+0 <= 0) { print "none"; exit }
+    p = (s+0) / (c+0) * 100
+    if (p >= k) print "cap"; else if (p >= w) print "warn"; else print "none"
+  }'
+}
+
+_rank() { case "$1" in cap) echo 2 ;; warn) echo 1 ;; *) echo 0 ;; esac; }
+
+# top2_models <json> → "opus-5 $31, fable-5 $75" (highest two spenders, provider/claude- prefix stripped)
+top2_models() {
+  printf '%s' "$1" | jq -r '
+    (.usd.models // {}) | to_entries | sort_by(-.value) | .[:2]
+    | map("\(.key | sub("^[^:]*:";"") | sub("^claude-";"")) $\(.value|round)") | join(", ")
+  ' 2>/dev/null || true
+}
+
+# send_tg <msg> — MESH_LABOR_ALERT_DRYRUN=1 prints the line to stdout instead of sending (test hook).
+send_tg() {
+  if [ -n "${MESH_LABOR_ALERT_DRYRUN:-}" ]; then echo "[dryrun-tg] $1"; return; fi
+  command -v mesh-tg >/dev/null 2>&1 && mesh-tg "$1" >/dev/null 2>&1 || true
+}
+
+# _msg <level> <json> <spent> <cap> — build + send the Russian operator line for a crossing.
+_msg() {
+  local lvl="$1" json="$2" spent="$3" cap="$4" wh pct burn top
+  wh="$(printf '%s' "$json" | jq -r '.window_h // 5' 2>/dev/null)"; case "$wh" in ''|null) wh=5 ;; esac
+  pct="$(awk -v s="$spent" -v c="$cap" 'BEGIN{printf "%d", (c+0>0? (s+0)/(c+0)*100 : 0)}')"
+  burn="$(awk -v s="$spent" -v w="$wh" 'BEGIN{printf "%.1f", (w+0>0? (s+0)/(w+0) : 0)}')"
+  top="$(top2_models "$json")"
+  if [ "$lvl" = cap ]; then
+    send_tg "🛑 Бюджет ${pct}%: \$$(round "$spent") из \$$(round "$cap") за ${wh}ч — лимит достигнут (burn \$${burn}/ч)${top:+ · $top}"
+  else
+    send_tg "⚠️ Бюджет ${pct}%: \$$(round "$spent") из \$$(round "$cap") за ${wh}ч (burn \$${burn}/ч)${top:+ · $top}"
+  fi
+}
+
+# decide <json> → mutates STATE, sends at most one TG, echoes the action taken:
+#   fire-warn | fire-cap | silent-<level> | silent-badjson
+# This is the whole edge-trigger, driven purely from the passed json + STATE (so --test can inject both).
+decide() {
+  local json="$1" spent cap lvl prev rn rp
+  spent="$(printf '%s' "$json" | jq -r '.usd.spent' 2>/dev/null)"
+  cap="$(printf '%s' "$json" | jq -r '.usd.cap' 2>/dev/null)"
+  case "$spent" in ''|null|*[!0-9.]*) echo "silent-badjson"; return ;; esac
+  case "$cap"   in ''|null|*[!0-9.]*) echo "silent-badjson"; return ;; esac
+  lvl="$(level_for "$spent" "$cap")"
+  prev="$(cat "$STATE" 2>/dev/null)"; case "$prev" in none|warn|cap) : ;; *) prev=none ;; esac
+  rn="$(_rank "$lvl")"; rp="$(_rank "$prev")"
+  printf '%s\n' "$lvl" > "$STATE"     # state always tracks the current level (silent on any drop)
+  if [ "$rn" -gt "$rp" ]; then
+    _msg "$lvl" "$json" "$spent" "$cap"
+    echo "fire-$lvl"
+  else
+    echo "silent-$lvl"
+  fi
+}
+
+get_json() {
+  if [ -n "${MESH_LABOR_ALERT_TEST_JSON:-}" ]; then printf '%s' "$MESH_LABOR_ALERT_TEST_JSON"; return; fi
+  command -v mesh-labor >/dev/null 2>&1 || return 1
+  mesh-labor --json 2>/dev/null
+}
+
+# =============================== --test (injected json; no live spend, no TG, no cron) ===============================
+if [ "${1:-}" = --test ]; then
+  command -v jq >/dev/null 2>&1 || { echo "smoke-test: FAIL (no jq)"; exit 1; }
+  _td="$(mktemp -d)"; trap 'rm -rf "$_td"' EXIT
+  export MESH_LABOR_ALERT_DRYRUN=1
+  fail=0
+  chk(){ [ "$2" = "$3" ] || { echo "  FAIL: $1 → expected '$3', got '$2'"; fail=1; }; }
+
+  # ---- level_for boundaries (the threshold math the whole reflex rests on) ----
+  chk "50% → none"     "$(level_for 50 100)"  none
+  chk "79.9% → none"   "$(level_for 79.9 100)" none
+  chk "exactly 80% → warn" "$(level_for 80 100)"  warn
+  chk "85% → warn"     "$(level_for 85 100)"  warn
+  chk "99% → warn"     "$(level_for 99 100)"  warn
+  chk "exactly 100% → cap" "$(level_for 100 100)" cap
+  chk "130% → cap"     "$(level_for 130 100)" cap
+  chk "no cap (0) → none" "$(level_for 42 0)"    none
+
+  j(){ printf '{"window_h":5,"usd":{"spent":%s,"cap":100,"models":{"anthropic:claude-opus-5":%s,"anthropic:claude-fable-5":%s}}}' "$1" "$2" "$3"; }
+  J85="$(j 85 50 35)"; J50="$(j 50 30 20)"; J101="$(j 101 60 41)"
+
+  # (a) at 85% it fires the WARN TG (the message must actually be emitted, not just the action label)
+  S="$_td/a"; : > "$S"
+  out="$(STATE="$S" decide "$J85")"
+  case "$out" in *fire-warn*) : ;; *) echo "  FAIL: 85% must fire-warn (got: $out)"; fail=1 ;; esac
+  case "$out" in *"⚠️"*"85%"*) : ;; *) echo "  FAIL: 85% warn TG string missing pct (got: $out)"; fail=1 ;; esac
+  [ "$(cat "$S")" = warn ] || { echo "  FAIL: state after 85% must be 'warn' (got '$(cat "$S")')"; fail=1; }
+
+  # (b) at 50% it stays SILENT — no TG line at all
+  S="$_td/b"; : > "$S"
+  out="$(STATE="$S" decide "$J50")"
+  chk "50% action" "$out" silent-none
+  case "$out" in *dryrun-tg*) echo "  FAIL: 50% must send NO tg (got: $out)"; fail=1 ;; esac
+
+  # (c) DEDUP: two consecutive 85% runs fire ONCE — the 2nd is silent (edge, not level)
+  S="$_td/c"; : > "$S"
+  o1="$(STATE="$S" decide "$J85")"; o2="$(STATE="$S" decide "$J85")"
+  case "$o1" in *fire-warn*) : ;; *) echo "  FAIL: dedup 1st run must fire (got: $o1)"; fail=1 ;; esac
+  chk "dedup 2nd run silent" "$o2" silent-warn
+  case "$o2" in *dryrun-tg*) echo "  FAIL: dedup 2nd run must NOT re-send (got: $o2)"; fail=1 ;; esac
+
+  # (d) escalation warn→cap fires the CAP TG once, then holds silent at cap
+  S="$_td/d"; : > "$S"
+  STATE="$S" decide "$J85" >/dev/null
+  oc="$(STATE="$S" decide "$J101")"
+  case "$oc" in *fire-cap*) : ;; *) echo "  FAIL: warn→cap must fire-cap (got: $oc)"; fail=1 ;; esac
+  case "$oc" in *"🛑"*"лимит"*) : ;; *) echo "  FAIL: cap TG must name лимит достигнут (got: $oc)"; fail=1 ;; esac
+  chk "cap→cap holds silent" "$(STATE="$S" decide "$J101")" silent-cap
+
+  # (e) DROP re-arms: warn → below-80 (silent reset to none) → back to 85 re-fires
+  S="$_td/e"; : > "$S"
+  STATE="$S" decide "$J85" >/dev/null
+  od="$(STATE="$S" decide "$J50")"
+  chk "drop below 80 resets to none, silently" "$od" silent-none
+  case "$od" in *dryrun-tg*) echo "  FAIL: the drop must NOT TG (got: $od)"; fail=1 ;; esac
+  or="$(STATE="$S" decide "$J85")"
+  case "$or" in *fire-warn*) : ;; *) echo "  FAIL: re-crossing after a drop must re-alert (got: $or)"; fail=1 ;; esac
+
+  # (f) none→cap jump (never passed through warn) fires cap directly
+  S="$_td/f"; : > "$S"
+  oj="$(STATE="$S" decide "$J101")"
+  case "$oj" in *fire-cap*) : ;; *) echo "  FAIL: none→cap jump must fire-cap (got: $oj)"; fail=1 ;; esac
+
+  # (g) malformed json → silent-badjson, never a fabricated alert
+  chk "bad json → silent-badjson" "$(STATE="$_td/g" decide '{"nope":1}')" silent-badjson
+
+  if [ "$fail" = 0 ]; then
+    echo "smoke-test: ok (level thresholds + edge dedup + warn/cap TG strings + drop re-arm + badjson; no live spend, no TG)"
+    exit 0
+  else
+    echo "smoke-test: FAIL"; exit 1
+  fi
+fi
+
+# =============================== live ===============================
+# No cap configured → report-only mode: mesh-labor still meters, but there is nothing to alert AGAINST.
+case "${MESH_LABOR_BUDGET_USD:-0}" in ''|0) exit 0 ;; esac
+
+JSON="$(get_json)" || { echo "[labor-alert] mesh-labor unavailable — cannot assess" >&2; exit 0; }
+[ -n "$JSON" ] || { echo "[labor-alert] empty mesh-labor json — cannot assess" >&2; exit 0; }
+
+if [ "${1:-}" = --status ]; then
+  spent="$(printf '%s' "$JSON" | jq -r '.usd.spent' 2>/dev/null)"
+  cap="$(printf '%s' "$JSON" | jq -r '.usd.cap' 2>/dev/null)"
+  lvl="$(level_for "${spent:-0}" "${cap:-0}")"
+  prev="$(cat "$STATE" 2>/dev/null || echo none)"
+  echo "[labor-alert] level=$lvl spent=\$$(round "${spent:-0}") cap=\$$(round "${cap:-0}") (state=$prev)"
+  exit 0
+fi
+
+action="$(decide "$JSON")"
+
+# Liveness-touch: mtime = ran-live (every run), content = the change-gated level (decide writes it only
+# when it moves). Decouples the two so a long-stable level cannot decay to a FALSE STALE in the mtime
+# watchdogs. (conditional-write-liveness-touch convention.)
+command -v mesh-state-touch >/dev/null 2>&1 && mesh-state-touch "$STATE" >/dev/null 2>&1 || touch "$STATE" 2>/dev/null || true
+
+echo "[labor-alert] $action"
