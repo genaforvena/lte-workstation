@@ -98,6 +98,25 @@ admission all genuinely asserted, all green, and it never once invoked whisper. 
 exercise the thing it wraps (transcribe a known wav, assert the known words), exit 2 where the organ is
 absent. (974d864.)
 
+Extend it to **the mode bit that is not the write**: `[ -w "$f" ]` is not "the write will be accepted".
+A permission bit describes the INODE; it does not tell you what the kernel will DO with your write, and
+for a kernel pseudo-file (procfs/sysfs/cgroupfs) the two come apart. Measured this node (kernel
+6.8.0-136): `/proc/pressure/cpu` is mode 0666, `[ -w ]` and `os.access(W_OK)` both TRUE, yet as uid 1000
+EVERY write is refused (80 spanning combinations, zero accepted) while root's first identical string is
+accepted. The errno compounds the lie — the refusal is `EINVAL`(22) "Invalid argument", not
+`EPERM`/`EACCES`, so it reads as "your format is wrong" and sends you to tune numbers (18 format attempts
+lost to exactly that before testing the privilege axis). Contrast, same node same moment: the 0644
+root-owned cgroup `cpu.pressure` refuses with `EACCES`(13) — mode honest, errno honest; the 0666 file
+lies twice. Sibling of "executable and loadable are different claims" above, and it compounds with
+"an error message names a cause, not the cause" — here the errno ITSELF is the misdirection, so a tool
+that logs `EINVAL` faithfully still teaches the wrong lesson. Practical rule: for a pseudo-file, probe by
+ATTEMPTING the write and checking the result; never gate on the mode. No live instance in the genome
+(checked) — the ~14 `[ -w ]` uses in `scripts/` are all ordinary regular files, where the bit is
+accurate; the one pseudo-file writer, `mesh-act:104` `ledh_write()`, is the pattern to copy — `[ -w ]` is
+a fast-path PREFERENCE and the write result is checked (`printf … && return 0`), so a mode-lying file
+degrades to the sudo path instead of reporting a false success. (`mesh-chat:450` met the same instinct in
+the test-vacuity direction — `[ -f LOG ] && [ -w LOG ]` standing in for a real dry-run.)
+
 Extend it to **the reflex that was never wired**: passing `--test` and running are unrelated facts.
 `mesh-channel-keepalive`/`mesh-mind-keepalive`/`mesh-supervise` all passed green with none in cron or
 carrying a `# reflex-cadence:` header. And a wired reflex can still be vacuous — `mesh-mind-keepalive`
