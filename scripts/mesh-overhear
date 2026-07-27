@@ -266,6 +266,12 @@ def recorder_argv(dest):
     # via direct arecord, but the graph delivered the null source; overhear buffer 0 chunks / transcript
     # 0B). Set OH_CAPTURE_BACKEND=alsa (+ OH_CAPTURE_DEV, default plughw:1,0) to capture the mic
     # DIRECTLY via arecord, bypassing the graph entirely. arecord raw stdout feeds the same FBYTES loop.
+    # OH_RECORDER_CMD (test hook): override the whole argv with a shell-split command — lets --test
+    # inject a recorder that fails instantly (no stdout, known stderr) to prove the no-backoff respawn
+    # gate WITHOUT a real mic. Never set in production.
+    _rc=os.environ.get("OH_RECORDER_CMD")
+    if _rc:
+        import shlex; return shlex.split(_rc)
     be=os.environ.get("OH_CAPTURE_BACKEND","pw").lower()
     if be=="alsa":
         dev=os.environ.get("OH_CAPTURE_DEV","plughw:1,0")
@@ -1028,14 +1034,24 @@ def read_exact(f,n):
     return b
 
 def capture_utterance():
-    # block until one utterance (speech onset → pause); return wav path or "" (too short).
+    # block until one utterance (speech onset → pause). Returns (wav_path_or_"", err):
+    #   err is None on a HEALTHY read (including a real-but-too-short capture — the recorder DID stream
+    #       audio, the speaker just didn't say enough);
+    #   err is a short reason string when the recorder produced ZERO full frames — arecord/pw-record
+    #       died or the device is unavailable. The caller MUST back off on a non-None err: retrying a
+    #       dead recorder costs this code nothing and the node everything (a clean short-read is not an
+    #       exception, so the daemon's except-branch sleep never fired → arecord respawned 861×/s for
+    #       4.7h undetected, 10% of a core; discover/overhear-recorder-respawn-loop-no-backoff 2026-07-27).
+    # stderr is PIPEd (was DEVNULL) so the reason is CARRIED OUT, not swallowed — an oracle that cannot
+    # report the fault (the second defect in that same Popen) is as bad as the storm it hides.
     p=subprocess.Popen(recorder_argv("-"),
-        stdout=subprocess.PIPE,stderr=subprocess.DEVNULL)
-    frames=[]; capturing=False; silence=0.0
+        stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+    frames=[]; capturing=False; silence=0.0; got_frame=False
     try:
         while True:
             buf=read_exact(p.stdout,FBYTES)
             if len(buf)<FBYTES: break
+            got_frame=True
             if os.path.exists(MUTE_FLAG):     # the mesh is speaking on the Bose → drain, don't capture self
                 capturing=False; frames=[]; silence=0.0
                 continue
@@ -1053,11 +1069,22 @@ def capture_utterance():
         p.kill()
         try: p.stdout.close()
         except Exception: pass
-    if (len(frames)*FSEC - silence) < MIN_UTT: return ""
+    if not got_frame:
+        # recorder never delivered a single full frame → it failed to start/produce, NOT a short
+        # utterance. Read WHY off stderr and surface it so the caller backs off + can log the cause.
+        err=""
+        try: err=(p.stderr.read() or b"").decode("utf-8","ignore").strip().replace("\n"," ")[:200]
+        except Exception: pass
+        try: p.stderr.close()
+        except Exception: pass
+        return ("", err or "recorder produced no audio (rc=%s)"%p.poll())
+    try: p.stderr.close()
+    except Exception: pass
+    if (len(frames)*FSEC - silence) < MIN_UTT: return ("", None)
     wav="/tmp/oh-utt-%d-%d.wav"%(os.getpid(),int(time.time()*1000)%100000)
     w=wave.open(wav,"wb"); w.setnchannels(1); w.setsampwidth(2); w.setframerate(RATE)
     w.writeframes(b"".join(frames)); w.close()
-    return wav
+    return (wav, None)
 
 def prune_and_read(stamp_now):
     # read OH_LOG, drop lines older than KEEP, rewrite, return kept text lines (chronological)
@@ -1092,9 +1119,23 @@ if mode=="daemon":
     # only at a trigger. default-string does ZERO whisper → never heats; IdeaPad transcribes only on demand.
     os.makedirs(BUFFER_DIR, exist_ok=True)
     last_prune=0.0
+    fail_streak=0
     while True:
         try:
-            w=capture_utterance()
+            w,err=capture_utterance()
+            if err is not None:
+                # recorder failed to produce audio → BACK OFF. A clean short-read is not an exception,
+                # so the except-branch sleep below never fired on this path and arecord respawned as
+                # fast as fork allows (~861/s). Escalate the sleep (cap 5s) so a persistently-dead mic
+                # can't storm the node, and break single-subdevice contention that a hot respawn loop
+                # only reinforces. Say WHY — once at onset, then every 50th — instead of silent spin.
+                fail_streak+=1
+                if fail_streak==1 or fail_streak%50==0:
+                    sys.stderr.write("overhear: recorder produced no audio (x%d) — %s\n"%(fail_streak, err or "no stderr"))
+                    sys.stderr.flush()
+                time.sleep(min(5.0, 0.5*fail_streak))
+                continue
+            fail_streak=0
             if w:
                 dst=os.path.join(BUFFER_DIR,"%d.wav"%int(time.time()*1000))
                 try:
@@ -1112,6 +1153,13 @@ if mode=="daemon":
                         except (ValueError,OSError): pass
         except Exception:
             time.sleep(0.5)
+
+elif mode=="capture_probe":
+    # TEST hook: call capture_utterance() once and report the (wav?, err) contract so --test can assert
+    # that a failed recorder surfaces a NON-None err (the reason, carried off stderr) instead of an
+    # indistinguishable "" — the no-backoff/mute-oracle pair. Drive with OH_RECORDER_CMD.
+    _w,_e=capture_utterance()
+    print("wav=%s|err=%s"%("yes" if _w else "no", ("None" if _e is None else _e)))
 
 elif mode=="buffer_fresh":
     # exit 0 if a buffered utterance exists within argv[2] secs — "is anyone talking right now"
@@ -1621,6 +1669,29 @@ case "${1:-}" in
     case "$(runpy gate_kind ambient)" in *гул*)    : ;; *) echo "smoke-test: FAIL (gate ambient marker)"; exit 1;; esac
     case "$(runpy gate_kind music)"   in *музыка*) : ;; *) echo "smoke-test: FAIL (gate music marker)"; exit 1;; esac
     echo "  pre-STT VAD gate mapping ok (silence/ambient/music → skip-whisper marker)"
+    # no-backoff respawn gate (discover/overhear-recorder-respawn-loop-no-backoff, 2026-07-27): a recorder
+    # that dies instantly with no stdout is a CLEAN short-read, not an exception, so the daemon's
+    # except-branch sleep never fired and arecord respawned ~861/s for 4.7h (10% of a core). Assert BOTH
+    # halves of the fix, driving a real failing recorder via OH_RECORDER_CMD:
+    #   (a) capture_utterance surfaces a NON-None err (reason carried off stderr — was DEVNULL-swallowed);
+    #   (b) the daemon BACKS OFF — bounded recorder spawns over a fixed window, not a fork storm.
+    _td="$(mktemp -d)"; _cnt="$_td/spawns"; : > "$_cnt"
+    _recstub="sh -c 'echo x >> $_cnt; echo \"test: forced recorder failure (device busy)\" >&2; exit 1'"
+    # (a) the fault must be reported, not swallowed — RED on the old DEVNULL/"" path.
+    _cp="$( export OH_RECORDER_CMD="$_recstub"; runpy capture_probe )"
+    case "$_cp" in
+      *"wav=no|err="*"forced recorder failure"*) : ;;
+      *) echo "smoke-test: FAIL (capture_utterance must surface the recorder failure reason, got: $_cp)"; rm -rf "$_td"; exit 1;;
+    esac
+    # (b) run the daemon ~2s against the failing recorder; spawns must stay bounded (backoff) not storm.
+    : > "$_cnt"
+    OH_RECORDER_CMD="$_recstub" OH_LOG="$_td/overheard.log" timeout 2 "$0" --daemon >/dev/null 2>&1 || true
+    _spawns="$(wc -l < "$_cnt" 2>/dev/null || echo 0)"; _spawns="$(printf '%s' "$_spawns" | tr -d ' ')"
+    rm -rf "$_td"
+    if [ "${_spawns:-0}" -gt 12 ]; then
+      echo "smoke-test: FAIL (no-backoff respawn: $_spawns recorder spawns in ~2s — daemon backoff not firing)"; exit 1
+    fi
+    echo "  recorder no-backoff gate ok (fault reason surfaced; $_spawns spawns in ~2s, backoff bounds the storm)"
     # wake-word tiering (chat-review/wake-confirm-mint-too-loose): a strict-stem hit must pass BOTH
     # wake_hit (poke) and wake_confirm_hit (marker+ack); a loose-only garble-family word must pass
     # wake_hit but NOT wake_confirm_hit, so it can never mint the marker or fire --ack.
