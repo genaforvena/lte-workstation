@@ -1,0 +1,240 @@
+#!/usr/bin/env bash
+# mesh-capability-probe — BLACK-BOX capability evaluation for the mesh's LLM inference pipelines.
+#
+# WHY (capability security, 2026-07-28): mesh-relay --status proves a pool is REACHABLE; mesh-relay
+# --chaos-drill proves the fallover chain HOLDS. Neither proves the served output is CORRECT. A pool
+# can be green on both and still be HOLLOW — a quota-exhausted API echoing an error blob, a wrong/tiny
+# model swapped in, a `|| echo <default>` silent fallback, a local model that OOM-loaded to garbage.
+# The mesh has been bitten by exactly this shape repeatedly (the silent-fallback beat=500, the hollow
+# `-n 1` sensor, ggml-tiny returning a DIFFERENT sentence than was spoken). "Reachability ≠ producing"
+# is doctrine; this tool is its enforcement for the inference lane.
+#
+# BLACK-BOX: a pipeline is treated purely as text-in → text-out. We never inspect the model, weights,
+# or internals — we send a small battery of KNOWN-ANSWER probes and grade the OUTPUT. That is the
+# capability-security posture: trust an inference supply-chain by its behaviour, not by whose name is
+# on it. Any new pipeline (a new mesh-relay pool, a new model, a new API) is auto-tested the same way.
+#
+# Verbs:
+#   mesh-capability-probe eval [--pool P] [--pipe 'CMD'] [--id LABEL]   probe one pipeline, print verdict
+#   mesh-capability-probe auto [--paid]                                 probe every reachable relay pool
+#                                                                       not verified within the TTL
+#                                                                       (the "auto-test NEW pipelines" verb)
+#   mesh-capability-probe ledger                                        last verdict per pipeline
+#   mesh-capability-probe --test                                        self-test (stubbed, offline)
+#
+# Verdicts (exit code): CAPABLE (0) · HOLLOW (1, reachable-but-wrong — the dangerous one) ·
+#   ABSENT (2, no response at all — honest n/a, mesh-land treats exit 2 as a pass).
+#
+# A pipeline that was CAPABLE and is now HOLLOW is a REGRESSION — flagged loudly (a trusted inference
+# organ silently degrading is the worst case). Default probing is FREE/LOCAL pools only; paid pools
+# (opencode/claude) are skipped unless --paid, so a scheduled run never silently burns quota.
+#
+# reflex-cadence: 0 6 * * *
+# reflex-args: auto
+set -uo pipefail
+case ":$PATH:" in *":$HOME/.local/bin:"*) : ;; *) PATH="$HOME/.local/bin:$PATH" ;; esac
+export PATH
+
+MESH="${MESH_DIR:-$HOME/.mesh}"
+LOG="${MESH_CAPABILITY_LOG:-$MESH/capability-probe.log}"
+THRESH_NUM="${MESH_CAPABILITY_THRESH_NUM:-1}"   # pass ratio floor = NUM/DEN (default 1/2 = half)
+THRESH_DEN="${MESH_CAPABILITY_THRESH_DEN:-2}"
+TTL_DAYS="${MESH_CAPABILITY_TTL_DAYS:-7}"       # a CAPABLE verdict newer than this = "already verified"
+
+# --- the probe battery: id | prompt | expected-regex (grep -Ei) ---
+# Known-answer, deterministic, tolerant grading (regex PRESENCE anywhere, case-insensitive) so a chatty
+# model that wraps the answer in prose still passes. Small (4) to bound cost; spans arithmetic,
+# instruction-following, factual recall, and a non-English (ru — the operator's language) probe.
+PROBES=(
+  "arith|What is 17 plus 26? Reply with only the number.|\\b43\\b"
+  "instr|Reply with exactly this one word and nothing else: PONG|pong"
+  "fact|What is the chemical symbol for gold? Reply with only the symbol.|\\bau\\b"
+  "lang-ru|Translate the word cat into Russian. Answer with one Russian word.|кот|кошк"
+)
+
+norm() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -s '[:space:]' ' ' | sed 's/^ //; s/ $//'; }
+
+# Run the pipeline-under-test as a black box: prompt on stdin → answer on stdout. PIPE is an arbitrary
+# shell command (default: route through mesh-relay). Everything else in this tool grades only its stdout.
+run_pipeline() { printf '%s' "$1" | eval "$PIPE" 2>/dev/null; }
+
+# Grade one pipeline. Sets globals: V_VERDICT V_RC V_PASS V_TOTAL V_DETAIL. Never trusts a non-empty
+# blob: an output that merely ECHOES the prompt (the classic silent-fallback / cat-passthrough shape)
+# is a FAIL, not a pass — non-empty is not correct.
+evaluate() {
+  local id="$1"; local pass=0 total=0 responded=0 detail=""
+  local line pid prompt rx out n p
+  for line in "${PROBES[@]}"; do
+    IFS='|' read -r pid prompt rx <<<"$line"
+    total=$((total+1))
+    out="$(run_pipeline "$prompt")"
+    n="$(norm "$out")"; p="$(norm "$prompt")"
+    if [ -z "$n" ]; then
+      detail+="${pid}:noresp "                       # empty → pipeline did not answer
+    elif [ "$n" = "$p" ]; then
+      responded=1; detail+="${pid}:ECHO "            # echoed the prompt → degenerate, a FAIL
+    elif printf '%s' "$out" | grep -qiE "$rx"; then
+      responded=1; pass=$((pass+1)); detail+="${pid}:ok "
+    else
+      responded=1; detail+="${pid}:WRONG "           # answered, but not the known answer → HOLLOW signal
+    fi
+  done
+  V_PASS=$pass; V_TOTAL=$total; V_DETAIL="${detail% }"
+  if [ "$responded" -eq 0 ]; then
+    V_VERDICT=ABSENT; V_RC=2                          # no response to ANY probe → honest n/a
+  elif [ $((pass * THRESH_DEN)) -ge $((total * THRESH_NUM)) ]; then
+    V_VERDICT=CAPABLE; V_RC=0
+  else
+    V_VERDICT=HOLLOW; V_RC=1                          # reachable but below the capability floor
+  fi
+}
+
+# Was this pipeline ever CAPABLE (any past row)? Used to flag a CAPABLE→HOLLOW regression.
+was_capable() { [ -f "$LOG" ] && grep -qE "\|$1\|CAPABLE\|" "$LOG"; }
+# Verified CAPABLE within the TTL? Used by `auto` to skip already-trusted pipelines.
+fresh_capable() {
+  [ -f "$LOG" ] || return 1
+  local cutoff row rts
+  cutoff=$(( $(date +%s) - TTL_DAYS*86400 ))
+  while IFS='|' read -r ts id verdict rest; do
+    [ "$id" = "$1" ] && [ "$verdict" = CAPABLE ] || continue
+    rts=$(date -d "$ts" +%s 2>/dev/null) || continue
+    [ "$rts" -ge "$cutoff" ] && return 0
+  done < <(grep "|$1|" "$LOG")
+  return 1
+}
+
+record() {   # ts | id | verdict | pass/total | detail
+  mkdir -p "$(dirname "$LOG")"
+  printf '%s|%s|%s|%s/%s|%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$2" "$3" "$4" "$5" >>"$LOG"
+}
+
+# Evaluate one pipeline, print a one-line verdict, record it, flag a regression, return its rc.
+probe_one() {   # id
+  local id="$1" reg=""
+  evaluate "$id"
+  was_capable "$id" && [ "$V_VERDICT" = HOLLOW ] && reg="  ⚠ REGRESSION (was CAPABLE)"
+  record "$id" "$V_VERDICT" "$V_PASS" "$V_TOTAL" "$V_DETAIL"
+  printf '%-22s %-8s %s/%s  [%s]%s\n' "$id" "$V_VERDICT" "$V_PASS" "$V_TOTAL" "$V_DETAIL" "$reg"
+  return "$V_RC"
+}
+
+# ---------------- self-test (offline, stubbed pipelines) ----------------
+if [ "${1:-}" = --test ]; then
+  tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+  LOG="$tmp/cap.log"                                  # NEVER touch the production ledger from --test
+  rc_all=0
+
+  # A CORRECT pipeline: answers every probe. Must read CAPABLE.
+  good="$tmp/good.sh"
+  cat >"$good" <<'STUB'
+#!/usr/bin/env bash
+p="$(cat)"
+case "$p" in
+  *17*26*)  echo 43 ;;
+  *PONG*)   echo PONG ;;
+  *gold*)   echo "The symbol is Au." ;;
+  *cat*)    echo "кот" ;;
+  *)        echo ok ;;
+esac
+STUB
+  chmod +x "$good"
+  PIPE="$good" probe_one good-stub >/dev/null
+  [ "$V_VERDICT" = CAPABLE ] || { echo "smoke-test: FAIL (correct stub graded $V_VERDICT, not CAPABLE)"; exit 1; }
+
+  # A HOLLOW pipeline: reachable (echoes the prompt back — the silent-fallback shape) but never correct.
+  # This is the gate's whole reason to exist: it MUST catch a reachable-but-wrong pool. If grading did
+  # not discriminate, this would read CAPABLE and the gate would be vacuous — so assert HOLLOW hard.
+  PIPE="cat" probe_one echo-stub >/dev/null
+  [ "$V_VERDICT" = HOLLOW ] || { echo "smoke-test: FAIL (echo stub graded $V_VERDICT, not HOLLOW — grading does not discriminate)"; exit 1; }
+  [ "$V_PASS" -eq 0 ] || { echo "smoke-test: FAIL (echo stub scored $V_PASS passes; an echo answers nothing)"; exit 1; }
+
+  # A WRONG-but-talking pipeline: always answers, always the wrong thing → HOLLOW, not CAPABLE, not ABSENT.
+  PIPE="cat >/dev/null; echo nope" probe_one wrong-stub >/dev/null
+  [ "$V_VERDICT" = HOLLOW ] || { echo "smoke-test: FAIL (always-wrong stub graded $V_VERDICT, not HOLLOW)"; exit 1; }
+
+  # An ABSENT pipeline: no output at all → exit 2 (honest n/a), NOT a false CAPABLE.
+  PIPE="cat >/dev/null" probe_one silent-stub >/dev/null
+  [ "$V_VERDICT" = ABSENT ] || { echo "smoke-test: FAIL (silent stub graded $V_VERDICT, not ABSENT)"; exit 1; }
+
+  # Regression detection: the echo-stub already logged HOLLOW, but seed a prior CAPABLE and re-probe hollow.
+  record regr-stub CAPABLE 4 4 seed
+  reg_out="$(PIPE="cat" probe_one regr-stub)"
+  echo "$reg_out" | grep -q REGRESSION || { echo "smoke-test: FAIL (CAPABLE→HOLLOW not flagged as REGRESSION)"; exit 1; }
+
+  # fresh_capable TTL logic: a just-logged CAPABLE is fresh; an ancient one is not.
+  record fresh-stub CAPABLE 4 4 now
+  fresh_capable fresh-stub || { echo "smoke-test: FAIL (a just-recorded CAPABLE is not seen as fresh)"; exit 1; }
+  printf '2000-01-01T00:00:00Z|old-stub|CAPABLE|4/4|old\n' >>"$LOG"
+  fresh_capable old-stub && { echo "smoke-test: FAIL (a year-2000 CAPABLE counted as fresh within TTL)"; exit 1; }
+
+  # The ledger the test wrote must be the SANDBOX one, never the real one (forged-artifact trap).
+  [ "$LOG" = "$tmp/cap.log" ] || { echo "smoke-test: FAIL (test wrote to a non-sandbox ledger: $LOG)"; exit 1; }
+
+  echo "smoke-test: ok (grading discriminates CAPABLE/HOLLOW/ABSENT; regression + TTL + sandbox-ledger asserted)"
+  exit 0
+fi
+
+# ---------------- eval: probe ONE pipeline ----------------
+if [ "${1:-}" = eval ] || [ -z "${1:-}" ]; then
+  shift 2>/dev/null || true
+  POOL=""; PIPE=""; ID=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --pool) POOL="${2:-}"; shift 2 ;;
+      --pipe) PIPE="${2:-}"; shift 2 ;;
+      --id)   ID="${2:-}"; shift 2 ;;
+      *) echo "mesh-capability-probe eval: unknown arg '$1'" >&2; exit 64 ;;
+    esac
+  done
+  if [ -z "$PIPE" ]; then
+    command -v mesh-relay >/dev/null 2>&1 || { echo "mesh-capability-probe: no mesh-relay and no --pipe — nothing to probe (n/a)"; exit 2; }
+    if [ -n "$POOL" ]; then PIPE="mesh-relay --pool $POOL"; else PIPE="mesh-relay"; fi
+  fi
+  [ -n "$ID" ] || ID="relay:${POOL:-auto}"
+  probe_one "$ID"
+  exit $?
+fi
+
+# ---------------- auto: probe every reachable relay pool not verified within the TTL ----------------
+if [ "$1" = auto ]; then
+  shift
+  paid=0; [ "${1:-}" = --paid ] && paid=1
+  command -v mesh-relay >/dev/null 2>&1 || { echo "mesh-capability-probe auto: no mesh-relay here (n/a)"; exit 2; }
+  status="$(mesh-relay --status 2>/dev/null)"
+  worst=0; probed=0
+  # Free/local pools by default; paid pools only with --paid (never silently burn quota on a schedule).
+  for pool in groq local opencode-free $([ "$paid" = 1 ] && echo opencode claude); do
+    # reachable? read mesh-relay --status — skip a pool it reports absent/unreachable/no-key.
+    ln="$(printf '%s\n' "$status" | grep -E "^$pool:" )"
+    case "$ln" in
+      *absent*|*"no key"*|*unreachable*) continue ;;
+    esac
+    [ -n "$ln" ] || continue
+    id="relay:$pool"
+    if fresh_capable "$id"; then
+      printf '%-22s %-8s (verified within %sd — skipped)\n' "$id" "FRESH" "$TTL_DAYS"
+      continue
+    fi
+    PIPE="mesh-relay --pool $pool"
+    probe_one "$id"; rc=$?
+    probed=$((probed+1))
+    [ "$rc" -gt "$worst" ] && worst=$rc
+  done
+  [ "$probed" -eq 0 ] && echo "(no new/stale reachable pools to probe — all fresh or absent)"
+  exit "$worst"
+fi
+
+# ---------------- ledger: last verdict per pipeline ----------------
+if [ "$1" = ledger ]; then
+  [ -f "$LOG" ] || { echo "(no capability-probe ledger yet: $LOG)"; exit 0; }
+  echo "pipeline               verdict   score  when                  detail"
+  awk -F'|' '{ last[$2]=$0 } END { for (k in last) print last[k] }' "$LOG" | sort | \
+  while IFS='|' read -r ts id verdict score detail; do
+    printf '%-22s %-8s %-6s %-21s %s\n' "$id" "$verdict" "$score" "$ts" "$detail"
+  done
+  exit 0
+fi
+
+echo "mesh-capability-probe: unknown verb '${1:-}' (try: eval | auto | ledger | --test)" >&2
+exit 64
