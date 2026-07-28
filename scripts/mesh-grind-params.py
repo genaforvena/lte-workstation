@@ -28,6 +28,13 @@ def rng(salt, i, lo, hi, nd=2):
 # mode pool: lib heavily favoured (close loop), then q, poly — never rw. Rotated by i AND jittered by
 # a hash so the sequence isn't a fixed cycle either.
 MODE_POOL = ["lib", "lib", "q", "lib", "poly", "q", "lib", "poly"]
+# Cyclic timelines for `m q` (grainneukeln `amc pat`, 2026-07-24). The euclidean generator can only
+# spread k hits evenly over ONE beat, so every q recipe the mesh ever emitted lived in the same
+# metric universe — a large part of why the batches read as monotonous. These are real timelines
+# spanning multiple beats (12/8 bells, 16-pulse claves, tala thekas, aksak meters), each carrying
+# its own cycle length and accent map. None -> keep the euclidean ek/en path, so the two coexist.
+TIMELINES = [None, "bembe", "clave32", "teental", "aksak9", "colotomic", "bell6", "gnawa",
+             "tresillo", "jajinmori", "rumba32", "maqsum", "khandachapu", "aksak7"]
 BANDS  = [None, "300,12000", "100,8000", "80,4000", "500,15000", "1,250", "200,6000", "40,2000"]
 EUCLID = [(3, 8), (5, 8), (2, 5), (7, 16), (4, 9), (5, 16), (3, 4), (7, 12)]
 WDIV   = [2, 4, 8]
@@ -40,8 +47,15 @@ for i in range(n):
     mode = MODE_POOL[(i + int(u("mjit", i) * 3)) % len(MODE_POOL)]
     toks = ["m", mode]
     if mode == "q":
-        ek, en = pick("euclid", i, EUCLID)
-        toks += ["ek", str(ek), "en", str(en)]
+        tl = pick("timeline", i, TIMELINES)
+        if tl:
+            # `rot` is its own salt: rotating a familiar timeline against unfamiliar material is
+            # the cheapest way to a groove that is neither, and it decorrelates from the timeline
+            # choice so the same bell never comes back at the same rotation.
+            toks += ["pat", tl, "rot", str(int(u("rot", i) * 12))]
+        else:
+            ek, en = pick("euclid", i, EUCLID)
+            toks += ["ek", str(ek), "en", str(en)]
     elif mode == "lib":
         toks += ["lib", pick("lpol", i, LPOL), "lk", str(pick("lk", i, LK))]
     elif mode == "poly":
