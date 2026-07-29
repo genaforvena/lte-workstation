@@ -27,6 +27,7 @@ export PATH="$HOME/.local/bin:$PATH"
 [ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
 MESH="$HOME/.mesh"; SESS="$(hostname)"
 SPEND_LOG="${MESH_SPEND_LOG:-$MESH/spend.log}"
+BOARD="${MESH_BOARD:-$MESH/chat.log}"                      # the node-local work board (goodput = [done] posts)
 CLAUDE_WINDOWS="${MESH_CLAUDE_WINDOWS:-minds genome tg}"   # the paid/anthropic-quota panes (manifest)
 # WEEKLY position (operator 2026-06-25 "посчитать где мы по лимитам"). HONEST per the rule above:
 # the providers expose no remaining-quota feed, so the CAP is operator-set, never invented. Used = REAL
@@ -157,6 +158,75 @@ weekly_alert(){ # cheap [fyi] when we cross ~80% of a SET cap — stamp-throttle
   exit 0
 }
 
+# --- METASTABLE-FAILURE precursor (the busy-but-useless quadrant) ---------------------
+# LITERATURE (distributed-systems coordination, live web, 2026-07-29, genome mind): METASTABLE FAILURE
+# — Bronson/Aghayev/Charapko/Zhang, "Metastable Failures in Distributed Systems", HotOS'21
+# (sigops.org/s/conferences/hotos/2021/papers/hotos21-s11-bronson.pdf); Brooker,
+# brooker.co.za/blog/2021/05/24/metastable.html; formal analysis arXiv:2510.03551 (2025); Isaacs/Alvaro,
+# "Analyzing Metastable Failures", HotOS'25. A metastable failure is a SELF-SUSTAINING congestive
+# collapse: a transient trigger (a rate-limit spike) tips the system into low-goodput mode, and it stays
+# stuck THERE EVEN AFTER THE TRIGGER CLEARS because its own work-amplification (retries) sustains it —
+# "busy and useless". The defining METRIC is the hysteresis: goodput collapsed while offered-load stays
+# high, with the trigger already gone. Recovery needs a NUDGE (shed/drain/backoff-reset), not patience.
+#
+# mesh-quota already reports offered-load (burn = paid round-trips) and covers three quadrants —
+# WASTE (quota-live+idle), DOWNTIME (walled+no-fallback), healthy (live & working) — but it has NO
+# GOODPUT axis, so it EQUATES burn>0 with "working". A retry-loop / stranded re-dispatch churn burns
+# round-trips with ZERO board completions and, being non-walled, reads as "healthy". That is exactly
+# the metastable quadrant, and it is the one blind spot. This probe adds the missing axis:
+#   busy   = paid burn over the persistence window   (spend.log — offered load)
+#   useless= ZERO [done] on the board over that window (chat.log — goodput)
+#   cleared= NO fresh rate-limit wall in the window   (trigger gone → not DOWNTIME, disjoint by design)
+# STALL(metastable precursor) = busy ∧ useless ∧ cleared. READ-ONLY / visibility only (like resource-
+# guard's DUAL-ELEVATED) — it flags, never acts; the acting nudge is failover/quota-resume's job.
+# HONEST: an unreadable spend.log OR board renders UNKNOWN, never a confident "clear" (fusion rule).
+# SELF-CALIBRATING: the persistence window is 3× the board's own median [done] cadence (a dry spell must
+# be abnormal RELATIVE TO THE LIVE CORPUS, not an assumed constant that rots), clamped [60,240] min.
+
+board_done_since(){ # $1=minutes back → count of [done] board lines newer than cutoff
+  [ -f "$BOARD" ] || { echo -1; return; }   # -1 = unreadable (UNKNOWN), distinct from 0 = none
+  local cut; cut=$(date -u -d "$1 minutes ago" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null) || { echo -1; return; }
+  awk -v c="$cut" '$1>c && index($0,"[done]"){n++} END{print n+0}' "$BOARD"
+}
+wall_recent(){ # $1=minutes back → 1 if any rate-limit trigger active/recent in the window, else 0
+  local f ep; for f in "$MESH"/.rl-cooldown-*; do
+    [ -e "$f" ] || continue; ep=$(cut -d'|' -f1 "$f" 2>/dev/null)
+    case "$ep" in ''|*[!0-9]*) continue;; esac; [ "$ep" -gt "$now" ] && { echo 1; return; }
+  done
+  [ -f "$BOARD" ] || { echo 0; return; }
+  local cut; cut=$(date -u -d "$1 minutes ago" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null) || { echo 0; return; }
+  awk -v c="$cut" '$1>c && (index($0,"[mind-limited]")||index($0,"DOWNTIME")){f=1} END{print f?1:0}' "$BOARD"
+}
+stall_span_mins(){ # persistence window, self-calibrated to the board's own [done] cadence
+  [ -n "${MESH_QUOTA_STALL_SPAN:-}" ] && { echo "$MESH_QUOTA_STALL_SPAN"; return; }
+  local d; d=$(board_done_since 1440)   # completions over the last day
+  [ "${d:-0}" -ge 4 ] || { echo 180; return; }   # too few to estimate cadence → conservative default
+  local sp=$(( 3 * 1440 / d ))          # 3× the median gap between completions
+  [ "$sp" -lt 60 ] && sp=60; [ "$sp" -gt 240 ] && sp=240; echo "$sp"
+}
+# metastable_eval: populate MS_* globals + return rc (0 clear · 1 STALL · 2 UNKNOWN). Prints nothing.
+metastable_eval(){
+  MS_SPAN=$(stall_span_mins)
+  MS_FLOOR=$(( MS_SPAN / 60 )); [ "$MS_FLOOR" -lt 2 ] && MS_FLOOR=2   # ≥~1 rt/h sustained AND ≥2 total
+  MS_BURN=$(units_since "$MS_SPAN" paid)
+  MS_GOOD=$(board_done_since "$MS_SPAN")
+  MS_WALL=$(wall_recent "$MS_SPAN")
+  if [ ! -f "$SPEND_LOG" ] || [ "$MS_GOOD" -lt 0 ]; then MS_VERDICT=UNKNOWN; return 2; fi
+  if [ "$MS_BURN" -ge "$MS_FLOOR" ] && [ "$MS_GOOD" -eq 0 ] && [ "$MS_WALL" -eq 0 ]; then
+    MS_VERDICT=STALL; return 1
+  fi
+  MS_VERDICT=clear; return 0
+}
+emit_metastable(){ # human line + honest rc for `--metastable`
+  metastable_eval; local rc=$?
+  case "$MS_VERDICT" in
+    UNKNOWN) printf 'metastable: \033[1;33mUNKNOWN\033[0m — spend.log/board unreadable (no confident all-clear)\n' ;;
+    STALL)   printf 'metastable: \033[1;31mSTALL (precursor)\033[0m — burn=%s good=0 over %sm, no fresh wall: spending but not completing = self-sustaining collapse; NUDGE (mesh-failover --scan / quota-resume), do not wait it out\n' "$MS_BURN" "$MS_SPAN" ;;
+    *)       printf 'metastable: \033[1;32mclear\033[0m — burn=%s good=%s wall=%s over %sm window\n' "$MS_BURN" "$MS_GOOD" "$MS_WALL" "$MS_SPAN" ;;
+  esac
+  return $rc
+}
+
 # --- gather paid-window state ---------------------------------------------------------
 collect(){
   PAID_LIVE=0; PAID_WALLED=0; PAID_FALLBACK=0; PAID_IDLE_LIVE=0; MIN_RESET=""; ROWS=()
@@ -208,6 +278,9 @@ emit_text(){
 
   # verdicts — the actionable, honest read
   emit_verdict
+  # metastable-failure precursor (busy-but-useless) — shown only when it fires or is UNKNOWN, so the
+  # steady healthy case stays quiet; a 'clear' is the silent norm.
+  metastable_eval; case "$MS_VERDICT" in STALL|UNKNOWN) emit_metastable | sed 's/^/  /';; esac
 }
 
 emit_json(){
@@ -220,8 +293,10 @@ emit_json(){
     printf '{"window":"%s","state":"%s","engine":"%s","busy":"%s","reset_s":%s}' "$w" "$st" "$eng" "$busy" "${rs:-null}"
   done
   local ph=false phr; phr=$(pace_hold_remain) && ph=true
-  printf '],"flags":{"live":%d,"walled":%d,"fallback":%d,"idle_live":%d,"pace_held":%s,"pace_gap_left_s":%s}}\n' \
-    "$PAID_LIVE" "$PAID_WALLED" "$PAID_FALLBACK" "$PAID_IDLE_LIVE" "$ph" "${phr:-null}"
+  metastable_eval || true
+  printf '],"flags":{"live":%d,"walled":%d,"fallback":%d,"idle_live":%d,"pace_held":%s,"pace_gap_left_s":%s},"metastable":{"verdict":"%s","burn":%s,"goodput":%s,"wall":%s,"span_min":%s}}\n' \
+    "$PAID_LIVE" "$PAID_WALLED" "$PAID_FALLBACK" "$PAID_IDLE_LIVE" "$ph" "${phr:-null}" \
+    "$MS_VERDICT" "$MS_BURN" "$MS_GOOD" "${MS_WALL:-0}" "$MS_SPAN"
 }
 
 case "${1:-}" in
@@ -233,6 +308,7 @@ case "${1:-}" in
     rm -f "$MESH/.quota-fallback-$2" && echo "cleared quota-fallback mark for $2 (engine now treated as a sovereign operator choice)" ;;
   --weekly-alert) weekly_alert ;;   # cron-wireable: [fyi] on ≥80% of a SET cap (inert until MESH_WEEKLY_PAID_CAP set)
   --json) emit_json ;;
+  --metastable) emit_metastable; exit $? ;;   # busy-but-useless precursor: rc 0 clear · 1 STALL · 2 UNKNOWN
   --watch)
     secs="${2:-${MESH_QUOTA_WATCH:-20}}"
     while :; do printf '\033[H\033[2J'; emit_text; sleep "$secs"; done ;;
@@ -288,7 +364,40 @@ case "${1:-}" in
     SENTINEL_FILE="$sb/seen" PATH="$sb:$PATH" pace_hold_remain >/dev/null 2>&1
     [ -f "$sb/seen" ] || { rm -rf "$qt" "$sb"; fail "mesh-quota did not export MESH_QUOTA_IN_PACE onto its mesh-pace call — recursion guard is inert"; }
     rm -rf "$qt" "$sb"
+
+    # METASTABLE-FAILURE PRECURSOR (busy-but-useless quadrant) — each defining condition isolated so a
+    # single broken clause goes RED. The window self-calibrates from the board's [done] cadence; with a
+    # near-empty test board that is the conservative 180m default, so 'recent' = now-ish lines.
+    mt=$(mktemp -d) || fail mktemp
+    N=$(date -u +%Y-%m-%dT%H:%M:%SZ)                 # inside every window
+    OUT=$(date -u -d '20 hours ago' +%Y-%m-%dT%H:%M:%SZ)  # outside the 180m stall window
+    Nsp=$(date -u +%Y-%m-%dT%H:%M)                   # spend.log uses minute precision (no seconds)
+    mkstall(){ printf '%s turn genome claude anthropic paid a\n%s turn tg claude anthropic paid b\n%s turn minds claude anthropic paid c\n%s turn genome claude anthropic paid d\n' "$Nsp" "$Nsp" "$Nsp" "$Nsp" > "$mt/spend.log"; }
+    # 1) STALL: burn≥floor, ZERO recent [done], NO wall → must fire (the whole point; watched RED if any
+    #    clause is inverted). Board carries only OLD completions so goodput-in-window is genuinely 0.
+    mkstall; printf '%s  genome@x  ::  [done] genome: old work\n' "$OUT" > "$mt/board.log"
+    v=$(MESH="$mt" SPEND_LOG="$mt/spend.log" MESH_SPEND_LOG="$mt/spend.log" BOARD="$mt/board.log" MESH_QUOTA_STALL_SPAN=180; metastable_eval; echo "$MS_VERDICT $MS_BURN $MS_GOOD $MS_WALL")
+    case "$v" in STALL\ [4-9]\ 0\ 0*|STALL\ 4\ 0\ 0*) : ;; *) rm -rf "$mt"; fail "metastable STALL scenario did not fire: $v";; esac
+    # 2) GOODPUT present → NOT metastable (a fresh [done] means it IS completing; disjoint from stall)
+    mkstall; printf '%s  genome@x  ::  [done] genome: fresh work\n' "$N" > "$mt/board.log"
+    v=$(MESH="$mt" SPEND_LOG="$mt/spend.log" BOARD="$mt/board.log" MESH_QUOTA_STALL_SPAN=180; metastable_eval; echo "$MS_VERDICT")
+    [ "$v" = clear ] || { rm -rf "$mt"; fail "metastable must clear when board has a fresh [done]: $v"; }
+    # 3) FRESH WALL → NOT metastable (trigger still present = DOWNTIME lane, not the cleared-collapse)
+    mkstall; printf '%s  genome@x  ::  [mind-limited] genome walled\n' "$N" > "$mt/board.log"
+    v=$(MESH="$mt" SPEND_LOG="$mt/spend.log" BOARD="$mt/board.log" MESH_QUOTA_STALL_SPAN=180; metastable_eval; echo "$MS_VERDICT")
+    [ "$v" = clear ] || { rm -rf "$mt"; fail "metastable must clear when a fresh wall is present (trigger not cleared): $v"; }
+    # 4) NOT BUSY (burn below floor) → NOT metastable (that is the idle/WASTE lane, not busy-but-useless)
+    printf '%s turn genome claude anthropic paid a\n' "$Nsp" > "$mt/spend.log"   # 1 turn < floor(3 for 180m)
+    : > "$mt/board.log"
+    v=$(MESH="$mt" SPEND_LOG="$mt/spend.log" BOARD="$mt/board.log" MESH_QUOTA_STALL_SPAN=180; metastable_eval; echo "$MS_VERDICT")
+    [ "$v" = clear ] || { rm -rf "$mt"; fail "metastable must clear when burn is below the busy floor: $v"; }
+    # 5) UNKNOWN, never a confident all-clear, when the board is unreadable (honest-fusion)
+    mkstall
+    v=$(MESH="$mt" SPEND_LOG="$mt/spend.log" BOARD="$mt/does-not-exist" MESH_QUOTA_STALL_SPAN=180; metastable_eval; echo "$MS_VERDICT")
+    [ "$v" = UNKNOWN ] || { rm -rf "$mt"; fail "metastable must be UNKNOWN when the board is unreadable, not clear: $v"; }
+    rm -rf "$mt"
+
     echo "smoke-test: ok"; exit 0 ;;
   ""|--text) emit_text ;;
-  *) echo "usage: mesh-quota [--json|--watch [secs]|--test]"; exit 2 ;;
+  *) echo "usage: mesh-quota [--json|--metastable|--watch [secs]|--test]"; exit 2 ;;
 esac
