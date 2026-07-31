@@ -49,3 +49,28 @@ Both are the recurring **false-decay** shape: a decay heuristic that reads *not-
 organs whose shebang/organ lives on another node. The artifact for "failing" must be the tool's own
 `--test` run under a shell it can execute — not a bare exec on a node it was never meant to run on.
 Sibling of `na-must-be-a-claim-about-the-node` and `invoked-by-is-not-ever-runs`.
+
+## Addendum 2026-07-31 (re-dispatch): RED-ability DEMONSTRATED + why it re-queued
+
+The idea-queue re-dispatched the identical `mesh-phone-beacon2` decay review. Re-verified, still **KEEP**,
+and closed the two gaps the first pass left open:
+
+**1. The `--test` is not just *asserted* RED-able — it was SEEN red.** Two scratch-copy mutants (genome
+untouched):
+- neuter the chaos short-circuit (`MESH_CHAOS_NETFAIL` guard → `:`) → `rc=1`, 4 FAILs incl.
+  `netfail(env) did not crash the connection` and `armed fault lost buffered records (kept=0, want 2)`.
+- break `flush_queue` retention (drop failed pushes) → `rc=1`, `flush_queue did not retain only failed
+  pushes (kept=0 remaining=)`.
+Both restore to `smoke-test: ok`. A gate that goes red for the right reason on the exact behaviours it
+guards — non-vacuous, confirmed by observation, not inference.
+
+**2. Root cause of the re-dispatch: a STALE candidate report, not a live signal.** `--candidates` still
+listed beacon2 as `UNUSED + FAILS smoke [--test rc=127]` — but that answer comes from the persisted
+report `~/.mesh/reflex-decay.log` stamped **04:41:01Z**, generated *before* the wrong-node guard landed
+at **fe92b88 07:48:18Z**. The guard (deployed, in sync with genome) parses the shebang interpreter
+(`/data/data/com.termux/files/usr/bin/sh`), finds it absent (`[ ! -x ]`), and classifies the tool
+`UNASSESSABLE on this node (lives)` — never a smoke failure. Its own `--test` case **4c** asserts exactly
+this and passes `rc=0`. So the class is permanently fixed at the lane; a fresh scan drops beacon2 from
+candidates. **No genome change needed** — the fix already shipped; the re-dispatch was minted off a
+report that predates it. (Sibling of `a-constant-outlives-its-reader`: a cached verdict outliving the
+code that would now render it differently.)
