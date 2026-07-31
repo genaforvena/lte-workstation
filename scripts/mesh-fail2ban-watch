@@ -1,0 +1,317 @@
+#!/usr/bin/env bash
+# mesh-fail2ban-watch — LIVE intrusion-jail sense: reads fail2ban's sshd jail as it bans, on the
+# mesh's WAN-exposed node. Node-bound (runs ONLY where fail2ban-client exists — phaedra today).
+#
+# WHY (spec: ~/.mesh/knowledge/capability-fail2ban-sshd-jail-unread-live-phaedra-20260731.md,
+# discover 2026-07-31, verified live by health 19:35Z): phaedra holds the mesh's only public IP and
+# has run fail2ban continuously since 2026-07-22 — 475 bans / 20629 failed auths in 9 days (~53/day),
+# with the same source IPs re-offending across ban/expiry cycles (2.57.122.238 banned 3× in 35min).
+# NOTHING in the mesh reads it: `mesh-prior-art` CLEAN, zero `fail2ban`/`f2b` hits in scripts/ or docs/.
+# The DEFENSE runs (fail2ban blocks the IPs); the gap is pure OBSERVABILITY — "phaedra is under active
+# brute-force" / "ban-rate spiked" / "one IP keeps coming back" surfaces nowhere. This closes that.
+#
+# DELTA over the existing senses (not a re-implementation):
+#   - mesh-egress-health / mesh-ingress-blocked characterize whether traffic REACHES the node; neither
+#     reads the jail STATE. mesh-organ tracks phaedra's own liveness, not who is attacking it.
+#   - mesh-journal-watch reads systemd/kernel `-p err`; fail2ban logs to its own /var/log/fail2ban.log
+#     at NOTICE (not -p err), so the jail's bans never appear in journal-watch's stream. Orthogonal.
+#   - The mesh-home sshd-auth-failure finding (same day) was LOW-URGENCY: no WAN ingress, 14 benign
+#     LAN-typo events/7d. This is the opposite — real continuous internet attack on the only WAN node.
+#
+#   mesh-fail2ban-watch            one delta pass: [fyi] on a NEW signal (rate spike / repeat-offender), tape it (cron)
+#   mesh-fail2ban-watch --once     current jail status + per-IP ban counts in the window, no state change
+#   mesh-fail2ban-watch --status   last state line, no read
+#   mesh-fail2ban-watch --reset    clear baseline + seen (next pass re-seeds baseline-silent)
+#   mesh-fail2ban-watch --test     real jail-read gate (honest n/a exit 2 where fail2ban absent) + fixture logic
+#
+# Design constraints (each earned by a documented trap in CLAUDE.md / MEMORY):
+#   - TWO SIGNALS, EACH DEDUP'D — not a raw ban count on the board every cadence:
+#       (A) RATE SPIKE: fail2ban's `Total banned` is a monotonic in-memory counter (survives log
+#           rotation, resets only on service restart). We sample (epoch,total) each pass; a surge is
+#           delta_bans >= RATE_MIN *AND* the implied rate >= RATE_PER_HR (~4.5× the ~2.2/hr baseline).
+#           BOTH conditions — a 5-min window with 2 bans is 24/hr instantaneous but not a real wave;
+#           requiring an absolute-delta floor kills that instantaneous-rate noise (the "check what your
+#           ranker SELECTS FOR" trap: a naive bans/hr on a short window selects for tiny-count jitter).
+#           Dedup: at most one rate alert per wall-clock hour (bucket key), so a sustained wave is one
+#           post, not one every 5 min.
+#       (B) REPEAT-OFFENDER: a single source IP crossing REPEAT_N bans within a trailing WINDOW — a
+#           scripted attacker retrying on a timer, the shape the spec highlights. Parsed from the log's
+#           Ban lines. Dedup: seen key `repeat-<ip>` — alerts ONCE per IP (tradeoff, below).
+#   - COUNTER-RESET IS NOT A SPIKE. If `Total banned` DROPS below the last sample, fail2ban restarted
+#     (counter zeroed) — re-seed the baseline, never alert (a reset read as a negative delta, or the
+#     next positive delta off a zero base, would be a false spike — the "silent fallback" inverse).
+#   - BASELINE-SILENT FIRST RUN (mesh-journal-watch's replay-trap guard). The jail already holds 475
+#     bans and standing repeat-offenders (surfaced manually by discover). A first run seeds the baseline
+#     sample AND marks every current in-window repeat-offender as seen, then stays silent — only signal
+#     accruing AFTER install surfaces. Never storm the board with the known backlog.
+#   - SEEN IS FOREVER, PER-IP (journal-watch's "signature at most once"). A repeat-offender alerts the
+#     first time it crosses the threshold and not again — even if it returns next week. Tradeoff, taken
+#     deliberately: the *novel* fact "this IP is a persistent re-offender" is the signal; the tape keeps
+#     every occurrence with counts for forensics. `--reset` re-arms.
+#   - REAL-READ GATE, NOT `[ -x ]` (executable≠works, and a mode bit≠the read). --test drives a REAL
+#     `fail2ban-client status sshd` and asserts a parseable `Total banned:` integer — a jail that
+#     exists but returns nothing is a hollow sense. Fixtures run FIRST (no binary needed) so the logic
+#     is verified even on a node WITHOUT fail2ban; the real-read gate then exits 2 (honest n/a) where
+#     the organ is absent — mesh-land / mesh-autowire treat exit 2 as pass/skip, never a fake QUIET.
+#   - liveness-touch every successful pass (mtime = ran) independent of whether anything fired — a
+#     long-quiet-but-live jail must not read as a dead reflex to the mtime watchdogs.
+#
+# reflex-cadence: */5 * * * *
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+
+STATE_DIR="${MESH_STATE_DIR:-$HOME/.mesh}"
+BASE="$STATE_DIR/.fail2ban-watch-baseline"    # last "epoch total" sample for rate computation
+SEEN="$STATE_DIR/.fail2ban-watch-seen"        # dedup keys (repeat-<ip>, rate-<hourbucket>)
+TAPE="${MESH_FAIL2BAN_WATCH_TAPE:-$STATE_DIR/fail2ban-watch.log}"
+STATE="$STATE_DIR/.fail2ban-watch-state"
+CHAT="${MESH_FAIL2BAN_WATCH_CHAT:-1}"
+JAIL="${MESH_FAIL2BAN_JAIL:-sshd}"
+LOG="${MESH_FAIL2BAN_LOG:-/var/log/fail2ban.log}"
+WINDOW="${MESH_FAIL2BAN_WINDOW:-21600}"        # 6h trailing window for repeat-offender
+REPEAT_N="${MESH_FAIL2BAN_REPEAT:-3}"          # bans-in-window to flag an IP as a repeat-offender
+RATE_MIN="${MESH_FAIL2BAN_RATE_MIN:-5}"        # min NEW bans since last sample to consider a spike
+RATE_PER_HR="${MESH_FAIL2BAN_RATE:-10}"        # bans/hr threshold (~4.5× the ~2.2/hr baseline)
+mkdir -p "$STATE_DIR"
+
+# --- primitives (all overridable for --test; live path needs no fixtures) ----
+now_epoch(){ if [ -n "${MESH_FAIL2BAN_NOW:-}" ]; then printf '%s' "$MESH_FAIL2BAN_NOW"; else date +%s; fi; }
+
+have_fail2ban(){ command -v fail2ban-client >/dev/null 2>&1; }
+
+status_raw(){ # fail2ban-client status <jail> output (or fixture)
+  if [ -n "${MESH_FAIL2BAN_STATUS:-}" ]; then cat "$MESH_FAIL2BAN_STATUS"; return 0; fi
+  fail2ban-client status "$JAIL" 2>/dev/null && return 0
+  sudo -n fail2ban-client status "$JAIL" 2>/dev/null
+}
+
+# Extract a named integer field ("Total banned" / "Currently banned") from status output on stdin.
+status_int(){ awk -v k="$1" 'index($0,k){ n=$0; sub(/.*:[[:space:]]*/,"",n); gsub(/[^0-9].*$/,"",n); if(n=="")n=0; print n; exit }'; }
+
+# Emit one IP per Ban event inside the trailing window [now-WINDOW, now].
+bans_in_window(){
+  local now cutoff
+  now="$(now_epoch)"; cutoff=$(( now - WINDOW ))
+  local f
+  for f in "$LOG" "$LOG.1"; do
+    [ -r "$f" ] || continue
+    grep -aE ' Ban ' "$f" 2>/dev/null
+  done | while IFS= read -r line; do
+    local tsstr ip ep
+    tsstr="${line:0:19}"          # "YYYY-MM-DD HH:MM:SS" (drops the ,millis)
+    ip="${line##* }"             # last whitespace token
+    ep="$(date -d "$tsstr" +%s 2>/dev/null)" || continue
+    [ -n "$ep" ] || continue
+    [ "$ep" -ge "$cutoff" ] && [ "$ep" -le "$now" ] && printf '%s\n' "$ip"
+  done
+}
+
+# per-IP counts in window: "<count> <ip>" lines, descending.
+repeat_offenders(){ bans_in_window | sort | uniq -c | sort -rn | awk '{print $1" "$2}'; }
+
+seen_has(){ [ -f "$SEEN" ] && grep -Fxq "$1" "$SEEN" 2>/dev/null; }
+seen_add(){ printf '%s\n' "$1" >> "$SEEN"; }
+
+# --- --once: human view, no state change ------------------------------------
+if [ "${1:-}" = --once ]; then
+  have_fail2ban || [ -n "${MESH_FAIL2BAN_STATUS:-}" ] || { echo "mesh-fail2ban-watch: n/a (no fail2ban-client — not the WAN jail node)"; exit 2; }
+  s="$(status_raw)"
+  [ -n "$s" ] || { echo "mesh-fail2ban-watch: FAIL (jail '$JAIL' returned no status)"; exit 1; }
+  tb="$(printf '%s\n' "$s" | status_int 'Total banned')"
+  cb="$(printf '%s\n' "$s" | status_int 'Currently banned')"
+  tf="$(printf '%s\n' "$s" | status_int 'Total failed')"
+  echo "  jail=$JAIL  total-banned=$tb  currently-banned=$cb  total-failed=$tf"
+  echo "  repeat-offenders in last $((WINDOW/3600))h (count ip):"
+  repeat_offenders | awk '{printf "    %4d  %s\n",$1,$2}'
+  echo "  (an IP with count >= $REPEAT_N would alert as a repeat-offender)"
+  exit 0
+fi
+
+# --- --status ----------------------------------------------------------------
+if [ "${1:-}" = --status ]; then
+  [ -r "$STATE" ] && cat "$STATE" || echo "mesh-fail2ban-watch: no state yet"
+  exit 0
+fi
+
+# --- --reset -----------------------------------------------------------------
+if [ "${1:-}" = --reset ]; then
+  rm -f "$BASE" "$SEEN"
+  echo "mesh-fail2ban-watch: reset (baseline + seen cleared; next pass re-seeds baseline-silent)"
+  exit 0
+fi
+
+# --- one delta pass (shared by live + --test fixtures) ----------------------
+# Reads jail state, emits [fyi] on a NEW rate-spike or repeat-offender, updates baseline+seen+tape.
+run_pass(){
+  local ts now host s tb cb
+  now="$(now_epoch)"; ts="$(date -u -d "@$now" +%FT%TZ 2>/dev/null || date -u +%FT%TZ)"
+  host="$(hostname)"
+  s="$(status_raw)"
+  if [ -z "$s" ]; then
+    printf 'FAIL jail=%s no-status %s\n' "$JAIL" "$ts" > "$STATE"
+    echo "mesh-fail2ban-watch: FAIL (jail '$JAIL' returned no status)"; return 1
+  fi
+  tb="$(printf '%s\n' "$s" | status_int 'Total banned')"
+  cb="$(printf '%s\n' "$s" | status_int 'Currently banned')"
+
+  # BASELINE-SILENT first run: seed sample + mark current repeat-offenders seen, surface nothing.
+  if [ ! -f "$BASE" ]; then
+    printf '%s %s\n' "$now" "$tb" > "$BASE"
+    local c ip
+    while read -r c ip; do
+      [ -n "$ip" ] || continue
+      [ "$c" -ge "$REPEAT_N" ] && seen_add "repeat-$ip"
+    done < <(repeat_offenders)
+    printf 'SEEDED total=%s banned=%s %s\n' "$tb" "$cb" "$ts" > "$STATE"
+    command -v mesh-state-touch >/dev/null 2>&1 && mesh-state-touch "$STATE" >/dev/null 2>&1 || true
+    echo "mesh-fail2ban-watch: seeded baseline (silent first run; total-banned=$tb)"; return 0
+  fi
+
+  local ep_prev tb_prev; read -r ep_prev tb_prev < "$BASE"
+  [ -n "${ep_prev:-}" ] || ep_prev="$now"; [ -n "${tb_prev:-}" ] || tb_prev="$tb"
+
+  local fired=0 posts=()
+
+  # (A) RATE SPIKE — counter-reset guarded.
+  if [ "$tb" -lt "$tb_prev" ]; then
+    printf '%s counter-reset (total-banned %s -> %s; fail2ban restarted) — baseline re-seeded\n' "$ts" "$tb_prev" "$tb" >> "$TAPE"
+  else
+    local db dt rate_hr mins bucket
+    db=$(( tb - tb_prev )); dt=$(( now - ep_prev )); [ "$dt" -gt 0 ] || dt=1
+    rate_hr=$(( db * 3600 / dt )); mins=$(( dt / 60 ))
+    if [ "$db" -ge "$RATE_MIN" ] && [ "$rate_hr" -ge "$RATE_PER_HR" ]; then
+      bucket="rate-$(date -u -d "@$now" +%Y%m%d%H 2>/dev/null || echo now)"
+      if ! seen_has "$bucket"; then
+        seen_add "$bucket"; fired=1
+        posts+=("[fyi] mesh-fail2ban-watch: $host — sshd ban-rate SPIKE: $db new bans in ${mins}min (~${rate_hr}/hr vs ~2/hr baseline); currently-banned=$cb, total-banned=$tb. Live brute-force wave on the WAN node; tape ~/.mesh/fail2ban-watch.log")
+        printf '%s SPIKE db=%s dt=%ss rate=%s/hr total=%s\n' "$ts" "$db" "$dt" "$rate_hr" "$tb" >> "$TAPE"
+      fi
+    fi
+  fi
+
+  # (B) REPEAT-OFFENDER.
+  local c ip
+  while read -r c ip; do
+    [ -n "$ip" ] || continue
+    if [ "$c" -ge "$REPEAT_N" ] && ! seen_has "repeat-$ip"; then
+      seen_add "repeat-$ip"; fired=1
+      posts+=("[fyi] mesh-fail2ban-watch: $host — repeat-offender $ip: $c bans in last $((WINDOW/3600))h (scripted retry across ban/expiry cycles, not noise); jail=$JAIL. tape ~/.mesh/fail2ban-watch.log")
+      printf '%s REPEAT ip=%s count=%s\n' "$ts" "$ip" "$c" >> "$TAPE"
+    fi
+  done < <(repeat_offenders)
+
+  # advance baseline sample every pass (rate is measured between samples).
+  printf '%s %s\n' "$now" "$tb" > "$BASE"
+
+  local p
+  for p in "${posts[@]:-}"; do
+    [ -n "$p" ] || continue
+    echo "$p"
+    if [ "$CHAT" = 1 ] && command -v mesh-chat >/dev/null 2>&1; then
+      MESH_WHO="fail2ban-watch@$host" mesh-chat "$p" >/dev/null 2>&1 || true
+    fi
+  done
+
+  local status; status="$([ "$fired" -gt 0 ] && echo ALERT || echo QUIET)"
+  printf '%s new=%s total=%s banned=%s %s\n' "$status" "$fired" "$tb" "$cb" "$ts" > "$STATE"
+  command -v mesh-state-touch >/dev/null 2>&1 && mesh-state-touch "$STATE" >/dev/null 2>&1 || true
+  if [ "$fired" -gt 0 ]; then echo "mesh-fail2ban-watch: $fired new signal(s) surfaced (total-banned=$tb)"
+  else echo "mesh-fail2ban-watch: QUIET (no new signal; total-banned=$tb)"; fi
+  return 0
+}
+
+# --- --test ------------------------------------------------------------------
+if [ "${1:-}" = --test ]; then
+  for b in awk sed grep date; do command -v "$b" >/dev/null 2>&1 || { echo "smoke-test: FAIL (no $b)"; exit 1; }; done
+
+  _td="$(mktemp -d)"
+  # Deterministic clock/TZ so fixture timestamps and NOW agree.
+  _NOW="$(TZ=UTC date -d '2026-07-31 20:00:00' +%s)"
+  _log="$_td/fail2ban.log"; _stat="$_td/status.txt"
+  base_env="TZ=UTC MESH_STATE_DIR=$_td MESH_FAIL2BAN_WATCH_CHAT=0 MESH_FAIL2BAN_NOW=$_NOW \
+            MESH_FAIL2BAN_LOG=$_log MESH_FAIL2BAN_STATUS=$_stat MESH_FAIL2BAN_WATCH_TAPE=$_td/tape.log \
+            MESH_FAIL2BAN_REPEAT=3 MESH_FAIL2BAN_RATE_MIN=5 MESH_FAIL2BAN_RATE=10 MESH_FAIL2BAN_WINDOW=21600"
+  mkstatus(){ printf 'Status for the jail: sshd\n|- Filter\n|  `- Total failed:\t%s\n`- Actions\n   |- Currently banned:\t%s\n   `- Total banned:\t%s\n' "$1" "$2" "$3" > "$_stat"; }
+  pass(){ env $base_env "$0" ; }
+
+  # Fixture log: 2.57.122.238 banned 3× (repeat-offender), 92.118.39.77 once, all within the 6h window.
+  cat > "$_log" <<'EOF'
+2026-07-31 16:36:10,001 fail2ban.actions [1]: NOTICE  [sshd] Ban 2.57.122.238
+2026-07-31 17:54:57,002 fail2ban.actions [1]: NOTICE  [sshd] Ban 92.118.39.77
+2026-07-31 18:53:38,003 fail2ban.actions [1]: NOTICE  [sshd] Ban 2.57.122.238
+2026-07-31 19:11:16,004 fail2ban.actions [1]: NOTICE  [sshd] Ban 2.57.122.238
+EOF
+
+  # (1) BASELINE-SILENT first run: seeds, surfaces NOTHING even with a standing repeat-offender.
+  mkstatus 20629 1 475
+  out="$(pass 2>&1)"; rc=$?
+  { [ "$rc" = 0 ] && printf '%s' "$out" | grep -qi 'seeded' && ! printf '%s' "$out" | grep -qF '[fyi]' \
+      && grep -Fxq 'repeat-2.57.122.238' "$_td/.fail2ban-watch-seen"; } \
+    || { rm -rf "$_td"; echo "smoke-test: FAIL (first run must seed silent + mark current repeat-offender seen: rc=$rc out='$out')"; exit 1; }
+
+  # (2) A NEW repeat-offender (different IP crossing N) surfaces; the already-seen one does NOT re-fire.
+  cat >> "$_log" <<'EOF'
+2026-07-31 19:30:00,005 fail2ban.actions [1]: NOTICE  [sshd] Ban 45.1.2.3
+2026-07-31 19:40:00,006 fail2ban.actions [1]: NOTICE  [sshd] Ban 45.1.2.3
+2026-07-31 19:50:00,007 fail2ban.actions [1]: NOTICE  [sshd] Ban 45.1.2.3
+EOF
+  mkstatus 20632 2 478                     # +3 bans over ~large seed gap: NOT a spike (db=3 < RATE_MIN=5)
+  out="$(pass 2>&1)"; rc=$?
+  { [ "$rc" = 0 ] && printf '%s' "$out" | grep -qF 'repeat-offender 45.1.2.3' \
+      && ! printf '%s' "$out" | grep -qF '2.57.122.238' \
+      && ! printf '%s' "$out" | grep -qi 'SPIKE'; } \
+    || { rm -rf "$_td"; echo "smoke-test: FAIL (new repeat-offender must fire once; seen one must not; +3 must not be a spike: rc=$rc out='$out')"; exit 1; }
+
+  # (3) DEDUP: an immediate re-run with no new events is QUIET (45.1.2.3 already seen).
+  out="$(pass 2>&1)"; rc=$?
+  { [ "$rc" = 0 ] && printf '%s' "$out" | grep -qi 'QUIET' && ! printf '%s' "$out" | grep -qF '[fyi]'; } \
+    || { rm -rf "$_td"; echo "smoke-test: FAIL (a seen repeat-offender must not re-alert: rc=$rc out='$out')"; exit 1; }
+
+  # (4) RATE SPIKE: a big Total-banned jump over a short interval fires once; re-run same hour is deduped.
+  rm -rf "$_td"; _td="$(mktemp -d)"; _log="$_td/fail2ban.log"; _stat="$_td/status.txt"
+  : > "$_log"
+  base_env="TZ=UTC MESH_STATE_DIR=$_td MESH_FAIL2BAN_WATCH_CHAT=0 MESH_FAIL2BAN_LOG=$_log \
+            MESH_FAIL2BAN_STATUS=$_stat MESH_FAIL2BAN_WATCH_TAPE=$_td/tape.log \
+            MESH_FAIL2BAN_REPEAT=3 MESH_FAIL2BAN_RATE_MIN=5 MESH_FAIL2BAN_RATE=10 MESH_FAIL2BAN_WINDOW=21600"
+  passN(){ env $base_env MESH_FAIL2BAN_NOW="$1" "$0" ; }
+  n0="$(TZ=UTC date -d '2026-07-31 20:00:00' +%s)"; n1=$(( n0 + 600 ))   # +10min
+  mkstatus 20629 1 475; out="$(passN "$n0" 2>&1)"                       # seed
+  mkstatus 20629 6 487; out="$(passN "$n1" 2>&1)"; rc=$?                 # +12 bans in 10min = 72/hr
+  { [ "$rc" = 0 ] && printf '%s' "$out" | grep -qi 'ban-rate SPIKE' && printf '%s' "$out" | grep -qF '12 new bans'; } \
+    || { rm -rf "$_td"; echo "smoke-test: FAIL (a real Total-banned surge must alert as a spike: rc=$rc out='$out')"; exit 1; }
+  n2=$(( n1 + 300 )); mkstatus 20629 6 499; out="$(passN "$n2" 2>&1)"; rc=$?   # +12 again, SAME hour
+  { [ "$rc" = 0 ] && ! printf '%s' "$out" | grep -qi 'SPIKE'; } \
+    || { rm -rf "$_td"; echo "smoke-test: FAIL (a second spike in the same hour bucket must be deduped: rc=$rc out='$out')"; exit 1; }
+
+  # (5) SMALL delta is NOT a spike even at a high instantaneous rate (absolute-delta floor).
+  n3=$(( n2 + 60 )); mkstatus 20629 6 502; out="$(passN "$n3" 2>&1)"; rc=$?  # +3 in 60s = 180/hr but db<5
+  { [ "$rc" = 0 ] && ! printf '%s' "$out" | grep -qi 'SPIKE'; } \
+    || { rm -rf "$_td"; echo "smoke-test: FAIL (delta below RATE_MIN must NOT be a spike despite high rate: rc=$rc out='$out')"; exit 1; }
+
+  # (6) COUNTER RESET (fail2ban restart) is NOT a spike — re-seeds silently.
+  n4=$(( n3 + 3600 )); mkstatus 5 1 12; out="$(passN "$n4" 2>&1)"; rc=$?      # total dropped 502 -> 12
+  { [ "$rc" = 0 ] && ! printf '%s' "$out" | grep -qi 'SPIKE' && grep -qi 'counter-reset' "$_td/tape.log"; } \
+    || { rm -rf "$_td"; echo "smoke-test: FAIL (a counter reset must not be a spike and must be taped: rc=$rc out='$out')"; exit 1; }
+
+  rm -rf "$_td"
+
+  # REAL-READ gate LAST (honest n/a where fail2ban is absent — e.g. mesh-home dev node).
+  if ! have_fail2ban; then
+    echo "smoke-test: ok (fixtures: seed-silent/repeat/dedup/spike/floor/reset) — real read n/a (no fail2ban-client here)"; exit 2
+  fi
+  s="$(status_raw)"
+  [ -n "$s" ] || { echo "smoke-test: FAIL (fail2ban-client present but jail '$JAIL' returned no status)"; exit 1; }
+  printf '%s\n' "$s" | grep -q 'Total banned' \
+    || { echo "smoke-test: FAIL (jail status has no 'Total banned' field — hollow read)"; exit 1; }
+  tb="$(printf '%s\n' "$s" | status_int 'Total banned')"
+  [ "$tb" -ge 0 ] 2>/dev/null || { echo "smoke-test: FAIL ('Total banned' did not parse to an integer: got '$tb')"; exit 1; }
+  echo "smoke-test: ok (fixtures + REAL jail read: '$JAIL' total-banned=$tb)"; exit 0
+fi
+
+# --- default: one delta pass -------------------------------------------------
+if ! have_fail2ban && [ -z "${MESH_FAIL2BAN_STATUS:-}" ]; then
+  printf 'N/A %s\n' "$(date -u +%FT%TZ)" > "$STATE"
+  echo "mesh-fail2ban-watch: n/a (no fail2ban-client on this node — not the WAN jail node)"; exit 2
+fi
+run_pass

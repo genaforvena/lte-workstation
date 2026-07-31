@@ -459,7 +459,9 @@ dead-on-arrival orphan stays visible.
 - **Node-bound senses/reflexes (run only on the node whose organ they read — unwired elsewhere by design):**
   `mesh-phone-beacon2` · `mesh-sms-monitor` · `mesh-sms-rx` (phone BODY / Termux) · `mesh-tg-watchdog`
   (default-string's TG organ) · `mesh-tv-watch` (the TV-reachable node) · `mesh-wan-traffic` (GL-MT3000 router) ·
-  `mesh-ss-altport` (phaedra SS admin, operator-driven)
+  `mesh-ss-altport` (phaedra SS admin, operator-driven) · `mesh-fail2ban-watch` (the WAN-jail intrusion
+  sense — reads fail2ban's sshd jail; self-wires via `# reflex-cadence:` ONLY where `fail2ban-client`
+  exists, i.e. phaedra, and `--test` exits 2 → autowire SKIPs it on every other node)
 - **On-demand senses / fusion / queries (pulled when asked or consumed by a caller — not scheduled):**
   `mesh-overview` · `mesh-operator-context` · `mesh-operator-engagement` (these two overlap — operator-activity
   fusion) · `mesh-social-fusion` · `mesh-net-io` · `mesh-socket-state` · `mesh-power-source` · `mesh-proximity` ·
