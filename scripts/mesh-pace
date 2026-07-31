@@ -46,6 +46,13 @@ MIN_GAP="${MESH_PACE_MIN_GAP:-60}"   # COLD floor: when the paid window is barel
                                      # gap to THIS so a board event wakes the owner now, not on the
                                      # next cron poll (operator 2026-07-24: диспатч событийным).
 SPEND_LOG="${MESH_SPEND_LOG:-$HOME/.mesh/spend.log}"  # raw timestamped turn tape (burden trend reads it)
+# HARD-CAP GATE LEDGER: every over_budget() evaluation books one hledger txn recording the decision it
+# reached and the (cap, spent) it saw. This turns "did the $-gate ever fail-OPEN on a blind/stale meter
+# read or on cap<=0" from a source-reading inference into a balance query (mesh-pace --gate-ledger, or
+# `hledger -f <log> balance gate:decision`). Raised by @anp2network (dev.to 3c648); the gate's fail-open
+# branches (a >20s meter, an empty/unparseable read, no cap armed) are INVISIBLE at the call site — the
+# lane proceeds and nothing records WHY. The ledger makes each such fail-open a standing, countable row.
+PACE_GATE_LOG="${MESH_PACE_GATE_LOG:-$HOME/.mesh/pace-gate.journal}"
 COLD_BELOW="${MESH_PACE_COLD_BELOW:-7}"  # paid burn/h STRICTLY below this =cold → floor to MIN_GAP.
                                      # 7 = the first hot-staircase step, so cold ends exactly where
                                      # stretch begins — no flat-base band survives between them.
@@ -97,19 +104,69 @@ burn_mult() {
 # FAIL-OPEN: an absent/broken/unparseable meter, or no cap armed, never holds. MESH_PACE_GAP=0 (escape
 # hatch, checked before this) still fully disables the governor incl. this cap — the manual override.
 # MESH_PACE_BUDGET_OVERRIDE=over|under short-circuits the probe for a hermetic --test.
+# Bound the gate ledger so an ever-appending decision tape (dispatch calls the gate on every poll) can't
+# grow without limit. Called ~1% of books (keyed off $now) so the wc is not paid every dispatch. Trims to
+# the last KEEP lines on a TXN BOUNDARY — an hledger txn is a date-header line + two indented posting
+# lines, so a naive tail could sever a txn; the awk drops any leading orphan posting lines up to the first
+# date header, leaving a journal hledger still parses.
+_gate_rotate() {
+  local max=30000 keep=15000 n tmp
+  n="$(wc -l < "$PACE_GATE_LOG" 2>/dev/null || echo 0)"
+  [ "$n" -gt "$max" ] 2>/dev/null || return 0
+  tmp="$(mktemp 2>/dev/null)" || return 0
+  tail -n "$keep" "$PACE_GATE_LOG" 2>/dev/null | awk 'seen||/^[0-9]/{seen=1;print}' > "$tmp" 2>/dev/null \
+    && mv -f "$tmp" "$PACE_GATE_LOG" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+}
+
+# book_gate <reason> <cap> <spent> — append one hledger txn recording a hard-cap gate decision. Reasons:
+#   over        spent>=cap>0            → the gate HELD (return 0); the cap bit
+#   under       cap>0, spent<cap        → proceeded legitimately (headroom)
+#   nocap       cap<=0 / no cap armed   → proceeded FAIL-OPEN (governor's $-cap effectively disabled)
+#   blind-meter meter read failed/empty → proceeded FAIL-OPEN (a >20s / broken mesh-labor --json)
+#   blind-parse cap|spent unparseable   → proceeded FAIL-OPEN (meter returned malformed json)
+# Double-entry so `hledger -f <log> balance gate:decision` tallies each reason as a running count; the
+# contra `gate:calls` keeps every txn balanced (hledger check passes with no oracle). Synthetic states
+# (MESH_PACE_BUDGET_OVERRIDE, set by --test and any hermetic caller) are NEVER booked — the ledger records
+# only decisions reached against a REAL meter read, so a test can't forge a fail-open row a watchdog reads.
+book_gate() {
+  [ -n "${MESH_PACE_BUDGET_OVERRIDE:-}" ] && return 0     # synthetic decision — never book
+  local reason="$1" cap="${2:-na}" spent="${3:-na}" ts d t
+  ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"; d="${ts%%T*}"; t="${ts#*T}"   # hledger dates are YYYY-MM-DD; time → comment
+  { printf '%s * gate %s  ; ts:%s cap:%s spent:%s mode:%s\n' \
+        "$d" "$reason" "$t" "$cap" "$spent" "${PACE_GATE_MODE:-gate}"
+    printf '    gate:decision:%-12s   1 GATE\n' "$reason"
+    printf '    gate:calls                    -1 GATE\n'
+  } >> "$PACE_GATE_LOG" 2>/dev/null || true
+  [ $((now % 100)) -eq 0 ] && _gate_rotate
+  return 0
+}
+
 over_budget() {
   case "${MESH_PACE_BUDGET_OVERRIDE:-}" in over) return 0;; under) return 1;; esac
-  local j cap spent
+  local j cap spent cls
   # timeout must EXCEED the real meter read or the hard cap is blind: mesh-labor --json measured 12.2s
   # (2026-07-31), so the old `timeout 6` killed the read → empty → return 1 (FAIL-OPEN) EVERY time —
   # the operator's 07-27 $100/5h cap never held though spent had crossed it. 20s clears the read with
-  # margin; a genuinely broken/hung meter (>20s) still fails open, as intended.
-  j="$(timeout 20 mesh-labor --json 2>/dev/null)" || return 1
-  [ -n "$j" ] || return 1
+  # margin; a genuinely broken/hung meter (>20s) still fails open, as intended — now BOOKED as blind-meter.
+  # MESH_PACE_METER_JSON_OVERRIDE injects a meter payload (hermetic --test of the classify+book path
+  # WITHOUT MESH_PACE_BUDGET_OVERRIDE, which is booked as synthetic and skips the ledger). It is NOT the
+  # budget override: it still flows through the real cap/spent parse + classify, so a bad payload exercises
+  # the genuine blind-parse fail-open branch.
+  if [ -n "${MESH_PACE_METER_JSON_OVERRIDE+x}" ]; then j="$MESH_PACE_METER_JSON_OVERRIDE"
+  else j="$(timeout 20 mesh-labor --json 2>/dev/null)" || { book_gate blind-meter na na; return 1; }
+  fi
+  [ -n "$j" ] || { book_gate blind-meter na na; return 1; }
   cap="$(printf '%s' "$j"   | grep -oE '"cap":[0-9.]+'   | grep -oE '[0-9.]+' | head -1)"
   spent="$(printf '%s' "$j" | grep -oE '"spent":[0-9.]+' | grep -oE '[0-9.]+' | head -1)"
-  [ -n "$cap" ] && [ -n "$spent" ] || return 1
-  awk "BEGIN{exit !($cap > 0 && $spent >= $cap)}" 2>/dev/null || return 1
+  [ -n "$cap" ] && [ -n "$spent" ] || { book_gate blind-parse "${cap:-na}" "${spent:-na}"; return 1; }
+  # classify once (awk failure → blind-parse, preserving the original fail-open on a broken awk).
+  cls="$(awk "BEGIN{ if($cap>0 && $spent>=$cap) print \"over\"; else if($cap>0) print \"under\"; else print \"nocap\" }" 2>/dev/null)"
+  case "$cls" in
+    over)  book_gate over  "$cap" "$spent"; return 0 ;;
+    under) book_gate under "$cap" "$spent"; return 1 ;;
+    nocap) book_gate nocap "$cap" "$spent"; return 1 ;;
+    *)     book_gate blind-parse "$cap" "$spent"; return 1 ;;
+  esac
 }
 
 eff_gap() { # base_gap -> effective gap: SHRINK to MIN_GAP when cold, STRETCH by burn_mult when hot.
@@ -383,7 +440,30 @@ case "${1:-}" in
     _uy="$(_rw 100 99 "$((now-30)) 90")"
     [ "$_uy" = UNKNOWN ] || { echo "smoke-test: FAIL (runway: dt<MIN_DT must read UNKNOWN not a noisy rate, got '$_uy')"; rm -f "$_rst"; exit 1; }
     rm -f "$_rst"
-    echo "smoke-test: ok (gate passes when stale, skips when fresh; --check read-only; cold-shrink→MIN_GAP=${MIN_GAP}s, hot-stretch, unknown→base; HARD \$-cap holds over-budget + auto-resumes; budget-runway COMMITTED/APPROACHING/HEADROOM/RECEDING/OVER/UNKNOWN portrait; GAP=${GAP}s reserve=${RESERVE})"
+    # GATE LEDGER (dev.to 3c648 @anp2network): every over_budget() decision books one hledger txn, so
+    # "did the $-gate ever FAIL OPEN on cap<=0 or a stale/blind read" is a balance query not a source read.
+    # Hermetic via MESH_PACE_METER_JSON_OVERRIDE (the classify+book path against an injected meter payload,
+    # NOT the synthetic BUDGET_OVERRIDE which is deliberately never booked). RED-first: delete either the
+    # book_gate calls in over_budget or the --gate-ledger tally and these assertions go red — an empty
+    # journal reports 0 for every reason. The live journal is untouched: PACE_GATE_LOG points at a temp.
+    _gl="$(mktemp)"; rm -f "$_gl"
+    unset MESH_PACE_BUDGET_OVERRIDE   # the injected-meter path must run the REAL classify, not the synthetic short-circuit
+    MESH_PACE_GATE_LOG="$_gl" MESH_PACE_METER_JSON_OVERRIDE='{"cap":100,"spent":150}' "$0" __smoke_gl_$$ 1 >/dev/null 2>&1 && { echo "smoke-test: FAIL (gate-ledger: spent>cap must HOLD)"; rm -f "$_gl" "$DIR/__smoke_gl_$$"; exit 1; }
+    MESH_PACE_GATE_LOG="$_gl" MESH_PACE_METER_JSON_OVERRIDE='{"cap":100,"spent":50}'  "$0" __smoke_gl_$$ 1 >/dev/null 2>&1 || { echo "smoke-test: FAIL (gate-ledger: spent<cap must PASS)"; rm -f "$_gl" "$DIR/__smoke_gl_$$"; exit 1; }
+    MESH_PACE_GATE_LOG="$_gl" MESH_PACE_METER_JSON_OVERRIDE='{"cap":0,"spent":50}'    "$0" __smoke_glf_$$ 1 >/dev/null 2>&1 || { echo "smoke-test: FAIL (gate-ledger: cap<=0 must FAIL-OPEN/pass)"; rm -f "$_gl" "$DIR"/__smoke_gl*_$$; exit 1; }
+    MESH_PACE_GATE_LOG="$_gl" MESH_PACE_METER_JSON_OVERRIDE='{"garbage":1}'           "$0" __smoke_glp_$$ 1 >/dev/null 2>&1 || { echo "smoke-test: FAIL (gate-ledger: unparseable meter must FAIL-OPEN/pass)"; rm -f "$_gl" "$DIR"/__smoke_gl*_$$; exit 1; }
+    rm -f "$DIR"/__smoke_gl*_$$
+    grep -q 'gate:decision:over ' "$_gl"        || { echo "smoke-test: FAIL (gate-ledger: over decision not booked)"; rm -f "$_gl"; exit 1; }
+    grep -q 'gate:decision:under ' "$_gl"       || { echo "smoke-test: FAIL (gate-ledger: under decision not booked)"; rm -f "$_gl"; exit 1; }
+    grep -q 'gate:decision:nocap ' "$_gl"       || { echo "smoke-test: FAIL (gate-ledger: nocap fail-open not booked)"; rm -f "$_gl"; exit 1; }
+    grep -q 'gate:decision:blind-parse ' "$_gl" || { echo "smoke-test: FAIL (gate-ledger: blind-parse fail-open not booked)"; rm -f "$_gl"; exit 1; }
+    _fo="$(MESH_PACE_GATE_LOG="$_gl" "$0" --gate-ledger 2>/dev/null | grep 'fail-open' | grep -oE ': *[0-9]+' | head -1 | grep -oE '[0-9]+')"
+    [ "${_fo:-x}" = 2 ] || { echo "smoke-test: FAIL (gate-ledger: --gate-ledger must tally the 2 fail-open decisions (nocap+blind-parse), got '${_fo:-<none>}')"; rm -f "$_gl"; exit 1; }
+    if command -v hledger >/dev/null 2>&1; then
+      hledger -f "$_gl" check >/dev/null 2>&1 || { echo "smoke-test: FAIL (gate-ledger: journal must pass hledger check — balanced double-entry)"; rm -f "$_gl"; exit 1; }
+    fi
+    rm -f "$_gl"
+    echo "smoke-test: ok (gate passes when stale, skips when fresh; --check read-only; cold-shrink→MIN_GAP=${MIN_GAP}s, hot-stretch, unknown→base; HARD \$-cap holds over-budget + auto-resumes; gate-ledger books over/under/nocap/blind-* per decision, --gate-ledger tallies fail-open; budget-runway COMMITTED/APPROACHING/HEADROOM/RECEDING/OVER/UNKNOWN portrait; GAP=${GAP}s reserve=${RESERVE})"
     exit 0 ;;
 
   --eff-gap)
@@ -433,23 +513,42 @@ case "${1:-}" in
     # itself burn the reserve, the pace-noop-consumes-slot bug in probe form).
     key="${2:-}"; [ -n "$key" ] || { echo "usage: mesh-pace --check <key> [gap]"; exit 1; }
     [ "${GAP:-0}" = 0 ] && exit 0
-    over_budget && exit 1          # HARD $ CAP: over rolling-5h cap → the gate would hold
+    PACE_GATE_MODE=check over_budget && exit 1   # HARD $ CAP: over rolling-5h cap → the gate would hold
     base="${3:-$GAP}"; gap="$(eff_gap "$base")"
     f="$DIR/$key"; last="$(cat "$f" 2>/dev/null || echo 0)"
     [ $((now - last)) -ge "$gap" ] && exit 0
     exit 1 ;;
+
+  --gate-ledger)
+    # The BALANCE QUERY the ledger exists to answer: how many times did the $-gate reach each decision —
+    # and crucially how often it FAILED OPEN (nocap/blind-*) instead of holding. Source-reading the gate
+    # tells you the branches EXIST; this tells you which ones FIRED, and how often. hledger if present
+    # (real double-entry balance), else an awk tally over the same journal — the answer is identical.
+    if [ ! -s "$PACE_GATE_LOG" ]; then echo "gate-ledger: empty ($PACE_GATE_LOG) — no hard-cap decision booked yet"; exit 0; fi
+    echo "gate-ledger: $PACE_GATE_LOG"
+    if command -v hledger >/dev/null 2>&1; then
+      hledger -f "$PACE_GATE_LOG" balance gate:decision --no-total --flat 2>/dev/null \
+        || awk '/gate:decision:/{split($1,a,":"); c[a[3]]++} END{for(k in c) printf "  %8d  gate:decision:%s\n", c[k], k}' "$PACE_GATE_LOG"
+    else
+      awk '/gate:decision:/{split($1,a,":"); c[a[3]]++} END{for(k in c) printf "  %8d  gate:decision:%s\n", c[k], k}' "$PACE_GATE_LOG"
+    fi
+    # highlight the fail-open count — the number the dev.to question actually asked for
+    fo="$(awk '/gate:decision:(nocap|blind-meter|blind-parse)/{n++} END{print n+0}' "$PACE_GATE_LOG")"
+    held="$(awk '/gate:decision:over /{n++} END{print n+0}' "$PACE_GATE_LOG")"
+    echo "  ── fail-open (nocap/blind, cap NOT enforced): $fo    held (cap enforced): $held"
+    exit 0 ;;
 
   --reset)
     if [ -n "${2:-}" ]; then rm -f "$DIR/$2" && echo "reset: $2"; else rm -f "$DIR"/* 2>/dev/null; echo "reset: all keys"; fi
     exit 0 ;;
 
   ""|-h|--help)
-    echo "usage: mesh-pace <key> [gap] | --check <key> [gap] | --status | --eff-gap [base] | --burden | --runway | --reset [key] | --test"
+    echo "usage: mesh-pace <key> [gap] | --check <key> [gap] | --status | --eff-gap [base] | --burden | --runway | --gate-ledger | --reset [key] | --test"
     echo "  knob: MESH_PACE_GAP (seconds, default 900) in ~/.mesh/restore.env — bigger = gentler"
     [ "${1:-}" = "" ] && exit 1 || exit 0 ;;
 
   -*)
-    echo "usage: mesh-pace <key> [gap] | --check <key> [gap] | --status | --eff-gap [base] | --burden | --runway | --reset [key] | --test"; exit 1 ;;
+    echo "usage: mesh-pace <key> [gap] | --check <key> [gap] | --status | --eff-gap [base] | --burden | --runway | --gate-ledger | --reset [key] | --test"; exit 1 ;;
 
   *)
     key="$1"
