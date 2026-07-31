@@ -45,7 +45,8 @@ RESERVE="${MESH_PACE_RESERVE:-1}"    # 1 = stretch the gap when paid burn is hot
 MIN_GAP="${MESH_PACE_MIN_GAP:-60}"   # COLD floor: when the paid window is barely touched, shrink the
                                      # gap to THIS so a board event wakes the owner now, not on the
                                      # next cron poll (operator 2026-07-24: диспатч событийным).
-COLD_BELOW="${MESH_PACE_COLD_BELOW:-7}"  # paid burn/h STRICTLY below this = cold → floor to MIN_GAP.
+SPEND_LOG="${MESH_SPEND_LOG:-$HOME/.mesh/spend.log}"  # raw timestamped turn tape (burden trend reads it)
+COLD_BELOW="${MESH_PACE_COLD_BELOW:-7}"  # paid burn/h STRICTLY below this =cold → floor to MIN_GAP.
                                      # 7 = the first hot-staircase step, so cold ends exactly where
                                      # stretch begins — no flat-base band survives between them.
 DIR="$HOME/.mesh/pace"; mkdir -p "$DIR" 2>/dev/null || true
@@ -123,6 +124,136 @@ eff_gap() { # base_gap -> effective gap: SHRINK to MIN_GAP when cold, STRETCH by
   awk -v b="$base" -v m="$mult" 'BEGIN{printf "%d\n", b*m}'
 }
 
+# CONTROL-BURDEN TREND (Ziegler 2026, "When Regulation Has Memory: Hysteresis and Control Burden in
+# Artificial Agency", arXiv:2606.30975). Finding: the gain a regulator must expend to hold a target is
+# PATH-dependent — the same target costs different gain depending on whether the system is moving TOWARD
+# a demanding regime or RETURNING from one (a reproducible hysteresis loop), and anticipatory
+# stabilisation needs LESS gain than recovery-after-the-fact. mesh-pace's gain (burn_mult) is a
+# MEMORYLESS staircase on the 5h-AVERAGE burn: same average → same gain, blind to the recent TREND. So
+# when burn is climbing but the 5h average is still cold, the governor holds gain slack and only stretches
+# AFTER the average crosses hot — Ziegler's expensive recovery branch, exactly when the $-cap is nearest.
+# This read exposes which branch the governor is in. REPORT-ONLY — it never changes eff_gap; the pacing
+# knob and any anticipatory pre-stretch stay the operator's call (spend behaviour, not autonomous).
+burden_state() { # prints "trend r1h prior1h mult branch" — report-only, no side effect
+  local mult r1 r0 out c1 c2 trend branch
+  mult="$(burn_mult)"
+  c1="$(date -u -d '1 hour ago'  +%Y-%m-%dT%H:%MZ 2>/dev/null)"   # last-1h window opens here
+  c2="$(date -u -d '2 hours ago' +%Y-%m-%dT%H:%MZ 2>/dev/null)"   # prior-1h window opens here
+  # PAID turns ($5==anthropic) binned by the fixed-width ISO ts (lexical compare = chronological, no
+  # mktime/TZ dance): [c1,now]=recent hour, [c2,c1)=prior hour. Missing log → 0 0 (honest, never faked).
+  out="$(awk -v c1="$c1" -v c2="$c2" '$5=="anthropic"{ if($1>=c1)a++; else if($1>=c2)b++ } END{printf "%d %d", a+0, b+0}' "$SPEND_LOG" 2>/dev/null)"
+  read -r r1 r0 <<<"$out"; r1="${r1:-0}"; r0="${r0:-0}"
+  if   [ "$r1" -gt "$r0" ]; then trend=RISING
+  elif [ "$r1" -lt "$r0" ]; then trend=FALLING
+  else trend=STEADY; fi
+  # The memoryless gain LAGS the trend in both directions: RISING while gain is still slack (<1.5x) is
+  # the recovery-risk branch (will stretch late); FALLING while gain is still stretched (>1x) over-holds.
+  if   [ "$trend" = RISING ]  && awk "BEGIN{exit !($mult < 1.5)}"; then branch="recovery-risk"
+  elif [ "$trend" = FALLING ] && awk "BEGIN{exit !($mult > 1)}";   then branch="over-hold"
+  else branch="matched"; fi
+  printf '%s %s %s %s %s' "$trend" "$r1" "$r0" "$mult" "$branch"
+}
+
+burden_line() { # human one-liner over burden_state
+  local bs trend r1 r0 mult branch human
+  bs="$(burden_state)"; read -r trend r1 r0 mult branch <<<"$bs"
+  case "$branch" in
+    recovery-risk) human="burn climbing but gain still slack — memoryless staircase will stretch LATE (Ziegler's expensive recovery branch); a trend-anticipatory pre-stretch would cost less" ;;
+    over-hold)     human="burn receding but gain still stretched — defending a disturbance already leaving" ;;
+    *)             human="gain tracks the trend" ;;
+  esac
+  printf 'control-burden: paid r1h=%s prior1h=%s trend=%s gain=%sx — %s: %s\n' "$r1" "$r0" "$trend" "$mult" "$branch" "$human"
+}
+
+# BUDGET VIABILITY PORTRAIT / MORTALITY MANIFOLD (McShaffrey & Beer, "Viability Space Decomposition",
+# arXiv:2605.16753, 2026 — the autopoiesis/viability-constraint lineage: an agent bounded to a viability
+# region is an EXTENDED dynamical system where TRANSIENT dynamics can lead to death, so a level check
+# ["are we in-bounds NOW"] and a CSD early-warning ["approaching a bifurcation"] are both insufficient —
+# you must decompose the state space by SURVIVAL OUTCOME, and the new object is the MORTALITY MANIFOLD:
+# the surface past which death is already COMMITTED even though no constraint is yet violated).
+#
+# The $-cap is exactly such a bounded viability region. mesh-pace already reads its two ENDPOINTS —
+# over_budget() = the OVER region (spent>=cap; already dead) and burden_state() = the TREND direction
+# (RISING/FALLING, memoryless, no projection). Neither reads the region BETWEEN them: green now, cap not
+# yet hit, but the transient (current $-burn) crosses the cap before the sole corrective (dispatch HOLD)
+# can take effect. That committed-in-transient region is the mortality manifold, and it was blind.
+#
+# runway_state projects it. It samples $-spend over time (persisted, two-sample rate like the OOM-ramp
+# guard) and classifies the budget viability portrait. REPORT-ONLY: it NEVER changes eff_gap or the gate
+# (the pacing knob + any anticipatory pre-hold stay the operator's call — spend behaviour, like --burden).
+#   HEADROOM     eta beyond the 5h window — rolling relief keeps spend under the cap; viable.
+#   RECEDING     net burn <=0 — old spend ages off faster than new accrues; moving OFF the wall (viable).
+#   APPROACHING  eta within the window but beyond the reaction budget — a HOLD now still averts the cap.
+#   COMMITTED    eta <= reaction budget (MESH_PACE_REACT_S) — the HOLD cannot bite in time; the crossing
+#                is unavoidable at this burn. THE MORTALITY MANIFOLD (distinct from OVER, which is death
+#                already realized, and from APPROACHING, where control authority still suffices).
+#   OVER         spent>=cap — already in the OVER region (== over_budget; not a manifold read).
+#   UNKNOWN      no cap armed / unreadable spend / no usable prior sample / inter-sample interval too
+#                short to be a rate (MESH_PACE_RUNWAY_MIN_DT, default 120s) — honest, NEVER a fake alarm.
+# The min-interval guard keeps a too-young baseline instead of resampling, so rapid back-to-back calls
+# can't manufacture an inflated $/h from a sub-second dt; a real rate emerges once MIN_DT has elapsed.
+_fmt_eta() { # seconds -> human eta; "inf"/nonpositive -> ∞ / 0m
+  case "$1" in inf) echo "∞"; return;; esac
+  awk -v s="$1" 'BEGIN{ if(s+0<=0){print "0m"; exit} if(s<3600) printf "%dm",(s+30)/60; else printf "%.1fh",s/3600 }'
+}
+runway_state() { # prints "class eta_s spent cap burn_ph" — report-only; persists a sample for the next call
+  local j cap spent wh react prev pts pspent dt burn eta win sf
+  react="${MESH_PACE_REACT_S:-300}"
+  # budget figures: overrides win (hermetic --test), else the labour ledger (same journal over_budget reads).
+  cap="${MESH_PACE_CAP_OVERRIDE:-}"; spent="${MESH_PACE_SPENT_OVERRIDE:-}"; wh="${MESH_PACE_WINDOW_H_OVERRIDE:-}"
+  if [ -z "$cap" ] || [ -z "$spent" ] || [ -z "$wh" ]; then
+    j="$(timeout 6 mesh-labor --json 2>/dev/null)" || j=""
+    [ -n "$cap" ]   || cap="$(printf '%s' "$j"   | grep -oE '"cap":[0-9.]+'      | grep -oE '[0-9.]+' | head -1)"
+    [ -n "$spent" ] || spent="$(printf '%s' "$j" | grep -oE '"spent":[0-9.]+'    | grep -oE '[0-9.]+' | head -1)"
+    [ -n "$wh" ]    || wh="$(printf '%s' "$j"    | grep -oE '"window_h":[0-9.]+' | grep -oE '[0-9.]+' | head -1)"
+  fi
+  wh="${wh:-5}"
+  # no cap armed or unreadable spend → UNKNOWN (fail-safe: never a fake all-clear, never a fake alarm)
+  if [ -z "$cap" ] || [ -z "$spent" ] || awk "BEGIN{exit !($cap<=0)}"; then printf 'UNKNOWN 0 %s %s 0' "${spent:-?}" "${cap:-?}"; return; fi
+  # already over the cap → the OVER region (death realized; == over_budget, not a manifold projection)
+  if awk "BEGIN{exit !($spent>=$cap)}"; then printf 'OVER 0 %s %s 0' "$spent" "$cap"; return; fi
+  sf="${MESH_PACE_RUNWAY_STATE:-$DIR/runway.state}"
+  local min_dt; min_dt="${MESH_PACE_RUNWAY_MIN_DT:-120}"   # a rate over <this many seconds is noise, not a rate
+  prev="${MESH_PACE_RUNWAY_PREV:-$(cat "$sf" 2>/dev/null)}"
+  read -r pts pspent <<<"$prev"
+  if [ -n "$pts" ] && [ -n "$pspent" ] && [ "$pts" -lt "$now" ] 2>/dev/null; then dt=$((now - pts)); else dt=-1; fi
+  # LIVE-file path only: refresh the persisted baseline when there's none yet, or when it's old enough to
+  # have yielded a stable rate — but KEEP a too-young baseline so a later call gets a real interval (else
+  # rapid back-to-back calls would each resample a sub-second dt and manufacture a wildly inflated $/h).
+  # An injected PREV (hermetic --test) never touches the file.
+  if [ -z "${MESH_PACE_RUNWAY_PREV:-}" ] && { [ "$dt" -lt 0 ] || [ "$dt" -ge "$min_dt" ]; }; then
+    printf '%s %s\n' "$now" "$spent" > "$sf" 2>/dev/null || true
+  fi
+  # no usable prior → can't derive a rate → UNKNOWN (honest, no projection)
+  [ "$dt" -ge 0 ] || { printf 'UNKNOWN 0 %s %s 0' "$spent" "$cap"; return; }
+  # interval too short for a stable rate → UNKNOWN (the sub-minute-noise guard)
+  [ "$dt" -ge "$min_dt" ] || { printf 'UNKNOWN 0 %s %s 0' "$spent" "$cap"; return; }
+  # a prior older than the rolling window is not a CURRENT rate → UNKNOWN
+  awk "BEGIN{exit !($dt > $wh*3600)}" && { printf 'UNKNOWN 0 %s %s 0' "$spent" "$cap"; return; }
+  burn="$(awk "BEGIN{printf \"%.4f\", ($spent-$pspent)/($dt/3600.0)}")"   # net $-burn per hour
+  # net burn <=0 → rolling relief exceeds new spend; moving OFF the wall (RECEDING/viable, eta=∞)
+  if awk "BEGIN{exit !($burn<=0)}"; then printf 'RECEDING inf %s %s %s' "$spent" "$cap" "$burn"; return; fi
+  eta="$(awk "BEGIN{printf \"%.0f\", ($cap-$spent)/$burn*3600}")"         # seconds to cap at current burn
+  win="$(awk "BEGIN{printf \"%.0f\", $wh*3600}")"
+  if   [ "$eta" -le "$react" ]; then printf 'COMMITTED %s %s %s %s'   "$eta" "$spent" "$cap" "$burn"
+  elif [ "$eta" -le "$win" ];   then printf 'APPROACHING %s %s %s %s' "$eta" "$spent" "$cap" "$burn"
+  else printf 'HEADROOM %s %s %s %s' "$eta" "$spent" "$cap" "$burn"; fi
+}
+runway_line() { # human one-liner over runway_state — report-only
+  local rs class eta spent cap burn human react
+  react="${MESH_PACE_REACT_S:-300}"
+  rs="$(runway_state)"; read -r class eta spent cap burn <<<"$rs"
+  case "$class" in
+    COMMITTED)   human="point of no return CROSSED — at \$$burn/h the cap is hit in $(_fmt_eta "$eta"), sooner than a dispatch HOLD can bite (react ${react}s); holding now cannot avert it (mortality manifold)" ;;
+    APPROACHING) human="on course for the cap in $(_fmt_eta "$eta") at \$$burn/h — a HOLD now still averts it" ;;
+    HEADROOM)    human="cap $(_fmt_eta "$eta") off at \$$burn/h, beyond the window — rolling relief keeps spend under it" ;;
+    RECEDING)    human="net burn \$$burn/h ≤ 0 — spend receding off the cap, moving off the wall" ;;
+    OVER)        human="already at/over the \$$cap cap — HOLD active (the OVER region, not a manifold read)" ;;
+    *)           human="budget rate not yet derivable (no cap armed, unreadable spend, or no prior sample) — UNKNOWN, no alarm" ;;
+  esac
+  printf 'budget-runway: spent=$%s cap=$%s burn=$%s/h eta=%s class=%s — %s\n' "$spent" "$cap" "$burn" "$(_fmt_eta "$eta")" "$class" "$human"
+}
+
 case "${1:-}" in
   --test)
     command -v awk >/dev/null 2>&1 || { echo "smoke-test: FAIL (no awk)"; exit 1; }
@@ -173,7 +304,66 @@ case "${1:-}" in
     MESH_PACE_GAP=900 MESH_PACE_BUDGET_OVERRIDE=over  "$0" --check "$k5" 1 >/dev/null 2>&1 && { echo "smoke-test: FAIL (over cap: --check must report would-hold)"; rm -f "$DIR/$k5"; exit 1; }
     MESH_PACE_GAP=900 MESH_PACE_BUDGET_OVERRIDE=under "$0" --check "$k5" 1 >/dev/null 2>&1 || { echo "smoke-test: FAIL (under cap: --check must report would-pass)"; rm -f "$DIR/$k5"; exit 1; }
     rm -f "$DIR/$k5"
-    echo "smoke-test: ok (gate passes when stale, skips when fresh; --check read-only; cold-shrink→MIN_GAP=${MIN_GAP}s, hot-stretch, unknown→base; HARD \$-cap holds over-budget + auto-resumes; GAP=${GAP}s reserve=${RESERVE})"
+    # CONTROL-BURDEN TREND (Ziegler 2026) — hermetic: a synthetic spend.log + a burn override so the
+    # gain (mult) is deterministic. RED before the trend read: nothing distinguished a climbing from a
+    # receding window; the memoryless staircase reported the SAME gain for both.
+    _n="$(date -u +%s)"
+    _bl_up="$(mktemp)"     # 3 paid turns in the last hour, 1 in the prior hour → RISING
+    for _m in 5 20 40; do printf '%s turn genome claude anthropic paid x\n' "$(date -u -d "@$((_n-_m*60))" +%Y-%m-%dT%H:%MZ)"; done >>"$_bl_up"
+    printf '%s turn genome claude anthropic paid x\n' "$(date -u -d "@$((_n-90*60))" +%Y-%m-%dT%H:%MZ)" >>"$_bl_up"
+    _bs="$(SPEND_LOG="$_bl_up" MESH_PACE_BURN_OVERRIDE=2 MESH_PACE_RESERVE=1 burden_state)"
+    read -r _tr _r1 _r0 _mu _br <<<"$_bs"
+    [ "$_tr" = RISING ]        || { echo "smoke-test: FAIL (burden: 3-in-1h vs 1-prior must read RISING, got '$_bs')"; rm -f "$_bl_up"; exit 1; }
+    [ "$_br" = recovery-risk ] || { echo "smoke-test: FAIL (burden: RISING with slack gain=${_mu}x must be recovery-risk, got '$_bs')"; rm -f "$_bl_up"; exit 1; }
+    _bl_dn="$(mktemp)"     # 1 paid turn in the last hour, 4 in the prior hour → FALLING
+    printf '%s turn genome claude anthropic paid x\n' "$(date -u -d "@$((_n-40*60))" +%Y-%m-%dT%H:%MZ)" >>"$_bl_dn"
+    for _m in 70 80 90 100; do printf '%s turn genome claude anthropic paid x\n' "$(date -u -d "@$((_n-_m*60))" +%Y-%m-%dT%H:%MZ)"; done >>"$_bl_dn"
+    _bs2="$(SPEND_LOG="$_bl_dn" MESH_PACE_BURN_OVERRIDE=20 MESH_PACE_RESERVE=1 burden_state)"
+    read -r _tr2 _x _y _mu2 _br2 <<<"$_bs2"
+    [ "$_tr2" = FALLING ]  || { echo "smoke-test: FAIL (burden: 1-in-1h vs 4-prior must read FALLING, got '$_bs2')"; rm -f "$_bl_up" "$_bl_dn"; exit 1; }
+    [ "$_br2" = over-hold ] || { echo "smoke-test: FAIL (burden: FALLING with stretched gain=${_mu2}x must be over-hold, got '$_bs2')"; rm -f "$_bl_up" "$_bl_dn"; exit 1; }
+    # opencode (free) turns must NOT count as paid burn: a log of only opencode reads 0/0 → STEADY
+    _bl_free="$(mktemp)"
+    for _m in 5 20 40; do printf '%s turn health opencode opencode paid x\n' "$(date -u -d "@$((_n-_m*60))" +%Y-%m-%dT%H:%MZ)"; done >>"$_bl_free"
+    _bs3="$(SPEND_LOG="$_bl_free" MESH_PACE_BURN_OVERRIDE=2 MESH_PACE_RESERVE=1 burden_state)"
+    read -r _tr3 _u _v _w _z <<<"$_bs3"
+    [ "$_tr3" = STEADY ] || { echo "smoke-test: FAIL (burden: free/opencode turns must not count as paid burn, got '$_bs3')"; rm -f "$_bl_up" "$_bl_dn" "$_bl_free"; exit 1; }
+    rm -f "$_bl_up" "$_bl_dn" "$_bl_free"
+    # BUDGET VIABILITY PORTRAIT / MORTALITY MANIFOLD (McShaffrey & Beer 2026) — hermetic: drive spent/cap/
+    # window via overrides + inject the prior sample so the $-burn (and thus eta) is deterministic. The
+    # RED-first witness for the mortality-manifold DISTINCTION is the COMMITTED vs APPROACHING split at the
+    # react threshold: collapse the `eta<=react → COMMITTED` branch into APPROACHING and leg (r) goes RED —
+    # the whole point of the axis (past the manifold a HOLD can't avert) vanishes and every crossing reads
+    # as still-avertable. State file is a temp so the live runway.state is never touched by --test.
+    _rst="$(mktemp)"; rm -f "$_rst"   # empty: exercises the no-prior UNKNOWN path
+    _rw() { MESH_PACE_RUNWAY_STATE="$_rst" MESH_PACE_CAP_OVERRIDE="$1" MESH_PACE_SPENT_OVERRIDE="$2" \
+            MESH_PACE_WINDOW_H_OVERRIDE=5 MESH_PACE_RUNWAY_PREV="$3" MESH_PACE_REACT_S=300 runway_state | awk '{print $1}'; }
+    # (r) COMMITTED: spent 99/100, +9$ over the last 300s → 108$/h → eta ~33s ≤ react 300 → past the manifold
+    _c="$(_rw 100 99 "$((now-300)) 90")"
+    [ "$_c" = COMMITTED ] || { echo "smoke-test: FAIL (runway: eta≤react must read COMMITTED/mortality-manifold, got '$_c')"; rm -f "$_rst"; exit 1; }
+    # (s) APPROACHING: spent 95/100, +3$ over the last hour → 3$/h → eta 6000s (react<eta<5h window) → avertable
+    _a="$(_rw 100 95 "$((now-3600)) 92")"
+    [ "$_a" = APPROACHING ] || { echo "smoke-test: FAIL (runway: react<eta<window must read APPROACHING, got '$_a')"; rm -f "$_rst"; exit 1; }
+    # (t) HEADROOM: spent 50/100, +1$/h → eta 50h ≫ window → rolling relief keeps it under
+    _h="$(_rw 100 50 "$((now-3600)) 49")"
+    [ "$_h" = HEADROOM ] || { echo "smoke-test: FAIL (runway: eta≫window must read HEADROOM, got '$_h')"; rm -f "$_rst"; exit 1; }
+    # (u) RECEDING: spent fell 60→50 → net burn <0 → moving off the wall
+    _rc="$(_rw 100 50 "$((now-3600)) 60")"
+    [ "$_rc" = RECEDING ] || { echo "smoke-test: FAIL (runway: negative net burn must read RECEDING, got '$_rc')"; rm -f "$_rst"; exit 1; }
+    # (v) OVER: spent≥cap → the OVER region
+    _o="$(_rw 100 100 "$((now-60)) 90")"
+    [ "$_o" = OVER ] || { echo "smoke-test: FAIL (runway: spent≥cap must read OVER, got '$_o')"; rm -f "$_rst"; exit 1; }
+    # (w) UNKNOWN — no cap armed (cap 0): honest, never a fake alarm
+    _u="$(_rw 0 50 "$((now-3600)) 40")"
+    [ "$_u" = UNKNOWN ] || { echo "smoke-test: FAIL (runway: no cap armed must read UNKNOWN, got '$_u')"; rm -f "$_rst"; exit 1; }
+    # (x) UNKNOWN — no prior sample (empty state, no injected PREV): can't derive a rate
+    _un="$(MESH_PACE_RUNWAY_STATE="$_rst" MESH_PACE_CAP_OVERRIDE=100 MESH_PACE_SPENT_OVERRIDE=95 MESH_PACE_WINDOW_H_OVERRIDE=5 runway_state | awk '{print $1}')"
+    [ "$_un" = UNKNOWN ] || { echo "smoke-test: FAIL (runway: no prior sample must read UNKNOWN, got '$_un')"; rm -f "$_rst"; exit 1; }
+    # (y) UNKNOWN — prior too young (dt<MIN_DT): a sub-interval rate is noise, not a rate (would-be COMMITTED suppressed)
+    _uy="$(_rw 100 99 "$((now-30)) 90")"
+    [ "$_uy" = UNKNOWN ] || { echo "smoke-test: FAIL (runway: dt<MIN_DT must read UNKNOWN not a noisy rate, got '$_uy')"; rm -f "$_rst"; exit 1; }
+    rm -f "$_rst"
+    echo "smoke-test: ok (gate passes when stale, skips when fresh; --check read-only; cold-shrink→MIN_GAP=${MIN_GAP}s, hot-stretch, unknown→base; HARD \$-cap holds over-budget + auto-resumes; budget-runway COMMITTED/APPROACHING/HEADROOM/RECEDING/OVER/UNKNOWN portrait; GAP=${GAP}s reserve=${RESERVE})"
     exit 0 ;;
 
   --eff-gap)
@@ -181,8 +371,19 @@ case "${1:-}" in
     # Used by --test and handy operationally to see whether the window is cold (→MIN_GAP) or hot.
     base="${2:-$GAP}"; eff_gap "$base"; exit 0 ;;
 
+  --burden)
+    # control-burden trend read (Ziegler 2026 hysteresis) — report-only, never changes pacing.
+    burden_line; exit 0 ;;
+
+  --runway)
+    # budget viability portrait / mortality-manifold read (McShaffrey & Beer 2026) — report-only, never
+    # changes pacing. Projects when the $-burn transient crosses the cap vs. when a HOLD can still avert it.
+    runway_line; exit 0 ;;
+
   --status)
     echo "mesh-pace · base GAP=${GAP}s reserve=${RESERVE} (mult=$(burn_mult)x) · as of $(date -u +%H:%MZ)"
+    burden_line
+    runway_line
     printf "  %-14s %8s %8s %8s  %s\n" key last_age eff_gap remain now
     shopt -s nullglob
     any=0
@@ -215,12 +416,12 @@ case "${1:-}" in
     exit 0 ;;
 
   ""|-h|--help)
-    echo "usage: mesh-pace <key> [gap] | --check <key> [gap] | --status | --eff-gap [base] | --reset [key] | --test"
+    echo "usage: mesh-pace <key> [gap] | --check <key> [gap] | --status | --eff-gap [base] | --burden | --runway | --reset [key] | --test"
     echo "  knob: MESH_PACE_GAP (seconds, default 900) in ~/.mesh/restore.env — bigger = gentler"
     [ "${1:-}" = "" ] && exit 1 || exit 0 ;;
 
   -*)
-    echo "usage: mesh-pace <key> [gap] | --check <key> [gap] | --status | --eff-gap [base] | --reset [key] | --test"; exit 1 ;;
+    echo "usage: mesh-pace <key> [gap] | --check <key> [gap] | --status | --eff-gap [base] | --burden | --runway | --reset [key] | --test"; exit 1 ;;
 
   *)
     key="$1"
