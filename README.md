@@ -292,6 +292,7 @@ When the bore.pub port changes, all approved users are automatically sent the up
 
 ```
 docs/
+  mesh-architecture.md          # the whole, reasoned: board, hledger ledger, uxn gate lane, verification
   mesh-skeleton.md              # the minimal kernel: capability classes + the mesh tools
   coordination.md               # substrate changes + multi-agent single-writer protocol
   body.md                       # phone-as-body: termux-api senses + actuators, verification
