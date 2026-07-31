@@ -1,0 +1,245 @@
+#!/usr/bin/env bash
+# mesh-crash-watch — process-level CRASH-REPORT sense: reads Apport's /var/crash forensic channel.
+#
+# WHY (spec: ~/.mesh/knowledge/capability-apport-crash-reports-unread-fault-channel-mesh-home-20260731.md,
+# discover 2026-07-31): Ubuntu's Apport hooks the kernel core_pattern and writes a per-crash report to
+# /var/crash/*.crash (ExecutablePath, Signal, ProcMaps, deps). On mesh-home this channel has been
+# recording REAL, RECURRING crashes for over a week with ZERO mesh visibility — adb fork-server SIGABRT
+# (transport for the Note3 baro/cam/IR organs) and ss-server SIGSEGV (local shadowsocks). A crash-looping
+# adb is exactly the kind of failure that surfaces as an intermittent, un-reproducible Note3-organ flake;
+# until now nobody could cross-reference the flake against a real crash timestamp.
+#
+# DELTA over the existing fault senses (not a re-implementation):
+#   - mesh-kill-events / mesh-hw-fault-watch read journalctl -k (KERNEL kill lines: OOM/segfault-as-logged).
+#     Apport is a DISTINCT hook — a userspace core_pattern pipe that captures the crashing process's full
+#     forensic state into a report file, orthogonal to the kernel log line. It answers "WHICH of our own
+#     dependent binaries crashed, with what signal, and here is the retrace-able core", not just "a segv
+#     was logged". The two channels corroborate; neither subsumes the other.
+#   - Every other hw/sw fault sense here is kernel-level or counter-based (hwmon/nvidia-smi/sysfs). None
+#     is process-level userspace crash forensics.
+#
+#   mesh-crash-watch            one delta pass: [fyi] once per NEW crash report signature, tape it (cron)
+#   mesh-crash-watch --once     list ALL current /var/crash reports (exe + signal + age), no state change
+#   mesh-crash-watch --status   last state line, no read
+#   mesh-crash-watch --test     apport-active gate (honest n/a exit 2 if absent) + fixture logic tests
+#
+# Design constraints:
+#   - SIGNATURE = <report-basename>:<mtime-epoch>. Edge-trigger once per signature: apport dedupes
+#     identical reports ("already exists and unseen, skipping") so a signature is stable until the report
+#     is removed and a genuinely NEW crash regenerates it (new mtime -> new signature -> re-alert, correct).
+#   - FIRST RUN ALERTS the backlog (bounded) — a DELIBERATE divergence from mesh-kill-events' baseline-
+#     silent first run. There the source is a 19k-line journal (replay trap); HERE /var/crash is inherently
+#     bounded (apport keeps one report per signature + a disk-usage-DoS guard), and surfacing the
+#     ALREADY-UNREAD backlog is the tool's entire charter. A CAP (MESH_CRASH_WATCH_CAP) collapses a
+#     pathological burst to one summary line so a first run can never storm the board.
+#   - Root-owned reports (mode 0640 root group) are read direct-first, sudo-fallback (NOPASSWD here); the
+#     adb report is owner-readable, ss-server needs sudo. A script's `sudo grep` is unaffected by the
+#     interactive rtk hook.
+#   - HONEST N/A: a node without Apport (no /var/crash, apport inactive) is not blind, it is not-applicable
+#     -> --test exits 2 (mesh-land treats exit 2 as a pass), never a fake QUIET.
+#   - liveness-touch every successful pass (mtime = ran) independent of whether anything fired.
+#
+# reflex-cadence: */15 * * * *
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+
+CRASH_DIR="${MESH_CRASH_DIR:-/var/crash}"
+STATE_DIR="${MESH_STATE_DIR:-$HOME/.mesh}"
+STATE="$STATE_DIR/.crash-watch-state"
+SEEN="$STATE_DIR/.crash-watch-seen"
+TAPE="${MESH_CRASH_WATCH_TAPE:-$STATE_DIR/crash-watch.log}"
+CHAT="${MESH_CRASH_WATCH_CHAT:-1}"
+CAP="${MESH_CRASH_WATCH_CAP:-10}"   # board-post cap; a burst beyond this collapses to one summary line
+
+mkdir -p "$STATE_DIR"
+
+# --- helpers -----------------------------------------------------------------
+sig_name(){ # map a numeric signal to its name when SignalName field is absent (older apport)
+  case "$1" in
+    4) echo SIGILL;; 5) echo SIGTRAP;; 6) echo SIGABRT;; 7) echo SIGBUS;;
+    8) echo SIGFPE;; 11) echo SIGSEGV;; 2) echo SIGINT;; 9) echo SIGKILL;; 15) echo SIGTERM;;
+    ''|*[!0-9]*) echo "sig?";; *) echo "sig$1";;
+  esac
+}
+
+age_fmt(){ # $1 = seconds -> compact "2d3h" / "5h" / "12m" / "45s"
+  local s="$1" d h m
+  [ "$s" -lt 0 ] 2>/dev/null && s=0
+  d=$((s/86400)); h=$(((s%86400)/3600)); m=$(((s%3600)/60))
+  if [ "$d" -gt 0 ]; then printf '%dd%dh\n' "$d" "$h"
+  elif [ "$h" -gt 0 ]; then printf '%dh%dm\n' "$h" "$m"
+  elif [ "$m" -gt 0 ]; then printf '%dm\n' "$m"
+  else printf '%ds\n' "$s"; fi
+}
+
+crash_field(){ # $1=file $2=field -> field value ('' if none); direct read, sudo fallback for root-owned
+  local f="$1" field="$2" v
+  v="$(grep -aE -m1 "^$field:" "$f" 2>/dev/null || true)"
+  if [ -z "$v" ] && [ ! -r "$f" ]; then
+    v="$(sudo -n grep -aE -m1 "^$field:" "$f" 2>/dev/null || true)"
+  fi
+  v="${v#*:}"; v="${v# }"
+  printf '%s' "$v"
+}
+
+report_desc(){ # $1=file -> "exe SIGNAL age" describing one crash report
+  local f="$1" exe sig sname mt now age base
+  exe="$(crash_field "$f" ExecutablePath)"; base="${exe##*/}"; [ -n "$base" ] || base="?"
+  sname="$(crash_field "$f" SignalName)"
+  if [ -z "$sname" ]; then sig="$(crash_field "$f" Signal)"; sname="$(sig_name "$sig")"; fi
+  mt="$(stat -c %Y "$f" 2>/dev/null || echo 0)"
+  now="$(date +%s)"; age="$(age_fmt $((now - mt)))"
+  printf '%s %s %s\n' "$base" "$sname" "$age"
+}
+
+list_reports(){ # emit each *.crash path in CRASH_DIR (nul-safe-ish; apport names have no spaces)
+  [ -d "$CRASH_DIR" ] || return 0
+  local f
+  for f in "$CRASH_DIR"/*.crash; do [ -e "$f" ] || continue; printf '%s\n' "$f"; done
+}
+
+apport_active(){ systemctl is-active apport.service 2>/dev/null | grep -q '^active$'; }
+
+# --- --once: human view, no state change ------------------------------------
+if [ "${1:-}" = --once ]; then
+  if [ ! -d "$CRASH_DIR" ]; then
+    echo "mesh-crash-watch: n/a (no $CRASH_DIR — Apport not present on this node)"; exit 2
+  fi
+  n=0
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    printf '  %-8s %s\n' "$(report_desc "$f" | awk '{print $3}')" "$(report_desc "$f" | awk '{print $1" "$2}')"
+    n=$((n+1))
+  done < <(list_reports)
+  [ "$n" = 0 ] && echo "mesh-crash-watch: no crash reports in $CRASH_DIR (clean)"
+  exit 0
+fi
+
+# --- --status ----------------------------------------------------------------
+if [ "${1:-}" = --status ]; then
+  [ -r "$STATE" ] && cat "$STATE" || echo "mesh-crash-watch: no state yet"
+  exit 0
+fi
+
+# --- --test ------------------------------------------------------------------
+if [ "${1:-}" = --test ]; then
+  command -v awk >/dev/null 2>&1 || { echo "smoke-test: FAIL (no awk)"; exit 1; }
+  # HONEST N/A gate: a node without Apport is not-applicable, not blind.
+  if [ ! -d "$CRASH_DIR" ] || ! apport_active; then
+    echo "smoke-test: n/a (Apport not active / no $CRASH_DIR on this node — not every node is Ubuntu+apport)"; exit 2
+  fi
+  # REAL-read gate (verification principle): the real /var/crash must be enumerable right now.
+  ls "$CRASH_DIR" >/dev/null 2>&1 || { echo "smoke-test: FAIL (real $CRASH_DIR unreadable)"; exit 1; }
+
+  _td="$(mktemp -d)"; _cd="$_td/crash"; mkdir -p "$_cd"
+  _env="MESH_STATE_DIR=$_td MESH_CRASH_DIR=$_cd MESH_CRASH_WATCH_CHAT=0"
+  mkfx(){ # $1=name $2=exe $3=signum $4=signame $5=mtime(YYYY-MM-DD HH:MM)
+    { echo "ProblemType: Crash"; echo "ExecutablePath: $2"; echo "Signal: $3"; echo "SignalName: $4"; } > "$_cd/$1"
+    touch -d "$5" "$_cd/$1"
+  }
+
+  # (1) FIRST RUN surfaces the backlog (charter): a pre-existing report must alert + tape.
+  mkfx "_usr_bin_ss-server.1.crash" /usr/bin/ss-server 11 SIGSEGV "2026-07-29 22:56"
+  out="$(env $_env "$0" 2>&1)"; rc=$?
+  { [ "$rc" = 0 ] && printf '%s' "$out" | grep -qF '[crash]' && printf '%s' "$out" | grep -qF 'ss-server' \
+      && grep -qE 'crash victim=ss-server signal=SIGSEGV' "$_td/crash-watch.log"; } \
+    || { rm -rf "$_td"; echo "smoke-test: FAIL (first run must surface+tape the backlog: rc=$rc out='$out')"; exit 1; }
+
+  # (2) NO-REPLAY: unchanged rerun is silent, tape unchanged.
+  tb="$(wc -l < "$_td/crash-watch.log")"
+  out="$(env $_env "$0" 2>&1)"; rc=$?
+  { [ "$rc" = 0 ] && ! printf '%s' "$out" | grep -qF '[crash]' && [ "$(wc -l < "$_td/crash-watch.log")" = "$tb" ]; } \
+    || { rm -rf "$_td"; echo "smoke-test: FAIL (unchanged rerun replayed: rc=$rc out='$out')"; exit 1; }
+
+  # (3) NEW signature (different exe) alerts once, with signal + basename parsed.
+  mkfx "_usr_lib_android-sdk_platform-tools_adb.1000.crash" /usr/lib/android-sdk/platform-tools/adb 6 SIGABRT "2026-07-31 02:02"
+  out="$(env $_env "$0" 2>&1)"; rc=$?
+  { [ "$rc" = 0 ] && printf '%s' "$out" | grep -qF 'adb' && printf '%s' "$out" | grep -qF 'SIGABRT' \
+      && grep -qE 'crash victim=adb signal=SIGABRT' "$_td/crash-watch.log" \
+      && ! printf '%s' "$out" | grep -qF 'ss-server'; } \
+    || { rm -rf "$_td"; echo "smoke-test: FAIL (new signature must alert only the new report: rc=$rc out='$out')"; exit 1; }
+
+  # (4) SIGNATURE is mtime-keyed: same filename, NEW mtime (report regenerated by a fresh crash) re-alerts.
+  touch -d "2026-07-31 05:00" "$_cd/_usr_bin_ss-server.1.crash"
+  out="$(env $_env "$0" 2>&1)"; rc=$?
+  { [ "$rc" = 0 ] && printf '%s' "$out" | grep -qF 'ss-server'; } \
+    || { rm -rf "$_td"; echo "smoke-test: FAIL (regenerated report (new mtime) must re-alert: rc=$rc out='$out')"; exit 1; }
+
+  # (5) Signal-NAME fallback: a report lacking SignalName maps the numeric Signal.
+  { echo "ProblemType: Crash"; echo "ExecutablePath: /bin/nn"; echo "Signal: 8"; } > "$_cd/_bin_nn.7.crash"
+  touch -d "2026-07-31 06:00" "$_cd/_bin_nn.7.crash"
+  out="$(env $_env "$0" 2>&1)"; rc=$?
+  printf '%s' "$out" | grep -qF 'SIGFPE' \
+    || { rm -rf "$_td"; echo "smoke-test: FAIL (numeric Signal 8 must map to SIGFPE: out='$out')"; exit 1; }
+
+  # (6) BURST CAP: many new reports at once collapse to one summary line, never N board lines.
+  rm -rf "$_td"; _td="$(mktemp -d)"; _cd="$_td/crash"; mkdir -p "$_cd"
+  _env="MESH_STATE_DIR=$_td MESH_CRASH_DIR=$_cd MESH_CRASH_WATCH_CHAT=0 MESH_CRASH_WATCH_CAP=3"
+  i=0; while [ "$i" -lt 6 ]; do
+    { echo "ProblemType: Crash"; echo "ExecutablePath: /bin/b$i"; echo "Signal: 11"; echo "SignalName: SIGSEGV"; } > "$_cd/_bin_b$i.$i.crash"
+    touch -d "2026-07-31 07:0$i" "$_cd/_bin_b$i.$i.crash"; i=$((i+1))
+  done
+  out="$(env $_env "$0" 2>&1)"; rc=$?
+  { [ "$rc" = 0 ] && printf '%s' "$out" | grep -qiE 'crash-storm|[0-9]+ new crash' \
+      && [ "$(printf '%s' "$out" | grep -cF '[crash]')" -le 1 ]; } \
+    || { rm -rf "$_td"; echo "smoke-test: FAIL (burst beyond CAP must collapse to one summary line: rc=$rc out='$out')"; exit 1; }
+
+  rm -rf "$_td"
+  echo "smoke-test: ok (real /var/crash read + backlog-surface/no-replay/new-sig/mtime-regen/signal-fallback/burst-cap fixtures)"; exit 0
+fi
+
+# --- default: one delta pass -------------------------------------------------
+if [ ! -d "$CRASH_DIR" ]; then
+  printf 'N/A %s\n' "$(date -u +%FT%TZ)" > "$STATE"
+  echo "mesh-crash-watch: n/a (no $CRASH_DIR — Apport not present)"; exit 2
+fi
+
+new_sigs=()
+new_files=()
+while IFS= read -r f; do
+  [ -n "$f" ] || continue
+  mt="$(stat -c %Y "$f" 2>/dev/null || echo 0)"
+  sig="${f##*/}:$mt"
+  if [ -f "$SEEN" ] && grep -Fxq "$sig" "$SEEN" 2>/dev/null; then continue; fi
+  new_sigs+=("$sig")
+  new_files+=("$f")
+done < <(list_reports)
+
+count="${#new_files[@]}"
+if [ "$count" -gt 0 ]; then
+  # record signatures + tape every new report (full forensic value, no cap on the tape)
+  for i in "${!new_files[@]}"; do
+    f="${new_files[$i]}"
+    printf '%s\n' "${new_sigs[$i]}" >> "$SEEN"
+    read -r base sname age <<<"$(report_desc "$f")"
+    printf '%s crash victim=%s signal=%s age=%s file=%s\n' \
+      "$(date -u +%FT%TZ)" "$base" "$sname" "$age" "${f##*/}" >> "$TAPE"
+  done
+  host="$(hostname)"
+  if [ "$count" -le "$CAP" ]; then
+    for f in "${new_files[@]}"; do
+      read -r base sname age <<<"$(report_desc "$f")"
+      echo "[crash] $base $sname (age $age) — report $CRASH_DIR/${f##*/}, tape ~/.mesh/crash-watch.log"
+      if [ "$CHAT" = 1 ] && command -v mesh-chat >/dev/null 2>&1; then
+        MESH_WHO="crash-watch@$host" mesh-chat "[fyi] mesh-crash-watch: $host — $base crashed $sname (age $age); Apport report $CRASH_DIR/${f##*/}. Cross-ref adb→Note3 organs / ss-server→shadowsocks flakiness against this; retrace with 'sudo apport-unpack'." >/dev/null 2>&1 || true
+      fi
+    done
+  else
+    # burst: one summary line, never N board posts (first-run-on-a-messy-node guard)
+    summary="$(for f in "${new_files[@]}"; do report_desc "$f" | awk '{print $1"("$2")"}'; done | sort | uniq -c | awk '{printf "%s×%s ", $1, $2}')"
+    echo "[crash] crash-storm: $count new reports — $summary"
+    if [ "$CHAT" = 1 ] && command -v mesh-chat >/dev/null 2>&1; then
+      MESH_WHO="crash-watch@$host" mesh-chat "[fyi] mesh-crash-watch: $host — $count new Apport crash reports this pass (over cap $CAP): $summary. Read them with 'mesh-crash-watch --once'." >/dev/null 2>&1 || true
+    fi
+  fi
+fi
+
+printf '%s new=%s %s\n' "$([ "$count" -gt 0 ] && echo CRASH || echo QUIET)" "$count" "$(date -u +%FT%TZ)" > "$STATE"
+command -v mesh-state-touch >/dev/null 2>&1 && mesh-state-touch "$STATE" >/dev/null 2>&1 || true
+if [ "$count" -gt 0 ]; then
+  echo "mesh-crash-watch: $count new crash report(s) surfaced this pass"
+else
+  echo "mesh-crash-watch: QUIET (no new crash reports)"
+fi
+exit 0
