@@ -35,7 +35,32 @@ set -uo pipefail
 
 [ -f "$HOME/.mesh/rns-offgrid.env" ] && . "$HOME/.mesh/rns-offgrid.env"
 PEER="${RNS_OG_PEER:-ilya@100.107.198.111}"
-LOCAL_LAN="${RNS_OG_LOCAL_LAN:-192.168.8.225}"
+# LOCAL_LAN default: AUTO-DETECT this host's RFC1918 (non-Tailscale-CGNAT) LAN IP.
+# A hardcoded IP rots the moment DHCP reassigns it — that drift (192.168.8.225→.224)
+# is what made this proof die with a silent EADDRNOTAVAIL rc=255.
+# BUT "first global RFC1918" is WRONG on a node with overlays: this host carries
+# wg-mesh 10.66.66.16/32, docker0 172.17.0.1/16 AND wifi 192.168.8.224/24, and a bare
+# `head -1` picked the wg /32 — a POINT-TO-POINT host route the peer cannot dial
+# (the proof then died `Connection refused` dialing 10.66.66.16, NOT honest n/a).
+# The LAN the peer shares is the one behind the DEFAULT ROUTE (the real uplink NIC),
+# never a /32 overlay or a docker bridge. Prefer the default-route dev's RFC1918 IP;
+# fall back to first-global-RFC1918-on-a-NON-/32-iface (drops overlays generically).
+_rfc1918(){ grep -E '^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)' \
+             | grep -vE '^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.'; }
+autodetect_lan(){
+  local dev ip
+  dev="$(ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
+  if [ -n "$dev" ]; then
+    ip="$(ip -4 -o addr show dev "$dev" scope global 2>/dev/null \
+            | awk '{print $4}' | cut -d/ -f1 | _rfc1918 | head -1)"
+    [ -n "$ip" ] && { printf '%s\n' "$ip"; return; }
+  fi
+  # No default route (e.g. resolved mid-blackout): first RFC1918 on a NON-/32 iface —
+  # a /32 is an overlay host route (wg/tailscale), never a shared broadcast LAN.
+  ip -4 -o addr show scope global 2>/dev/null \
+    | awk '$4 !~ /\/32$/ {print $4}' | cut -d/ -f1 | _rfc1918 | head -1
+}
+LOCAL_LAN="${RNS_OG_LOCAL_LAN:-$(autodetect_lan)}"
 GW="${RNS_OG_GW:-192.168.8.1}"
 WIFI="${RNS_OG_WIFI:-wlxbcec43434a22}"
 PORT="${RNS_OG_PORT:-4343}"
@@ -47,9 +72,12 @@ PROOF="$HERE/rns-link-proof.py"
 
 WORK="$HOME/.mesh/rns-offgrid"
 SRV="$WORK/server"; HASHF="$WORK/server.hash"; SLOG="$WORK/server.log"
-SPID=""
+PIDF="$WORK/server.pid"
 ts(){ date -u +%H:%M:%SZ; }
-cleanup(){ [ -n "$SPID" ] && kill "$SPID" 2>/dev/null; }
+# start_server runs inside $(...) — a subshell — so a plain SPID=$! never reaches
+# this trap and the server leaks, holding port 4343 and colliding with the next run
+# ("passes once then fails"). Persist the pid to a file the parent trap can read.
+cleanup(){ [ -f "$PIDF" ] && kill "$(cat "$PIDF" 2>/dev/null)" 2>/dev/null; rm -f "$PIDF"; }
 trap cleanup EXIT
 
 na(){ echo "n/a: $*" >&2; exit 2; }
@@ -57,6 +85,13 @@ fail(){ echo "FAIL: $*" >&2; exit 1; }
 
 [ -x "$PY" ] || na "no local rns venv at $PY"
 [ -f "$PROOF" ] || na "proof lib missing at $PROOF"
+[ -n "$LOCAL_LAN" ] || na "no LAN IP to bind (autodetect found none; set RNS_OG_LOCAL_LAN)"
+# The TCPServer binds LOCAL_LAN; if it is not actually assigned here the bind fails
+# with EADDRNOTAVAIL and RNS exits 255 with NO output — an oracle that cannot report
+# its own fault. Assert the address is bound so drift reads as honest n/a instead.
+ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 \
+  | grep -qx "$LOCAL_LAN" || na "LAN IP $LOCAL_LAN not assigned on this host \
+(DHCP drift? detected: $(autodetect_lan)) — set RNS_OG_LOCAL_LAN"
 
 # --- write the TCP-over-LAN config on both ends (ONLY this iface: no internet path) ---
 setup(){
@@ -97,7 +132,7 @@ EOF
 start_server(){
   rm -f "$HASHF"
   nohup "$PY" "$PROOF" server --configdir "$SRV" --hashfile "$HASHF" >"$SLOG" 2>&1 &
-  SPID=$!
+  echo $! > "$PIDF"
   for _ in $(seq 1 40); do [ -s "$HASHF" ] && break; sleep 0.5; done
   [ -s "$HASHF" ] || fail "server did not announce (see $SLOG)"
   tail -1 "$HASHF"
