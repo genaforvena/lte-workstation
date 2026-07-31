@@ -1,0 +1,262 @@
+#!/usr/bin/env bash
+# mesh-journal-watch — LIVE current-boot error-priority sense: reads journalctl -p err as it accrues.
+#
+# WHY (spec: ~/.mesh/knowledge/capability-journalctl-current-boot-err-priority-unread-live-mesh-home-20260731.md,
+# discover 2026-07-31): the systemd/kernel `-p err` priority stream is read by the mesh ONLY
+# retrospectively and ONLY after a reboot — mesh-node-care:296 and mesh-heartbeat:66 both read
+# `journalctl -b -1 -p err` (PREVIOUS boot, reboot-triggered forensics); mesh-doctor never touches
+# journalctl at all. So an error-priority fault that occurs mid-boot on a node that never freezes or
+# reboots is invisible to the mesh forever — it only surfaces in the narrow case where the node crashes
+# AFTER it, and even then only the last ~30-40 tail lines survive. Real signal sitting unread in this
+# stream right now: recurring Bluetooth hci0 opcode failures, and hourly PipeWire 'capture open failed:
+# Device or resource busy' collisions on the USB webcam mic. This closes that live blind spot.
+#
+# DELTA over the existing fault senses (not a re-implementation):
+#   - mesh-node-care / mesh-heartbeat read `-b -1 -p err` (previous boot, only on a rejoin/reboot event).
+#     THIS reads `-b 0` continuously via a persistent journal cursor, so a fault is caught within one
+#     cadence of happening, not weeks later if-and-only-if the node reboots.
+#   - mesh-crash-watch reads Apport /var/crash (userspace process crashes WITH core files). This is the
+#     kernel/systemd `-p err` stream — driver/hardware/protocol faults (Bluetooth opcode, PipeWire
+#     device-busy, cgroup OOM records) that never produce a *.crash file. The channels are orthogonal.
+#
+#   mesh-journal-watch            one delta pass: [fyi] once per genuinely NEW fault SIGNATURE, tape it (cron)
+#   mesh-journal-watch --once     current-boot -p err signatures + counts (post-exclusion), no state change
+#   mesh-journal-watch --status   last state line, no read
+#   mesh-journal-watch --reset    clear cursor + seen (next pass re-seeds baseline-silent)
+#   mesh-journal-watch --test     journalctl real-read gate (honest n/a exit 2 if absent) + fixture logic
+#
+# Design constraints (each earned by a documented trap in CLAUDE.md / MEMORY):
+#   - SIGNATURE, NOT RAW COUNT. This stream's noise floor is bursty and enormous — 12k+ rtw_8822bu USB-wifi
+#     register lines/boot, hundreds of pipewire lines, 200+ OOM lines — so a threshold on line count is
+#     meaningless. Each line is normalized (hex->0xN, digit-runs->N) into a signature; a signature alerts
+#     [fyi] AT MOST ONCE (persistent SEEN file), the FIRST time it appears. 12,198 rtw lines collapse to
+#     one alert; the tape keeps the count + a raw sample for forensics. Novelty is the signal, volume is
+#     the tape.
+#   - EXCLUDE mesh-heavy-run's OOM PROBE. ~220 `Memory cgroup out of memory: Killed process N (python3)`
+#     lines/boot are mesh-heavy-run's DESIGNED cgroup-delegation probe (bytearray(128MB) under
+#     MemoryMax=32M — scripts/mesh-heavy-run mem_cap_available(), documented as-designed). Reporting it
+#     even once is a false positive, and it would poison the dedup. Dropped BEFORE signature/dedup.
+#     Tradeoff (documented): a real python CGROUP OOM would also be dropped — acceptable, since the probe
+#     fires constantly and no real python-under-cgroup workload runs here; a GLOBAL oom ("Out of memory:")
+#     or a non-python cgroup OOM still surfaces.
+#   - BASELINE-SILENT FIRST RUN (mesh-kill-events' replay-trap guard). The journal holds 12k+ backlog err
+#     lines; a first run must NOT storm the board with history. First run seeds the cursor at the current
+#     tail (`-n 0 --cursor-file`) and stays silent; only faults accruing AFTER install are surfaced. (The
+#     current backlog was already surfaced manually by discover.)
+#   - CURSOR-GATED, NO REPEAT. journalctl's own `--cursor-file` advances monotonically, so a line is read
+#     exactly once, and (journal is persistent here, /var/log/journal) the cursor flows ACROSS a reboot —
+#     strictly more coverage than `-b -1`-on-reboot. If the journal is vacuumed past the cursor
+#     ("Failed to seek to cursor", rc=1) the pass re-seeds silently and tapes a reseat note, never storms.
+#   - BURST CAP (MESH_JOURNAL_WATCH_CAP): if a single pass yields more than CAP new signatures, collapse
+#     to one summary line — a first pass right after seeding can legitimately meet several standing faults
+#     at once (rtw + pipewire + bluetooth); it must never become N board posts.
+#   - HONEST N/A: a node without journalctl (non-systemd) is not blind, it is not-applicable -> --test
+#     exits 2 (mesh-land treats exit 2 as a pass), never a fake QUIET.
+#   - liveness-touch every successful pass (mtime = ran) independent of whether anything fired.
+#
+# reflex-cadence: */5 * * * *
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+
+STATE_DIR="${MESH_STATE_DIR:-$HOME/.mesh}"
+CURSOR="$STATE_DIR/.journal-watch-cursor"
+SEEN="$STATE_DIR/.journal-watch-seen"
+TAPE="${MESH_JOURNAL_WATCH_TAPE:-$STATE_DIR/journal-watch.log}"
+STATE="$STATE_DIR/.journal-watch-state"
+CHAT="${MESH_JOURNAL_WATCH_CHAT:-1}"
+CAP="${MESH_JOURNAL_WATCH_CAP:-8}"          # new-signature board-post cap; a burst beyond this collapses
+mkdir -p "$STATE_DIR"
+
+# --- helpers -----------------------------------------------------------------
+normalize(){ # stdin: raw message -> normalized signature body (volatile tokens collapsed)
+  sed -E 's/0x[0-9a-fA-F]+/0xN/g; s/\b[0-9a-f]{8,}\b/HEX/g; s/[0-9]+/N/g'
+}
+
+is_heavy_run_oom(){ # $1=msg -> 0 (drop) iff it is mesh-heavy-run's designed cgroup OOM-probe signature
+  case "$1" in
+    "Memory cgroup out of memory: Killed process "*"(python"*) return 0 ;;
+  esac
+  return 1
+}
+
+# Emit "IDENT|||MSG" for each error-priority entry to process this pass.
+#   test mode (MESH_JOURNAL_WATCH_STDIN=1): records are already on stdin (fixtures).
+#   live mode: delta since the persistent cursor; re-seed on a seek failure.
+SEEK_RESEED=0
+delta_records(){
+  if [ "${MESH_JOURNAL_WATCH_STDIN:-0}" = 1 ]; then cat; return 0; fi
+  local errf; errf="$(mktemp)"
+  journalctl -p err --cursor-file="$CURSOR" -o json 2>"$errf" \
+    | jq -r '((.SYSLOG_IDENTIFIER // ._COMM // "kernel")|tostring) + "|||" + ((.MESSAGE // "")|tostring)'
+  local jrc=${PIPESTATUS[0]}
+  if [ "$jrc" -ne 0 ] && grep -q 'seek to cursor' "$errf" 2>/dev/null; then
+    journalctl -p err -n 0 --cursor-file="$CURSOR" >/dev/null 2>&1   # re-seat at tail, silent
+    printf '%s cursor-reseat (journal rotated past cursor)\n' "$(date -u +%FT%TZ)" >> "$TAPE"
+    SEEK_RESEED=1
+  fi
+  rm -f "$errf"
+}
+
+have_journalctl(){ command -v journalctl >/dev/null 2>&1; }
+
+# --- --once: human view, no state change ------------------------------------
+if [ "${1:-}" = --once ]; then
+  have_journalctl || { echo "mesh-journal-watch: n/a (no journalctl — not a systemd node)"; exit 2; }
+  jq --version >/dev/null 2>&1 || { echo "mesh-journal-watch: FAIL (no jq)"; exit 1; }
+  journalctl -b 0 -p err -o json 2>/dev/null \
+    | jq -r '((.SYSLOG_IDENTIFIER // ._COMM // "kernel")|tostring) + "|||" + ((.MESSAGE // "")|tostring)' \
+    | while IFS= read -r rec; do
+        m="${rec#*|||}"; is_heavy_run_oom "$m" && continue
+        printf '%s\t%s\n' "${rec%%|||*}" "$(printf '%s' "$m" | normalize)"
+      done \
+    | sort | uniq -c | sort -rn \
+    | awk '{c=$1; $1=""; sub(/^ /,""); printf "  %6d  %s\n", c, $0}'
+  echo "  (mesh-heavy-run OOM-probe excluded; signatures normalized)"
+  exit 0
+fi
+
+# --- --status ----------------------------------------------------------------
+if [ "${1:-}" = --status ]; then
+  [ -r "$STATE" ] && cat "$STATE" || echo "mesh-journal-watch: no state yet"
+  exit 0
+fi
+
+# --- --reset -----------------------------------------------------------------
+if [ "${1:-}" = --reset ]; then
+  rm -f "$CURSOR" "$SEEN"
+  echo "mesh-journal-watch: reset (cursor + seen cleared; next pass re-seeds baseline-silent)"
+  exit 0
+fi
+
+# --- --test ------------------------------------------------------------------
+if [ "${1:-}" = --test ]; then
+  command -v awk >/dev/null 2>&1 || { echo "smoke-test: FAIL (no awk)"; exit 1; }
+  command -v sed >/dev/null 2>&1 || { echo "smoke-test: FAIL (no sed)"; exit 1; }
+  # HONEST N/A gate: a non-systemd node is not-applicable, not blind.
+  if ! have_journalctl; then
+    echo "smoke-test: n/a (no journalctl on this node — not every node is systemd)"; exit 2
+  fi
+  jq --version >/dev/null 2>&1 || { echo "smoke-test: FAIL (jq required for the live path)"; exit 1; }
+  # REAL-READ gate (verification principle): journalctl MUST produce -p err JSON with a MESSAGE field
+  # right now, and cursor-file seeding MUST actually write a cursor. Not "[ -x journalctl ]".
+  _rc="$(mktemp)"; rm -f "$_rc"
+  journalctl -b 0 -p err -n 0 --cursor-file="$_rc" >/dev/null 2>&1
+  [ -s "$_rc" ] || { rm -f "$_rc"; echo "smoke-test: FAIL (journalctl --cursor-file wrote no cursor — real read broken)"; exit 1; }
+  journalctl -b 0 -p err -o json -n 1 2>/dev/null | jq -e '.MESSAGE? // ._COMM? // .SYSLOG_IDENTIFIER?' >/dev/null 2>&1 \
+    || { rm -f "$_rc"; echo "smoke-test: FAIL (journalctl -o json produced no parseable entry)"; exit 1; }
+  rm -f "$_rc"
+
+  _td="$(mktemp -d)"
+  _env="MESH_STATE_DIR=$_td MESH_JOURNAL_WATCH_CHAT=0 MESH_JOURNAL_WATCH_STDIN=1"
+  feed(){ env $_env MESH_JOURNAL_WATCH_TAPE="$_td/tape.log" "$0" ; }   # records on stdin
+
+  # (1) NEW signature alerts once + tapes it.
+  out="$(printf 'kernel|||Bluetooth: hci0: Opcode 0x0401 failed: -16\n' | feed 2>&1)"; rc=$?
+  { [ "$rc" = 0 ] && printf '%s' "$out" | grep -qF '[journal]' && printf '%s' "$out" | grep -qF 'Bluetooth' \
+      && grep -qF 'Bluetooth' "$_td/tape.log"; } \
+    || { rm -rf "$_td"; echo "smoke-test: FAIL (new signature must alert + tape: rc=$rc out='$out')"; exit 1; }
+
+  # (2) DEDUP: the SAME signature (volatile tokens differ) is silent on the next pass — 0x0401 vs 0x2005
+  #     both normalize to 'Opcode 0xN failed: -N', so a distinct opcode does NOT re-alert.
+  tb="$(wc -l < "$_td/tape.log")"
+  out="$(printf 'kernel|||Bluetooth: hci0: Opcode 0x2005 failed: -71\n' | feed 2>&1)"; rc=$?
+  { [ "$rc" = 0 ] && ! printf '%s' "$out" | grep -qF '[journal]'; } \
+    || { rm -rf "$_td"; echo "smoke-test: FAIL (a seen signature (normalized) must not re-alert: rc=$rc out='$out')"; exit 1; }
+
+  # (3) EXCLUSION: the mesh-heavy-run OOM probe is dropped — never alerted, never taped.
+  tb="$(wc -l < "$_td/tape.log")"
+  out="$(printf 'kernel|||Memory cgroup out of memory: Killed process 500497 (python3) total-vm:149044kB, anon-rss:32512kB oom_score_adj:0\n' | feed 2>&1)"; rc=$?
+  { [ "$rc" = 0 ] && ! printf '%s' "$out" | grep -qiF 'python' \
+      && [ "$(wc -l < "$_td/tape.log")" = "$tb" ] && ! grep -qiF 'python' "$_td/tape.log"; } \
+    || { rm -rf "$_td"; echo "smoke-test: FAIL (heavy-run OOM probe must be dropped entirely: rc=$rc out='$out')"; exit 1; }
+
+  # (4) A REAL non-probe fault of a DIFFERENT shape still surfaces (exclusion is not over-broad).
+  out="$(printf 'pipewire|||spa.alsa: '\''hw:0'\'': capture open failed: Device or resource busy\n' | feed 2>&1)"; rc=$?
+  { [ "$rc" = 0 ] && printf '%s' "$out" | grep -qF '[journal]' && printf '%s' "$out" | grep -qiF 'capture open failed'; } \
+    || { rm -rf "$_td"; echo "smoke-test: FAIL (a genuinely new non-probe fault must surface: rc=$rc out='$out')"; exit 1; }
+
+  # (5) A GLOBAL oom (not cgroup) is NOT excluded — only the cgroup-python probe is.
+  out="$(printf 'kernel|||Out of memory: Killed process 1234 (postgres) total-vm:8000000kB\n' | feed 2>&1)"; rc=$?
+  { [ "$rc" = 0 ] && printf '%s' "$out" | grep -qiF 'postgres'; } \
+    || { rm -rf "$_td"; echo "smoke-test: FAIL (a GLOBAL/non-python OOM must NOT be excluded: rc=$rc out='$out')"; exit 1; }
+
+  # (6) BURST CAP: many new signatures in one pass collapse to one summary line, never N board lines.
+  rm -rf "$_td"; _td="$(mktemp -d)"
+  _env="MESH_STATE_DIR=$_td MESH_JOURNAL_WATCH_CHAT=0 MESH_JOURNAL_WATCH_STDIN=1 MESH_JOURNAL_WATCH_CAP=3"
+  feed(){ env $_env MESH_JOURNAL_WATCH_TAPE="$_td/tape.log" "$0" ; }
+  out="$(printf 'a|||fault alpha %s\nb|||fault bravo\nc|||fault charlie\nd|||fault delta\ne|||fault echo\n' x | feed 2>&1)"; rc=$?
+  { [ "$rc" = 0 ] && printf '%s' "$out" | grep -qiE 'journal-storm|[0-9]+ new fault' \
+      && [ "$(printf '%s' "$out" | grep -cF '[journal]')" -le 1 ]; } \
+    || { rm -rf "$_td"; echo "smoke-test: FAIL (burst beyond CAP must collapse to one summary line: rc=$rc out='$out')"; exit 1; }
+
+  rm -rf "$_td"
+  echo "smoke-test: ok (real journalctl -p err/cursor read + new-sig/dedup/oom-exclusion/global-oom-kept/burst-cap fixtures)"; exit 0
+fi
+
+# --- default: one delta pass -------------------------------------------------
+if [ "${MESH_JOURNAL_WATCH_STDIN:-0}" != 1 ]; then
+  have_journalctl || { printf 'N/A %s\n' "$(date -u +%FT%TZ)" > "$STATE"; echo "mesh-journal-watch: n/a (no journalctl)"; exit 2; }
+  jq --version >/dev/null 2>&1 || { echo "mesh-journal-watch: FAIL (jq required)"; exit 1; }
+  # BASELINE-SILENT first run: seed the cursor at the current tail, surface nothing (replay-trap guard).
+  if [ ! -f "$CURSOR" ]; then
+    journalctl -p err -n 0 --cursor-file="$CURSOR" >/dev/null 2>&1
+    printf 'SEEDED %s\n' "$(date -u +%FT%TZ)" > "$STATE"
+    command -v mesh-state-touch >/dev/null 2>&1 && mesh-state-touch "$STATE" >/dev/null 2>&1 || true
+    echo "mesh-journal-watch: seeded baseline cursor (silent first run)"; exit 0
+  fi
+fi
+
+ts="$(date -u +%FT%TZ)"
+declare -A cnt sample
+total=0
+while IFS= read -r rec; do
+  [ -n "$rec" ] || continue
+  ident="${rec%%|||*}"; msg="${rec#*|||}"
+  is_heavy_run_oom "$msg" && continue
+  norm="$(printf '%s' "$msg" | normalize)"
+  sig="$ident|||$norm"
+  [ -n "${cnt[$sig]:-}" ] || sample["$sig"]="$ident: $msg"
+  cnt["$sig"]=$(( ${cnt[$sig]:-0} + 1 ))
+  total=$((total+1))
+done < <(delta_records)
+
+new_sigs=()
+for sig in "${!cnt[@]}"; do
+  is_new=no
+  if ! { [ -f "$SEEN" ] && grep -Fxq "$sig" "$SEEN" 2>/dev/null; }; then
+    is_new=yes; new_sigs+=("$sig"); printf '%s\n' "$sig" >> "$SEEN"
+  fi
+  printf '%s count=%s new=%s sample=%s\n' "$ts" "${cnt[$sig]}" "$is_new" "${sample[$sig]}" >> "$TAPE"
+done
+
+ncount="${#new_sigs[@]}"
+host="$(hostname)"
+if [ "$ncount" -gt 0 ]; then
+  if [ "$ncount" -le "$CAP" ]; then
+    for sig in "${new_sigs[@]}"; do
+      s="${sample[$sig]}"; c="${cnt[$sig]}"
+      echo "[journal] NEW fault: $s (×$c this pass) — tape ~/.mesh/journal-watch.log"
+      if [ "$CHAT" = 1 ] && command -v mesh-chat >/dev/null 2>&1; then
+        MESH_WHO="journal-watch@$host" mesh-chat "[fyi] mesh-journal-watch: $host — NEW -p err fault signature: $s (×$c this pass). Live current-boot fault (journalctl -p err), not seen before; tape ~/.mesh/journal-watch.log, all with 'mesh-journal-watch --once'." >/dev/null 2>&1 || true
+      fi
+    done
+  else
+    summary="$(for sig in "${new_sigs[@]}"; do printf '%s(×%s) ' "$(printf '%s' "${sample[$sig]}" | cut -c1-40)" "${cnt[$sig]}"; done)"
+    echo "[journal] journal-storm: $ncount new fault signatures this pass — $summary"
+    if [ "$CHAT" = 1 ] && command -v mesh-chat >/dev/null 2>&1; then
+      MESH_WHO="journal-watch@$host" mesh-chat "[fyi] mesh-journal-watch: $host — $ncount new -p err fault signatures this pass (over cap $CAP): $summary. Read them with 'mesh-journal-watch --once'." >/dev/null 2>&1 || true
+    fi
+  fi
+fi
+
+status="$([ "$ncount" -gt 0 ] && echo FAULT || echo QUIET)"
+[ "$SEEK_RESEED" = 1 ] && status="RESEED"
+printf '%s new=%s seen=%s scanned=%s %s\n' "$status" "$ncount" "$([ -f "$SEEN" ] && wc -l < "$SEEN" || echo 0)" "$total" "$ts" > "$STATE"
+command -v mesh-state-touch >/dev/null 2>&1 && mesh-state-touch "$STATE" >/dev/null 2>&1 || true
+if [ "$ncount" -gt 0 ]; then
+  echo "mesh-journal-watch: $ncount new fault signature(s) surfaced this pass (scanned $total)"
+else
+  echo "mesh-journal-watch: QUIET (no new fault signatures; scanned $total)"
+fi
+exit 0
