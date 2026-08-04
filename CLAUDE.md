@@ -450,7 +450,9 @@ is on-demand by design. Keep entries CONSERVATIVE — when unsure, leave it flag
 dead-on-arrival orphan stays visible.
 
 - **Test harnesses:** `test-*`
-- **Node-specific units (deploy where relevant):** `mesh-card-watchdog.{sh,service,timer}` ·
+- **Node-specific units (deploy where relevant):** `mesh-card-watchdog.{service,timer}` (the UNITS only —
+  the bare `mesh-card-watchdog` script is cron-wired via its own `# reflex-cadence:` and must stay a
+  candidate orphan; never both schedulers on one node) ·
   `mtg-watchdog.{sh,service,timer}` · `bore-mtg.{sh,service,timer}` · `mesh-cam-watch.*` ·
   `mesh-tuner-eye.*` · `node-join-android.sh` · `mesh-phaedra-port80-fallback.service` (phaedra only) ·
   `mesh-voice-clone.service` (GPU/venv-ai node only — warm XTTS daemon for the operator-voice clone) ·
