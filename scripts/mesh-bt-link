@@ -37,13 +37,45 @@
 #   mesh-bt-link --edge     REFLEX: post [bt-connected]/[bt-none]/[bt-offline] to the board ONLY on a
 #                           verdict/connected-set CHANGE (2-consecutive not needed — BT connect/disconnect
 #                           is a discrete hardware event, not a noisy analog signal)
+#   mesh-bt-link --exposure THIS node's OWN pairability posture (see EXPOSURE below)
 #   mesh-bt-link --test     smoke test (classifier fixtures + live controller-read gate)
 #   mesh-bt-link --forget   reset state (next run re-seeds silently)
+#
+# EXPOSURE — can an unknown device pair with THIS node right now (2026-08-04, discover→genome baton).
+# The Bluetooth-transport twin of `mesh-socket-state --exposure`, which asks the same question of TCP/
+# UDP: not "who is out there" but "what will WE answer". Five BT-touching tools and none of them asked
+# it — `mesh-rfkill` sees radio on/off only (and does not distinguish "on and closed" from "on and open
+# to pairing"), `mesh-bt-census` inquiry-scans OTHER devices, `mesh-presence` scans BLE advertisers,
+# `mesh-imac-peripherals` reads ALREADY-paired links, `mesh-ble-heal` heals the scanning direction.
+# This tool was the one place already parsing `bluetoothctl show` live — and extracted `Powered:` only.
+# The fix is "stop discarding the fields we already read", not a new probe.
+#
+# HONEST CLASSES — read off the controller's own two flags, nothing inferred beyond them:
+#   DISCOVERABLE  Powered:yes + Discoverable:yes — answerable to an INQUIRY SCAN by anyone in radio
+#                 range, no prior knowledge of the MAC needed. The PUBLIC-class (wildcard-bind)
+#                 equivalent. A DiscoverableTimeout of 0 means it NEVER expires — reported loudly,
+#                 because the 180s default self-closes and a 0 does not.
+#   PAIRABLE      Powered:yes + Discoverable:no + Pairable:yes — hidden from inquiry scan but STILL
+#                 completes a pairing handshake with any peer that has (or guesses) the MAC. The
+#                 BOUND-class equivalent: silent, not closed. This is the state the axis exists for —
+#                 it looks shut from the outside and is not.
+#   CLOSED        Powered:no (radio off ⇒ definitively cannot pair) OR Pairable:no.
+#   UNKNOWN       controller readable but did not report Discoverable:/Pairable: — an absent field is
+#                 never rendered as a closed door (honest-fusion rule).
+#   OFFLINE(2)    bluetoothctl absent | rfkill-blocked | bluetoothd down | no controller — unreadable.
+#                 NOTE the deliberate split from the peripheral sense above: there, Powered:no is
+#                 OFFLINE (nothing can be enumerated); here it is a real, load-bearing CLOSED answer.
+#
+# Wiring: the exposure edge rides the EXISTING `--edge` reflex (one cron line per tool — a second
+# cadence for the same name would not survive autowire), and is evaluated BEFORE the peripheral
+# sense's OFFLINE early-exit, so a powered-down radio still posts its CLOSED verdict.
 set -uo pipefail
 export PATH="$HOME/.local/bin:$PATH"
 [ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
 
-STATE="$HOME/.mesh/.bt-link-state"
+STATE_DIR="${MESH_STATE_DIR:-$HOME/.mesh}"
+STATE="$STATE_DIR/.bt-link-state"
+XSTATE="$STATE_DIR/.bt-exposure-state"
 BTCTL_TIMEOUT=8
 
 # classify_icon <icon-string> → audio|input|display|phone|other
@@ -58,6 +90,171 @@ classify_icon() {
     phone|*phone*)                           echo "phone" ;;
     *)                                       echo "other" ;;
   esac
+}
+
+# ---- exposure: THIS node's own pairability posture -----------------------------------------------
+# show_text → the raw `bluetoothctl show` output. MESH_BT_SHOW redirects it at a FIXTURE FILE so the
+# --test exposure legs drive the REAL parse+classify+edge path end-to-end (a pointed-at file that does
+# not exist yields empty ⇒ the OFFLINE branch, which is itself an asserted leg).
+show_text() {
+  if [ -n "${MESH_BT_SHOW:-}" ]; then
+    [ -f "$MESH_BT_SHOW" ] && cat "$MESH_BT_SHOW"
+    return 0
+  fi
+  command -v bluetoothctl >/dev/null 2>&1 || return 0
+  timeout "$BTCTL_TIMEOUT" bluetoothctl show 2>/dev/null
+}
+
+# read_posture → "powered|discoverable|pairable|disc_timeout|pair_timeout|source", empty on unreadable.
+#
+# D-BUS FIRST, `bluetoothctl show` as the fallback. Two reasons, both measured 2026-08-04:
+#   1. bluez exposes `PairableTimeout` on org.bluez.Adapter1 and `bluetoothctl show` NEVER PRINTS IT.
+#      That field is the difference between a pairable window that self-closes and one that does not
+#      (live here: 0 = never expires) — on the PAIRABLE class it is the load-bearing half of the
+#      verdict, and the text interface simply does not carry it.
+#   2. THE PROBE CREATES THE EXPOSURE IT REPORTS. `bluetoothctl` registers a default agent, and bluez
+#      flips `Pairable` true while one is registered — so asking the text interface "am I pairable?"
+#      MAKES the answer yes. Measured on mesh-home 2026-08-04 as a controlled A/B, sampling the D-Bus
+#      property once a second:
+#        A) 30s of pure observation, no bluetoothctl invoked → false ×30, not one spontaneous flip.
+#        B) one `bluetoothctl show` at t=0                   → false ×6, true ×8, false ×16.
+#        C) one plain `mesh-bt-link` run (this tool's own peripheral sense) → same flip.
+#      So the node's RESTING posture is CLOSED, and the `Pairable: yes` this axis was filed on was an
+#      artifact of the finder's own probe. A sense that reads posture through bluetoothctl cannot be
+#      correct — it reports its own footprint. busctl reads the property and registers no agent.
+#      NOTE the unfixed consequence, flagged not silently widened: this tool's `--edge` reflex still
+#      enumerates peripherals via bluetoothctl every 9 minutes, so it opens an ~8s pairable window at
+#      that cadence. Moving that enumeration to the ObjectManager API is a separate, larger change;
+#      the exposure LEG below is now the sense that can actually see it happen.
+read_posture() {
+  if [ -n "${MESH_BT_POSTURE:-}" ]; then
+    [ -f "$MESH_BT_POSTURE" ] && cat "$MESH_BT_POSTURE"
+    return 0
+  fi
+  local pw disc pair pto
+  if [ -z "${MESH_BT_SHOW:-}" ] && command -v busctl >/dev/null 2>&1; then
+    _prop() { # <name> → the scalar value, empty if unreadable
+      timeout "$BTCTL_TIMEOUT" busctl get-property org.bluez /org/bluez/hci0 \
+        org.bluez.Adapter1 "$1" 2>/dev/null | awk '{print $2}'
+    }
+    pw="$(_prop Powered)"; disc="$(_prop Discoverable)"; pair="$(_prop Pairable)"
+    if [ -n "$pw" ] && [ -n "$disc" ] && [ -n "$pair" ]; then
+      _yn() { case "$1" in true) echo yes ;; false) echo no ;; *) echo "" ;; esac; }
+      printf '%s|%s|%s|%s|%s|dbus\n' "$(_yn "$pw")" "$(_yn "$disc")" "$(_yn "$pair")" \
+        "$(_prop DiscoverableTimeout)" "$(_prop PairableTimeout)"
+      return 0
+    fi
+  fi
+  # fallback: parse the text interface (no PairableTimeout there — reported as unknown, not as 0)
+  local show; show="$(show_text)"
+  [ -n "$show" ] || return 0
+  printf '%s' "$show" | grep -qiE '^[[:space:]]*Controller|Powered:' || return 0
+  printf '%s|%s|%s|%s||bluetoothctl\n' \
+    "$(show_field "$show" Powered)" "$(show_field "$show" Discoverable)" \
+    "$(show_field "$show" Pairable)" "$(discoverable_timeout_secs "$show")"
+}
+
+# show_field <show-text> <field> → the field's value, or empty if the controller did not report it.
+# Anchored with a literal ':' so `Discoverable` never swallows `DiscoverableTimeout`.
+show_field() {
+  printf '%s\n' "$1" | sed -n "s/^[[:space:]]*$2:[[:space:]]*//p" | head -1
+}
+
+# discoverable_timeout_secs <show-text> → the DECIMAL timeout, or empty. bluez prints
+# "DiscoverableTimeout: 0x000000b4 (180)" — the parenthesised decimal is the readable one.
+discoverable_timeout_secs() {
+  local raw; raw="$(show_field "$1" DiscoverableTimeout)"
+  case "$raw" in
+    *\(*\)*) printf '%s' "$raw" | sed -n 's/.*(\([0-9]\+\)).*/\1/p' ;;
+    0x*)     printf '%d' "$raw" 2>/dev/null ;;
+    [0-9]*)  printf '%s' "${raw%% *}" ;;
+  esac
+}
+
+# exposure_offline_reason → reason if the POSTURE is unreadable, else empty.
+# Powered:no is deliberately NOT a reason here — it is a real CLOSED verdict (see header).
+exposure_offline_reason() {
+  local posture="$1"
+  if [ -z "${MESH_BT_SHOW:-}${MESH_BT_POSTURE:-}" ]; then
+    command -v busctl >/dev/null 2>&1 || command -v bluetoothctl >/dev/null 2>&1 \
+      || { echo "neither busctl nor bluetoothctl installed"; return; }
+    if command -v rfkill >/dev/null 2>&1 \
+       && rfkill list bluetooth 2>/dev/null | grep -qi 'blocked: *yes'; then
+      echo "rfkill-blocked (radio off)"; return
+    fi
+  fi
+  [ -n "$posture" ] || { echo "bluetoothd down / no controller (adapter properties unreadable)"; return; }
+}
+
+# fmt_timeout <secs> <field-name> → human phrasing. 0 is the loud one: the window never self-closes.
+fmt_timeout() {
+  case "$1" in
+    0)  echo "$2 NEVER EXPIRES (0)" ;;
+    "") echo "$2 unreported" ;;
+    *)  echo "$2 ${1}s" ;;
+  esac
+}
+
+# classify_exposure <powered> <discoverable> <pairable> <disc-timeout> <pair-timeout> → "CLASS|detail".
+# Pure — the --test drives it on fixtures, and the live path drives the same function.
+classify_exposure() {
+  local pw="$1" disc="$2" pair="$3" dto="$4" pto="${5:-}"
+  if [ "$pw" = "no" ]; then
+    echo "CLOSED|radio powered off — cannot pair (Powered:no)"; return
+  fi
+  # an absent flag must never render as a closed door
+  if [ -z "$pw" ] || [ -z "$disc" ] || [ -z "$pair" ]; then
+    echo "UNKNOWN|controller readable but did not report Powered/Discoverable/Pairable (powered='$pw' discoverable='$disc' pairable='$pair')"
+    return
+  fi
+  if [ "$disc" = "yes" ]; then
+    if [ "$pair" = "yes" ]; then
+      echo "DISCOVERABLE|answerable to an INQUIRY SCAN and pairable — $(fmt_timeout "$dto" discoverable-for), $(fmt_timeout "$pto" pairable-for)"
+    else
+      echo "DISCOVERABLE|visible to an INQUIRY SCAN, but Pairable:no — $(fmt_timeout "$dto" discoverable-for)"
+    fi
+    return
+  fi
+  if [ "$pair" = "yes" ]; then
+    echo "PAIRABLE|hidden from inquiry scan but answers a DIRECTED pair request (Discoverable:no Pairable:yes) — $(fmt_timeout "$pto" pairable-for)"
+    return
+  fi
+  echo "CLOSED|powered but refuses pairing (Discoverable:no Pairable:no)"
+}
+
+# exposure_run <edge?> → print (or, with edge=1, post-on-change) the posture verdict.
+# Returns 2 when the posture is UNREADABLE (honest n/a), 0 otherwise — including CLOSED.
+exposure_run() {
+  local edge="${1:-0}" posture off verdict label detail sig old_sig had=0
+  posture="$(read_posture)"
+  off="$(exposure_offline_reason "$posture")"
+  if [ -n "$off" ]; then
+    verdict="OFFLINE|$off"; sig="OFFLINE"
+  else
+    local pw disc pair dto pto src
+    IFS='|' read -r pw disc pair dto pto src <<< "$posture"
+    verdict="$(classify_exposure "$pw" "$disc" "$pair" "$dto" "$pto")"
+    verdict="$verdict [via $src]"
+    sig="${verdict%%|*}#${pw},${disc},${pair},${dto},${pto}"
+  fi
+  label="${verdict%%|*}"; detail="${verdict#*|}"
+  [ -f "$XSTATE" ] && { had=1; old_sig="$(sed -n '2p' "$XSTATE" 2>/dev/null)"; }
+  # STATE write is unconditional per run — mtime = ran-live, never gated on the value changing
+  mkdir -p "$(dirname "$XSTATE")" 2>/dev/null
+  printf '%s\n%s\n' "$verdict" "$sig" > "$XSTATE" 2>/dev/null
+  if [ "$edge" = 1 ]; then
+    if [ "$had" = 1 ] && [ -n "${old_sig:-}" ] && [ "$old_sig" != "$sig" ]; then
+      # NOPOST is how --test drives the real edge path without writing to the real board. It suppresses
+      # ONLY the mesh-chat call, never the emit the test asserts. A PATH stub cannot do this job here:
+      # this script re-prepends $HOME/.local/bin to PATH at load, so the real mesh-chat wins anyway.
+      [ "${MESH_BT_TEST_NOPOST:-0}" = 1 ] || { command -v mesh-chat >/dev/null 2>&1 && \
+        MESH_WHO="bt-link@$(hostname)" mesh-chat "[bt-exposure] $label — $detail" >/dev/null 2>&1; }
+      echo "[bt-exposure] $label — $detail"
+    fi
+  else
+    echo "bt-exposure: $label — $detail"
+  fi
+  [ "$label" = "OFFLINE" ] && return 2 || return 0
 }
 
 # bt_offline_reason → echoes a reason string if the BT sensor is UNREACHABLE, else empty.
@@ -82,15 +279,27 @@ bt_offline_reason() {
 
 # read_connected → prints "MAC<TAB>class<TAB>name" per connected peripheral (may be empty = NONE).
 # Uses `bluetoothctl devices Connected` (bluez 5.65+); per device, `info <MAC>` → Icon → classify_icon.
+# MESH_BT_DEVICES redirects the device list at a fixture so --test can assert the row filter below
+# WITHOUT a radio (that filter is the fix for the 2026-07-06 phantom-peripheral bug, and until now
+# nothing asserted it). Under a fixture the per-device Icon lookup is skipped → class "other".
+devices_raw() {
+  if [ -n "${MESH_BT_DEVICES:-}" ]; then
+    [ -f "$MESH_BT_DEVICES" ] && cat "$MESH_BT_DEVICES"
+    return 0
+  fi
+  timeout "$BTCTL_TIMEOUT" bluetoothctl devices Connected 2>/dev/null
+}
+
 read_connected() {
   local line mac name icon cls
-  timeout "$BTCTL_TIMEOUT" bluetoothctl devices Connected 2>/dev/null | while read -r _dev mac name; do
+  devices_raw | while read -r _dev mac name; do
     # only real "Device <MAC> <name>" rows — bluetoothctl also emits controller-status noise lines
     # ("Pairable: yes", "Discovering: yes") that otherwise parse as phantom peripherals (seen live
     # on Default-string 2026-07-06 12:00Z: [bt-connected] n=2 ... "Pairable: yes(other)").
     [ "$_dev" = "Device" ] || continue
     [ -n "$mac" ] || continue
-    icon="$(timeout "$BTCTL_TIMEOUT" bluetoothctl info "$mac" 2>/dev/null | sed -n 's/^[[:space:]]*Icon:[[:space:]]*//p' | head -1)"
+    if [ -n "${MESH_BT_DEVICES:-}" ]; then icon=""
+    else icon="$(timeout "$BTCTL_TIMEOUT" bluetoothctl info "$mac" 2>/dev/null | sed -n 's/^[[:space:]]*Icon:[[:space:]]*//p' | head -1)"; fi
     cls="$(classify_icon "${icon:-unknown}")"
     printf '%s\t%s\t%s\n' "$mac" "$cls" "$name"
   done
@@ -139,6 +348,105 @@ if [ "${1:-}" = "--test" ]; then
   vn="$(build_verdict "")"
   echo "$vn" | grep -q '^NONE|' || { echo "  FAIL empty table should be NONE: got '$vn'"; _f=1; }
   [ "$_f" = 0 ] || { echo "smoke-test: FAIL (classifier / verdict-builder contract)"; exit 1; }
+
+  # ---- exposure legs (2026-08-04) --------------------------------------------------------------
+  # UNIT: the posture classifier, incl. the two states the axis exists for (silent-but-answerable,
+  # and never-expiring discoverable) and the absent-field case that must NOT read as a closed door.
+  _xf=0
+  _c(){ classify_exposure "$1" "$2" "$3" "$4" "${5:-}" | cut -d'|' -f1; }
+  [ "$(_c yes no  yes 180)" = "PAIRABLE" ]     || { echo "  FAIL powered+hidden+pairable→PAIRABLE (got $(_c yes no yes 180))"; _xf=1; }
+  [ "$(_c yes no  no  180)" = "CLOSED" ]       || { echo "  FAIL powered+hidden+unpairable→CLOSED"; _xf=1; }
+  [ "$(_c no  no  yes 180)" = "CLOSED" ]       || { echo "  FAIL radio off→CLOSED"; _xf=1; }
+  [ "$(_c yes yes yes 180)" = "DISCOVERABLE" ] || { echo "  FAIL discoverable→DISCOVERABLE"; _xf=1; }
+  [ "$(_c yes yes no  180)" = "DISCOVERABLE" ] || { echo "  FAIL discoverable+unpairable is still DISCOVERABLE"; _xf=1; }
+  [ "$(_c yes ''  yes 180)" = "UNKNOWN" ]      || { echo "  FAIL absent Discoverable must be UNKNOWN, never CLOSED"; _xf=1; }
+  [ "$(_c yes no  ''  180)" = "UNKNOWN" ]      || { echo "  FAIL absent Pairable must be UNKNOWN, never CLOSED"; _xf=1; }
+  [ "$(_c ''  no  yes 180)" = "UNKNOWN" ]      || { echo "  FAIL absent Powered must be UNKNOWN, never CLOSED"; _xf=1; }
+  # the two timeouts are DISTINCT axes and each must survive into its own class's detail
+  classify_exposure yes yes yes 0 180 | grep -q 'discoverable-for NEVER EXPIRES' \
+    || { echo "  FAIL DiscoverableTimeout 0 must read as never-expiring"; _xf=1; }
+  classify_exposure yes yes yes 180 180 | grep -q 'discoverable-for 180s' \
+    || { echo "  FAIL a finite DiscoverableTimeout must read as expiring"; _xf=1; }
+  # the live-here case: PAIRABLE with a never-expiring pairable window (bluetoothctl show cannot see it)
+  classify_exposure yes no yes 180 0 | grep -q 'pairable-for NEVER EXPIRES' \
+    || { echo "  FAIL PairableTimeout 0 must read as never-expiring on the PAIRABLE class"; _xf=1; }
+  classify_exposure yes no yes 180 60 | grep -q 'pairable-for 60s' \
+    || { echo "  FAIL a finite PairableTimeout must read as expiring"; _xf=1; }
+  # an UNREPORTED timeout (the bluetoothctl fallback has no PairableTimeout) must say so, never "0"
+  classify_exposure yes no yes 180 '' | grep -q 'pairable-for unreported' \
+    || { echo "  FAIL an unreported PairableTimeout must not be rendered as never-expiring"; _xf=1; }
+
+  # FUNCTIONAL: drive "$0" --exposure against a REAL `bluetoothctl show` capture, so the field parse,
+  # the hex-timeout decode, the classifier and the edge state all run together on the production path.
+  # MESH_STATE_DIR is redirected at a scratch dir — a --test that writes the artifact a reader trusts
+  # forges the evidence it exists to check.
+  _bx="$(mktemp -d)"
+  _mkshow(){ # <discoverable> <pairable> <timeout-hex> <timeout-dec>
+    # DiscoverableTimeout is emitted BEFORE Discoverable — the reverse of bluez's own order, on
+    # purpose. With the real order a `Discoverable[A-Za-z]*:` prefix-match still passes (head -1 picks
+    # the right line by luck), so the anchoring assertion asserts nothing; this ordering makes the
+    # prefix-match lose and turns it into a gate that can actually fail.
+    { echo "Controller 00:13:25:AC:CD:1B (public)"
+      echo "	Name: fixture"
+      echo "	Powered: yes"
+      echo "	DiscoverableTimeout: $3 ($4)"
+      echo "	Discoverable: $1"
+      echo "	Pairable: $2"
+      echo "	Discovering: no"; } > "$_bx/show"
+  }
+  _xrun(){ MESH_STATE_DIR="$_bx" MESH_BT_SHOW="$_bx/show" MESH_BT_TEST_NOPOST=1 "$0" "$@"; }
+  # the live-on-mesh-home shape the find was filed on: hidden from scan, still answerable
+  _mkshow no yes 0x000000b4 180
+  _o="$(_xrun --exposure)"
+  printf '%s' "$_o" | grep -q '^bt-exposure: PAIRABLE ' \
+    || { echo "  FAIL --exposure on a hidden-but-pairable controller: got '$_o'"; _xf=1; }
+  # the text fallback has NO PairableTimeout — it must be reported unknown, never assumed
+  printf '%s' "$_o" | grep -q 'pairable-for unreported' \
+    || { echo "  FAIL the bluetoothctl fallback must report PairableTimeout as unreported: got '$_o'"; _xf=1; }
+  printf '%s' "$_o" | grep -q '\[via bluetoothctl\]' \
+    || { echo "  FAIL the verdict must name the source it was read from: got '$_o'"; _xf=1; }
+  # DiscoverableTimeout must be decoded from the parenthesised DECIMAL, not the 0x string
+  _mkshow yes yes 0x0000012c 300
+  printf '%s' "$(_xrun --exposure)" | grep -q 'discoverable-for 300s' \
+    || { echo "  FAIL hex timeout must decode to its decimal: got '$(_xrun --exposure)'"; _xf=1; }
+  # `Discoverable:` must not swallow `DiscoverableTimeout:`
+  _mkshow no no 0x00000000 0
+  printf '%s' "$(_xrun --exposure)" | grep -q '^bt-exposure: CLOSED ' \
+    || { echo "  FAIL Discoverable parse leaked DiscoverableTimeout: got '$(_xrun --exposure)'"; _xf=1; }
+  # EDGE: seeds silently, stays silent on an unchanged posture, fires on a real change
+  _mkshow no no 0x000000b4 180
+  rm -f "$_bx/.bt-exposure-state"
+  [ -z "$(_xrun --exposure --edge)" ] || { echo "  FAIL the exposure edge must seed SILENTLY"; _xf=1; }
+  [ -z "$(_xrun --exposure --edge)" ] || { echo "  FAIL the exposure edge re-emitted on an UNCHANGED posture"; _xf=1; }
+  _mkshow no yes 0x000000b4 180
+  printf '%s' "$(_xrun --edge --exposure)" | grep -q '^\[bt-exposure\] PAIRABLE' \
+    || { echo "  FAIL the exposure edge missed CLOSED→PAIRABLE (flag order --edge --exposure)"; _xf=1; }
+  # D-BUS PATH: the normalized posture record (the source that carries PairableTimeout at all) drives
+  # the same classifier — asserted separately from the text fallback, since only this path can be
+  # PAIRABLE-with-a-never-expiring-window, the exact live shape on mesh-home the find was filed on.
+  printf 'yes|no|yes|180|0|dbus\n' > "$_bx/posture"
+  _p="$(MESH_STATE_DIR="$_bx" MESH_BT_POSTURE="$_bx/posture" MESH_BT_TEST_NOPOST=1 "$0" --exposure)"
+  printf '%s' "$_p" | grep -q '^bt-exposure: PAIRABLE ' \
+    || { echo "  FAIL the dbus posture record must classify: got '$_p'"; _xf=1; }
+  printf '%s' "$_p" | grep -q 'pairable-for NEVER EXPIRES' \
+    || { echo "  FAIL the dbus path must surface PairableTimeout 0: got '$_p'"; _xf=1; }
+  printf '%s' "$_p" | grep -q '\[via dbus\]' \
+    || { echo "  FAIL the dbus verdict must name its source: got '$_p'"; _xf=1; }
+
+  # HONEST DEGRADE: an unreadable controller is exit 2 + OFFLINE, never a fabricated CLOSED
+  _o="$(MESH_STATE_DIR="$_bx" MESH_BT_SHOW="$_bx/absent" MESH_BT_TEST_NOPOST=1 "$0" --exposure)"; _rc=$?
+  [ "$_rc" = 2 ] || { echo "  FAIL an unreadable controller must exit 2 (got $_rc)"; _xf=1; }
+  printf '%s' "$_o" | grep -q 'OFFLINE' \
+    || { echo "  FAIL an unreadable controller must read OFFLINE, not a closed door: got '$_o'"; _xf=1; }
+
+  # REGRESSION GUARD for the 2026-07-06 phantom-peripheral bug the read_connected filter fixes: the
+  # controller-status lines must never parse as devices. Asserted here for the first time.
+  printf 'Pairable: yes\nDiscovering: yes\nDevice AA:BB:CC:DD:EE:FF Bose Revolve\n' > "$_bx/devices"
+  _n="$(MESH_BT_DEVICES="$_bx/devices" read_connected | grep -c . || true)"
+  [ "$_n" = 1 ] || { echo "  FAIL controller-status lines parsed as phantom peripherals (rows=$_n, want 1)"; _xf=1; }
+  rm -rf "$_bx"
+  [ "$_xf" = 0 ] || { echo "smoke-test: FAIL (exposure contract)"; exit 1; }
+
   # REAL-READ GATE (verification principle): assert the controller is actually READABLE right now — a
   # real enumeration succeeds (0 or more devices is fine; the point is the read works, not the count).
   # Radio off / blocked / daemon down = honest n/a (exit 2), never a fake green.
@@ -150,12 +458,39 @@ if [ "${1:-}" = "--test" ]; then
   timeout "$BTCTL_TIMEOUT" bluetoothctl devices Connected >/dev/null 2>&1 \
     || { echo "smoke-test: n/a (controller reachable but 'devices Connected' failed — bluez too old?)"; exit 2; }
   _live_n="$(read_connected | grep -c . || true)"
-  echo "smoke-test: ok (classifier + verdict-builder + REAL controller read: ${_live_n} peripheral(s) connected)"; exit 0
+  # REAL-READ GATE for the exposure axis too: the live controller must actually REPORT the two flags
+  # this leg judges. A bluez that names neither would render UNKNOWN forever while every fixture leg
+  # stayed green — the hollow-sense shape.
+  _lp="$(read_posture)"
+  printf '%s' "$_lp" | grep -qE '^(yes|no)\|(yes|no)\|(yes|no)\|' \
+    || { echo "smoke-test: n/a (controller up but Powered/Discoverable/Pairable unreadable: '$_lp' — exposure leg unassertable here)"; exit 2; }
+  # …driven as a CHILD with MESH_STATE_DIR at a scratch dir: calling exposure_run in-process would
+  # write the real .bt-exposure-state and re-baseline the edge, suppressing the next genuine change.
+  _lxd="$(mktemp -d)"; _lx="$(MESH_STATE_DIR="$_lxd" "$0" --exposure)"; rm -rf "$_lxd"
+  echo "smoke-test: ok (classifier + verdict-builder + exposure contract + REAL controller read: ${_live_n} peripheral(s) connected; ${_lx})"; exit 0
 fi
 
 [ "${1:-}" = "--forget" ] && { rm -f "$STATE"; echo "bt-link state forgotten — next run re-seeds"; exit 0; }
 
-MODE="${1:-}"
+# Flags, not positional: `--exposure --edge` and `--edge --exposure` must mean the same thing.
+MODE=""; EDGE=0; JSON=0; EXPOSURE=0
+for _a in "$@"; do
+  case "$_a" in
+    --edge)     EDGE=1;     MODE="--edge" ;;
+    --json)     JSON=1;     MODE="--json" ;;
+    --exposure) EXPOSURE=1 ;;
+  esac
+done
+
+# ---- exposure leg -------------------------------------------------------------------------------
+# Evaluated BEFORE the peripheral sense's OFFLINE early-exit, so a powered-down radio still reports
+# its (real, load-bearing) CLOSED posture instead of being swallowed by an exit 2.
+if [ "$EXPOSURE" = 1 ]; then
+  exposure_run "$EDGE"; exit $?
+fi
+if [ "$EDGE" = 1 ]; then
+  exposure_run 1 || true   # rides the existing reflex cadence; never blocks the peripheral sense
+fi
 
 # ---- offline gate (honest-degrade) --------------------------------------------------------------
 offline="$(bt_offline_reason)"
