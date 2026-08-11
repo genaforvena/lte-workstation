@@ -121,6 +121,50 @@ _gate_rotate() {
     && mv -f "$tmp" "$PACE_GATE_LOG" 2>/dev/null || rm -f "$tmp" 2>/dev/null
 }
 
+# _gate_scrub — repair CRASH FRAGMENTS in the gate journal so hledger consumers parse it.
+# Measured cause (2026-08-11, 5 spans in the live journal): NOT a concurrent-append race. Every span sits
+# EXACTLY at an unclean-shutdown boundary — last good txn 22:47 → NULs → next txn after the reboot — and
+# each span is a whole multiple of the 155-byte txn (310/155/155/308/308 = 2/1/1/2/2 txns). That is ext4
+# delayed allocation: the append grew i_size (journalled) but the data blocks were never written back
+# before power loss, so recovery returns ZEROS for the last 1-2 appended txns. `>>` is already O_APPEND
+# and each writer emits <4KiB, so no lock can prevent this — only fsync-per-append could, and paying a
+# barrier on every dispatch poll to protect a decision TAPE is the wrong trade. The right posture: the
+# hole is acceptable, the POISON is not — a lost txn must read as ABSENT ROWS, never as bytes that make
+# every consumer of the whole journal error out (one bad span at line 1198 killed the entire 14k-line
+# balance query, not just its own row).
+# Rebuild by TXN GROUP, not by deleting NULs: a span can sever a line mid-way, and `tr -d '\0'` would
+# splice two half-lines into one plausible-looking bogus txn (or leave an orphan posting whose date
+# header is gone — hledger's other parse error). Only complete date-header + 2-posting groups survive,
+# so whatever the crash cut, the output is parseable AND balanced. Idempotent + silent on a clean file.
+# Echoes what it dropped to stderr and books a `;` audit comment — a repair that leaves no trace is the
+# silent fallback the doctrine forbids (a journal quietly healing every boot reads as one that never breaks).
+_gate_scrub() {
+  [ -s "$PACE_GATE_LOG" ] || return 1
+  local tmp before after dropped
+  tmp="$(mktemp 2>/dev/null)" || return 1
+  before="$(tr -dc '\n' < "$PACE_GATE_LOG" 2>/dev/null | wc -c)"
+  LC_ALL=C awk '
+    /^;/ { print; next }                                        # audit comments pass through
+    /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] \* gate / { hdr=$0; getline p1; getline p2
+          if (p1 ~ /^    gate:decision:/ && p2 ~ /^    gate:calls /) { print hdr; print p1; print p2 }
+          next }
+    { next }                                                    # anything else = crash fragment, drop
+  ' "$PACE_GATE_LOG" > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+  [ -s "$tmp" ] || { rm -f "$tmp"; return 1; }                  # never replace a journal with nothing
+  after="$(tr -dc '\n' < "$tmp" 2>/dev/null | wc -c)"
+  dropped=$((before - after))
+  # Idempotence is decided by the REBUILD, not by a NUL probe: a crash can also leave a SEVERED line with
+  # no NUL in it (head-of-txn spliced onto tail-of-txn), which hledger rejects just as hard. Rebuilding
+  # unconditionally and installing only when the line count MOVED covers both damage shapes with one pass,
+  # and makes "clean" a property the scrub proved rather than one a cheap probe assumed.
+  [ "$dropped" -gt 0 ] 2>/dev/null || { rm -f "$tmp"; return 1; }
+  printf '; scrub %s  ; dropped %s crash-fragment line(s) (unclean-shutdown NUL span)\n' \
+    "$(date -u +%Y-%m-%d)" "$dropped" >> "$tmp"
+  mv -f "$tmp" "$PACE_GATE_LOG" 2>/dev/null || { rm -f "$tmp"; return 1; }
+  echo "mesh-pace: gate journal repaired — dropped $dropped crash-fragment line(s) from $PACE_GATE_LOG" >&2
+  return 0
+}
+
 # book_gate <reason> <cap> <spent> — append one hledger txn recording a hard-cap gate decision. Reasons:
 #   over        spent>=cap>0            → the gate HELD (return 0); the cap bit
 #   under       cap>0, spent<cap        → proceeded legitimately (headroom)
@@ -140,7 +184,7 @@ book_gate() {
     printf '    gate:decision:%-12s   1 GATE\n' "$reason"
     printf '    gate:calls                    -1 GATE\n'
   } >> "$PACE_GATE_LOG" 2>/dev/null || true
-  [ $((now % 100)) -eq 0 ] && _gate_rotate
+  [ $((now % 100)) -eq 0 ] && { _gate_rotate; _gate_scrub >/dev/null 2>&1 || true; }
   return 0
 }
 
@@ -585,7 +629,48 @@ case "${1:-}" in
     if command -v hledger >/dev/null 2>&1; then
       hledger -f "$_gl" check >/dev/null 2>&1 || { echo "smoke-test: FAIL (gate-ledger: journal must pass hledger check — balanced double-entry)"; rm -f "$_gl"; exit 1; }
     fi
-    rm -f "$_gl"
+    # CRASH-FRAGMENT SCRUB (witness@mesh-home 2026-08-11: the live journal carried 5 NUL spans, each at an
+    # unclean-shutdown boundary, and ONE of them made hledger error on the WHOLE 14k-line file). Fixture
+    # reproduces the real damage shape: overwrite bytes IN PLACE with NULs mid-file (a crash zeroes blocks,
+    # it does not shorten the file) and cut mid-line so the scrub must reject a severed txn, not just strip
+    # NULs. Asserted end to end: the fixture genuinely breaks hledger BEFORE (a scrub test on a file that
+    # parses anyway asserts nothing), the reader repairs it, hledger parses AFTER, the tally survives, and
+    # a second pass is a silent no-op. RED-first witnesses (each RUN from a scratch copy, seen fail):
+    #   m1 _gate_scrub → `return 1` (never repairs)      → "NUL bytes survived the repair" RED
+    #   m2 scrub via `tr -d '\0'` instead of txn-group   → NUL count unmoved → same leg RED
+    #   m3 scrub silent in BOTH channels (stderr+stdout) → "must announce the repair" RED
+    # The txn-group claim itself was measured head-to-head on the same poisoned fixture rather than by a
+    # mutant (a `tr -d` mutant dies on the earlier NUL leg before it can reach the parse leg): tr-strip
+    # output FAILS `hledger check` — the NULs go but the two half-lines they severed splice into one bogus
+    # txn — while the group rebuild PASSES and keeps 394 of the 398 decision rows. Stripping the poison is
+    # not repairing the damage.
+    # NULs come from /dev/zero, never from printf: bash's `printf '\0'` emits NOTHING (the shell drops the
+    # byte), so the obvious fixture silently degrades into a plain 200-byte EXCISION — a different damage
+    # shape that would let a NUL-blind scrub pass. head -c on /dev/zero writes the bytes for real.
+    _gp="$(mktemp)"; _sz="$(wc -c < "$_gl")"; _cut=$((_sz/2 + 37))
+    { head -c "$_cut" "$_gl"; head -c 200 /dev/zero; tail -c "+$((_cut+201))" "$_gl"; } > "$_gp" 2>/dev/null
+    # NUL presence is measured by DELETION, not by grep: GNU grep cannot match a NUL byte at all — with a
+    # verified 200-NUL fixture, `grep -qUP '\x00'` (and every $'\x00' spelling, which bash empties into the
+    # match-everything pattern) returns NO MATCH. A grep-based NUL detector reports every poisoned journal
+    # clean. tr -d actually removes the bytes, so a size delta is the byte-level fact.
+    _nul() { local a b; a="$(wc -c < "$1")"; b="$(LC_ALL=C tr -d '\000' < "$1" | wc -c)"; [ "$a" -ne "$b" ]; }
+    _nul "$_gp" || { echo "smoke-test: FAIL (gate-scrub: fixture carries no NUL bytes — it is not the damage shape being tested)"; rm -f "$_gl" "$_gp"; exit 1; }
+    if command -v hledger >/dev/null 2>&1; then
+      hledger -f "$_gp" check >/dev/null 2>&1 && { echo "smoke-test: FAIL (gate-scrub: fixture must genuinely break hledger BEFORE the repair — it parsed clean, so the test asserts nothing)"; rm -f "$_gl" "$_gp"; exit 1; }
+    fi
+    # ORDER MATTERS: the byte/parse legs are asserted BEFORE the announce leg. With announce first, EVERY
+    # mutant died on it — a no-op scrub, a tr-strip scrub and a silent scrub all reported the same failure,
+    # so the legs that carry the actual claim (NULs gone, hledger parses again) were never seen red at all.
+    _sc="$(MESH_PACE_GATE_LOG="$_gp" "$0" --gate-ledger 2>&1)"
+    _nul "$_gp" && { echo "smoke-test: FAIL (gate-scrub: NUL bytes survived the repair)"; rm -f "$_gl" "$_gp"; exit 1; }
+    if command -v hledger >/dev/null 2>&1; then
+      hledger -f "$_gp" check >/dev/null 2>&1 || { echo "smoke-test: FAIL (gate-scrub: journal must pass hledger check AFTER the repair)"; rm -f "$_gl" "$_gp"; exit 1; }
+    fi
+    grep -q 'gate:decision:over ' "$_gp" || { echo "smoke-test: FAIL (gate-scrub: repair destroyed the surviving decisions)"; rm -f "$_gl" "$_gp"; exit 1; }
+    case "$_sc" in *repaired*) ;; *) echo "smoke-test: FAIL (gate-scrub: reader must ANNOUNCE the repair, not heal silently)"; rm -f "$_gl" "$_gp"; exit 1;; esac
+    _sc2="$(MESH_PACE_GATE_LOG="$_gp" "$0" --gate-ledger 2>&1)"
+    case "$_sc2" in *repaired*) echo "smoke-test: FAIL (gate-scrub: must be a silent no-op on an already-clean journal)"; rm -f "$_gl" "$_gp"; exit 1;; esac
+    rm -f "$_gl" "$_gp"
     # ANTAGONISTIC CONTROLLER PAIR / CONTROL MODE (Ruoff 2025) — hermetic: three synthetic turn tapes
     # drive the REAL control_mode_state (no override short-circuits its classifier; only the tape and the
     # span are injected, exactly as the --burden legs do). The three fixtures are the three modes the
@@ -693,9 +778,17 @@ case "${1:-}" in
     # (real double-entry balance), else an awk tally over the same journal — the answer is identical.
     if [ ! -s "$PACE_GATE_LOG" ]; then echo "gate-ledger: empty ($PACE_GATE_LOG) — no hard-cap decision booked yet"; exit 0; fi
     echo "gate-ledger: $PACE_GATE_LOG"
+    _gate_scrub && echo "  (journal was crash-poisoned — repaired above; hledger consumers parse it again)"
     if command -v hledger >/dev/null 2>&1; then
-      hledger -f "$PACE_GATE_LOG" balance gate:decision --no-total --flat 2>/dev/null \
-        || awk '/gate:decision:/{split($1,a,":"); c[a[3]]++} END{for(k in c) printf "  %8d  gate:decision:%s\n", c[k], k}' "$PACE_GATE_LOG"
+      # The hledger→awk fallback must SAY it fell back. Silently swallowing the parse error rendered a
+      # plausible awk tally while every OTHER hledger consumer of the same journal was erroring out —
+      # exactly the fallback that makes a total failure look like a constant. Same answer, loud provenance.
+      _hl_err="$(mktemp)"
+      hledger -f "$PACE_GATE_LOG" balance gate:decision --no-total --flat 2>"$_hl_err" \
+        || { echo "  WARN: hledger could not parse this journal — falling back to awk tally"
+             sed -n '1,2p' "$_hl_err" | sed 's/^/    /'
+             awk '/gate:decision:/{split($1,a,":"); c[a[3]]++} END{for(k in c) printf "  %8d  gate:decision:%s\n", c[k], k}' "$PACE_GATE_LOG"; }
+      rm -f "$_hl_err"
     else
       awk '/gate:decision:/{split($1,a,":"); c[a[3]]++} END{for(k in c) printf "  %8d  gate:decision:%s\n", c[k], k}' "$PACE_GATE_LOG"
     fi
