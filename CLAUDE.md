@@ -158,6 +158,30 @@ node, and a bad edit severs the path you reach the node through. Before any subs
 rides the offered route, and the forwarding mark must **exclude** LAN/private ranges (`10/8`,
 `172.16/12`, `192.168/16`) and Tailscale CGNAT (`100.64/10`). `mesh-card --refresh` flags violations.
 
+**The NESTING invariant — never add a path the UPSTREAM already carries (operator 2026-08-11).** A
+tunnel is not additive. If the node's router/gateway already egresses through the same VPN, a second
+tunnel raised *on the host* does not "also" reach the world — it nests inside the first, and the
+node's own traffic loops out through a path it is already inside. mesh-home carried exactly this:
+the router held the LAN VPN, `wg-quick@wg-mesh` held a consumer tunnel to phaedra, and the operator
+had to `wg-quick down` **by hand** to get mesh connectivity back. So, before raising ANY tunnel,
+route, exit-node or proxy on a node: **establish what the upstream already provides, and if it
+provides it, the answer is not to add — it is to consume.** A capability the path already has is not
+missing.
+
+That failure has a name and it generalises past routing: **a change is SELF-DEFEATING when it
+disables the channel through which it would be undone.** No `mesh-dms` fires if the mind cannot be
+reached; no reflex heals a link it is reaching over; every rollback in this doctrine is written on
+the assumption that the mesh can still be *spoken to*. The gate is not "is this reversible?" but
+"**is this reversible FROM OUTSIDE ITSELF?**" — and if the honest answer is that the operator's hands
+are the rollback path, the change does not go in. Two consequences, both binding: **the artifact for
+a path change is reachability measured from a vantage the change cannot sever** (a peer's
+`mesh-tell --peek`, another node's `mesh-health`), never a local "the interface came up"; and **the
+operator having to fix connectivity by hand IS the incident** — log it, name the self-defeating edge,
+and make the node's role explicit so nothing re-raises it (mesh-home: `MESH_EGRESS_TUNNEL=off` in
+`~/.mesh/nodes` → `mesh-egress-tunnel` renders n/a and `--test` exits 2, so `mesh-autowire` cannot
+resurrect the reflex, and the `VPN_EGRESS_*` block is commented out so `mesh-fix-egress` no-ops).
+A role declared only in a mind's memory is re-raised by the next reflex that reads the config.
+
 Full protocol + the 2026-06-07 worked example: `docs/coordination.md`.
 
 ## End-of-session protocol (mandatory)
