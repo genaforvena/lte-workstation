@@ -33,6 +33,10 @@ RX_STATE = MESH / ".voice-rx-state"
 OPERATOR_FYI_LOG = Path(os.environ.get("MESH_OPERATOR_FYI_LOG", str(MESH / "operator-fyi.log")))
 LOCK_F = Path(os.environ.get("MESH_VOICE_RX_LOCK", str(MESH / ".voice-rx.lock")))
 _LOCK_FH = None
+# Bounded hold for the operator's original voice audio (see the voice-hold block in transcribe()).
+# Long enough that a misclassified recording survives until he asks for it, short enough that this
+# is retention and not an archive. 0 restores the old destroy-on-classify behaviour (do not).
+VOICE_HOLD_DAYS = float(os.environ.get("MESH_VOICE_HOLD_DAYS", "7"))
 SCRUB_CMD = os.environ.get("MESH_LOG_SCRUB_CMD", "mesh-log-scrub")
 
 # Route through mesh-whisper-run (nice+ionice+flock shim, drop-in args) so a voice-note burst can't
@@ -158,7 +162,7 @@ def acquire_instance_lock():
 
 # Reject a competing poller before opening logs or spawning the scrubber. Focused unit-style tests do
 # not poll Telegram, so they may run beside the live receiver.
-_NO_POLL_TEST = len(sys.argv) > 1 and sys.argv[1] in ('--test-operator-fyi-routing', '--test-image-routing', '--test-document-board-claim')
+_NO_POLL_TEST = len(sys.argv) > 1 and sys.argv[1] in ('--test-operator-fyi-routing', '--test-image-routing', '--test-document-board-claim', '--test-voice-hold')
 if not _NO_POLL_TEST and not acquire_instance_lock():
     sys.exit(0)
 
@@ -444,6 +448,76 @@ def _music_only(txt):
     residue = _NOISE_ANNOT.sub(" ", txt)
     return re.sub(r"[\s\.,!\?\-–—…]+", "", residue) == ""
 
+def _hold_audio(oga, hold_dir=None, days=None):
+    """Move the operator's original voice audio into a BOUNDED hold instead of deleting it.
+
+    Returns the held path (or None if there was nothing to hold / the move failed). Separated from
+    transcribe() so the retention contract is assertable offline — transcribe() itself is all
+    network I/O, and a rule asserted only inside it is not asserted.
+    """
+    hold = Path(hold_dir) if hold_dir else (MESH / "voice-hold")
+    d = VOICE_HOLD_DAYS if days is None else days
+    dest = None
+    try:
+        hold.mkdir(parents=True, exist_ok=True)
+        if oga is not None and Path(oga).exists():
+            dest = hold / f"voice-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}.oga"
+            Path(oga).replace(dest)
+        cutoff = time.time() - d * 86400
+        for old in hold.glob("voice-*.oga"):
+            if old.stat().st_mtime < cutoff:
+                old.unlink()
+    except OSError as e:
+        print(f"[voice-rx] voice-hold failed: {str(e)[:80]}", file=sys.stderr)
+        return None
+    return dest
+
+
+if len(sys.argv) > 1 and sys.argv[1] == '--test-voice-hold':
+    # GATE for the retention contract (2026-08-14). Goes RED if the hold is ever reverted to an
+    # unlink, if the prune window stops binding, or if a "speech" transcript can still destroy audio.
+    import tempfile
+    ok = True
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td); hold = td / "hold"
+        src = td / "voice-in.oga"; src.write_bytes(b"OGGSfake")
+        # 1. A note whose transcript reads as SPEECH must STILL keep its audio. This is the whole
+        #    fix: whisper hallucinated fluent lyrics over the operator's guitar recording, so the
+        #    text classifier said "speech" and the old code unlinked the file.
+        held = _hold_audio(src, hold_dir=hold, days=7)
+        if held is None or not held.exists() or held.read_bytes() != b"OGGSfake":
+            print("smoke-test: FAIL (audio not held — a misclassified recording would be destroyed)")
+            ok = False
+        if ok and src.exists():
+            print("smoke-test: FAIL (original left in place — transcribe() unlinks it next line)")
+            ok = False
+        # 2. Retention is BOUNDED, not an archive: anything past the window is pruned.
+        if ok:
+            stale = hold / "voice-20200101T000000000000Z.oga"; stale.write_bytes(b"old")
+            os.utime(stale, (time.time() - 30 * 86400, time.time() - 30 * 86400))
+            fresh = _hold_audio(None, hold_dir=hold, days=7)
+            if stale.exists():
+                print("smoke-test: FAIL (stale hold entry not pruned — retention is unbounded)")
+                ok = False
+            if ok and not held.exists():
+                print("smoke-test: FAIL (prune ate an in-window entry)")
+                ok = False
+            if ok and fresh is not None:
+                print("smoke-test: FAIL (holding nothing must return None, not a path)")
+                ok = False
+        # 3. Two notes in the same second must not collide (one overwriting the other is a
+        #    quieter version of the same data loss).
+        if ok:
+            a = td / "a.oga"; a.write_bytes(b"A")
+            b = td / "b.oga"; b.write_bytes(b"B")
+            pa = _hold_audio(a, hold_dir=hold, days=7); pb = _hold_audio(b, hold_dir=hold, days=7)
+            if pa is None or pb is None or pa == pb or not (pa.exists() and pb.exists()):
+                print("smoke-test: FAIL (same-second notes collide — one recording overwrites another)")
+                ok = False
+    print("smoke-test: ok" if ok else "smoke-test: FAILED")
+    sys.exit(0 if ok else 1)
+
+
 if len(sys.argv) > 1 and sys.argv[1] == '--test-image-routing':
     ok = True
     # ALBUM COLLISION gate (2026-07-25): two DIFFERENT photos of one album must land on two different
@@ -625,6 +699,21 @@ def transcribe(file_id):
                    f"as the source, and reply to the operator")
         except OSError:
             pass
+    # HOLD, don't destroy. The line below used to `unlink()` the operator's original .oga whenever
+    # `_music_only(txt)` was False — i.e. the irreversible step was gated on a TEXT classifier reading
+    # a hallucination-prone transcript. That gate cannot see the case it most needs to: whisper does
+    # not always render music as annotations, it sometimes hallucinates fluent LYRICS. Then the
+    # transcript is indistinguishable from speech by text alone, `_music_only` says False (correctly,
+    # on the text it was given), and the audio is deleted.
+    # 2026-08-14 21:41Z, the second time this destroyed operator material: he sent a GUITAR RECORDING
+    # made on the mac, asking us to calibrate the guitar-extraction with it. whisper returned a full
+    # verse-and-chorus lyric over the instrumental; no alphabet widening can catch that (the
+    # 2026-07-31 fix at _NOISE_ANNOT widened the alphabet and is orthogonal). The .oga was unlinked
+    # and the recording exists nowhere on this node — only in his Telegram account.
+    # So: stop deciding destruction from a guess. A misclassification now costs disk, not the
+    # material. Retention stays BOUNDED (the privacy stance is unchanged in kind — the audio was
+    # never meant to live forever, only to survive long enough to be recoverable).
+    _hold_audio(oga)
     for p in (oga, wav):
         try: p.unlink()
         except OSError: pass
