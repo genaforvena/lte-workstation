@@ -52,6 +52,10 @@
 #   mesh-vram-watch --json   machine-readable
 #   mesh-vram-watch --edge   emit only on band change (state still refreshed every success)
 #   mesh-vram-watch --test   fixture-backed classifier (RED-first) + real-read gate
+#
+# UNREACHABLE is a CONDITION, not an event (see offline_announce below): an INSTALLED-but-dead GPU
+# re-announces on a backoff with the outage duration and posts [gpu-down] to the board; an ABSENT
+# dGPU says so once and stays quiet. MESH_VRAM_OFFLINE_RENOTIFY_S tunes the backoff (default 3600).
 set -uo pipefail
 export PATH="$HOME/.local/bin:$PATH"
 [ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
@@ -189,6 +193,62 @@ classify_all() {
   printf '%s|%s\n' "$best_label" "$best_reason"
 }
 
+# ---- the organ being DOWN is a CONDITION, not an EVENT ---------------------
+# 2026-08-14: the node rebooted into kernel 6.8.0-137 and the nvidia module never loaded. The
+# one-shot sentinel below announced ONCE at 12:50Z and the next 43 ticks emitted NOTHING, while
+# ollama ran every vision/STT/wake-gate call on CPU for 7h08m. A latch that turns an ongoing
+# outage into a single line is the deauth-is-an-event-a-wedge-is-a-condition shape.
+#
+# Two causes the old code collapsed into one silence, separated here:
+#   ABSENT  no nvidia-smi at all → this node simply has no dGPU. Say it ONCE, then stay quiet
+#           forever; a per-tick line about a card that was never here is pure noise.
+#   DOWN    nvidia-smi is INSTALLED but its query fails → the organ EXISTS and is broken. That is
+#           an ongoing incident: re-announce on a backoff and post it to the board, because the
+#           cost (all local inference silently on CPU) accrues every minute it holds.
+#
+# And it must be DATABLE. `.vram-watch.state` cannot date the outage — it is only written on a
+# SUCCESSFUL read, so during a real outage its mtime is frozen at the last healthy tick (that is
+# honest blindness, not a bug; do NOT touch it here or the freshness would be forged). The
+# sentinel is the one artifact that exists across the whole outage, so it carries `since` in its
+# own content, falling back to its own mtime for a sentinel written by the pre-fix code.
+OFFLINE_RENOTIFY_S="${MESH_VRAM_OFFLINE_RENOTIFY_S:-3600}"   # DOWN re-announce backoff (ABSENT never repeats)
+
+_dur() { # seconds → compact human duration
+  local s="${1:-0}"
+  if   [ "$s" -ge 3600 ]; then printf '%dh%02dm' $(( s / 3600 )) $(( (s % 3600) / 60 ))
+  elif [ "$s" -ge 60   ]; then printf '%dm' $(( s / 60 ))
+  else printf '%ds' "$s"; fi
+}
+
+offline_announce() { # $1=ABSENT|DOWN  $2=what the read said
+  local kind="$1" what="$2"
+  local now since kind_prev last down say=0 line
+  now="$(date +%s)"
+  since=""; kind_prev=""; last=""
+  [ -f "$OFFLINEFILE" ] && read -r since kind_prev last < "$OFFLINEFILE" 2>/dev/null
+  # a sentinel from the pre-fix code is EMPTY — recover the start from its own mtime, never "now"
+  case "$since" in ''|*[!0-9]*) since="$(stat -c %Y "$OFFLINEFILE" 2>/dev/null || echo "$now")" ;; esac
+  case "$last"  in ''|*[!0-9]*) last=0 ;; esac
+  [ "$kind_prev" = "$kind" ] || last=0        # cause changed → speak the new one
+  down=$(( now - since ))
+  if   [ "$last" -eq 0 ]; then say=1                                                    # first sighting
+  elif [ "$kind" = DOWN ] && [ $(( now - last )) -ge "$OFFLINE_RENOTIFY_S" ]; then say=1 # still down
+  fi
+  [ "$say" = 1 ] && last="$now"
+  printf '%s %s %s\n' "$since" "$kind" "$last" > "$OFFLINEFILE"
+  [ "$say" = 1 ] || return 0
+
+  if [ "$kind" = DOWN ]; then
+    line="vram-watch: GPU DOWN — $what — down=$(_dur "$down") since $(date -u -d "@$since" +%Y-%m-%dT%H:%M:%SZ). The dGPU organ is INSTALLED, so this is an OUTAGE, not an absence: local inference (ollama/gigaam/vision) is running on CPU until it clears."
+    echo "$line" >&2
+    command -v mesh-chat >/dev/null 2>&1 &&
+      MESH_WHO="vram-watch@$(hostname)" mesh-chat "[gpu-down] $line" >/dev/null 2>&1
+  else
+    echo "vram-watch: UNREACHABLE — $what (no dGPU organ on this node — said once, not repeated)" >&2
+  fi
+  return 0
+}
+
 # ---- self-test ------------------------------------------------------------
 if [ "${1:-}" = --test ]; then
   fail() { echo "smoke-test: FAIL ($1)"; exit 1; }
@@ -299,6 +359,50 @@ if [ "${1:-}" = --test ]; then
   # a read MISSING the four link fields (7 cols, e.g. an older driver) must be REJECTED — no fabricated Gen4-x16
   printf '3000, 12288, 0, 300, 2160, 0x0000000000000000, 45\n' | parse_nvsmi >/dev/null 2>&1 && fail "7-field line (no pcie link) must be rejected — link fields are required"
 
+  # ---- offline announcer: a CONDITION must keep speaking, an ABSENCE must not -----------------
+  # Sandboxed: its own MESH dir + a mesh-chat stub on PATH, so the real board is never touched and
+  # the posts this asserts are captured rather than swallowed.
+  _oz="$(mktemp -d)"; trap 'rm -rf "$_oz"' EXIT
+  OFFLINEFILE="$_oz/.vram-watch-offline"
+  printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s/chat.posts"\n' "$_oz" > "$_oz/mesh-chat"
+  chmod +x "$_oz/mesh-chat"; PATH="$_oz:$PATH"
+  _says() { offline_announce "$1" "fixture" 2>>"$_oz/said"; }        # stderr lines = what it announced
+  _nsaid() { [ -s "$_oz/said" ] && grep -c . "$_oz/said" || echo 0; }
+  _nposted() { [ -s "$_oz/chat.posts" ] && grep -c . "$_oz/chat.posts" || echo 0; }
+
+  # ABSENT: says it once, then NEVER again — a card that was never here is not an incident.
+  _says ABSENT; _says ABSENT; _says ABSENT
+  [ "$(_nsaid)" = 1 ] || fail "ABSENT must announce exactly ONCE across 3 ticks, got $(_nsaid) line(s)"
+  [ "$(_nposted)" = 0 ] || fail "ABSENT must never post to the board (no dGPU is not an outage)"
+  case "$(cat "$_oz/said")" in *"not repeated"*) : ;; *) fail "ABSENT line must say it will not repeat: $(cat "$_oz/said")" ;; esac
+
+  # DOWN: the 2026-08-14 shape. First tick speaks; a tick inside the backoff stays quiet; a tick
+  # PAST the backoff speaks AGAIN — the outage cannot go silent while it holds.
+  rm -f "$_oz/.vram-watch-offline" "$_oz/said" "$_oz/chat.posts"
+  MESH_VRAM_OFFLINE_RENOTIFY_S=3600; OFFLINE_RENOTIFY_S=3600
+  _says DOWN
+  [ "$(_nsaid)" = 1 ] || fail "DOWN must announce on first sighting, got $(_nsaid)"
+  [ "$(_nposted)" = 1 ] || fail "DOWN must post [gpu-down] to the board (a log nobody reads is how 7h08m passed unnoticed)"
+  case "$(cat "$_oz/chat.posts")" in \[gpu-down\]*) : ;; *) fail "board post must carry the [gpu-down] marker, got: $(cat "$_oz/chat.posts")" ;; esac
+  _says DOWN
+  [ "$(_nsaid)" = 1 ] || fail "DOWN inside the backoff must stay quiet, got $(_nsaid) line(s)"
+  # rewind `since` and `last` past the backoff → the SAME condition must be re-announced
+  read -r _os _ok _ol < "$_oz/.vram-watch-offline"
+  printf '%s %s %s\n' "$(( _os - 26000 ))" "$_ok" "$(( _ol - 26000 ))" > "$_oz/.vram-watch-offline"
+  _says DOWN
+  [ "$(_nsaid)" = 2 ] || fail "an ONGOING outage must re-announce past the backoff, got $(_nsaid) line(s)"
+  # and every re-announce must be DATABLE — the state file cannot date it, the sentinel must
+  case "$(tail -n1 "$_oz/said")" in *"down=7h13m"*) : ;; *) fail "re-announce must carry the outage duration from the sentinel, got: $(tail -n1 "$_oz/said")" ;; esac
+  case "$(tail -n1 "$_oz/said")" in *since*) : ;; *) fail "re-announce must name the outage start, got: $(tail -n1 "$_oz/said")" ;; esac
+
+  # a pre-fix EMPTY sentinel must date the outage from its own MTIME, not from now (else every
+  # upgrade resets a running outage to zero)
+  rm -f "$_oz/.vram-watch-offline" "$_oz/said" "$_oz/chat.posts"
+  : > "$_oz/.vram-watch-offline"; touch -d '@'"$(( $(date +%s) - 7200 ))" "$_oz/.vram-watch-offline"
+  _says DOWN
+  case "$(cat "$_oz/said")" in *"down=2h0"*) : ;; *) fail "empty (pre-fix) sentinel must date from its mtime, got: $(cat "$_oz/said")" ;; esac
+  rm -rf "$_oz"; trap - EXIT; OFFLINEFILE="$MESH/.vram-watch-offline"
+
   # real-read gate: a LIVE nvidia-smi must yield a parseable hex bitmask + numeric used + numeric temp, or exit 2
   if ! command -v "$NVSMI" >/dev/null 2>&1; then
     echo "smoke-test: n/a (no nvidia-smi on this node — no dGPU organ)"; exit 2
@@ -311,7 +415,7 @@ if [ "${1:-}" = --test ]; then
   case "$temp" in ''|*[!0-9]*) fail "live read missing numeric temperature.gpu: $live" ;; esac
   case "$widthcur" in ''|*[!0-9]*) fail "live read missing numeric pcie.link.width.current: $live" ;; esac
   case "$widthmax" in ''|*[!0-9]*) fail "live read missing numeric pcie.link.width.max: $live" ;; esac
-  echo "smoke-test: ok (idle-benign + 9 RED axes + temp/gen/width warn+trap + clamp-vs-idle + spill-unknown + garbage/no-temp/no-link reject + live read: used=${used}/${total}MiB util=${util}% clk=${curclk}/${maxclk}MHz mask=${mask} temp=${temp}C pcie=gen${gencur}/${genmax}x${widthcur}/${widthmax})"
+  echo "smoke-test: ok (idle-benign + 9 RED axes + temp/gen/width warn+trap + clamp-vs-idle + spill-unknown + garbage/no-temp/no-link reject + offline condition-vs-absence (once/backoff/re-announce/mtime-dating/board post) + live read: used=${used}/${total}MiB util=${util}% clk=${curclk}/${maxclk}MHz mask=${mask} temp=${temp}C pcie=gen${gencur}/${genmax}x${widthcur}/${widthmax})"
   exit 0
 fi
 # ---------------------------------------------------------------------------
@@ -320,11 +424,11 @@ JSON=0; EDGE=0
 for a in "$@"; do case "$a" in --json) JSON=1 ;; --edge) EDGE=1 ;; esac; done
 
 command -v "$NVSMI" >/dev/null 2>&1 || {
-  [ -f "$OFFLINEFILE" ] || { echo "vram-watch: UNREACHABLE — no nvidia-smi (no dGPU organ on this node)" >&2; : > "$OFFLINEFILE"; }
+  offline_announce ABSENT "no nvidia-smi binary"
   exit 2
 }
 LIVE="$("$NVSMI" --query-gpu=memory.used,memory.total,utilization.gpu,clocks.current.graphics,clocks.max.graphics,clocks_event_reasons.active,temperature.gpu,pcie.link.gen.current,pcie.link.gen.max,pcie.link.width.current,pcie.link.width.max --format=csv,noheader,nounits 2>/dev/null | parse_nvsmi)" || {
-  [ -f "$OFFLINEFILE" ] || { echo "vram-watch: UNREACHABLE — nvidia-smi unreadable (driver down?)" >&2; : > "$OFFLINEFILE"; }
+  offline_announce DOWN "nvidia-smi present but its query failed (driver/module not loaded?)"
   exit 2
 }
 rm -f "$OFFLINEFILE" 2>/dev/null || true
