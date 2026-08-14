@@ -426,11 +426,41 @@ read_voice_rx_state(){   # -> OK | ERR:<class> | STALE | ?
   find "$f" -mmin "-$VOICE_RX_FRESH_MIN" 2>/dev/null | grep -q . || { echo "STALE"; return; }
   awk '{print $1; exit}' "$f" 2>/dev/null || echo "?"    # field 1 of "<status>\t<iso-ts>"
 }
+# EGRESS CAUSE (2026-08-14, chat-review/stress-egress-bad-mislabeled-geoblock). `.egress-state` is a
+# BINARY OK/BAD bit, and this tool used to read "BAD" as "geo-blocked → channel literally down" —
+# CRITICAL + "run mesh-fix-egress NOW". But mesh-egress-health fires BAD for two orthogonal mechanisms:
+# a 403 geo-block (the Anthropic round-trip is DEAD — a real channel outage) and a country MISMATCH
+# (the round-trip works; we are merely egressing somewhere unexpected — a risk, not an outage). The bit
+# could not tell them apart, so a working channel paged as a down one: measured on mesh-home 2026-08-14,
+# every BAD sample carried anthropic=405 (function alive) with ZERO 403s all day, while stress sat
+# CRITICAL and situation=ALERT. mesh-egress-health now writes the cause in `.egress-cause` beside the
+# bit; we read it. NO sidecar (older writer, other node) ⇒ cause "?" ⇒ the old conservative CRITICAL
+# stands — an absent cause is not evidence of a benign one (never a faked all-clear).
+read_egress_cause(){   # -> egress_cause (OK|GEOBLOCK|ISO-MISMATCH|?), egress_fn (PRESERVED|IMPAIRED|UNKNOWN|?)
+  egress_cause="?"; egress_fn="?"
+  if [ -n "${MESH_STRESS_EGRESS_CAUSE:-}" ]; then set -- $MESH_STRESS_EGRESS_CAUSE   # --test / injection
+  else
+    local f="$MESH_DIR/.egress-cause"; [ -f "$f" ] || return 0
+    set -- $(cat "$f" 2>/dev/null)
+  fi
+  [ -n "${1:-}" ] && egress_cause="$1"
+  case "${2:-}" in qfunc=*) egress_fn="${2#qfunc=}" ;; esac
+}
+# Pure fusion rule (no clock, no files → --test drives every branch). CRITICAL is reserved for the
+# channel actually being DOWN; a degraded-but-working egress is a WATCH signal, not a page.
+egress_channel(){  # $1=egress_s $2=egress_cause $3=egress_fn -> CALM|WARM|CRITICAL
+  case "$1" in BAD) ;; *) echo CALM; return ;; esac
+  case "$2" in
+    ISO-MISMATCH) [ "$3" = PRESERVED ] && { echo WARM; return; } ;;  # wrong country, round-trip alive → watch
+  esac
+  echo CRITICAL   # GEOBLOCK, an impaired/unknown function, or no cause sidecar at all
+}
 read_siblings() {
   therm_s=$(cat "$MESH_DIR/.therm-state" 2>/dev/null || echo "?")            # HOT / OK
   router_s=$(cat "$MESH_DIR/.router-thermal-state" 2>/dev/null || echo "?")  # hot / cool
   egress_s=$(cat "$MESH_DIR/.egress-state" 2>/dev/null || echo "?")          # OK / BAD
-  voicerx_s=$(read_voice_rx_state)                                           # OK / ERR:<class> / STALE / ?
+  read_egress_cause                                                          # -> egress_cause, egress_fn
+  voicerx_s=$(read_voice_rx_state)                                         # OK / ERR:<class> / STALE / ?
   pkg_s=$(read_pkg_state)                                                    # LOW / NORMAL / HIGH / ?
   gpu_s=$(read_gpu_state)                                                    # IDLE / LIGHT / BUSY / ?
   swap_s=$(read_swap_state)                                                  # IDLE / LIGHT / THRASHING / ?
@@ -482,7 +512,9 @@ assess() {
   # CHANNEL pressure from cached sibling reflexes — the operator channel dies without heat too.
   local channel=CALM
   [ "$router_s" = hot ] && channel=$(worse "$channel" STRESSED)   # LAN+egress at risk
-  [ "$egress_s" = BAD ] && channel=$(worse "$channel" CRITICAL)   # geo-blocked → channel literally down
+  # egress: CRITICAL only for a channel that is actually DOWN (403 geo-block / round-trip impaired /
+  # cause unknown); a wrong-country egress whose Anthropic round-trip is alive is WARM (see egress_channel).
+  channel=$(worse "$channel" "$(egress_channel "$egress_s" "${egress_cause:-?}" "${egress_fn:-?}")")
   # OPERATOR CHANNEL (inbound): a fresh voice-rx error OR a wedged/dead poller (STALE) is the actual
   # channel impaired — STRESSED, matching router=hot (a WATCH-level "at risk", not the CRITICAL hard-
   # down egress geo-block gets). "?"/OK never escalate: absent writer = no signal, OK = channel up.
@@ -540,7 +572,8 @@ reason_str() {
     case "${gpu_s:-?}" in BUSY) r="$r(burn:gpu)";; IDLE) r="$r(burn:cpu)";; esac; }
   [ "$decoupled" = yes ] && r="$r temp-frozen(decoupled)"
   [ "$router_s" = hot ] && r="$r router=HOT"
-  [ "$egress_s" = BAD ] && r="$r egress=BAD"
+  # Name the MECHANISM, never just the bit — "egress=BAD" alone was read as "geo-blocked" for months.
+  [ "$egress_s" = BAD ] && r="$r egress=BAD(${egress_cause:-?},fn=${egress_fn:-?})"
   case "$voicerx_s" in
     ERR:*) r="$r operator-channel=${voicerx_s}" ;;                    # e.g. operator-channel=ERR:dns
     STALE) r="$r operator-channel=STALE(poller-wedged?)" ;;
@@ -563,14 +596,27 @@ reason_str() {
   echo "$r"
 }
 
+# Is `mesh-fix-egress` an ACTION on THIS node, or a clean no-op? It exits 2 by design where the node
+# offers no VPN egress (no VPN_EGRESS_* in ~/.mesh/nodes — mesh-home since the 2026-08-11 nesting
+# rollback), so prescribing it there demands an action that cannot run. Prescribe the remedy only where
+# it applies; elsewhere say what the operator can actually do. (MESH_STRESS_FIX_EGRESS_RC drives --test.)
+egress_remedy(){  # -> the operator instruction for a down/degraded egress on THIS node
+  local rc="${MESH_STRESS_FIX_EGRESS_RC:-}"
+  [ -n "$rc" ] || { mesh-fix-egress --test >/dev/null 2>&1; rc=$?; }
+  [ "$rc" = 2 ] && { echo "mesh-fix-egress is n/a on this node (offers no VPN egress) → check the UPSTREAM path (router/gateway VPN) and ~/.mesh/egress.conf's expected ISO"; return; }
+  echo "mesh-fix-egress NOW"
+}
 advice() {
   case "$level" in
-    CRITICAL) [ "$egress_s" = BAD ] && { echo "egress geo-blocked → mesh-fix-egress NOW"; return; }
+    CRITICAL) [ "$egress_s" = BAD ] && [ "$(egress_channel "$egress_s" "${egress_cause:-?}" "${egress_fn:-?}")" = CRITICAL ] &&
+                { echo "egress DOWN (${egress_cause:-?}, function ${egress_fn:-?}) → $(egress_remedy)"; return; }
               echo "at/over throttle → auto new-load shed ACTIVE (tick-skip + dispatch-hold ≥92C). Sustained = the running mind set alone overheats this box → operator lever: fewer MESH_MIND_CHANNELS / re-enable offload. Do NOT pause a running mind (loses work; mesh-supervise has no thermal shed)";;
     STRESSED) [ "$router_s" = hot ] && { echo "router hot → check gateway airflow/load"; return; }
               [ "$swap_s" = THRASHING ] && { echo "memory THRASHING (≥500 pg/s sustained swap) → box is paging hard, memory-bound stall (not heat) → free RAM / shed a mind"; return; }
               echo "in the 95-97C throttle zone → new-load auto-hold is engaging; don't pile heavy work. Running minds are NOT shed (by design — shed new load, never touch a running mind)";;
-    WARM)     echo "watch — load/heat building";;
+    WARM)     [ "$egress_s" = BAD ] && [ "${egress_cause:-?}" = ISO-MISMATCH ] && [ "${egress_fn:-?}" = PRESERVED ] &&
+                { echo "egress exits the WRONG country but the Anthropic round-trip is ALIVE (anth ok) — a risk to watch, NOT a geo-block: verify ~/.mesh/egress.conf's expected ISO still matches this node's real path"; return; }
+              echo "watch — load/heat building";;
     *)        echo "ok";;
   esac
 }
@@ -595,6 +641,36 @@ case "${1:-}" in
     [ "$temp" = 71 ] || { rm -rf "$_hf"; echo "smoke-test: FAIL (cross-tier max: zone 71C over hwmon 67C, got temp=$temp)"; exit 1; }
     STRESS_ZONE_GLOB="$_hf/nozone*/temp" STRESS_HWMON_GLOB="$_hf/nohwmon*/temp*_input" read_local
     [ "$temp" = -1 ] || { rm -rf "$_hf"; echo "smoke-test: FAIL (no thermal organ anywhere must stay -1, never a fake reading, got temp=$temp)"; exit 1; }
+    # EGRESS CAUSE (chat-review/stress-egress-bad-mislabeled-geoblock): a BAD bit is not a geo-block.
+    ec=0
+    [ "$(egress_channel OK OK PRESERVED)"           = CALM ]     || { echo "  FAIL: egress OK must not touch the channel band"; ec=1; }
+    [ "$(egress_channel '?' '?' '?')"               = CALM ]     || { echo "  FAIL: an absent egress writer is no signal, not pressure"; ec=1; }
+    [ "$(egress_channel BAD GEOBLOCK IMPAIRED)"     = CRITICAL ] || { echo "  FAIL: a real 403 geo-block must still be CRITICAL"; ec=1; }
+    [ "$(egress_channel BAD ISO-MISMATCH PRESERVED)" = WARM ]    || { echo "  FAIL: wrong country + LIVE Anthropic round-trip is a WATCH, not a channel-down page"; ec=1; }
+    [ "$(egress_channel BAD ISO-MISMATCH IMPAIRED)" = CRITICAL ] || { echo "  FAIL: wrong country AND an impaired round-trip is a real outage"; ec=1; }
+    [ "$(egress_channel BAD '?' '?')"               = CRITICAL ] || { echo "  FAIL: BAD with NO cause sidecar must stay conservatively CRITICAL (no faked all-clear)"; ec=1; }
+    [ "$ec" = 0 ] || { echo "smoke-test: FAIL (egress cause fusion drifted)"; exit 1; }
+    # the sidecar reader, incl. the injection path and a missing file
+    _ed=$(mktemp -d); _mdsave="$MESH_DIR"; MESH_DIR="$_ed"
+    read_egress_cause; [ "$egress_cause" = "?" ] && [ "$egress_fn" = "?" ] || { rm -rf "$_ed"; MESH_DIR="$_mdsave"; echo "smoke-test: FAIL (missing .egress-cause must read '?/?', never a benign default)"; exit 1; }
+    printf 'ISO-MISMATCH qfunc=PRESERVED anth=405\n' > "$_ed/.egress-cause"
+    read_egress_cause; [ "$egress_cause" = ISO-MISMATCH ] && [ "$egress_fn" = PRESERVED ] || { rm -rf "$_ed"; MESH_DIR="$_mdsave"; echo "smoke-test: FAIL (cause sidecar parse: got '$egress_cause'/'$egress_fn')"; exit 1; }
+    rm -rf "$_ed"; MESH_DIR="$_mdsave"
+    # end-to-end: the fused level + the operator string, both directions, with the thermal bands pinned away
+    ( WARM_C=900 STRESSED_C=901 CRIT_C=902
+      MESH_STRESS_EGRESS_CAUSE='ISO-MISMATCH qfunc=PRESERVED anth=405' MESH_STRESS_FIX_EGRESS_RC=2
+      export MESH_STRESS_EGRESS_CAUSE MESH_STRESS_FIX_EGRESS_RC
+      assess; egress_s=BAD; read_egress_cause
+      level=$(worse CALM "$(egress_channel BAD "$egress_cause" "$egress_fn")")
+      [ "$level" = WARM ] || { echo "smoke-test: FAIL (working-but-wrong-country egress must fuse to WARM, got $level)"; exit 1; }
+      reason_str | grep -q 'egress=BAD(ISO-MISMATCH,fn=PRESERVED)' || { echo "smoke-test: FAIL (the report must name the mechanism, not just the bit)"; exit 1; }
+      advice | grep -q 'geo-block' || { echo "smoke-test: FAIL (the WARM advice must say what it is NOT)"; exit 1; }
+      advice | grep -q 'mesh-fix-egress NOW' && { echo "smoke-test: FAIL (a working channel must never demand mesh-fix-egress)"; exit 1; }
+      level=CRITICAL; egress_cause=GEOBLOCK egress_fn=IMPAIRED
+      advice | grep -q 'egress DOWN (GEOBLOCK' || { echo "smoke-test: FAIL (a real geo-block must still page)"; exit 1; }
+      advice | grep -q 'n/a on this node' || { echo "smoke-test: FAIL (an inapplicable remedy must not be prescribed — mesh-fix-egress exits 2 here)"; exit 1; }
+      MESH_STRESS_FIX_EGRESS_RC=0 advice | grep -q 'mesh-fix-egress NOW' || { echo "smoke-test: FAIL (where the remedy DOES apply it must still be prescribed)"; exit 1; }
+    ) || exit 1
     temp=-1 load_norm=0 minds=0 climbing=no decoupled=no router_s=cool egress_s=OK pkg_s=? gpu_s=? swap_s=? allo_n=-1 regime_s=? leading=no chronic=no brittle=no
     reason_str | grep -q 'temp=?(no-organ)' || { rm -rf "$_hf"; echo "smoke-test: FAIL (temp=-1 must render as the honest '?(no-organ)', not a plausible number)"; exit 1; }
     rm -rf "$_hf"
