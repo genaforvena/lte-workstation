@@ -123,6 +123,28 @@ carrying a `# reflex-cadence:` header. And a wired reflex can still be vacuous �
 tends a window the re-org deleted, so cronning it yields a permanently green reflex tending a phantom.
 Check the reflex has a TARGET THAT EXISTS, not just a cadence. (cc617e5.)
 
+Extend it to **the SAMPLE THAT IS NOT THE INTERVAL — a live sense can be blind without ever being
+wrong.** A reflex's coverage is its sampling WINDOW divided by its CADENCE, and nothing in a green
+`--test`, a fresh mtime, or an honest reading exposes the ratio. `mesh-psi` read `avg10` — a
+10-second kernel average — once per 600s cron tick: **1.7% of wallclock**, and the `--edge`
+2-consecutive debounce compounded it, requiring a burst to be caught by two independent 1.7% samples
+600s apart, so anything shorter than ~20 minutes could essentially never raise the level. Result:
+`.psi.state` read CALM for **14.2 days** on a node whose real workload (three llama-servers, whisper,
+the grinder) put it at `cpu some=78%, STALLED` the moment a human ran the tool by hand. Every
+liveness frame was honest — the band was live and re-fired on demand, the mtime was 2 minutes old,
+the value-frozen report correctly said "not an alarm" — and the sense was still asleep 98.3% of the
+time while its CALM was read as a claim about the node. Note the shape: `reflex-health`'s
+`value-frozen` flag was the ONLY thing pointing at it, and it points at both real constancy and this,
+so it is a lead, never a verdict. **Rule: a sense whose window is narrower than its cadence reports a
+sample, not a state — prefer the kernel's own monotonic ACCUMULATOR (`total=` in `/proc/pressure`,
+counters in `/proc/diskstats`) delta'd across the interval, which covers 100% of it at zero extra
+cost.** Keep both windows: the interval mean dilutes a sharp spike, the instantaneous one misses
+everything between ticks — they answer different questions, so fold with a max that NAMES its winner
+and publish the coverage IN the reading (`window=inst+iv`), so a consumer can never mistake the
+narrow claim for the wide one. Missing evidence renders `na`, never 0 (a reboot-reset counter read as
+`0` is a fabricated calm). Checked the sibling: `mesh-psi-memory` already reads avg10/60/300 and is
+not this shape. (fe35dd9.)
+
 Extend it to **the gate that greps its own source**: `grep -q '<literal>' "$0"` ALWAYS matches the grep
 line itself, so the gate asserts its own text and can never fail. `mesh-land` carried two guarding the
 mesh's only unattended push; deleting that push entirely still yielded `smoke-test: ok` (**33 of 52**
