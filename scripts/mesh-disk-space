@@ -1,11 +1,25 @@
 #!/usr/bin/env bash
 # reflex-cadence: */15 * * * *
-# mesh-disk-space — ROOT FILESYSTEM SPACE & INODE usage sense.
-# Reads df -P / to monitor disk block and inode space, and tests writeability.
+# mesh-disk-space — LOCAL FILESYSTEM SPACE & INODE usage sense (WORST mount, named).
+# Scans every real local mount (df -P -T), takes the worst block% and worst inode%, and tests
+# writeability of $HOME/.mesh.
 # Why it matters:
 #   - Disk exhaustion (100% blocks) halts database writes, logging, and sync tools.
 #   - Inode exhaustion (100% inodes) prevents creating new files even with gigabytes free.
 #   - Read-only filesystem remounts (due to ext4 / storage faults) drop the node into a zombie state.
+#
+# WHY ALL MOUNTS, NOT JUST $HOME's (2026-08-15, phaedra incident — the /tmp blindness):
+#   this sense read `df -P "$HOME"` ALONE, i.e. exactly one filesystem. phaedra hit 100% /tmp
+#   (59,234 leaked shell-mktemp files) — every write to /tmp failing — while this sense read its
+#   root fs (58G, 88%) and published NORMAL, and mesh-storage-health fused that into
+#   'HEALTHY|capacity=NORMAL' on the same box at the same moment. Nothing was wrong with the
+#   reading: it was an honest claim about a DIFFERENT filesystem than the one that was broken.
+#   A node's storage is not one number, and $HOME is not the only fs its tools write to (/tmp,
+#   /var/tmp, /dev/shm, /boot all break things when full). So: enumerate, take the worst, and
+#   NAME THE MOUNT in the reason — an unattributed 'use=96%' is the same class of mistake, one
+#   level down. Exclusions are deliberate: read-only images (squashfs/iso9660) sit at 100% by
+#   construction and would fake a permanent CRITICAL, and mounts below MIN_KB (64 MiB — /run/lock
+#   at 5 MiB, efivarfs at 128 KiB) are pseudo-scratch whose percentage is noise, not capacity.
 #
 # Usage:
 #   mesh-disk-space           one-shot status check
@@ -23,9 +37,41 @@ export PATH="$HOME/.local/bin:$PATH"
 
 STATE="$HOME/.mesh/.disk-space.state"
 TEST_FILE="$HOME/.mesh/.fs_write_test_$$"
+MIN_KB="${MESH_DISK_MIN_KB:-65536}"   # ignore mounts under 64 MiB (see header)
+DF_X="-x squashfs -x iso9660 -x devtmpfs -x efivarfs -x tracefs -x fuse.snapfuse -x fuse.portal"
 
-classify_disk() { # <use_pct> <inode_pct> <writeable> -> "LABEL|reason"
-  local use="$1" inode="$2" writeable="$3"
+# mount_rows → one row per real local mount: "<mount> <size1k> <use_pct> <inode_pct>"
+# (inode_pct is "-" for filesystems that don't report inodes, e.g. btrfs — that is a missing
+#  AXIS on one mount, never a missing reading for the node.)
+mount_rows() {
+  local bt it
+  bt="$(df -P -T $DF_X 2>/dev/null | tail -n +2)"
+  [ -n "$bt" ] || bt="$(df -P -T 2>/dev/null | tail -n +2)"    # ancient df without -x
+  [ -n "$bt" ] || return 1
+  it="$(df -P -T -i $DF_X 2>/dev/null | tail -n +2)"
+  [ -n "$it" ] || it="$(df -P -T -i 2>/dev/null | tail -n +2)"
+  awk 'NR==FNR { gsub(/%/,"",$6); ip[$NF]=$6; next }
+       { gsub(/%/,"",$6); print $NF, $3, $6, (($NF in ip) ? ip[$NF] : "-") }' \
+      <(printf '%s\n' "$it") <(printf '%s\n' "$bt")
+}
+
+# scan_rows <min_kb> — PURE: reads mount rows on stdin, prints "<use>|<use_mount>|<inode>|<inode_mount>"
+# taking the WORST of each axis over every mount at or above min_kb. No mount at all → OFFLINE.
+scan_rows() {
+  awk -v min_kb="${1:-0}" '
+    { m=$1; sz=$2+0; u=$3; i=$4
+      if (sz < min_kb+0) next
+      if (u ~ /^[0-9]+$/) { if (bm=="" || u+0 > bu) { bu=u+0; bm=m } }
+      if (i ~ /^[0-9]+$/) { if (im=="" || i+0 > bi) { bi=i+0; im=m } } }
+    END {
+      if (bm=="") { print "OFFLINE|-|OFFLINE|-"; exit }
+      printf "%d|%s|%s|%s\n", bu, bm, (im=="" ? "OFFLINE" : bi""), (im=="" ? "-" : im) }'
+}
+
+classify_disk() { # <use_pct> <inode_pct> <writeable> [use_mount] [inode_mount] -> "LABEL|reason"
+  local use="$1" inode="$2" writeable="$3" um="${4:-}" im="${5:-}"
+  local uw iw
+  uw="${um:+ on $um}"; iw="${im:+ on $im}"
   if [ "$writeable" -ne 1 ] 2>/dev/null; then
     echo "CRITICAL|filesystem is read-only or unwritable"
     return
@@ -35,14 +81,14 @@ classify_disk() { # <use_pct> <inode_pct> <writeable> -> "LABEL|reason"
     return
   fi
   if [ "$use" -ge 95 ] 2>/dev/null || [ "$inode" -ge 95 ] 2>/dev/null; then
-    echo "CRITICAL|exhausted (use=${use}% inode=${inode}%)"
+    echo "CRITICAL|exhausted (use=${use}%${uw} inode=${inode}%${iw})"
     return
   fi
   if [ "$use" -ge 85 ] 2>/dev/null || [ "$inode" -ge 85 ] 2>/dev/null; then
-    echo "WARNING|low space (use=${use}% inode=${inode}%)"
+    echo "WARNING|low space (use=${use}%${uw} inode=${inode}%${iw})"
     return
   fi
-  echo "NORMAL|space OK (use=${use}% inode=${inode}%)"
+  echo "NORMAL|space OK (use=${use}%${uw} inode=${inode}%${iw})"
 }
 
 # --- Test mode ---
@@ -70,13 +116,49 @@ if [ "${1:-}" = --test ]; then
   r="$(classify_disk OFFLINE 8 1)"
   echo "$r" | grep -q '^OFFLINE' || { echo "  FAIL classify OFFLINE blocks: got=$r"; fail=1; }
 
+  # --- MULTI-MOUNT leg (the phaedra /tmp blindness) ---
+  # A synthetic mount table where the ROOT fs is comfortable and a NON-root mount is exhausted.
+  # Reading $HOME's fs alone answers NORMAL here; that is exactly the failure this leg exists for.
+  _rows='/ 957682616 20 5
+/tmp 8388608 100 97
+/boot 1992552 11 1'
+  r="$(printf '%s\n' "$_rows" | scan_rows "$MIN_KB")"
+  [ "$r" = "100|/tmp|97|/tmp" ] || { echo "  FAIL scan_rows worst-mount: expected 100|/tmp|97|/tmp got=$r"; fail=1; }
+  r="$(classify_disk "${r%%|*}" "$(printf '%s' "$r" | cut -d'|' -f3)" 1 "$(printf '%s' "$r" | cut -d'|' -f2)" "$(printf '%s' "$r" | cut -d'|' -f4)")"
+  echo "$r" | grep -q '^CRITICAL' || { echo "  FAIL multi-mount CRITICAL: a 100% non-root mount must raise: got=$r"; fail=1; }
+  # ...and the verdict must NAME the mount — an unattributed 'use=100%' sends the reader to the wrong fs
+  echo "$r" | grep -q 'on /tmp' || { echo "  FAIL multi-mount attribution: verdict does not name the mount: got=$r"; fail=1; }
+  # the root fs must still be able to win when IT is the worst (no bias toward the last row)
+  r="$(printf '/ 957682616 91 5\n/tmp 8388608 3 1\n' | scan_rows "$MIN_KB")"
+  [ "$r" = "91|/|5|/" ] || { echo "  FAIL scan_rows root-worst: got=$r"; fail=1; }
+  # TINY pseudo-mounts are noise, not capacity: /run/lock at 100% of 5 MiB must NOT win
+  r="$(printf '/ 957682616 20 5\n/run/lock 5120 100 100\n' | scan_rows "$MIN_KB")"
+  [ "$r" = "20|/|5|/" ] || { echo "  FAIL scan_rows tiny-mount excluded: got=$r"; fail=1; }
+  # a filesystem that reports no inode figures ('-', e.g. btrfs) must not blank the BLOCK axis
+  r="$(printf '/data 209715200 77 -\n' | scan_rows "$MIN_KB")"
+  [ "$r" = "77|/data|OFFLINE|-" ] || { echo "  FAIL scan_rows inode-less fs: got=$r"; fail=1; }
+  # no mount at all -> OFFLINE, never a fabricated 0%
+  r="$(printf '' | scan_rows "$MIN_KB")"
+  [ "$r" = "OFFLINE|-|OFFLINE|-" ] || { echo "  FAIL scan_rows empty table: got=$r"; fail=1; }
+
   # REAL-READ GATE: verify the real df is running on this node and readable
   if ! df -P "$HOME" >/dev/null 2>&1; then
     echo "smoke-test: n/a — df not functional or no home directory"
     exit 2
   fi
-  
-  [ "$fail" = 0 ] && { echo "smoke-test: ok"; exit 0; } || { echo "smoke-test: FAIL"; exit 1; }
+  # REAL READ of the ACTUAL mount table: the parser must enumerate more than the one fs $HOME is on,
+  # and the live scan must produce a numeric worst — a fixture-only pass would leave the real df
+  # join (column indices, the -x flags, the two-table awk) entirely unasserted.
+  _live="$(mount_rows)" || { echo "smoke-test: n/a — df -T unavailable"; exit 2; }
+  _n="$(printf '%s\n' "$_live" | grep -c . )"
+  [ "${_n:-0}" -ge 1 ] || { echo "  FAIL real-read: mount_rows enumerated nothing"; fail=1; }
+  printf '%s\n' "$_live" | awk '$1=="/"{f=1} END{exit !f}' || { echo "  FAIL real-read: root fs missing from mount_rows"; fail=1; }
+  _lw="$(printf '%s\n' "$_live" | scan_rows "$MIN_KB")"
+  case "${_lw%%|*}" in
+    ''|*[!0-9]*) echo "  FAIL real-read: live worst use% not numeric: got=$_lw"; fail=1 ;;
+  esac
+
+  [ "$fail" = 0 ] && { echo "smoke-test: ok (classifier x7 + multi-mount x6 + real-read x3; live mounts: $_n, worst: $_lw)"; exit 0; } || { echo "smoke-test: FAIL"; exit 1; }
 fi
 
 # --- Live read path ---
@@ -89,28 +171,34 @@ if timeout 2 touch "$TEST_FILE" 2>/dev/null; then
   rm -f "$TEST_FILE"
 fi
 
-# 2. Get block space percentage
-use_pct="OFFLINE"
-df_out="$(df -P "$HOME" 2>/dev/null | tail -n 1)" || true
-if [ -n "$df_out" ]; then
-  val="$(printf '%s' "$df_out" | awk '{print $5}' | tr -d '%')"
-  if [[ "$val" =~ ^[0-9]+$ ]]; then
-    use_pct="$val"
+# 2+3. Worst block% and worst inode% across EVERY real local mount (see header: reading only
+# $HOME's fs published NORMAL on a node whose /tmp was 100% and refusing every write).
+use_pct="OFFLINE"; inode_pct="OFFLINE"; use_mnt=""; inode_mnt=""
+worst="$(mount_rows 2>/dev/null | scan_rows "$MIN_KB")" || true
+if [ -n "${worst:-}" ]; then
+  val="$(printf '%s' "$worst" | cut -d'|' -f1)"; [[ "$val" =~ ^[0-9]+$ ]] && use_pct="$val"
+  use_mnt="$(printf '%s' "$worst" | cut -d'|' -f2)"; [ "$use_mnt" = "-" ] && use_mnt=""
+  val="$(printf '%s' "$worst" | cut -d'|' -f3)"; [[ "$val" =~ ^[0-9]+$ ]] && inode_pct="$val"
+  inode_mnt="$(printf '%s' "$worst" | cut -d'|' -f4)"; [ "$inode_mnt" = "-" ] && inode_mnt=""
+fi
+# fall back to the single-fs read if the mount-table join produced nothing at all (exotic df)
+if [ "$use_pct" = OFFLINE ]; then
+  df_out="$(df -P "$HOME" 2>/dev/null | tail -n 1)" || true
+  if [ -n "$df_out" ]; then
+    val="$(printf '%s' "$df_out" | awk '{print $5}' | tr -d '%')"
+    [[ "$val" =~ ^[0-9]+$ ]] && { use_pct="$val"; use_mnt="$(printf '%s' "$df_out" | awk '{print $NF}')"; }
   fi
 fi
-
-# 3. Get inode percentage
-inode_pct="OFFLINE"
-df_i_out="$(df -P -i "$HOME" 2>/dev/null | tail -n 1)" || true
-if [ -n "$df_i_out" ]; then
-  val="$(printf '%s' "$df_i_out" | awk '{print $5}' | tr -d '%')"
-  if [[ "$val" =~ ^[0-9]+$ ]]; then
-    inode_pct="$val"
+if [ "$inode_pct" = OFFLINE ]; then
+  df_i_out="$(df -P -i "$HOME" 2>/dev/null | tail -n 1)" || true
+  if [ -n "$df_i_out" ]; then
+    val="$(printf '%s' "$df_i_out" | awk '{print $5}' | tr -d '%')"
+    [[ "$val" =~ ^[0-9]+$ ]] && { inode_pct="$val"; inode_mnt="$(printf '%s' "$df_i_out" | awk '{print $NF}')"; }
   fi
 fi
 
 # Classify
-result="$(classify_disk "$use_pct" "$inode_pct" "$writeable")"
+result="$(classify_disk "$use_pct" "$inode_pct" "$writeable" "$use_mnt" "$inode_mnt")"
 label="${result%%|*}"
 reason="${result#*|}"
 
