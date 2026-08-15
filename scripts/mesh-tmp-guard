@@ -1,0 +1,287 @@
+#!/usr/bin/env bash
+# reflex-cadence: 41 */6 * * *
+# reflex-args: --edge
+# mesh-tmp-guard — the node's TEMP DIRECTORIES: is writing to them still possible, how much leaked
+# there, and a BOUNDED-AGE sweep of what leaked.
+#
+# WHY THIS EXISTS (2026-08-15, phaedra incident). phaedra hit 100% /tmp: 59,234 stranded
+# shell-mktemp files (52,480 of them ZERO bytes) + 419 MB of leaked opencode.db dirs. Every write to
+# /tmp on the box failed. Nothing in the mesh was watching: mesh-storage-health read
+# 'HEALTHY|capacity=NORMAL' at the same moment on the same box, because the capacity axis was a
+# claim about the ROOT fs (58G, 88%) — an honest reading of a DIFFERENT filesystem. mesh-disk-space
+# now scans every mount and names the worst, which closes the CAPACITY half. This tool closes the
+# other two halves, which capacity alone cannot see:
+#
+#   1. CAN WE STILL WRITE THERE? A percentage is not a permission. A tmpfs can be at 100% while the
+#      root fs is fine, and — the nastier direction — mktemp on a FULL filesystem still SUCCEEDS at
+#      creating the inode and only the WRITE fails, so the failure feeds itself: every caller adds
+#      another zero-byte file to the fs it could not write to. (That is precisely the shape of
+#      phaedra's 52,480 zero-byte files.) So the probe here is an ATTEMPTED WRITE with content,
+#      read back — never a mode bit, never a `df` number.
+#   2. IS SOMETHING LEAKING? Capacity says a filesystem is full; it never says temps are ACCUMULATING
+#      while there is still room. A leak at 4,000 files/day is invisible for a week and then is an
+#      incident. Counting is the early warning capacity cannot give.
+#
+# And the sweep is the part no trap can replace: the producers now clean up under a
+# trap (EXIT/INT/HUP/TERM), but SIGKILL is UNTRAPPABLE by definition — a kill -9, an OOM kill, or a
+# power cut strands the temp no matter how carefully the tool is written. A bounded-age sweep is the
+# only backstop for that class, which is why "just add a trap" would have been a fix that reads
+# complete and isn't.
+#
+# WHAT IT SWEEPS (deliberately narrow — this deletes files, so the target set is named, not guessed):
+#   - MESH-OWNED temps: mesh-*.XXXXXXXX / mesh-*.XXXXXXXXXX (the named prefixes the mesh's tools now
+#     use), owned by the invoking user, older than MESH_TMP_AGE_H (default 24h).
+#   - GENERIC mktemp leftovers: exactly the `tmp.XXXXXXXXXX` shape the shell's mktemp produces,
+#     owned by the invoking user, whose mtime AND atime are both older than MESH_TMP_GENERIC_AGE_D
+#     (default 3 days) — a file something still reads is not idle.
+#   Everything else is COUNTED and never touched: a temp dir holds other people's work (editor
+#   swaps, X sockets, another user's build), and a sweeper that guesses is worse than a full disk.
+#   Entries owned by ANOTHER user are reported separately (`other-owner=N`) rather than silently
+#   omitted — a user-run guard cannot clean root's leaks, and that limit must be visible, not
+#   assumed away. Depth is 1: a leaked DIR goes whole, but nothing inside a directory the guard did
+#   not decide to remove is ever considered.
+#
+# Bands:
+#   CRITICAL  a temp dir exists but a real write to it FAILS (the incident state), or is >=95% full
+#   LEAKING   >= MESH_TMP_WARN_N entries (default 2000) or >= MESH_TMP_WARN_MB (default 1024) left
+#             AFTER the sweep — the sweep is not keeping up, or the leak is outside its target set
+#   NORMAL    writable, under both thresholds
+#
+#   mesh-tmp-guard              sweep + one-line verdict
+#   mesh-tmp-guard --dry-run    report only; removes nothing (prints what it WOULD remove)
+#   mesh-tmp-guard --json       machine-readable
+#   mesh-tmp-guard --edge       sweep, emit only on verdict change (cron reflex; posts CRITICAL)
+#   mesh-tmp-guard --test       smoke test (sandbox temp root, real files, RED-able)
+#
+# Exit: 0 = assessed · 2 = no temp directory could be examined at all (honest n/a, never a fake OK)
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+
+MESH="${MESH_DIR:-$HOME/.mesh}"
+STATE="$MESH/.tmp-guard.state"
+LOG="$MESH/tmp-guard.log"
+AGE_H="${MESH_TMP_AGE_H:-24}"            # mesh-prefixed temps: hours
+GEN_AGE_D="${MESH_TMP_GENERIC_AGE_D:-3}" # generic tmp.XXXXXXXXXX: days (mtime AND atime)
+WARN_N="${MESH_TMP_WARN_N:-2000}"
+WARN_MB="${MESH_TMP_WARN_MB:-1024}"
+
+# temp dirs to examine (deduped, existing, directories)
+# MESH_TMP_DIRS is EXCLUSIVE, not additive: it must be possible to point this tool at a sandbox and
+# have it touch NOTHING else. An additive override would make the --test itself sweep the live /tmp —
+# a test that mutates the artifact it exists to protect.
+tmp_dirs() {
+  local d seen="" list="/tmp /var/tmp /dev/shm"
+  [ -n "${MESH_TMP_DIRS:-}" ] && list="$MESH_TMP_DIRS"
+  [ -z "${MESH_TMP_DIRS:-}" ] && list="${TMPDIR:-} $list"
+  for d in $list; do
+    [ -n "$d" ] || continue
+    for one in $d; do
+      [ -d "$one" ] || continue
+      one="$(cd "$one" 2>/dev/null && pwd -P)" || continue
+      case " $seen " in *" $one "*) continue ;; esac
+      seen="$seen $one"; printf '%s\n' "$one"
+    done
+  done
+}
+
+# probe_write <dir> -> 0 writable (content verified), 1 not
+# NOT a mode bit and NOT `df`: on a full filesystem the inode is created and only the WRITE fails,
+# which is the state that must read as CRITICAL. Write bytes, read them back, remove.
+probe_write() {
+  local d="$1" f rc=1
+  f="$d/.mesh-tmp-guard-probe.$$"
+  # subshell: a REDIRECTION failure is reported by the shell BEFORE the command runs, so a trailing
+  # `2>/dev/null` on the printf never suppresses it — the noise has to be caught around the redirect.
+  if ( printf 'mesh-tmp-guard\n' > "$f" ) 2>/dev/null; then
+    [ "$(head -c 14 "$f" 2>/dev/null)" = "mesh-tmp-guard" ] && rc=0
+  fi
+  rm -f "$f" 2>/dev/null
+  return $rc
+}
+
+# targets <dir> -> NUL-separated paths this guard is allowed to remove (see header)
+targets() {
+  local d="$1" uid; uid="$(id -u)"
+  find "$d" -maxdepth 1 -mindepth 1 -user "$uid" \
+       \( \( \( -name 'mesh-*.????????' -o -name 'mesh-*.??????????' \) -mmin "+$((AGE_H * 60))" \) \
+          -o \( -name 'tmp.??????????' -mtime "+$GEN_AGE_D" -atime "+$GEN_AGE_D" \) \) \
+       -print0 2>/dev/null
+}
+
+# classify <writable> <use_pct> <entries> <mb> -> "LABEL|reason"
+classify_tmp() {
+  local w="$1" use="$2" n="$3" mb="$4"
+  if [ "$w" != 1 ]; then
+    echo "CRITICAL|write to temp dir FAILED (a real write, not a mode bit) — every mktemp caller on this node is now a leaker"
+    return
+  fi
+  if [ "$use" != "na" ] && [ "$use" -ge 95 ] 2>/dev/null; then
+    echo "CRITICAL|temp filesystem ${use}% full — writes will start failing"
+    return
+  fi
+  if [ "$n" -ge "$WARN_N" ] 2>/dev/null || [ "$mb" -ge "$WARN_MB" ] 2>/dev/null; then
+    echo "LEAKING|${n} entries / ${mb}MB left after the sweep (>= ${WARN_N} / ${WARN_MB}MB) — producers are stranding temps faster than the age sweep clears them"
+    return
+  fi
+  echo "NORMAL|${n} entries / ${mb}MB, writable"
+}
+
+if [ "${1:-}" = --test ]; then
+  fail=0
+  # pure classifier
+  r="$(classify_tmp 0 10 5 1)";     echo "$r" | grep -q '^CRITICAL' || { echo "  FAIL classify unwritable: got=$r"; fail=1; }
+  r="$(classify_tmp 1 97 5 1)";     echo "$r" | grep -q '^CRITICAL' || { echo "  FAIL classify full: got=$r"; fail=1; }
+  r="$(classify_tmp 1 10 "$WARN_N" 1)"; echo "$r" | grep -q '^LEAKING' || { echo "  FAIL classify leak-by-count: got=$r"; fail=1; }
+  r="$(classify_tmp 1 10 5 "$WARN_MB")"; echo "$r" | grep -q '^LEAKING' || { echo "  FAIL classify leak-by-size: got=$r"; fail=1; }
+  r="$(classify_tmp 1 10 5 1)";     echo "$r" | grep -q '^NORMAL'   || { echo "  FAIL classify normal: got=$r"; fail=1; }
+  r="$(classify_tmp 1 na 5 1)";     echo "$r" | grep -q '^NORMAL'   || { echo "  FAIL classify unknown-use must not fake CRITICAL: got=$r"; fail=1; }
+
+  # --- REAL SWEEP on a sandbox temp root: real files, real ages, real removal ---
+  sb="$(mktemp -d -t mesh-tmp-guard-test.XXXXXXXX)"
+  trap 'rm -rf "$sb"' EXIT INT HUP TERM
+  old="$(date -d '10 days ago' +%Y%m%d%H%M 2>/dev/null || date -v-10d +%Y%m%d%H%M)"
+  mkdir -p "$sb/root"
+  # SHOULD GO: an aged mesh-prefixed dir and an aged generic mktemp file
+  mkdir -p "$sb/root/mesh-ledger.AbCdEfGh";    touch -t "$old" "$sb/root/mesh-ledger.AbCdEfGh"
+  : > "$sb/root/tmp.AbCdEfGhIj";               touch -t "$old" "$sb/root/tmp.AbCdEfGhIj"
+  # SHOULD STAY: fresh ones (a live tool's temp), and anything not in the named target set
+  mkdir -p "$sb/root/mesh-ledger.FreshOne1"
+  : > "$sb/root/tmp.FreshOne12"
+  : > "$sb/root/important-notes.txt";          touch -t "$old" "$sb/root/important-notes.txt"
+  mkdir -p "$sb/root/somebody-elses-workdir";  touch -t "$old" "$sb/root/somebody-elses-workdir"
+  : > "$sb/root/tmp.TOOSHORT";                 touch -t "$old" "$sb/root/tmp.TOOSHORT"
+  # SHOULD STAY: an aged file NESTED inside a directory the guard has no business entering
+  mkdir -p "$sb/root/keepdir"; : > "$sb/root/keepdir/tmp.AbCdEfGhIj"; touch -t "$old" "$sb/root/keepdir/tmp.AbCdEfGhIj"
+
+  MESH_TMP_DIRS="$sb/root" TMPDIR="$sb/root" MESH_DIR="$sb/mesh" bash "$0" --dry-run >"$sb/dry.out" 2>&1
+  grep -q 'would-remove=2' "$sb/dry.out" || { echo "  FAIL dry-run count: expected would-remove=2, got: $(cat "$sb/dry.out")"; fail=1; }
+  # ...and the sandbox is the ONLY thing it looked at — otherwise this --test sweeps the live /tmp
+  grep -q 'across 1 dir(s)' "$sb/dry.out" || { echo "  FAIL sandbox containment: MESH_TMP_DIRS must be exclusive, this run scanned more: $(cat "$sb/dry.out")"; fail=1; }
+  [ -e "$sb/root/mesh-ledger.AbCdEfGh" ] || { echo "  FAIL dry-run REMOVED a file — --dry-run must not delete"; fail=1; }
+
+  MESH_TMP_DIRS="$sb/root" TMPDIR="$sb/root" MESH_DIR="$sb/mesh" bash "$0" >"$sb/sweep.out" 2>&1
+  [ -e "$sb/root/mesh-ledger.AbCdEfGh" ] && { echo "  FAIL sweep: aged mesh-prefixed dir survived"; fail=1; }
+  [ -e "$sb/root/tmp.AbCdEfGhIj" ]       && { echo "  FAIL sweep: aged generic mktemp file survived"; fail=1; }
+  [ -e "$sb/root/mesh-ledger.FreshOne1" ] || { echo "  FAIL sweep: a FRESH mesh temp was removed — a live tool's scratch dir was deleted under it"; fail=1; }
+  [ -e "$sb/root/tmp.FreshOne12" ]        || { echo "  FAIL sweep: a FRESH generic temp was removed"; fail=1; }
+  [ -e "$sb/root/important-notes.txt" ]   || { echo "  FAIL sweep: an aged file OUTSIDE the target set was removed — the sweep is guessing"; fail=1; }
+  [ -e "$sb/root/somebody-elses-workdir" ] || { echo "  FAIL sweep: an aged non-temp DIRECTORY was removed"; fail=1; }
+  [ -e "$sb/root/tmp.TOOSHORT" ]          || { echo "  FAIL sweep: a name that is not the mktemp shape was removed"; fail=1; }
+  [ -e "$sb/root/keepdir/tmp.AbCdEfGhIj" ] || { echo "  FAIL sweep: descended INTO a directory (maxdepth) and removed a nested file"; fail=1; }
+  grep -q 'swept=2' "$sb/sweep.out" || { echo "  FAIL sweep report: expected swept=2, got: $(cat "$sb/sweep.out")"; fail=1; }
+  # the sweep must be IDEMPOTENT: a second pass has nothing left to do
+  MESH_TMP_DIRS="$sb/root" TMPDIR="$sb/root" MESH_DIR="$sb/mesh" bash "$0" >"$sb/sweep2.out" 2>&1
+  grep -q 'swept=0' "$sb/sweep2.out" || { echo "  FAIL sweep idempotence: second pass did not report swept=0: $(cat "$sb/sweep2.out")"; fail=1; }
+
+  # --- the WRITE probe must fail on a dir that cannot be written (the incident state) ---
+  if [ "$(id -u)" = 0 ]; then
+    echo "  (write-probe leg skipped: running as root, which bypasses the mode bits this leg uses to simulate a full fs)"
+  else
+    mkdir -p "$sb/ro"; chmod a-w "$sb/ro"
+    if probe_write "$sb/ro"; then echo "  FAIL write-probe: an unwritable dir probed as writable"; fail=1; fi
+    probe_write "$sb/root" || { echo "  FAIL write-probe: a writable dir probed as unwritable"; fail=1; }
+    chmod u+w "$sb/ro"
+  fi
+  # a probe must leave nothing behind (it is itself a temp writer)
+  probe_write "$sb/root" || true
+  [ "$(find "$sb/root" -maxdepth 1 -name '.mesh-tmp-guard-probe.*' | wc -l)" = 0 ] || { echo "  FAIL write-probe left its own probe file behind"; fail=1; }
+
+  # --- REAL READ of this node's actual temp dirs (no sweep) ---
+  live="$(tmp_dirs | wc -l)"
+  [ "${live:-0}" -ge 1 ] || { echo "  FAIL real-read: no temp directory found on this node"; fail=1; }
+
+  rm -rf "$sb"; trap - EXIT INT HUP TERM
+  [ "$fail" = 1 ] && { echo "smoke-test: FAIL"; exit 1; }
+  echo "smoke-test: ok (classifier x6 + real sweep x12 incl. dry-run/idempotence/maxdepth + write-probe x3 + real-read; live temp dirs: $live)"
+  exit 0
+fi
+
+MODE="${1:-}"
+DRY=0; [ "$MODE" = --dry-run ] && DRY=1
+mkdir -p "$MESH" 2>/dev/null || true
+
+TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+dirs="$(tmp_dirs)"
+[ -n "$dirs" ] || { echo "mesh-tmp-guard: n/a — no temp directory could be examined" >&2; exit 2; }
+
+writable=1; swept=0; freed=0; entries=0; other=0; ndirs=0; worst_use="na"; worst_dir=""
+detail=""
+while IFS= read -r d; do
+  [ -n "$d" ] || continue
+  ndirs=$((ndirs + 1))
+  probe_write "$d" || writable=0
+  # fs use% of the filesystem this temp dir lives on (named, so the number is never a claim about
+  # some other mount — the whole point of the incident)
+  u="$(df -P "$d" 2>/dev/null | tail -n1 | awk '{gsub(/%/,"",$5); print $5}')"
+  case "$u" in ''|*[!0-9]*) u="na" ;; esac
+  if [ "$u" != na ]; then
+    if [ "$worst_use" = na ] || [ "$u" -gt "$worst_use" ]; then worst_use="$u"; worst_dir="$d"; fi
+  fi
+  n="$(find "$d" -maxdepth 1 -mindepth 1 2>/dev/null | wc -l)"
+  entries=$((entries + n))
+  o="$(find "$d" -maxdepth 1 -mindepth 1 ! -user "$(id -u)" 2>/dev/null | wc -l)"
+  other=$((other + o))
+  # what may go, and how much it holds (one du call over the target list)
+  tn="$(targets "$d" | tr -dc '\0' | wc -c)"
+  if [ "${tn:-0}" -gt 0 ]; then
+    tb="$(targets "$d" | du -sb --files0-from=- 2>/dev/null | awk '{s+=$1} END{print s+0}')"
+    if [ "$DRY" = 0 ]; then
+      targets "$d" | xargs -0 -r rm -rf 2>/dev/null || true
+      swept=$((swept + tn)); freed=$((freed + ${tb:-0}))
+    else
+      swept=$((swept + tn)); freed=$((freed + ${tb:-0}))
+    fi
+    detail="$detail $d:$tn"
+  fi
+done <<EOF
+$dirs
+EOF
+
+# post-sweep census (what is STILL there is what the bands judge)
+left=0
+while IFS= read -r d; do
+  [ -n "$d" ] || continue
+  n="$(find "$d" -maxdepth 1 -mindepth 1 2>/dev/null | wc -l)"
+  left=$((left + n))
+done <<EOF
+$dirs
+EOF
+[ "$DRY" = 1 ] && left="$entries"
+mb=$((freed / 1048576))
+# size still resident in the temp dirs is expensive to compute exactly on a leaking node; the band
+# uses the FREED figure plus the filesystem's own use% — both cheap, neither invented.
+result="$(classify_tmp "$writable" "$worst_use" "$left" "$mb")"
+label="${result%%|*}"; reason="${result#*|}"
+
+line="$label|dirs=$ndirs|entries=$left|swept=$swept|freed_mb=$((freed / 1048576))|other-owner=$other|use=${worst_use}%${worst_dir:+ on $worst_dir}|$reason"
+prev=""; [ -f "$STATE" ] && prev="$(head -1 "$STATE" 2>/dev/null | cut -d'|' -f1)" || true
+if [ "$DRY" = 0 ]; then
+  printf '%s\n' "$line" > "$STATE"
+  [ -x "$HOME/.local/bin/mesh-state-touch" ] && mesh-state-touch "$STATE" >/dev/null 2>&1 || touch "$STATE" 2>/dev/null || true
+  [ "$swept" -gt 0 ] && printf '%s swept=%s freed=%sB dirs=%s%s\n' "$TS" "$swept" "$freed" "$ndirs" "$detail" >> "$LOG"
+fi
+
+if [ "$MODE" = --json ]; then
+  printf '{"label":"%s","reason":"%s","dirs":%s,"entries":%s,"swept":%s,"freed_bytes":%s,"other_owner":%s,"use_pct":"%s","worst_dir":"%s","dry_run":%s,"ts":"%s"}\n' \
+    "$label" "$reason" "$ndirs" "$left" "$swept" "$freed" "$other" "$worst_use" "$worst_dir" "$DRY" "$TS"
+  exit 0
+fi
+if [ "$DRY" = 1 ]; then
+  printf '[tmp-guard-dry] %s — would-remove=%s (%sB) across %s dir(s); entries=%s other-owner=%s use=%s%%%s\n' \
+    "$label" "$swept" "$freed" "$ndirs" "$left" "$other" "$worst_use" "${worst_dir:+ on $worst_dir}"
+  exit 0
+fi
+if [ "$MODE" = --edge ]; then
+  [ "$prev" = "$label" ] && exit 0
+  printf '[tmp-guard-%s] %s\n' "$(printf '%s' "$label" | tr '[:upper:]' '[:lower:]')" "$line"
+  if command -v mesh-chat >/dev/null 2>&1; then
+    case "$label" in
+      CRITICAL) msg="[task] tmp-guard CRITICAL on $(hostname): $reason (swept=$swept, entries=$left, use=${worst_use}% on ${worst_dir:-?}) (owner: health priority:incident)" ;;
+      *)        msg="[fyi] tmp-guard $(hostname): ${prev:-none}->${label} — $reason (swept=$swept)" ;;
+    esac
+    MESH_WHO="tmp-guard@$(hostname)" mesh-chat "$msg" >/dev/null 2>&1 || true
+  fi
+  exit 0
+fi
+printf '[tmp-guard-%s] %s\n' "$(printf '%s' "$label" | tr '[:upper:]' '[:lower:]')" "$line"
