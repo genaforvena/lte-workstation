@@ -1,0 +1,212 @@
+#!/usr/bin/env python3
+"""mesh-job-scan — sweep hh for vacancies worth his time and append the new ones to the board.
+
+  mesh-job-scan [--queries <file>] [--pages N] [--json] [--quiet]
+  mesh-job-scan --test
+
+# reflex-cadence: 41 6 * * *
+
+Why the browser and not the API: hh's public API answers 403 to this node (measured 2026-08-15,
+both with and without a UA — anonymous vacancy search is closed), so the only reachable surface is
+the logged-in SERP that mesh-hh-drive already holds open. Every row is extracted from data-qa
+attributes, never from layout position.
+
+Appends to ~/.mesh/job-board.tsv with state `seen`. A vacancy already on the board — in ANY state —
+is skipped, so a row he already rejected, or already applied to, can never be resurfaced by a later
+sweep. That dedupe is by vacancy id, not by title: the same job is reposted under a new title all
+the time, and the id is the only stable identity hh gives.
+
+Queries live in ~/.mesh/job/scan-queries.txt, one per line, `#` comments ignored. They are search
+TEXT, not URLs — the salary floor and the rest of the filter come from MESH_JOB_SALARY_FLOOR
+(default 400000, his own floor as of 2026-08-15) so a change of mind is one env var, not an edit
+of ten query strings.
+"""
+import argparse, json, os, pathlib, re, subprocess, sys, time
+from urllib.parse import quote
+
+MESH = pathlib.Path(os.path.expanduser("~/.mesh"))
+BOARD = MESH / "job-board.tsv"
+QUERIES = MESH / "job/scan-queries.txt"
+LOG = MESH / "job/hh-drive.log"
+FLOOR = int(os.environ.get("MESH_JOB_SALARY_FLOOR", "400000"))
+
+DEFAULT_QUERIES = [
+    "team lead Go", "руководитель группы разработки Go", "engineering manager Go",
+    "tech lead backend", "руководитель разработки backend", "head of engineering",
+]
+
+JS = ("JSON.stringify(Array.from(document.querySelectorAll('[data-qa=vacancy-serp__vacancy]'))"
+      ".map(e=>({"
+      "title:(e.querySelector('[data-qa=serp-item__title]')||{}).innerText||'',"
+      "emp:(e.querySelector('[data-qa=vacancy-serp__vacancy-employer]')||{}).innerText||'',"
+      "href:(e.querySelector('[data-qa=serp-item__title]')||{}).href||'',"
+      "txt:(e.innerText||'').split('\\n').slice(0,6).join(' | ')})))")
+
+
+def drive(args, timeout=90):
+    return subprocess.run(["mesh-hh-drive"] + args, capture_output=True, text=True, timeout=timeout)
+
+
+def read_js(mark):
+    """Last [js] payload written after byte offset `mark`."""
+    payload = None
+    for _ in range(30):
+        time.sleep(2)
+        with LOG.open("r", encoding="utf-8", errors="replace") as f:
+            f.seek(mark)
+            for line in f:
+                if line.startswith("[js] ["):
+                    payload = line[len("[js] "):].strip()
+        if payload:
+            return json.loads(payload)
+    return None
+
+
+def parse_salary(text):
+    """Lowest RUB figure in the row, or None. hh writes 'от 450 000 ₽', '450 000 – 600 000 ₽'."""
+    t = text.replace(" ", " ").replace("\xa0", " ")
+    nums = [int(n.replace(" ", "")) for n in re.findall(r"(\d[\d ]{4,})", t)]
+    nums = [n for n in nums if 30000 <= n <= 3000000]
+    return min(nums) if nums else None
+
+
+def board_ids():
+    if not BOARD.exists():
+        return set()
+    return set(re.findall(r"/vacancy/(\d+)", BOARD.read_text(encoding="utf-8")))
+
+
+def search_url(text, page=0):
+    return ("https://hh.ru/search/vacancy?text=%s&page=%d&order_by=publication_time"
+            "&search_field=name&search_field=description&items_on_page=50"
+            % (quote(text), page))
+
+
+def sweep(queries, pages):
+    if drive(["--alive"]).returncode != 0:
+        return None
+    seen, rows = board_ids(), []
+    got = set()
+    for q in queries:
+        for pg in range(pages):
+            if drive(["--goto", search_url(q, pg)], timeout=180).returncode != 0:
+                print("blocked by hh browser-check on %r page %d — stopping the sweep here"
+                      % (q, pg), file=sys.stderr)
+                return rows
+            mark = LOG.stat().st_size if LOG.exists() else 0
+            drive(["--send", "js " + JS])
+            items = read_js(mark) or []
+            for it in items:
+                m = re.search(r"/vacancy/(\d+)", it.get("href") or "")
+                if not m:
+                    continue
+                vid = m.group(1)
+                if vid in seen or vid in got:
+                    continue
+                sal = parse_salary(it.get("txt") or "")
+                got.add(vid)
+                rows.append({"id": vid, "title": (it.get("title") or "").strip(),
+                             "employer": (it.get("emp") or "").strip(),
+                             "url": "https://hh.ru/vacancy/" + vid,
+                             "salary": sal, "query": q,
+                             "raw": (it.get("txt") or "")[:300]})
+    return rows
+
+
+def append(rows, today):
+    lines = []
+    for r in rows:
+        note = "scan %s | запрос: %s | %s" % (
+            today, r["query"], ("от %d ₽" % r["salary"]) if r["salary"] else "зарплата не указана")
+        lines.append("\t".join([today, r["employer"], r["title"], r["url"], "seen",
+                                note + " || " + r["raw"].replace("\t", " ")]))
+    if lines:
+        with BOARD.open("a", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+    return len(lines)
+
+
+def ensure_driver():
+    """A cron-fired reflex cannot assume the browser daemon is up — it exits after 45 min idle by
+    design. Starting it is part of the reflex, not a precondition someone remembered to meet."""
+    if subprocess.run(["mesh-hh-drive", "--alive"], capture_output=True).returncode != 0:
+        subprocess.run(["mesh-hh-drive", "--start"], capture_output=True, timeout=180)
+
+def selftest():
+    rc = 0
+
+    def check(label, cond):
+        nonlocal rc
+        print(("ok:   " if cond else "FAIL: ") + label)
+        if not cond:
+            rc = 1
+
+    check("salary parser takes the LOWER bound of a range",
+          parse_salary("от 450 000 до 600 000 ₽ за месяц") == 450000)
+    check("salary parser survives hh's narrow no-break spaces",
+          parse_salary("от 450 000 ₽") == 450000)
+    check("no salary reads as None, never 0",
+          parse_salary("Уровень дохода не указан") is None)
+    # A vacancy id in the row must not be mistaken for money — the exact bug that would let a
+    # 135728677-rouble salary through and rank a random job first.
+    check("a vacancy id is not mistaken for a salary",
+          parse_salary("Опыт 3-6 лет | /vacancy/135728677") is None)
+    check("experience years are not money", parse_salary("Опыт работы: более 6 лет") is None)
+
+    ids = board_ids()
+    check("board ids are read from the live board", len(ids) > 0)
+    check("already-sent vacancies are in the dedupe set", "135728677" in ids)
+    check("search url escapes cyrillic queries",
+          "text=%D1%80" in search_url("руководитель").lower() or "%D1%80" in search_url("руководитель"))
+
+    if drive(["--alive"]).returncode != 0:
+        print("n/a: hh driver not running — cannot assert a real sweep")
+        return 2 if rc == 0 else rc
+    rows = sweep(["team lead Go"], 1)
+    check("live sweep returns rows with ids, titles and employers",
+          bool(rows) is not False and all(r["id"].isdigit() and r["title"] for r in (rows or [])))
+    print("      live: %d new row(s) on one page of one query" % len(rows or []))
+    return rc
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=False)
+    ap.add_argument("--queries", default=str(QUERIES))
+    ap.add_argument("--pages", type=int, default=1)
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--quiet", action="store_true")
+    ap.add_argument("--test", action="store_true")
+    ap.add_argument("-h", "--help", action="store_true")
+    a = ap.parse_args()
+    if a.help:
+        print(__doc__)
+        return 0
+    if a.test:
+        return selftest()
+
+    qp = pathlib.Path(a.queries)
+    queries = DEFAULT_QUERIES
+    if qp.exists():
+        queries = [l.strip() for l in qp.read_text(encoding="utf-8").splitlines()
+                   if l.strip() and not l.startswith("#")] or DEFAULT_QUERIES
+
+    ensure_driver()
+    rows = sweep(queries, a.pages)
+    if rows is None:
+        print("n/a: hh driver did not answer (mesh-hh-drive --start)", file=sys.stderr)
+        return 2
+    today = time.strftime("%Y-%m-%d")
+    n = append(rows, today)
+    if a.json:
+        print(json.dumps(rows, ensure_ascii=False, indent=1))
+    elif not a.quiet:
+        for r in rows:
+            print("%-9s %-24s %s" % (("%dk" % (r["salary"] // 1000)) if r["salary"] else "—",
+                                     r["employer"][:24], r["title"][:52]))
+        print("\n%d new vacancy row(s) appended to the board from %d quer%s"
+              % (n, len(queries), "y" if len(queries) == 1 else "ies"))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

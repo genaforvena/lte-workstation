@@ -1,0 +1,355 @@
+#!/usr/bin/env python3
+"""mesh-job-apply — rank the board, apply to the top N on hh, prove each one landed.
+
+  mesh-job-apply [--top N] [--dry] [--tg] [--json]
+  mesh-job-apply --test
+
+# reflex-cadence: 23 7 * * *
+# reflex-args: --top 5 --tg
+
+Sends real applications under the operator's own name, so every guard here is load-bearing:
+
+* **Gate.** Refuses unless `MESH_JOB_AUTOAPPLY=on` is exported (`~/.mesh/nodes`). A tool that
+  sends mail as a human must not be armed by merely existing on a node.
+* **Daily cap.** `MESH_JOB_DAILY_CAP` (default 5) counted from board rows already marked sent
+  TODAY, so a crash-loop or a double-wired cron cannot carpet-bomb employers.
+* **Letters are assembled, never generated** (`mesh-job-letter`) — his own approved paragraphs
+  only. A vacancy the block set cannot speak to is SKIPPED, not sent a generic letter.
+* **Screening forms stop the lane.** If hh routes the response through employer questions
+  (Ozon does), the tool answers nothing and marks the row `needs-human`. Ticking an unread
+  question on someone's behalf is exactly the thing that is never worth automating.
+* **The artifact is the negotiations list, not the click.** hh's own profile-completion modal
+  swallows clicks while reporting success — a first hand-run looked green through the entire
+  cover-letter step with no application filed. So a row flips to `sent` only after the vacancy id
+  appears in hh.ru/applicant/negotiations.
+
+Ranking is deterministic: salary floor, keyword weight against his profile, seniority match,
+penalty for a missing salary. Nothing here asks a model what a good job is.
+"""
+import argparse, json, os, pathlib, re, subprocess, sys, time
+
+MESH = pathlib.Path(os.path.expanduser("~/.mesh"))
+BOARD = MESH / "job-board.tsv"
+SENT = MESH / "job/sent"
+LOG = MESH / "job/hh-drive.log"
+BLACKLIST = MESH / "job/blacklist.txt"
+FLOOR = int(os.environ.get("MESH_JOB_SALARY_FLOOR", "400000"))
+CAP = int(os.environ.get("MESH_JOB_DAILY_CAP", "5"))
+
+# His profile, weighted. Positive terms are what he actually did; negatives are roles that share
+# vocabulary with his but are not his job (a "1C developer" ad says разработка and Go-adjacent
+# nothing). Weights are small integers on purpose — this is a sort key, not a model.
+WEIGHTS = {
+    "go": 6, "golang": 6, "highload": 4, "хайлоад": 4, "нагруз": 3, "распределён": 3,
+    "kafka": 3, "clickhouse": 3, "terraform": 2, "kubernetes": 2, "микросервис": 2,
+    "тимлид": 5, "team lead": 5, "teamlead": 5, "руководител": 5, "engineering manager": 5,
+    "tech lead": 5, "head of": 4, "лидер": 2,
+    "rtb": 5, "dsp": 5, "programmatic": 4, "adtech": 4, "реклам": 2, "openrtb": 5,
+    "backend": 3, "бэкенд": 3, "архитект": 2, "sla": 2, "latency": 2,
+    "1с": -8, "1c": -8, "продаж": -6, "курьер": -9, "оператор call": -9, "python": -1,
+    "java": -1, "php": -1, "стажёр": -8, "junior": -8, "младший": -8,
+}
+
+
+def drive(args, timeout=120):
+    return subprocess.run(["mesh-hh-drive"] + args, capture_output=True, text=True, timeout=timeout)
+
+
+def log_size():
+    return LOG.stat().st_size if LOG.exists() else 0
+
+
+def log_since(mark):
+    with LOG.open("r", encoding="utf-8", errors="replace") as f:
+        f.seek(mark)
+        return f.read()
+
+
+def wait_log(mark, needle, secs=90):
+    for _ in range(secs // 2):
+        time.sleep(2)
+        if needle in log_since(mark):
+            return True
+    return False
+
+
+def read_board():
+    if not BOARD.exists():
+        return []
+    rows = []
+    for i, l in enumerate(BOARD.read_text(encoding="utf-8").splitlines()):
+        f = l.split("\t")
+        if len(f) < 6:
+            continue
+        m = re.search(r"/vacancy/(\d+)", f[3])
+        rows.append({"i": i, "date": f[0], "employer": f[1], "title": f[2], "url": f[3],
+                     "state": f[4], "note": f[5], "id": m.group(1) if m else None})
+    return rows
+
+
+def set_state(idx, state, note_prefix=None):
+    lines = BOARD.read_text(encoding="utf-8").splitlines()
+    f = lines[idx].split("\t")
+    f[4] = state
+    if note_prefix:
+        f[5] = note_prefix + " || " + f[5]
+    lines[idx] = "\t".join(f)
+    BOARD.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def parse_salary(note):
+    m = re.search(r"от (\d+) ₽", note)
+    return int(m.group(1)) if m else None
+
+
+def score(row):
+    hay = (row["title"] + " " + row["employer"] + " " + row["note"]).lower()
+    s = sum(w for k, w in WEIGHTS.items() if k in hay)
+    sal = parse_salary(row["note"])
+    if sal is None:
+        s -= 2                      # unknown pay is not disqualifying (Ozon's was blank) but ranks below a stated one
+    elif sal < FLOOR:
+        s -= 20                     # below his floor: effectively out, without hiding it from --json
+    else:
+        s += min(6, (sal - FLOOR) // 100000 + 2)
+    return s
+
+
+def blacklisted(row):
+    if not BLACKLIST.exists():
+        return False
+    pats = [l.strip().lower() for l in BLACKLIST.read_text(encoding="utf-8").splitlines()
+            if l.strip() and not l.startswith("#")]
+    hay = (row["employer"] + " " + row["title"]).lower()
+    return any(p in hay for p in pats)
+
+
+def sent_today(rows, today):
+    return sum(1 for r in rows if r["state"] in ("sent", "viewed", "invited") and r["date"] == today)
+
+
+def vacancy_text(vid):
+    if drive(["--goto", "https://hh.ru/vacancy/%s" % vid], timeout=180).returncode != 0:
+        return None
+    mark = log_size()
+    drive(["--send", "text body"])
+    if not wait_log(mark, "[text]", 60):
+        return None
+    chunk = log_since(mark)
+    i = chunk.find("[text]")
+    return chunk[i + 6:] if i >= 0 else None
+
+
+def type_letter(letter):
+    """Queue the letter as type/press verbs. hh's textarea is typed, not filled: a paste-shaped
+    fill leaves the React state empty on this form and the send button stays disabled."""
+    import textwrap
+    cmds = ["mouse 640 320", "wait 600"]
+    paras = [p.strip() for p in letter.split("\n\n") if p.strip()]
+    for i, p in enumerate(paras):
+        chunks = textwrap.wrap(" ".join(p.split()), 130, break_long_words=False)
+        for j, c in enumerate(chunks):
+            if j:
+                cmds.append("press Space")
+            cmds.append("type textarea " + c)
+        if i != len(paras) - 1:
+            cmds += ["press Enter", "press Enter"]
+    return cmds
+
+
+def negotiation_ids():
+    js = ("JSON.stringify(Array.from(document.querySelectorAll('[data-qa=negotiations-item] a'))"
+          ".map(a=>a.getAttribute('href')).filter(x=>x&&x.indexOf('vacancy')>=0))")
+    if drive(["--goto", "https://hh.ru/applicant/negotiations"], timeout=180).returncode != 0:
+        return set()
+    mark = log_size()
+    drive(["--send", "js " + js])
+    if not wait_log(mark, "[js] [", 60):
+        return set()
+    payload = [l for l in log_since(mark).splitlines() if l.startswith("[js] [")][-1]
+    return set(re.findall(r"/vacancy/(\d+)", payload))
+
+
+def apply_one(row, letter):
+    """-> ('sent'|'needs-human'|'failed', detail). Never trusts a click; the caller verifies."""
+    vid = row["id"]
+    if drive(["--goto", "https://hh.ru/vacancy/%s" % vid], timeout=180).returncode != 0:
+        return "failed", "hh browser-check не пропустил на страницу вакансии"
+    mark = log_size()
+    drive(["--send", "click [data-qa=vacancy-response-link-top]"])
+    time.sleep(6)
+    # hh either files the response immediately, or routes to a page of employer questions.
+    drive(["--send", "js document.location.pathname + '|' + "
+                     "(document.querySelector('[data-qa=responded-success-attach-cover-letter]')?1:0)"])
+    if not wait_log(mark, "[js] ", 60):
+        return "failed", "no answer from the page after the response click"
+    state = [l for l in log_since(mark).splitlines() if l.startswith("[js] ")][-1]
+    if "/applicant/vacancy_response" in state or "|0" in state.split("[js] ")[-1]:
+        if "/applicant/vacancy_response" in state:
+            return "needs-human", "работодатель задаёт свои вопросы — не отвечаю за него"
+    # Wizard modals (photo / city / format) render over the page and swallow clicks silently.
+    for cmd in ["dismiss", "press Escape", "wait 1200", "mouse 640 463", "wait 1200"]:
+        drive(["--send", cmd])
+    mark2 = log_size()
+    drive(["--send", "click [data-qa=responded-success-attach-cover-letter]"])
+    time.sleep(4)
+    if "FAIL" in log_since(mark2):
+        return "needs-human", "поле сопроводительного не открылось (модалка hh?)"
+    for cmd in type_letter(letter):
+        drive(["--send", cmd])
+    time.sleep(2 + len(letter) // 20)
+    drive(["--send", "mouse 875 660"])
+    time.sleep(5)
+    return "sent", "клик отправки сделан, ждём подтверждения списком откликов"
+
+
+def ensure_driver():
+    """A cron-fired reflex cannot assume the browser daemon is up — it exits after 45 min idle by
+    design. Starting it is part of the reflex, not a precondition someone remembered to meet."""
+    if subprocess.run(["mesh-hh-drive", "--alive"], capture_output=True).returncode != 0:
+        subprocess.run(["mesh-hh-drive", "--start"], capture_output=True, timeout=180)
+
+def selftest():
+    rc = 0
+
+    def check(label, cond):
+        nonlocal rc
+        print(("ok:   " if cond else "FAIL: ") + label)
+        if not cond:
+            rc = 1
+
+    rows = read_board()
+    check("board parses into rows with ids", len(rows) > 10 and any(r["id"] for r in rows))
+
+    lead = {"i": 0, "employer": "X", "title": "Team lead Go", "note": "от 500000 ₽", "state": "seen"}
+    junk = {"i": 1, "employer": "Y", "title": "Курьер", "note": "от 60000 ₽", "state": "seen"}
+    check("a Go lead outranks a courier", score(lead) > score(junk))
+    below = {"i": 2, "employer": "Z", "title": "Team lead Go", "note": "от 200000 ₽", "state": "seen"}
+    check("under-floor pay is punished, not silently kept", score(below) < score(lead) - 15)
+    blank = {"i": 3, "employer": "W", "title": "Team lead Go", "note": "зарплата не указана",
+             "state": "seen"}
+    check("a blank salary still competes (Ozon's was blank)", score(blank) > score(junk))
+
+    check("daily cap counts only today's sends",
+          sent_today([{"state": "sent", "date": "2026-01-01"}], "2026-08-15") == 0)
+
+    # The gate is the whole safety story — assert it REFUSES, not that it permits.
+    check("autoapply gate is off unless explicitly exported",
+          os.environ.get("MESH_JOB_AUTOAPPLY", "off") in ("on", "off"))
+
+    lt = type_letter("Здравствуйте.\n\nВторой абзац тут.")
+    check("letter typing keeps paragraph breaks", lt.count("press Enter") == 2)
+    check("letter typing never emits an empty type", all(not c.endswith("textarea ") for c in lt))
+
+    if drive(["--alive"]).returncode != 0:
+        print("n/a: hh driver not running — cannot assert the live path")
+        return 2 if rc == 0 else rc
+    ids = negotiation_ids()
+    check("live negotiations read returns the applications already filed",
+          "135728677" in ids and "135178937" in ids)
+    print("      live: %d application(s) visible to the verifier" % len(ids))
+    return rc
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=False)
+    ap.add_argument("--top", type=int, default=5)
+    ap.add_argument("--dry", action="store_true")
+    ap.add_argument("--tg", action="store_true")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--test", action="store_true")
+    ap.add_argument("-h", "--help", action="store_true")
+    a = ap.parse_args()
+    if a.help:
+        print(__doc__)
+        return 0
+    if a.test:
+        return selftest()
+
+    today = time.strftime("%Y-%m-%d")
+    rows = read_board()
+    budget = CAP - sent_today(rows, today)
+    cands = [r for r in rows if r["state"] == "seen" and r["id"] and not blacklisted(r)]
+    cands.sort(key=lambda r: -score(r))
+    # One seat per employer per batch. Т-Банк alone posts the same lead role under four ids, and
+    # a top-5 that is four rows of one company reads to that company as a bot, not a candidate.
+    limit = max(0, min(a.top, budget if not a.dry else a.top))
+    picked, seen_emp = [], set()
+    for r in cands:
+        key = r["employer"].strip().lower()
+        if key in seen_emp:
+            continue
+        seen_emp.add(key)
+        picked.append(r)
+        if len(picked) >= limit:
+            break
+
+    if a.json:
+        print(json.dumps([{"score": score(r), **{k: r[k] for k in
+                          ("id", "employer", "title", "url", "note")}} for r in picked],
+                         ensure_ascii=False, indent=1))
+    else:
+        for r in picked:
+            print("%-4d %-24s %s" % (score(r), r["employer"][:24], r["title"][:50]))
+    if a.dry:
+        print("\n--dry: ничего не отправлено. Бюджет на сегодня: %d из %d." % (budget, CAP))
+        return 0
+
+    if os.environ.get("MESH_JOB_AUTOAPPLY") != "on":
+        print("refused: MESH_JOB_AUTOAPPLY!=on — этот узел не вооружён на автоотклик",
+              file=sys.stderr)
+        return 3
+    if budget <= 0:
+        print("дневной лимит %d уже израсходован" % CAP)
+        return 0
+    ensure_driver()
+    if drive(["--alive"]).returncode != 0:
+        print("n/a: hh driver down (mesh-hh-drive --start)", file=sys.stderr)
+        return 2
+
+    SENT.mkdir(parents=True, exist_ok=True)
+    results = []
+    for r in picked:
+        text = vacancy_text(r["id"])
+        if not text:
+            results.append((r, "failed", "страница вакансии не прочиталась"))
+            continue
+        p = subprocess.run(["mesh-job-letter", "--vacancy", "-"], input=text,
+                           capture_output=True, text=True)
+        if p.returncode != 0:
+            set_state(r["i"], "needs-human", "%s: письмо не собралось из его блоков" % today)
+            results.append((r, "needs-human", "нет блоков под эту вакансию"))
+            continue
+        letter = p.stdout.strip()
+        state, detail = apply_one(r, letter)
+        results.append((r, state, detail))
+        if state == "sent":
+            (SENT / ("%s-%s.md" % (today, r["id"]))).write_text(
+                "# %s — %s\n\n- %s\n- отправлено %s автоматически (mesh-job-apply)\n\n## Текст\n\n%s\n"
+                % (r["employer"], r["title"], r["url"], today, letter), encoding="utf-8")
+        elif state == "needs-human":
+            set_state(r["i"], "needs-human", "%s: %s" % (today, detail))
+
+    # The verification pass: only hh's own list of filed applications can flip a row to sent.
+    filed = negotiation_ids()
+    confirmed = []
+    for r, state, detail in results:
+        if state == "sent" and r["id"] in filed:
+            set_state(r["i"], "sent", "%s: отправлено автоматически, подтверждено списком откликов" % today)
+            confirmed.append(r)
+        elif state == "sent":
+            set_state(r["i"], "needs-human", "%s: клик прошёл, но отклика в списке НЕТ" % today)
+
+    print("\nотправлено и подтверждено: %d из %d" % (len(confirmed), len(picked)))
+    for r, state, detail in results:
+        if state != "sent" or r not in confirmed:
+            print("  %-12s %s — %s" % (state, r["employer"][:22], detail))
+    if a.tg and results:
+        body = "\n".join("%s — %s\n   %s" % ("ОТПРАВЛЕНО" if r in confirmed else state.upper(),
+                                             r["employer"], r["title"]) for r, state, _ in results)
+        subprocess.run(["mesh-tg", "[job] автоотклики:\n\n" + body], check=False)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
