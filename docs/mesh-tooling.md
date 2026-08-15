@@ -61,7 +61,9 @@ less lands `.unverified`. Unreachable renders honest n/a NAMING which — `off-l
 `auth-rejected`. `--where` · `--status` · `--verify` · `--restore-check`) · `mesh-sync-tools`
 (detect/heal genome↔local tool drift) · `mesh-genome-sync`
 (mirror the genome off-GitHub) · `mesh-restore` (revive a node's session) · `mesh-dms` (dead-man's
-switch for substrate edits) · `mesh-land` (steward lands SETTLED+parse-clean stranded stream edits;
+switch for substrate edits; `--list` enumerates what is armed right now — pid, deadline, the rollback
+it would run — and flags `ORPHANED-UNROLLED`: a timer killed before its deadline, i.e. a change left
+live with nothing to undo it) · `mesh-land` (steward lands SETTLED+parse-clean stranded stream edits;
 `--check` cron alerts so [done]-but-uncommitted work never strands into drift) · `mesh-fix-egress` ·
 `mesh-revert-catch` · `mesh-harden-ssh` (close the `:22` password-auth lateral-movement surface —
 disables password/kbd-interactive auth, key-auth only, UNDER mesh-dms with a verified-key-login

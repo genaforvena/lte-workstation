@@ -42,6 +42,11 @@ A contended substrate resource has **one owner at a time**. Before you touch it:
    ```
    The other agent **acknowledges in the same channel** and states what it has left
    outstanding (its un-rolled-back changes). Now there is a single writer.
+   **Don't take that answer on trust — read the node instead:** `mesh-dms --list` enumerates the
+   dead-man switches armed *right now* (pid, deadline, and the exact rollback each would run).
+   A record whose timer died **before** its deadline prints `ORPHANED-UNROLLED` — that is a change
+   sitting live with nothing left to undo it, i.e. precisely the outstanding state step 3 asks about,
+   surfaced whether or not anyone remembers to declare it.
 4. **Apply under a dead-man's switch** (`mesh-dms`): schedule the rollback *before*
    the change, cancel only after `mesh-health` (and `mesh-card --refresh`) confirm
    the invariant holds. The dead-man gate is the **host-safety** check (host still on
