@@ -5,10 +5,17 @@ Read + draft-and-confirm send, driven by Telethon over the operator's OWN accoun
 (session reused from tdl, ~/.tdl/data/default -> ~/.mesh/tg-userbot.session).
 
   READ  (safe):  me · unread · read <chat> [N]
+                 download <chat> <msg_id>   # pull an attachment -> ~/.mesh/tg-inbox/
   ACT  (gated):  draft <chat> <text>        # stages only, NEVER sends
                  send  <chat> <text> --confirm
                  reply <chat> <msg_id> <text> --confirm
                  mark-read <chat>
+
+DOWNLOAD: MTProto gives the userbot a 2GB per-file ceiling where the BOT organ is capped at
+20MB — this is the only hands-free path for a large attachment. It is INBOUND (no --confirm),
+but it WRITES TO DISK, so the destination directory is FIXED (~/.mesh/tg-inbox) and never
+taken from an argument; the server-supplied filename is sanitized and confined to that dir.
+`read` marks every message that carries a file with [id name size] so a mind can pick one.
 
 DRAFT-AND-CONFIRM DOCTRINE: send/reply are outward-facing and IRREVERSIBLE — a wrong
 send to a real contact cannot be unsent. They REFUSE without --confirm (exit 3), print
@@ -19,12 +26,17 @@ shows it to the operator, and only then runs `send ... --confirm`.
 Node-bound: needs ~/.venv-tg (telethon) + the session file — mesh-home only. orphan-ok.
 """
 # orphan-ok: node-bound userbot organ (venv + operator session on mesh-home only)
-import asyncio, os, sys, base64, json, time, html
+import asyncio, os, sys, base64, json, time, html, re, shutil, hashlib, mimetypes
 
 HOME = os.path.expanduser("~")
 SESSION = os.path.join(HOME, ".mesh", "tg-userbot.session")
 TDL_STORE = os.path.join(HOME, ".tdl", "data", "default")
 DRAFT_DIR = os.path.join(HOME, ".mesh", "tg-drafts")
+# FIXED download destination — never taken from an argument (see DOWNLOAD in the docstring)
+INBOX_DIR = os.path.join(HOME, ".mesh", "tg-inbox")
+# the self-test downloads into its OWN dir: a test must never write the artifact a human reads
+SELFTEST_DIR = os.path.join(INBOX_DIR, ".selftest")
+FREE_FLOOR = 1 << 30  # refuse a download that would leave less than 1GiB free
 # OUR OWN log — ~/.mesh/tg-sent.log belongs to the mesh BOT organ (mesh-tg/voice-tx); never share it
 SENT_LOG = os.path.join(HOME, ".mesh", "tg-userbot-sent.log")
 # tdl uses the public Telegram Desktop app credentials
@@ -101,10 +113,18 @@ async def _entity(c, arg, allow_fuzzy=True):
         return "me"
     if arg.startswith("@"):
         return await c.get_entity(arg)
-    try:
-        return await c.get_entity(int(arg))
-    except ValueError:
-        pass
+    if re.fullmatch(r"-?\d+", arg):
+        try:
+            return await c.get_entity(int(arg))
+        except (ValueError, TypeError):
+            pass
+        # get_entity(int) needs the id in the session cache; a channel id printed by `unread`
+        # or a media scan often is not. Match it against the dialog list BY ID — never let a
+        # numeric arg fall through to the fuzzy NAME branch (it can only mismatch there).
+        async for d in c.iter_dialogs():
+            if getattr(d.entity, "id", None) == int(arg):
+                return d.entity
+        raise SystemExit(f"no dialog with id {arg}")
     if not allow_fuzzy:
         raise SystemExit(f"refusing to send to fuzzy name {arg!r} — use 'me', @username, or numeric id")
     low = arg.lower()
@@ -144,10 +164,80 @@ async def v_read(c, args):
     ent = await _entity(c, args[0])
     msgs = await c.get_messages(ent, limit=n)
     for m in reversed(msgs):
-        who = "me" if m.out else ((m.sender and (m.sender.first_name or getattr(m.sender, "title", None))) or "?")
+        # a channel sender has .title and NO .first_name — attribute access, not getattr, is
+        # what raised AttributeError here the moment a channel became reachable by numeric id
+        who = "me" if m.out else ((m.sender and (getattr(m.sender, "first_name", None)
+                                                 or getattr(m.sender, "title", None))) or "?")
         t = m.date.astimezone().strftime("%m-%d %H:%M")
         txt = (m.text or ("<%s>" % (m.media and type(m.media).__name__ or "")) or "").replace("\n", " ")
-        print(f"[{m.id}] {t} {who}: {txt[:120]}")
+        # mark a downloadable attachment so `download` has a msg_id to aim at
+        att = ""
+        if m.file:
+            att = f"  [file {m.file.name or '-'} {_human(m.file.size or 0)}]"
+        print(f"[{m.id}] {t} {who}: {txt[:120]}{att}")
+
+
+def _human(n):
+    for u in ("B", "K", "M", "G"):
+        if n < 1024 or u == "G":
+            return f"{n:.0f}{u}" if u == "B" else f"{n:.1f}{u}"
+        n /= 1024.0
+
+
+def _safe_name(msg):
+    """Server-supplied filename -> a leaf name that cannot escape the fixed inbox."""
+    raw = os.path.basename(msg.file.name or "") if msg.file else ""
+    raw = re.sub(r"[^A-Za-z0-9._-]", "_", raw).lstrip(".")[:120]
+    if not raw:
+        ext = mimetypes.guess_extension((msg.file.mime_type or "").split(";")[0]) or ".bin"
+        raw = f"attachment{ext}"
+    return f"{msg.id}-{raw}"
+
+
+def _md5(path):
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+async def _fetch_media(c, msg, dest_dir):
+    """Download msg's attachment into dest_dir. Returns (path, size, md5).
+
+    Asserts the bytes on disk match the size the SERVER declared — 'the file appeared'
+    is not the claim; a truncated download is the failure this catches."""
+    want = msg.file.size or 0
+    os.makedirs(dest_dir, mode=0o700, exist_ok=True)
+    free = shutil.disk_usage(dest_dir).free
+    if want + FREE_FLOOR > free:
+        raise SystemExit(f"refusing: {_human(want)} would leave <1GiB free ({_human(free)} now)")
+    dest = os.path.join(dest_dir, _safe_name(msg))
+    root = os.path.realpath(dest_dir) + os.sep
+    if not os.path.realpath(dest).startswith(root):
+        raise SystemExit(f"refusing: sanitized name escapes {dest_dir}")
+    part = dest + ".part"
+    await c.download_media(msg, file=part)
+    got = os.path.getsize(part)
+    if want and got != want:
+        os.unlink(part)
+        raise SystemExit(f"TRUNCATED: got {got} bytes, server declared {want} — nothing written")
+    os.replace(part, dest)
+    return dest, got, _md5(dest)
+
+
+async def v_download(c, args):
+    if len(args) < 2:
+        raise SystemExit("usage: download <chat> <msg_id>   (dest is fixed: %s)" % INBOX_DIR)
+    ent = await _entity(c, args[0])
+    mid = int(args[1])
+    msg = await c.get_messages(ent, ids=mid)
+    if msg is None:
+        raise SystemExit(f"no message {mid} in {args[0]!r}")
+    if not msg.file:
+        raise SystemExit(f"message {mid} carries no file (media={type(msg.media).__name__ if msg.media else None})")
+    path, size, md5 = await _fetch_media(c, msg, INBOX_DIR)
+    print(f"DOWNLOADED {path}\n  {size} bytes ({_human(size)})  md5={md5}")
 
 
 async def v_draft(c, args):
@@ -210,9 +300,31 @@ async def v_test(c, _):
     me = await c.get_me()
     assert me and me.id, "get_me returned no id"
     print(f"ok: authorized as id {me.id}")
+    # real-DOWNLOAD gate: drive the actual transfer path, not a stub. A wrapper's test must
+    # exercise the thing it wraps — assert BYTES ON DISK against the server-declared size.
+    small = None
+    async for m in c.iter_messages("me", limit=120):
+        if m.file and 0 < (m.file.size or 0) <= (1 << 20):
+            if small is None or m.file.size < small.file.size:
+                small = m
+    if small is None:
+        print("no attachment <=1MiB in the last 120 Saved Messages — download leg not exercised",
+              file=sys.stderr)
+        raise SystemExit(2)
+    shutil.rmtree(SELFTEST_DIR, ignore_errors=True)
+    path, size, md5 = await _fetch_media(c, small, SELFTEST_DIR)
+    try:
+        assert size == small.file.size, f"size {size} != declared {small.file.size}"
+        assert len(md5) == 32, f"bad md5 {md5!r}"
+        assert os.path.realpath(path).startswith(os.path.realpath(SELFTEST_DIR) + os.sep), \
+            f"wrote outside the self-test dir: {path}"
+        print(f"ok: downloaded msg {small.id} -> {size} bytes md5={md5} (declared {small.file.size})")
+    finally:
+        shutil.rmtree(SELFTEST_DIR, ignore_errors=True)
 
 
 VERBS = {"me": v_me, "unread": v_unread, "read": v_read, "draft": v_draft,
+         "download": v_download,
          "send": v_send, "reply": v_reply, "mark-read": v_mark_read, "test": v_test}
 
 
