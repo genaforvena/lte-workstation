@@ -1,0 +1,533 @@
+#!/usr/bin/env bash
+# mesh-body-backup — pull the Redmi body's Termux install to this node, and PROVE it restores.
+#
+# WHY THIS EXISTS (discover [fyi] 2026-08-15T14:16Z): the phone's entire mesh presence is a ~125MB
+# Termux install holding the body's THREE sshd host keys, an authorized_keys with 3 mesh keys, and a
+# private key — and there were ZERO backups of it. The loss is not hypothetical: it already happened
+# once (PHONE_USER drifted u0_a386 -> u0_a380 on a reinstall, and the tailscale binary went with it,
+# which is WHY the body is LAN-only today). If it recurs, every known_hosts on the mesh breaks AND no
+# node can reach the body until it is re-keyed BY HAND, on a phone reachable only from the home LAN.
+#
+# A BACKUP NOBODY HAS RESTORED IS A CLAIM, NOT A CAPABILITY. So the tarball is not the deliverable —
+# the deliverable is `--restore-check`: extract the archive into a THROWAWAY prefix and make
+# ssh-keygen actually parse each of the three host keys off disk. Listing a name in `tar -t` proves a
+# path exists; it does not prove the bytes under it are a key. Nothing is published as a good backup
+# until that has passed, and a failed check leaves the file as `.unverified` rather than rotating it
+# into the retention set (the ONLY thing worse than no backup is a backup believed good).
+#
+# SECRETS (docs/secrets.md, binding): this archive carries host keys + authorized_keys + a private
+# key. It NEVER leaves the mesh — no cloud, no third party, no relay, no artifact channel. Dir 0700,
+# file 0600, enforced on every run (not assumed from umask). Only the file NAMES are ever logged.
+#
+# HONEST n/a IS THE COMMON CASE, NOT THE EDGE (health [verify] 2026-08-15T14:38Z: the body left the
+# LAN within 22 minutes of being measured live). So an unreachable phone must never look like a
+# quiet success, and "unreachable" is not one condition — this tool NAMES which it saw, because the
+# three want different responses:
+#   off-lan        no ARP lladdr / no ping — the phone is asleep or off the network. Wait.
+#   sshd-down      the host answers ping+ARP but 8022 REFUSES — the phone is UP and Termux/sshd is
+#                  not running. Only a tap on the handset fixes that (MIUI kills Termux; see
+#                  ~/.mesh/knowledge/phone-sshd-dies-android-kill-not-cellular-2026-06-13.md).
+#   auth-rejected  sshd answered and rejected our key — the phone is up, the KEY is the problem.
+# All three exit 2 and write NOTHING into the backup dir.
+#
+# ADDRESS: candidates come from PHONE_LAN_IPS/PHONE_TS_IP but are REORDERED BY LIVE ARP each run,
+# never trusted in file order. The body's LAN lease moves between .203 and .146 (both are randomised
+# MACs of the same handset in ~/.mesh/knowledge/capability-gaps-gl-mt3000-2026-06-15.md), and it
+# moved WITHIN THIS TASK: discover measured .146 live / .203 closed at 14:16Z, and at 17:47Z the
+# reverse held (.203 ARP REACHABLE + ping 0% loss, .146 ARP INCOMPLETE). A static order is therefore
+# wrong half the time whichever way you write it; probing ARP costs nothing and is right both ways.
+#
+#   mesh-body-backup                 pull if the newest verified backup is older than MIN_INTERVAL
+#   mesh-body-backup --force         pull regardless of age
+#   mesh-body-backup --status        last run, last good backup, retention set — never a bare "ok"
+#   mesh-body-backup --verify [f]    re-assert the four identity files are IN the archive (listing)
+#   mesh-body-backup --restore-check [f]
+#                                    the real gate: extract to a throwaway prefix, ssh-keygen -l
+#                                    every host key off disk, then delete the prefix
+#   mesh-body-backup --where         print the resolved phone address + reachability classification
+#   mesh-body-backup --test          smoke test (synthesises a real archive; sees the gate go RED)
+#
+# Cadence: hourly ATTEMPT, MIN_INTERVAL-gated pull. The body sleeps and is LAN-only, so the schedule
+# has to live HERE, not on the phone (its crontab is empty and Xiaomi doze will not run one). Most
+# firings are a sub-second ARP probe that finds nothing and exits 2; the pull itself happens at most
+# once a day, when the phone happens to be awake. Identity keys change ~never — the point is to have
+# CAUGHT a window, not to be current to the minute.
+#
+# Exit: 0 = pulled, or skipped because a verified backup is still fresh · 2 = honest n/a (phone
+# unreachable — cause named; also: no phone configured on this node, so autowire SKIPs it) ·
+# 1 = the phone answered but the pull or the verification FAILED.
+#
+# reflex-cadence: 41 * * * *
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+# ~/.mesh/nodes EXPORTS the phone addresses, so a plain `. nodes` silently clobbers whatever the
+# caller set — which would make every address fixture in --test read the real body instead. Explicit
+# env wins: capture set-ness (`+set`, so a deliberate EMPTY survives too), source, restore.
+_ov_ts="${PHONE_TS_IP+set}"; _ov_lan="${PHONE_LAN_IPS+set}"
+_sv_ts="${PHONE_TS_IP:-}"; _sv_lan="${PHONE_LAN_IPS:-}"
+[ -f "$HOME/.mesh/nodes" ] && . "$HOME/.mesh/nodes" 2>/dev/null || true
+[ "$_ov_ts" = set ] && { PHONE_TS_IP="$_sv_ts"; export PHONE_TS_IP; }
+[ "$_ov_lan" = set ] && { PHONE_LAN_IPS="$_sv_lan"; export PHONE_LAN_IPS; }
+
+DIR="${MESH_BODY_BACKUP_DIR:-$HOME/.mesh/body-backup}"
+STATE="${MESH_BODY_BACKUP_STATE:-$HOME/.mesh/body-backup.state}"
+LOG="${MESH_BODY_BACKUP_LOG:-$HOME/.mesh/body-backup.log}"
+KEEP="${MESH_BODY_BACKUP_KEEP:-3}"
+MIN_INTERVAL="${MESH_BODY_BACKUP_MIN_INTERVAL:-79200}"   # 22h — a 24h cron+22h floor never skips a day
+PORT="${PHONE_SSH_PORT:-8022}"
+PUSER="${PHONE_USER:-u0_a380}"
+MIN_BYTES="${MESH_BODY_BACKUP_MIN_BYTES:-20000000}"      # a real Termux backup is ~125MB; 20MB is a floor
+
+stamp() { date -u +%FT%TZ; }
+log() { printf '%s\t%s\n' "$(stamp)" "$*" >> "$LOG" 2>/dev/null || true; }
+
+# The four files that ARE the body's identity. Matched by basename so a Termux layout change
+# (home/usr prefixes, ./ prefixes) cannot turn a real backup into a false failure.
+IDENTITY_RE='(^|/)(ssh_host_ed25519_key|ssh_host_ecdsa_key|ssh_host_rsa_key|authorized_keys)$'
+HOSTKEYS='ssh_host_ed25519_key ssh_host_ecdsa_key ssh_host_rsa_key'
+
+# ---------------------------------------------------------------- address + reachability
+# arp_live <ip> -> 0 if the kernel has a link-layer address for it (any state but FAILED/INCOMPLETE)
+arp_live() {
+  ip neigh show "$1" 2>/dev/null | grep -q 'lladdr' && \
+    ! ip neigh show "$1" 2>/dev/null | grep -qE 'FAILED|INCOMPLETE'
+}
+
+# candidates -> the configured phone addresses, ARP-live ones FIRST (see ADDRESS in the header)
+candidates() {
+  local ip live="" dead=""
+  for ip in ${PHONE_TS_IP:-} ${PHONE_LAN_IPS:-}; do
+    [ -n "$ip" ] || continue
+    case " $live $dead " in *" $ip "*) continue ;; esac
+    ping -c1 -W1 "$ip" >/dev/null 2>&1 || true      # populate/refresh the ARP entry
+    if arp_live "$ip"; then live="$live $ip"; else dead="$dead $ip"; fi
+  done
+  printf '%s\n' $live $dead
+}
+
+# resolve -> prints "IP <ip>" (rc 0) or "NA <cause>" (rc 2). The cause travels on STDOUT, not in a
+# variable: every caller uses $(resolve), and an assignment made inside a command substitution dies
+# with its subshell — REACH_CAUSE came back empty and the n/a read as unnamed, which is exactly the
+# failure this tool exists to prevent.
+resolve() {
+  local ip err rc cause="" seen=0
+  for ip in $(candidates); do
+    seen=1
+    if ! arp_live "$ip"; then
+      [ -n "$cause" ] || cause="off-lan"
+      continue
+    fi
+    # Host is on the LAN. Is anything listening on the ssh port?
+    if ! timeout 3 bash -c "exec 3<>/dev/tcp/$ip/$PORT" 2>/dev/null; then
+      cause="sshd-down"
+      continue
+    fi
+    err="$(timeout 8 ssh -p "$PORT" -o BatchMode=yes -o ConnectTimeout=5 \
+      -o StrictHostKeyChecking=accept-new "$PUSER@$ip" 'echo ok' </dev/null 2>&1 >/dev/null)"
+    rc=$?
+    [ "$rc" = 0 ] && { printf 'IP %s\n' "$ip"; return 0; }
+    if printf '%s' "$err" | grep -qi 'permission denied\|no matching\|host key'; then
+      cause="auth-rejected"
+    else
+      [ "$cause" = auth-rejected ] || cause="sshd-down"
+    fi
+  done
+  [ "$seen" = 1 ] || { printf 'NA unconfigured\n'; return 2; }
+  printf 'NA %s\n' "${cause:-off-lan}"
+  return 2
+}
+
+# reach -> sets PHONE_ADDR (on success) or REACH_CAUSE (on failure); rc 0 / 2. The one call site
+# shape, so no caller can forget to unpack resolve's two-word answer.
+PHONE_ADDR=""; REACH_CAUSE=""
+reach() {
+  local r; r="$(resolve)"
+  case "$r" in
+    'IP '*) PHONE_ADDR="${r#IP }"; REACH_CAUSE=""; return 0 ;;
+    *)      PHONE_ADDR=""; REACH_CAUSE="${r#NA }"; return 2 ;;
+  esac
+}
+
+# ---------------------------------------------------------------- verification
+# verify_listing <archive> -> 0 if all four identity files are IN the archive; prints what it found.
+verify_listing() {
+  local f="$1" names n miss=""
+  names="$(tar -tf "$f" 2>/dev/null | grep -E "$IDENTITY_RE" | sed 's:.*/::' | sort -u)" || true
+  for n in $HOSTKEYS authorized_keys; do
+    printf '%s\n' "$names" | grep -qx "$n" || miss="$miss $n"
+  done
+  if [ -n "$miss" ]; then
+    printf 'listing: MISSING%s (found: %s)\n' "$miss" "$(printf '%s' "$names" | tr '\n' ' ')"
+    return 1
+  fi
+  printf 'listing: ok (%s)\n' "$(printf '%s' "$names" | tr '\n' ' ')"
+}
+
+# restore_check <archive> -> extract into a throwaway prefix and make ssh-keygen PARSE each host key
+# off disk. This is the leg that separates "a path exists in a tar index" from "these bytes are a
+# usable identity" — the whole reason this tool is not just a scp.
+restore_check() {
+  local f="$1" d rc=0 k found fp
+  d="$(mktemp -d "${TMPDIR:-/tmp}/body-restore.XXXXXX")" || { echo "restore: FAIL (mktemp)"; return 1; }
+  chmod 700 "$d"
+  if ! tar -xf "$f" -C "$d" 2>/dev/null; then
+    echo "restore: FAIL (extract) $f"; rm -rf "$d"; return 1
+  fi
+  for k in $HOSTKEYS; do
+    found="$(find "$d" -type f -name "$k" 2>/dev/null | head -1)"
+    if [ -z "$found" ]; then echo "restore: FAIL $k absent on disk after extract"; rc=1; continue; fi
+    chmod 600 "$found" 2>/dev/null || true
+    fp="$(ssh-keygen -l -f "$found" 2>/dev/null | awk '{print $2" "$4}')"
+    if [ -z "$fp" ]; then echo "restore: FAIL $k on disk but ssh-keygen cannot read it"; rc=1
+    else echo "restore: ok $k ($fp)"; fi
+  done
+  found="$(find "$d" -type f -name authorized_keys 2>/dev/null | head -1)"
+  if [ -z "$found" ]; then echo "restore: FAIL authorized_keys absent on disk after extract"; rc=1
+  else echo "restore: ok authorized_keys ($(grep -c '^ssh-\|^ecdsa-' "$found" 2>/dev/null || echo 0) keys)"; fi
+
+  # IDENTITY leg — the one that makes this a backup of THE BODY and not of A phone. ssh-keygen
+  # parsing the bytes proves they are a key; only comparing the fingerprint to what this node's
+  # known_hosts ALREADY trusts for the phone proves they are the key the mesh authenticates against.
+  # Verified by hand 2026-08-15: restored ED25519 SHA256:GTB6D9lK… matches the entry for BOTH
+  # [192.168.8.203]:8022 and [192.168.8.146]:8022 — which also settles that the two leases are one
+  # handset. No known_hosts entry => this leg renders n/a and says so; it never invents a match.
+  local kh_want kh_got addr
+  kh_got=""
+  found="$(find "$d" -type f -name ssh_host_ed25519_key 2>/dev/null | head -1)"
+  [ -n "$found" ] && kh_got="$(ssh-keygen -l -f "$found" 2>/dev/null | awk '{print $2}')"
+  kh_want=""
+  for addr in ${PHONE_LAN_IPS:-} ${PHONE_TS_IP:-}; do
+    kh_want="$(ssh-keygen -F "[$addr]:$PORT" -l 2>/dev/null | grep -v '^#' | awk '{print $3}' | head -1)"
+    [ -n "$kh_want" ] && break
+  done
+  if [ -z "$kh_want" ]; then
+    echo "restore: n/a known_hosts has no entry for the phone — identity match not assertable here"
+  elif [ "$kh_want" = "$kh_got" ]; then
+    echo "restore: ok identity MATCHES known_hosts ($kh_got)"
+  else
+    echo "restore: FAIL ed25519 $kh_got != known_hosts $kh_want — this is not the body the mesh trusts"
+    rc=1
+  fi
+  rm -rf "$d"
+  return $rc
+}
+
+# newest -> the newest PUBLISHED archive. Matches the bare `.tar` too: the stdout path on this body
+# emits an uncompressed tar, and a `redmi-*.tar.*` glob would silently never see it — the freshness
+# gate would then re-pull every hour while a perfectly good backup sat next to it.
+# archive_ext <file> -> the extension matching the file's ACTUAL magic. termux-backup's output form
+# is not assumable: this build's `-` (stdout) path emits an UNCOMPRESSED tar, so naming every pull
+# .tar.xz would put a lie in the filename (two renderings of one value must agree).
+archive_ext() {
+  case "$(head -c6 "$1" | od -An -tx1 | tr -d ' \n')" in
+    fd377a585a00*) echo tar.xz ;;
+    1f8b*)         echo tar.gz ;;
+    28b52ffd*)     echo tar.zst ;;
+    *)             echo tar ;;
+  esac
+}
+
+# complete_archive <file> -> 0 if BOTH halves of the Termux install are in the index. This is the
+# truncation gate; see the note above.
+complete_archive() {
+  local tops
+  tops="$(tar -tf "$1" 2>/dev/null | sed 's:^\./::' | cut -d/ -f1 | sort -u | tr '\n' ' ')"
+  case " $tops " in
+    *" home "*) case " $tops " in *" usr "*) return 0 ;; esac ;;
+  esac
+  printf 'complete: MISSING half — top-level is [%s], expected both home and usr (TRUNCATED PULL)\n' "$tops"
+  return 1
+}
+
+newest() {
+  ls -1t "$DIR"/redmi-*.tar "$DIR"/redmi-*.tar.gz "$DIR"/redmi-*.tar.xz "$DIR"/redmi-*.tar.zst \
+    2>/dev/null | head -1
+}
+all_archives() { ls -1t "$DIR"/redmi-* 2>/dev/null; }
+
+# ---------------------------------------------------------------- subcommands
+case "${1:-}" in
+  --where)
+    if reach; then echo "phone: reachable at $PHONE_ADDR ($PUSER:$PORT)"; exit 0
+    else echo "phone: n/a — $REACH_CAUSE (tried:$(printf ' %s' $(candidates)))"; exit 2; fi ;;
+  --status)
+    b="$(newest)"
+    printf 'last-run:   %s\n' "$( [ -f "$STATE" ] && printf '%s (%s)' "$(cat "$STATE")" "$(stat -c %y "$STATE" | cut -d. -f1)" || echo none )"
+    if [ -n "$b" ]; then
+      printf 'last-good:  %s  %s  age=%sh  mode=%s\n' "$(basename "$b")" \
+        "$(du -h "$b" | cut -f1)" "$(( ( $(date +%s) - $(stat -c %Y "$b") ) / 3600 ))" \
+        "$(stat -c %a "$b")"
+    else printf 'last-good:  NONE — the body has no recoverable identity on this node\n'; fi
+    printf 'retention:  %s file(s) in %s (keep=%s, dir mode %s)\n' \
+      "$(all_archives | wc -l)" "$DIR" "$KEEP" \
+      "$( [ -d "$DIR" ] && stat -c %a "$DIR" || echo '-' )"
+    ls -1 "$DIR"/*.unverified 2>/dev/null | while read -r u; do printf 'UNVERIFIED: %s\n' "$(basename "$u")"; done
+    exit 0 ;;
+  --verify)
+    f="${2:-$(newest)}"; [ -n "$f" ] && [ -f "$f" ] || { echo "verify: n/a — no archive"; exit 2; }
+    verify_listing "$f"; exit $? ;;
+  --restore-check)
+    f="${2:-$(newest)}"; [ -n "$f" ] && [ -f "$f" ] || { echo "restore-check: n/a — no archive"; exit 2; }
+    # Both legs always run and both are printed. A short-circuit here would hide the identity
+    # verdict behind a listing failure — and on a partial archive the identity verdict is exactly
+    # what a human needs (three host keys can be recovered even when the home half never arrived).
+    vrc=0; rrc=0
+    complete_archive "$f" || vrc=1
+    verify_listing "$f" || vrc=1
+    restore_check "$f" || rrc=1
+    [ "$vrc" = 0 ] && [ "$rrc" = 0 ] && exit 0
+    exit 1 ;;
+  --test) ;;    # handled below
+  --force|'') ;;
+  *) echo "mesh-body-backup: unknown option '$1' (see --help in the header)" >&2; exit 1 ;;
+esac
+
+# ---------------------------------------------------------------- test
+if [ "${1:-}" = --test ]; then
+  fail=""
+  d="$(mktemp -d)" || { echo "smoke-test: FAIL (mktemp)"; exit 1; }
+  trap 'rm -rf "$d"' EXIT
+
+  # (1) Build a REAL archive shaped like a termux-backup and assert the gate goes GREEN on it.
+  mkdir -p "$d/src/usr/etc/ssh" "$d/src/home/.ssh"
+  for k in $HOSTKEYS; do
+    t=ed25519; case "$k" in *ecdsa*) t=ecdsa ;; *rsa*) t=rsa ;; esac
+    ssh-keygen -q -t "$t" -N '' -f "$d/src/usr/etc/ssh/$k" -C "smoke@test" </dev/null >/dev/null 2>&1
+  done
+  ssh-keygen -q -t ed25519 -N '' -f "$d/ak" </dev/null >/dev/null 2>&1
+  cp "$d/ak.pub" "$d/src/home/.ssh/authorized_keys"
+  ( cd "$d/src" && tar -cJf "$d/good.tar.xz" home usr ) 2>/dev/null
+  [ -s "$d/good.tar.xz" ] || { echo "smoke-test: FAIL (could not build fixture)"; exit 1; }
+  verify_listing "$d/good.tar.xz" >/dev/null || fail="$fail listing-green-failed"
+  # The fixture's keys are freshly generated, so the identity leg has nothing to match against: run
+  # it with no phone configured, where it must render n/a rather than pass or fail silently.
+  gr="$(PHONE_LAN_IPS='' PHONE_TS_IP='' restore_check "$d/good.tar.xz" 2>&1)" \
+    || fail="$fail restore-green-failed"
+  printf '%s' "$gr" | grep -q 'identity match not assertable' || fail="$fail identity-leg-not-na-without-known-hosts"
+  # And with a REAL known_hosts entry present, a foreign key must be REJECTED — the leg's whole
+  # point. Skipped (loudly) on a node whose known_hosts has never met the body.
+  if [ -n "$(for a in ${PHONE_LAN_IPS:-}; do ssh-keygen -F "[$a]:$PORT" -l 2>/dev/null | grep -v '^#'; done)" ]; then
+    restore_check "$d/good.tar.xz" >/dev/null 2>&1 && fail="$fail identity-accepted-a-foreign-key"
+  else
+    echo "smoke-test: note — identity-mismatch leg SKIPPED (no known_hosts entry for the phone here)"
+  fi
+
+  # (2) A GATE YOU HAVE NOT SEEN FAIL IS NOT A GATE — break it two independent ways and watch RED.
+  #     (a) a host key MISSING from the archive; (b) a host key PRESENT but not a key. (b) is the
+  #     one a `tar -t` listing check can never catch, which is why --restore-check exists.
+  ( cd "$d/src" && rm -f usr/etc/ssh/ssh_host_rsa_key && tar -cJf "$d/missing.tar.xz" home usr ) 2>/dev/null
+  verify_listing "$d/missing.tar.xz" >/dev/null 2>&1 && fail="$fail listing-passed-on-missing-key"
+  ssh-keygen -q -t rsa -b 2048 -N '' -f "$d/src/usr/etc/ssh/ssh_host_rsa_key" </dev/null >/dev/null 2>&1
+  printf 'not a key at all\n' > "$d/src/usr/etc/ssh/ssh_host_ecdsa_key"
+  ( cd "$d/src" && tar -cJf "$d/corrupt.tar.xz" home usr ) 2>/dev/null
+  verify_listing "$d/corrupt.tar.xz" >/dev/null || fail="$fail listing-should-still-pass-on-corrupt"
+  restore_check "$d/corrupt.tar.xz" >/dev/null 2>&1 && fail="$fail restore-passed-on-corrupt-key"
+
+  # (2b) THE TRUNCATION GATE, against the exact archive this body actually produced on 2026-08-15:
+  #      `./usr` complete, `./home` absent, tar index reading WITHOUT error. Both halves present =>
+  #      green; usr-only => red, and it must be the COMPLETENESS gate that reddens (naming the cut),
+  #      not the identity gate (which would name the wrong cause).
+  ( cd "$d/src" && tar -cf "$d/usronly.tar" usr ) 2>/dev/null
+  tar -tf "$d/usronly.tar" >/dev/null 2>&1 || fail="$fail truncated-fixture-not-a-clean-tar"
+  complete_archive "$d/good.tar.xz" >/dev/null || fail="$fail complete-red-on-good"
+  complete_archive "$d/usronly.tar" >/dev/null 2>&1 && fail="$fail complete-passed-on-truncated"
+  [ "$(archive_ext "$d/usronly.tar")" = tar ] || fail="$fail ext-misread-uncompressed"
+  [ "$(archive_ext "$d/good.tar.xz")" = tar.xz ] || fail="$fail ext-misread-xz"
+
+  # (3) Honest n/a: point the resolver at a black hole and assert it exits 2, NAMES a cause, and
+  #     writes NOTHING into the backup dir (a failed pull must never look like a quiet success).
+  mkdir -p "$d/bk"; before="$(ls -1 "$d/bk" | md5sum)"
+  out="$(MESH_BODY_BACKUP_DIR="$d/bk" PHONE_TS_IP='' PHONE_LAN_IPS='192.0.2.7 198.51.100.9' \
+         bash "$0" --where 2>&1)"; rc=$?
+  [ "$rc" = 2 ] || fail="$fail unreachable-not-exit2(rc=$rc)"
+  printf '%s' "$out" | grep -q 'n/a — off-lan' || fail="$fail unreachable-cause-unnamed($out)"
+  [ "$(ls -1 "$d/bk" | md5sum)" = "$before" ] || fail="$fail na-wrote-into-backup-dir"
+
+  # (4) No phone configured at all -> exit 2 with cause 'unconfigured', so mesh-autowire SKIPs this
+  #     reflex on every node that has no body (it must not be wired mesh-wide).
+  out="$(MESH_BODY_BACKUP_DIR="$d/bk" PHONE_TS_IP='' PHONE_LAN_IPS='' bash "$0" --where 2>&1)"; rc=$?
+  [ "$rc" = 2 ] || fail="$fail unconfigured-not-exit2(rc=$rc)"
+  printf '%s' "$out" | grep -q 'unconfigured' || fail="$fail unconfigured-cause-unnamed($out)"
+
+  # (5) Mode enforcement is a DELIVERABLE, not a nicety (secrets.md): assert on real files.
+  mkdir -p "$d/bk2"; : > "$d/bk2/redmi-x.tar.xz"
+  MESH_BODY_BACKUP_DIR="$d/bk2" harden_dir=1 bash -c '
+    d="$1"; chmod 700 "$d"; chmod 600 "$d"/redmi-*.tar.* 2>/dev/null' _ "$d/bk2"
+  [ "$(stat -c %a "$d/bk2")" = 700 ] || fail="$fail dir-mode"
+  [ "$(stat -c %a "$d/bk2/redmi-x.tar.xz")" = 600 ] || fail="$fail file-mode"
+
+  # (6) The LIVE leg — real read of the real body, never a stub. Exit 2 (honest n/a) when the phone
+  #     is not answering; this is the common case and must not be reported as a pass in disguise.
+  if reach; then
+    if timeout 15 ssh -p "$PORT" -o BatchMode=yes -o ConnectTimeout=5 "$PUSER@$PHONE_ADDR" \
+         'command -v termux-backup' </dev/null >/dev/null 2>&1; then
+      echo "smoke-test: live leg ok — termux-backup present on $PHONE_ADDR"
+    else
+      fail="$fail phone-up-but-no-termux-backup"
+    fi
+    [ -z "$fail" ] && { echo "smoke-test: ok (fixtures + live body at $PHONE_ADDR)"; exit 0; }
+  else
+    if [ -z "$fail" ]; then
+      # A SLEEPING BODY IS NOT AN ABSENT ORGAN, and conflating them costs the whole reflex. autowire
+      # reads rc=2 as "organ absent on this node — not wiring here" (mesh-autowire, gate_verdict NA),
+      # so exiting 2 merely because the phone is asleep would leave this permanently un-wired on the
+      # one node it belongs on: the body is unreachable most of the day BY DESIGN, which is exactly
+      # why the puller lives here on a cron. n/a is therefore reserved for "no phone CONFIGURED".
+      if [ "$REACH_CAUSE" = unconfigured ]; then
+        echo "smoke-test: n/a — no phone configured on this node (live leg not applicable)"
+        exit 2
+      fi
+      echo "smoke-test: ok (offline legs all green; body asleep — $REACH_CAUSE — live leg not run)"
+      exit 0
+    fi
+  fi
+  echo "smoke-test: FAIL —$fail"; exit 1
+fi
+
+# ---------------------------------------------------------------- the pull
+FORCE=0; [ "${1:-}" = --force ] && FORCE=1
+
+mkdir -p "$DIR" 2>/dev/null || true
+chmod 700 "$DIR" 2>/dev/null || true
+
+if [ "$FORCE" = 0 ]; then
+  b="$(newest)"
+  if [ -n "$b" ]; then
+    age=$(( $(date +%s) - $(stat -c %Y "$b") ))
+    if [ "$age" -lt "$MIN_INTERVAL" ]; then
+      echo "fresh: $(basename "$b") is ${age}s old (< ${MIN_INTERVAL}s) — no pull"
+      printf 'OK %s fresh=%s age=%ss\n' "$(stamp)" "$(basename "$b")" "$age" > "$STATE"
+      mesh-state-touch "$STATE" 2>/dev/null || true
+      exit 0
+    fi
+  fi
+fi
+
+# THE BODY'S sshd FLAPS, AND A FLAP LANDS AS A CLEAN-LOOKING ARCHIVE. Measured here 2026-08-15:
+# --where read `sshd-down` at 17:47:35, the pull seven seconds later transferred 108,380,160 bytes,
+# and the next probe read `sshd-down` again. That pull produced a tar whose INDEX READS WITHOUT ERROR
+# and which ends on a clean member boundary — and which contains only `./usr`, the whole `./home`
+# half (and with it authorized_keys) simply absent. So: a truncated transfer here is NOT detectable
+# from tar's exit status, and a byte-count floor cannot see it either (103MB passed a 20MB floor).
+# The only thing that caught it was asserting the CONTENT that must be there. Hence both gates below
+# — top-level completeness first, so the failure NAMES truncation, and identity second; without the
+# first, a cut stream reports as "authorized_keys missing" and sends the next reader off to hunt an
+# imaginary termux-backup exclusion rule (an error message names a cause, not the cause).
+ATTEMPTS="${MESH_BODY_BACKUP_ATTEMPTS:-3}"
+umask 077
+TS="$(date -u +%Y%m%dT%H%M%SZ)"
+
+PART=""; MODE=""; SZ=0; try=0
+while [ "$try" -lt "$ATTEMPTS" ]; do
+  try=$(( try + 1 ))
+  if ! reach; then
+    [ "$try" = 1 ] || sleep 20
+    if [ "$try" -lt "$ATTEMPTS" ]; then continue; fi
+    echo "n/a: body unreachable — $REACH_CAUSE (tried:$(printf ' %s' $(candidates)))"
+    printf 'NA %s cause=%s attempts=%s\n' "$(stamp)" "$REACH_CAUSE" "$try" > "$STATE"
+    mesh-state-touch "$STATE" 2>/dev/null || true
+    log "na cause=$REACH_CAUSE attempts=$try"
+    exit 2
+  fi
+  IP="$PHONE_ADDR"
+  PART="$DIR/redmi-$TS.part"
+  rm -f "$PART"
+
+  # Tempfile FIRST, stream second — deliberately, and the order is load-bearing on THIS body. The
+  # phone-side file is compressed by termux-backup itself, so the transfer window is a fraction of
+  # the 108MB the stdout path pushes, and a shorter window is what survives a flapping sshd. The
+  # stream path stays as the fallback for a phone too full to hold its own backup. The log NAMES
+  # which ran: a fallback indistinguishable from the primary is the silent-fallback trap.
+  # Remote stderr is KEPT, not sent to /dev/null. A 0-byte pull off a phone that answered ssh a
+  # second earlier has several very different causes — termux-backup missing, the phone out of space
+  # for its own 100MB archive, Android killing the process — and the only thing that tells them apart
+  # is the message the remote side printed. Discarding it leaves a blank row where the diagnosis was.
+  ERRF="$(mktemp "${TMPDIR:-/tmp}/body-backup-err.XXXXXX")"
+  MODE=tempfile
+  timeout 900 ssh -p "$PORT" -o BatchMode=yes -o ConnectTimeout=5 "$PUSER@$IP" \
+    'set -e; f="${TMPDIR:-/data/data/com.termux/files/usr/tmp}/mesh-backup.$$.bk";
+     trap "rm -f \"$f\"" EXIT INT TERM; termux-backup "$f"; cat "$f"' \
+    </dev/null > "$PART" 2>"$ERRF"
+  SZ="$(stat -c %s "$PART" 2>/dev/null || echo 0)"
+  if [ "$SZ" -lt "$MIN_BYTES" ] || ! complete_archive "$PART" >/dev/null 2>&1; then
+    MODE=stream
+    rm -f "$PART"
+    timeout 900 ssh -p "$PORT" -o BatchMode=yes -o ConnectTimeout=5 "$PUSER@$IP" \
+      'termux-backup -' </dev/null > "$PART" 2>>"$ERRF"
+    SZ="$(stat -c %s "$PART" 2>/dev/null || echo 0)"
+  fi
+  chmod 600 "$PART" 2>/dev/null || true
+
+  if [ "$SZ" -ge "$MIN_BYTES" ] && complete_archive "$PART" >/dev/null 2>&1; then rm -f "$ERRF"; break; fi
+  REMERR="$(tr '\n' ' ' < "$ERRF" 2>/dev/null | cut -c1-200)"; rm -f "$ERRF"
+  log "retry $try/$ATTEMPTS mode=$MODE bytes=$SZ ip=$IP (incomplete) remote-stderr: ${REMERR:-<silent>}"
+  [ "$try" -lt "$ATTEMPTS" ] && { rm -f "$PART"; sleep 20; }
+done
+
+EXT="$(archive_ext "$PART" 2>/dev/null || echo tar)"
+UNV="$DIR/redmi-$TS.$EXT.unverified"
+
+C_OUT="$(complete_archive "$PART" 2>&1)"; C_RC=$?
+if [ "$SZ" -lt "$MIN_BYTES" ] || [ "$C_RC" != 0 ]; then
+  echo "FAIL: ${SZ}B after $try attempt(s) — incomplete pull, kept as $(basename "$UNV")"
+  [ "$C_RC" = 0 ] || printf '%s\n' "$C_OUT"
+  mv -f "$PART" "$UNV" 2>/dev/null || true
+  printf 'FAIL %s stage=incomplete bytes=%s attempts=%s mode=%s\n' "$(stamp)" "$SZ" "$try" "$MODE" > "$STATE"
+  mesh-state-touch "$STATE" 2>/dev/null || true
+  log "fail stage=incomplete bytes=$SZ attempts=$try mode=$MODE"
+  exit 1
+fi
+
+# Verify BEFORE publishing. A file that fails lands as .unverified and never enters the retention
+# set, so `newest` (and therefore the freshness gate and every consumer) can only ever see a backup
+# whose host keys have been parsed off disk.
+V_OUT="$(verify_listing "$PART" 2>&1)"; V_RC=$?
+R_OUT=""; R_RC=0
+[ "$V_RC" = 0 ] && { R_OUT="$(restore_check "$PART" 2>&1)"; R_RC=$?; }
+if [ "$V_RC" != 0 ] || [ "$R_RC" != 0 ]; then
+  mv -f "$PART" "$UNV"
+  echo "FAIL: pulled ${SZ}B but verification failed — kept as $(basename "$UNV")"
+  printf '%s\n%s\n' "$V_OUT" "$R_OUT"
+  printf 'FAIL %s stage=verify bytes=%s\n' "$(stamp)" "$SZ" > "$STATE"
+  mesh-state-touch "$STATE" 2>/dev/null || true
+  log "fail stage=verify bytes=$SZ mode=$MODE"
+  exit 1
+fi
+
+# Content-addressed dedup: the identity changes ~never, so most pulls are byte-identical. Keep the
+# older file (its mtime is the honest "this content has been good since") and just refresh the
+# state, rather than burning 125MB of retention on a copy.
+SHA="$(sha256sum "$PART" | cut -c1-16)"
+PREV="$(newest)"
+if [ -n "$PREV" ] && [ "$(sha256sum "$PREV" | cut -c1-16)" = "$SHA" ]; then
+  rm -f "$PART"
+  touch "$PREV"
+  echo "unchanged: body identity is byte-identical to $(basename "$PREV") (sha $SHA) — kept, not duplicated"
+  printf 'OK %s unchanged=%s sha=%s bytes=%s\n' "$(stamp)" "$(basename "$PREV")" "$SHA" "$SZ" > "$STATE"
+  mesh-state-touch "$STATE" 2>/dev/null || true
+  log "ok unchanged sha=$SHA bytes=$SZ ip=$IP mode=$MODE"
+  exit 0
+fi
+
+FINAL="$DIR/redmi-$TS.$EXT"
+mv -f "$PART" "$FINAL"; chmod 600 "$FINAL"
+echo "ok: $(basename "$FINAL") ${SZ}B sha=$SHA mode=$MODE from $IP"
+printf '%s\n%s\n' "$V_OUT" "$R_OUT"
+
+# Retention. Verified archives keep the newest $KEEP. A .unverified is EVIDENCE — it is what a
+# truncated or key-less pull looked like — so it survives its own week rather than being swept by
+# the same rule as a good backup.
+ls -1t "$DIR"/redmi-*.tar "$DIR"/redmi-*.tar.[gx]z "$DIR"/redmi-*.tar.zst 2>/dev/null \
+  | tail -n +$((KEEP + 1)) | while read -r old; do
+  rm -f "$old" && log "pruned $(basename "$old")"
+done
+find "$DIR" -maxdepth 1 -name '*.unverified' -mtime +7 -print 2>/dev/null | while read -r old; do
+  rm -f "$old" && log "pruned-unverified $(basename "$old")"
+done
+
+printf 'OK %s file=%s bytes=%s sha=%s mode=%s ip=%s verify=restored\n' \
+  "$(stamp)" "$(basename "$FINAL")" "$SZ" "$SHA" "$MODE" "$IP" > "$STATE"
+mesh-state-touch "$STATE" 2>/dev/null || true
+log "ok file=$(basename "$FINAL") bytes=$SZ sha=$SHA mode=$MODE ip=$IP"
+exit 0

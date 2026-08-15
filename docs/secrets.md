@@ -10,7 +10,7 @@ Credentials fall into four classes, handled differently:
 |---|---|---|
 | **Shared service secrets** | `BOT_TOKEN`, `CHAT_ID`, `MTG_SECRET` | Encrypted in `secrets/`, decrypted on every service node |
 | **Legacy mesh source-of-truth** | retired WG hub DB (`~/.wg-mesh-nodes.json`) | Kept only as historical backup material for the retired central overlay |
-| **Per-node identity** | each node's `age` key, tailscale identity, SSH host key | NOT shared — re-provisionable, not backed up |
+| **Per-node identity** | each node's `age` key, tailscale identity, SSH host key | NOT shared — re-provisionable, not backed up. **ONE EXCEPTION: the Redmi body — see below.** |
 | **Cross-node access** | reaching the phone body | Phone's `authorized_keys` holds each node's PUBLIC key (no private-key sharing) |
 
 ## Mechanism: `age` + SOPS in this (public) repo
@@ -57,6 +57,31 @@ Two further gaps between doctrine and the tree as of 2026-06-15 (reality-checked
 2. `age-keygen -o ~/.config/sops/age/keys.txt && chmod 600 ~/.config/sops/age/keys.txt`
 3. Add its public key (`age-keygen -y …`) to `.sops.yaml`, then `sops updatekeys secrets/*` from an existing node.
 4. Clone this repo and hydrate secrets with the local `sops`/`age` workflow in use on that node.
+
+## The one identity that IS backed up: the Redmi body
+
+"Per-node identity is re-provisionable, so we don't back it up" holds for every node you can reach.
+It does not hold for the phone. The Redmi body's whole mesh presence is a ~125MB Termux install
+holding its **three sshd host keys** and an `authorized_keys` with three mesh public keys — and it is
+**LAN-only** (its Tailscale peer has been dead since 2026-06-26 and there is no `tailscale` binary in
+that Termux). So a reinstall does not cost a re-provision; it costs *every `known_hosts` on the mesh*
+plus *every node's access*, recoverable only by hand, on a handset, from inside the house. It has
+already happened once — `PHONE_USER` drifted `u0_a386` → `u0_a380` on a reinstall.
+
+`mesh-body-backup` (hourly attempt, ~daily pull) is the exception this justifies. Rules, binding:
+
+- **Mesh-only, always.** `~/.mesh/body-backup/`, dir `0700`, files `0600`, enforced every run. The
+  archive carries host keys, `authorized_keys` and a private key — it goes to no cloud, no third
+  party, no relay, no artifact channel, and **never into this repo** (the repo is public; SOPS
+  protects `secrets/`, and a 100MB tarball is not going through SOPS). Only file NAMES are logged.
+- **Not a substitute for the encrypted store.** This is disaster material for one device, not a new
+  credential-sharing mechanism. Nothing reads it automatically.
+- **Verified, or it does not count.** A pull is published only after the archive is extracted into a
+  throwaway prefix, `ssh-keygen` parses all three host keys off disk, and the ed25519 fingerprint
+  **matches what this node's `known_hosts` already trusts for the phone**. Anything short of that
+  lands as `.unverified` and is never treated as a backup.
+- **If the phone is ever compromised, this archive is compromised with it** — rotate the body's host
+  keys and `authorized_keys` on the handset, then delete every archive here; do not "restore" it.
 
 ## Recovery key
 

@@ -53,7 +53,13 @@ sound · needs=goals are self-derived · autowire=products integrate.
 then wires it into `~/.mesh/reflexes.cron` (→ `mesh-reflexes --apply`, add-only) after a passing `--test`.
 This is how a self-built reflex JOINS the operating metabolism without a human editing cron.
 
-**Genome / substrate:** `mesh-sync-tools` (detect/heal genome↔local tool drift) · `mesh-genome-sync`
+**Genome / substrate:** `mesh-body-backup` (the Redmi body's only recoverable identity: pulls its
+Termux install over LAN ssh to `~/.mesh/body-backup/` 0700/0600, mesh-only — `docs/secrets.md`
+governs. Publishes a pull ONLY after extracting it to a throwaway prefix, parsing all three sshd host
+keys off disk with `ssh-keygen`, and matching the ed25519 fingerprint against `known_hosts`; anything
+less lands `.unverified`. Unreachable renders honest n/a NAMING which — `off-lan` / `sshd-down` /
+`auth-rejected`. `--where` · `--status` · `--verify` · `--restore-check`) · `mesh-sync-tools`
+(detect/heal genome↔local tool drift) · `mesh-genome-sync`
 (mirror the genome off-GitHub) · `mesh-restore` (revive a node's session) · `mesh-dms` (dead-man's
 switch for substrate edits) · `mesh-land` (steward lands SETTLED+parse-clean stranded stream edits;
 `--check` cron alerts so [done]-but-uncommitted work never strands into drift) · `mesh-fix-egress` ·
