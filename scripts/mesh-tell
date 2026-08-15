@@ -20,6 +20,13 @@
 #                                                   every send journals intent BEFORE acting + outcome
 #                                                   after (write-ahead) to ~/.mesh/tell-wal.log; a
 #                                                   dangling intent renders UNRESOLVED (crashed send)
+#   MESH_TELL_WAL_LEVEL=full|redact|minimal|off     how much of a send the WAL keeps (env, or
+#                                                   MESH_TELL_WAL_LEVEL= in ~/.mesh/nodes; env wins;
+#                                                   default full = today's record). redact keeps the
+#                                                   record + a reproducible payload digest, minimal
+#                                                   keeps the record alone, off keeps nothing and
+#                                                   gives up the write-ahead guarantee. A level
+#                                                   CHANGE is journalled in the log itself.
 #
 # --ack (opt-in; mesh-tell-ack 2026-06-24): after the send, briefly poll the target pane and print a
 # terse ACK/NO-ACK to STDERR. RECEIVED = an engine WORKING counter appears within
@@ -184,27 +191,115 @@ composer_holds_text(){
 # ts · pid · phase · who · node · win · b64(prompt). Prompt travels base64 (same payload the send
 # uses) so multi-line prompts stay one log line. WAL path read at CALL time, not load time (a test's
 # env assignment must bind — the export-vs-load-time-global trap).
+#
+# ── LOGGING LEVEL (STUDY write-ahead log 2026-08-15) ────────────────────────────────────────────────
+# `MESH_TELL_WAL_LEVEL`, or `MESH_TELL_WAL_LEVEL=` in ~/.mesh/nodes (env wins), default `full`:
+#
+#   full     ts·pid·phase·who·node·win·b64(prompt) — today's record, unchanged. THE DEFAULT.
+#   redact   same record, payload replaced by `r:<sha256[0:8]>:<b64len>` — the audit trail and the
+#            ORDERING survive; the prompt text does not. This node's live log is 1.5MB of verbatim
+#            prompts in 2026 lines; a mind is routinely handed tokens, paths and operator text, and
+#            the WAL retains all of it for 4000 lines. The digest still answers "was THIS the prompt
+#            that was sent?" (hash the candidate and compare) — it only stops answering "what was it".
+#   minimal  same record, payload `-`. Ordering-only audit, nothing derived from the content at all.
+#   off      no records. The write-ahead guarantee is GONE at this level: a crash mid-send leaves no
+#            dangling intent, so nothing can be reconstructed. Deliberately the loudest to choose.
+#
+# The level only ever thins the PAYLOAD COLUMN — never the record, never the ordering. `intent`
+# still lands before any guard at every level except `off`; a level cannot make the log claim less
+# than what was attempted while it is still writing at all.
+#
+# TWO RULES KEEP A THINNED LOG FROM READING AS A QUIET ONE:
+#  1. A level CHANGE is journalled in the log itself (phase `level`, `<from>-><to>`), exactly once,
+#     at the moment it happens — so a gap or a payload-less stretch is always explained IN the
+#     artifact, not only in whatever env the reader happens to have. `off` writes that one marker
+#     and then nothing: the log SAYS where it stopped. (The marker carries `-` for pid/node/win so
+#     it can never be matched as an outcome by the pid+win join in wal_replay.)
+#  2. --replay renders a thinned payload as an explicit «redacted …» / «no payload retained», never
+#     as an empty column — an empty column is indistinguishable from an empty prompt, which is the
+#     silent-fallback shape this doctrine keeps meeting.
+# An UNRECOGNISED level is a loud stderr warning and falls back to `full`: the fail-safe direction
+# for a journal is MORE evidence, never less (mesh-load-gate's documented asymmetry, same reasoning).
+# The `-` and `r:` sentinels are outside the base64 alphabet, so they can never collide with a real
+# payload.
+_wal_lv=""
+wal_level(){ # resolved at CALL time (see above), cached per PROCESS
+  [ -n "$_wal_lv" ] && { printf '%s' "$_wal_lv"; return 0; }
+  local lv="${MESH_TELL_WAL_LEVEL:-}" src=env cfg="${MESH_TELL_NODES:-$HOME/.mesh/nodes}"
+  if [ -z "$lv" ] && [ -r "$cfg" ]; then
+    lv="$(sed -nE 's/^[[:space:]]*(export[[:space:]]+)?MESH_TELL_WAL_LEVEL=["'"'"']?([A-Za-z]+).*/\2/p' "$cfg" | tail -1)"
+    src="$cfg"
+  fi
+  [ -n "$lv" ] || { lv=full; src=default; }
+  case "$lv" in
+    full|redact|minimal|off) : ;;
+    *) echo "mesh-tell: unrecognised WAL level '$lv' (from $src) — journalling at FULL" >&2; lv=full ;;
+  esac
+  _wal_lv="$lv"; printf '%s' "$lv"
+}
+wal_mark_level(){ # <wal> <level> — journal a level CHANGE into the log, once, when it happens
+  local wal="$1" lv="$2" side="$1.level" prev=""
+  [ -r "$side" ] && prev="$(cat -- "$side" 2>/dev/null)"
+  [ "$prev" = "$lv" ] && return 0
+  # a first-ever run at the DEFAULT level is not a change and needs no announcement; every other
+  # transition does, including the first run at a non-default level.
+  if [ -n "$prev" ] || [ "$lv" != full ]; then
+    printf '%s\t-\t%s\t%s\t-\t-\t%s\n' "$(date -u +%FT%TZ)" level "${MESH_WHO:-$(id -un)}" \
+      "${prev:-unset}->$lv" >> "$wal" 2>/dev/null
+  fi
+  printf '%s' "$lv" > "$side" 2>/dev/null
+}
 wal_append(){ # wal_append <phase> <win> <node> <b64|->
-  local wal="${MESH_TELL_WAL:-$HOME/.mesh/tell-wal.log}"
+  local wal="${MESH_TELL_WAL:-$HOME/.mesh/tell-wal.log}" lv payload="${4:--}"
   mkdir -p "${wal%/*}" 2>/dev/null
+  lv="$(wal_level)"
+  wal_mark_level "$wal" "$lv"
+  [ "$lv" = off ] && return 0
+  case "$lv" in
+    redact)  [ "$payload" = - ] || payload="r:$(printf '%s' "$payload" | sha256sum 2>/dev/null | cut -c1-8):${#payload}" ;;
+    minimal) payload=- ;;
+  esac
   # retention (intent-only, once per invocation): >4000 lines → keep 2000. flock -n: a concurrent
   # trimmer skips; a concurrent appender can lose its line to the mv window — rare, accepted for audit.
   if [ "$1" = intent ] && [ -f "$wal" ] && [ "$(wc -l < "$wal")" -gt 4000 ]; then
     ( flock -n 9 && tail -n 2000 "$wal" > "$wal.tmp.$$" && mv "$wal.tmp.$$" "$wal" ) 9>>"$wal" 2>/dev/null
   fi
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date -u +%FT%TZ)" "$$" "$1" "${MESH_WHO:-$(id -un)}" "$3" "$2" "${4:--}" >> "$wal" 2>/dev/null
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date -u +%FT%TZ)" "$$" "$1" "${MESH_WHO:-$(id -un)}" "$3" "$2" "$payload" >> "$wal" 2>/dev/null
 }
 wal_replay(){ # wal_replay [-n N] [<win>] — audit view: one line per intent, outcome or UNRESOLVED
   local wal="${MESH_TELL_WAL:-$HOME/.mesh/tell-wal.log}" n=20 win="" ts pid phase who node w b64 out txt
+  local lv lastmark
   while [ $# -gt 0 ]; do case "$1" in -n) n="${2:?-n needs a count}"; shift 2;; *) win="$1"; shift;; esac; done
-  [ -s "$wal" ] || { echo "mesh-tell: no injection log at $wal" >&2; return 1; }
+  lv="$(wal_level)"
+  # An ABSENT log is a different claim at each level, and the difference is the whole point of
+  # announcing it: at `off` there is nothing to read BY CONFIGURATION, and reporting that as a bare
+  # "no injection log" would let a deliberately silenced journal read as a node that sent nothing.
+  if [ ! -s "$wal" ]; then
+    if [ "$lv" = off ]; then
+      echo "mesh-tell: WAL level=off — this node journals no sends; an empty log at $wal is a CONFIGURATION, not evidence that nothing was injected" >&2
+    else
+      echo "mesh-tell: no injection log at $wal" >&2
+    fi
+    return 1
+  fi
+  # the log's OWN last recorded level — the reader's env is not necessarily the writer's
+  lastmark="$(awk -F'\t' '$3=="level"{v=$7; t=$1} END{if(v!="") print v" @ "t}' "$wal")"
+  [ "$lv" = full ] && [ -z "$lastmark" ] || \
+    echo "level: $lv${lastmark:+ (last recorded change in the log: $lastmark)}"
   awk -F'\t' -v w="$win" '$3=="intent" && (w=="" || $6==w)' "$wal" | tail -n "$n" | \
   while IFS=$'\t' read -r ts pid phase who node w b64; do
     # outcome = first non-intent record of the SAME pid+win at/after the intent's ts (pid alone is
     # reusable across the log's lifetime; win narrows the collision to same-pid-same-win — accepted).
+    # `level` markers carry `-` for pid AND win, so they can never be joined here as an outcome.
     out="$(awk -F'\t' -v p="$pid" -v ww="$w" -v t="$ts" '$2==p && $6==ww && $3!="intent" && $1>=t {print $3; exit}' "$wal")"
-    # awk, not tr: tr is byte-wise and truncates the multibyte '¦' to its lead byte (mojibake)
-    txt="$(printf '%s' "$b64" | base64 -d 2>/dev/null | awk 'NR>1{printf "¦"} {printf "%s",$0}' | cut -c1-100)"
+    # a THINNED payload is rendered as an explicit claim, never as an empty column — an empty column
+    # is indistinguishable from an empty prompt. `-` and `r:` are outside the base64 alphabet.
+    case "$b64" in
+      -)   txt='«no payload retained (level=minimal)»' ;;
+      r:*) txt="«redacted (level=redact) ${b64#r:}»" ;;
+      # awk, not tr: tr is byte-wise and truncates the multibyte '¦' to its lead byte (mojibake)
+      *)   txt="$(printf '%s' "$b64" | base64 -d 2>/dev/null | awk 'NR>1{printf "¦"} {printf "%s",$0}' | cut -c1-100)" ;;
+    esac
     printf '%s  %-14s %-16s %-10s %s\n' "$ts" "$w@$node" "$who" "${out:-UNRESOLVED}" "$txt"
   done
 }
@@ -477,6 +572,103 @@ if [ "${1:-}" = --test ]; then
   _wr="$(awk -F'\t' -v w="$_ew" '$3=="refused" && $6==w {print NR; exit}' "$MESH_TELL_WAL")"
   { [ -n "$_wi" ] && [ -n "$_wr" ] && [ "$_wi" -lt "$_wr" ]; } \
     || { echo "  FAIL: write-ahead ordering — refused e2e send must log intent BEFORE refusal (intent=$_wi refused=$_wr)"; wlf=1; }
+  # ── WAL LOGGING LEVELS (STUDY write-ahead log 2026-08-15) ───────────────────────────────────────
+  # Every leg drives a REAL send in a CHILD process — not wal_append in-process — because the level
+  # is resolved once and cached per process: an in-process leg would silently test the FIRST level
+  # it ever saw and go green for all four. Each child sends to a window that does not exist, so
+  # dead_shell_guard refuses and the run journals intent+refused without needing a tmux fixture.
+  _lvd="$(mktemp -d)"; _lvw="mtell-level-fixture-$$"
+  # the same payload shape leg 3 uses: dead_shell_guard REFUSES it, so each child produces a real
+  # intent+outcome pair. (A benign payload to a missing window exits 0 having journalled only the
+  # intent — pre-existing behaviour, and exactly the dangling-intent case --replay calls UNRESOLVED.)
+  _lvtext='would you like some rm -rf'
+  # …and the same DEAD-SHELL stub, exported into the child: that verdict is what makes the guard
+  # refuse, so every level fixture produces an intent AND its outcome.
+  mesh-mind-state(){ printf 'DEAD-SHELL\tbare shell\n'; return 8; }
+  export -f mesh-mind-state
+  printf '# fixture node config\n' > "$_lvd/nodes"
+  # <level> [extra env assignments...] → returns the log path it wrote
+  _lvrun(){ local lv="$1"; shift
+    rm -f "$_lvd/w" "$_lvd/w.level"
+    env MESH_TELL_WAL="$_lvd/w" MESH_TELL_NODES="$_lvd/nodes" MESH_TELL_WAL_LEVEL="$lv" "$@" \
+      "$0" "$_lvw" "$_lvtext" >/dev/null 2>"$_lvd/err" || true
+  }
+  _lvfield(){ awk -F'\t' -v w="$_lvw" '$3=="intent" && $6==w {print $7; exit}' "$_lvd/w"; }
+  # leg 5 — redact: the record and its ordering survive, the prompt text does not; the digest is a
+  # REPRODUCIBLE identity (hash the candidate b64 and compare), not a placeholder.
+  _lvrun redact
+  _lvp="$(_lvfield)"
+  _lvexp="r:$(printf '%s' "$(printf '%s' "$_lvtext" | base64 | tr -d '\n')" | sha256sum | cut -c1-8):$(printf '%s' "$_lvtext" | base64 | tr -d '\n' | wc -c)"
+  [ "$_lvp" = "$_lvexp" ] || { echo "  FAIL: WAL level=redact must journal the reproducible digest (want $_lvexp, got $_lvp)"; wlf=1; }
+  grep -qF -- "$_lvtext" "$_lvd/w" && { echo "  FAIL: WAL level=redact leaked the prompt text into the log"; wlf=1; }
+  grep -q "$(printf '%s' "$_lvtext" | base64 | tr -d '\n')" "$_lvd/w" && { echo "  FAIL: WAL level=redact left the b64 payload in the log"; wlf=1; }
+  # leg 6 — the ORDERING invariant a level must never break: intent still precedes the outcome
+  _lvi="$(awk -F'\t' -v w="$_lvw" '$3=="intent"  && $6==w {print NR; exit}' "$_lvd/w")"
+  _lvr="$(awk -F'\t' -v w="$_lvw" '$3=="refused" && $6==w {print NR; exit}' "$_lvd/w")"
+  { [ -n "$_lvi" ] && [ -n "$_lvr" ] && [ "$_lvi" -lt "$_lvr" ]; } \
+    || { echo "  FAIL: a thinned level broke write-ahead ordering (intent=$_lvi refused=$_lvr) — a level may thin the payload, never the record"; wlf=1; }
+  # leg 7 — minimal: payload gone entirely, record still there
+  _lvrun minimal
+  [ "$(_lvfield)" = "-" ] || { echo "  FAIL: WAL level=minimal must journal the record with an empty payload (got: $(_lvfield))"; wlf=1; }
+  # leg 8 — off: NO send record at all, and EXACTLY ONE level marker saying so (a gap in the log
+  # must be explained IN the log, else a silenced journal reads as a node that sent nothing)
+  _lvrun off
+  [ -z "$(_lvfield)" ] || { echo "  FAIL: WAL level=off journalled a send record"; wlf=1; }
+  [ "$(awk -F'\t' '$3=="level"' "$_lvd/w" | wc -l)" = 1 ] \
+    || { echo "  FAIL: WAL level=off must leave exactly one level marker explaining the silence (got $(awk -F'\t' '$3=="level"' "$_lvd/w" | wc -l))"; wlf=1; }
+  # the marker's OWN fields, asserted at the writer (leg 9 asserts the reader): pid and win must be
+  # `-`, which is what makes it unjoinable by the pid+win outcome lookup.
+  [ "$(awk -F'\t' '$3=="level"{print $2"/"$6; exit}' "$_lvd/w")" = "-/-" ] \
+    || { echo "  FAIL: a level marker must carry '-' for pid and win (got $(awk -F'\t' '$3=="level"{print $2"/"$6; exit}' "$_lvd/w")) — anything else can be joined as an outcome"; wlf=1; }
+  # leg 9 — a level marker must never be joinable as an OUTCOME: it carries `-` for pid and win, so
+  # an intent with no real outcome stays UNRESOLVED even with a marker sitting after it.
+  _lvrun minimal
+  printf '%s\t-\tlevel\ttester\t-\t-\tminimal->full\n' "$(date -u +%FT%TZ)" >> "$_lvd/w"
+  awk -F'\t' -v w="$_lvw" '$3=="refused" && $6==w {next} {print}' "$_lvd/w" > "$_lvd/w2"; mv "$_lvd/w2" "$_lvd/w"
+  case "$(MESH_TELL_WAL="$_lvd/w" MESH_TELL_NODES="$_lvd/nodes" "$0" --replay -n 5 "$_lvw")" in
+    *UNRESOLVED*) :;;
+    *) echo "  FAIL: a level marker was joined as an outcome — an outcome-less intent must stay UNRESOLVED"; wlf=1;;
+  esac
+  # leg 10 — replay renders a thinned payload as an explicit claim, never as an empty column
+  _lvrun redact
+  _lvrp="$(MESH_TELL_WAL="$_lvd/w" MESH_TELL_NODES="$_lvd/nodes" "$0" --replay -n 5 "$_lvw")"
+  case "$_lvrp" in *redacted*) :;; *) echo "  FAIL: --replay must render a redacted payload as «redacted …», not blank (got: $_lvrp)"; wlf=1;; esac
+  case "$_lvrp" in *'level: '*) :;; *) echo "  FAIL: --replay must announce a non-default level (got: $_lvrp)"; wlf=1;; esac
+  # …and the MINIMAL rendering needs its own assert: a leg that only covers `redact` leaves the other
+  # thinned branch free to render blank — which is the exact failure this rule exists to prevent.
+  # (Found by a surviving mutant that blanked this branch while every other leg stayed green.)
+  _lvrun minimal
+  case "$(MESH_TELL_WAL="$_lvd/w" MESH_TELL_NODES="$_lvd/nodes" "$0" --replay -n 5 "$_lvw")" in
+    *'no payload retained'*) :;;
+    *) echo "  FAIL: --replay must render a payload-less record as an explicit claim, not a blank column"; wlf=1;;
+  esac
+  # leg 11 — an UNRECOGNISED level falls back to FULL (a journal fails toward MORE evidence) and SAYS
+  # so on stderr. Both halves: a silent fallback to full is the shape this doctrine keeps meeting.
+  _lvrun bogus-level
+  [ "$(_lvfield)" = "$(printf '%s' "$_lvtext" | base64 | tr -d '\n')" ] \
+    || { echo "  FAIL: an unrecognised WAL level must fall back to FULL journalling (got: $(_lvfield))"; wlf=1; }
+  grep -q 'unrecognised WAL level' "$_lvd/err" \
+    || { echo "  FAIL: an unrecognised WAL level must warn loudly on stderr, not fall back silently"; wlf=1; }
+  # leg 12 — the CONFIGURATION half: the level is settable per node in ~/.mesh/nodes, not only by env
+  printf 'MESH_TELL_WAL_LEVEL=minimal\n' >> "$_lvd/nodes"
+  rm -f "$_lvd/w" "$_lvd/w.level"
+  env -u MESH_TELL_WAL_LEVEL MESH_TELL_WAL="$_lvd/w" MESH_TELL_NODES="$_lvd/nodes" "$0" "$_lvw" "$_lvtext" >/dev/null 2>&1 || true
+  [ "$(_lvfield)" = "-" ] || { echo "  FAIL: MESH_TELL_WAL_LEVEL in the node config must set the level (got: $(_lvfield))"; wlf=1; }
+  # leg 13 — env WINS over the node config (a one-off run must be able to override the node default)
+  _lvrun full
+  [ "$(_lvfield)" = "$(printf '%s' "$_lvtext" | base64 | tr -d '\n')" ] \
+    || { echo "  FAIL: MESH_TELL_WAL_LEVEL in the env must override the node config (got: $(_lvfield))"; wlf=1; }
+  # leg 14 — THE DEFAULT IS UNCHANGED: no env, no config key → the same 7-field b64 record as before
+  # this feature existed, and NO level marker on a fresh log (the default announces nothing).
+  : > "$_lvd/nodes"; rm -f "$_lvd/w" "$_lvd/w.level"
+  env -u MESH_TELL_WAL_LEVEL MESH_TELL_WAL="$_lvd/w" MESH_TELL_NODES="$_lvd/nodes" "$0" "$_lvw" "$_lvtext" >/dev/null 2>&1 || true
+  [ "$(_lvfield)" = "$(printf '%s' "$_lvtext" | base64 | tr -d '\n')" ] \
+    || { echo "  FAIL: the DEFAULT level must journal the full b64 payload exactly as before (got: $(_lvfield))"; wlf=1; }
+  [ "$(awk -F'\t' '$3=="level"' "$_lvd/w" | wc -l)" = 0 ] \
+    || { echo "  FAIL: the default level must write no marker on a fresh log (silence is the default, not an event)"; wlf=1; }
+  unset -f mesh-mind-state
+  rm -rf "$_lvd"
+
   # leg 4 — sandbox honesty: the REAL injection log must not have grown during this test
   _wal_real_sz2="$({ wc -c < "$_wal_real"; } 2>/dev/null || echo 0)"
   [ "$_wal_real_sz2" = "$_wal_real_sz" ] || { echo "  FAIL: --test wrote the REAL injection log ($_wal_real_sz → $_wal_real_sz2 bytes)"; wlf=1; }
@@ -614,7 +806,7 @@ EOF
   [ "$of" = 0 ] || { echo "smoke-test: FAIL (origin disclosure regressed — see asserts above)"; exit 1; }
 
   rm -f "$MESH_TELL_WAL"
-  echo "smoke-test: ok (base64 round-trip + 4 ack_probe asserts: idle-unchanged=NO-ACK, working-counter=RECEIVED, stall=NO-ACK, late-paint-submitted=RECEIVED + load-aware ACK window: narrow=NO-ACK, widened catches late footer=RECEIVED + stall re-fire: stall=HOLDS/working+empty=not-held/observable-C-m-submits + copy-mode wedge guard: in-mode→cancel-exits→delivery-restored + DEAD-SHELL guard: refuses/allows/escape-hatch + end-to-end send refusal + SHED-cooldown gate: active-refuses/expired-allows/ALLOW_SHED-bypasses/absent-fails-open/RATE-LIMITED-defense-in-depth + WAL: replay-decodes/sent-outcome/UNRESOLVED-dangling-intent/intent-precedes-refusal/real-log-untouched + origin disclosure: default-off-byte-identical/stamps-WHO-same-line/slash-command-skipped/ALLOW_SHELL-skipped/carries-sender + --fresh: blocked-clear-still-delivers/wip→clear→send ordering/plain-tell-never-clears/bounded-readiness-wait/remote-n-a/empty-prompt-refuses-before-clearing)"; exit 0
+  echo "smoke-test: ok (base64 round-trip + 4 ack_probe asserts: idle-unchanged=NO-ACK, working-counter=RECEIVED, stall=NO-ACK, late-paint-submitted=RECEIVED + load-aware ACK window: narrow=NO-ACK, widened catches late footer=RECEIVED + stall re-fire: stall=HOLDS/working+empty=not-held/observable-C-m-submits + copy-mode wedge guard: in-mode→cancel-exits→delivery-restored + DEAD-SHELL guard: refuses/allows/escape-hatch + end-to-end send refusal + SHED-cooldown gate: active-refuses/expired-allows/ALLOW_SHED-bypasses/absent-fails-open/RATE-LIMITED-defense-in-depth + WAL: replay-decodes/sent-outcome/UNRESOLVED-dangling-intent/intent-precedes-refusal/real-log-untouched + WAL levels: redact-digest-reproducible-and-text-gone/ordering-survives-thinning/minimal-empty/off-writes-only-its-marker/marker-never-joins-as-outcome/replay-renders-thinned-explicitly/unknown-level-falls-back-to-FULL-and-warns/node-config-sets-it/env-overrides-config/default-byte-identical-and-markerless + origin disclosure: default-off-byte-identical/stamps-WHO-same-line/slash-command-skipped/ALLOW_SHELL-skipped/carries-sender + --fresh: blocked-clear-still-delivers/wip→clear→send ordering/plain-tell-never-clears/bounded-readiness-wait/remote-n-a/empty-prompt-refuses-before-clearing)"; exit 0
 fi
 node=local
 ssh_port=""
