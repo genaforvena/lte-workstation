@@ -137,3 +137,89 @@ all-counters-AHEAD baseline and passed with the guard deleted — the plain `del
 that case on its own, so the gate asserted nothing. Only a **torn** reset (completed-count behind,
 ticks ahead) reaches the guard. A gate written against the obvious fixture can be vacuous against
 the subtle one, and the only way to find out is to break the code and watch.
+
+---
+
+# The narrow-window accumulator family — the other five
+
+**2026-08-15 · senses@mesh-home · task:narrow-window-accumulator-family**
+
+The five tools the sweep filed. One shared idiom in all of them: *read counter, sleep N, read
+again, store the verdict, throw the counters away* — while the counter itself was a monotonic
+accumulator whose across-run delta covers 100% of the interval for free. All five now carry the raw
+counters in their state, keep BOTH windows, fold with a max that **names its winner**, publish
+`window=inst+iv` in the reading, and render `na` (never 0) on an absent, reset, cross-domain or
+stale baseline.
+
+| tool | was | now |
+|---|---|---|
+| **mesh-swap-rate** | 3 s / 300 s = **1.0%** of `/proc/vmstat` pswpin+pswpout | `window=inst+iv`, `pps_inst`/`pps_iv`/`won`, `raw=` carry |
+| **mesh-cstate** | 2.1 s / 300 s = **0.70%** of cpuidle `state*/time` | folds on the ACTIVITY direction (busier window wins), publishes `level_inst`/`level_iv` |
+| **mesh-package-power** | 2.0 s / 300 s = **0.67%** of RAPL `energy_uj` | interval watts + a wrap-decidability rule (below) |
+| **mesh-load-audit** | 0.3 s / 120 s = **0.25%** of per-process CPU ticks | whole-snapshot carry → a per-process mean over the interval |
+| **mesh-fitness** | PSI `avg10` / 540 s = **1.85%**, and it is a VERDICT axis | avg10+avg60+avg300+`total=` delta, folded, winner named in the deferral note |
+
+## Four things this round taught that the disk pair did not
+
+**1. A max fold is not always "the bigger number".** `mesh-cstate` measures idle%, so the *louder*
+window is the LOWER one; the fold runs on the activity direction and takes the busier window's
+deep%/ratio with it, so the pair stays coherent. And because idle% alone cannot express
+SHALLOW-vs-DEEP (the disjunction the sense exists for), both windows' LEVELS are published — a fold
+that kept only the busier reading could hide a SHALLOW-REST the other window saw.
+
+**2. A wrapping counter's interval can be undecidable, and the ambiguity does not look like an
+error.** RAPL `energy_uj` wraps at `max_energy_range_uj`. Across an interval the counter may have
+wrapped *k* times and nothing in the two values says which: each extra wrap ADDS `max`, so the usual
+single correction silently picks the SMALLEST — a fabricated calm that reads as an ordinary number.
+Two drafts of this fix got it wrong in opposite ways (first "an absurdly HIGH reading means
+multi-wrap" — backwards; then "dt too long means ambiguous" — a fixed rule that made every reading
+at the live cadence `na` on this node's small 65.5 kJ counter). What decides it is **physics**: the
+package cannot exceed `MAX_PLAUSIBLE_W`, so the reading is published only when the *next* wrap
+candidate is impossible. Self-adapting: at 300 s the candidates are 218 W apart and the interval is
+decidable; stretch it toward an hour and they close up until both fit under the ceiling — which is
+exactly when the reading stops being knowable.
+
+**3. A narrow window has a RESOLUTION, and a plain max hands it every verdict.** `mesh-load-audit`
+samples 0.3 s at 100 Hz, so one tick is **33.3%** and the reading is quantised in 33-point steps.
+Measured on this node: a `kworker/u32:*` read **1544%** in a 1 s window (kernel stime for unbound
+workqueue threads lands in bursts) while its interval mean was ~100%. A plain max would hand that
+artifact the top spot every pass and the interval would be computed, published, and never consumed.
+The fold therefore lets the in-run window win only when it clears the interval by more than one
+tick's worth. (The burst itself is real in `/proc` and is left alone — it is a separate finding, not
+something to launder inside a coverage fix.)
+
+**4. Widening a gate has a direction, and it must be argued.** `mesh-fitness`'s PSI read is not a
+corroborator; it decides whether an **auto-revert** fires on a real commit, and it decides in the
+"do not flag" direction. Widening can only make it defer more often — safe for a tool whose known
+failure mode is reverting innocent commits (2026-07-10T06:54Z, 403a6c0), and a genuine regression
+fails again at the next */9 tick. The gate that pins the other side is the one asserting that with
+all four windows calm and memory healthy, a repeat rc=1 is **still flagged**.
+
+Two smaller ones, both from watching mutants survive:
+
+- **An overlapping guard cannot be seen to fail.** `mesh-cstate`'s explicit reset check is shadowed
+  by `compute()`'s own negative-delta rejection, and `mesh-load-audit`'s backwards-tick check by its
+  `d>0` filter. One is kept (documented as pinning behaviour, not the line), one was deleted. A
+  redundant guard that no gate can redden is decoration that reads as protection.
+- **A gate on a busy node can be vacuous by luck.** The package-power fold gate asserted `level=HIGH`
+  while the live 2 s sample already read HIGH — so classifying off the WRONG window produced the same
+  word and the mutant survived. Fixed by pinning `MESH_PKG_HIGH_W=120` for the gate's child, a
+  threshold the live sample cannot reach.
+
+## Gates seen RED (this round)
+
+29 mutants, each run from a scratch copy against the real hardware.
+
+| tool | mutations watched fail |
+|---|---|
+| mesh-swap-rate | carry deleted · na→0 · fold ignores iv · verdict off inst · reset guard · stale guard (6) |
+| mesh-cstate | carry deleted · na→0 · fold ignores iv · verdict off inst · ncpu-hotplug guard · stale guard · both reset guards (7) |
+| mesh-package-power | carry deleted · na→0 · fold ignores iv · verdict off inst · stale guard · wrap-ambiguity · ceiling · cross-domain baseline (8) |
+| mesh-load-audit | snapshot carry deleted · iv table never consumed · fold always inst · unexplained-old-proc credited · impossible-row cap · dt/stale guards (6) |
+| mesh-fitness | avg300 leg dropped · interval dropped · reset guard · stale guard · fold takes first not max · na can win · deferral silenced (7) |
+
+`mesh-wakeup-attrib` was touched as a consumer: it reads cstate's `_inst` fields on purpose, because
+its method is correlating cstate against an irq rate sampled back-to-back — pairing a 5-minute mean
+with a 3-second irq read would attribute one window's restlessness to another window's interrupts.
+Its sub-sense binaries now resolve **sibling-first**, so a fused tool's `--test` asserts against the
+generation it is being landed with rather than the stale deployed copy.
