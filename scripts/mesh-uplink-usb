@@ -1,0 +1,250 @@
+#!/usr/bin/env bash
+# orphan-ok: on-demand SUBSTRATE tool — a raised tether is a running meter on the operator's SIM,
+#   so this is invoked for the length of a measurement and taken back down. NEVER cron-wire it.
+# mesh-uplink-usb — the Note3's USB tether as a SECOND, SCOPED uplink for this node.
+#
+# SCOPED means: the `main` table is never touched. The address is added `noprefixroute` (so the
+# kernel does NOT auto-insert a connected route into main), the connected route and the default
+# both live in TABLE 42, and only a socket explicitly BOUND to the tether device (`ip rule add
+# oif <dev>`, i.e. curl --interface) ever looks that table up. Nothing else on this node can
+# reach it, by construction — which is also why raising it cannot sever the path you are
+# reaching this node through.
+#
+#   mesh-uplink-usb --up            link up + addr + table 42 default + oif rule   (needs sudo)
+#   mesh-uplink-usb --up --mobile   ...and force the PHONE onto its radio first (see EGRESS below)
+#   mesh-uplink-usb --down          full idempotent rollback (incl. restoring the phone's wifi)
+#   mesh-uplink-usb --status        WHAT IS ACTUALLY UP, item by item — never a bare "ok"
+#   mesh-uplink-usb --probe [host]  curl --interface <dev>; reports the public IP AND classifies
+#                                   the egress against this node's main-route IP
+#   mesh-uplink-usb --test          artifact gate: main bitwise-unchanged, egress classified,
+#                                   --down returns rule+table to empty
+#
+# EGRESS — the thing this tool exists to get, and the thing it must not fake:
+#   A tether is only a SECOND vantage if the PHONE's own default route is its radio. Measured
+#   2026-08-15 on this body: the Note3's default was `via 192.168.8.1 dev wlan0` — the SAME home
+#   LAN this node already sits on, every rmnet DOWN and unaddressed. Tethering in that state
+#   egresses through the same router and the same VPN, and --probe returns the node's own public
+#   IP. That observable is IDENTICAL to "the scoped rule leaked into main", and the two have
+#   opposite fixes, so --probe reads the phone's route table and NAMES which one it is.
+#   --mobile is the mechanism for the intended state: `svc wifi disable` on the phone for the
+#   measurement window, restored by --down. It is opt-in because it is an actuator on the
+#   operator's handset and it starts a METERED counter — and it REFUSES outright when the radio
+#   cannot raise data, because dropping wifi then costs more than it buys: measured live here,
+#   the SIM registers ROAMING with data_roaming=0, every rmnet stayed DOWN, the phone was left
+#   with no default route at all, AND Android tore down USB tethering itself (rndis0 unaddressed
+#   until a tap on Settings→Tethering restored it). Turning roaming data on is the OPERATOR's
+#   cost decision, so this tool names it and stops.
+#
+# BOUNDARIES (fixed in the header so nothing re-derives them from a stale note):
+#   · HSDPA on a metered MTS SIM. This is a MEASUREMENT and emergency-control channel, not bulk.
+#   · The default route in `main` is NEVER moved here. If you want this node's traffic on the
+#     tether, that is a different, contended change — and see the NESTING invariant in CLAUDE.md.
+#   · Never scheduled. A raised link is a running meter.
+#   · This node's home public IP is MEASURED every run, never quoted: the 38.49.216.141 in the older
+#     notes was already stale on 2026-08-15 (live: 77.246.104.228). A hardcoded egress IP is a
+#     constant that outlives its reader and turns this gate into a coin flip.
+#
+# Config (~/.mesh/nodes): MESH_USB_UPLINK_DEV (default: autodetected rndis_host/cdc_ether iface) ·
+#   MESH_USB_UPLINK_GW (192.168.42.129) · MESH_USB_UPLINK_ADDR (192.168.42.130/24) ·
+#   MESH_USB_UPLINK_TABLE (42) · MESH_USB_UPLINK_PRIO (5100) · MESH_NOTE3_ADB_SERIAL
+#
+# Exit codes: 0 = done · 2 = no tether device / phone absent, or independence genuinely
+# unassertable (honest n/a) · 1 = present but the action or the assertion failed.
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+[ -f "$HOME/.mesh/nodes" ] && . "$HOME/.mesh/nodes" 2>/dev/null || true
+
+GW="${MESH_USB_UPLINK_GW:-192.168.42.129}"
+ADDR="${MESH_USB_UPLINK_ADDR:-192.168.42.130/24}"
+TBL="${MESH_USB_UPLINK_TABLE:-42}"
+PRIO="${MESH_USB_UPLINK_PRIO:-5100}"
+SER="${MESH_NOTE3_ADB_SERIAL:-4d00553d61ab90b7}"
+LOG="${MESH_USB_UPLINK_LOG:-$HOME/.mesh/uplink-usb.log}"
+STATE="$HOME/.mesh/uplink-usb.state"
+PROBE_URL="${MESH_USB_UPLINK_PROBE:-https://api.ipify.org}"
+
+log() { printf '%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "$LOG" 2>/dev/null || true; }
+
+# The tether interface is found by DRIVER, never by name: enx<mac> is derived from the phone's
+# randomised rndis MAC and changes; the driver does not.
+find_dev() {
+  [ -n "${MESH_USB_UPLINK_DEV:-}" ] && { echo "$MESH_USB_UPLINK_DEV"; return; }
+  local n d
+  for n in /sys/class/net/*; do
+    [ -e "$n/device/driver" ] || continue
+    d="$(basename "$(readlink -f "$n/device/driver")")"
+    case "$d" in rndis_host|cdc_ether|rndis_wlan) basename "$n"; return;; esac
+  done
+}
+DEV="$(find_dev)"
+
+# unproxied curl — an exported HTTPS_PROXY would route the probe through the very path we are
+# trying to bypass and hand back the home IP as if it were the tether's.
+ncurl() { env -u http_proxy -u https_proxy -u ftp_proxy -u all_proxy \
+               -u HTTP_PROXY -u HTTPS_PROXY -u FTP_PROXY -u ALL_PROXY curl "$@"; }
+
+main_snapshot() { ip route show table main | sort; }
+rule_present()  { ip rule show | grep -q "oif $DEV lookup $TBL"; }
+addr_present()  { ip -4 addr show dev "$DEV" 2>/dev/null | grep -q "${ADDR%%/*}"; }
+tbl_lines()     { ip route show table "$TBL" 2>/dev/null; }
+
+phone_up()  { timeout 8 adb -s "$SER" get-state 2>/dev/null | tr -d '\r' | grep -q '^device$'; }
+phone_sh()  { timeout "${2:-20}" adb -s "$SER" shell "$1" 2>/dev/null | tr -d '\r'; }
+phone_default_dev() { phone_sh 'ip route' 15 | awk '/^default/{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | head -1; }
+
+wifi_off() { phone_sh 'svc wifi disable' 20 >/dev/null; phone_sh 'su -c "svc wifi disable"' 20 >/dev/null; }
+wifi_on()  { phone_sh 'svc wifi enable' 20 >/dev/null;  phone_sh 'su -c "svc wifi enable"' 20 >/dev/null; }
+
+no_dev() { echo "uplink-usb: n/a (no rndis/cdc tether interface — phone not on USB, or tethering off)"; log "n/a no-dev"; exit 2; }
+
+do_up() {   # $1 = 1 → also force the phone onto its radio
+  local mobile="${1:-0}"
+  [ -n "$DEV" ] || no_dev
+  if [ "$mobile" = 1 ]; then
+    phone_up || { echo "uplink-usb: --mobile needs adb to the phone, which is absent"; exit 2; }
+    # REFUSE when the radio provably cannot raise data. Measured 2026-08-15 on this body: the MTS
+    # SIM registers ROAMING and data_roaming=0, so mDataConnectionState stays -1 forever — and
+    # dropping wifi in that state does not fall back to the radio, it leaves the phone with NO
+    # default route AND tears down USB tethering itself (rndis0 goes DOWN and unaddressed; it took
+    # a `mesh-note3-ui --tap` on Settings→Tethering to bring it back). So --mobile without a usable
+    # radio is not merely useless, it BREAKS the link it was meant to improve. Enabling data
+    # roaming is the operator's call — a cost decision, not a tool's.
+    local roam svc
+    roam="$(phone_sh 'settings get global data_roaming' 12)"
+    svc="$(phone_sh 'dumpsys telephony.registry 2>/dev/null | grep -m1 mServiceState' 15)"
+    if [ "$roam" = 0 ] && [ "$svc" != "${svc/roaming/}" ]; then
+      echo "uplink-usb: refusing --mobile — the SIM is ROAMING with data_roaming=0, so the radio"
+      echo "            can never raise a data context. Dropping wifi would leave the phone with no"
+      echo "            uplink at all and tear down USB tethering. Enabling roaming data is an"
+      echo "            OPERATOR cost decision; raise the link without --mobile for a shared-egress"
+      echo "            vantage, or ask the operator."
+      log "mobile REFUSED (roaming, data_roaming=$roam)"; exit 2
+    fi
+    echo "wifi_was=on" > "$STATE"; wifi_off; log "phone wifi disabled (--mobile)"
+    local i=0
+    while [ $i -lt 12 ]; do
+      [ "$(phone_default_dev)" != "wlan0" ] && break
+      sleep 3; i=$((i+1))
+    done
+    echo "phone default now: dev $(phone_default_dev)"
+  fi
+  sudo ip link set dev "$DEV" up 2>/dev/null
+  # noprefixroute: without it the kernel drops a connected route into MAIN and the "main is
+  # untouched" claim becomes false. The connected route goes into table $TBL by hand instead.
+  addr_present || sudo ip addr add "$ADDR" dev "$DEV" noprefixroute 2>/dev/null
+  sudo ip route replace "${ADDR%.*}.0/${ADDR##*/}" dev "$DEV" scope link src "${ADDR%%/*}" table "$TBL" 2>/dev/null
+  sudo ip route replace default via "$GW" dev "$DEV" table "$TBL" 2>/dev/null
+  rule_present || sudo ip rule add oif "$DEV" table "$TBL" priority "$PRIO" 2>/dev/null
+  log "up dev=$DEV addr=$ADDR tbl=$TBL prio=$PRIO mobile=$mobile"
+  mesh-trace "uplink-usb: --up $DEV → table $TBL (oif rule prio $PRIO, main untouched); rollback: mesh-uplink-usb --down" >/dev/null 2>&1 || true
+}
+
+do_down() {
+  [ -n "$DEV" ] || { echo "uplink-usb: nothing to take down (no tether interface)"; exit 0; }
+  while ip rule show | grep -q "oif $DEV lookup $TBL"; do sudo ip rule del oif "$DEV" table "$TBL" 2>/dev/null || break; done
+  sudo ip route flush table "$TBL" 2>/dev/null
+  addr_present && sudo ip addr del "$ADDR" dev "$DEV" 2>/dev/null
+  sudo ip link set dev "$DEV" down 2>/dev/null
+  if [ -f "$STATE" ] && grep -q 'wifi_was=on' "$STATE"; then
+    phone_up && { wifi_on; log "phone wifi restored"; echo "phone wifi restored"; }
+    rm -f "$STATE"
+  fi
+  log "down dev=$DEV"
+  mesh-trace "uplink-usb: --down $DEV (rule+table $TBL cleared, addr removed, link down)" >/dev/null 2>&1 || true
+}
+
+classify_egress() {   # $1 = probe IP, $2 = main IP → prints the verdict, names the mechanism
+  local pip="$1" mip="$2" pdev roam
+  if [ -z "$pip" ]; then
+    echo "egress=UNREACHABLE (no answer through $DEV)"
+    # Do NOT stop at "the tether is broken" — the usual cause is upstream of this node entirely.
+    if phone_up && [ -z "$(phone_default_dev)" ]; then
+      roam="$(phone_sh 'settings get global data_roaming' 12)"
+      echo "        cause: the PHONE has no default route of its own (wifi off, and the radio's data"
+      echo "        context is down). data_roaming=$roam, service state $(phone_sh 'dumpsys telephony.registry 2>/dev/null | grep -m1 mServiceState' 15 | grep -o 'roaming' || echo 'home')."
+      echo "        A roaming SIM with data_roaming=0 will NEVER raise data — that is an OPERATOR"
+      echo "        decision (cost), not something this tool should flip."
+    fi
+    return 1
+  fi
+  if [ "$pip" != "$mip" ]; then echo "egress=INDEPENDENT (tether $pip ≠ main $mip)"; return 0; fi
+  pdev="$(phone_up && phone_default_dev)"
+  if [ -n "$pdev" ] && [ "$pdev" != "${pdev#wlan}" ]; then
+    echo "egress=SHARED via the phone's OWN wifi (phone default dev=$pdev; $pip == main $mip)"
+    echo "        NOT a leak into main — the handset's uplink is this same LAN. An independent"
+    echo "        vantage needs the phone on its RADIO, which needs roaming data (operator call)."
+  else
+    echo "egress=SHARED and the phone is NOT on wifi (default dev=${pdev:-unknown}) → suspect the"
+    echo "        scoped rule/table: check 'ip rule show | grep oif $DEV' and 'ip route show table $TBL'."
+  fi
+  return 1
+}
+
+case "${1:---status}" in
+--up)
+  M=0; [ "${2:-}" = --mobile ] && M=1
+  do_up "$M"; echo; exec "$0" --status
+  ;;
+--down) do_down; echo "down: rule/table $TBL cleared"; ;;
+
+--status)
+  [ -n "$DEV" ] || no_dev
+  echo "dev=$DEV driver=$(basename "$(readlink -f /sys/class/net/$DEV/device/driver 2>/dev/null)" 2>/dev/null)"
+  echo "link=$(ip -br link show "$DEV" 2>/dev/null | awk '{print $2}')  addr=$(ip -4 -br addr show "$DEV" 2>/dev/null | awk '{print $3}' | grep . || echo none)"
+  echo "rule: $(ip rule show | grep "oif $DEV lookup $TBL" || echo "(absent)")"
+  echo "table $TBL:"; tbl_lines | sed 's/^/  /' | grep . || echo "  (empty)"
+  echo "main default: $(ip route show table main | grep '^default' | head -1)"
+  if rule_present && [ -n "$(tbl_lines)" ]; then echo "state=UP (scoped: only sockets bound to $DEV use table $TBL)"
+  else echo "state=DOWN"; fi
+  ;;
+
+--probe)
+  [ -n "$DEV" ] || no_dev
+  URL="${2:-$PROBE_URL}"
+  MIP="$(ncurl -s --max-time 20 "$PROBE_URL")"
+  PIP="$(ncurl -s --max-time 25 --interface "$DEV" "$URL")"
+  echo "via=$DEV probe=${PIP:-<none>}  main=${MIP:-<none>}"
+  classify_egress "$PIP" "$MIP"
+  ;;
+
+--test)
+  f=0
+  [ -n "$DEV" ] || { echo "smoke-test: n/a (no tether interface)"; exit 2; }
+  phone_up || { echo "smoke-test: n/a (phone not on adb)"; exit 2; }
+  WAS_UP=0; rule_present && WAS_UP=1
+
+  # (1) the claim under test is "raising this link does not touch routing" — assert it BITWISE.
+  BEFORE="$(main_snapshot)"
+  do_up "${MESH_USB_UPLINK_TEST_MOBILE:-0}"
+  AFTER="$(main_snapshot)"
+  if [ "$BEFORE" != "$AFTER" ]; then
+    echo "  FAIL: table main CHANGED across --up:"; diff <(echo "$BEFORE") <(echo "$AFTER") | sed 's/^/    /'; f=1
+  fi
+  # (2) the scoping must exist as artifacts, not as intent
+  rule_present || { echo "  FAIL: no 'oif $DEV lookup $TBL' rule after --up"; f=1; }
+  tbl_lines | grep -q '^default via' || { echo "  FAIL: table $TBL carries no default after --up"; f=1; }
+  # (3) egress: measured against a LIVE main IP, never a hardcoded one
+  MIP="$(ncurl -s --max-time 20 "$PROBE_URL")"
+  PIP="$(ncurl -s --max-time 25 --interface "$DEV" "$PROBE_URL")"
+  VERDICT="$(classify_egress "$PIP" "$MIP")"; INDEP=$?
+  echo "$VERDICT" | sed 's/^/  /'
+  # (4) --down must return the substrate to empty
+  do_down
+  rule_present && { echo "  FAIL: rule survived --down"; f=1; }
+  [ -n "$(tbl_lines)" ] && { echo "  FAIL: table $TBL not empty after --down"; f=1; }
+  [ "$(main_snapshot)" = "$BEFORE" ] || { echo "  FAIL: main not restored after --down"; f=1; }
+  [ "$WAS_UP" = 1 ] && do_up 0
+
+  [ "$f" = 0 ] || { echo "smoke-test: FAIL"; exit 1; }
+  if [ "$INDEP" != 0 ]; then
+    echo "smoke-test: n/a (scoping + rollback asserted; INDEPENDENCE unassertable — see verdict above."
+    echo "            Not a defect in this tool: the phone has no uplink of its own to lend.)"
+    exit 2
+  fi
+  echo "smoke-test: ok (main bitwise-unchanged, scoped artifacts present, egress independent, --down clean)"
+  ;;
+
+-h|--help) sed -n '/^# mesh-uplink-usb —/,/^set -uo/p' "$0" | grep '^#' | sed 's/^# \{0,1\}//' ;;
+*) echo "uplink-usb: unknown verb '${1:-}' — see --help"; exit 1;;
+esac
