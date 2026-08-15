@@ -39,7 +39,51 @@
 # Change-gated: rewrites its STATE only when a total moves, but mesh-state-touch's the STATE on
 # EVERY successful run so a long-CLEAN (stable-zero) link cannot decay to a FALSE-STALE.
 #
-#   mesh-pcie-health           one reading + delta vs last sample (updates the baseline)
+# ---- SECOND AXIS: LINK GEOMETRY (added 2026-08-15) ---------------------------------------
+# AER counts ERRORS on the link. Geometry asks a different question no counter answers: is the
+# link even NEGOTIATED at the speed/width the hardware can do? A link that silently trained at
+# Gen1 x4 instead of Gen4 x16 produces ZERO AER errors — it is not erroring, it is just 8-32x
+# slower — so the AER axis is structurally blind to it. Bus-wide, from
+# /sys/bus/pci/devices/*/{current,max}_link_{speed,width}: mode 444, no root, no vendor tool
+# (20 devices expose it on this node; nvidia-smi sees exactly one of them and cannot see the
+# boot+root NVMe at all, which is why this is NOT a fold into mesh-vram-watch).
+#
+# THE TRAP THIS AXIS EXISTS TO NOT FALL INTO — the device's OWN max is not its ceiling:
+#   * A Gen4 card in a Gen3 slot reads current 8.0 / max 16.0 and the kernel even annotates it
+#     "(downgraded)" in lspci. It is at its real ceiling: the PARENT bridge's max is 8.0.
+#     Measured here: spare NVMe 04:00.0 under bridge 03:00.0 — permanent, correct, not a fault.
+#     Drove 8GB of direct I/O through it: 8.0 GT/s at every sample, so an "is it busy?" gate
+#     does not rescue the rule either.
+#   * A bridge is bounded from BELOW too: root port 00:01.2 reads 8.0 of max 16.0 x4 of x8
+#     because every endpoint under it (02:00.{0,1,2}) caps at 8.0 GT/s x4.
+#   * Idle ASPM parks a healthy link at 2.5 GT/s: GPU 2b:00.0 AND its parent bridge 00:03.1
+#     both read 2.5 of 16.0 at 0% util. The gen gap is real and means nothing.
+# So: EFFECTIVE ceiling = min(device max, PARENT bridge max, and for a bridge the fastest/widest
+# DOWNSTREAM endpoint max) — never the device's own max alone. On this node the naive
+# device-max rule false-fires on 5 of 20 devices with zero PCIe faults present.
+#
+# Per-device geometry verdict:
+#   OK         — at the effective ceiling in both speed and width
+#   ASPM       — current speed below the effective ceiling, width full, capability unchanged.
+#                INFORMATIONAL, never a fault: this is what an idle link looks like. Counted in
+#                the header so it is visible, never folded into the overall verdict.
+#   WIDTH-DOWN — current WIDTH below the effective ceiling. A real fault (seating, riser, EMI):
+#                ASPM does not narrow a link, so unlike speed there is no benign reading here.
+#                Fires on the FIRST sample — it is a same-sample comparison, needs no baseline.
+#   CAP-DROP   — the effective CEILING itself fell below the per-device recorded high-water.
+#                This is the honest delta for the SPEED axis: max_link_speed is a capability,
+#                so ASPM cannot move it and a slot ceiling is constant — a drop is the link
+#                re-training its advertised capability downward. (A current-vs-baseline speed
+#                delta was DELIBERATELY not used: idle ASPM flaps current every sample and would
+#                fire on every idle transition. See the [done] note, 2026-08-15.)
+#   BASELINE   — first sample for this device (no prior high-water yet)
+# Baseline = per-device HIGH-WATER of the effective ceiling (monotone), so a real cap drop keeps
+# reporting until the link recovers instead of warning once and going quiet. Legitimately moving
+# a card to a slower slot => delete $MESH_PCIE_GEOM_STATE (or its line) to re-baseline.
+# A device with a missing/unparseable field is SKIPPED, never emitted as an at-max zero; no
+# device parsing at all renders n/a, never a fabricated all-clear.
+#
+#   mesh-pcie-health           both axes: AER errors + link geometry (updates both baselines)
 #   mesh-pcie-health --raw     also print the non-zero error-type breakdown per device
 #   mesh-pcie-health --test    synthetic parser/classifier fixtures + a real-hardware read gate
 set -uo pipefail
@@ -117,6 +161,147 @@ classify() {
 }
 rank_of() { case "$1" in FATAL) echo 5;; NONFATAL) echo 4;; CORRECTING) echo 3;; BASELINE) echo 2;; HEALED) echo 1;; *) echo 0;; esac; }
 
+# ---- AXIS 2: link geometry ---------------------------------------------------------------
+GEOM_STATE="${MESH_PCIE_GEOM_STATE:-$HOME/.mesh/.pcie-geom-state}"
+
+# "16.0 GT/s PCIe" -> 160 (tenths of GT/s, so 2.5 stays exact in integer arithmetic).
+# rc=1 on "Unknown"/empty/garbage — the caller SKIPS the device rather than inventing a number.
+speed_tenths() {
+  local v
+  v="$(printf '%s\n' "${1:-}" | awk 'NR==1 && $1 ~ /^[0-9]+(\.[0-9]+)?$/ {printf "%d", $1*10 + 0.5}')"
+  case "$v" in ''|*[!0-9]*) return 1;; esac
+  [ "$v" -gt 0 ] || return 1
+  printf '%s' "$v"
+}
+fmt_s() { printf '%s.%s' "${1%?}" "${1: -1}"; }   # 160 -> 16.0 ; 25 -> 2.5
+
+read_speed() { local v; v="$(cat "$1" 2>/dev/null)" || return 1; speed_tenths "$v"; }
+read_width() {
+  local v; v="$(cat "$1" 2>/dev/null)" || return 1
+  case "$v" in ''|*[!0-9]*) return 1;; esac
+  [ "$v" -gt 0 ] || return 1; printf '%s' "$v"
+}
+
+# The parent BRIDGE of a device, walked through the real sysfs topology (each entry in
+# /sys/bus/pci/devices is a symlink into /sys/devices/pci*/...), never guessed from the slot
+# string — "the parent is what separates a Gen3-in-a-Gen3-slot from a real downshift", so it
+# has to be read, not assumed. rc=1 for a root port (whose parent is the host bridge, not a
+# PCI device).
+parent_of() {
+  local real p
+  real="$(readlink -f "$PCI_ROOT/$1" 2>/dev/null)" || return 1
+  [ -n "$real" ] || return 1
+  p="$(basename "$(dirname "$real")")"
+  [ -n "$p" ] && [ "$p" != "$1" ] && [ -d "$PCI_ROOT/$p" ] || return 1
+  printf '%s' "$p"
+}
+
+# raw sweep -> "<slot> <kind> <cur_s> <max_s> <cur_w> <max_w> <parent|->", one line per device
+# that exposes a COMPLETE, parseable geometry. Incomplete => skipped (never a fabricated at-max).
+geom_raw() {
+  local d slot cls kind cs ms cw mw par
+  for d in "$PCI_ROOT"/*/; do
+    [ -r "$d/current_link_speed" ] || continue
+    slot="$(basename "$d")"
+    cs="$(read_speed "$d/current_link_speed")" || continue
+    ms="$(read_speed "$d/max_link_speed")"     || continue
+    cw="$(read_width "$d/current_link_width")" || continue
+    mw="$(read_width "$d/max_link_width")"     || continue
+    cls="$(cat "$d/class" 2>/dev/null)"; kind="$(kind_of "${cls:-0x000000}")"
+    par="$(parent_of "$slot")" || par='-'
+    echo "$slot $kind $cs $ms $cw $mw $par"
+  done
+}
+
+# stdin: geom_raw lines -> stdout: "<slot> <kind> <cur_s> <eff_s> <cur_w> <eff_w>"
+# eff = min(device max, parent bridge max, [bridges only] fastest/widest downstream endpoint max).
+geom_effective() {
+  local -A K CS MS CW MW PAR DS_S DS_W
+  local slot kind cs ms cw mw par es ew p
+  while read -r slot kind cs ms cw mw par; do
+    [ -n "$slot" ] || continue
+    K["$slot"]=$kind; CS["$slot"]=$cs; MS["$slot"]=$ms
+    CW["$slot"]=$cw; MW["$slot"]=$mw; PAR["$slot"]=$par
+  done
+  [ "${#K[@]}" -gt 0 ] || return 0
+  for slot in "${!K[@]}"; do                       # roll each device's max UP into its parent
+    p="${PAR[$slot]}"
+    [ "$p" != - ] && [ -n "${K[$p]+x}" ] || continue
+    [ "${MS[$slot]}" -gt "${DS_S[$p]:-0}" ] && DS_S["$p"]=${MS[$slot]}
+    [ "${MW[$slot]}" -gt "${DS_W[$p]:-0}" ] && DS_W["$p"]=${MW[$slot]}
+  done
+  for slot in $(printf '%s\n' "${!K[@]}" | sort); do
+    es=${MS[$slot]}; ew=${MW[$slot]}; p="${PAR[$slot]}"
+    if [ "$p" != - ] && [ -n "${K[$p]+x}" ]; then
+      [ "${MS[$p]}" -lt "$es" ] && es=${MS[$p]}
+      [ "${MW[$p]}" -lt "$ew" ] && ew=${MW[$p]}
+    fi
+    if [ "${K[$slot]}" = Bridge ]; then
+      [ -n "${DS_S[$slot]+x}" ] && [ "${DS_S[$slot]}" -lt "$es" ] && es=${DS_S[$slot]}
+      [ -n "${DS_W[$slot]+x}" ] && [ "${DS_W[$slot]}" -lt "$ew" ] && ew=${DS_W[$slot]}
+    fi
+    echo "$slot ${K[$slot]} ${CS[$slot]} $es ${CW[$slot]} $ew"
+  done
+}
+
+# geom_classify <cur_s> <eff_s> <cur_w> <eff_w> <base_eff_s> <base_eff_w> <have_prior>
+geom_classify() {
+  local cs=$1 es=$2 cw=$3 ew=$4 bs=$5 bw=$6 prior=$7
+  [ "$cw" -lt "$ew" ] && { echo WIDTH-DOWN; return; }        # no baseline needed, no benign case
+  if [ "$prior" = 1 ] && { [ "$es" -lt "$bs" ] || [ "$ew" -lt "$bw" ]; }; then echo CAP-DROP; return; fi
+  [ "$prior" = 0 ] && { echo BASELINE; return; }
+  [ "$cs" -lt "$es" ] && { echo ASPM; return; }              # informational, rank 0
+  echo OK
+}
+geom_rank() { case "$1" in WIDTH-DOWN) echo 3;; CAP-DROP) echo 2;; BASELINE) echo 1;; *) echo 0;; esac; }
+
+# Print the geometry block. rc: 0 fine · 1 fault (WIDTH-DOWN/CAP-DROP) · 2 honest n/a.
+# write_state=1 updates the high-water baseline (the --test drives it with a scratch state file).
+geom_axis() {
+  local write_state="${1:-1}" raw eff slot kind cs es cw ew v r
+  local worst=OK worst_rank=0 aspm=0 ndev=0 report="" new_state="" prior bs bw
+  raw="$(geom_raw)"
+  [ -n "$raw" ] || { echo "pcie-geom: n/a — no PCIe device exposes a complete link geometry (no current_link_speed / unparseable)"; return 2; }
+  eff="$(printf '%s\n' "$raw" | geom_effective)"
+  [ -n "$eff" ] || { echo "pcie-geom: n/a — geometry present but no effective ceiling could be resolved"; return 2; }
+  declare -A B_S B_W
+  if [ -s "$GEOM_STATE" ]; then
+    # state line: <slot> <kind> <high-water eff speed> <high-water eff width> <last seen cur speed>
+    while read -r slot _k bs bw _lastcur; do
+      [ -n "$slot" ] || continue
+      B_S["$slot"]=$bs; B_W["$slot"]=$bw
+    done < "$GEOM_STATE"
+  fi
+  while read -r slot kind cs es cw ew; do
+    [ -n "$slot" ] || continue
+    ndev=$((ndev+1))
+    prior=0; [ -n "${B_S[$slot]+x}" ] && prior=1
+    bs=${B_S[$slot]:-$es}; bw=${B_W[$slot]:-$ew}
+    v="$(geom_classify "$cs" "$es" "$cw" "$ew" "$bs" "$bw" "$prior")"
+    r="$(geom_rank "$v")"; [ "$r" -gt "$worst_rank" ] && { worst_rank=$r; worst=$v; }
+    [ "$v" = ASPM ] && aspm=$((aspm+1))
+    report+="  $slot [$kind] $v — link $(fmt_s "$cs")GT/s x$cw of effective $(fmt_s "$es")GT/s x$ew"
+    [ "$v" = CAP-DROP ] && report+=" (was $(fmt_s "$bs")GT/s x$bw)"
+    report+=$'\n'
+    # high-water baseline: the ceiling only ever moves UP in the state file
+    [ "$es" -gt "$bs" ] && bs=$es
+    [ "$ew" -gt "$bw" ] && bw=$ew
+    new_state+="$slot $kind $bs $bw $cs"$'\n'
+  done <<< "$eff"
+  local suffix=""
+  [ "$aspm" -gt 0 ] && suffix=" ($aspm of $ndev below the speed ceiling — idle/ASPM, informational)"
+  echo "pcie-geom: $worst$suffix"
+  printf '%s' "$report"
+  if [ "$write_state" = 1 ]; then
+    mkdir -p "$(dirname "$GEOM_STATE")" 2>/dev/null
+    if [ ! -s "$GEOM_STATE" ] || [ "$new_state" != "$(cat "$GEOM_STATE" 2>/dev/null)" ]; then
+      printf '%s' "$new_state" > "$GEOM_STATE"
+    fi
+    mesh-state-touch "$GEOM_STATE" 2>/dev/null || touch "$GEOM_STATE" 2>/dev/null
+  fi
+  case "$worst" in WIDTH-DOWN|CAP-DROP) return 1;; *) return 0;; esac
+}
+
 # ---- --test: synthetic fixtures + real-hardware read gate --------------------------------
 if [ "${1:-}" = --test ]; then
   e=0
@@ -159,16 +344,87 @@ if [ "${1:-}" = --test ]; then
   printf 'TOTAL_ERR_COR 0\n'           > "$fo/0000:00:07.1/aer_rootport_total_err_cor"  # AER service bound
   own_n="$(MESH_PCI_ROOT="$fo" bash -c 'PCI_ROOT="$MESH_PCI_ROOT"; '"$(declare -f aer_rootports)"'; aer_rootports')"
   [ "$own_n" = 1 ] || { echo "test: owned topology should count 1 root port (got $own_n) FAIL"; e=1; }
-  owned_out="$(MESH_PCI_ROOT="$fo" MESH_PCIE_STATE="$tf/st-own" bash "$0" 2>&1)"; owned_rc=$?
+  owned_out="$(MESH_PCI_ROOT="$fo" MESH_PCIE_STATE="$tf/st-own" MESH_PCIE_GEOM_STATE="$tf/st-own-geom" bash "$0" 2>&1)"; owned_rc=$?
   printf '%s' "$owned_out" | grep -q BLIND && { echo "test: owned topology must NOT be BLIND FAIL"; e=1; }
   [ "$owned_rc" = 0 ] || { echo "test: owned topology should exit 0 (got $owned_rc) FAIL"; e=1; }
   rm -f "$fo/0000:00:07.1/aer_rootport_total_err_cor"   # revoke AER ownership (_OSC denied)
   blind_n="$(MESH_PCI_ROOT="$fo" bash -c 'PCI_ROOT="$MESH_PCI_ROOT"; '"$(declare -f aer_rootports)"'; aer_rootports')"
   [ "$blind_n" = 0 ] || { echo "test: _OSC-denied topology should count 0 root ports (got $blind_n) FAIL"; e=1; }
-  blind_out="$(MESH_PCI_ROOT="$fo" MESH_PCIE_STATE="$tf/st-blind" bash "$0" 2>&1)"; blind_rc=$?
+  blind_out="$(MESH_PCI_ROOT="$fo" MESH_PCIE_STATE="$tf/st-blind" MESH_PCIE_GEOM_STATE="$tf/st-blind-geom" bash "$0" 2>&1)"; blind_rc=$?
   printf '%s' "$blind_out" | grep -q BLIND || { echo "test: _OSC-denied topology must render BLIND FAIL"; e=1; }
   [ "$blind_rc" = 3 ] || { echo "test: BLIND should exit 3 (distinct from n/a exit 2) (got $blind_rc) FAIL"; e=1; }
-  # (5) REAL-HARDWARE read gate: a live read must parse >=1 device's counters, OR exit 2 (honest n/a).
+  # (5) GEOMETRY parser: tenths-of-GT/s, and a refusal that is a refusal (never a fabricated 0)
+  [ "$(speed_tenths '16.0 GT/s PCIe')" = 160 ] || { echo "test: speed_tenths 16.0 FAIL"; e=1; }
+  [ "$(speed_tenths '2.5 GT/s PCIe')" = 25 ]   || { echo "test: speed_tenths 2.5 FAIL"; e=1; }
+  speed_tenths 'Unknown' >/dev/null 2>&1 && { echo "test: speed_tenths must reject Unknown FAIL"; e=1; }
+  speed_tenths '' >/dev/null 2>&1        && { echo "test: speed_tenths must reject empty FAIL"; e=1; }
+  [ "$(fmt_s 160)" = 16.0 ] && [ "$(fmt_s 25)" = 2.5 ] || { echo "test: fmt_s FAIL"; e=1; }
+
+  # (6) GEOMETRY not-fire gate — the whole point of the axis. The fixture is the REAL topology of
+  #     this node, the five healthy lines measured 2026-08-15 that a naive "current < device max"
+  #     rule calls faults. Built as a true sysfs shape (devices/ tree + bus/ symlinks) so
+  #     parent_of() walks it exactly as it walks /sys. If any of these five ever fires, the axis
+  #     is crying wolf on hardware with zero PCIe faults.
+  gd="$tf/g/devices/pci0000:00"; gb="$tf/g/bus"; mkdir -p "$gd" "$gb"
+  mkdev() { # <path-under-pci0000:00> <class> <cur_s> <max_s> <cur_w> <max_w>
+    local p="$gd/$1" slot; slot="$(basename "$1")"; mkdir -p "$p"
+    printf '%s\n' "$2" > "$p/class"
+    printf '%s GT/s PCIe\n' "$3" > "$p/current_link_speed"
+    printf '%s GT/s PCIe\n' "$4" > "$p/max_link_speed"
+    printf '%s\n' "$5" > "$p/current_link_width"
+    printf '%s\n' "$6" > "$p/max_link_width"
+    ln -sfn "$p" "$gb/$slot"
+  }
+  B=0x060400
+  mkdev '0000:00:01.2'                                          $B       8.0 16.0  4 8   # root port, 8of16 x4of8
+  mkdev '0000:00:01.2/0000:02:00.2'                             $B       8.0  8.0  4 4
+  mkdev '0000:00:01.2/0000:02:00.2/0000:03:00.0'                $B       8.0  8.0  4 4
+  mkdev '0000:00:01.2/0000:02:00.2/0000:03:00.0/0000:04:00.0'   0x010802 8.0 16.0  4 4   # Gen4 NVMe in a Gen3 slot
+  mkdev '0000:00:01.2/0000:02:00.2/0000:03:09.0'                $B       2.5  8.0  1 1   # 2.5of8 x1
+  mkdev '0000:00:01.2/0000:02:00.2/0000:03:09.0/0000:2a:00.0'   0x020000 2.5  2.5  1 1
+  mkdev '0000:00:03.1'                                          $B       2.5 16.0 16 16  # ASPM on the BRIDGE
+  mkdev '0000:00:03.1/0000:2b:00.0'                             0x030000 2.5 16.0 16 16  # ASPM on the GPU
+  # NB: capture ONCE and grep the variable — `ge | grep -q` under `set -o pipefail` reports the
+  # producer's SIGPIPE (141) as a failed assertion the moment the match is an EARLY line.
+  geout="$(MESH_PCI_ROOT="$gb" bash -c 'PCI_ROOT="$MESH_PCI_ROOT"; '"$(declare -f kind_of speed_tenths read_speed read_width parent_of geom_raw geom_effective)"'; geom_raw | geom_effective')"
+  # the two ceilings that come from somewhere OTHER than the device's own max_*
+  case "$geout" in *'0000:04:00.0 NVMe 80 80 4 4'*) : ;;
+    *) echo "test: 04:00.0 effective speed must be the PARENT's 8.0, not its own 16.0 — got: $(printf '%s\n' "$geout" | grep 04:00.0) FAIL"; e=1 ;; esac
+  case "$geout" in *'0000:00:01.2 Bridge 80 80 4 4'*) : ;;
+    *) echo "test: 00:01.2 effective ceiling must be bounded by its DOWNSTREAM endpoints (8.0/x4), not its own 16.0/x8 — got: $(printf '%s\n' "$geout" | grep 00:01.2) FAIL"; e=1 ;; esac
+  gst="$tf/geom-state"; gargs=(MESH_PCI_ROOT="$gb" MESH_PCIE_STATE="$tf/g-aer-st" MESH_PCIE_GEOM_STATE="$gst")
+  g1="$(env "${gargs[@]}" bash "$0" 2>&1)"
+  printf '%s\n' "$g1" | grep -q 'pcie-geom: BASELINE' || { echo "test: first geometry sample must render BASELINE FAIL"; e=1; }
+  g2="$(env "${gargs[@]}" bash "$0" 2>&1)"; g2rc=$?
+  printf '%s\n' "$g2" | grep -qE 'WIDTH-DOWN|CAP-DROP' && { echo "test: NOT-FIRE gate — five healthy real lines must produce no fault: $(printf '%s\n' "$g2" | grep -E 'WIDTH-DOWN|CAP-DROP') FAIL"; e=1; }
+  [ "$g2rc" = 0 ] || { echo "test: healthy geometry must exit 0 (got $g2rc) FAIL"; e=1; }
+  for ok in '0000:04:00.0 \[NVMe\] OK' '0000:00:01.2 \[Bridge\] OK' '0000:03:09.0 \[Bridge\] OK' '0000:2a:00.0 \[Network\] OK'; do
+    printf '%s\n' "$g2" | grep -qE "$ok" || { echo "test: expected '$ok' in the settled sample FAIL"; e=1; }
+  done
+  for aspm in '0000:2b:00.0 \[GPU\] ASPM' '0000:00:03.1 \[Bridge\] ASPM'; do
+    printf '%s\n' "$g2" | grep -qE "$aspm" || { echo "test: idle ASPM must be labelled ASPM (informational), got: $(printf '%s\n' "$g2" | grep -E "${aspm%% *}") FAIL"; e=1; }
+  done
+  printf '%s\n' "$g2" | grep -q 'pcie-geom: OK (2 of 8 below the speed ceiling' || { echo "test: header must COUNT the ASPM devices, not hide or promote them — got: $(printf '%s\n' "$g2" | grep '^pcie-geom:') FAIL"; e=1; }
+  # (7) GEOMETRY fire gates — same fixture, one field moved. A gate never seen fire is not a gate.
+  printf '2\n' > "$gd/0000:00:01.2/0000:02:00.2/0000:03:00.0/0000:04:00.0/current_link_width"
+  gw="$(env "${gargs[@]}" bash "$0" 2>&1)"; gwrc=$?
+  printf '%s\n' "$gw" | grep -q '0000:04:00.0 \[NVMe\] WIDTH-DOWN' || { echo "test: x2 of an effective x4 must be WIDTH-DOWN FAIL"; e=1; }
+  [ "$gwrc" = 1 ] || { echo "test: WIDTH-DOWN must exit 1 (got $gwrc) FAIL"; e=1; }
+  printf '4\n' > "$gd/0000:00:01.2/0000:02:00.2/0000:03:00.0/0000:04:00.0/current_link_width"
+  printf '5.0 GT/s PCIe\n' > "$gd/0000:00:01.2/0000:02:00.2/0000:03:00.0/max_link_speed"   # the SLOT loses a gen
+  gc="$(env "${gargs[@]}" bash "$0" 2>&1)"; gcrc=$?
+  printf '%s\n' "$gc" | grep -q '0000:04:00.0 \[NVMe\] CAP-DROP' || { echo "test: effective ceiling falling below its high-water must be CAP-DROP FAIL"; e=1; }
+  [ "$gcrc" = 1 ] || { echo "test: CAP-DROP must exit 1 (got $gcrc) FAIL"; e=1; }
+  gc2="$(env "${gargs[@]}" bash "$0" 2>&1)"
+  printf '%s\n' "$gc2" | grep -q '0000:04:00.0 \[NVMe\] CAP-DROP' || { echo "test: CAP-DROP must PERSIST (high-water baseline, not a one-shot edge) FAIL"; e=1; }
+  # (8) n/a is a claim, not a green: a tree with no geometry files renders n/a, never OK.
+  mkdir -p "$tf/g-empty"
+  gn="$(MESH_PCI_ROOT="$tf/g-empty" MESH_PCIE_STATE="$tf/n-aer" MESH_PCIE_GEOM_STATE="$tf/n-geom" bash "$0" 2>&1)"; gnrc=$?
+  printf '%s\n' "$gn" | grep -q 'pcie-geom: n/a' || { echo "test: no-geometry tree must render n/a FAIL"; e=1; }
+  [ "$gnrc" = 2 ] || { echo "test: both axes n/a must exit 2 (got $gnrc) FAIL"; e=1; }
+  [ -e "$tf/n-geom" ] && { echo "test: an n/a run must not write a geometry baseline FAIL"; e=1; }
+
+  # (9) REAL-HARDWARE read gate: a live read must parse >=1 device's counters, OR exit 2 (honest n/a).
   real="$(snapshot)"
   if [ -z "$real" ]; then
     echo "test: no live AER device on this node — honest n/a (exit 2)"; [ "$e" = 0 ] && exit 2 || exit 1
@@ -176,13 +432,43 @@ if [ "${1:-}" = --test ]; then
   echo "$real" | awk 'NF!=5 || $3 ~ /[^0-9]/ || $4 ~ /[^0-9]/ || $5 ~ /[^0-9]/ {bad=1} END{exit bad}' \
     || { echo "test: live read produced a non-numeric counter FAIL"; e=1; }
   ndev="$(printf '%s\n' "$real" | grep -c .)"
-  [ "$e" = 0 ] && echo "test: PASS (real read: $ndev AER device(s))" || echo "test: FAIL"
+  # ...and the geometry axis reads the SAME real bus: every emitted line must be complete and
+  # numeric, and its effective ceiling must resolve. A parser that only ever meets its own
+  # fixtures asserts nothing about /sys.
+  greal="$(geom_raw)"
+  if [ -z "$greal" ]; then
+    ngeo="0 (honest n/a — no device exposes a complete link geometry)"
+  else
+    printf '%s\n' "$greal" | awk 'NF!=7 || $3 ~ /[^0-9]/ || $4 ~ /[^0-9]/ || $5 ~ /[^0-9]/ || $6 ~ /[^0-9]/ {bad=1} END{exit bad}' \
+      || { echo "test: live geometry read produced a malformed line FAIL"; e=1; }
+    geff="$(printf '%s\n' "$greal" | geom_effective)"
+    [ "$(printf '%s\n' "$geff" | grep -c .)" = "$(printf '%s\n' "$greal" | grep -c .)" ] \
+      || { echo "test: live effective-ceiling resolution dropped device(s) FAIL"; e=1; }
+    ngeo="$(printf '%s\n' "$greal" | grep -c .)"
+  fi
+  [ "$e" = 0 ] && echo "test: PASS (real read: $ndev AER device(s), $ngeo geometry device(s))" || echo "test: FAIL"
   exit "$e"
 fi
 
 # ---- live run ---------------------------------------------------------------------------
+# The two axes are INDEPENDENT reads of the same bus: AER can be absent (exit 2) or unowned
+# (BLIND) on a node whose link geometry is perfectly readable, so the geometry block runs at
+# EVERY AER exit path — an axis must never be silenced by an unrelated axis's n/a.
+geom_out=""; geom_rc=0
+geom_out="$(geom_axis 1)"; geom_rc=$?
+
+# combine <aer-exit> — 1 (a real fault on either axis) wins over 3 (AER blind) over 2 (both n/a).
+finish() {
+  local aer_rc="$1"
+  printf '%s\n' "$geom_out"
+  if [ "$aer_rc" = 1 ] || [ "$geom_rc" = 1 ]; then exit 1; fi
+  if [ "$aer_rc" = 3 ]; then exit 3; fi
+  if [ "$aer_rc" = 2 ] && [ "$geom_rc" = 2 ]; then exit 2; fi
+  exit 0
+}
+
 cur="$(snapshot)"
-[ -n "$cur" ] || { echo "pcie-aer: n/a — no PCIe AER counters exposed (CONFIG_PCIEAER off / no AER device)"; exit 2; }
+[ -n "$cur" ] || { echo "pcie-aer: n/a — no PCIe AER counters exposed (CONFIG_PCIEAER off / no AER device)"; finish 2; }
 
 # OWNERSHIP GATE — never render CLEAN on a node that cannot observe a PCIe error.
 # aer_dev_* exists on endpoints regardless of _OSC AER ownership; on a firmware-first / _OSC-denied /
@@ -193,7 +479,7 @@ cur="$(snapshot)"
 # node from "no AER hardware" (exit 2): here the hardware has AER the OS is not allowed to read.
 if [ "$(aer_rootports)" -eq 0 ]; then
   echo "pcie-aer: BLIND — AER counters present but the OS does not own AER (no root port exposes aer_rootport_total_err_cor); PCIe errors are structurally unobservable on this node (firmware-first / _OSC-denied / pcie_ports=compat). Not CLEAN."
-  exit 3
+  finish 3
 fi
 
 mkdir -p "$(dirname "$STATE")" 2>/dev/null
@@ -237,4 +523,4 @@ if [ ! -s "$STATE" ] || [ "$new_state" != "$(cat "$STATE" 2>/dev/null)" ]; then
 fi
 mesh-state-touch "$STATE" 2>/dev/null || touch "$STATE" 2>/dev/null
 
-case "$worst" in FATAL|NONFATAL) exit 1;; *) exit 0;; esac
+case "$worst" in FATAL|NONFATAL) finish 1;; *) finish 0;; esac
