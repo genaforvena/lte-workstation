@@ -1,0 +1,334 @@
+#!/usr/bin/env bash
+# mesh-gpu-lid — graceful thermal ACTUATOR for the GPU envelope: cap the board power limit to shed
+# heat WITHOUT killing work. The AMD-node sibling of mesh-turbo-lid, which needs intel_pstate and is
+# honestly n/a here (mesh-home became the mind node 2026-07-14 and is AMD/acpi-cpufreq). Its header
+# names the cost of the missing rung: the ladder is observe → nice → **lid** → shed/kill, and without
+# a lid "the mesh jumps from renice straight to killing a mind mid-flight" — on the node running ALL
+# the minds, the sole 180W inference GPU (whisper/gigaam/ollama) and the grinder, with no fan-RPM or
+# VRM telemetry either. This closes that rung on the biggest, hottest, burstiest consumer with ONE
+# root call. See ~/.mesh/knowledge/capability-thermal-lid-absent-on-amd-mind-node-gpu-power-cap-latent-mesh-home-20260815.md
+# and the Intel prior art ~/.mesh/knowledge/capability-turbo-lid-actuator-20260705.md.
+#
+#   mesh-gpu-lid --on [--watts W|--pct N] [--ttl S] [--reason R]   close the lid.
+#                     bare     → cap to the device's MIN power limit (hardest graceful step)
+#                     --pct N  → N% of the DEFAULT limit (graded cap, e.g. 70)
+#                     --watts W→ explicit watts
+#                     both forms CLAMP into [min_limit, default_limit] — a lid never RAISES the
+#                     envelope (max_limit > default is an overclock, not a thermal step).
+#   mesh-gpu-lid --off                     restore the device default power limit
+#   mesh-gpu-lid --status                  live nvidia-smi read + state metadata
+#   mesh-gpu-lid --release-if-expired      dead-man: --off IFF the lid's TTL passed
+#   mesh-gpu-lid --sweep                   cron backstop == --release-if-expired
+#   mesh-gpu-lid --test                    pure logic + real-read + REAL no-op write; exit 2 where the lever is absent
+#
+# SAFETY (carried VERBATIM in intent from the 2026-07-05 lid doc — an actuator that halves the node
+# must never wedge it):
+#   1. AUTO-RELEASE dead-man. Every --on writes a deadline (now+TTL, default MESH_GPU_LID_TTL=600s)
+#      into the state file AND spawns a detached (setsid) one-shot releaser that fires
+#      --release-if-expired after TTL. A dead caller therefore NEVER leaves the envelope cut; the
+#      */1 --sweep cron is the belt-and-suspenders backstop for a releaser that itself died (OOM).
+#      Re-asserting (--on again) pushes the deadline forward and re-spawns.
+#   2. SINGLE-WRITER. One envelope writer per node — two concurrent writers racing -pl oscillate the
+#      clock. A node-LOCAL flock (fd 200, NEVER the board): the power limit is a per-node knob, so a
+#      board claim would only churn coordination and could cross-node false-refuse a peer capping its
+#      OWN gpu. A 2nd CONCURRENT --on exits 2 while the 1st holds the lock.
+#   3. HONEST SENSE LINE. ~/.mesh/.gpu-lid.state (LID=on|off watts=N since=<ts> deadline=<ts>
+#      reason=<tier> pid=<releaser> announced=<0|1> ttl=<hold>); mesh-state-touch on EVERY eval
+#      (mtime=ran-live, decoupled from the change-gated content) so the staleness watchdogs never
+#      false-STALE it. Board [gpu-lid-on]/[gpu-lid-off] on EDGES only, with turbo-lid's drops-log +
+#      catch-up self-heal so a swallowed on-edge cannot read as "still lidded" forever.
+#   4. FAIL-OPEN. A reboot / driver reload resets the limit to default and kills the releaser —
+#      acceptable, the lid defaults open. nvidia-smi is the truth for the ACTUAL envelope; the state
+#      file is metadata only.
+#   5. HONEST n/a. No nvidia-smi, no GPU, or no passwordless root for the write → exit 2 and change
+#      nothing, copying mesh-turbo-lid rather than faking a lever (that tool's n/a is right, and this
+#      tool does NOT replace it — an intel_pstate host still wants the CPU lid).
+#
+# NOT CARRIED from mesh-turbo-lid (deliberate, named so the absence reads as a choice): the adaptive
+# hold / flap dampener and the post-tiering of intra-flap edges to mesh-trace. Both are refinements
+# earned by that tool's live flap history; this lid has no such history yet. If [gpu-lid-*] churn
+# shows up on the board, port them from mesh-turbo-lid — they are not re-invented here.
+#
+# reflex-cadence: * * * * *
+# reflex-args: --sweep
+set -uo pipefail
+# cron's minimal PATH lacks ~/.local/bin — the */1 --sweep release then can't find mesh-chat, so the
+# [gpu-lid-off] edge post silently drops while the envelope+state release fine (the exact 2026-07-05
+# 22:15Z failure on the CPU lid: a lid-on with no lid-off = a false "still lidded").
+export PATH="$HOME/.local/bin:$PATH"
+
+MESH="${MESH_HOME:-$HOME/.mesh}"
+STATE="${MESH_GPU_LID_STATE:-$MESH/.gpu-lid.state}"
+TTL_DEFAULT="${MESH_GPU_LID_TTL:-600}"
+GPU_IDX="${MESH_GPU_LID_INDEX:-0}"
+DROPLOG="${MESH_GPU_LID_DROPLOG:-$MESH/.gpu-lid-drops.log}"     # swallowed board edges land here (detectable)
+LOCKFILE="${MESH_GPU_LID_LOCK:-$MESH/.gpu-lid.lock}"            # node-local single-writer flock (fd 200)
+# A --test must not contend the PRODUCTION lock: the live reflex uses flock -n, so a doctor-storm
+# smoke holding the real lock makes the real run silently skip its cycle (a stolen turn, worse than
+# an mtime forge). Divert when this IS a test or a test's child.
+if [ "${1:-}" = --test ] || [ "${MESH_TEST_SANDBOX:-0}" = 1 ]; then LOCKFILE="${TMPDIR:-/tmp}/.gpu-lid.lock.sandbox.$$"; fi
+
+ts(){ date -u +%Y-%m-%dT%H:%M:%SZ; }
+now(){ date +%s; }
+
+# --- device read (the ONE query; every consumer parses this line) -------------------------
+# "limit, min, default, max, draw, temp" in whole watts / °C. Empty on any failure — never a
+# plausible constant: an absent GPU must render n/a, never a fabricated 180.
+gpu_read(){
+  command -v nvidia-smi >/dev/null 2>&1 || return 1
+  local line
+  line="$(nvidia-smi -i "$GPU_IDX" --format=csv,noheader,nounits \
+      --query-gpu=power.limit,power.min_limit,power.default_limit,power.max_limit,power.draw,temperature.gpu 2>/dev/null)" || return 1
+  [ -n "$line" ] || return 1
+  # a driver that answers but has no power telemetry prints "[N/A]" — that is n/a, not a reading
+  case "$line" in *N/A*|*'[Not Supported]'*) return 1 ;; esac
+  printf '%s\n' "$line" | awk -F', *' '{printf "%d %d %d %d %d %d\n", $1+0.5, $2+0.5, $3+0.5, $4+0.5, $5+0.5, $6+0.5}'
+}
+
+have_lever(){ gpu_read >/dev/null 2>&1; }
+
+# --- envelope writer (DRYRUN-gated so --test never fires a real cap / needs no sudo) -------
+write_pl(){ # $1 watts
+  local w="$1"
+  if [ "${MESH_GPU_LID_DRYRUN:-0}" = 1 ]; then echo "DRYRUN write -pl $w"; return 0; fi
+  # -pl is a root call; passwordless sudo confirmed on this node. nvidia-smi prints "All done."
+  sudo -n nvidia-smi -i "$GPU_IDX" -pl "$w" >/dev/null 2>&1
+}
+
+# --- PURE: clamp a requested cap into [min, default] --------------------------------------
+# A lid may only NARROW the envelope. Above default is an overclock (max_limit > default on this
+# device: 190 > 180) and is refused by clamping DOWN to default, not up to max.
+clamp_watts(){ # $1 want  $2 min  $3 default → clamped
+  local want="$1" lo="$2" hi="$3"
+  [[ "$want" =~ ^[0-9]+$ ]] || { echo "$hi"; return; }
+  [ "$want" -lt "$lo" ] && want="$lo"
+  [ "$want" -gt "$hi" ] && want="$hi"
+  echo "$want"
+}
+
+# --- PURE: decide whether an on-lid has expired (--test drives it) ------------------------
+lid_expired(){ # $1 lid_state  $2 deadline  $3 now  → 0 = release, 1 = hold/na
+  [ "$1" = on ] || return 1
+  [[ "$2" =~ ^[0-9]+$ ]] || return 0   # on but no valid deadline = release (never strand capped)
+  [ "$3" -ge "$2" ]
+}
+
+# --- state file (metadata; nvidia-smi is truth for the actual envelope) --------------------
+state_get(){ # $1 field → value ('' if absent)
+  [ -f "$STATE" ] || { echo ""; return; }
+  awk -v k="$1" '{for(i=1;i<=NF;i++){n=index($i,"="); if(n>0 && substr($i,1,n-1)==k){print substr($i,n+1); exit}}}' "$STATE"
+}
+state_write(){ # LID watts since deadline reason pid [announced] [ttl]
+  printf 'LID=%s watts=%s since=%s deadline=%s reason=%s pid=%s announced=%s ttl=%s\n' \
+    "$1" "$2" "$3" "$4" "$5" "$6" "${7:-0}" "${8:-0}" > "$STATE"
+  command -v mesh-state-touch >/dev/null 2>&1 && mesh-state-touch "$STATE" >/dev/null 2>&1 || touch "$STATE"
+}
+
+board(){ # $1 marker-line — edge posts only. Returns 0 IFF the board actually took it; a SWALLOWED
+         # post lands in a durable drops-log so a silent drop is DETECTABLE + self-healable.
+  if command -v mesh-chat >/dev/null 2>&1 && MESH_WHO="gpu-lid@$(hostname)" mesh-chat "$1" >/dev/null 2>&1; then
+    return 0
+  fi
+  { printf '%s DROPPED %s\n' "$(ts)" "$1" >> "$DROPLOG"; } 2>/dev/null || true
+  return 1
+}
+
+do_off(){ # $1 reason
+  local prev pid ann on_reason r lim mn df
+  prev="$(state_get LID)"; pid="$(state_get pid)"; ann="$(state_get announced)"; on_reason="$(state_get reason)"
+  if r="$(gpu_read)"; then read -r lim mn df _ _ _ <<<"$r"; else df=""; fi
+  [ -n "$df" ] && write_pl "$df"
+  # persist OFF *before* cancelling the releaser: when the releaser ITSELF calls do_off (dead-man
+  # path), killing its own pid is a suicide — state must already be written or it strands at LID=on.
+  state_write off "${df:-na}" "$(state_get since)" "" "${1:-off}" "" 0 0
+  [[ "$pid" =~ ^[0-9]+$ ]] && [ "$pid" != "$$" ] && kill "$pid" 2>/dev/null || true
+  if [ "$prev" = on ]; then
+    # SELF-HEAL: if this episode's [gpu-lid-on] board post was DROPPED (announced!=1), reconstruct a
+    # catch-up before the off-edge so the board's on/off pairing is restored — else a silent on reads
+    # as "still capped" forever. The catch-up is itself drop-logged by board() if it fails.
+    [ "$ann" != 1 ] && board "[gpu-lid-on] $(hostname) (CATCH-UP: on-edge post was dropped — reconstructing pairing) reason=${on_reason:-?}"
+    board "[gpu-lid-off] $(hostname) GPU envelope restored (power limit ${df:-?}W = device default) — reason=${1:-off}"
+  fi
+  echo "gpu-lid: OFF (restored ${df:-?}W)"
+}
+
+do_on(){
+  local want="" pct="" ttl="$TTL_DEFAULT" reason="manual"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --watts)  want="$2"; shift 2 ;;
+      --pct)    pct="$2";  shift 2 ;;
+      --ttl)    ttl="$2";  shift 2 ;;
+      --reason) reason="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  [[ "$ttl" =~ ^[0-9]+$ ]] || ttl="$TTL_DEFAULT"
+  # single-writer: node-LOCAL flock. FAIL-OPEN — if flock is absent or the lockfile can't open,
+  # proceed: thermal safety outranks single-writer (SAFETY #4).
+  if command -v flock >/dev/null 2>&1; then
+    if exec 200>"$LOCKFILE" 2>/dev/null && ! flock -n 200; then
+      echo "gpu-lid: REFUSED — another gpu-lid invocation holds the lock (concurrent)"; exit 2
+    fi
+  fi
+  local r lim mn df
+  r="$(gpu_read)" || { echo "gpu-lid: no readable GPU power envelope — n/a"; exit 2; }
+  read -r lim mn df _ _ _ <<<"$r"
+  if [ -n "$pct" ]; then
+    [[ "$pct" =~ ^[0-9]+$ ]] && [ "$pct" -ge 10 ] && [ "$pct" -le 100 ] || { echo "gpu-lid: bad --pct '$pct' (10-100)"; exit 1; }
+    want=$(( df * pct / 100 ))
+  elif [ -z "$want" ]; then
+    want="$mn"                                    # bare --on = the hardest graceful step
+  fi
+  local watts; watts="$(clamp_watts "$want" "$mn" "$df")"
+  write_pl "$watts" || { echo "gpu-lid: -pl write REFUSED (no passwordless root?) — envelope unchanged"; exit 2; }
+  local prev; prev="$(state_get LID)"
+  # (re)spawn the detached dead-man releaser; kill any prior one first (re-assert pushes deadline)
+  local oldpid; oldpid="$(state_get pid)"
+  [[ "$oldpid" =~ ^[0-9]+$ ]] && kill "$oldpid" 2>/dev/null || true
+  local deadline=$(( $(now) + ttl )) rpid=""
+  if [ "${MESH_GPU_LID_DRYRUN:-0}" != 1 ]; then
+    # 200>&- : do NOT let the detached releaser inherit the writer lock (fd 200) — else it would hold
+    # the lock for the whole TTL and refuse every re-assert.
+    setsid bash -c "sleep $ttl; exec '$0' --release-if-expired" </dev/null >/dev/null 2>&1 200>&- &
+    rpid=$!
+  fi
+  # announced tracks whether the [gpu-lid-on] edge post actually landed; on a re-assert (prev==on, no
+  # new edge) carry the prior value forward so an earlier drop still owes its catch-up on release.
+  local ann; ann="$(state_get announced)"; [[ "$ann" =~ ^[01]$ ]] || ann=0
+  if [ "$prev" != on ]; then
+    if board "[gpu-lid-on] $(hostname) GPU envelope CUT to ${watts}W of ${df}W default (ttl=${ttl}s) — reason=$reason"; then ann=1; else ann=0; fi
+  fi
+  state_write on "$watts" "$(ts)" "$deadline" "$reason" "$rpid" "$ann" "$ttl"
+  echo "gpu-lid: ON (watts=$watts/${df} ttl=${ttl}s deadline=$deadline reason=$reason releaser=$rpid announced=$ann)"
+}
+
+do_status(){
+  local r lim mn df mx draw temp
+  echo "gpu-lid status @ $(hostname) $(ts)"
+  if r="$(gpu_read)"; then
+    read -r lim mn df mx draw temp <<<"$r"
+    echo "  device: limit=${lim}W (min=${mn} default=${df} max=${mx})  draw=${draw}W  temp=${temp}C"
+  else
+    echo "  device: n/a (no nvidia-smi / no GPU / no power telemetry)"
+  fi
+  if [ -f "$STATE" ]; then echo "  state:  $(cat "$STATE")"; else echo "  state:  (none)"; fi
+  [ -n "${lim:-}" ] || return 2
+}
+
+case "${1:---status}" in
+  --on)  shift; have_lever || { echo "gpu-lid: no readable GPU power envelope — n/a"; exit 2; }; do_on "$@" ;;
+  --off) have_lever || { echo "gpu-lid: no readable GPU power envelope — n/a"; exit 2; }; do_off manual ;;
+  --release-if-expired|--sweep)
+    have_lever || exit 2
+    command -v mesh-state-touch >/dev/null 2>&1 && [ -f "$STATE" ] && mesh-state-touch "$STATE" >/dev/null 2>&1
+    if lid_expired "$(state_get LID)" "$(state_get deadline)" "$(now)"; then do_off auto-release-ttl; else exit 0; fi ;;
+  --status) do_status ;;
+
+  --test)
+    fail(){ echo "smoke-test: FAIL ($1)"; exit 1; }
+    export MESH_TEST_SANDBOX=1   # children divert their lock too
+    # sandbox honesty (mechanism-assert): the lock this run holds must be the diverted one — holding
+    # the PRODUCTION lock steals the real reflex's flock -n turn. Falsify: drop the diversion.
+    [ "$LOCKFILE" != "$MESH/.gpu-lid.lock" ] || fail "lock diversion inactive — this --test contends the PRODUCTION lock"
+
+    # ---- pure: dead-man expiry classification (falsifiable both ways) ----
+    lid_expired on 1000 1000 || fail "expired: now==deadline must release"
+    lid_expired on 1000 1001 || fail "expired: now>deadline must release"
+    lid_expired on 1000 999  && fail "expired: now<deadline must HOLD (not release)"
+    lid_expired off 0 9999   && fail "expired: an OFF lid must never 'release'"
+    lid_expired on '' 9999   || fail "expired: on with no deadline must release (never strand capped)"
+    _fx(){ [ "$1" = on ] || return 1; [ "$3" -gt "$2" ]; }   # the WRONG (strict) variant
+    _fx on 1000 1000 && fail "falsify: strict-> variant should NOT release at now==deadline (guards the >= boundary)"
+
+    # ---- pure: clamp — a lid NARROWS, never RAISES ----
+    [ "$(clamp_watts 140 100 180)" = 140 ] || fail "clamp: an in-range cap must pass through"
+    [ "$(clamp_watts  40 100 180)" = 100 ] || fail "clamp: below min must clamp UP to min (an unbootable cap is not a lid)"
+    [ "$(clamp_watts 190 100 180)" = 180 ] || fail "clamp: above default must clamp DOWN to default, NOT up to max (190>180 is an overclock)"
+    [ "$(clamp_watts abc 100 180)" = 180 ] || fail "clamp: garbage must render the default envelope, never a cap"
+    [ "$(clamp_watts 100 100 180)" = 100 ] || fail "clamp: min itself is a legal cap"
+
+    # ---- gpu_read must FAIL (not fabricate) when the device answers n/a ----
+    ( nvidia-smi(){ echo "[N/A], [N/A], [N/A], [N/A], [N/A], [N/A]"; }
+      export -f nvidia-smi 2>/dev/null
+      gpu_read >/dev/null 2>&1 ) && fail "gpu_read: an [N/A] telemetry answer must FAIL, never parse to 0/plausible watts"
+    ( nvidia-smi(){ return 9; }; gpu_read >/dev/null 2>&1 ) && fail "gpu_read: a failing nvidia-smi must FAIL, not emit a constant"
+
+    # ---- state round-trip parse (sandboxed file) ----
+    STATE="$(mktemp)"; trap 'rm -f "$STATE"' EXIT
+    state_write on 120 T1 12345 therm-hot 4242 1 900
+    [ "$(state_get LID)" = on ]         || fail "state LID parse"
+    [ "$(state_get watts)" = 120 ]      || fail "state watts parse"
+    [ "$(state_get deadline)" = 12345 ] || fail "state deadline parse"
+    [ "$(state_get pid)" = 4242 ]       || fail "state pid parse"
+    [ "$(state_get announced)" = 1 ]    || fail "state announced parse"
+    [ "$(state_get ttl)" = 900 ]        || fail "state ttl parse"
+    [ -z "$(state_get nope)" ]          || fail "absent field must be empty"
+
+    # ---- the envelope write is DRYRUN-intercepted in test (no real cap, no sudo) ----
+    MESH_GPU_LID_DRYRUN=1
+    case "$(write_pl 140)" in *"DRYRUN write -pl 140"*) : ;; *) fail "dryrun did not intercept the real -pl write";; esac
+
+    # ---- board() drops-log: a SWALLOWED post is detectable, a good one leaves no drop ----
+    DROPLOG="$(mktemp)"; mesh-chat(){ return 1; }
+    board "[gpu-lid-on] test drop" && fail "board must return non-zero when the post is swallowed"
+    grep -q 'DROPPED .*\[gpu-lid-on\] test drop' "$DROPLOG" || fail "board must append a swallowed post to the drops-log"
+    mesh-chat(){ return 0; }; : > "$DROPLOG"
+    board "[gpu-lid-off] test ok" || fail "board must return 0 on a successful post"
+    [ -s "$DROPLOG" ] && fail "a successful post must NOT write to the drops-log"
+    unset -f mesh-chat; rm -f "$DROPLOG"
+
+    # ---- SELF-HEAL catch-up + PHANTOM guard, driven through the REAL do_off (DRYRUN, stubbed board) ----
+    cap="$(mktemp)"; mesh-chat(){ printf '%s\n' "$*" >> "$cap"; return 0; }
+    STATE="$(mktemp)"
+    state_write on 100 T1 12345 therm-hot '' 0 600            # announced=0 → on-edge was dropped
+    do_off auto-release-ttl >/dev/null 2>&1
+    grep -q 'CATCH-UP' "$cap" || fail "self-heal: a dropped on-edge (announced=0) must reconstruct a catch-up [gpu-lid-on] on release"
+    grep -q '\[gpu-lid-off\]' "$cap" || fail "self-heal: [gpu-lid-off] must still post after the catch-up"
+    : > "$cap"
+    state_write on 100 T1 12345 therm-hot '' 1 600            # announced=1 → NO catch-up
+    do_off auto-release-ttl >/dev/null 2>&1
+    grep -q 'CATCH-UP' "$cap" && fail "self-heal: an announced=1 lid must NOT emit a catch-up (no double post)"
+    grep -q '\[gpu-lid-off\]' "$cap" || fail "self-heal: [gpu-lid-off] must post for announced=1 too"
+    : > "$cap"
+    state_write off 180 T1 '' off '' 0 0                      # prev=off → nothing was held
+    do_off manual >/dev/null 2>&1
+    grep -q '\[gpu-lid-' "$cap" && fail "phantom: --off on an already-open envelope must NOT board-post"
+    unset -f mesh-chat; rm -f "$cap" "$STATE"
+
+    # ---- SINGLE-WRITER via node-local flock (hermetic; two OFDs conflict even in-process) ----
+    if command -v flock >/dev/null 2>&1; then
+      _lk="$(mktemp -u)"
+      exec 200>"$_lk"; flock -n 200 || fail "flock: first acquisition on a free lock must succeed"
+      if ( exec 201>"$_lk"; flock -n 201 ); then fail "flock: a 2nd CONCURRENT acquisition must be refused (the exit-2 path) while the lock is held"; fi
+      exec 200>&-
+      ( exec 202>"$_lk"; flock -n 202 ) || fail "flock: after release the lock must be re-acquirable"
+      rm -f "$_lk"
+    fi
+
+    # ---- REAL GATE: a live device read AND a live no-op WRITE. A mode bit / an executable path is
+    #      not the claim (mesh-whisper-run drove only stubs and never once invoked whisper): the only
+    #      proof that -pl will be ACCEPTED is attempting it. Same value in, envelope unchanged after.
+    if r="$(gpu_read)"; then
+      read -r _lim _mn _df _mx _draw _temp <<<"$r"
+      [ "${_lim:-0}" -ge 1 ] && [ "${_mn:-0}" -ge 1 ] && [ "${_df:-0}" -ge 1 ] || fail "real-read: implausible power envelope ($r)"
+      [ "$_mn" -le "$_df" ] || fail "real-read: min_limit ($_mn) above default ($_df) — envelope makes no sense"
+      [ "${_temp:-0}" -ge 1 ] && [ "$_temp" -le 120 ] || fail "real-read: implausible GPU temp (${_temp}C)"
+      if sudo -n true 2>/dev/null; then
+        MESH_GPU_LID_DRYRUN=0
+        write_pl "$_lim" || fail "real-write: -pl ${_lim}W (a NO-OP, the current limit) was REFUSED — the lever is not actually operable"
+        r2="$(gpu_read)" || fail "real-write: device unreadable after the no-op write"
+        read -r _lim2 _ _ _ _ _ <<<"$r2"
+        [ "$_lim2" = "$_lim" ] || fail "real-write: the no-op write CHANGED the envelope ($_lim → $_lim2) — test must leave nothing changed"
+        echo "smoke-test: ok (gpu live: limit=${_lim}W min=${_mn} default=${_df} temp=${_temp}C; -pl write path exercised no-op, envelope unchanged)"
+        exit 0
+      fi
+      echo "smoke-test: n/a (gpu readable: limit=${_lim}W, but no passwordless root — the -pl lever is not operable here)"
+      exit 2
+    else
+      echo "smoke-test: n/a (no nvidia-smi / no GPU / no power telemetry on this host — actuator not applicable)"
+      exit 2
+    fi ;;
+
+  *) echo "usage: mesh-gpu-lid --on [--watts W|--pct N] [--ttl S] [--reason R] | --off | --status | --sweep | --test"; exit 1 ;;
+esac
