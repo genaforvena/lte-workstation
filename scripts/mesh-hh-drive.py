@@ -13,18 +13,28 @@ Verbs (one per line in the command file):
   goto URL · dump · text SEL · js EXPR · shot NAME · wait MS
   click SEL · clicknth SEL N · clickbtn NAME · clicktext TEXT
   fill SEL TEXT · type SEL TEXT · press KEY · check SEL · select SEL VAL
-  mouse X Y · frames · fclick IDX SEL · dismiss · quit
+  mouse X Y · frames · fclick IDX SEL · dismiss · upload SEL PATH · settext SEL PATH
+  fillenv SEL KEY (value from env or ~/.mesh/job/.creds.env — never logged) · quit
 
 `dismiss` closes hh's profile-completion modal, which silently swallows clicks on the page beneath
 it — the single most common reason a hh flow appears to hang while every command reports success.
+
+`upload` is what makes this driver usable for ATS forms (Greenhouse/Ashby/Lever), where the resume
+is a file input rather than a text field — a drag-drop widget still carries a real <input type=file>
+underneath, so the selector to hand it is that input, not the visible dropzone.
+
+HH_PROFILE names the instance: a second driver (say the webmail one) gets its own state, command
+file, log and shots so its cookies never land in hh's session. Default profile = `hh`.
 """
 import json, os, pathlib, shlex, sys, time
 
 MESH = pathlib.Path(os.path.expanduser("~/.mesh"))
-STATE = MESH / "browser/hh-state.json"
-CMD = MESH / "job/hh-cmd.txt"
-LOG = MESH / "job/hh-drive.log"
+PROFILE = os.environ.get("HH_PROFILE", "hh")
+STATE = pathlib.Path(os.environ.get("HH_STATE", MESH / f"browser/{PROFILE}-state.json"))
+CMD = pathlib.Path(os.environ.get("HH_CMD", MESH / f"job/{PROFILE}-cmd.txt"))
+LOG = pathlib.Path(os.environ.get("HH_LOG", MESH / f"job/{PROFILE}-drive.log"))
 SHOTS = MESH / "job/shots"
+HOME_URL = os.environ.get("HH_HOME", "https://hh.ru/")
 IDLE_LIMIT = int(os.environ.get("HH_IDLE_LIMIT", 45 * 60))
 
 # Verbs whose argument is free text, not a shell-ish selector list. `js`/`text` take the whole
@@ -49,7 +59,9 @@ CONTROLS_JS = """Array.from(document.querySelectorAll('input,button,select,texta
     +(e.name?' name='+e.name:'')
     +(e.getAttribute('data-qa')?' qa='+e.getAttribute('data-qa'):'')
     +(e.placeholder?' ph='+e.placeholder:'')
-    +' :: '+((e.innerText||e.value||'').trim().slice(0,45).replace(/\\n/g,' '))})
+    +' :: '+((e.type==='password'||/pass|pwd/i.test(e.name||e.id||''))
+        ? '<'+(e.value||'').length+' chars hidden>'
+        : (e.innerText||e.value||'').trim().slice(0,45).replace(/\\n/g,' '))})
   .join('\\n')"""
 
 # hh's "какой формат удобнее / расскажите о себе" wizard renders over the page and eats every click
@@ -84,7 +96,7 @@ def run():
                             user_agent=("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                                         "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"))
         pg = ctx.new_page()
-        pg.goto("https://hh.ru/", wait_until="domcontentloaded", timeout=60000)
+        pg.goto(HOME_URL, wait_until="domcontentloaded", timeout=60000)
         pg.wait_for_timeout(4000)
         out("[ready]")
         dump(pg)
@@ -153,6 +165,52 @@ def run():
                         (pg.press(rest[0], rest[1], timeout=15000) if len(rest) > 1
                          else pg.keyboard.press(rest[0]))
                         pg.wait_for_timeout(1200)
+                    elif verb == "fillenv":
+                        # A password must never reach the command file, the log, or a pane. The
+                        # caller names a KEY; the value is looked up in the environment, then in
+                        # ~/.mesh/job/.creds.env, and only its LENGTH is ever printed.
+                        val = os.environ.get(rest[1])
+                        if val is None:
+                            cf = MESH / "job/.creds.env"
+                            if cf.exists():
+                                for ln in cf.read_text(encoding="utf-8").splitlines():
+                                    ln = ln.strip()
+                                    if ln.startswith("#") or "=" not in ln:
+                                        continue
+                                    k, v = ln.split("=", 1)
+                                    if k.strip() == rest[1]:
+                                        val = v.strip().strip('"').strip("'")
+                                        break
+                        if not val:
+                            out("[FAIL] fillenv: no value for", rest[1])
+                        else:
+                            pg.fill(rest[0], val, timeout=20000)
+                            pg.wait_for_timeout(800)
+                            out("[fillenv]", rest[1], f"({len(val)} chars) ->", rest[0])
+                    elif verb == "settext":
+                        # A cover letter is multi-line and the command file is line-based, so the
+                        # text comes from a FILE — the same file that gets archived as the audit
+                        # copy of what was sent, which is why this reads it rather than taking it
+                        # inline: one artifact, no chance of the archive and the form diverging.
+                        pth = pathlib.Path(os.path.expanduser(" ".join(rest[1:])))
+                        if not pth.is_file() or pth.stat().st_size == 0:
+                            out("[FAIL] settext: no such file (or empty):", pth)
+                        else:
+                            body = pth.read_text(encoding="utf-8")
+                            pg.fill(rest[0], body, timeout=20000)
+                            pg.wait_for_timeout(1200)
+                            out("[settext]", pth, len(body), "chars ->", rest[0])
+                    elif verb == "upload":
+                        # Assert the file EXISTS before handing it over: playwright accepts a
+                        # missing path against some inputs and the form then submits with no
+                        # resume, which reads downstream as a successful application.
+                        pth = pathlib.Path(os.path.expanduser(" ".join(rest[1:])))
+                        if not pth.is_file() or pth.stat().st_size == 0:
+                            out("[FAIL] upload: no such file (or empty):", pth)
+                        else:
+                            pg.set_input_files(rest[0], str(pth), timeout=20000)
+                            pg.wait_for_timeout(2500)
+                            out("[upload]", pth, pth.stat().st_size, "bytes ->", rest[0])
                     elif verb == "check":
                         pg.check(rest[0], timeout=15000)
                     elif verb == "select":
