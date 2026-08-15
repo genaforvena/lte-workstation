@@ -111,6 +111,56 @@ find_root_disk() {
 # Caveat that bounds the name: on a queued device util means ">=1 I/O in flight", so it
 # reports BUSY, not saturated. Throughput/iops stay in the reason string as reported
 # detail; they are never judged.
+# --- Coverage: fold the 1s INSTANTANEOUS window with the across-run INTERVAL -------
+# A 1s sample once per 600s cadence covers 0.17% of wallclock. Measured on this node
+# 2026-08-15, same instant: the 1s window read util=0.1% write=60 KB/s (→ IDLE) while
+# the 60s accumulator delta over the SAME span read util=61.1% write=77403 KB/s — a
+# 600x error on throughput that flips the verdict. /proc/diskstats is a MONOTONIC
+# ACCUMULATOR, so delta'ing it across runs covers 100% of the interval at zero cost;
+# the only thing missing was carrying the raw counters in the state file.
+#
+# Both windows are kept because they answer different questions: the interval mean
+# dilutes a sharp spike, the instantaneous one misses everything between ticks. Fold
+# with a max that NAMES its winner so a consumer can never mistake which it read.
+#
+# fold_util <inst> <iv|na> -> "<fused> <winner>"   (winner: inst|iv — na loses by default)
+fold_util() {
+  local inst="$1" iv="${2:-na}"
+  case "$iv" in ''|na) printf '%s inst\n' "$inst"; return;; esac
+  if [ "$iv" -gt "$inst" ] 2>/dev/null; then printf '%s iv\n' "$iv"; else printf '%s inst\n' "$inst"; fi
+}
+
+# interval_from_raw <prev_line> <now_epoch> <r_sect> <w_sect> <r_ios> <w_ios> <ms> <max_age_s>
+#   -> "<read_kb> <write_kb> <iops> <util>" on success, or "na na na na".
+# MISSING EVIDENCE RENDERS na, NEVER 0 — a reboot-reset counter read as 0 is a
+# fabricated calm, and a first run has no baseline at all. Any counter going BACKWARDS
+# means the accumulator reset (reboot / device re-enumeration): that is absence of
+# evidence, not evidence of quiet.
+interval_from_raw() {
+  local prev="$1" ne="$2" rs="$3" ws="$4" ri="$5" wi="$6" ms="$7" maxage="$8"
+  local pe prs pws pri pwi pms dt
+  read -r pe prs pws pri pwi pms <<< "$prev"
+  # every field must be a bare integer — a truncated/garbage state line is na, not 0
+  for _f in "$pe" "$prs" "$pws" "$pri" "$pwi" "$pms"; do
+    case "$_f" in ''|*[!0-9]*) printf 'na na na na\n'; return;; esac
+  done
+  dt=$(( ne - pe ))
+  [ "$dt" -gt 0 ] || { printf 'na na na na\n'; return; }
+  [ "$dt" -le "$maxage" ] || { printf 'na na na na\n'; return; }   # stale baseline: don't average across a gap
+  # counter went backwards anywhere => reset => na
+  if [ "$rs" -lt "$prs" ] || [ "$ws" -lt "$pws" ] || [ "$ri" -lt "$pri" ] || [ "$wi" -lt "$pwi" ] || [ "$ms" -lt "$pms" ]; then
+    printf 'na na na na\n'; return
+  fi
+  local rkb wkb io ut
+  rkb=$(( (rs - prs) * 512 / 1024 / dt ))
+  wkb=$(( (ws - pws) * 512 / 1024 / dt ))
+  io=$(( (ri - pri + wi - pwi) / dt ))
+  ut=$(( (ms - pms) * 100 / (dt * 1000) ))
+  [ "$ut" -gt 100 ] && ut=100
+  [ "$ut" -lt 0 ] && ut=0
+  printf '%s %s %s %s\n' "$rkb" "$wkb" "$io" "$ut"
+}
+
 classify() {
   local rkb="$1" wkb="$2" iops="$3" util="${4:-0}"
 
@@ -160,6 +210,31 @@ if [ "${1:-}" = --test ]; then
   r="$(classify 0 468 115 0)"; s="${r%%|*}"
   [ "$s" = "IDLE" ] || { echo "  FAIL: 468 KB/s @ 115 iops but util=0 → $s (expected IDLE — absolute-throughput thresholds are back)"; fail=1; }
 
+  # --- COVERAGE gates: the interval window and the fold that names its winner -------
+  # fold_util: the max must NAME which window won, and na must never beat a real read.
+  [ "$(fold_util 10 60)" = "60 iv" ]   || { echo "  FAIL: fold_util 10 60 → $(fold_util 10 60) (expected '60 iv')"; fail=1; }
+  [ "$(fold_util 80 20)" = "80 inst" ] || { echo "  FAIL: fold_util 80 20 → $(fold_util 80 20) (expected '80 inst')"; fail=1; }
+  [ "$(fold_util 40 40)" = "40 inst" ] || { echo "  FAIL: fold_util 40 40 → $(fold_util 40 40) (expected '40 inst' — ties name inst)"; fail=1; }
+  [ "$(fold_util 7 na)" = "7 inst" ]   || { echo "  FAIL: fold_util 7 na → $(fold_util 7 na) (expected '7 inst')"; fail=1; }
+
+  # interval_from_raw: a real delta. prev at t=0 with 0 counters, now at t=100 with
+  # 200000 sectors written and 61000 busy-ms → 1000 KB/s, util 61.
+  r="$(interval_from_raw "0 0 0 0 0 0" 100 0 200000 0 1000 61000 2400)"
+  [ "$r" = "0 1000 10 61" ] || { echo "  FAIL: interval_from_raw → '$r' (expected '0 1000 10 61')"; fail=1; }
+
+  # MISSING EVIDENCE RENDERS na, NEVER 0 — each of these read as a fabricated calm if
+  # it returned 0, which is exactly how a reboot-reset counter becomes a false IDLE.
+  r="$(interval_from_raw "" 100 0 200000 0 1000 61000 2400)"
+  [ "$r" = "na na na na" ] || { echo "  FAIL: no baseline (first run) → '$r' (expected na — 0 would be a fabricated calm)"; fail=1; }
+  r="$(interval_from_raw "0 0 999999 0 0 0" 100 0 200000 0 1000 61000 2400)"
+  [ "$r" = "na na na na" ] || { echo "  FAIL: counter went BACKWARDS (reboot/reset) → '$r' (expected na)"; fail=1; }
+  r="$(interval_from_raw "0 0 0 0 0 0" 99999 0 200000 0 1000 61000 2400)"
+  [ "$r" = "na na na na" ] || { echo "  FAIL: stale baseline past max-age → '$r' (expected na — never average across an unobserved gap)"; fail=1; }
+  r="$(interval_from_raw "0 0 garbage 0 0 0" 100 0 200000 0 1000 61000 2400)"
+  [ "$r" = "na na na na" ] || { echo "  FAIL: garbage state field → '$r' (expected na)"; fail=1; }
+  r="$(interval_from_raw "100 0 0 0 0 0" 100 0 200000 0 1000 61000 2400)"
+  [ "$r" = "na na na na" ] || { echo "  FAIL: dt=0 → '$r' (expected na)"; fail=1; }
+
   # /proc/diskstats must be readable
   [ -r "$DISKSTATS" ] || { echo "smoke-test: FAIL ($DISKSTATS not readable)"; exit 1; }
 
@@ -194,6 +269,44 @@ if [ "${1:-}" = --test ]; then
   rm -rf "$_tl"
   [ -n "$_wkb" ] || { echo "smoke-test: FAIL (no write_kb_s in live --json: $_live)"; exit 1; }
   [ "$_wkb" -gt 100 ] || { echo "smoke-test: FAIL (write_kb_s=$_wkb under a sustained direct write — the throughput axis is dead, not idle)"; exit 1; }
+
+  # The pure functions above cannot prove the STATE ROUND-TRIP works — the interval
+  # window only exists if run N's counters actually reach run N+1. Drive two real runs
+  # in a sandboxed HOME and assert the coverage WIDENS: run 1 has no baseline
+  # (window=inst, util_iv=na), run 2 must read run 1's raw counters (window=inst+iv,
+  # util_iv numeric). A gate that only checked run 1 would pass with the carry deleted.
+  _tw="$(mktemp -d)"; mkdir -p "$_tw/.mesh"
+  _r1="$(HOME="$_tw" "$0" --json 2>/dev/null)"
+  _r2="$(HOME="$_tw" "$0" --json 2>/dev/null)"
+  _w1="$(printf '%s' "$_r1" | sed -n 's/.*"window":"\([a-z+]*\)".*/\1/p')"
+  _w2="$(printf '%s' "$_r2" | sed -n 's/.*"window":"\([a-z+]*\)".*/\1/p')"
+  _iv2="$(printf '%s' "$_r2" | sed -n 's/.*"util_iv":\([a-z0-9]*\).*/\1/p')"
+  _raw2="$(sed -n 's/.*|raw=\([0-9 ]*\)$/\1/p' "$_tw/.mesh/.diskio-state" 2>/dev/null | tail -1)"
+  rm -rf "$_tw"
+  [ "$_w1" = "inst" ] || { echo "smoke-test: FAIL (run 1 has no baseline but reported window=$_w1 — an interval was invented from nothing)"; exit 1; }
+  [ "$_w2" = "inst+iv" ] || { echo "smoke-test: FAIL (run 2 reported window=$_w2 — the accumulator is NOT carried across runs, coverage is still 1s/600s)"; exit 1; }
+  case "$_iv2" in ''|na) echo "smoke-test: FAIL (run 2 util_iv=$_iv2 — interval window did not produce a reading)"; exit 1;; esac
+  [ -n "$_raw2" ] || { echo "smoke-test: FAIL (state file carries no raw= counters — next run cannot compute an interval)"; exit 1; }
+
+  # Computing the interval is not CONSUMING it. Seed a baseline that makes the interval
+  # window unambiguously the loud one (10s ago, 9000 busy-ms behind → util_iv≈90) and
+  # assert the interval WINS the fold, is NAMED as the winner, and actually drives the
+  # published verdict. Without this the tool could compute a perfect interval, print it,
+  # and still classify off the 1s sample — a sub-axis is not the verdict.
+  _tf="$(mktemp -d)"; mkdir -p "$_tf/.mesh"
+  _live_ds="$(read_diskstats "$_disk")"
+  read -r _f_rs _f_ws _f_ri _f_wi _f_ms <<< "$_live_ds"
+  printf 'SEED|raw=%s %s %s %s %s %s\n' \
+    "$(( $(date +%s) - 10 ))" "$_f_rs" "$_f_ws" "$_f_ri" "$_f_wi" "$(( _f_ms > 9000 ? _f_ms - 9000 : 0 ))" \
+    > "$_tf/.mesh/.diskio-state"
+  _rf="$(HOME="$_tf" "$0" --json 2>/dev/null)"
+  rm -rf "$_tf"
+  _fwin="$(printf '%s' "$_rf" | sed -n 's/.*"util_win":"\([a-z]*\)".*/\1/p')"
+  _fpct="$(printf '%s' "$_rf" | sed -n 's/.*"util_pct":\([0-9]*\).*/\1/p')"
+  _fst="$(printf '%s' "$_rf"  | sed -n 's/.*"state":"\([A-Z]*\)".*/\1/p')"
+  [ "$_fwin" = iv ] || { echo "smoke-test: FAIL (seeded a ~90% interval but the fold named winner=$_fwin — the interval window loses to the 1s sample)"; exit 1; }
+  [ "${_fpct:-0}" -ge 70 ] 2>/dev/null || { echo "smoke-test: FAIL (interval won but util_pct=$_fpct — the published axis is not the fold's value)"; exit 1; }
+  [ "$_fst" = PRESSURED ] || { echo "smoke-test: FAIL (fused util=$_fpct but state=$_fst — the verdict does not ride on the fused axis)"; exit 1; }
 
   # The exit-2 branch must be a claim about the NODE, not a hiding place for our own
   # bugs. Drive the LIVE path with a stubbed df reporting a non-block-backed root and
@@ -238,6 +351,10 @@ now_read="$(read_diskstats "$ROOT_DISK")"
 now_epoch="$(date +%s)"
 read -r nr_sectors nw_sectors nr_ios nw_ios n_ms <<< "$now_read"
 
+# Read the PREVIOUS run's raw counters before anything overwrites the state file.
+# Absent (first run / pre-upgrade state line) => interval renders na, never 0.
+prev_raw="$(sed -n 's/.*|raw=\([0-9 ]*\)$/\1/p' "$STATE_FILE" 2>/dev/null | tail -1)"
+
 # --- Sample 2: wait 1s, snapshot again ---
 sleep 1
 later_read="$(read_diskstats "$ROOT_DISK")"
@@ -267,8 +384,28 @@ util=$(( (l_ms - n_ms) * 100 / (dt * 1000) ))
 # percentage of wall time, so cap it rather than emit a >100% impossibility.
 [ "$util" -gt 100 ] && util=100
 
-# --- Classify ---
-fused="$(classify "$read_kb" "$write_kb" "$iops" "$util")"
+# --- Interval window (across-run accumulator delta) ---
+# MAX_IV_AGE caps how stale a baseline may be: beyond it the reflex was down and the
+# "average" would span a gap we never observed. 4x the 600s cadence.
+MAX_IV_AGE="${MESH_DISKIO_MAX_IV_AGE:-2400}"
+read -r iv_read_kb iv_write_kb iv_iops iv_util <<< "$(
+  interval_from_raw "$prev_raw" "$later_epoch" "$lr_sectors" "$lw_sectors" "$lr_ios" "$lw_ios" "$l_ms" "$MAX_IV_AGE"
+)"
+
+# --- Fold: max that NAMES its winner ---
+read -r fused_util util_win <<< "$(fold_util "$util" "$iv_util")"
+if [ "$util_win" = iv ]; then
+  v_read_kb="$iv_read_kb"; v_write_kb="$iv_write_kb"; v_iops="$iv_iops"
+else
+  v_read_kb="$read_kb"; v_write_kb="$write_kb"; v_iops="$iops"
+fi
+# Publish the COVERAGE in the reading, so a consumer cannot mistake the narrow claim
+# for the wide one: window=inst+iv when both windows are real, window=inst when the
+# interval is unavailable (first run, reset counter, stale baseline).
+if [ "$iv_util" = na ]; then window="inst"; else window="inst+iv"; fi
+
+# --- Classify (rides on the FUSED util) ---
+fused="$(classify "$v_read_kb" "$v_write_kb" "$v_iops" "$fused_util")"
 state="${fused%%|*}"
 reason="${fused#*|}"
 
@@ -281,13 +418,19 @@ ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 # the lane reads as absent rather than dead. Written on EVERY successful eval (this
 # sense has no change-gate), which is also what puts `diskio` on the health pane —
 # mesh-dash's state_wall globs .[a-z]*-state.
-printf '%s|read_kb_s=%s|write_kb_s=%s|iops=%s|util_pct=%s|disk=%s|%s\n' \
-  "$state" "$read_kb" "$write_kb" "$iops" "$util" "$ROOT_DISK" "$ts" > "$STATE_FILE"
+# The trailing |raw= field carries the accumulator forward to the NEXT run — it is what
+# makes the interval window possible at all. Field order before it is unchanged, so
+# existing consumers (which read field 1 / the named keys) are untouched.
+printf '%s|read_kb_s=%s|write_kb_s=%s|iops=%s|util_pct=%s|window=%s|util_inst=%s|util_iv=%s|util_win=%s|disk=%s|%s|raw=%s %s %s %s %s %s\n' \
+  "$state" "$v_read_kb" "$v_write_kb" "$v_iops" "$fused_util" "$window" "$util" "$iv_util" "$util_win" "$ROOT_DISK" "$ts" \
+  "$later_epoch" "$lr_sectors" "$lw_sectors" "$lr_ios" "$lw_ios" "$l_ms" > "$STATE_FILE"
 mesh-state-touch "$STATE_FILE" 2>/dev/null || true
 
 if [ "${1:-}" = --json ]; then
-  printf '{"state":"%s","read_kb_s":%d,"write_kb_s":%d,"iops":%d,"util_pct":%d,"disk":"%s","ts":"%s"}\n' \
-    "$state" "$read_kb" "$write_kb" "$iops" "$util" "$ROOT_DISK" "$ts"
+  printf '{"state":"%s","read_kb_s":%d,"write_kb_s":%d,"iops":%d,"util_pct":%d,"window":"%s","util_inst":%d,"util_iv":%s,"util_win":"%s","disk":"%s","ts":"%s"}\n' \
+    "$state" "$v_read_kb" "$v_write_kb" "$v_iops" "$fused_util" "$window" "$util" \
+    "$([ "$iv_util" = na ] && echo null || echo "$iv_util")" "$util_win" "$ROOT_DISK" "$ts"
 else
-  printf '[diskio] %s — %s | disk=%s\n' "$state" "$reason" "$ROOT_DISK"
+  printf '[diskio] %s — %s | window=%s inst=%s%% iv=%s%% won=%s | disk=%s\n' \
+    "$state" "$reason" "$window" "$util" "$iv_util" "$util_win" "$ROOT_DISK"
 fi

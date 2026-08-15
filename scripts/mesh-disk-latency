@@ -97,10 +97,70 @@ if [ "${1:-}" = --test ]; then
   # Real read of /proc/diskstats
   [ -f /proc/diskstats ] || { echo "smoke-test: FAIL (no /proc/diskstats)"; exit 1; }
   ndevs=$(ls /sys/block/ 2>/dev/null | grep -cvE '^(loop|ram|dm-)' )
+
+  # --- COVERAGE gates (real path, sandboxed HOME so no live artifact is forged) ------
+  # The classifier above is pure and proves nothing about WHICH WINDOW feeds it. The
+  # since-boot mean cannot reach SLOW in under 10 hours of sustained stall on this node
+  # (see the two-window note at the live read path), so a tool that bands only on the
+  # cumulative is a sense that cannot alarm. These gates drive the real path.
+  _td="$(mktemp -d)"; mkdir -p "$_td/.mesh"
+
+  # (1) round-trip: run 1 has no baseline (window=cum — an interval must NOT be invented
+  #     from nothing), run 2 must pick up run 1's counters (window=cum+iv).
+  # The 1s gap is load-bearing: dt is whole seconds, and two runs inside the same second
+  # give dt=0, which correctly renders cum-only (no elapsed time, no interval). Live the
+  # gap is the 300s cadence; here it has to be made explicit or the gate reads its own
+  # zero-duration window as a missing carry.
+  _o1="$(HOME="$_td" "$0" 2>/dev/null)"
+  sleep 1.1
+  _o2="$(HOME="$_td" "$0" 2>/dev/null)"
+  case "$_o1" in *window=cum\ *) : ;; *) echo "smoke-test: FAIL (run 1 has no baseline but reported '${_o1#*window=}' — an interval was invented from nothing)"; rm -rf "$_td"; exit 1;; esac
+  case "$_o2" in *window=cum+iv*) : ;; *) echo "smoke-test: FAIL (run 2 did not widen to cum+iv — counters are not carried across runs, so the band still rides a since-boot mean that needs 10h of stall to move)"; rm -rf "$_td"; exit 1;; esac
+  grep -q '|raw=[0-9]' "$_td/.mesh/.disk-latency-state" || { echo "smoke-test: FAIL (state carries no raw= counters — next run cannot compute an interval)"; rm -rf "$_td"; exit 1; }
+
+  # (2) the interval must be CONSUMED, not merely computed. Seed a baseline 60s old whose
+  #     write counters are one IO and 60000ms behind the live ones → interval write await
+  #     ~60000ms, far past STALLED. If the band still reads off the cumulative mean, this
+  #     goes red: computing a perfect interval and classifying off the other window is
+  #     exactly the failure being fixed.
+  _dev="$(ls /sys/block/ 2>/dev/null | grep -vE '^(loop|ram)' | head -1)"
+  if [ -n "$_dev" ]; then
+    read -r _s_rc _s_rt _s_wc _s_wt <<< "$(awk -v d="$_dev" '$3==d{print $4,$7,$8,$11}' /proc/diskstats)"
+    printf 'SEED|raw=%s;%s:%s,%s,%s,%s\n' "$(( $(date +%s) - 60 ))" "$_dev" \
+      "$_s_rc" "$_s_rt" "$(( _s_wc > 1 ? _s_wc - 1 : 0 ))" "$(( _s_wt > 60000 ? _s_wt - 60000 : 0 ))" \
+      > "$_td/.mesh/.disk-latency-state"
+    _o3="$(HOME="$_td" "$0" 2>/dev/null)"
+    case "$_o3" in
+      *STALLED*won=iv*) : ;;
+      *) echo "smoke-test: FAIL (seeded a ~60000ms interval write-await on $_dev; expected STALLED won=iv, got: $_o3 — the verdict does not ride on the interval window)"; rm -rf "$_td"; exit 1;; esac
+  fi
+
+  # (3) MISSING EVIDENCE RENDERS na, NEVER a fabricated interval. A baseline whose
+  #     counters run AHEAD of the live ones means the accumulator reset (reboot); a
+  #     baseline older than max-age spans a gap we never observed. Both → cum only.
+  # The seed here is deliberate and was earned: an all-counters-AHEAD baseline is caught
+  # by the plain (delta > 0) check and so cannot prove the reset guard exists at all —
+  # the first version of this gate passed with the guard deleted. A TORN reset is the
+  # case only the guard catches: completed-count BEHIND (so the delta looks positive and
+  # valid) while ticks are AHEAD. Without the guard that device is counted as a live
+  # interval and the reading claims cum+iv coverage it does not have.
+  if [ -n "$_dev" ]; then
+    printf 'SEED|raw=%s;%s:%s,%s,%s,%s\n' "$(( $(date +%s) - 60 ))" "$_dev" \
+      "$(( _s_rc > 10 ? _s_rc - 10 : 0 ))" "$(( _s_rt + 60000 ))" \
+      "$(( _s_wc > 10 ? _s_wc - 10 : 0 ))" "$(( _s_wt + 60000 ))" \
+      > "$_td/.mesh/.disk-latency-state"
+    _o4="$(HOME="$_td" "$0" 2>/dev/null)"
+    case "$_o4" in *window=cum\ *) : ;; *) echo "smoke-test: FAIL (torn counter reset — counts behind, ticks ahead — but the window claimed '${_o4#*window=}'; a reset accumulator was counted as a live interval)"; rm -rf "$_td"; exit 1;; esac
+  fi
+  printf 'SEED|raw=%s;%s:1,1,1,1\n' "$(( $(date +%s) - 99999 ))" "${_dev:-sda}" > "$_td/.mesh/.disk-latency-state"
+  _o5="$(HOME="$_td" "$0" 2>/dev/null)"
+  case "$_o5" in *window=cum\ *) : ;; *) echo "smoke-test: FAIL (baseline far past max-age but window='${_o5#*window=}' — averaged across an unobserved gap)"; rm -rf "$_td"; exit 1;; esac
+  rm -rf "$_td"
+
   if [ "$ndevs" -lt 1 ]; then
     echo "smoke-test: WARN (no real block devices visible — container?)"
   else
-    echo "smoke-test: ok (classifier + $ndevs device(s) in /proc/diskstats)"
+    echo "smoke-test: ok (classifier + $ndevs device(s) + two-window coverage: round-trip, interval-consumed, reset/stale→cum)"
   fi
   exit 0
 fi
@@ -112,10 +172,25 @@ fi
 # (avoids the loop/nvme0n1p1/sda1 partition-filter headache — /sys/block/ is partitions-free).
 # For each whole-disk device, compute read_await_ms = read_ticks_ms / reads_completed, ditto write.
 # Track worst: STALLED > SLOW > NORMAL > FAST > UNKNOWN. Per-device 0 IOs → that device UNKNOWN.
-read -r worst_band worst_dev worst_side worst_ra worst_wa <<< "$(
+#
+# TWO WINDOWS. read_ticks/reads_completed straight from /proc/diskstats is the average
+# await SINCE BOOT — nominally 100% coverage, but the denominator only grows, so the
+# reading is diluted toward unreachable. Measured on this node 2026-08-15 (dm-0, 1.3d
+# uptime, 19.9M writes accumulated): a 90s window moves the cumulative mean by 0.035%,
+# and dragging it from 27.35ms to the SLOW threshold (100ms) would take 10.5 HOURS of
+# sustained 600ms-await storm; STALLED (500ms) would take 340 hours. Both alarm bands
+# are effectively unreachable, and they get MORE unreachable the longer the node stays
+# up — a sense that cannot alarm, reporting NORMAL forever, with a green --test and a
+# fresh mtime. The interval window (this run's counters minus last run's) is the one
+# that can actually move; the cumulative is kept because it is the long-run truth.
+# Fold with a max that NAMES its winner, so "won=cum" reads as a HISTORICAL alarm.
+prev_raw="$(sed -n 's/.*|raw=\(.*\)$/\1/p' "$STATE" 2>/dev/null | tail -1)"
+now_epoch="$(date +%s)"
+MAX_IV_AGE="${MESH_DISKLAT_MAX_IV_AGE:-1200}"   # 4x the 300s cadence
+read -r worst_band worst_dev worst_side worst_ra worst_wa worst_win window raw_out <<< "$(
   # Build the set of whole-disk device names from /sys/block (one per line, via ls)
   blk_list=$(ls /sys/block/ 2>/dev/null)
-  awk -v blk_list="$blk_list" '
+  awk -v blk_list="$blk_list" -v prev="$prev_raw" -v now_epoch="$now_epoch" -v maxage="$MAX_IV_AGE" '
     function band(ra, wa) {
       if (ra < 0 || wa < 0) return "UNKNOWN";
       if (ra >= 200 || wa >= 500) return "STALLED";
@@ -127,6 +202,28 @@ read -r worst_band worst_dev worst_side worst_ra worst_wa <<< "$(
     BEGIN {
       worst = "UNKNOWN"; worstp = 0; ndevs = 0
       nblk = split(blk_list, blk, " ")
+      # prev format: "<epoch>;dev:rc,rt,wc,wt;dev:rc,rt,wc,wt;..."
+      # A missing/garbage/stale baseline leaves have_prev=0 → the interval renders na,
+      # never 0: a reboot-reset counter read as 0 await is a fabricated calm.
+      have_prev = 0; dt = 0
+      if (prev != "") {
+        np = split(prev, pp, ";")
+        if (np >= 1 && pp[1] ~ /^[0-9]+$/) {
+          dt = now_epoch - (pp[1] + 0)
+          if (dt > 0 && dt <= maxage) {
+            have_prev = 1
+            for (i = 2; i <= np; i++) {
+              if (pp[i] == "") continue
+              c = index(pp[i], ":"); if (c == 0) continue
+              pdev = substr(pp[i], 1, c-1); pvals = substr(pp[i], c+1)
+              if (split(pvals, v, ",") == 4) {
+                prc[pdev] = v[1]+0; prt[pdev] = v[2]+0; pwc[pdev] = v[3]+0; pwt[pdev] = v[4]+0
+                pseen[pdev] = 1
+              }
+            }
+          }
+        }
+      }
     }
     function is_whole(name,    i) {
       for (i = 1; i <= nblk; i++) if (blk[i] == name) return 1
@@ -138,17 +235,38 @@ read -r worst_band worst_dev worst_side worst_ra worst_wa <<< "$(
       if (NF < 14) next
       rd_completed = $4 + 0; rd_ticks = $7 + 0
       wr_completed = $8 + 0; wr_ticks = $11 + 0
+      # carry this run"s counters forward for the NEXT run"s interval window
+      raw = raw ";" name ":" rd_completed "," rd_ticks "," wr_completed "," wr_ticks
       if (rd_completed + wr_completed == 0) {
-        b = "UNKNOWN"; ra = -1; wa = -1
+        b = "UNKNOWN"; ra = -1; wa = -1; win = "cum"
       } else {
-        ra = (rd_completed > 0) ? rd_ticks / rd_completed : -1
-        wa = (wr_completed > 0) ? wr_ticks / wr_completed : -1
+        # window 1: cumulative since boot (diluted, but the long-run truth)
+        ra_c = (rd_completed > 0) ? rd_ticks / rd_completed : -1
+        wa_c = (wr_completed > 0) ? wr_ticks / wr_completed : -1
+        # window 2: this interval only — the one that can actually move.
+        # Any counter going BACKWARDS means the accumulator reset (reboot / device
+        # re-enumeration): absence of evidence, so na — not 0.
+        ra_i = -1; wa_i = -1
+        if (have_prev && pseen[name] \
+            && rd_completed >= prc[name] && rd_ticks >= prt[name] \
+            && wr_completed >= pwc[name] && wr_ticks >= pwt[name]) {
+          drc = rd_completed - prc[name]; drt = rd_ticks - prt[name]
+          dwc = wr_completed - pwc[name]; dwt = wr_ticks - pwt[name]
+          if (drc > 0) ra_i = drt / drc
+          if (dwc > 0) wa_i = dwt / dwc
+          if (drc > 0 || dwc > 0) any_iv = 1
+        }
+        # fold: max per side, and NAME which window won (a max that hides its
+        # disjunction turns a historical alarm and a live one into the same sentence)
+        ra = ra_c; win_r = "cum"; if (ra_i > ra) { ra = ra_i; win_r = "iv" }
+        wa = wa_c; win_w = "cum"; if (wa_i > wa) { wa = wa_i; win_w = "iv" }
         b = band(ra, wa)
+        win = (win_r == "iv" || win_w == "iv") ? "iv" : "cum"
       }
       ndevs++
       if (prio(b) > worstp) {
         worstp = prio(b); worst = b; worst_name = name
-        worst_ra = ra; worst_wa = wa
+        worst_ra = ra; worst_wa = wa; worst_win = win
         if (b == "FAST") worst_side = "none"
         else if (b == "NORMAL" || b == "SLOW" || b == "STALLED") {
           if (ra >= 5 && ra >= wa) worst_side = "read"
@@ -158,8 +276,13 @@ read -r worst_band worst_dev worst_side worst_ra worst_wa <<< "$(
       }
     }
     END {
-      if (ndevs == 0) { print "UNKNOWN none n/a -1 -1"; exit }
-      printf "%s %s %s %.2f %.2f\n", worst, worst_name, worst_side, worst_ra, worst_wa
+      # window= publishes the COVERAGE in the reading, so a consumer cannot mistake the
+      # since-boot mean for a claim about now. cum+iv only when the interval actually
+      # produced a reading; a baseline that exists but saw zero IOs is still just cum.
+      wlabel = (have_prev && any_iv) ? "cum+iv" : "cum"
+      if (ndevs == 0) { print "UNKNOWN none n/a -1 -1 cum " wlabel " " now_epoch raw; exit }
+      printf "%s %s %s %.2f %.2f %s %s %s\n", worst, worst_name, worst_side, worst_ra, worst_wa, \
+        (worst_win == "" ? "cum" : worst_win), wlabel, now_epoch raw
     }
   ' /proc/diskstats 2>/dev/null
 )"
@@ -185,12 +308,13 @@ fi
 
 TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 # mtime = ran-live (always), content = value-changed (worst band)
-printf '%s|verdict=%s|dev=%s|side=%s|read_ms=%.2f|write_ms=%.2f|ndevs=%d|%s\n' "$label" "$label" "$dev" "$side" "$ra" "$wa" "$ndevs" "$TS" > "$STATE"
+printf '%s|verdict=%s|dev=%s|side=%s|read_ms=%.2f|write_ms=%.2f|window=%s|won=%s|ndevs=%d|%s|raw=%s\n' \
+  "$label" "$label" "$dev" "$side" "$ra" "$wa" "$window" "$worst_win" "$ndevs" "$TS" "$raw_out" > "$STATE"
 [ -x "$HOME/.local/bin/mesh-state-touch" ] && mesh-state-touch "$STATE" >/dev/null 2>&1 || true
 
 # Emit
 if [ "$label" = "UNKNOWN" ]; then
   echo "[disk-latency-unknown] UNKNOWN — $ndevs device(s), no I/O completed yet (dev=$dev)"
 else
-  echo "[disk-latency-$label] $label — dev=$dev side=$side read=${ra}ms write=${wa}ms (across $ndevs device(s))"
+  echo "[disk-latency-$label] $label — dev=$dev side=$side read=${ra}ms write=${wa}ms window=$window won=$worst_win (across $ndevs device(s))"
 fi
