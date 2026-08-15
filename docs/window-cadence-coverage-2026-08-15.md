@@ -185,8 +185,13 @@ Measured on this node: a `kworker/u32:*` read **1544%** in a 1 s window (kernel 
 workqueue threads lands in bursts) while its interval mean was ~100%. A plain max would hand that
 artifact the top spot every pass and the interval would be computed, published, and never consumed.
 The fold therefore lets the in-run window win only when it clears the interval by more than one
-tick's worth. (The burst itself is real in `/proc` and is left alone — it is a separate finding, not
-something to launder inside a coverage fix.)
+tick's worth. And the same *physical* rule now applies to both windows: a row claiming more CPU than
+the machine HAS (100% × nproc) is not a measurement. The interval ranking always dropped those; the
+in-run one published them — live at **cpu_inst=5776.7%** on a 16-core box, in the same state line as
+a 98.9% interval that called the identical shape impossible. One rule, both windows, and the drop is
+counted in `impossible_rows=` so "the artifact stopped appearing" can never be read as "nothing was
+dropped". The burst *below* that ceiling is real in `/proc` and is left alone — it is a separate
+finding, not something to launder inside a coverage fix.
 
 **4. Widening a gate has a direction, and it must be argued.** `mesh-fitness`'s PSI read is not a
 corroborator; it decides whether an **auto-revert** fires on a real commit, and it decides in the
@@ -208,14 +213,14 @@ Two smaller ones, both from watching mutants survive:
 
 ## Gates seen RED (this round)
 
-29 mutants, each run from a scratch copy against the real hardware.
+31 mutants, each run from a scratch copy against the real hardware.
 
 | tool | mutations watched fail |
 |---|---|
 | mesh-swap-rate | carry deleted · na→0 · fold ignores iv · verdict off inst · reset guard · stale guard (6) |
 | mesh-cstate | carry deleted · na→0 · fold ignores iv · verdict off inst · ncpu-hotplug guard · stale guard · both reset guards (7) |
 | mesh-package-power | carry deleted · na→0 · fold ignores iv · verdict off inst · stale guard · wrap-ambiguity · ceiling · cross-domain baseline (8) |
-| mesh-load-audit | snapshot carry deleted · iv table never consumed · fold always inst · unexplained-old-proc credited · impossible-row cap · dt/stale guards (6) |
+| mesh-load-audit | snapshot carry deleted · iv table never consumed · fold always inst · unexplained-old-proc credited · impossible-row cap (both windows) · iv percentage math · dt/stale guards (8) |
 | mesh-fitness | avg300 leg dropped · interval dropped · reset guard · stale guard · fold takes first not max · na can win · deferral silenced (7) |
 
 `mesh-wakeup-attrib` was touched as a consumer: it reads cstate's `_inst` fields on purpose, because
