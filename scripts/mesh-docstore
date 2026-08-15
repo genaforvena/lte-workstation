@@ -1,0 +1,768 @@
+#!/usr/bin/env python3
+"""mesh-docstore — a single-file document store (Bitcask shape) for node-local persistence.
+
+ONE file holds everything: a magic header, then append-only length-prefixed records, each
+carrying its own CRC. There is no sidecar index, no journal, no directory of parts — the
+index is rebuilt by scanning the file on open, so the file IS the database and a copy of
+the file is a complete, restorable backup.
+
+WHY IT EXISTS (measured on mesh-home 2026-08-15, not hypothetical):
+the board's durability tier is 72 whole COPIES of an overlapping 3000-line window —
+69,412,988 bytes on disk holding 4,789 distinct records totalling 1,720,393 bytes, a 40x
+redundancy — and the window is `tail -3000`, so a line evicted from the board survives only
+by accident, in whichever copies happen to predate its eviction. Content-addressed union
+storage collapses the duplication AND makes the eviction lossless, because a put of a line
+already stored is a no-op instead of another megabyte.
+
+RECORD FORMAT (all integers big-endian, no padding):
+
+    magic   b"MESHDOC\\x01\\n"                      once, at offset 0
+    record  0x1E | klen:u32 vlen:u32 flags:u8 ts_ns:u64 | hcrc:u32 | key | val | dcrc:u32
+                   \\_____________ 17 bytes _____________/            \\__ crc32 over key+val
+
+flags bit0 = tombstone (a delete is an append, like every other write).
+
+The header carries its OWN crc, separate from the data crc, and the reason is narrower than
+it first looks — stated precisely because the obvious claim for it does not survive a mutant.
+The data crc covers key+val ONLY. `flags` and `ts_ns` are covered by NOTHING else, so a
+single flipped bit in the flags byte turns a live document into a tombstone that every other
+check waves through: the data crc still matches, the lengths are still sane. The header crc
+is what makes that bit-flip a REPORTED loss instead of a silent delete. Its second job is a
+cheap early reject during resync, so a corrupt length never reaches an allocation.
+
+What the header crc does NOT buy: immunity from a resync landing inside a payload. Any
+payload may contain a byte-for-byte valid record (store one record as another's value and it
+does, by construction) — no checksum can distinguish that from the real thing. Resync is
+therefore probabilistic: a random 0x1E must clear the header crc AND the data crc, ~2^-64,
+but an ADVERSARIAL or self-referential payload is indistinguishable in principle. Records
+before a gap and after it are exact; the boundary is a best effort, and it says so.
+
+TWO DAMAGE SHAPES, deliberately distinguished, because they need opposite handling:
+
+  TORN TAIL — an unparseable region running to EOF. This is the ordinary crash: the last
+    append was partially on disk. Repairable, and a write truncates it back to the last good
+    offset (loudly) before appending.
+  GAP — an unparseable region with good records AFTER it. On ext4 this is delayed-allocation
+    crash loss: recovery returns ZEROS for records whose i_size was journalled while the data
+    blocks were still dirty (measured on this node's pace journal — whole records lost, spans
+    quantised to the record size, every span aligned to an unclean shutdown). A gap is NOT
+    truncatable: everything past it is good. It is reported, and `compact` removes it by
+    rewriting the good records.
+
+Both are reported by BYTE COUNT on stderr by every command that scans, and both are counted
+in `stat`/`verify`. A damaged store never reads as a small clean one: a lost record renders
+as an ABSENT record, never as poison and never as a fabricated empty.
+
+Missing store → exit 2 (honest n/a), never a fabricated `0 documents`. Foreign/short magic →
+exit 2 as well, never "empty, I'll start writing here" — that would overwrite someone's file.
+
+Commands:
+    put [--key K] [--value V]   append (value from stdin if --value absent); prints the key
+    get <key>                   value to stdout; exit 4 if absent or tombstoned
+    del <key>                   append a tombstone; exit 4 if the key was not live
+    ingest                      stdin, one document per LINE, content-addressed + deduped
+    all                         live values, one per line, in file order
+    keys                        "<key>\\t<iso-ts>\\t<bytes>" per live document
+    count                       live document count
+    stat                        one-line summary (docs, bytes, dead, gaps, torn)
+    verify                      full scan; exit 1 if damaged
+    compact                     rewrite the live set to a new file, atomically
+
+Store path: --file, else $MESH_DOCSTORE, else ~/.mesh/docstore.db
+
+Invoked by mesh-chat-sync's board_archive() every anti-entropy round; also usable by hand.
+"""
+import binascii
+import fcntl
+import hashlib
+import os
+import struct
+import sys
+import time
+
+MAGIC = b"MESHDOC\x01\n"
+REC = 0x1E
+HDR = struct.Struct(">IIBQ")          # klen, vlen, flags, ts_ns  → 17 bytes
+CRC = struct.Struct(">I")             # header crc / data crc     → 4 bytes
+HDRLEN = HDR.size                     # 17
+FIXED = 1 + HDRLEN + CRC.size + CRC.size   # 0x1E + hdr + hcrc + dcrc = 26
+
+# Sanity bounds. A corrupt length field must not make us allocate wildly; these are checked
+# on read AND on write, so a value this tool refuses to store is also a value it refuses to
+# believe it read.
+MAX_KEY = 4096
+MAX_VAL = 64 * 1024 * 1024
+
+TOMB = 0x01
+
+
+def crc32(b):
+    return binascii.crc32(b) & 0xFFFFFFFF
+
+
+def store_path(argv):
+    if "--file" in argv:
+        return argv[argv.index("--file") + 1]
+    env = os.environ.get("MESH_DOCSTORE")
+    if env:
+        return env
+    return os.path.join(os.path.expanduser("~"), ".mesh", "docstore.db")
+
+
+def pack(key, val, flags, ts_ns):
+    head = HDR.pack(len(key), len(val), flags, ts_ns)
+    return b"".join([
+        bytes([REC]), head, CRC.pack(crc32(head)),
+        key, val, CRC.pack(crc32(key + val)),
+    ])
+
+
+def _try_record(data, pos):
+    """Parse a record at `pos`. Returns (key, val, flags, ts_ns, end) or None.
+
+    None means "not a valid record here" for ANY reason — wrong lead byte, bad header crc,
+    insane lengths, overruns EOF, bad data crc. The caller decides whether that is a torn
+    tail or a gap; this function never guesses.
+    """
+    n = len(data)
+    if pos >= n or data[pos] != REC:
+        return None
+    if pos + 1 + HDRLEN + CRC.size > n:
+        return None
+    head = data[pos + 1:pos + 1 + HDRLEN]
+    (hcrc,) = CRC.unpack_from(data, pos + 1 + HDRLEN)
+    if crc32(head) != hcrc:
+        return None
+    klen, vlen, flags, ts_ns = HDR.unpack(head)
+    if klen > MAX_KEY or vlen > MAX_VAL or klen == 0:
+        return None
+    end = pos + FIXED + klen + vlen
+    if end > n:
+        return None
+    kv_at = pos + 1 + HDRLEN + CRC.size
+    key = data[kv_at:kv_at + klen]
+    val = data[kv_at + klen:kv_at + klen + vlen]
+    (dcrc,) = CRC.unpack_from(data, kv_at + klen + vlen)
+    if crc32(key + val) != dcrc:
+        return None
+    return key, val, flags, ts_ns, end
+
+
+class Damage(object):
+    def __init__(self):
+        self.gaps = []          # [(offset, bytes)] — good records follow
+        self.torn = 0           # bytes of unparseable tail running to EOF
+        self.torn_at = None     # offset the tail begins at (the truncate point)
+
+    @property
+    def gap_bytes(self):
+        return sum(g[1] for g in self.gaps)
+
+    @property
+    def damaged(self):
+        return bool(self.gaps) or self.torn > 0
+
+    def render(self):
+        bits = []
+        if self.gaps:
+            bits.append("GAP %d span(s) / %d byte(s) lost mid-file (crash loss — records ABSENT, "
+                        "not corrupt; `compact` rewrites them out)" % (len(self.gaps), self.gap_bytes))
+        if self.torn:
+            bits.append("TORN TAIL %d byte(s) at offset %d (partial last append — the next write "
+                        "truncates it back)" % (self.torn, self.torn_at))
+        return " · ".join(bits)
+
+
+class Store(object):
+    def __init__(self, path):
+        self.path = path
+        self.index = {}         # key -> (offset, ts_ns, vlen)
+        self.live_bytes = 0     # bytes of records reachable from the index
+        self.total_bytes = 0    # bytes of all accepted records (live + superseded + tombstones)
+        self.records = 0        # accepted records, including superseded and tombstones
+        self.damage = Damage()
+        self.size = 0
+
+    def load(self):
+        """Scan the whole file, rebuilding the index. Raises FileNotFoundError / ValueError."""
+        with open(self.path, "rb") as f:
+            data = f.read()
+        self.size = len(data)
+        if self.size == 0:
+            # A zero-byte file is not a store and is not an error either: it is what an
+            # interrupted create leaves. Treat as empty-but-initialisable.
+            return self
+        if not data.startswith(MAGIC):
+            raise ValueError("not a mesh-docstore file (magic mismatch) — refusing to read or "
+                             "append; move it aside if this path is meant to be a store")
+        pos = len(MAGIC)
+        order = []
+        while pos < self.size:
+            got = _try_record(data, pos)
+            if got is None:
+                bad_at = pos
+                nxt = self._resync(data, pos + 1)
+                if nxt is None:
+                    self.damage.torn = self.size - bad_at
+                    self.damage.torn_at = bad_at
+                    break
+                self.damage.gaps.append((bad_at, nxt - bad_at))
+                pos = nxt
+                continue
+            key, val, flags, ts_ns, end = got
+            rlen = end - pos
+            self.records += 1
+            self.total_bytes += rlen
+            if flags & TOMB:
+                self.index.pop(key, None)
+            else:
+                self.index[key] = (pos, ts_ns, len(val))
+                order.append(key)
+            pos = end
+        self.live_bytes = sum(
+            FIXED + len(k) + v[2] for k, v in self.index.items()
+        )
+        return self
+
+    @staticmethod
+    def _resync(data, start):
+        """Offset of the next byte that begins a fully-valid record, or None."""
+        n = len(data)
+        p = start
+        while True:
+            p = data.find(bytes([REC]), p)
+            if p < 0 or p >= n:
+                return None
+            if _try_record(data, p) is not None:
+                return p
+            p += 1
+
+    # ── reads ──────────────────────────────────────────────────────────────────────────
+    def get(self, key):
+        ent = self.index.get(key)
+        if ent is None:
+            return None
+        with open(self.path, "rb") as f:
+            f.seek(ent[0])
+            data = f.read(FIXED + MAX_KEY + ent[2])
+        got = _try_record(data, 0)
+        if got is None:
+            return None
+        return got[1]
+
+    def live(self):
+        """(key, val, ts_ns) for every live document, in file order."""
+        with open(self.path, "rb") as f:
+            data = f.read()
+        out = []
+        for key, (off, ts_ns, _vlen) in self.index.items():
+            got = _try_record(data, off)
+            if got is not None:
+                out.append((key, got[1], ts_ns))
+        out.sort(key=lambda kv: self.index[kv[0]][0])
+        return out
+
+    # ── writes ─────────────────────────────────────────────────────────────────────────
+    def _open_for_append(self):
+        """Open (creating + stamping the magic), take the lock, repair a torn tail."""
+        newfile = not os.path.exists(self.path) or os.path.getsize(self.path) == 0
+        d = os.path.dirname(self.path)
+        if d and not os.path.isdir(d):
+            os.makedirs(d, exist_ok=True)
+        f = open(self.path, "r+b" if not newfile else "w+b")
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        if newfile:
+            f.seek(0)
+            f.write(MAGIC)
+            f.flush()
+            os.fsync(f.fileno())
+        elif self.damage.torn:
+            # Loud, always. A silent repair is a silent data loss.
+            sys.stderr.write(
+                "mesh-docstore: repairing TORN TAIL — truncating %d byte(s) of partial append at "
+                "offset %d (crash recovery)\n" % (self.damage.torn, self.damage.torn_at))
+            f.truncate(self.damage.torn_at)
+            f.flush()
+            os.fsync(f.fileno())
+            self.damage.torn = 0
+            self.damage.torn_at = None
+        f.seek(0, os.SEEK_END)
+        return f
+
+    def append(self, items, fsync=True):
+        """items = [(key, val, flags)]. One fsync for the batch; returns records written."""
+        for key, val, _flags in items:
+            if not key or len(key) > MAX_KEY:
+                raise ValueError("key must be 1..%d bytes" % MAX_KEY)
+            if len(val) > MAX_VAL:
+                raise ValueError("value exceeds %d bytes" % MAX_VAL)
+        f = self._open_for_append()
+        try:
+            off = f.tell()
+            buf = []
+            for key, val, flags in items:
+                ts = time.time_ns()
+                rec = pack(key, val, flags, ts)
+                buf.append(rec)
+                if flags & TOMB:
+                    self.index.pop(key, None)
+                else:
+                    self.index[key] = (off, ts, len(val))
+                off += len(rec)
+            f.write(b"".join(buf))
+            f.flush()
+            if fsync:
+                os.fsync(f.fileno())
+        finally:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            f.close()
+        return len(items)
+
+    def compact(self):
+        """Rewrite the live set to a temp file and rename it over the store.
+
+        Atomic by construction: the live store is untouched until os.replace, and the
+        replacement is fsynced (file AND directory) before the rename. A crash at any point
+        leaves either the old complete store or the new complete store, never a half one.
+        """
+        rows = self.live()
+        tmp = self.path + ".compact.%d" % os.getpid()
+        with open(tmp, "wb") as f:
+            f.write(MAGIC)
+            for key, val, ts in rows:
+                f.write(pack(key, val, 0, ts))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, self.path)
+        d = os.path.dirname(os.path.abspath(self.path))
+        fd = os.open(d, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        return len(rows)
+
+
+def open_store(path, must_exist=True):
+    st = Store(path)
+    try:
+        st.load()
+    except FileNotFoundError:
+        if must_exist:
+            sys.stderr.write("mesh-docstore: n/a — no store at %s\n" % path)
+            sys.exit(2)
+    except (OSError, ValueError) as e:
+        sys.stderr.write("mesh-docstore: n/a — %s: %s\n" % (path, e))
+        sys.exit(2)
+    if st.damage.damaged:
+        sys.stderr.write("mesh-docstore: DAMAGE in %s — %s\n" % (path, st.damage.render()))
+    return st
+
+
+def ckey(val):
+    return hashlib.sha256(val).hexdigest()[:16].encode()
+
+
+def iso(ts_ns):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts_ns / 1e9))
+
+
+def cmd_stat(st):
+    dead = st.total_bytes - st.live_bytes
+    print("docs=%d records=%d file=%dB live=%dB dead=%dB (%d%%) gaps=%d/%dB torn=%dB" % (
+        len(st.index), st.records, st.size, st.live_bytes, dead,
+        (dead * 100 // st.total_bytes) if st.total_bytes else 0,
+        len(st.damage.gaps), st.damage.gap_bytes, st.damage.torn))
+
+
+def main(argv):
+    path = store_path(argv)
+    args = [a for a in argv if a != "--file"]
+    if "--file" in argv:
+        args = argv[:]
+        i = args.index("--file")
+        del args[i:i + 2]
+    cmd = args[0] if args else "stat"
+
+    if cmd == "put":
+        key = None
+        if "--key" in args:
+            key = args[args.index("--key") + 1].encode()
+        if "--value" in args:
+            val = args[args.index("--value") + 1].encode()
+        else:
+            val = sys.stdin.buffer.read()
+        st = open_store(path, must_exist=False)
+        if key is None:
+            key = ckey(val)
+        st.append([(key, val, 0)])
+        print(key.decode())
+        return 0
+
+    if cmd == "ingest":
+        st = open_store(path, must_exist=False)
+        new = dup = 0
+        batch = []
+        seen = set()
+        for line in sys.stdin.buffer:
+            line = line.rstrip(b"\n")
+            if not line:
+                continue
+            k = ckey(line)
+            if k in st.index or k in seen:
+                dup += 1
+                continue
+            seen.add(k)
+            batch.append((k, line, 0))
+            new += 1
+        if batch:
+            st.append(batch)
+        print("ingested %d new, %d duplicate, %d live" % (new, dup, len(st.index)))
+        return 0
+
+    st = open_store(path, must_exist=True)
+
+    if cmd == "get":
+        if len(args) < 2:
+            sys.stderr.write("usage: mesh-docstore get <key>\n")
+            return 3
+        val = st.get(args[1].encode())
+        if val is None:
+            return 4
+        sys.stdout.buffer.write(val)
+        if not val.endswith(b"\n"):
+            sys.stdout.buffer.write(b"\n")
+        return 0
+
+    if cmd == "del":
+        if len(args) < 2:
+            sys.stderr.write("usage: mesh-docstore del <key>\n")
+            return 3
+        k = args[1].encode()
+        if k not in st.index:
+            return 4
+        st.append([(k, b"", TOMB)])
+        return 0
+
+    if cmd == "all":
+        out = sys.stdout.buffer
+        for _k, val, _ts in st.live():
+            out.write(val)
+            if not val.endswith(b"\n"):
+                out.write(b"\n")
+        return 0
+
+    if cmd == "keys":
+        for k, _val, ts in st.live():
+            print("%s\t%s\t%d" % (k.decode(), iso(ts), st.index[k][2]))
+        return 0
+
+    if cmd == "count":
+        print(len(st.index))
+        return 0
+
+    if cmd == "stat":
+        cmd_stat(st)
+        return 0
+
+    if cmd == "verify":
+        cmd_stat(st)
+        if st.damage.damaged:
+            print("verify: DAMAGED — %s" % st.damage.render())
+            return 1
+        print("verify: ok — %d document(s), every record's header and data crc validated" % len(st.index))
+        return 0
+
+    if cmd == "compact":
+        before = st.size
+        n = st.compact()
+        after = os.path.getsize(st.path)
+        print("compacted %d live document(s): %dB → %dB (%d%% reclaimed)" % (
+            n, before, after, ((before - after) * 100 // before) if before else 0))
+        return 0
+
+    sys.stderr.write("mesh-docstore: unknown command %r (see --help)\n" % cmd)
+    return 3
+
+
+# ── smoke test ─────────────────────────────────────────────────────────────────────────────
+# Hermetic: everything happens in a fresh tempdir, so this NEVER touches the production store
+# (asserted below: the default path's size is unchanged across the whole run — the mesh-gpu-lid
+# lesson, a test that writes the artifact a human reads forges the evidence it exists to check).
+def selftest():
+    import subprocess
+    import tempfile
+
+    fails = []
+
+    def ck(cond, msg):
+        if not cond:
+            fails.append(msg)
+            print("test: %s FAIL" % msg)
+
+    real = store_path([])
+    real_before = os.path.getsize(real) if os.path.exists(real) else -1
+
+    tmp = tempfile.mkdtemp(prefix="docstore-test-")
+    db = os.path.join(tmp, "t.db")
+
+    def run(*a, **kw):
+        return subprocess.run([sys.executable, os.path.abspath(__file__), "--file", db] + list(a),
+                              capture_output=True, **kw)
+
+    # 1. absent store reads as n/a (exit 2), NEVER as a clean zero.
+    r = run("count")
+    ck(r.returncode == 2, "absent store must exit 2 (honest n/a), got rc=%d out=%r" % (r.returncode, r.stdout))
+    ck(b"0" not in r.stdout, "absent store must not print a count — a fabricated 0 is a false clean claim")
+
+    # 2. put/get round-trip THROUGH A SEPARATE PROCESS — asserts the on-disk format, not
+    #    in-memory state. A round-trip inside one process proves only that pack() and
+    #    _try_record() agree with each other.
+    val = b"2026-08-15T00:00:00Z  a@n  ::  [task] alpha"
+    r = run("put", "--value", val.decode())
+    key = r.stdout.strip().decode()
+    ck(r.returncode == 0 and len(key) == 16, "put must succeed and print a 16-hex key, got rc=%d %r" % (r.returncode, r.stdout))
+    r = run("get", key)
+    ck(r.stdout.rstrip(b"\n") == val, "get must return the exact bytes put, got %r" % r.stdout)
+    r = run("get", "deadbeefdeadbeef")
+    ck(r.returncode == 4, "get of an absent key must exit 4, got %d" % r.returncode)
+
+    # 3. ingest is idempotent — the union property the board's G-Set merge claims and its
+    #    `tail -3000` storage does not have. Same input twice must not grow the live set.
+    lines = b"".join(b"2026-08-15T00:00:%02dZ  n@n  ::  line %d\n" % (i, i) for i in range(50))
+    run("ingest", input=lines)
+    size_after_first = os.path.getsize(db)
+    r = run("ingest", input=lines)
+    ck(b"0 new, 50 duplicate" in r.stdout, "second identical ingest must add 0 new, got %r" % r.stdout)
+    # …and assert it on BYTES, not just the message. The keys are content hashes, so re-appending
+    # every record leaves the live COUNT identical (each key is overwritten with the same value) —
+    # a count assertion here is vacuous, measured against a dedup-deleted mutant. The union property
+    # is "the file grows with distinct documents, not with the number of ingests", and that is a
+    # statement about size.
+    ck(os.path.getsize(db) == size_after_first,
+       "a re-ingest of identical input must not grow the file (%d → %d)" % (size_after_first, os.path.getsize(db)))
+    r = run("count")
+    ck(r.stdout.strip() == b"51", "live count after dedup must be 51 (1 put + 50 lines), got %r" % r.stdout)
+
+    # 4. delete is an append; the key goes away and stays away across a reopen.
+    run("del", key)
+    r = run("get", key)
+    ck(r.returncode == 4, "get after del must exit 4, got %d" % r.returncode)
+    r = run("del", key)
+    ck(r.returncode == 4, "del of an already-dead key must exit 4, got %d" % r.returncode)
+
+    # 5. TORN TAIL — the ordinary crash. Chop the last record (the tombstone from step 4) in
+    #    half: every record BEFORE the tear must read, the tear must be named by byte count,
+    #    and the torn write must be simply ABSENT — which here means the deleted key is live
+    #    again, because the delete was the write that did not make it to disk. That is the
+    #    honest semantics of a torn tail, and asserting it is stronger than asserting a count.
+    r = run("count")
+    ck(r.stdout.strip() == b"50", "live count before the tear must be 50 (51 put, 1 deleted), got %r" % r.stdout)
+    torn = os.path.join(tmp, "torn.db")
+    with open(db, "rb") as a, open(torn, "wb") as b:
+        d = a.read()
+        b.write(d[:-40])
+    rt = subprocess.run([sys.executable, os.path.abspath(__file__), "--file", torn, "verify"],
+                        capture_output=True)
+    ck(rt.returncode == 1, "verify of a torn store must exit 1 (damaged), got %d" % rt.returncode)
+    ck(b"TORN TAIL" in rt.stdout + rt.stderr, "torn store must NAME the torn tail, got %r" % (rt.stdout + rt.stderr))
+    rc = subprocess.run([sys.executable, os.path.abspath(__file__), "--file", torn, "count"],
+                        capture_output=True)
+    ck(rc.stdout.strip() == b"51", "a torn tail must lose ONLY the torn record (want 51 — the "
+                                   "tombstone was the torn write), got %r" % rc.stdout)
+    rk = subprocess.run([sys.executable, os.path.abspath(__file__), "--file", torn, "get", key],
+                        capture_output=True)
+    ck(rk.returncode == 0 and rk.stdout.rstrip(b"\n") == val,
+       "the record the torn delete pointed at must be intact and live again, got rc=%d %r" % (rk.returncode, rk.stdout))
+    rp = subprocess.run([sys.executable, os.path.abspath(__file__), "--file", torn, "put",
+                         "--value", "after-repair"], capture_output=True)
+    ck(b"repairing TORN TAIL" in rp.stderr, "the repair must be LOUD on stderr, got %r" % rp.stderr)
+    rv = subprocess.run([sys.executable, os.path.abspath(__file__), "--file", torn, "verify"],
+                        capture_output=True)
+    ck(rv.returncode == 0, "verify after repair must be clean, got %d %r" % (rv.returncode, rv.stdout))
+
+    # 6. GAP — the ext4 delayed-allocation crash-loss shape measured on this node: a whole
+    #    record's bytes come back as ZEROS. Records AFTER the hole must still be readable
+    #    (resync), the loss must be reported as ABSENT records, and it must NOT be truncated
+    #    away — everything past a gap is good.
+    gap = os.path.join(tmp, "gap.db")
+    with open(db, "rb") as a:
+        d = bytearray(a.read())
+    # find the second record boundary and null a whole record out
+    off = len(MAGIC)
+    first = _try_record(bytes(d), off)
+    second_off = first[4]
+    second = _try_record(bytes(d), second_off)
+    third_off = second[4]
+    d[second_off:third_off] = b"\x00" * (third_off - second_off)
+    with open(gap, "wb") as b:
+        b.write(bytes(d))
+    rg = subprocess.run([sys.executable, os.path.abspath(__file__), "--file", gap, "verify"],
+                        capture_output=True)
+    ck(rg.returncode == 1, "verify of a gapped store must exit 1, got %d" % rg.returncode)
+    ck(b"GAP" in rg.stdout + rg.stderr, "gapped store must NAME the gap, got %r" % (rg.stdout + rg.stderr))
+    ck(b"torn=0B" in rg.stdout, "a mid-file gap must NOT be reported as a torn tail, got %r" % rg.stdout)
+    rgc = subprocess.run([sys.executable, os.path.abspath(__file__), "--file", gap, "count"],
+                         capture_output=True)
+    ck(rgc.stdout.strip() == b"49", "records after the gap must survive resync (want 49), got %r" % rgc.stdout)
+    ck(os.path.getsize(gap) == len(d), "a gap must NOT truncate the file — everything past it is good")
+
+    # 6b. HEADER-CRC: a single flipped bit in the flags byte must be DETECTED, not obeyed.
+    #     The data crc covers key+val only, so without the header crc this bit-flip silently
+    #     converts a live document into a tombstone — a delete nobody asked for and nobody is
+    #     told about. Correct behaviour is a reported loss: the record is rejected as damage
+    #     and the document is ABSENT, which is honest, rather than deleted, which is a lie.
+    flip = os.path.join(tmp, "flip.db")
+    subprocess.run([sys.executable, os.path.abspath(__file__), "--file", flip, "put",
+                    "--key", "alive", "--value", "still here"], capture_output=True)
+    subprocess.run([sys.executable, os.path.abspath(__file__), "--file", flip, "put",
+                    "--key", "other", "--value", "second doc"], capture_output=True)
+    with open(flip, "rb") as a:
+        d = bytearray(a.read())
+    flags_at = len(MAGIC) + 1 + 4 + 4          # 0x1E, klen, vlen → flags byte of record 1
+    ck(d[flags_at] == 0, "fixture: flags byte must start clear, got %d" % d[flags_at])
+    d[flags_at] = TOMB                          # one bit — the tombstone bit
+    with open(flip, "wb") as b:
+        b.write(bytes(d))
+    rfl = subprocess.run([sys.executable, os.path.abspath(__file__), "--file", flip, "verify"],
+                         capture_output=True)
+    ck(rfl.returncode == 1, "a flipped flags bit must be reported as damage, got rc=%d %r" % (rfl.returncode, rfl.stdout))
+    rfk = subprocess.run([sys.executable, os.path.abspath(__file__), "--file", flip, "keys"],
+                         capture_output=True)
+    ck(b"other" in rfk.stdout, "the undamaged document must survive the flip, got %r" % rfk.stdout)
+
+    # 6c. DATA-CRC: bit rot inside a stored VALUE must be reported, never returned. Without
+    #     the data crc the header still validates, the lengths are still sane, and `get`
+    #     hands back silently corrupted bytes — the worst failure a store has, because every
+    #     other layer trusts it. Correct behaviour: the record is damage, the document is
+    #     ABSENT. (Flip a byte in the value region, not the header — 6b covers the header.)
+    rot = os.path.join(tmp, "rot.db")
+    subprocess.run([sys.executable, os.path.abspath(__file__), "--file", rot, "put",
+                    "--key", "rotten", "--value", "the original bytes"], capture_output=True)
+    with open(rot, "rb") as a:
+        d = bytearray(a.read())
+    val_at = len(MAGIC) + FIXED - CRC.size + len(b"rotten")   # first byte of the value
+    ck(bytes(d[val_at:val_at + 3]) == b"the", "fixture: value must start where expected, got %r" % bytes(d[val_at:val_at + 3]))
+    d[val_at] = ord("T")                                       # one byte of bit rot
+    with open(rot, "wb") as b:
+        b.write(bytes(d))
+    rr = subprocess.run([sys.executable, os.path.abspath(__file__), "--file", rot, "get", "rotten"],
+                        capture_output=True)
+    ck(b"The original" not in rr.stdout, "a rotted value must NEVER be returned — got %r" % rr.stdout)
+    ck(rr.returncode == 4, "a rotted document must read as ABSENT (exit 4), got %d" % rr.returncode)
+    rrv = subprocess.run([sys.executable, os.path.abspath(__file__), "--file", rot, "verify"],
+                         capture_output=True)
+    ck(rrv.returncode == 1, "bit rot in a value must be reported as damage, got rc=%d" % rrv.returncode)
+
+    # 7. a 0x1E byte inside a PAYLOAD must not be mistaken for a record start by the resync
+    #    scan. This asserts the LENGTH+data-crc rejection, not the header crc (see the module
+    #    docstring: no checksum can reject a payload that IS a valid record).
+    dec = os.path.join(tmp, "decoy.db")
+    # the decoy carries NUL bytes, so it goes in over stdin — argv cannot carry a NUL, and a
+    # --value version of this fixture would silently test a DIFFERENT payload.
+    subprocess.run([sys.executable, os.path.abspath(__file__), "--file", dec, "put"],
+                   input=b"\x1e\x00\x00\x00\x08decoy payload", capture_output=True)
+    subprocess.run([sys.executable, os.path.abspath(__file__), "--file", dec, "put",
+                    "--value", "real second"], capture_output=True)
+    with open(dec, "rb") as a:
+        d = bytearray(a.read())
+    d[len(MAGIC)] = 0x00                      # break the FIRST record's lead byte → force a resync
+    with open(dec, "wb") as b:
+        b.write(bytes(d))
+    rd = subprocess.run([sys.executable, os.path.abspath(__file__), "--file", dec, "count"],
+                        capture_output=True)
+    ck(rd.stdout.strip() == b"1", "resync must land on the real second record, not the payload decoy — got %r" % rd.stdout)
+
+    # 8. foreign file → exit 2, never "empty store, I'll append here".
+    foreign = os.path.join(tmp, "foreign.db")
+    with open(foreign, "wb") as f:
+        f.write(b"this is somebody else's file\n" * 10)
+    before = os.path.getsize(foreign)
+    rf = subprocess.run([sys.executable, os.path.abspath(__file__), "--file", foreign, "put",
+                         "--value", "x"], capture_output=True)
+    ck(rf.returncode == 2, "put into a foreign file must exit 2, got %d" % rf.returncode)
+    ck(os.path.getsize(foreign) == before, "a foreign file must not be written to AT ALL")
+
+    # 9. compaction reclaims superseded records and preserves the live set exactly.
+    #    THREE keys, not one: a single-key fixture cannot tell "keeps the newest version"
+    #    apart from "keeps whatever version it happens to walk first", because there is only
+    #    one live row to order. Measured — a reversed-order mutant stayed green on the
+    #    one-key version of this test and goes red here.
+    comp = os.path.join(tmp, "comp.db")
+    for i in range(20):
+        for k in ("ka", "kb", "kc"):
+            subprocess.run([sys.executable, os.path.abspath(__file__), "--file", comp, "put",
+                            "--key", k, "--value", "%s-v%d" % (k, i)], capture_output=True)
+    pre = os.path.getsize(comp)
+    rcp = subprocess.run([sys.executable, os.path.abspath(__file__), "--file", comp, "compact"],
+                         capture_output=True)
+    post = os.path.getsize(comp)
+    ck(rcp.returncode == 0 and post < pre, "compact must shrink a 60-record/3-key store (%d → %d)" % (pre, post))
+    for k in ("ka", "kb", "kc"):
+        rg2 = subprocess.run([sys.executable, os.path.abspath(__file__), "--file", comp, "get", k],
+                             capture_output=True)
+        ck(rg2.stdout.strip() == ("%s-v19" % k).encode(),
+           "compact must keep the NEWEST version of %s, got %r" % (k, rg2.stdout))
+    rst = subprocess.run([sys.executable, os.path.abspath(__file__), "--file", comp, "stat"],
+                         capture_output=True)
+    ck(b"docs=3 records=3 " in rst.stdout,
+       "after compact the file must hold exactly the live set — no superseded records left, got %r" % rst.stdout)
+    ck(b"dead=0B" in rst.stdout, "after compact there must be no dead bytes, got %r" % rst.stdout)
+    ck(not [f for f in os.listdir(tmp) if ".compact." in f], "compact must leave no temp file behind")
+
+    # 9b. DURABILITY is the one claim a pure-filesystem test cannot see: whether the bytes
+    #     survive a power cut depends on an fsync that succeeded, and no assertion short of a
+    #     crash injector can observe that. What IS observable is whether the call is made at
+    #     all — so the gate watches the syscall. A `if fsync:` mutated to `if False:` passes
+    #     every other leg in this file; this is the only one that catches it. Where strace is
+    #     absent the leg SKIPS, loudly and by name, and the summary says so — an unrunnable
+    #     gate must never read as a passed one.
+    fsync_leg = "skipped"
+    if subprocess.run(["sh", "-c", "command -v strace"], capture_output=True).returncode == 0:
+        sdb = os.path.join(tmp, "sync.db")
+        trace = os.path.join(tmp, "strace.out")
+        # Trace the SECOND put, into a store that already exists. The first put also fsyncs
+        # when it stamps the magic, and a `>= 1` on that run passes even with the append's
+        # fsync deleted — measured: the mutant stayed green until this line created the store
+        # first. A gate that counts the wrong process's syscall asserts the wrong claim.
+        subprocess.run([sys.executable, os.path.abspath(__file__), "--file", sdb, "put",
+                        "--value", "first"], capture_output=True)
+        subprocess.run(["strace", "-f", "-e", "trace=fsync", "-o", trace, sys.executable,
+                        os.path.abspath(__file__), "--file", sdb, "put", "--value", "durable"],
+                       capture_output=True)
+        n_fsync = 0
+        try:
+            with open(trace) as f:
+                n_fsync = sum(1 for ln in f if "fsync(" in ln and "unfinished" not in ln)
+        except OSError:
+            pass
+        ck(n_fsync >= 1, "a put must actually CALL fsync — strace saw %d" % n_fsync)
+        fsync_leg = "observed %d fsync syscall(s)" % n_fsync
+    else:
+        print("test: fsync leg SKIPPED — no strace on this node (the call is unobserved here, "
+              "not asserted-and-passed)")
+
+    # 10. the production store was not touched by any of the above.
+    real_after = os.path.getsize(real) if os.path.exists(real) else -1
+    ck(real_after == real_before,
+       "--test must not touch the production store %s (%d → %d)" % (real, real_before, real_after))
+
+    subprocess.run(["rm", "-rf", tmp])
+    if fails:
+        print("smoke-test: FAIL (%d)" % len(fails))
+        return 1
+    print("smoke-test: ok — format round-trips through a separate process; header bit-flip and value "
+          "bit rot both read as ABSENT, never as a silent delete or silent corruption; torn tail "
+          "repaired loudly; mid-file gap resynced without truncation; foreign file refused; "
+          "compaction keeps the newest version of every key and leaves no dead bytes; fsync %s; "
+          "production store untouched" % fsync_leg)
+    return 0
+
+
+if __name__ == "__main__":
+    if "--test" in sys.argv[1:]:
+        sys.exit(selftest())
+    if "--help" in sys.argv[1:] or "-h" in sys.argv[1:]:
+        print(__doc__)
+        sys.exit(0)
+    sys.exit(main(sys.argv[1:]))

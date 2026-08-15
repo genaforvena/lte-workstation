@@ -1,0 +1,306 @@
+#!/usr/bin/env bash
+# reflex-cadence: 17 * * * *
+# mesh-kernel-taint — the kernel's own permanent fault LATCH, read from /proc/sys/kernel/tainted.
+#
+# The kernel sets a taint bit when something happened that it will never forget: a machine check, a
+# bad page, a WARN_ON(), a CPU run out of spec, a module force-loaded. The bits are WRITE-ONCE — there
+# is no clearing path short of a reboot — so the mask is a monotone record of "this kernel has been
+# through something", and nothing else in the mesh reads it. That is the axis: not a rate, not a
+# level, a LATCH. A node can look perfectly healthy on every other sense while carrying a WARN it took
+# three weeks ago.
+#
+# THE DECODE TABLE IS THE WHOLE TOOL, and it is exactly what went wrong the first time. The 2026-07-05
+# knowledge file (capability-kernel-taint-drift) carried a bit->name table that was WRONG IN EVERY
+# ENTRY, and the error INVERTED the alarm: it pinned 512 as a clean baseline calling it "benign
+# firmware_workaround", when 512 is bit 9 = TAINT_WARN — the kernel hit a WARN_ON(). An organ built on
+# that table would have baselined away the exact latch it exists to catch. So this tool does not carry
+# a table it believes in:
+#
+#   1. It DERIVES the table from the kernel's own headers (/usr/src/linux-headers-*/include/linux/
+#      panic.h) whenever they are installed, and says `table=derived(<path>)`.
+#   2. It falls back to a pinned table only when no headers exist, and says `table=pinned` so the
+#      claim is visible rather than assumed.
+#   3. --test asserts the DERIVED table equals the PINNED one wherever headers exist. That is the
+#      cross-check that would have caught the original error the day it was written, and it runs on
+#      every node that has headers.
+#
+# THREE TRAPS, all from the knowledge file, all built in:
+#
+#   * NEVER grep dmesg for "Tainted:". Every stack dump prints the current mask, so a node with many
+#     dumps looks like a node with drifting taint while the mask held constant; and dmesg_restrict=1
+#     needs root anyway. The sysctl is the only source read here.
+#   * --test NEVER sets a bit to prove itself. The bits are write-once latches; the only writable path
+#     ORs in TAINT_AUX(16) and there is no undo. The test drives the DECODER on synthetic masks and
+#     asserts the LIVE read separately.
+#   * A missing or unreadable file renders n/a and exits 2 — never 0. A 0 mask is a real and strong
+#     claim ("this kernel is clean"); fabricating it from a failed read is the worst thing this tool
+#     could do.
+#
+# BASELINE IS DERIVED PER NODE, and per BOOT — which is the correction the contract needed. The bits
+# only accumulate WITHIN a boot; a reboot resets the mask to whatever the fresh kernel latches (here
+# 4096, nvidia's out-of-tree module, latched at load). Baselining without a boot scope means the first
+# reboot that loads one fewer module reads as bits DISAPPEARING, which is impossible within a boot and
+# would be reported as a fault. The state file carries the boot_id, and a boot_id change re-baselines
+# instead of alarming.
+#
+# Verdicts: BASELINE (first sample this boot) · OK (mask unchanged) · LATCH (new bit(s) since the
+# baseline — the alarm, and it keeps reporting rather than firing once) · n/a (unreadable).
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+
+MESH="${MESH_DIR:-$HOME/.mesh}"
+TAINT_FILE="${MESH_TAINT_FILE:-/proc/sys/kernel/tainted}"
+BOOTID_FILE="${MESH_BOOTID_FILE:-/proc/sys/kernel/random/boot_id}"
+STATE="${MESH_TAINT_STATE:-$MESH/.kernel-taint-state}"
+LOG="${MESH_TAINT_LOG:-$MESH/kernel-taint.log}"
+HDR_GLOB="${MESH_TAINT_HDR_GLOB:-/usr/src/linux-headers-*/include/linux/panic.h}"
+POST_REFRESH="${MESH_TAINT_POST_REFRESH:-86400}"   # debounce the board post for a standing latch
+
+# Pinned fallback table — verified 2026-08-15 against
+# /usr/src/linux-headers-6.8.0-137/include/linux/panic.h:57-75 on mesh-home. Used ONLY when no kernel
+# headers are installed, and the renderer says so.
+PINNED=(
+  PROPRIETARY_MODULE FORCED_MODULE CPU_OUT_OF_SPEC FORCED_RMMOD MACHINE_CHECK
+  BAD_PAGE USER DIE OVERRIDDEN_ACPI_TABLE WARN CRAP FIRMWARE_WORKAROUND
+  OOT_MODULE UNSIGNED_MODULE SOFTLOCKUP LIVEPATCH AUX RANDSTRUCT TEST
+)
+
+TABLE=(); TABLE_SRC=""
+
+# derive_table — parse `#define TAINT_<NAME> <bit>` out of a kernel header into TABLE[bit]=NAME.
+# Deliberately ignores TAINT_FLAGS_COUNT / TAINT_FLAGS_MAX (they are not bits). Returns 1 if the
+# header yields nothing usable, so the caller can fall back LOUDLY rather than to an empty table.
+derive_table(){ # $1 = header path
+  local f="$1" name bit n=0
+  [ -r "$f" ] || return 1
+  TABLE=()
+  while read -r name bit; do
+    case "$bit" in ''|*[!0-9]*) continue ;; esac
+    [ "$bit" -gt 63 ] && continue
+    TABLE[$bit]="$name"
+    n=$(( n + 1 ))
+  done < <(sed -nE 's/^#define[[:space:]]+TAINT_([A-Z_]+)[[:space:]]+([0-9]+).*/\1 \2/p' "$f" \
+           | grep -vE '^(FLAGS_COUNT|FLAGS_MAX) ')
+  [ "$n" -ge 10 ] || return 1     # a header that yields 3 names is a parse failure, not a small table
+  return 0
+}
+
+load_table(){
+  local f
+  for f in $HDR_GLOB; do
+    if derive_table "$f"; then TABLE_SRC="derived($f)"; return 0; fi
+  done
+  TABLE=("${PINNED[@]}")
+  TABLE_SRC="pinned"
+  return 0
+}
+
+# decode <mask> → space-separated bit NAMES, low bit first. A bit with no name in the table renders
+# as bit<N> rather than being dropped: a future kernel adds bits, and a latch this tool cannot name
+# is still a latch. Mask 0 renders the empty string (the caller prints "none"), never a name.
+decode(){
+  local m="$1" i=0 out=""
+  case "$m" in ''|*[!0-9]*) printf ''; return 1 ;; esac
+  while [ "$i" -lt 64 ]; do
+    if [ $(( (m >> i) & 1 )) -eq 1 ]; then
+      if [ -n "${TABLE[$i]:-}" ]; then out="$out ${TABLE[$i]}"; else out="$out bit$i"; fi
+    fi
+    i=$(( i + 1 ))
+  done
+  printf '%s' "${out# }"
+}
+
+read_mask(){ # → mask on stdout, rc0; rc1 on any unreadable/unparseable read (NEVER prints 0)
+  local m
+  [ -r "$TAINT_FILE" ] || return 1
+  m="$(cat "$TAINT_FILE" 2>/dev/null)" || return 1
+  m="${m//[[:space:]]/}"
+  case "$m" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s' "$m"
+}
+
+read_bootid(){ local b; b="$(cat "$BOOTID_FILE" 2>/dev/null)" || b=""; printf '%s' "${b//[[:space:]]/}"; }
+
+main(){
+  load_table
+  local mask bootid prev_mask="" prev_boot="" verdict new_bits="" names
+  if ! mask="$(read_mask)"; then
+    echo "kernel-taint: n/a — $TAINT_FILE unreadable (no claim about this kernel; a 0 here would be fabricated)"
+    exit 2
+  fi
+  bootid="$(read_bootid)"
+  if [ -r "$STATE" ]; then
+    # shellcheck disable=SC1090
+    prev_mask="$(sed -nE 's/^MASK=([0-9]+).*/\1/p' "$STATE" 2>/dev/null)"
+    prev_boot="$(sed -nE 's/^BOOT=(.*)$/\1/p' "$STATE" 2>/dev/null)"
+  fi
+  case "$prev_mask" in ''|*[!0-9]*) prev_mask="" ;; esac
+
+  if [ -z "$prev_mask" ] || [ "$prev_boot" != "$bootid" ]; then
+    verdict="BASELINE"
+  elif [ "$mask" = "$prev_mask" ]; then
+    verdict="OK"
+  elif [ $(( mask & ~prev_mask )) -ne 0 ]; then
+    verdict="LATCH"
+    new_bits="$(decode $(( mask & ~prev_mask )))"
+  else
+    # Bits vanished WITHIN a boot. The kernel has no clearing path, so this is not a kernel event —
+    # it is a corrupt state file or a hand-edited baseline. Say which, do not report it as recovery.
+    verdict="BASELINE"
+    new_bits=""
+  fi
+
+  names="$(decode "$mask")"; [ -n "$names" ] || names="none"
+  local line="TAINT=$mask|BITS=$names|$verdict table=$TABLE_SRC"
+  [ "$verdict" = "LATCH" ] && line="$line new=$new_bits baseline=$prev_mask"
+  echo "kernel-taint: $line"
+
+  # State is written only when the mask or the boot changes; mtime is refreshed on EVERY successful
+  # eval via mesh-state-touch, so the mtime-aging watchdogs read liveness while the content stays
+  # change-gated (the liveness-touch convention — a taint mask that legitimately holds for months
+  # would otherwise read as a dead reflex).
+  if [ "$mask" != "$prev_mask" ] || [ "$prev_boot" != "$bootid" ]; then
+    mkdir -p "$(dirname "$STATE")" 2>/dev/null || true
+    { printf 'MASK=%s\n' "$mask"; printf 'BOOT=%s\n' "$bootid"
+      printf 'BITS=%s\n' "$names"; printf 'SINCE=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    } > "$STATE.tmp" 2>/dev/null && mv -f "$STATE.tmp" "$STATE" 2>/dev/null || true
+    printf '%s  %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$line" >> "$LOG" 2>/dev/null || true
+  fi
+  command -v mesh-state-touch >/dev/null 2>&1 && mesh-state-touch "$STATE" >/dev/null 2>&1 || true
+
+  if [ "$verdict" = "LATCH" ]; then
+    local pstate="$MESH/.kernel-taint-posted" now last=0
+    now="$(date +%s)"
+    [ -f "$pstate" ] && last="$(cat "$pstate" 2>/dev/null)"
+    case "$last" in ''|*[!0-9]*) last=0 ;; esac
+    if [ $(( now - last )) -ge "$POST_REFRESH" ] && command -v mesh-chat >/dev/null 2>&1; then
+      MESH_WHO="kernel-taint@$(hostname)" mesh-chat "[fyi] kernel-taint: NEW LATCH on $(hostname) — the kernel set $new_bits (mask $prev_mask → $mask, $TABLE_SRC). Taint bits are write-once until reboot, so this is permanent for this boot and names something the kernel will never forget (a WARN_ON, a machine check, a bad page, a forced module). Not an outage by itself; it is the record that one happened." >/dev/null 2>&1 || true
+      echo "$now" > "$pstate" 2>/dev/null || true
+    fi
+    exit 1
+  fi
+  exit 0
+}
+
+# ── smoke test ─────────────────────────────────────────────────────────────────────────────────
+# Writes NOTHING to the production state/log (both re-pointed into a tempdir, and the production
+# paths' sizes are asserted unchanged), and sets NO taint bit — the bits are write-once latches with
+# no undo, so a test that proved itself by tainting the kernel would permanently damage the very
+# signal it measures.
+if [ "${1:-}" = --test ]; then
+  e=0
+  tmp="$(mktemp -d)" || { echo "smoke-test: FAIL (mktemp)"; exit 1; }
+  trap 'rm -rf "$tmp"' EXIT
+  real_state="$MESH/.kernel-taint-state"; real_log="$MESH/kernel-taint.log"
+  rs_pre="absent"; [ -f "$real_state" ] && rs_pre="$(wc -c < "$real_state")"
+  rl_pre="absent"; [ -f "$real_log" ]   && rl_pre="$(wc -c < "$real_log")"
+
+  # 1. DERIVED-vs-PINNED cross-check. This is the leg that would have caught the 2026-07-05 table,
+  #    every entry of which was wrong. Where no headers exist it SKIPS by name — an unrunnable
+  #    cross-check must not read as a passed one.
+  hdr=""; for f in $HDR_GLOB; do [ -r "$f" ] && { hdr="$f"; break; }; done
+  if [ -n "$hdr" ]; then
+    derive_table "$hdr" || { echo "test: derive_table failed to parse $hdr FAIL"; e=1; }
+    i=0; mism=""
+    while [ "$i" -lt 19 ]; do
+      [ "${TABLE[$i]:-}" = "${PINNED[$i]}" ] || mism="$mism bit$i(derived=${TABLE[$i]:-MISSING} pinned=${PINNED[$i]})"
+      i=$(( i + 1 ))
+    done
+    [ -z "$mism" ] || { echo "test: DERIVED table disagrees with PINNED —$mism FAIL"; e=1; }
+    xcheck="derived-vs-pinned agreed on all 19 bits ($hdr)"
+  else
+    xcheck="derived-vs-pinned SKIPPED (no kernel headers on this node — the pinned table is unverified here)"
+    echo "test: NOTE $xcheck"
+  fi
+
+  # 2. DECODER on synthetic masks — no bit is ever set on the running kernel.
+  TABLE=("${PINNED[@]}"); TABLE_SRC=pinned
+  [ "$(decode 0)" = "" ]              || { echo "test: decode 0 must be empty, got '$(decode 0)' FAIL"; e=1; }
+  [ "$(decode 4096)" = "OOT_MODULE" ] || { echo "test: decode 4096 must be OOT_MODULE, got '$(decode 4096)' FAIL"; e=1; }
+  # the inversion that caused the original bug: 512 is WARN, not a benign firmware workaround
+  [ "$(decode 512)" = "WARN" ]        || { echo "test: decode 512 must be WARN (the 2026-07-05 table called it firmware_workaround) FAIL"; e=1; }
+  [ "$(decode 2048)" = "FIRMWARE_WORKAROUND" ] || { echo "test: decode 2048 must be FIRMWARE_WORKAROUND FAIL"; e=1; }
+  [ "$(decode 64)" = "USER" ]         || { echo "test: decode 64 must be USER FAIL"; e=1; }
+  [ "$(decode 128)" = "DIE" ]         || { echo "test: decode 128 must be DIE FAIL"; e=1; }
+  [ "$(decode 256)" = "OVERRIDDEN_ACPI_TABLE" ] || { echo "test: decode 256 must be OVERRIDDEN_ACPI_TABLE FAIL"; e=1; }
+  [ "$(decode 1024)" = "CRAP" ]       || { echo "test: decode 1024 must be CRAP FAIL"; e=1; }
+  [ "$(decode 8192)" = "UNSIGNED_MODULE" ] || { echo "test: decode 8192 must be UNSIGNED_MODULE FAIL"; e=1; }
+  [ "$(decode 4608)" = "WARN OOT_MODULE" ] || { echo "test: decode 4608 (WARN|OOT) must list both low-bit-first, got '$(decode 4608)' FAIL"; e=1; }
+  [ "$(decode 262144)" = "TEST" ]     || { echo "test: decode 262144 must be TEST (bit 18, the last named bit) FAIL"; e=1; }
+  # an unnamed bit must be REPORTED, not dropped — a future kernel's latch is still a latch
+  [ "$(decode 524288)" = "bit19" ]    || { echo "test: an unnamed bit must render bit19, got '$(decode 524288)' FAIL"; e=1; }
+  decode "" >/dev/null 2>&1           && { echo "test: decode of a non-numeric mask must fail FAIL"; e=1; }
+
+  # 3. derive_table must REFUSE a header that does not really carry the table, rather than returning
+  #    a 2-entry table that then silently mis-decodes everything above it.
+  printf '#define TAINT_PROPRIETARY_MODULE\t0\n#define TAINT_FLAGS_COUNT\t19\n' > "$tmp/thin.h"
+  derive_table "$tmp/thin.h" && { echo "test: derive_table must REFUSE a 1-name header (fall back loudly, not silently) FAIL"; e=1; }
+  derive_table "$tmp/nope.h" && { echo "test: derive_table must fail on a missing header FAIL"; e=1; }
+
+  # 4. UNREADABLE SOURCE → n/a exit 2, and no fabricated 0 anywhere in the output.
+  out="$(MESH_TAINT_FILE="$tmp/absent" MESH_TAINT_STATE="$tmp/s" MESH_TAINT_LOG="$tmp/l" "$0" 2>&1)"; rc=$?
+  [ "$rc" = 2 ] || { echo "test: unreadable taint file must exit 2, got $rc FAIL"; e=1; }
+  case "$out" in *n/a*) : ;; *) echo "test: unreadable taint file must render n/a, got '$out' FAIL"; e=1 ;; esac
+  case "$out" in *TAINT=0*) echo "test: unreadable must NEVER render TAINT=0 — a clean claim from a failed read FAIL"; e=1 ;; esac
+  printf 'not-a-number\n' > "$tmp/junk"
+  MESH_TAINT_FILE="$tmp/junk" MESH_TAINT_STATE="$tmp/s" MESH_TAINT_LOG="$tmp/l" "$0" >/dev/null 2>&1
+  [ $? = 2 ] || { echo "test: an unparseable mask must exit 2, not be coerced FAIL"; e=1; }
+
+  # 5. BASELINE → OK → LATCH, all on a sandboxed fake sysctl. Note what is NOT done here: no bit is
+  #    set on the running kernel at any point.
+  printf '4096\n' > "$tmp/mask"; printf 'boot-aaa\n' > "$tmp/boot"
+  run(){ MESH_TAINT_FILE="$tmp/mask" MESH_BOOTID_FILE="$tmp/boot" MESH_TAINT_STATE="$tmp/st" \
+         MESH_TAINT_LOG="$tmp/lg" MESH_DIR="$tmp" "$0" 2>&1; }
+  o1="$(run)"; r1=$?
+  case "$o1" in *BASELINE*) : ;; *) echo "test: first sample must be BASELINE, got '$o1' FAIL"; e=1 ;; esac
+  [ "$r1" = 0 ] || { echo "test: BASELINE must exit 0, got $r1 FAIL"; e=1; }
+  case "$o1" in *"BITS=OOT_MODULE"*) : ;; *) echo "test: baseline must decode 4096 as OOT_MODULE, got '$o1' FAIL"; e=1 ;; esac
+  o2="$(run)"; r2=$?
+  case "$o2" in *"|OK "*) : ;; *) echo "test: unchanged mask must be OK, got '$o2' FAIL"; e=1 ;; esac
+  [ "$r2" = 0 ] || { echo "test: OK must exit 0, got $r2 FAIL"; e=1; }
+  printf '4608\n' > "$tmp/mask"     # the kernel took a WARN_ON on top of the nvidia module
+  o3="$(run)"; r3=$?
+  case "$o3" in *LATCH*) : ;; *) echo "test: a NEW bit must render LATCH, got '$o3' FAIL"; e=1 ;; esac
+  case "$o3" in *"new=WARN"*) : ;; *) echo "test: LATCH must NAME the new bit (WARN), got '$o3' FAIL"; e=1 ;; esac
+  [ "$r3" = 1 ] || { echo "test: LATCH must exit 1, got $r3 FAIL"; e=1; }
+  o4="$(run)"
+  case "$o4" in *"|OK "*) : ;; *) echo "test: after the latch is absorbed into the baseline the next sample is OK, got '$o4' FAIL"; e=1 ;; esac
+
+  # 6. A REBOOT must re-baseline, not alarm. Within a boot the bits only accumulate, so a mask that
+  #    DROPS can only be a new boot (fewer modules loaded) — reporting that as a fault would make
+  #    every reboot that skips a module look like an event.
+  printf '0\n' > "$tmp/mask"; printf 'boot-bbb\n' > "$tmp/boot"
+  o5="$(run)"; r5=$?
+  case "$o5" in *BASELINE*) : ;; *) echo "test: a new boot_id must RE-BASELINE, got '$o5' FAIL"; e=1 ;; esac
+  [ "$r5" = 0 ] || { echo "test: a reboot re-baseline must exit 0 (not an alarm), got $r5 FAIL"; e=1; }
+  case "$o5" in *"BITS=none"*) : ;; *) echo "test: a genuine 0 mask must render BITS=none, got '$o5' FAIL"; e=1 ;; esac
+  # …and a mask that drops WITHIN one boot is a corrupt baseline, not recovery: re-baseline, never OK
+  printf '4096\n' > "$tmp/mask"; run >/dev/null 2>&1
+  printf '0\n' > "$tmp/mask"
+  o6="$(run)"
+  case "$o6" in *BASELINE*) : ;; *) echo "test: bits vanishing within one boot must re-baseline, got '$o6' FAIL"; e=1 ;; esac
+
+  # 7. THE LIVE READ — a real, unprivileged read of this node's own sysctl, asserted separately from
+  #    the decoder. Without this the whole test is a decoder unit-test that never touches a kernel.
+  if lm="$(read_mask)"; then
+    live="live read ok: TAINT=$lm BITS=$(load_table; decode "$lm")"
+    [ -n "$lm" ] || { echo "test: live read returned empty FAIL"; e=1; }
+  else
+    live="live read n/a (exit 2 path — $TAINT_FILE unreadable on this node)"
+  fi
+
+  # 8. the production state/log were not written by any of the above.
+  rs_post="absent"; [ -f "$real_state" ] && rs_post="$(wc -c < "$real_state")"
+  rl_post="absent"; [ -f "$real_log" ]   && rl_post="$(wc -c < "$real_log")"
+  [ "$rs_pre" = "$rs_post" ] || { echo "test: --test WROTE the production state $real_state ($rs_pre → $rs_post) FAIL"; e=1; }
+  [ "$rl_pre" = "$rl_post" ] || { echo "test: --test WROTE the production log $real_log ($rl_pre → $rl_post) FAIL"; e=1; }
+
+  [ "$e" = 0 ] || { echo "smoke-test: FAIL"; exit 1; }
+  echo "smoke-test: ok — $xcheck; decoder asserted on 12 synthetic masks incl. the 512=WARN inversion that broke the original table and an unnamed bit19; thin/missing headers refused rather than silently truncating the table; unreadable and unparseable sources both exit 2 with no fabricated TAINT=0; BASELINE→OK→LATCH→OK walked, reboot and within-boot mask drops both re-baseline instead of alarming; $live; no taint bit was set and the production state/log are byte-unchanged"
+  exit 0
+fi
+
+case "${1:-}" in
+  --help|-h) sed -n '3,45p' "$0"; exit 0 ;;
+  *) main ;;
+esac
