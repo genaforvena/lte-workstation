@@ -1,0 +1,518 @@
+#!/usr/bin/env bash
+# reflex-cadence: 4-59/10 * * * *
+# mesh-dram-bw — the node's DRAM BANDWIDTH sense, off the AMD Data Fabric uncore PMU.
+#
+# The hardware has always had this counter; the driver (`amd_uncore`, in-tree + signed, loads under
+# lockdown) was simply never loaded, so /sys/bus/event_source/devices/ held no `amd_df` and the mesh
+# had no memory-bandwidth axis at all. This tool is that axis.
+#
+#   mesh-dram-bw              one-line reading (level + GB/s + % of the node's own derived ceiling)
+#   mesh-dram-bw --json       machine-readable
+#   mesh-dram-bw --sampler    long-lived 1 Hz appender (the 100%-coverage interval lane; supervised)
+#   mesh-dram-bw --test       smoke test: fixtures + a LIVE read + the gate driven RED for real
+#
+# ── WHAT WAS MEASURED HERE, AND WHAT EACH NUMBER COST (genome@mesh-home 2026-08-16, re-derived
+#    independently of the discover find that proposed the axis) ───────────────────────────────────
+#
+# (1) THE UNIT IS 64 B/BEAT — CALIBRATED TWICE, AND THE FIRST TWO CALIBRATIONS WERE WRONG.
+#     `dram_channel_data_controller_N` counts beats, not bytes, and 32 vs 64 B/beat is a 2x error in
+#     every downstream number. A "known-size read" is only known if nothing else in the perf window
+#     moves DRAM, and twice it did:
+#       · mmap(MAP_POPULATE) of a 4 GiB tmpfs file puts the kernel's own prefault work (1M struct-page
+#         touches + PTE writes, ~640 MB of traffic) INSIDE the window → 48-52 B/beat, a 25% "error"
+#         that is not the unit at all. Fix: setup happens before the window; `perf stat -D <ms>` opens
+#         the counters only for the read phase.
+#       · a random pointer chase — the textbook "exactly one 64 B line per access" fixture — measures
+#         3.8-4.6 beats per access, because prefetch and page-walk traffic ride along on a random
+#         pattern. A random-access fixture CANNOT calibrate a bandwidth counter; a long sequential
+#         read can, because prefetch overfetch is bounded by the region.
+#     Clean differential (read phase only, paired same-duration idle control subtracted, 6+4 reps):
+#         4 GiB → 61.9 B/beat · 2 GiB → 65.4 B/beat  (bar was ±15%; 32 B/beat is off by 2x)
+#     So: bytes = beats × 64.
+#
+# (2) THE CHANNEL MAP IS ch0+ch1, AND THE OTHER SIX ARE EXCLUDED BY EVIDENCE, NOT BY ASSUMPTION.
+#     perf exposes `dram_channel_data_controller_0..7` on every Zen3, including this 2-channel desktop
+#     part (Ryzen 7 5700X, 2 populated DIMMs, one per channel). Measured:
+#       · ch0 ≈ ch1 within 1% in every sample, idle and loaded — the two populated channels.
+#       · ch3..ch7 read exactly 0 in every sample, idle and loaded.
+#       · ch2 is the trap: ~1% of ch0 at idle, so a naive sum quietly adds it. Under a 28 GB/s
+#         sequential read it FALLS to 0.05%, and under an 8-way chase to 0.025%. A term that
+#         ANTI-correlates with DRAM traffic is not DRAM traffic. Excluded.
+#     Second reason, independent of semantics: this DF has 4 counters. Two events fit with zero
+#     multiplexing; asking for all eight forces perf to time-share and EXTRAPOLATE — measured
+#     `50.00` in the enabled column, i.e. a sum over eight channels is also a sum over half a window.
+#
+# (3) THE COUNTERS ARE NOT MONOTONIC ACCUMULATORS BETWEEN RUNS — the /proc/pressure `total=` trick
+#     does not transfer. A DF counter exists only inside an open perf event: `perf stat` zeroes it at
+#     open and frees it at close, and there is no sysfs value to read (amd_df exposes `format/` only).
+#     So a stateless CLI cannot delta across runs, and sampling for N seconds every cadence would
+#     rebuild exactly mesh-psi's 1.7%-coverage blindness (fe35dd9). The fix is a LIVING reader: the
+#     `--sampler` lane holds one perf event open at 1 Hz and appends rows; this tool deltas the
+#     SAMPLER LOG across runs (cursor in the state file) for 100% interval coverage plus a peak-1s
+#     that a mean would dilute away. Cost of that lane, measured: 0 clock ticks of CPU over 18 s of
+#     wall (<10 ms, i.e. <0.06% of one core). Coverage is COMPUTED (rows×period / wallclock), never
+#     asserted — a sampler that died mid-interval renders its real percentage, and a stale one
+#     renders `iv=na`, never 0.
+#
+# (4) ARMING, MEASURED — `modprobe amd_uncore` costs 8.6-11.3 ms (5 reps); unload costs ~50 ms. The
+#     module is in-tree and signed, so it loads with sig_enforce=Y: no MOK, no reboot. This tool
+#     SELF-ARMS at run (idempotent presence check first, so the common path costs nothing) rather
+#     than requiring /etc/modules-load.d — self-arming cannot rot into a wired-nowhere declaration,
+#     and it leaves the node's boot state untouched (a reboot returns it to as-found). It never
+#     unloads: another reader may hold the counter.
+#     `perf_event_paranoid=4` on this node means the READ needs root too, so the tool runs
+#     `sudo -n perf`; where that is unavailable it exits 2 (honest n/a) instead of guessing.
+#
+# (5) WHETHER THE AXIS MATTERS — the question the find left open, now answered, and the answer is
+#     BOTH: it depends entirely on where the model sits.
+#       · qwen3-vl:4b GPU-resident, 98 tok/s → peak 4.1 GB/s over 100 ms = 9.6% of ceiling. DRAM is
+#         irrelevant headroom.
+#       · the SAME model forced CPU-only (num_gpu:0), 11.3 tok/s → median 31.5 GB/s, peak 39.3 GB/s
+#         over 100 ms, sustained 17.7 s = 74% median / 92% peak of the ceiling. DRAM is THE ceiling.
+#     Which makes the DIMM finding load-bearing rather than trivia: the parts decode DDR4-3600 and
+#     run at 2667 MT/s configured, so a bandwidth-bound CPU inference is leaving ~35% of its token
+#     rate in an unset XMP profile.
+#
+# (6) THE CEILING IS DERIVED PER NODE, NEVER HARDCODED (a constant outlives its reader): configured
+#     MT/s × 8 B × populated DIMMs, read from dmidecode and cached 7 days with its derivation. If it
+#     cannot be derived, the percentage and the level render `na` — the GB/s still reports.
+#
+# Honest contract: no amd_df and modprobe fails → exit 2 · perf error or a zero delta → `na` with a
+# reason, never 0.00 · sampler stale/absent → `iv=na cov=inst-only`, never a fabricated interval.
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+export LC_ALL=C
+
+MESH="${MESH_DIR:-$HOME/.mesh}"
+mkdir -p "$MESH" 2>/dev/null || true
+STATE="$MESH/.dram-bw.state"
+LOG="$MESH/dram-bw.log"
+SAMPLES="${MESH_DRAM_SAMPLES:-$MESH/dram-bw-samples.log}"
+PEAKCACHE="$MESH/.dram-bw-peak"
+# MESH_TEST_SANDBOX=1 diverts every durable write — a --test that stamped the live state/log would
+# forge the liveness evidence it exists to check (09f7914).
+if [ "${MESH_TEST_SANDBOX:-0}" = 1 ]; then
+  STATE="${TMPDIR:-/tmp}/.dram-bw.state.sandbox.$$"
+  LOG="${TMPDIR:-/tmp}/dram-bw.log.sandbox.$$"
+  PEAKCACHE="${TMPDIR:-/tmp}/.dram-bw-peak.sandbox.$$"
+fi
+
+PERF="${MESH_DRAM_PERF:-perf}"
+SUDO="${MESH_DRAM_SUDO-sudo -n}"          # settable to empty for a test stub / an already-root caller
+SYSFS_DF="${MESH_DRAM_SYSFS:-/sys/bus/event_source/devices/amd_df}"
+SAMPLE_SECS="${MESH_DRAM_SAMPLE_SECS:-2}"  # the inst window
+SAMPLER_PERIOD="${MESH_DRAM_SAMPLER_PERIOD:-1}"   # seconds per sampler row
+SAMPLER_LEASE="${MESH_DRAM_SAMPLER_LEASE:-120}"   # a sampler row older than this = stale, iv=na
+BYTES_PER_BEAT=64                          # (1) above — calibrated, not assumed
+
+# THE CHANNEL SET. Two channels, named explicitly, for the reasons in (2). Widening this is a
+# semantic claim about the node's UMC map, not a config tweak — --test asserts the width.
+DRAM_CHANNELS="${MESH_DRAM_CHANNELS:-0 1}"
+ev_list() { local c out=; for c in $DRAM_CHANNELS; do out="$out,amd_df/dram_channel_data_controller_$c/"; done; printf '%s' "${out#,}"; }
+
+# ── pure helpers ────────────────────────────────────────────────────────────────────────────────
+
+# fold one axis's two windows, NAMING the winner — a bare max effaces which window saw the traffic,
+# and the two answer different questions (a 2 s inst sample catches a spike happening right now; the
+# interval mean covers the wallclock the inst sample cannot see). args: inst iv|na → "<val> <winner>"
+fold_axis() {
+  local a="$1" i="$2"
+  [ "$i" = na ] && { printf '%s inst' "$a"; return; }
+  [ "$a" = na ] && { printf '%s iv' "$i"; return; }
+  awk -v a="$a" -v i="$i" 'BEGIN{ if (i+0 > a+0) printf "%s iv", i; else printf "%s inst", a }'
+}
+
+# sum ONLY the declared channels out of a perf -x, CSV. Anything else in the stream is ignored, so a
+# stray ch2 row cannot slip into the total.
+sum_beats() {   # stdin = perf -x, csv
+  awk -F, -v chans="$DRAM_CHANNELS" '
+    BEGIN{ n=split(chans,c," "); for(i=1;i<=n;i++) want["amd_df/dram_channel_data_controller_" c[i] "/"]=1 }
+    { name=$3; if (name in want && $1 ~ /^[0-9]+$/) { t+=$1; seen[name]=1 } }
+    END{ k=0; for (s in seen) k++; if (k != n) exit 1; printf "%d\n", t }'
+}
+
+# level from % of the node's own derived ceiling. Calibrated against THIS node's measured corpus,
+# not an assumed 0..1: idle 1.4-5.9% · single-thread sequential read 67% · CPU-only llama median 74%,
+# peak 92%. Re-derive if the corpus moves — these are the current answer to the claim, not the claim.
+classify() {
+  awk -v p="${1:-}" 'BEGIN{
+    if (p == "" || p == "na") { print "UNRATED"; exit }
+    if (p >= 75) { print "SATURATED"; exit }
+    if (p >= 40) { print "BUSY"; exit }
+    if (p >= 10) { print "LIGHT"; exit }
+    print "IDLE" }'
+}
+
+# ceiling: configured MT/s × 8 B × populated DIMMs, from dmidecode. Cached 7 days WITH its derivation.
+derive_peak() {
+  local out speed n
+  out="$($SUDO dmidecode -t memory 2>/dev/null)" || return 1
+  speed="$(printf '%s\n' "$out" | awk -F': *' '/Configured Memory Speed:/ && $2 ~ /^[0-9]+ MT\/s/ {print $2; exit}' | awk '{print $1}')"
+  n="$(printf '%s\n' "$out" | grep -c 'Configured Memory Speed: [0-9]')"
+  [ -n "$speed" ] && [ "${n:-0}" -gt 0 ] || return 1
+  awk -v s="$speed" -v n="$n" 'BEGIN{ printf "%.1f %s %s\n", s*8*n/1000, s, n }'
+}
+peak_gbps() {
+  local cached age
+  if [ -r "$PEAKCACHE" ]; then
+    age=$(( $(date +%s) - $(stat -c %Y "$PEAKCACHE" 2>/dev/null || echo 0) ))
+    cached="$(awk '{print $1}' "$PEAKCACHE" 2>/dev/null)"
+    [ "$age" -lt 604800 ] && [ -n "$cached" ] && { printf '%s' "$cached"; return 0; }
+  fi
+  local d; d="$(derive_peak)" || { printf 'na'; return 1; }
+  printf '%s MT/s=%s dimms=%s derived=%s\n' $d "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$PEAKCACHE" 2>/dev/null
+  printf '%s' "${d%% *}"
+}
+
+# ── arming (4) ──────────────────────────────────────────────────────────────────────────────────
+arm() {
+  [ -d "$SYSFS_DF" ] && return 0
+  $SUDO modprobe amd_uncore >/dev/null 2>&1
+  [ -d "$SYSFS_DF" ]
+}
+
+# ── the live read. GATE (c): the module must be loaded AND the counter must produce a NONZERO delta.
+# Never "the event is readable" — with amd_uncore unloaded perf does not return 0, it exits 129 with
+# "Cannot find PMU `amd_df'", and a leg that swallowed that would render na as a blank row.
+sample_gbps() {   # $1 = seconds → echoes GB/s, or fails with a reason on stderr
+  local secs="$1" out rc beats
+  out="$($SUDO $PERF stat -a -x, -e "$(ev_list)" -- sleep "$secs" 2>&1)"; rc=$?
+  [ "$rc" = 0 ] || { echo "perf-rc=$rc" >&2; return 1; }
+  beats="$(printf '%s\n' "$out" | sum_beats)" || { echo "channel-missing" >&2; return 1; }
+  [ -n "$beats" ] && [ "$beats" -gt 0 ] 2>/dev/null || { echo "zero-delta" >&2; return 1; }
+  awk -v b="$beats" -v s="$secs" -v w="$BYTES_PER_BEAT" 'BEGIN{ printf "%.2f", b*w/s/1e9 }'
+}
+
+# ── the interval lane (d): delta the SAMPLER LOG across runs. Coverage is computed, never claimed.
+# echoes: "<mean> <peak> <coverage_pct> <rows>" or "na na na 0"
+interval_from_sampler() {
+  local cursor now
+  cursor="$(awk -F'|' '/^cursor=/{print substr($0,8)}' "$STATE" 2>/dev/null | tail -1)"
+  now="$(date +%s)"
+  [ -r "$SAMPLES" ] || { echo "na na na 0"; return; }
+  # rows are counted PER DISTINCT TIMESTAMP: two samplers appending to one log would otherwise
+  # double the row count and mint coverage out of duplicates (the --sampler flock makes that state
+  # unreachable, but coverage must not depend on a lock held somewhere else).
+  awk -v cur="${cursor:-0}" -v now="$now" -v lease="$SAMPLER_LEASE" -v per="$SAMPLER_PERIOD" '
+    $1 ~ /^[0-9]+$/ { last=$1; if ($1 > cur && !($1 in seen)) { seen[$1]=1; n++; s+=$2; if ($2+0 > pk+0) pk=$2 } }
+    END{
+      if (last == "" || now - last > lease) { print "na na na 0"; exit }   # stale sampler → na, not 0
+      if (n == 0 || cur == 0) { print "na na na 0"; exit }                  # no baseline → na
+      span = now - cur; if (span <= 0) { print "na na na 0"; exit }
+      cov = n * per * 100 / span; if (cov > 100) cov = 100
+      printf "%.2f %.2f %.0f %d\n", s/n, pk, cov, n
+    }' "$SAMPLES"
+}
+
+# ── the sampler (the living reader that makes 100% coverage possible) ────────────────────────────
+SAMPLER_CHUNK="${MESH_DRAM_SAMPLER_CHUNK:-3600}"   # perf is re-invoked per chunk: a stranded ROOT perf
+SAMPLER_KEEP="${MESH_DRAM_SAMPLER_KEEP:-172800}"  # (whose parent died) then self-terminates in ≤1 h
+PERFPID="$MESH/.dram-bw-sampler.perfpid"
+
+# THE ORPHAN REAPER, and it is not defensive decoration — it is the repair for a leak this tool's
+# first draft actually produced on this node. `kill <wrapper>` does NOT reap `sudo perf`: the child
+# runs as ROOT, so an unprivileged parent cannot signal it, and the awk on the other side of the pipe
+# is orphaned too — it keeps reading, so perf never takes the SIGPIPE that "the pipe will reap it"
+# assumes. Four root perf sessions accumulated that way in one afternoon, each holding 2 of this DF's
+# 4 counters: at two orphans the PMU is full and every later reader gets multiplexed or refused, and
+# `modprobe -r amd_uncore` fails "Module is in use" (refcnt 8, no visible user-owned process).
+# Called at startup as well as from the trap, because a trap does not run on SIGKILL.
+SAMPLER_PAT="perf stat -a -x, -I .* -e amd_df/dram_channel_data_controller"
+# A PROBE STRING IS ITSELF A CMDLINE. `sudo -n pgrep -f "$SAMPLER_PAT"` always matches at least one
+# process — the `sudo` carrying the pattern in its own argv — so the naive form reports a stranded
+# perf that does not exist, and the leak gate it feeds can never go green. Filter on comm.
+perf_sessions() {
+  local p
+  $SUDO pgrep -f "$SAMPLER_PAT" 2>/dev/null | while read -r p; do
+    [ "$(ps -o comm= -p "$p" 2>/dev/null)" = perf ] && echo "$p"
+  done
+}
+reap_orphans() {
+  local p
+  for p in $(perf_sessions); do $SUDO kill -TERM "$p" 2>/dev/null; done
+}
+AWKPID=""
+sampler_cleanup() {
+  local sp; sp="$(cat "$PERFPID" 2>/dev/null)"
+  [ -n "$sp" ] && { $SUDO kill -TERM "$sp" 2>/dev/null; $SUDO pkill -P "$sp" 2>/dev/null; }
+  [ -n "$AWKPID" ] && kill "$AWKPID" 2>/dev/null
+  reap_orphans
+  rm -f "$PERFPID" "$MESH/.dram-bw-sampler.fifo.$$" 2>/dev/null
+}
+run_sampler() {
+  # SINGLE WRITER. Two samplers on one log double every row and burn two more of this DF's four
+  # counters (2 sampler + 2 reader is already the whole file — a third opener would multiplex and
+  # perf would EXTRAPOLATE the reading instead of measuring it). Nearly created that state by hand.
+  exec 9>"$MESH/.dram-bw-sampler.lock"
+  flock -n 9 || { echo "dram-bw sampler: another sampler already holds the lock — exiting" >&2; exit 0; }
+  arm || { echo "dram-bw sampler: n/a — amd_df absent and modprobe amd_uncore failed" >&2; exit 2; }
+  trap 'sampler_cleanup; exit 0' EXIT INT TERM HUP
+  reap_orphans      # any perf stranded by a previous sampler's death, before opening our own
+  while :; do
+    sampler_chunk
+    # rotate between chunks — 1 row/s is ~1.7 MB/day; keep 2 days
+    if [ "$(wc -l < "$SAMPLES" 2>/dev/null || echo 0)" -gt "$SAMPLER_KEEP" ]; then
+      tail -n "$SAMPLER_KEEP" "$SAMPLES" > "$SAMPLES.tmp" 2>/dev/null && mv "$SAMPLES.tmp" "$SAMPLES"
+    fi
+    sleep 1
+  done
+}
+sampler_chunk() {
+  local start fifo sp; start="$(date +%s)"
+  # A FIFO instead of a `|`, so the ROOT perf's pid is knowable and killable. With a pipeline both
+  # members are children of this shell and neither dies when this shell does (see reap_orphans).
+  fifo="$MESH/.dram-bw-sampler.fifo.$$"; rm -f "$fifo"; mkfifo "$fifo" 2>/dev/null || return 1
+  # perf -I writes interval rows to stderr; stdbuf keeps them flowing.
+  $SUDO stdbuf -oL -eL $PERF stat -a -x, -I "$((SAMPLER_PERIOD*1000))" -e "$(ev_list)" -- sleep "$SAMPLER_CHUNK" > "$fifo" 2>&1 &
+  sp=$!; echo "$sp" > "$PERFPID"
+  stdbuf -oL awk -F, -v start="$start" -v chans="$DRAM_CHANNELS" -v w="$BYTES_PER_BEAT" -v per="$SAMPLER_PERIOD" -v out="$SAMPLES" '
+    BEGIN{ n=split(chans,c," "); for(i=1;i<=n;i++) want["amd_df/dram_channel_data_controller_" c[i] "/"]=1 }
+    $1 ~ /^[ ]*[0-9.]+$/ && ($4 in want) {
+      t=$1+0; if (t != cur) { if (k == n) { printf "%d\t%.3f\n", start+cur, acc*w/per/1e9 >> out; fflush(out) } cur=t; acc=0; k=0 }
+      acc+=$2; k++
+    }
+    END{ if (k == n) { printf "%d\t%.3f\n", start+cur, acc*w/per/1e9 >> out; fflush(out) } }' < "$fifo" &
+  AWKPID=$!
+  # `wait`, not a foreground child: bash defers a trapped signal until the FOREGROUND command
+  # returns, so with the awk in the foreground the TERM handler never ran and the cleanup that
+  # exists to reap the root perf was itself unreachable. The orphan --test leg caught exactly this.
+  # And `wait -n` on BOTH, not just the awk: the fifo's write end is held by `sudo`, not by perf, so
+  # a perf that dies alone never gives the awk its EOF — one stuck wrapper sat in do_wait for 5
+  # minutes exactly that way, alive to the supervisor, producing nothing. Whichever side goes first,
+  # the other is killed and the loop opens a fresh chunk.
+  wait -n "$sp" "$AWKPID" 2>/dev/null
+  $SUDO kill -TERM "$sp" 2>/dev/null
+  kill "$AWKPID" 2>/dev/null
+  wait "$sp" "$AWKPID" 2>/dev/null
+  AWKPID=""; rm -f "$fifo" "$PERFPID" 2>/dev/null
+}
+
+# ── --test ───────────────────────────────────────────────────────────────────────────────────────
+if [ "${1:-}" = --test ]; then
+  if [ -z "${MESH_TEST_TMPD:-}" ]; then
+    MESH_TEST_TMPD="$(mktemp -d)" || { echo "smoke-test: FAIL (tmp fence: mktemp -d)"; exit 1; }
+    trap 'rm -rf "$MESH_TEST_TMPD"' EXIT INT HUP TERM
+    export MESH_TEST_TMPD TMPDIR="$MESH_TEST_TMPD" TMP="$MESH_TEST_TMPD" TEMP="$MESH_TEST_TMPD"
+    _rc=0; "$0" "$@" || _rc=$?; exit "$_rc"
+  fi
+  export MESH_TEST_SANDBOX=1
+  _live_state="$HOME/.mesh/.dram-bw.state"; _live_log="$HOME/.mesh/dram-bw.log"
+  _sig="$(stat -c '%y %s' "$_live_state" 2>/dev/null || echo absent)|$(stat -c '%y %s' "$_live_log" 2>/dev/null || echo absent)"
+  for c in awk perf sudo stat date; do command -v "$c" >/dev/null 2>&1 || { echo "smoke-test: n/a (no $c on this node)"; exit 2; }; done
+  td="$(mktemp -d)" || { echo "smoke-test: FAIL (mktemp)"; exit 1; }
+  # _sw is the orphan leg's sampler: it MUST die on every exit path, including the FAIL ones. A
+  # failing leg once left its own sampler parked in do_wait, where the supervisor read it as UP.
+  _sw=""
+  # (reap only when THIS test started a sampler — the leg is skipped while production holds the
+  #  lock, and an unconditional reap here would kill the live organ's perf.)
+  trap 'rm -rf "$td"; [ -n "$_sw" ] && { kill "$_sw" 2>/dev/null; sleep 1; reap_orphans; }' EXIT
+
+  # 1. fold_axis — the max that names its winner
+  [ "$(fold_axis 5 40)"   = "40 iv" ]    || { echo "smoke-test: FAIL (iv 40 > inst 5 must win as iv)"; exit 1; }
+  [ "$(fold_axis 40 5)"   = "40 inst" ]  || { echo "smoke-test: FAIL (inst 40 > iv 5 must win as inst)"; exit 1; }
+  [ "$(fold_axis 40 na)"  = "40 inst" ]  || { echo "smoke-test: FAIL (an na iv must degrade to inst)"; exit 1; }
+  [ "$(fold_axis 7 7)"    = "7 inst" ]   || { echo "smoke-test: FAIL (a tie must resolve to inst)"; exit 1; }
+
+  # 2. the channel set is exactly the declared width, and a foreign channel cannot enter the sum.
+  #    ch2 in this fixture carries a huge value: if it were summed, beats would be 3000000, not 300.
+  cat >"$td/perf.csv" <<'EOF'
+100,,amd_df/dram_channel_data_controller_0/,2000000000,100.00,,
+200,,amd_df/dram_channel_data_controller_1/,2000000000,100.00,,
+2999700,,amd_df/dram_channel_data_controller_2/,2000000000,100.00,,
+EOF
+  got="$(sum_beats <"$td/perf.csv")" || { echo "smoke-test: FAIL (sum_beats rejected a well-formed fixture)"; exit 1; }
+  [ "$got" = 300 ] || { echo "smoke-test: FAIL (sum must be ch0+ch1=300, got $got — a foreign channel entered the total)"; exit 1; }
+  printf '100,,amd_df/dram_channel_data_controller_0/,2000000000,100.00,,\n' >"$td/half.csv"
+  sum_beats <"$td/half.csv" >/dev/null 2>&1 && { echo "smoke-test: FAIL (a missing declared channel must fail, not half-report)"; exit 1; }
+
+  # 3. classify is calibrated against the measured corpus, and UNRATED when the ceiling is unknown
+  [ "$(classify 92)" = SATURATED ] || { echo "smoke-test: FAIL (92% must be SATURATED)"; exit 1; }
+  [ "$(classify 67)" = BUSY ]      || { echo "smoke-test: FAIL (67% must be BUSY)"; exit 1; }
+  [ "$(classify 12)" = LIGHT ]     || { echo "smoke-test: FAIL (12% must be LIGHT)"; exit 1; }
+  [ "$(classify 3)"  = IDLE ]      || { echo "smoke-test: FAIL (3% must be IDLE)"; exit 1; }
+  [ "$(classify na)" = UNRATED ]   || { echo "smoke-test: FAIL (an underived ceiling must be UNRATED, never a rated 0)"; exit 1; }
+
+  # 4. the interval lane: coverage is COMPUTED from the rows, and a stale sampler renders na (not 0)
+  _now="$(date +%s)"
+  : > "$td/state"; printf 'cursor=%s\n' "$((_now-100))" >> "$td/state"
+  : > "$td/samples"
+  for i in $(seq 1 50); do printf '%d\t1.500\n' "$((_now-100+i))" >> "$td/samples"; done
+  read -r _m _p _c _n <<<"$(STATE="$td/state" SAMPLES="$td/samples" bash -c 'STATE="'"$td/state"'"; SAMPLES="'"$td/samples"'"; SAMPLER_LEASE=120; SAMPLER_PERIOD=1; '"$(declare -f interval_from_sampler)"'; interval_from_sampler')"
+  [ "$_c" = 50 ] || { echo "smoke-test: FAIL (50 rows over a 100 s span must report 50% coverage, got $_c)"; exit 1; }
+  [ "$_m" = 1.50 ] || { echo "smoke-test: FAIL (interval mean must be 1.50, got $_m)"; exit 1; }
+  # duplicate rows (two samplers on one log) must not mint coverage: 100 rows over a 100 s span with
+  # every timestamp doubled is still 50 distinct seconds, i.e. 50% — not 100%.
+  cp "$td/samples" "$td/dup"; cat "$td/samples" >> "$td/dup"
+  read -r _md _pd _cd _nd <<<"$(bash -c 'STATE="'"$td/state"'"; SAMPLES="'"$td/dup"'"; SAMPLER_LEASE=120; SAMPLER_PERIOD=1; '"$(declare -f interval_from_sampler)"'; interval_from_sampler')"
+  [ "$_cd" = 50 ] || { echo "smoke-test: FAIL (duplicated rows minted coverage: 50 distinct seconds reported as $_cd%)"; exit 1; }
+  : > "$td/stale"; printf '%d\t9.000\n' "$((_now-9999))" >> "$td/stale"
+  read -r _m2 _p2 _c2 _n2 <<<"$(bash -c 'STATE="'"$td/state"'"; SAMPLES="'"$td/stale"'"; SAMPLER_LEASE=120; SAMPLER_PERIOD=1; '"$(declare -f interval_from_sampler)"'; interval_from_sampler')"
+  [ "$_m2" = na ] || { echo "smoke-test: FAIL (a sampler stale past its lease must render na, got $_m2)"; exit 1; }
+
+  # 5. THE GATE, DRIVEN RED. Two ways, because each covers what the other cannot.
+  #    5a. perf itself failing (the unloaded-module error is rc=129 with "Cannot find PMU") must
+  #        render `na` with a reason and exit 2 — never a 0.00 GB/s reading.
+  cat >"$td/perf-stub" <<'EOF'
+#!/bin/sh
+echo "event syntax error: 'amd_df/dram_channel_data_controller_0/'" >&2
+echo "Cannot find PMU \`amd_df'. Missing kernel support?" >&2
+exit 129
+EOF
+  chmod +x "$td/perf-stub"
+  out="$(MESH_DRAM_PERF="$td/perf-stub" MESH_DRAM_SUDO= "$0" 2>&1)"; rc=$?
+  [ "$rc" = 2 ] || { echo "smoke-test: FAIL (a perf that errors must exit 2, got rc=$rc: $out)"; exit 1; }
+  case "$out" in *na*reason=perf-rc=129*) :;; *) echo "smoke-test: FAIL (a failing perf must render na with its reason, got: $out)"; exit 1;; esac
+  case "$out" in *0.00*) echo "smoke-test: FAIL (a failing perf rendered a 0.00 reading: $out)"; exit 1;; esac
+  #    5b. a perf that succeeds but reports a ZERO delta is the other half of the gate — a counter
+  #        that is present and dead must not read as a calm 0 GB/s.
+  cat >"$td/perf-zero" <<'EOF'
+#!/bin/sh
+echo "0,,amd_df/dram_channel_data_controller_0/,2000000000,100.00,,"
+echo "0,,amd_df/dram_channel_data_controller_1/,2000000000,100.00,,"
+exit 0
+EOF
+  chmod +x "$td/perf-zero"
+  out="$(MESH_DRAM_PERF="$td/perf-zero" MESH_DRAM_SUDO= "$0" 2>&1)"; rc=$?
+  [ "$rc" = 2 ] || { echo "smoke-test: FAIL (a zero delta must exit 2, got rc=$rc: $out)"; exit 1; }
+  case "$out" in *reason=zero-delta*) :;; *) echo "smoke-test: FAIL (a zero delta must say so, got: $out)"; exit 1;; esac
+
+  # 6. sandbox honesty — nothing above may have touched the live artifacts
+  _sig2="$(stat -c '%y %s' "$_live_state" 2>/dev/null || echo absent)|$(stat -c '%y %s' "$_live_log" 2>/dev/null || echo absent)"
+  [ "$_sig2" = "$_sig" ] || { echo "smoke-test: FAIL (--test stamped the LIVE artifacts: '$_sig' → '$_sig2')"; exit 1; }
+
+  # 7. LIVE legs — the organ itself. Absent hardware is an honest n/a (exit 2), never a fail.
+  grep -qi 'AuthenticAMD' /proc/cpuinfo 2>/dev/null || { echo "smoke-test: n/a (not an AMD node — no Data Fabric uncore PMU)"; exit 2; }
+  sudo -n true >/dev/null 2>&1 || { echo "smoke-test: n/a (no passwordless sudo — perf_event_paranoid=4 needs root to read uncore)"; exit 2; }
+  _was_loaded=0; [ -d "$SYSFS_DF" ] && _was_loaded=1
+  arm || { echo "smoke-test: n/a (amd_df absent and modprobe amd_uncore failed)"; exit 2; }
+  live="$(MESH_DRAM_SAMPLE_SECS=1 "$0" --json 2>&1)"; rc=$?
+  [ "$rc" = 0 ] || { echo "smoke-test: FAIL (live read failed rc=$rc: $live)"; exit 1; }
+  printf '%s\n' "$live" | grep -qE '"gbps":[0-9]+\.[0-9]+' || { echo "smoke-test: FAIL (live read produced no gbps: $live)"; exit 1; }
+  printf '%s\n' "$live" | grep -q '"gbps":0.00' && { echo "smoke-test: FAIL (live read produced 0.00 GB/s — a live node always moves some DRAM)"; exit 1; }
+
+  # 8. THE REAL KERNEL STATE, BOTH DIRECTIONS — unload amd_uncore and drive the tool twice.
+  #    The first version of this leg asserted "unloaded → red" and went GREEN-then-FAIL for the right
+  #    reason: a SELF-ARMING tool re-modprobes and reads fine, so "unloaded" is not the failure mode
+  #    at all. What actually fails is unloaded AND unable to arm (a uid-1000 caller: no sudo to
+  #    modprobe, and perf_event_paranoid=4 refuses the read anyway). So this leg asserts both:
+  #      · unloaded + unprivileged → na, rc 2, never a 0.00 calm
+  #      · unloaded + privileged   → SELF-ARMS and reads, and amd_df is present afterwards
+  #    rmmod refuses while any perf event is open (a running sampler holds one), which is the
+  #    interlock: a busy module SKIPS this leg LOUDLY rather than fighting a live reader.
+  _red=SKIPPED
+  if sudo -n modprobe -r amd_uncore >/dev/null 2>&1; then
+    [ -d "$SYSFS_DF" ] && { sudo -n modprobe amd_uncore >/dev/null 2>&1; echo "smoke-test: FAIL (modprobe -r reported success but amd_df is still present — the unload leg would assert nothing)"; exit 1; }
+    out2="$(MESH_DRAM_SUDO= MESH_DRAM_SAMPLE_SECS=1 "$0" 2>&1)"; rc2=$?
+    if [ "$rc2" != 2 ]; then sudo -n modprobe amd_uncore >/dev/null 2>&1; echo "smoke-test: FAIL (unloaded + unprivileged must exit 2, got rc=$rc2: $out2)"; exit 1; fi
+    case "$out2" in *na*unarmed*) :;; *) sudo -n modprobe amd_uncore >/dev/null 2>&1; echo "smoke-test: FAIL (unloaded + unprivileged must render na unarmed, got: $out2)"; exit 1;; esac
+    case "$out2" in *0.00*) sudo -n modprobe amd_uncore >/dev/null 2>&1; echo "smoke-test: FAIL (unloaded rendered a 0.00 reading: $out2)"; exit 1;; esac
+    out3="$(MESH_DRAM_SAMPLE_SECS=1 "$0" 2>&1)"; rc3=$?
+    [ "$rc3" = 0 ] || { sudo -n modprobe amd_uncore >/dev/null 2>&1; echo "smoke-test: FAIL (self-arm from an unloaded module failed rc=$rc3: $out3)"; exit 1; }
+    [ -d "$SYSFS_DF" ] || { sudo -n modprobe amd_uncore >/dev/null 2>&1; echo "smoke-test: FAIL (the run reported a reading but left no amd_df — it did not really arm)"; exit 1; }
+    _red="red+self-arm verified against a really-unloaded module"
+  else
+    _red="SKIPPED (amd_uncore busy or absent — a live reader holds the counter; 5a/5b cover the same branch via stub)"
+  fi
+  # leave the module as this test found it
+  [ "$_was_loaded" = 1 ] || sudo -n modprobe -r amd_uncore >/dev/null 2>&1
+
+  # 9. THE ORPHAN LEG — the leak this tool actually caused: a killed sampler leaving a ROOT perf
+  #    holding DF counters forever. Drive a real sampler, kill its wrapper, assert nothing survives.
+  #    Skipped LOUDLY (never silently) while a production sampler holds the lock, because the reaper
+  #    cannot distinguish another sampler's perf from a stranded one and would reap the live organ.
+  _orph=SKIPPED
+  if command -v flock >/dev/null 2>&1 && flock -n "$MESH/.dram-bw-sampler.lock" true 2>/dev/null; then
+    MESH_DIR="$td" MESH_DRAM_SAMPLES="$td/s.log" "$0" --sampler >/dev/null 2>&1 &
+    _sw=$!
+    for _i in $(seq 1 20); do sleep 0.5; [ -n "$(perf_sessions)" ] && break; done
+    [ -n "$(perf_sessions)" ] || { kill "$_sw" 2>/dev/null; echo "smoke-test: FAIL (the sampler opened no perf session at all)"; exit 1; }
+    sleep 3   # the session appears within ~0.3 s; rows only start at the first 1 Hz tick
+    kill "$_sw" 2>/dev/null; sleep 3
+    if [ -n "$(perf_sessions)" ]; then
+      reap_orphans
+      echo "smoke-test: FAIL (a killed sampler stranded its ROOT perf — the DF counters leak, refcnt never drops)"; exit 1
+    fi
+    [ -s "$td/s.log" ] || { echo "smoke-test: FAIL (the sampler wrote no rows before it was killed)"; exit 1; }
+    _orph="reaped (real sampler killed, no root perf survived, $(wc -l < "$td/s.log") rows written)"
+  else
+    _orph="SKIPPED (a production sampler holds the lock — reaping it would kill the live organ)"
+  fi
+
+  _sig3="$(stat -c '%y %s' "$_live_state" 2>/dev/null || echo absent)|$(stat -c '%y %s' "$_live_log" 2>/dev/null || echo absent)"
+  [ "$_sig3" = "$_sig" ] || { echo "smoke-test: FAIL (the live legs stamped the LIVE artifacts)"; exit 1; }
+  echo "smoke-test: ok (fold + channel-width + calibration classify + coverage/lease fixtures; live uncore read; gate red via stub rc=129 and zero-delta; unload leg: $_red; orphan leg: $_orph)"
+  exit 0
+fi
+
+# ── run ─────────────────────────────────────────────────────────────────────────────────────────
+JSON=0
+for a in "$@"; do
+  case "$a" in
+    --json)    JSON=1 ;;
+    --sampler) run_sampler; exit 0 ;;
+  esac
+done
+
+TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+na() {   # $1 = reason
+  if [ "$JSON" = 1 ]; then
+    printf '{"level":"na","gbps":null,"reason":"%s","ts":"%s"}\n' "$1" "$TS"
+  else
+    printf '[dram-bw] na — reason=%s (no reading; the counter is not a calm 0) @ %s\n' "$1" "$TS"
+  fi
+  exit 2
+}
+
+arm || na "unarmed:modprobe-amd_uncore-failed"
+
+reason="$( { inst="$(sample_gbps "$SAMPLE_SECS")"; } 2>&1 1>/dev/null )"
+inst="$(sample_gbps "$SAMPLE_SECS" 2>/dev/null)" || na "$reason"
+[ -n "$inst" ] || na "${reason:-empty-read}"
+
+read -r iv_mean iv_peak iv_cov iv_rows <<<"$(interval_from_sampler)"
+read -r fold_val fold_win <<<"$(fold_axis "$inst" "$iv_mean")"
+
+peak="$(peak_gbps)"
+if [ "$peak" = na ]; then
+  pct=na
+else
+  pct="$(awk -v v="$fold_val" -v p="$peak" 'BEGIN{ printf "%.1f", v*100/p }')"
+fi
+level="$(classify "$pct")"
+
+if [ "$iv_mean" = na ]; then
+  cov="inst-only(${SAMPLE_SECS}s)"
+else
+  cov="${iv_cov}%(${iv_rows}rows)"
+fi
+
+# state: the cursor for the next interval delta + the reading. mtime is LIVENESS (the tool ran),
+# content is the value — decoupled on purpose (liveness-touch convention).
+{
+  printf 'cursor=%s\n' "$(date +%s)"
+  printf 'level=%s|gbps=%s|window=%s|inst=%s|iv=%s|iv_peak=%s|cov=%s|peak=%s|pct=%s|ch=%s|ts=%s\n' \
+    "$level" "$fold_val" "$fold_win" "$inst" "$iv_mean" "$iv_peak" "$cov" "$peak" "$pct" "$(echo $DRAM_CHANNELS | tr ' ' '+')" "$TS"
+} > "$STATE"
+command -v mesh-state-touch >/dev/null 2>&1 && mesh-state-touch "$STATE" >/dev/null 2>&1
+
+prev="$(awk -F'|' '/^level=/{split($1,a,"="); print a[2]}' "$STATE.prev" 2>/dev/null | tail -1)"
+if [ "$level" != "${prev:-}" ]; then
+  printf '%s %s gbps=%s window=%s inst=%s iv=%s iv_peak=%s cov=%s pct=%s\n' \
+    "$TS" "$level" "$fold_val" "$fold_win" "$inst" "$iv_mean" "$iv_peak" "$cov" "$pct" >> "$LOG"
+  grep '^level=' "$STATE" > "$STATE.prev" 2>/dev/null
+fi
+
+if [ "$JSON" = 1 ]; then
+  printf '{"level":"%s","gbps":%s,"window":"%s","inst_gbps":%s,"iv_gbps":%s,"iv_peak_gbps":%s,"coverage":"%s","peak_gbps":%s,"pct_of_peak":%s,"channels":"%s","bytes_per_beat":%s,"ts":"%s"}\n' \
+    "$level" "$fold_val" "$fold_win" "$inst" \
+    "$( [ "$iv_mean" = na ] && echo null || echo "$iv_mean" )" \
+    "$( [ "$iv_peak" = na ] && echo null || echo "$iv_peak" )" \
+    "$cov" "$( [ "$peak" = na ] && echo null || echo "$peak" )" \
+    "$( [ "$pct" = na ] && echo null || echo "$pct" )" \
+    "$(echo $DRAM_CHANNELS | tr ' ' '+')" "$BYTES_PER_BEAT" "$TS"
+else
+  printf '[dram-bw] %s — %s GB/s (%s%% of %s peak) window=%s inst=%s iv=%s iv_peak=%s cov=%s ch=%s @ %s\n' \
+    "$level" "$fold_val" "$pct" "$peak" "$fold_win" "$inst" "$iv_mean" "$iv_peak" "$cov" \
+    "$(echo $DRAM_CHANNELS | tr ' ' '+')" "$TS"
+fi
