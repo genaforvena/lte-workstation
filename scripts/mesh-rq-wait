@@ -1,0 +1,702 @@
+#!/usr/bin/env python3
+# reflex-cadence: 4-59/10 * * * *
+# reflex-args: --log
+"""mesh-rq-wait — WHICH TASK is starved: per-thread run-queue wait from /proc/<pid>/task/<tid>/schedstat.
+
+mesh-psi answers HOW MUCH the node stalls; mesh-psi-attrib answers WHICH CGROUP owns it.
+Neither can answer WHO — on this node every reflex, mind and shell pipeline lives inside the
+SAME user.slice/session-*.scope, so per-cgroup pressure structurally cannot separate a mind
+from the 270 forks/s of shell around it. This is that subject axis:
+
+    /proc/<tid>/schedstat = sum_exec_runtime_ns  run_delay_ns  pcount
+                            (time ON cpu)   (RUNNABLE but NOT running)  (switches)
+
+Unprivileged, zero probe traffic, and a monotonic ACCUMULATOR — delta'd across an interval it
+covers 100% of that interval in TIME (`a-senses-coverage-is-window-over-cadence`).
+
+Four things this tool must never do, each one a live trap that was measured, not imagined
+(discover's capability file + health's independent re-derivation, both 2026-08-16, in
+~/.mesh/knowledge/{capability-per-task-runqueue-wait-names-who-is-starved,verify-per-task-runqueue-wait-health}-*.md):
+
+1. GATE ON THE ENABLE BIT. `kernel.sched_schedstats` reads 0 on this node while `run_delay`
+   demonstrably advances (+13020ns over 5s on pid 1, measured at sysctl=0). A tool gating on the
+   sysctl renders n/a on a LIVE counter. Probe the DELTA; render n/a only when the counter is
+   FROZEN across a window in which /proc/stat busy moved.
+2. WALK /proc/<pid>. That sees leader threads only — 7.3% subject coverage vs 14.0% for the
+   per-thread walk, measured on the same node minutes apart. The step is free; take it.
+3. SORT OR ALARM ON THE WAIT FRACTION. wait/(run+wait) INVERTS the two regimes: an idle node's
+   top row is a kworker at 84.7% on 0.021s, a saturated node's is a whisper thread at 70.9% on
+   14.054s. The IDLE fraction is HIGHER. Any top-N or threshold keyed on the fraction fires
+   forever on idle kworkers and goes quiet exactly when work is starving. Absolute cpu-seconds
+   is the sort key and the alarm; the fraction is a per-row DESCRIPTOR.
+4. RENDER THE UNATTRIBUTED RESIDUAL AS 0. Tasks born AND died inside the window are invisible to
+   any two-sample delta and their wait is unknowable — `na`, never 0, or the reading is a
+   fabricated calm (`na-must-be-a-claim-about-the-node`).
+
+SUBJECT COVERAGE IS PUBLISHED PER READING AND IS NOT A CONSTANT. It is load-dependent and it is
+HIGHEST EXACTLY WHEN THE SENSE IS NEEDED: 11.4% idle / 13.1% across a real 29-reflex cron burst /
+**95.3% under 3 concurrent whisper.cpp**. The ~14% idle figure must never be quoted as "the
+sense's coverage" — it is the coverage of the regime where the reading does not matter. The
+residual at idle is short-lived fork churn (270 forks/s, mesh-proc-churn's own quantity), which
+dominates the ratio only while nothing real runs; real work is long-lived threads, and long-lived
+threads are precisely what a two-sample delta catches.
+
+TWO WINDOWS, both published, folded by a max that NAMES its winner:
+  inst — two samples MESH_RQWAIT_SECS apart. Catches a burst happening right now at high subject
+         coverage, but is a SAMPLE: at a 10-min cadence a 2s window sees 0.33% of wallclock.
+  iv   — this sample against the PREVIOUS TICK's persisted one. Covers 100% of the cron interval
+         for every thread that survived it, at the cost of diluting a sharp spike.
+They answer different questions, so neither replaces the other (this is mesh-psi's fe35dd9 lesson
+applied to a second surface). `window=inst+iv` in the reading says both were live; `inst-only`
+says the interval arm had no usable prior state and is NOT claiming a quiet interval.
+
+The aggregate is over ATTRIBUTED rows only, so it is a LOWER BOUND and prints as `agg>=`.
+
+  mesh-rq-wait                 one reading
+  mesh-rq-wait --json          machine form
+  mesh-rq-wait --top N         show N subjects (default 8)
+  mesh-rq-wait --log           append the reading to ~/.mesh/rq-wait.log (the reflex form)
+  mesh-rq-wait --test          self-test: fixtures + 5 mutants + a real live /proc read
+
+Exit 2 (honest n/a, never a fabricated calm) when /proc is unreadable, when schedstat is absent,
+or when the counter is frozen across a busy window.
+"""
+import json
+import os
+import sys
+import time
+
+import signal
+# SIGTERM MUST UNWIND, or every `finally` in this file is decorative. Python's DEFAULT SIGTERM
+# disposition terminates the interpreter WITHOUT running finally blocks, so a correct-looking
+# cleanup never runs. GNU `timeout` wraps EVERY `--test` in mesh-doctor's hourly sweep and in
+# mesh-autowire, and signals the whole process group. sys.exit() from the handler raises
+# SystemExit in the main thread, which is what actually unwinds. SIGKILL stays uncatchable; that
+# half is mesh-tmp-guard's sweep. Pattern and the measured mechanism: eb5b8e7, scripts/mesh-spend.
+for _sig in (signal.SIGTERM, signal.SIGHUP):
+    signal.signal(_sig, lambda _s, _f: sys.exit(128 + _s))
+
+PROC = os.environ.get("MESH_RQWAIT_PROC", "/proc")
+PROC2 = os.environ.get("MESH_RQWAIT_PROC2", "")          # 2nd snapshot root (fixtures); "" = re-read PROC
+WINDOW_OVERRIDE = os.environ.get("MESH_RQWAIT_WINDOW_S", "")  # fixture window length (no wall clock)
+STATE = os.environ.get("MESH_RQWAIT_STATE", os.path.expanduser("~/.mesh/.rq-wait.state"))
+LOG = os.environ.get("MESH_RQWAIT_LOG", os.path.expanduser("~/.mesh/rq-wait.log"))
+SECS = float(os.environ.get("MESH_RQWAIT_SECS", "2.0"))
+TOPN_DEFAULT = int(os.environ.get("MESH_RQWAIT_TOP", "8"))
+IV_MAX = float(os.environ.get("MESH_RQWAIT_IV_MAX", "3600"))   # older state → the iv arm is n/a
+LOG_KEEP = int(os.environ.get("MESH_RQWAIT_LOG_KEEP", "2000"))
+
+# The sort key is the ABSOLUTE run-queue wait, never the fraction — trap 3 in the header.
+SORT_KEY = "wait_ns"   # MUTANT:sortkey
+
+
+def _read(path):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            return fh.read()
+    except OSError:
+        return None
+
+
+def _read_int(path):
+    """First integer in a file, or None. Only the sysctl MUTANT calls this — the live tool
+    deliberately never reads an enable bit (trap 1)."""
+    s = _read(path)
+    if not s:
+        return None
+    try:
+        return int(s.split()[0])
+    except (ValueError, IndexError):
+        return None
+
+
+def tids_of(proot, pid):
+    """Every THREAD of a process. The pid-level walk sees leader threads only and halves subject
+    coverage (7.3% vs 14.0%, measured on this node) — trap 2."""
+    try:
+        return sorted(os.listdir(os.path.join(proot, pid, "task")))   # MUTANT:walk
+    except OSError:
+        return []
+
+
+def sample(proot):
+    """One full per-thread schedstat walk. Returns {"rows": {(pid,tid): (run,wait,nsw)},
+    "busy_s": float|None, "ncpu": int, "ts": float, "scan_ms": float} or None if /proc is
+    unreadable. Names are NOT resolved here — that cost is paid for the reported rows only."""
+    t0 = time.time()
+    try:
+        pids = [d for d in os.listdir(proot) if d.isdigit()]
+    except OSError:
+        return None
+    rows = {}
+    for pid in pids:
+        for tid in tids_of(proot, pid):
+            s = _read(os.path.join(proot, pid, "task", tid, "schedstat"))
+            if s is None:
+                continue                       # the thread exited mid-walk — normal, not an error
+            f = s.split()
+            if len(f) < 3:
+                continue
+            try:
+                rows[(pid, tid)] = (int(f[0]), int(f[1]), int(f[2]))
+            except ValueError:
+                continue
+    scan_ms = (time.time() - t0) * 1000.0
+    bt, ncpu = busy_ticks(proot)
+    hz = os.sysconf("SC_CLK_TCK") or 100
+    return {"rows": rows, "busy_s": (None if bt is None else bt / hz), "ncpu": ncpu,
+            "ts": time.time(), "scan_ms": scan_ms}
+
+
+def busy_ticks(proot):
+    """(busy_ticks, ncpu) from /proc/stat — busy = total - idle - iowait. (None, n) if
+    unreadable, which makes coverage render `na` rather than a fabricated 100%."""
+    s = _read(os.path.join(proot, "stat"))
+    if s is None:
+        return None, 0
+    busy = None
+    ncpu = 0
+    for line in s.splitlines():
+        f = line.split()
+        if not f:
+            continue
+        if f[0] == "cpu" and busy is None:
+            try:
+                v = [int(x) for x in f[1:9]]
+            except ValueError:
+                return None, 0
+            busy = sum(v) - v[3] - v[4]
+        elif f[0].startswith("cpu") and f[0][3:].isdigit():
+            ncpu += 1
+    return busy, max(ncpu, 1)
+
+
+def keep_row(dr, dw):
+    """Tid reuse (a recycled pid/tid pair) and a counter reset both give a NEGATIVE delta.
+    DROP the row — letting it through would SUBTRACT from the aggregate, silently shrinking
+    the very quantity the sense exists to report."""
+    return dr >= 0 and dw >= 0   # MUTANT:negdrop
+
+
+def delta_rows(prev, cur):
+    """Per-thread deltas for threads present in BOTH samples. Returns (rows, dropped)."""
+    out = []
+    dropped = 0
+    for k, c in cur.items():
+        p = prev.get(k)
+        if p is None:
+            continue                            # born inside the window — unattributable, not 0
+        dr, dw, dn = c[0] - p[0], c[1] - p[1], c[2] - p[2]
+        if not keep_row(dr, dw):
+            dropped += 1
+            continue
+        out.append({"pid": k[0], "tid": k[1], "run_ns": dr, "wait_ns": dw, "switches": dn,
+                    # descriptor ONLY — never the sort key, never a threshold (trap 3)
+                    "frac": (dw / (dr + dw)) if (dr + dw) > 0 else 0.0})
+    return out, dropped
+
+
+def busy_delta(before_s, after_s):
+    """/proc/stat busy is CUMULATIVE since boot; coverage wants the window's share of it.
+    None (→ coverage `na`) when either end is missing or the delta is negative — a reboot
+    reset the counter, and a negative denominator is not a 100%-covered window."""
+    if before_s is None or after_s is None:
+        return None
+    d = after_s - before_s
+    return None if d < 0 else d
+
+
+def coverage(attributed_run_s, busy_s):
+    """Subject coverage = attributed run time / /proc/stat busy over the SAME window.
+    None (→ `na`) when busy is unknown or zero: absence of evidence is not 100% coverage."""
+    if busy_s is None or busy_s <= 0:
+        return None
+    return attributed_run_s / busy_s
+
+
+def residual_wait_render(cov):
+    """The wait of threads born AND died inside the window. Two honest answers only:
+    0 when every busy cpu-second WAS attributed (nothing is hiding), `na` otherwise —
+    the residual's wait is not small, it is UNKNOWABLE from a two-sample delta (trap 4)."""
+    if cov is not None and cov >= 0.999:
+        return "0.0"
+    return "na"   # MUTANT:residual
+
+
+def counter_gate(dr_total, dw_total, busy_s, proot):
+    """The ONLY n/a condition for the counter: frozen across a window in which the CPU was
+    demonstrably busy. Deliberately NOT a read of kernel.sched_schedstats — that bit reads 0
+    on this node while the counter advances, so gating on it renders n/a on a live sense
+    (trap 1). Returns a reason string, or None to proceed."""
+    if dr_total == 0 and dw_total == 0 and busy_s is not None and busy_s > 0.05:   # MUTANT:gate
+        return "schedstat counters frozen across a window with %.2f busy cpu-s" % busy_s
+    return None
+
+
+def fold(inst_rate, iv_rate):
+    """Fold the two windows with a max that NAMES its winner (mesh-psi's rule, second surface).
+    A tie resolves to `inst` — the narrower, more conservative claim."""
+    if iv_rate is None:
+        return inst_rate, "inst"
+    if iv_rate > inst_rate:
+        return iv_rate, "iv"
+    return inst_rate, "inst"
+
+
+def classify(wait_per_core):
+    """Bands are UNIT-DERIVED, not fitted to a corpus that would rot underneath them
+    (`a-constant-outlives-its-reader`). The unit is cpu-seconds of run-queue wait per
+    wall-second per core — i.e. the average number of runnable-but-not-running threads
+    each core is carrying. 1.0 means every core has, on average, a whole extra thread
+    waiting behind whatever it is running."""
+    if wait_per_core >= 1.0:
+        return "STARVED"
+    if wait_per_core >= 0.10:
+        return "WAITING"
+    return "CALM"
+
+
+def name_row(proot, pid, tid):
+    """comm + a slice of the leader's cmdline, resolved ONLY for reported rows. The cmdline is
+    what carries the granularity a cgroup arm cannot reach — three whisper.cpp runs in one scope
+    are one cgroup but three distinct model arguments."""
+    comm = (_read(os.path.join(proot, pid, "task", tid, "comm")) or "?").strip()
+    cmd = _read(os.path.join(proot, pid, "cmdline")) or ""
+    cmd = " ".join(cmd.replace("\0", " ").split())[:70]
+    return comm, cmd
+
+
+def load_state(path):
+    """Previous tick's sample: 'ts busy_s' header then 'pid tid run wait nsw' lines."""
+    s = _read(path)
+    if not s:
+        return None
+    lines = s.splitlines()
+    if not lines:
+        return None
+    try:
+        h = lines[0].split()
+        ts = float(h[0])
+        busy_s = None if h[1] == "na" else float(h[1])
+    except (ValueError, IndexError):
+        return None
+    rows = {}
+    for line in lines[1:]:
+        f = line.split()
+        if len(f) != 5:
+            continue
+        try:
+            rows[(f[0], f[1])] = (int(f[2]), int(f[3]), int(f[4]))
+        except ValueError:
+            continue
+    return {"rows": rows, "busy_s": busy_s, "ts": ts}
+
+
+def save_state(path, snap):
+    d = os.path.dirname(path)
+    if d and not os.path.isdir(d):
+        try:
+            os.makedirs(d, exist_ok=True)
+        except OSError:
+            return
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write("%.3f %s\n" % (snap["ts"], "na" if snap["busy_s"] is None else "%.3f" % snap["busy_s"]))
+            for (pid, tid), v in snap["rows"].items():
+                fh.write("%s %s %d %d %d\n" % (pid, tid, v[0], v[1], v[2]))
+        os.replace(tmp, path)                 # atomic: a reader never sees a half-written tick
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def arm(prev_rows, cur_rows, window_s, busy_s, ncpu):
+    """One window's reading: sorted rows + aggregates + coverage. window_s<=0 → None (an
+    undefined window is not a quiet one)."""
+    if window_s is None or window_s <= 0:
+        return None
+    rows, dropped = delta_rows(prev_rows, cur_rows)
+    agg_wait_s = sum(r["wait_ns"] for r in rows) / 1e9
+    agg_run_s = sum(r["run_ns"] for r in rows) / 1e9
+    rows.sort(key=lambda r: (-r[SORT_KEY], r["pid"], r["tid"]))
+    cov = coverage(agg_run_s, busy_s)
+    return {"rows": rows, "dropped": dropped, "window_s": window_s,
+            "agg_wait_s": agg_wait_s, "agg_run_s": agg_run_s,
+            "wait_rate": agg_wait_s / window_s,
+            "wait_per_core": agg_wait_s / window_s / max(ncpu, 1),
+            "coverage": cov, "residual_wait": residual_wait_render(cov)}
+
+
+# ─────────────────────────────── self-test ───────────────────────────────
+
+def _mkproc(root, spec, busy_s, ncpu=1, schedstats="0"):
+    """Plant a fixture /proc. spec: {pid: (cmdline, {tid: (run_ns, wait_ns, nsw)})}."""
+    hz = os.sysconf("SC_CLK_TCK") or 100
+    os.makedirs(os.path.join(root, "sys", "kernel"), exist_ok=True)
+    with open(os.path.join(root, "sys", "kernel", "sched_schedstats"), "w") as fh:
+        fh.write(schedstats + "\n")           # the enable bit LIES: 0 while the counters advance
+    with open(os.path.join(root, "stat"), "w") as fh:
+        fh.write("cpu  %d 0 0 100000 0 0 0 0 0 0\n" % int(busy_s * hz))
+        for i in range(ncpu):
+            fh.write("cpu%d 0 0 0 0 0 0 0 0 0 0\n" % i)
+        fh.write("processes 12345\n")
+    for pid, (cmdline, tids) in spec.items():
+        with open(os.path.join(root, pid, "cmdline") if os.path.isdir(os.path.join(root, pid))
+                  else _mkd(root, pid, "cmdline"), "w") as fh:
+            fh.write(cmdline.replace(" ", "\0"))
+        for tid, v in tids.items():
+            td = os.path.join(root, pid, "task", tid)
+            os.makedirs(td, exist_ok=True)
+            with open(os.path.join(td, "schedstat"), "w") as fh:
+                fh.write("%d %d %d\n" % v)
+            with open(os.path.join(td, "comm"), "w") as fh:
+                fh.write(("w%s" % tid)[:15] + "\n")
+
+
+def _mkd(root, pid, leaf):
+    os.makedirs(os.path.join(root, pid), exist_ok=True)
+    return os.path.join(root, pid, leaf)
+
+
+def _selftest():
+    import tempfile, shutil, subprocess
+    fails = []
+
+    def _t(cond, label):
+        if cond:
+            print("  ok: " + label)
+        else:
+            print("  FAIL: " + label)
+            fails.append(label)
+
+    d = tempfile.mkdtemp(prefix="rq-wait-test-")
+    try:
+        # ── fixture: health's measured saturated window, 20.0s, 1 cpu ───────────────────
+        # pid 3168 = whisper.cpp. Its LEADER thread barely waits; the WORKER thread (a
+        # non-leader tid) carries the starvation. A /proc/<pid> walk sees only the leader,
+        # so this fixture is what makes the pid-walk mutant go red.
+        # pid 999 = a kworker: 84.7% of its runnable life waiting, and 0.021s of it. It must
+        # never outrank the worker thread. This is health's amendment, planted as a fixture.
+        # pid 555 = a RECYCLED tid: counters go DOWN. It must be dropped, not subtracted.
+        a, b = os.path.join(d, "pa"), os.path.join(d, "pb")
+        spec_a = {"3168": ("whispercpp/main -m ggml-base.bin -t 16",
+                           {"3168": (1_000_000_000, 10_000_000, 100),
+                            "3169": (1_000_000_000, 20_000_000, 100)}),
+                  "999": ("", {"999": (5_000_000, 3_000_000, 10)}),
+                  "555": ("", {"555": (9_000_000_000, 9_000_000_000, 900)})}
+        spec_b = {"3168": ("whispercpp/main -m ggml-base.bin -t 16",
+                           {"3168": (1_500_000_000, 20_000_000, 150),      # leader: +0.5s run, +0.01s wait
+                            "3169": (6_778_000_000, 14_074_000_000, 900)}),  # worker: +5.778s run, +14.054s wait
+                  "999": ("", {"999": (9_000_000, 24_000_000, 40)}),         # kworker: +0.004s run, +0.021s wait
+                  "555": ("", {"555": (1_000_000, 1_000_000, 5)})}           # recycled → negative delta
+        _mkproc(a, spec_a, busy_s=0.0, ncpu=1)
+        _mkproc(b, spec_b, busy_s=6.6, ncpu=1)     # 6.6 busy cpu-s vs 6.282 attributed → 95.2%
+        sa, sb = sample(a), sample(b)
+        _t(sa is not None and sb is not None, "fixture /proc parses")
+        r = arm(sa["rows"], sb["rows"], 20.0, sb["busy_s"], sb["ncpu"])
+        top = r["rows"][0]
+
+        # 1. the thread walk — the top subject is a NON-LEADER tid the pid-walk cannot see
+        _t(top["tid"] == "3169" and top["pid"] == "3168",
+           "top subject is the non-leader thread 3168/3169 (per-thread walk, not the pid walk)")
+        _t(len(r["rows"]) == 3, "all 3 surviving threads attributed (leader + worker + kworker)")
+
+        # 2. the fraction is a descriptor, NOT the sort key (health's amendment)
+        kw = [x for x in r["rows"] if x["pid"] == "999"][0]
+        _t(round(kw["frac"], 3) == 0.840, "the kworker's 84.0% fraction IS reported (descriptor present)")
+        _t(kw["frac"] > top["frac"], "the idle kworker's FRACTION is higher than the starved thread's")
+        _t(r["rows"].index(kw) != 0, "...and it is still NOT the top row — absolute cpu-s is the sort key")
+        _t(round(top["wait_ns"] / 1e9, 3) == 14.054 and round(top["frac"], 3) == 0.709,
+           "top row: 14.054s absolute wait, 70.9% of its runnable life")
+
+        # 3. run+wait must sum to the window for a permanently-runnable task (unit sanity:
+        #    a ns→s scaling slip shows up here and nowhere else)
+        _t(abs((top["run_ns"] + top["wait_ns"]) / 1e9 - 19.832) < 0.01,
+           "run+wait sums to the window for the saturated thread (ns→s scaling honest)")
+
+        # 4. a recycled tid is DROPPED, not subtracted
+        _t(r["dropped"] == 1 and not [x for x in r["rows"] if x["pid"] == "555"],
+           "the recycled tid (negative delta) is dropped, not subtracted")
+        _t(abs(r["agg_wait_s"] - 14.085) < 0.001,
+           "aggregate wait 14.085 cpu-s — the dropped row did not shrink it")
+
+        # 5. coverage published per reading, residual is `na` and never 0
+        _t(r["coverage"] is not None and 0.94 < r["coverage"] < 0.96,
+           "coverage 95% on the saturated fixture (published per reading, not a constant)")
+        _t(r["residual_wait"] == "na",
+           "unattributed wait renders `na` while coverage < 100% (never a fabricated 0)")
+        rfull = arm(sa["rows"], sb["rows"], 20.0, 6.282, 1)
+        _t(rfull["residual_wait"] == "0.0",
+           "...and renders 0 only when every busy cpu-second WAS attributed (gate is two-way)")
+        _t(coverage(1.0, None) is None and coverage(1.0, 0) is None,
+           "unreadable/zero busy → coverage na, not a fabricated 100%")
+
+        # 6. the enable bit LIES: the fixture sysctl reads 0 while its counters advance,
+        #    and the reading must still be produced. This is what the sysctl mutant breaks.
+        _t(_read_int(os.path.join(b, "sys", "kernel", "sched_schedstats")) == 0,
+           "fixture sched_schedstats reads 0 (the lying enable bit)")
+        _t(counter_gate(int(r["agg_run_s"] * 1e9), int(r["agg_wait_s"] * 1e9), sb["busy_s"], b) is None,
+           "a LIVE counter behind a 0 enable bit still produces a reading (no sysctl gate)")
+
+        # 7. frozen counter across a busy window → honest n/a, not a fabricated calm
+        _t(counter_gate(0, 0, 5.0, b) is not None,
+           "frozen counters across a busy window → n/a (exit 2), never CALM")
+        _t(counter_gate(0, 0, 0.0, b) is None,
+           "...but frozen counters across an IDLE window are not an error (nothing ran)")
+
+        # 8. the three bands, driven by health's REAL measured windows (not invented numbers)
+        _t(classify(667.65 / 20.1 / 16) == "STARVED",
+           "health's 3x whisper.cpp window (667.65 cpu-s/20.1s/16 cores = 2.08) is STARVED")
+        _t(classify(0.32 / 30.0 / 16) == "CALM", "health's idle window (0.32 cpu-s/30s/16 cores) is CALM")
+        _t(classify(0.74 / 45.1 / 16) == "CALM", "health's real cron burst (0.74 cpu-s/45s) is CALM")
+        _t(classify(r["wait_per_core"]) == "WAITING",
+           "the fixture (0.70 wait-s per core-s) is WAITING — the middle band is reachable")
+
+        # 9. the two-window fold names its winner, both directions + the na degrade
+        _t(fold(5.0, 40.0) == (40.0, "iv"), "iv > inst → iv wins and is NAMED")
+        _t(fold(40.0, 5.0) == (40.0, "inst"), "inst > iv → inst wins and is NAMED")
+        _t(fold(40.0, None) == (40.0, "inst"), "an absent interval arm degrades to inst-only")
+        _t(fold(7.0, 7.0) == (7.0, "inst"), "a tie resolves to inst (the narrower claim)")
+
+        # 10. an undefined window is not a quiet one
+        _t(arm(sa["rows"], sb["rows"], 0, 1.0, 1) is None, "a zero-length window renders None, not CALM")
+
+        # ── 11. REAL READ: the fixtures above cannot cover the live path ────────────────
+        live1 = sample("/proc")
+        if live1 is None or not live1["rows"]:
+            print("smoke-test: n/a (no readable /proc/<pid>/task/<tid>/schedstat on this node)")
+            return 2
+        time.sleep(0.35)
+        live2 = sample("/proc")
+        lr = arm(live1["rows"], live2["rows"], live2["ts"] - live1["ts"], live2["busy_s"], live2["ncpu"])
+        _t(len(live1["rows"]) >= 50,
+           "real read: %d live threads walked (a real per-thread enumeration)" % len(live1["rows"]))
+        _t(lr is not None and sum(x["run_ns"] for x in lr["rows"]) > 0,
+           "real read: run_delay/runtime counters ADVANCE on this node (the delta, not the sysctl)")
+        _t(live1["busy_s"] is not None and live1["ncpu"] >= 1,
+           "real read: /proc/stat busy + %d cpus parsed (the coverage denominator is live)" % live1["ncpu"])
+        _t(0 < live1["scan_ms"] < 5000,
+           "real read: scan cost %.0fms published with the reading" % live1["scan_ms"])
+        nm = name_row("/proc", str(os.getpid()), str(os.getpid()))
+        _t(nm[0] != "?" and "python" in nm[1].lower(),
+           "real read: a row resolves to a real comm+cmdline (%s)" % nm[0])
+
+        # busy is CUMULATIVE — coverage needs its window delta. The fixtures are handed a
+        # window-sized busy directly and so are structurally blind to this; only driving the
+        # WHOLE reading against the real /proc catches it. (It shipped broken until this leg
+        # existed: coverage rendered 0.0% on every live inst window.)
+        _t(busy_delta(10.0, 12.5) == 2.5 and busy_delta(None, 5.0) is None
+           and busy_delta(9.0, 1.0) is None,
+           "busy_delta: window share, na on a missing end, na on a reboot-reset counter")
+        e2e = subprocess.run(
+            [sys.executable, os.path.abspath(__file__), "--json"],
+            capture_output=True, text=True, timeout=120,
+            env=dict(os.environ, MESH_RQWAIT_SECS="1.0",
+                     MESH_RQWAIT_STATE=os.path.join(d, "e2e.state"),   # never the live artifact
+                     MESH_RQWAIT_LOG=os.path.join(d, "e2e.log")))
+        try:
+            j = json.loads(e2e.stdout)
+        except ValueError:
+            j = None
+        _t(j is not None and e2e.returncode == 0, "real read: end-to-end --json reading parses")
+        if j:
+            c = j["inst"]["coverage"]
+            _t(c is not None and 0.001 < c <= 1.5,
+               "real read e2e: live inst coverage %s is a plausible share, not 0 and not fabricated"
+               % (None if c is None else "%.1f%%" % (c * 100)))
+            _t(j["window"] == "inst-only" and j["iv"] is None,
+               "real read e2e: a fresh state file yields inst-only, NOT a claimed-quiet interval")
+            _t(j["level"] in ("CALM", "WAITING", "STARVED") and j["scan_ms"] > 0,
+               "real read e2e: level=%s scan=%.0fms published" % (j["level"], j["scan_ms"]))
+
+        # ── 12. MUTANTS, each from a SCRATCH COPY, each asserted red for ITS OWN leg ────
+        if os.environ.get("MESH_RQWAIT_NO_MUTANTS") == "1":
+            print("  (mutant pass skipped — this IS a mutant)")
+        else:
+            src = _read(os.path.abspath(__file__))
+            # Markers are assembled at runtime so these literals never match the real code
+            # lines above — a self-matching replace would mutate this table instead.
+            M = "# MUT" + "ANT:"
+            mutants = [
+                ('SORT_KEY = "wait_ns"   ' + M + "sortkey",
+                 'SORT_KEY = "frac"   # mutated',
+                 "still NOT the top row", "rank by the wait FRACTION"),
+                ("        return sorted(os.listdir(os.path.join(proot, pid, \"task\")))   " + M + "walk",
+                 "        return [pid]   # mutated",
+                 "non-leader thread", "walk /proc/<pid> instead of task/<tid>"),
+                ("    return dr >= 0 and dw >= 0   " + M + "negdrop",
+                 "    return True   # mutated",
+                 "dropped, not subtracted", "let a negative delta subtract"),
+                ('    return "na"   ' + M + "residual",
+                 '    return "0.0"   # mutated',
+                 "never a fabricated 0", "render the unattributed residual as 0"),
+                ("    if dr_total == 0 and dw_total == 0 and busy_s is not None and busy_s > 0.05:   " + M + "gate",
+                 '    if _read_int(os.path.join(proot, "sys", "kernel", "sched_schedstats")) == 0:   # mutated',
+                 "no sysctl gate", "gate on kernel.sched_schedstats instead of the delta"),
+            ]
+            env = dict(os.environ, MESH_RQWAIT_NO_MUTANTS="1")
+            for i, (old, new, expect, what) in enumerate(mutants):
+                if src.count(old) != 1:
+                    _t(False, "mutant %d (%s) has no unique target line — the mutant is VACUOUS" % (i, what))
+                    continue
+                mp = os.path.join(d, "mutant%d" % i)
+                with open(mp, "w", encoding="utf-8") as fh:
+                    fh.write(src.replace(old, new))
+                os.chmod(mp, 0o755)
+                p = subprocess.run([sys.executable, mp, "--test"], capture_output=True,
+                                   text=True, timeout=180, env=env)
+                out = p.stdout + p.stderr
+                # A mutant that merely exits non-zero proves nothing — it can go red for the
+                # wrong reason (a crash, a timeout, another leg). Require the FAIL line that
+                # belongs to THIS mutation.
+                red_here = any(ln.lstrip().startswith("FAIL:") and expect in ln
+                               for ln in out.splitlines())
+                _t(p.returncode != 0 and red_here,
+                   "mutant: %s → RED on its own leg (rc=%d)" % (what, p.returncode))
+
+        if fails:
+            print("smoke-test: FAIL (%d: %s)" % (len(fails), "; ".join(fails[:3])))
+            return 1
+        print("smoke-test: ok (thread-walk + absolute-vs-fraction sort + negative-delta drop + "
+              "coverage/residual both ways + lying-enable-bit + frozen-counter n/a + 3 bands + "
+              "4 fold + real live /proc read + 5 mutants each red on its own leg)")
+        return 0
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+# ─────────────────────────────── main ───────────────────────────────
+
+def main(argv):
+    if "--test" in argv:
+        return _selftest()
+
+    topn = TOPN_DEFAULT
+    if "--top" in argv:
+        try:
+            topn = int(argv[argv.index("--top") + 1])
+        except (IndexError, ValueError):
+            pass
+
+    s1 = sample(PROC)
+    if s1 is None or not s1["rows"]:
+        print("mesh-rq-wait: n/a — no readable /proc/<pid>/task/<tid>/schedstat", file=sys.stderr)
+        return 2
+    if PROC2:
+        s2 = sample(PROC2)
+    else:
+        time.sleep(max(SECS, 0.05))
+        s2 = sample(PROC)
+    if s2 is None:
+        print("mesh-rq-wait: n/a — /proc became unreadable mid-reading", file=sys.stderr)
+        return 2
+
+    inst_window = float(WINDOW_OVERRIDE) if WINDOW_OVERRIDE else (s2["ts"] - s1["ts"])
+    # busy is a CUMULATIVE counter — coverage needs its DELTA across the same window. Handing
+    # arm() the cumulative value divides a 2-second numerator by an uptime-long denominator and
+    # renders coverage 0.0%, which reads as "this sense attributes nothing" instead of "~14%".
+    # Caught on the live path, not by the fixtures: they are handed a window-sized busy directly.
+    inst_busy = busy_delta(s1["busy_s"], s2["busy_s"])
+    inst = arm(s1["rows"], s2["rows"], inst_window, inst_busy, s2["ncpu"])
+    if inst is None:
+        print("mesh-rq-wait: n/a — undefined sampling window", file=sys.stderr)
+        return 2
+
+    reason = counter_gate(int(inst["agg_run_s"] * 1e9), int(inst["agg_wait_s"] * 1e9),
+                          s2["busy_s"], PROC)
+    if reason:
+        print("mesh-rq-wait: n/a — %s" % reason, file=sys.stderr)
+        return 2
+
+    # interval arm: this sample vs the PREVIOUS TICK's. Covers 100% of the cadence for every
+    # thread that survived it — the half a 2s sample structurally cannot see.
+    prev = load_state(STATE)
+    iv = None
+    iv_why = "no prior tick"
+    if prev is not None:
+        age = s2["ts"] - prev["ts"]
+        if age <= 0 or age > IV_MAX:
+            iv_why = "prior tick %.0fs old (> %.0fs)" % (age, IV_MAX)
+        else:
+            iv = arm(prev["rows"], s2["rows"], age,
+                     busy_delta(prev["busy_s"], s2["busy_s"]), s2["ncpu"])
+            iv_why = "" if iv else "interval delta unusable"
+    save_state(STATE, s2)
+
+    rate, winner = fold(inst["wait_per_core"], iv["wait_per_core"] if iv else None)
+    level = classify(rate)
+    win = "inst+iv" if iv else "inst-only"
+    src = iv if (iv and winner == "iv") else inst
+
+    rows = src["rows"][:max(topn, 1)]
+    named = []
+    for r in rows:
+        comm, cmd = name_row(PROC, r["pid"], r["tid"])
+        named.append(dict(r, comm=comm, cmd=cmd,
+                          wait_s=round(r["wait_ns"] / 1e9, 3), run_s=round(r["run_ns"] / 1e9, 3),
+                          frac_pct=round(r["frac"] * 100, 1)))
+
+    def _cov(a):
+        return "na" if a is None or a["coverage"] is None else "%.1f%%" % (a["coverage"] * 100)
+
+    if "--json" in argv:
+        print(json.dumps({
+            "level": level, "wait_per_core": round(rate, 4), "window": win, "winner": winner,
+            "inst": {"window_s": round(inst["window_s"], 3), "agg_wait_s": round(inst["agg_wait_s"], 3),
+                     "wait_per_core": round(inst["wait_per_core"], 4),
+                     "coverage": None if inst["coverage"] is None else round(inst["coverage"], 4),
+                     "unattributed_wait": inst["residual_wait"], "dropped_rows": inst["dropped"]},
+            "iv": None if not iv else
+                  {"window_s": round(iv["window_s"], 3), "agg_wait_s": round(iv["agg_wait_s"], 3),
+                   "wait_per_core": round(iv["wait_per_core"], 4),
+                   "coverage": None if iv["coverage"] is None else round(iv["coverage"], 4),
+                   "unattributed_wait": iv["residual_wait"], "dropped_rows": iv["dropped"]},
+            "iv_absent_why": iv_why or None,
+            "threads_walked": len(s2["rows"]), "ncpu": s2["ncpu"],
+            "scan_ms": round(s2["scan_ms"], 1),
+            "top": named,
+            "sort_key": "absolute rq-wait cpu-seconds (the fraction is a descriptor)",
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }))
+        return 0
+
+    if named:
+        t = named[0]
+        subj = "%s/%s %s" % (t["pid"], t["tid"], t["comm"])
+        if t["cmd"]:
+            subj += " [%s]" % t["cmd"]
+        head = "top=%s %.3fs wait (%.1f%% of runnable)" % (subj, t["wait_s"], t["frac_pct"])
+    else:
+        head = "top=none (no thread survived both samples)"
+
+    line = ("[rq-wait] %s — %s | agg>=%.2f cpu-s over %.1fs = %.3f wait-s/core-s | window=%s(%s) "
+            "| coverage inst=%s iv=%s unattributed-wait=%s | %d threads, scan=%.0fms" %
+            (level, head, src["agg_wait_s"], src["window_s"], rate, win, winner,
+             _cov(inst), _cov(iv) if iv else "na(%s)" % iv_why,
+             src["residual_wait"], len(s2["rows"]), s2["scan_ms"]))
+    print(line)
+    for r in named[1:]:
+        print("  %8.3fs wait %8.3fs run %5.1f%%  %s/%s %s %s" %
+              (r["wait_s"], r["run_s"], r["frac_pct"], r["pid"], r["tid"], r["comm"], r["cmd"]))
+
+    if "--log" in argv:
+        try:
+            os.makedirs(os.path.dirname(LOG), exist_ok=True)
+            with open(LOG, "a", encoding="utf-8") as fh:
+                fh.write("%s %s\n" % (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), line))
+            old = _read(LOG)
+            if old is not None:
+                ls = old.splitlines(True)
+                if len(ls) > LOG_KEEP * 2:      # prune rarely, in bulk — this log is 144 lines/day
+                    with open(LOG, "w", encoding="utf-8") as fh:
+                        fh.writelines(ls[-LOG_KEEP:])
+        except OSError:
+            pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
