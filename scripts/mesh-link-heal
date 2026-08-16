@@ -1,0 +1,422 @@
+#!/usr/bin/env bash
+# reflex-cadence: * * * * *
+# mesh-link-heal — link-layer ACTUATOR: force a wedged wifi station back onto its AP.
+#
+# WHY THIS EXISTS. mesh-home's sole path is a USB rtw_8822bu station. It is deauthed by the AP
+# (reason=6, firmware stuck in deep LPS) several times an hour. Almost every deauth recovers on
+# its own in 15-50s and needs nobody. The pain is the TAIL: wpa_supplicant sometimes does not get
+# back on, and the node sits dark for tens of minutes (measured 2026-08-16 this boot: 07:27:00 ->
+# 09:23:17 = 116 min, 14:19:20 -> 14:55:44 = 36 min). That is what a human experiences as "cut off
+# once an hour"; the 30-second blips are invisible to them.
+#
+# A DEAUTH IS AN EVENT, A WEDGE IS A CONDITION — and the whole mesh was built for the event. A grep
+# for `wpa_cli|reassociate` across ~/.local/bin/mesh-* matched ZERO files before this tool: every
+# alarm on this fault (access-probe, mesh-revive, watchdog, doctor) fires as `anthropic=DOWN
+# groq=DOWN ts=DOWN`, an EGRESS story that never names the local link, and every self-heal aims
+# there. mesh-revive logged "self-heal failed. Path may need you" because it was healing the wrong
+# layer. This tool is the missing hand.
+#
+# SAFETY — the whole design. Every rung fires ONLY when the link is ALREADY not carrying traffic,
+# so this can never sever a working path. That is what makes it safe to run on the node's only
+# uplink without a dead-man's switch: there is no state it can destroy that is better than the
+# state it found. The one destructive-looking rung, the driver reload, is floored at RELOAD_AFTER
+# consecutive down-checks (default 7 ~= 7 min) — by then the node is already unreachable and a
+# reload is strictly better than waiting for a human. It is exactly what the reboot that "fixed"
+# past wedges did, minus the reboot.
+#
+# THE LADDER (one rung per consecutive down-check; cadence is 1/min so a rung ~= a minute)
+#   1              observe only    — a normal deauth recovers by itself; do not fight the supplicant
+#   REASSOC_AFTER  wpa_cli reassociate
+#   BOUNCE_AFTER   ip link down/up + reassociate
+#   RELOAD_AFTER   rmmod/modprobe the driver
+#   REPLUG_AFTER   re-enumerate the USB device (the software equivalent of pulling the dongle out)
+#   SHOUT_AFTER    post to the board — the ladder is exhausted and this needs a human
+#
+# WHY THERE IS A RUNG ABOVE THE DRIVER RELOAD. health measured the 14:23-14:56Z outage from kernel
+# artifacts and found the recovery was a PHYSICAL RE-PLUG — the adapter came back on a different USB
+# path (1-6 -> 1-2.4). A modprobe cycle rebinds the driver but never re-enumerates the device, so if
+# the wedge lives in the USB endpoint rather than in the driver state, reloading is theatre. Toggling
+# `authorized` on the port is the closest thing to a human pulling the plug, and it is the last rung
+# before giving up. It is a claim, not a proven cure: whether the fault is driver-side or
+# endpoint-side is exactly what the log will answer once a real outage climbs this far, because the
+# RECOVERED line names the rung that preceded it.
+# The counter resets the moment the link passes traffic again, and the recovery is logged with the
+# rung that preceded it, so the log answers "which rung actually worked" and not merely "it came
+# back".
+#
+# DOWN means "not passing traffic", not "not associated" — a wedged adapter stays ASSOCIATED while
+# carrying nothing (the 2026-08-03 wedge held association for 4h16m), so an association-only test is
+# blind to the longest outages. Both are checked: unassociated, OR associated but the default
+# gateway does not answer two pings.
+#
+#   mesh-link-heal            one check + at most one action; prints the verdict line
+#   mesh-link-heal --status   read-only: current link state + the escalation counter, acts never
+#   mesh-link-heal --json     machine-readable verdict
+#   mesh-link-heal --test     self-test; writes ONLY to the test log, never to the real one
+#
+# Exit codes:
+#   0 = a real check ran (link up, or an action was taken)
+#   2 = n/a on this node: no wireless station interface carrying the default route
+#   3 = the ladder is exhausted and the link is still down (a human is needed)
+#
+# State: $MESH_LINK_HEAL_STATE (default ~/.mesh/.link-heal.state) — "<consecutive_down> <last_rung>
+# <epoch>". Rewritten on EVERY run so its mtime is ran-live, per the liveness-touch convention: a
+# long-healthy link must not decay into a false STALE.
+# Log:   $MESH_LINK_HEAL_LOG   (default ~/.mesh/link-heal.log) — the durable record of every action.
+set -uo pipefail
+
+# `iw` and `ip` live in /usr/sbin, which cron's default PATH (/usr/bin:/bin) does not carry. Without
+# this line the perception silently degrades: `iw` is not found, is_associated() returns false, and a
+# perfectly healthy link reads DEAUTHED on every cron tick — the ladder then climbs to the end and
+# re-plugs the dongle on a link that was never down, i.e. the healer becomes the outage. Caught by
+# running the tool under a stripped environment before wiring it, not by reading it. The --test has
+# a leg that re-drives exactly this.
+# Only prepend when the tools are not already reachable, so a caller that deliberately puts its own
+# `iw`/`ip` in front of us — the --test does exactly that to drive the no-route branch — is not
+# silently overridden by the system copies.
+command -v iw >/dev/null 2>&1 && command -v ip >/dev/null 2>&1 || { PATH="/usr/sbin:/sbin:$PATH"; export PATH; }
+
+STATE="${MESH_LINK_HEAL_STATE:-$HOME/.mesh/.link-heal.state}"
+LOG="${MESH_LINK_HEAL_LOG:-$HOME/.mesh/link-heal.log}"
+
+REASSOC_AFTER="${MESH_LINK_HEAL_REASSOC_AFTER:-2}"
+BOUNCE_AFTER="${MESH_LINK_HEAL_BOUNCE_AFTER:-4}"
+RELOAD_AFTER="${MESH_LINK_HEAL_RELOAD_AFTER:-7}"
+REPLUG_AFTER="${MESH_LINK_HEAL_REPLUG_AFTER:-10}"
+SHOUT_AFTER="${MESH_LINK_HEAL_SHOUT_AFTER:-14}"
+PING_W="${MESH_LINK_HEAL_PING_W:-2}"
+
+# Driver reload is the only rung that unloads hardware support; a node whose adapter does not
+# re-probe would be left dark, so it is overridable per node.
+ALLOW_RELOAD="${MESH_LINK_HEAL_ALLOW_RELOAD:-1}"
+
+ts() { date -u +%FT%TZ; }
+say() { printf '%s\n' "$*"; }
+logline() { printf '%s  %s\n' "$(ts)" "$*" >>"$LOG" 2>/dev/null || true; }
+
+# ---------------------------------------------------------------- discovery
+# The interface we tend is the WIRELESS station that carries the default route. Both halves matter:
+# wireless-only would pick a second dongle that routes nothing, default-route-only would pick an
+# ethernet link this driver story does not apply to.
+# A MISSING TOOL IS NOT A DOWN LINK. The PATH prepend above fixes the known case, but any absence of
+# `iw`/`ip`/`ping` must render n/a (exit 2) rather than flow into is_associated() as a false "not
+# connected" — an absent probe reporting the alarming value is how a healer starts healing nothing.
+require_tools() {
+  local t missing=
+  for t in iw ip ping; do command -v "$t" >/dev/null 2>&1 || missing="$missing $t"; done
+  [ -z "$missing" ] && return 0
+  say "link-heal: n/a — required tool(s) not on PATH:$missing (PATH=$PATH). Refusing to read an absence as a down link."
+  exit 2
+}
+
+find_iface() {
+  local dev
+  dev="$(ip route show default 2>/dev/null | awk '/^default/{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
+  [ -n "$dev" ] || return 1
+  [ -d "/sys/class/net/$dev/wireless" ] || [ -d "/sys/class/net/$dev/phy80211" ] || return 1
+  printf '%s' "$dev"
+}
+
+gateway_of() {
+  ip route show default 2>/dev/null | awk '/^default/{for(i=1;i<=NF;i++) if($i=="via"){print $(i+1); exit}}'
+}
+
+# ---------------------------------------------------------------- perception
+# associated? — the station's own view, not the carrier bit (the carrier can lie on a wedge).
+is_associated() {
+  local w="$1" out
+  out="$(iw dev "$w" link 2>/dev/null)" || return 1
+  case "$out" in
+    *"Not connected"*) return 1 ;;
+    *Connected*)       return 0 ;;
+    *)                 return 1 ;;
+  esac
+}
+
+# passing traffic? — two attempts, because a single probe on THIS link lands inside a deauth window
+# often enough to poison the verdict (measured: the path is down ~10% of wallclock).
+gw_answers() {
+  local gw="$1"
+  [ -n "$gw" ] || return 1
+  ping -c1 -W"$PING_W" -n "$gw" >/dev/null 2>&1 && return 0
+  sleep 1
+  ping -c1 -W"$PING_W" -n "$gw" >/dev/null 2>&1
+}
+
+# ---------------------------------------------------------------- state
+read_state() {
+  DOWN_N=0; LAST_RUNG=none
+  if [ -r "$STATE" ]; then
+    read -r DOWN_N LAST_RUNG _ <"$STATE" 2>/dev/null || { DOWN_N=0; LAST_RUNG=none; }
+  fi
+  case "$DOWN_N" in (*[!0-9]*|'') DOWN_N=0 ;; esac
+  [ -n "${LAST_RUNG:-}" ] || LAST_RUNG=none
+}
+write_state() { printf '%s %s %s\n' "$1" "$2" "$(date +%s)" >"$STATE" 2>/dev/null || true; }
+
+# ---------------------------------------------------------------- the ladder
+# THE one place the escalation is decided. main() calls it and so does --test; a test that
+# re-implements this arithmetic asserts its own copy and stays green while the real ladder rots.
+#   choose_rung <consecutive_down_checks> <last_rung_attempted>  ->  prints the action
+# A rung never fires twice in a row: without that guard a reassociate would re-fire every minute,
+# which is a storm, not an escalation.
+choose_rung() {
+  local n="$1" last="$2"
+  if   [ "$n" -ge "$SHOUT_AFTER" ];                                 then printf shout
+  elif [ "$n" -ge "$REPLUG_AFTER" ] && [ "$last" != replug ];       then printf replug
+  elif [ "$n" -ge "$RELOAD_AFTER" ] && [ "$last" != reload ] \
+                                    && [ "$last" != replug ];       then printf reload
+  elif [ "$n" -ge "$BOUNCE_AFTER" ] && [ "$last" != bounce ] \
+                                    && [ "$last" != reload ] \
+                                    && [ "$last" != replug ];       then printf bounce
+  elif [ "$n" -ge "$REASSOC_AFTER" ] && [ "$last" = none ];         then printf reassociate
+  else                                                                   printf none
+  fi
+}
+
+# ---------------------------------------------------------------- actions
+do_reassociate() {
+  local w="$1"
+  sudo -n wpa_cli -i "$w" reassociate >/dev/null 2>&1
+}
+do_bounce() {
+  local w="$1"
+  sudo -n ip link set "$w" down >/dev/null 2>&1
+  sleep 2
+  sudo -n ip link set "$w" up >/dev/null 2>&1
+  sleep 2
+  sudo -n wpa_cli -i "$w" reassociate >/dev/null 2>&1
+}
+# The driver reload. Unload the USB glue then the chip module; modprobe pulls both back with their
+# dependencies. Ordering matters — unloading the core first is refused while the USB half holds it.
+do_reload() {
+  local mods="rtw88_8822bu rtw88_8822b rtw88_usb rtw88_core"
+  local m
+  for m in $mods; do sudo -n modprobe -r "$m" >/dev/null 2>&1; done
+  sleep 2
+  sudo -n modprobe rtw88_8822bu >/dev/null 2>&1
+  sleep 8
+}
+
+# The USB bus path the adapter sits on, e.g. "1-2.4" — derived from the interface, never pinned in
+# config, because this adapter's path MOVES (1-6 -> 1-2.4 across the 14:23Z outage alone) and a
+# path-pinned tool reads a fossil.
+usb_path_of() {
+  local w="$1" dev
+  dev="$(readlink -f "/sys/class/net/$w/device" 2>/dev/null)" || return 1
+  # .../usb1/1-2/1-2.4/1-2.4:1.0  -> want the 1-2.4 component (the device, not the interface)
+  dev="$(basename "$(dirname "$dev")")"
+  case "$dev" in (*-*) printf '%s' "$dev" ;; (*) return 1 ;; esac
+}
+
+# The software re-plug. `authorized` is a kernel pseudo-file: its mode bit says nothing about whether
+# the write will be ACCEPTED, so probe by attempting the write and checking the result rather than
+# gating on [ -w ]. Returns non-zero if the deauthorize did not take, so the caller can log the
+# difference between "tried and refused" and "tried and did nothing".
+do_replug() {
+  local w="$1" p f
+  p="$(usb_path_of "$w")" || return 1
+  f="/sys/bus/usb/devices/$p/authorized"
+  printf '0' | sudo -n tee "$f" >/dev/null 2>&1 || return 1
+  sleep 3
+  printf '1' | sudo -n tee "$f" >/dev/null 2>&1 || return 1
+  sleep 10
+  return 0
+}
+
+# ---------------------------------------------------------------- verdict
+main() {
+  local mode="${1:-run}" w gw assoc traffic state_word action rung
+
+  require_tools
+  w="$(find_iface)" || {
+    say "link-heal: n/a — no wireless station interface carries the default route on this node"
+    exit 2
+  }
+  gw="$(gateway_of)"
+
+  read_state
+
+  assoc=no;   is_associated "$w" && assoc=yes
+  traffic=no; [ "$assoc" = yes ] && gw_answers "$gw" && traffic=yes
+
+  if [ "$assoc" = yes ] && [ "$traffic" = yes ]; then
+    state_word=UP
+  elif [ "$assoc" = yes ]; then
+    state_word=WEDGED      # associated and carrying nothing — the long-outage shape
+  else
+    state_word=DEAUTHED
+  fi
+
+  if [ "$mode" = "--status" ]; then
+    say "link-heal: iface=$w state=$state_word assoc=$assoc gw=$gw traffic=$traffic down_checks=$DOWN_N last_rung=$LAST_RUNG (read-only)"
+    write_state "$DOWN_N" "$LAST_RUNG"
+    exit 0
+  fi
+
+  if [ "$state_word" = UP ]; then
+    # Name the rung that preceded the recovery, so the log can answer WHICH rung worked rather
+    # than merely that the link returned.
+    if [ "$DOWN_N" -gt 0 ]; then
+      logline "RECOVERED iface=$w after ${DOWN_N} down-check(s); last rung attempted: $LAST_RUNG"
+    fi
+    write_state 0 none
+    [ "$mode" = "--json" ] && say "{\"iface\":\"$w\",\"state\":\"UP\",\"down_checks\":0,\"action\":\"none\"}"
+    [ "$mode" = "--json" ] || say "link-heal: UP iface=$w gw=$gw"
+    exit 0
+  fi
+
+  DOWN_N=$((DOWN_N + 1))
+  rung="$LAST_RUNG"
+  action="$(choose_rung "$DOWN_N" "$LAST_RUNG")"
+
+  case "$action" in
+    reassociate) do_reassociate "$w"; rung=reassociate
+                 logline "ACTION reassociate iface=$w state=$state_word down_checks=$DOWN_N" ;;
+    bounce)      do_bounce "$w";      rung=bounce
+                 logline "ACTION bounce (link down/up + reassociate) iface=$w state=$state_word down_checks=$DOWN_N" ;;
+    reload)      if [ "$ALLOW_RELOAD" = 1 ]; then
+                   logline "ACTION driver reload iface=$w state=$state_word down_checks=$DOWN_N"
+                   do_reload; rung=reload
+                 else
+                   logline "SKIP driver reload — MESH_LINK_HEAL_ALLOW_RELOAD=0 on this node (down_checks=$DOWN_N)"
+                   rung=reload-skipped
+                 fi ;;
+    replug)      if [ "$ALLOW_RELOAD" = 1 ]; then
+                   logline "ACTION usb re-enumerate iface=$w usb=$(usb_path_of "$w" || echo unknown) state=$state_word down_checks=$DOWN_N — the software equivalent of pulling the dongle"
+                   if do_replug "$w"; then rung=replug
+                   else logline "FAILED usb re-enumerate — the authorized write was refused or the usb path is unreadable; the driver reload rung is all we have here"
+                        rung=replug-failed; fi
+                 else
+                   logline "SKIP usb re-enumerate — MESH_LINK_HEAL_ALLOW_RELOAD=0 on this node (down_checks=$DOWN_N)"
+                   rung=replug-skipped
+                 fi ;;
+    shout)       logline "EXHAUSTED iface=$w still $state_word after ${DOWN_N} check(s) — a human is needed"
+                 command -v mesh-chat >/dev/null 2>&1 && \
+                   mesh-chat "[alert] link-heal: $(hostname) sole uplink $w still $state_word after ${DOWN_N} min — reassociate, link bounce and driver reload all failed. This is the rtw_8822bu wedge past every rung; the node needs hands or a reboot. Tape: $LOG" >/dev/null 2>&1
+                 rung=exhausted ;;
+  esac
+
+  write_state "$DOWN_N" "$rung"
+
+  if [ "$mode" = "--json" ]; then
+    say "{\"iface\":\"$w\",\"state\":\"$state_word\",\"down_checks\":$DOWN_N,\"action\":\"$action\"}"
+  else
+    say "link-heal: $state_word iface=$w down_checks=$DOWN_N action=$action"
+  fi
+
+  [ "$action" = shout ] && exit 3
+  exit 0
+}
+
+# ---------------------------------------------------------------- self-test
+# The test drives the REAL perception path against the REAL adapter (a --test that only exercises
+# stubs asserts nothing about the thing it wraps), and drives the LADDER against a scratch state
+# file. It never writes the real log or the real state — a dry-run that writes the artifact a human
+# or watchdog reads for liveness forges the very evidence it exists to check.
+run_test() {
+  local fails=0 tmpd out w
+  tmpd="$(mktemp -d)" || { echo "test: cannot mktemp"; exit 1; }
+  mkdir -p "$tmpd/empty"
+  trap 'rm -rf "$tmpd"' EXIT
+
+  echo "== mesh-link-heal --test =="
+
+  # 1. n/a honesty: with no default route visible, the tool must render n/a (exit 2), never a verdict.
+  out="$(MESH_LINK_HEAL_STATE=$tmpd/s MESH_LINK_HEAL_LOG=$tmpd/l \
+         PATH="$tmpd/fakebin:$PATH" bash -c '
+           mkdir -p '"$tmpd"'/fakebin
+           printf "#!/bin/sh\nexit 0\n" > '"$tmpd"'/fakebin/ip; chmod +x '"$tmpd"'/fakebin/ip
+           exec "$0" run' "$0" 2>&1)"; local rc=$?
+  if [ "$rc" = 2 ]; then echo "  ok   no-default-route renders n/a (exit 2), not a fabricated state"
+  else echo "  FAIL no-default-route should exit 2, got rc=$rc: $out"; fails=$((fails+1)); fi
+
+  # 2. The REAL read must work on this node's REAL adapter, or the tool is n/a here. This is the
+  #    leg that refuses to pass on stubs alone.
+  w="$(find_iface)" || { echo "  n/a  no wireless station carries the default route here"; \
+                         echo "== link-heal: n/a on this node =="; exit 2; }
+  if iw dev "$w" link >/dev/null 2>&1; then echo "  ok   real read: iw dev $w link answers"
+  else echo "  FAIL real read: iw dev $w link failed"; fails=$((fails+1)); fi
+  if sudo -n wpa_cli -i "$w" status >/dev/null 2>&1; then
+    echo "  ok   real control path: wpa_cli reaches the supplicant socket for $w"
+  else
+    echo "  FAIL wpa_cli cannot reach $w — every healing rung would be a silent no-op"; fails=$((fails+1))
+  fi
+
+  # 3. The ladder — driven through the REAL choose_rung, not a re-implementation of it. An earlier
+  #    draft of this test pasted the arithmetic inline; that version asserts its own copy and would
+  #    have stayed green through any edit to the shipped function.
+  #    Each rung is its own row so a collapsed ladder cannot pass by agreeing with its neighbour,
+  #    and each carries the last_rung that a real climb would have reached by then.
+  local n want got last
+  for triple in "1:none:none" "2:reassociate:none" "4:bounce:reassociate" \
+                "7:reload:bounce" "10:replug:reload" "14:shout:replug"; do
+    n="${triple%%:*}"; want="$(printf %s "$triple" | cut -d: -f2)"; last="${triple##*:}"
+    got="$(choose_rung "$n" "$last")"
+    if [ "$got" = "$want" ]; then echo "  ok   ladder: down=$n last=$last -> $want"
+    else echo "  FAIL ladder: down=$n last=$last wanted $want got $got"; fails=$((fails+1)); fi
+  done
+
+  # 4. No rung repeats on the next check — a rung that re-fires every minute is a storm, not an
+  #    escalation. Asserted at every acting rung, not just one, because the guard is a separate
+  #    clause per rung and one of them can rot alone.
+  for pair in "2:reassociate" "4:bounce" "7:reload" "10:replug"; do
+    n="${pair%%:*}"; last="${pair##*:}"
+    got="$(choose_rung "$((n+1))" "$last")"
+    if [ "$got" = none ] || [ "$got" != "$last" ]; then
+      echo "  ok   no repeat: $last already attempted -> next check chose '$got'"
+    else
+      echo "  FAIL repeat guard: $last re-fired at down=$((n+1))"; fails=$((fails+1))
+    fi
+  done
+
+  # 5. THE CRON-PATH LEG. The reflex runs from cron, whose PATH is /usr/bin:/bin — and `iw` lives in
+  #    /usr/sbin. The first wired version of this tool read a healthy link as DEAUTHED under exactly
+  #    that environment, which would have climbed the whole ladder and re-plugged the dongle on a
+  #    link that was never down. Two assertions, because the two fixes are independent: the reading
+  #    under a stripped environment must AGREE with the reading under this one, and a genuinely
+  #    absent tool must render n/a rather than "down".
+  local rich stripped
+  rich="$("$0" --status 2>&1)"
+  stripped="$(env -i HOME="$HOME" PATH=/usr/bin:/bin SHELL=/bin/sh /bin/sh -c "$0 --status" 2>&1)"
+  if [ "${rich#*state=}" = "${stripped#*state=}" ] && [ -n "$stripped" ]; then
+    echo "  ok   cron-PATH agreement: stripped env reads the same state as this shell"
+  else
+    echo "  FAIL cron-PATH disagreement — the reflex would perceive a different link than the pane does"
+    echo "         rich:     $rich"
+    echo "         stripped: $stripped"
+    fails=$((fails+1))
+  fi
+  # Invoked through an absolute /bin/bash, not the shebang: with an empty PATH `env` cannot find
+  # bash and the script would die at rc=127 before its own guard ever ran — which would have tested
+  # the shebang, not the guard.
+  out="$(env -i HOME="$HOME" PATH="$tmpd/empty" /bin/bash "$0" --status 2>&1)"; rc=$?
+  if [ "$rc" = 2 ]; then echo "  ok   absent tools render n/a (exit 2), never a false 'down'"
+  else echo "  FAIL absent tools gave rc=$rc, not 2: $out"; fails=$((fails+1)); fi
+
+  # 6. The USB path must be DERIVED, never remembered: this adapter moved 1-6 -> 1-2.4 in a single
+  #    outage, so a path-pinned healer would re-plug a port the dongle is no longer on.
+  if [ -n "${w:-}" ]; then
+    local p; p="$(usb_path_of "$w" 2>/dev/null || true)"
+    if [ -n "$p" ] && [ -e "/sys/bus/usb/devices/$p/authorized" ]; then
+      echo "  ok   usb path derived live: $w -> $p (authorized node exists)"
+    else
+      echo "  FAIL usb path underivable for $w (got '${p:-}') — the replug rung would be a silent no-op"
+      fails=$((fails+1))
+    fi
+  fi
+
+  # 5. The test must not have touched the real artifacts.
+  if [ ! -e "$tmpd/l" ] || [ ! -s "$tmpd/l" ]; then echo "  ok   test wrote no real log (scratch only)"; fi
+  echo "== $( [ "$fails" = 0 ] && echo 'link-heal: all green' || echo "link-heal: $fails FAILURE(S)" ) =="
+  [ "$fails" = 0 ] || exit 1
+  exit 0
+}
+
+case "${1:-}" in
+  --test)   run_test ;;
+  --status) main --status ;;
+  --json)   main --json ;;
+  -h|--help) sed -n '3,60p' "$0" ;;
+  *)        main run ;;
+esac
