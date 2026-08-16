@@ -1,0 +1,473 @@
+#!/usr/bin/env bash
+# orphan-ok: on-demand paired sampler (it SLEEPS for its own window — a cron tick that blocks 60s is
+#   a worse shape than a mind/consumer pulling it). Consumed on demand by `mesh-tcp-retrans` /
+#   `mesh-tcp-health` (--who hands their anonymous verdict a subject) and by mesh-stress's network axis.
+#
+# mesh-tcp-attrib — WHICH FLOW is lossy. `mesh-tcp-retrans` publishes a node-global ratio read from
+# /proc/net/snmp ("LOSSY 4.32%") with no subject; the kernel already publishes the same quantity
+# PER SOCKET via netlink inet_diag (`ss -ti`: retrans:<out>/<total>, segs_out, minrtt, and with -p the
+# owning process), readable as uid 1000. This tool adds the missing half — which peer, which flow,
+# which process — and deliberately does NOT re-judge the global ratio: the bands belong to
+# mesh-tcp-retrans, and a second copy of them here would be a constant that outlives its reader.
+#
+#   mesh-tcp-attrib                    paired sample over the default window, top-K flows by Δretrans
+#   mesh-tcp-attrib --window N         sample over N seconds (default 60)
+#   mesh-tcp-attrib --top K            show K flows (default 5)
+#   mesh-tcp-attrib --peer <addr>      just this peer's flows (na — never 0 — if we hold none)
+#   mesh-tcp-attrib --who              one line for mesh-tcp-retrans/mesh-tcp-health to carry
+#   mesh-tcp-attrib --json             machine-readable
+#   mesh-tcp-attrib --test             smoke test (synthetic ss/snmp/tailscale fixtures + a live parse gate)
+#
+# ── FIVE PROPERTIES BUILT IN, NOT DISCOVERED LATER ──────────────────────────────────────────────
+# Sources: discover@mesh-home's find (knowledge/capability-per-flow-tcp-attribution-names-the-lossy-
+# peer-mesh-home-20260816.md, 60s paired sample 00:17Z) and health@mesh-home's independent
+# falsification pass (board 2026-08-16T00:44:21Z, its own parser, 60s paired sample 00:42Z).
+#
+# (1) A SINGLE `retrans:` READ IS A LIFETIME TOTAL. `retrans:0/500` says this socket retransmitted 500
+#     segments since it was established — possibly hours ago, possibly under a fault that is over. Rank
+#     on that and the tool answers "which flow has been alive longest through bad weather", not "which
+#     flow is lossy NOW". Every figure here is therefore a DELTA between two snapshots, and the --test
+#     carries a fixture whose lifetime-heaviest flow has a zero delta: a lifetime reader ranks it first
+#     and goes red. Same family as fe35dd9 (avg10 sampled once per 600s), opposite end: there the read
+#     was too narrow, here it is unboundedly wide.
+#
+# (2) ATTRIBUTION IS PARTIAL BY CONSTRUCTION, AND THE RESIDUAL IS NEVER 0. A delta sampler sees only
+#     sockets alive at BOTH ends of the window; a flow that opens and closes inside it is invisible,
+#     and its retransmits still land in the global counter. Measured twice, independently: 40/75 (53%,
+#     discover) and 34/78 (43.6%, health, which also named the mechanism — 24 flows at t0, 23 at t1,
+#     20 survived, 3 born, 4 died). So the coverage is not noise to be tuned away, it is structural,
+#     and every reading publishes `attributed=<n>/<total>` beside the flow rows. A renderer that
+#     printed the top flows without the coverage would read as a complete decomposition of the loss.
+#
+# (3) THE READING IS A SAMPLE AT ITS WINDOW, NEVER A STATE. Same minute, same node: mesh-tcp-retrans's
+#     5s window read CLEAN 0.0% (0/579) while a 60s window read 1.46% (78/5356). And the 60s figure
+#     ITSELF moved 4.32% → 1.46% in 25 minutes on the same window length. So the caveat is NOT "5s is
+#     too short" — the ratio is nonstationary over minutes at ANY window, and a single reading at 60s
+#     is a sample too. The window is printed in the reading and the nonstationarity is stated, so a
+#     consumer cannot mistake one pass for the path's condition.
+#
+# (4) THE derp/direct FLAG IS READ AT SAMPLE TIME, NEVER INFERRED FROM rtt. The find's first pass
+#     inferred "these are DERP relays" partly from latency; 25 minutes later `tailscale status --json`
+#     had phaedra DIRECT (CurAddr set, Relay only as fallback) while its ssh flow was still the lossiest
+#     tailnet flow at minrtt 137.4ms — and an unnamed NON-tailscale flow sat at minrtt 137.098 in the
+#     same pass. 137ms is the distance to that VPS, not a relay penalty; minrtt cannot separate the two.
+#     Every row's path is therefore read from CurAddr/Relay in the same pass that read the counters,
+#     and published per-sample. DERP node IPs are resolved from `tailscale debug derp-map`, not PTR
+#     (which named nothing for the single lossiest flow — tailscaled's own control-plane connection).
+#
+# (5) A BLANK OWNER IS `na`, NEVER "no process". `ss -p` names only OUR OWN uid's sockets. health@'s
+#     pass measured the two lossiest flows (11 + 10 retrans = 27% of the whole global delta) rendering
+#     with a blank owner at uid 1000, both of them tailscaled's (pid 3253482, visible only under sudo).
+#     So the flows this sense can least often name a process for are exactly the ones that matter most;
+#     rendering that as "no process" would be a fabricated fact about the system. Peer-side attribution
+#     still works for those rows, and it is the important half.
+#
+# Exit 2 — never a fabricated CLEAN — when `ss` or /proc/net/snmp is unreadable, or the counters go
+# backwards mid-window (a 4-tuple reused by a new socket restarts them: that flow drops out as na).
+set -uo pipefail
+export LC_ALL=C
+
+WINDOW="${MESH_TCP_ATTRIB_WINDOW:-60}"
+TOPN="${MESH_TCP_ATTRIB_TOPN:-5}"
+SS_CMD="${MESH_TCP_ATTRIB_SS_CMD:-ss -tinHp}"
+SNMP_CMD="${MESH_TCP_ATTRIB_SNMP_CMD:-cat /proc/net/snmp}"
+TS_CMD="${MESH_TCP_ATTRIB_TS_CMD:-tailscale status --json}"
+DERPMAP_CMD="${MESH_TCP_ATTRIB_DERPMAP_CMD:-tailscale debug derp-map}"
+
+# ── snap: ss output (stdin) → one line per flow: "<local>|<peer> <segs_out> <retrans_lifetime> <minrtt> <owner>"
+# `ss -ti` emits TWO lines per socket: the socket line, then a TAB-indented tcp_info line. A field the
+# kernel omits means the counter is genuinely 0 (ss prints retrans:/segs_out: only when nonzero) —
+# but an omitted minrtt is MISSING EVIDENCE and renders na, never 0.0ms.
+snap() {
+  awk '
+    function emit() {
+      if (key == "") return
+      printf "%s %s %s %s %s\n", key, segs, retr, (minrtt == "" ? "na" : minrtt), (owner == "" ? "na" : owner)
+      key = ""
+    }
+    /^[^ \t]/ {
+      emit()
+      if (NF < 5) { key = ""; next }
+      key = $4 "|" $5
+      owner = ""; segs = 0; retr = 0; minrtt = ""
+      for (i = 6; i <= NF; i++) if ($i ~ /^users:/) {
+        if (match($i, /\("[^"]+",pid=[0-9]+/)) {
+          s = substr($i, RSTART, RLENGTH)
+          gsub(/[("]/, "", s); sub(/,pid=/, "/", s)
+          owner = s
+        }
+      }
+      next
+    }
+    {
+      for (i = 1; i <= NF; i++) {
+        if      ($i ~ /^segs_out:/) { v = $i; sub(/segs_out:/, "", v); segs = v }
+        else if ($i ~ /^retrans:/)  { v = $i; sub(/retrans:/, "", v); sub(/^[0-9]*\//, "", v); retr = v }
+        else if ($i ~ /^minrtt:/)   { v = $i; sub(/minrtt:/, "", v); minrtt = v }
+      }
+      emit()
+    }
+    END { emit() }'
+}
+
+# ── pair: two snapshots → per-flow DELTAS. PURE. Emits `<peer> <dsegs> <dretr> <minrtt> <owner> <key>`
+# plus one `#census` line. Property (1) lives here: nothing downstream ever sees a lifetime total.
+pair() {  # $1 = t0 file, $2 = t1 file
+  awk '
+    NR == FNR { ps[$1] = $2; pr[$1] = $3; seen[$1] = 1; t0++; next }
+    {
+      t1++
+      if (!($1 in seen)) { born++; next }        # new socket: no baseline → na, not a 0-retrans row
+      matched++
+      ds = $2 - ps[$1]; dr = $3 - pr[$1]
+      if (ds < 0 || dr < 0) { reset++; next }    # the 4-tuple was reused by a NEW socket and its
+                                                 # counters restarted → drop as na, never a negative
+      split($1, k, "|")
+      printf "%s %s %s %s %s %s\n", k[2], ds, dr, $4, $5, $1
+    }
+    END { printf "#census t0=%d t1=%d survived=%d born=%d died=%d reset=%d\n",
+                 t0, t1, matched - reset, born, t0 - matched, reset }
+  ' "$1" "$2"
+}
+
+# ── read_tcp: "<OutSegs> <RetransSegs>" from an snmp-format stream (same parse mesh-tcp-retrans uses)
+read_tcp() {
+  awk '$1 == "Tcp:" { if (h == "") { for (i = 1; i <= NF; i++) { if ($i == "OutSegs") o = i; if ($i == "RetransSegs") r = i }; h = 1 }
+       else if (o && r && $o ~ /^[0-9]+$/ && $r ~ /^[0-9]+$/) { print $o, $r; exit } }'
+}
+
+# ── path/name resolution, READ AT SAMPLE TIME (property 4) ───────────────────────────────────────
+# Emits `<ip> <name> <path>` rows. Absent tailscale / absent jq → an EMPTY table, so every peer
+# renders `na` for name and path. Never a guessed label.
+resolve_table() {
+  command -v jq >/dev/null 2>&1 || return 0
+  sh -c "$TS_CMD" 2>/dev/null | jq -r '
+      (.Peer // {}) | to_entries[] | .value
+      | . as $p | ($p.TailscaleIPs // [])[]
+      | select(test(":") | not)
+      | [ ., ($p.HostName // "na"),
+          (if (($p.CurAddr // "") != "") then "direct" else ("derp:" + (($p.Relay // "na"))) end) ]
+      | @tsv' 2>/dev/null
+  sh -c "$DERPMAP_CMD" 2>/dev/null | jq -r '
+      (.Regions // {}) | to_entries[] | .value
+      | (.RegionCode // "na") as $rc
+      | (.Nodes // [])[]
+      | select((.IPv4 // "") != "")
+      | [ .IPv4, ("derp" + (.Name // "?") + "(" + $rc + ")"), "derp-relay" ]
+      | @tsv' 2>/dev/null
+}
+
+peer_ip() { printf '%s' "${1%:*}"; }   # strip the :port (IPv6 in ss is bracketed, so this is safe)
+
+# ── --test ───────────────────────────────────────────────────────────────────────────────────────
+if [ "${1:-}" = --test ]; then
+  command -v awk >/dev/null 2>&1 || { echo "smoke-test: FAIL (no awk)"; exit 1; }
+  fail() { echo "smoke-test: FAIL ($1)"; exit 1; }
+  _td="$(mktemp -d)"; trap 'rm -rf "$_td"' EXIT
+
+  # ── The fixture. Four flows, each carrying one property:
+  #   A 176.58.93.147:443   retrans 3 → 17   (Δ14)  — the real subject; no users: → owner must be na (5)
+  #   B 5.5.5.5:443         retrans 500 → 500 (Δ0)  — LIFETIME-HEAVY, currently silent (1)
+  #   C 9.9.9.9:443         retrans 9 → 2    (Δ-7)  — 4-tuple reused, counters restarted → dropped (na)
+  #   D 100.94.116.17:22    retrans 1 → 4    (Δ3)   — tailnet, CurAddr set = DIRECT, minrtt 137.4 (4)
+  #   E 100.103.99.16:41641 retrans 0 → 1    (Δ1)   — tailnet, CurAddr empty = derp:ams (4, other edge)
+  mkss() {  # $1 = out file, then per flow: A.retrans A.segs B.segs C.retrans D.retrans D.segs E.retrans E.segs
+    cat > "$1" <<EOF
+ESTAB 0 0 192.168.8.224:40001 176.58.93.147:443
+	 cubic rto:300 rtt:58.9/1.0 segs_out:$3 retrans:0/$2 minrtt:58.2
+ESTAB 0 0 192.168.8.224:40002 5.5.5.5:443 users:(("curl",pid=4242,fd=5))
+	 cubic rto:300 rtt:20.0/1.0 segs_out:$4 retrans:0/500 minrtt:19.9
+ESTAB 0 0 192.168.8.224:40003 9.9.9.9:443
+	 cubic rto:300 rtt:30.0/1.0 segs_out:100 retrans:0/$5 minrtt:29.0
+ESTAB 0 0 100.74.178.97:43742 100.94.116.17:22 users:(("ssh",pid=1696943,fd=3))
+	 cubic rto:397 rtt:196.2/11.9 segs_out:$7 retrans:0/$6 minrtt:137.4
+ESTAB 0 0 100.74.178.97:50001 100.103.99.16:41641
+	 cubic rto:300 rtt:80.0/2.0 segs_out:$9 retrans:0/$8 minrtt:79.0
+EOF
+  }
+  #        A.retr A.segs B.segs C.retr D.retr D.segs E.retr E.segs
+  mkss "$_td/ss0"  3   100   9000     9      1    253      0     60
+  mkss "$_td/ss1" 17   235   9700     2      4    453      1    110
+  # the ss command alternates t0 → t1 (a real paired sample; the PARSER is the one under test)
+  cat > "$_td/ss.sh" <<EOF
+#!/bin/sh
+if [ -f "$_td/seen" ]; then cat "$_td/ss1"; else : > "$_td/seen"; cat "$_td/ss0"; fi
+EOF
+  # snmp: global Δ = 100 retrans / 5000 segs. Per-flow Δ sums to 18 (14+0+3+1) → coverage 18/100.
+  printf 'Tcp: RtoAlgorithm MaxConn OutSegs RetransSegs\nTcp: 1 -1 100000 1000\n'   > "$_td/snmp0"
+  printf 'Tcp: RtoAlgorithm MaxConn OutSegs RetransSegs\nTcp: 1 -1 105000 1100\n'   > "$_td/snmp1"
+  cat > "$_td/snmp.sh" <<EOF
+#!/bin/sh
+if [ -f "$_td/seen2" ]; then cat "$_td/snmp1"; else : > "$_td/seen2"; cat "$_td/snmp0"; fi
+EOF
+  # tailscale: D is DIRECT despite 137.4ms minrtt (the correction); E is on a DERP relay.
+  cat > "$_td/ts.json" <<'EOF'
+{"Peer":{"k1":{"HostName":"phaedra","TailscaleIPs":["100.94.116.17","fd7a::1"],"CurAddr":"38.49.216.141:41641","Relay":"tor"},
+         "k2":{"HostName":"redmi","TailscaleIPs":["100.103.99.16"],"CurAddr":"","Relay":"ams"}}}
+EOF
+  cat > "$_td/derp.json" <<'EOF'
+{"Regions":{"14":{"RegionCode":"lhr","Nodes":[{"Name":"14c","IPv4":"176.58.93.147"}]}}}
+EOF
+  chmod +x "$_td/ss.sh" "$_td/snmp.sh"
+  run() {  # a fresh paired sample against the fixtures
+    rm -f "$_td/seen" "$_td/seen2"
+    MESH_TCP_ATTRIB_SS_CMD="$_td/ss.sh" MESH_TCP_ATTRIB_SNMP_CMD="$_td/snmp.sh" \
+    MESH_TCP_ATTRIB_TS_CMD="cat $_td/ts.json" MESH_TCP_ATTRIB_DERPMAP_CMD="cat $_td/derp.json" \
+    "$0" --window 1 "$@" 2>&1
+  }
+
+  # ── parser first: it is the thing every gate below rides on.
+  p="$(snap < "$_td/ss1")"
+  [ "$(printf '%s\n' "$p" | wc -l)" = 5 ] || fail "parser found $(printf '%s\n' "$p" | wc -l) flows in a 5-flow fixture: $p"
+  case "$p" in *"192.168.8.224:40001|176.58.93.147:443 235 17 58.2 na"*) :;; *)
+    fail "parser lost a field on flow A (segs/lifetime-retrans/minrtt/owner): $p";; esac
+  case "$p" in *"100.94.116.17:22 453 4 137.4 ssh/1696943"*) :;; *) fail "parser lost the owner on flow D: $p";; esac
+  # a socket whose tcp_info omits retrans:/segs_out: is genuinely 0 there, but an omitted minrtt is na
+  printf 'ESTAB 0 1 1.1.1.1:1 2.2.2.2:2\n\t cubic rto:1000 mss:524\n' > "$_td/bare"
+  case "$(snap < "$_td/bare")" in *"1.1.1.1:1|2.2.2.2:2 0 0 na na"*) :;; *)
+    fail "an omitted minrtt must render na, not 0: $(snap < "$_td/bare")";; esac
+
+  outA="$(run)" || fail "fixture run failed: $outA"
+
+  # (1) THE LIFETIME TRAP. Flow B carries retrans 500 at BOTH ends (Δ0); flow A carries Δ14. A tool
+  # that read the lifetime total ranks B first — the assertion below is one a lifetime reader cannot
+  # satisfy, which is the whole point of it existing.
+  _rows="$(printf '%s\n' "$outA" | awk '$1 ~ /^[0-9]+$/ { print }')"
+  _top="$(printf '%s\n' "$_rows" | head -1)"
+  case "$_top" in *176.58.93.147*) :;; *) fail "top flow by Δretrans should be A (Δ14); got: ${_top:-<none>} — a lifetime reader ranks B (500): $outA";; esac
+  # ...and no ROW may carry the lifetime figure itself. (Scoped to the rows on purpose: an unscoped
+  # match hit the global line's "5000 segs" and would have gone red for a reason unrelated to the claim.)
+  printf '%s\n' "$_rows" | awk '$1 == 500 || $2 == 500 { exit 1 }' \
+    || fail "a lifetime total (500) reached an attribution row — every figure must be a delta: $_rows"
+  case "$_top" in *" 14 "*|*"	14	"*) :;; *) fail "top row must carry Δretrans=14: $_top";; esac
+  # B is the lifetime-heaviest flow AND it is busy this window (Δsegs=700) — it must still rank last,
+  # at Δretrans 0. That is the discrimination a lifetime reader cannot make.
+  _b="$(printf '%s\n' "$_rows" | grep '5.5.5.5')"
+  [ -n "$_b" ] || fail "the lifetime-heavy flow vanished from the table entirely: $_rows"
+  printf '%s\n' "$_b" | awk '$1 != 0 { exit 1 }' \
+    || fail "the lifetime-heavy but currently-silent flow must render Δretrans=0: $_b"
+  printf '%s\n' "$_b" | awk '$2 != 700 { exit 1 }' \
+    || fail "flow B sent 700 segments in the window — anything but Δsegs=700 means the delta is not being taken: $_b"
+
+  # (2) COVERAGE, AND A RESIDUAL THAT IS NEVER 0. Per-flow Δ sums to 18 of a global Δ of 100.
+  case "$outA" in *"attributed=18/100"*) :;; *) fail "the reading must publish attributed=18/100: $outA";; esac
+  case "$outA" in *"unattributed=82"*) :;; *) fail "the unattributed residual must be named, never left to read as 0: $outA";; esac
+  # ...and it must not be dressed up as complete coverage
+  case "$outA" in *"attributed=18/100 retrans (100"*) fail "coverage rendered as 100%: $outA";; esac
+
+  # (3) THE WINDOW AND THE NONSTATIONARITY ARE IN THE READING, not in a man page.
+  case "$outA" in *"window=1s"*) :;; *) fail "the reading must carry its window: $outA";; esac
+  case "$outA" in *nonstationary*) :;; *) fail "the reading must state it is a sample, not a state: $outA";; esac
+
+  # (4) PATH AT SAMPLE TIME — both edges of the signal, so the flag cannot be a constant.
+  _d="$(printf '%s\n' "$outA" | grep '100.94.116.17')"
+  case "$_d" in *direct*) :;; *) fail "phaedra has CurAddr set = DIRECT at sample time; rendered: ${_d:-<absent>} — inferring derp from its 137.4ms minrtt is exactly the falsified claim";; esac
+  case "$_d" in *derp*) fail "the DIRECT flow was labelled derp — the flag was inferred, not read: $_d";; esac
+  _e="$(printf '%s\n' "$outA" | grep '100.103.99.16')"
+  case "$_e" in *"derp:ams"*) :;; *) fail "a peer with an empty CurAddr must render its relay: ${_e:-<absent>}";; esac
+  case "$outA" in *"derp14c(lhr)"*) :;; *) fail "a DERP node IP must be resolved from the derp-map, not left bare: $outA";; esac
+  case "$_d" in *phaedra*) :;; *) fail "a tailnet peer must be resolved to its hostname: $_d";; esac
+
+  # (5) A BLANK OWNER IS na — and it is the LOSSIEST flow that has one, as measured.
+  case "$_top" in *"na(not-ours)"*) :;; *) fail "a socket with no users: must render na(not-ours), never blank or 'no process': $_top";; esac
+  # scoped to the ROWS: the legend below the table has to be free to spell out what na means, and an
+  # unscoped match would be asserting against this tool's own explanation of itself.
+  printf '%s\n' "$_rows" | awk '/no process|none|-$/ { exit 1 }' \
+    || fail "an unattributable owner rendered as an assertion about the system, not as na: $_rows"
+
+  # ── counters that went BACKWARDS (flow C, 9 → 2: the 4-tuple was reused by a new socket)
+  case "$outA" in *-[0-9]*) fail "a reset counter produced a negative figure: $outA";; esac
+  case "$outA" in *9.9.9.9*) fail "a flow whose counters restarted must drop out as na, not be folded in: $outA";; esac
+  case "$outA" in *"reset=1"*) :;; *) fail "the census must name the dropped flow: $outA";; esac
+  case "$outA" in *"survived=4"*) :;; *) fail "the census must report the survivor count (property 2's mechanism): $outA";; esac
+
+  # ── --peer: na, never 0, for a peer we hold no flow with
+  outP="$(run --peer 10.9.9.9)"
+  case "$outP" in *na*) :;; *) fail "--peer with no live flow must render na: $outP";; esac
+  case "$outP" in *"0%"*|*" 0.00 "*) fail "--peer with no live flow rendered a 0 — a fabricated clean: $outP";; esac
+  outP2="$(run --peer 176.58.93.147)"
+  case "$outP2" in *176.58.93.147*) :;; *) fail "--peer with a live flow must render it: $outP2";; esac
+  case "$outP2" in *5.5.5.5*) fail "--peer must not render other peers' flows: $outP2";; esac
+
+  # ── --who: the line mesh-tcp-retrans/mesh-tcp-health carry. Must name a subject AND its coverage.
+  outW="$(run --who)"
+  case "$outW" in *176.58.93.147*) :;; *) fail "--who must name the top flow's peer: $outW";; esac
+  case "$outW" in *"18/100"*) :;; *) fail "--who must carry the coverage — a subject without it reads as the whole loss: $outW";; esac
+  case "$outW" in *"win=1s"*) :;; *) fail "--who must carry its window: $outW";; esac
+  case "$outW" in *direct*|*derp*) :;; *) fail "--who must carry the sample-time path: $outW";; esac
+
+  # ── --json shape
+  outJ="$(run --json)"
+  case "$outJ" in *'"attributed_retrans":18'*)   :;; *) fail "json must carry the attributed count: $outJ";; esac
+  case "$outJ" in *'"global_retrans":100'*)      :;; *) fail "json must carry the global delta: $outJ";; esac
+  case "$outJ" in *'"is_a_sample_not_a_state"'*) :;; *) fail "json must state the nonstationarity: $outJ";; esac
+  case "$outJ" in *'"path":"direct"'*)           :;; *) fail "json rows must carry the sample-time path: $outJ";; esac
+
+  # ── exit 2, never a fabricated CLEAN, on either unreadable source
+  outX="$(MESH_TCP_ATTRIB_SS_CMD="false" MESH_TCP_ATTRIB_SNMP_CMD="$_td/snmp.sh" "$0" --window 1 2>&1)"
+  [ $? -eq 2 ] || fail "an unreadable ss must exit 2: $outX"
+  case "$outX" in *UNREACHABLE*) :;; *) fail "an unreadable ss must say so: $outX";; esac
+  rm -f "$_td/seen" "$_td/seen2"
+  outY="$(MESH_TCP_ATTRIB_SS_CMD="$_td/ss.sh" MESH_TCP_ATTRIB_SNMP_CMD="false" "$0" --window 1 2>&1)"
+  [ $? -eq 2 ] || fail "unreadable snmp counters must exit 2: $outY"
+  case "$outY" in *[0-9]%*) fail "a fabricated ratio survived an unreadable /proc/net/snmp: $outY";; esac
+
+  rm -rf "$_td"; trap - EXIT
+
+  # ── the live gate: the fixtures above cannot prove the real `ss -tinHp` on this kernel still emits
+  # the fields this parser reads (a fixture-driven gate cannot cover the live path). Capture THEN
+  # assert — a `| grep -q` would SIGPIPE the producer and pipefail would paint that red.
+  if command -v ss >/dev/null 2>&1; then
+    _live="$(sh -c "$SS_CMD" 2>/dev/null | snap)"
+    _n="$(printf '%s' "$_live" | grep -c . )"
+    [ "${_n:-0}" -ge 1 ] || fail "live ss parsed 0 flows — the parser is broken or this node holds no TCP socket"
+    printf '%s\n' "$_live" | awk '$4 != "na" { found = 1 } END { exit !found }' \
+      || fail "live ss produced no minrtt on any of $_n flows — tcp_info is not reaching this parser"
+    echo "smoke-test: ok (parser + 5 properties asserted on synthetic fixtures incl. the lifetime trap and both path edges; live ss parsed $_n flows with tcp_info)"
+  else
+    echo "smoke-test: ok (fixtures asserted; no ss on this node — live parse n/a)"
+  fi
+  exit 0
+fi
+
+# ── args ─────────────────────────────────────────────────────────────────────────────────────────
+MODE=text; PEER=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --window) WINDOW="${2:-60}"; shift ;;
+    --top)    TOPN="${2:-5}"; shift ;;
+    --peer)   MODE=peer; PEER="${2:-}"; shift ;;
+    --who)    MODE=who ;;
+    --json)   MODE=json ;;
+    *) echo "mesh-tcp-attrib: unknown argument '$1'" >&2; exit 64 ;;
+  esac
+  shift
+done
+case "$WINDOW" in ''|*[!0-9]*) echo "mesh-tcp-attrib: --window must be an integer" >&2; exit 64;; esac
+
+die2() { echo "tcp-attrib: UNREACHABLE ($1)" >&2; exit 2; }
+
+TD="$(mktemp -d)"; trap 'rm -rf "$TD"' EXIT
+
+# ── the paired sample: both sources read at BOTH ends of the SAME window (property 1 + 2)
+sh -c "$SS_CMD" 2>/dev/null | snap > "$TD/s0"
+[ -s "$TD/s0" ] || die2 "ss produced no parseable flow at t0"
+sh -c "$SNMP_CMD" 2>/dev/null | read_tcp > "$TD/n0"
+[ -s "$TD/n0" ] || die2 "/proc/net/snmp Tcp: unparseable at t0"
+
+sleep "$WINDOW"
+
+sh -c "$SS_CMD" 2>/dev/null | snap > "$TD/s1"
+[ -s "$TD/s1" ] || die2 "ss produced no parseable flow at t1"
+sh -c "$SNMP_CMD" 2>/dev/null | read_tcp > "$TD/n1"
+[ -s "$TD/n1" ] || die2 "/proc/net/snmp Tcp: unparseable at t1"
+
+read -r O0 R0 < "$TD/n0"; read -r O1 R1 < "$TD/n1"
+DSEGS=$((O1 - O0)); DRETR=$((R1 - R0))
+{ [ "$DSEGS" -ge 0 ] && [ "$DRETR" -ge 0 ]; } || die2 "global counters went backwards mid-window (reboot?)"
+
+pair "$TD/s0" "$TD/s1" > "$TD/pairs"
+CENSUS="$(awk '$1 == "#census" { $1 = ""; sub(/^ /, ""); print; exit }' "$TD/pairs")"
+awk '$1 != "#census"' "$TD/pairs" | sort -k3 -nr > "$TD/rows"
+
+# attributed = the retrans this sense can put a subject on. NEVER presented as the whole loss.
+ATTR="$(awk '{ s += $3 } END { printf "%d", s + 0 }' "$TD/rows")"
+UNATTR=$((DRETR - ATTR))
+COVPCT="$(awk -v a="$ATTR" -v t="$DRETR" 'BEGIN { if (t <= 0) print "na"; else printf "%.1f", 100 * a / t }')"
+GPCT="$(awk -v r="$DRETR" -v o="$DSEGS" 'BEGIN { if (o <= 0) print "na"; else printf "%.2f", 100 * r / o }')"
+
+resolve_table > "$TD/res" 2>/dev/null || : > "$TD/res"
+
+# ── render_rows: the whole attribution table, one line per flow, resolution applied at sample time.
+# Fields: dretr dsegs ratio minrtt path owner peer name
+render_rows() {  # stdin = row lines
+  awk -v resf="$TD/res" '
+    BEGIN { while ((getline l < resf) > 0) { n = split(l, f, "\t"); if (n >= 3) { nm[f[1]] = f[2]; pa[f[1]] = f[3] } } }
+    {
+      peer = $1; ds = $2; dr = $3; mrtt = $4; own = $5
+      ip = peer; sub(/:[0-9]+$/, "", ip); gsub(/[\[\]]/, "", ip)
+      ratio = (ds + 0 > 0) ? sprintf("%.2f%%", 100 * dr / ds) : "na"
+      printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", dr, ds, ratio,
+             (mrtt == "na" ? "na" : mrtt "ms"),
+             (ip in pa ? pa[ip] : "na"),
+             (own == "na" ? "na(not-ours)" : own),
+             peer, (ip in nm ? nm[ip] : "na")
+    }'
+}
+
+TS_NOW="$(date -u +%H:%M:%SZ)"
+
+if [ "$MODE" = peer ]; then
+  sel="$(awk -v p="$PEER" '$1 ~ "^" p ":" || $1 == p' "$TD/rows")"
+  if [ -z "$sel" ]; then
+    printf 'tcp-attrib: na — no live TCP flow with %s at BOTH ends of the %ss window (na, never 0: this sense sees only peers we currently hold a socket with, and a flow that opened and closed inside the window is invisible to a delta sampler). coverage this pass: attributed=%s/%s retrans.\n' \
+      "$PEER" "$WINDOW" "$ATTR" "$DRETR"
+    exit 0
+  fi
+  printf 'tcp-attrib: %s over window=%ss (a SAMPLE — the ratio is nonstationary over minutes at any window length)\n' "$PEER" "$WINDOW"
+  printf '%s\n' "$sel" | render_rows | while IFS="$(printf '\t')" read -r dr ds ratio mrtt path own peer name; do
+    printf '  Δretr=%s Δsegs=%s ratio=%s minrtt=%s path=%s owner=%s peer=%s (%s)\n' "$dr" "$ds" "$ratio" "$mrtt" "$path" "$own" "$peer" "$name"
+  done
+  printf '  coverage: attributed=%s/%s retrans · unattributed=%s\n' "$ATTR" "$DRETR" "$UNATTR"
+  exit 0
+fi
+
+TOPROW="$(head -1 "$TD/rows")"
+
+if [ "$MODE" = who ]; then
+  if [ -z "$TOPROW" ]; then
+    printf 'na (no flow survived the %ss window — nothing to attribute; global Δretrans=%s, attributed=0/%s)\n' "$WINDOW" "$DRETR" "$DRETR"
+    exit 0
+  fi
+  line="$(printf '%s\n' "$TOPROW" | render_rows)"
+  IFS="$(printf '\t')" read -r dr ds ratio mrtt path own peer name <<EOF
+$line
+EOF
+  if [ "${dr:-0}" -le 0 ]; then
+    printf 'na (no flow retransmitted a segment in the %ss window — the global %s/%s is unattributable at socket granularity, not absent; attributed=%s/%s)\n' \
+      "$WINDOW" "$DRETR" "$DSEGS" "$ATTR" "$DRETR"
+    exit 0
+  fi
+  printf '%s (%s) %s/%s segs %s[flow,minrtt=%s,path=%s,owner=%s,win=%ss,attributed=%s/%s]\n' \
+    "$peer" "$name" "$dr" "$ds" "$ratio" "$mrtt" "$path" "$own" "$WINDOW" "$ATTR" "$DRETR"
+  exit 0
+fi
+
+if [ "$MODE" = json ]; then
+  {
+    printf '{"window_s":%s,"ts":"%s",' "$WINDOW" "$TS_NOW"
+    printf '"is_a_sample_not_a_state":"the retrans ratio is nonstationary over minutes at ANY window length (measured: the same 60s window read 4.32%% and 1.46%% 25min apart; a 5s window read 0.00%% in the minute a 60s window read 1.46%%)",'
+    printf '"global_segs":%s,"global_retrans":%s,"global_pct":"%s",' "$DSEGS" "$DRETR" "$GPCT"
+    printf '"attributed_retrans":%s,"unattributed_retrans":%s,"coverage_pct":"%s",' "$ATTR" "$UNATTR" "$COVPCT"
+    printf '"coverage_note":"partial by construction: a delta sampler sees only sockets alive at BOTH ends of the window; the residual is structural, never 0",'
+    printf '"census":"%s","rows":[' "$CENSUS"
+    first=1
+    head -n "$TOPN" "$TD/rows" | render_rows | while IFS="$(printf '\t')" read -r dr ds ratio mrtt path own peer name; do
+      [ "$first" = 1 ] || printf ','
+      first=0
+      printf '{"peer":"%s","name":"%s","d_retrans":%s,"d_segs":%s,"ratio":"%s","minrtt":"%s","path":"%s","owner":"%s"}' \
+        "$peer" "$name" "$dr" "$ds" "$ratio" "$mrtt" "$path" "$own"
+    done
+    printf ']}\n'
+  }
+  exit 0
+fi
+
+# ── text ─────────────────────────────────────────────────────────────────────────────────────────
+printf '[tcp-attrib] window=%ss · this is a SAMPLE, not a state: the retrans ratio is nonstationary over minutes at ANY window length (same 60s window read 4.32%% and 1.46%% 25min apart; a 5s window read 0.00%% in the minute a 60s window read 1.46%%).\n' "$WINDOW"
+printf '  global   : %s%% (%s/%s segs over %ss) — /proc/net/snmp Tcp:, the axis mesh-tcp-retrans owns the verdict bands for; this tool adds the subject, not a second verdict.\n' \
+  "$GPCT" "$DRETR" "$DSEGS" "$WINDOW"
+printf '  coverage : attributed=%s/%s retrans (%s%%) · unattributed=%s — partial BY CONSTRUCTION: a delta sampler sees only sockets alive at both ends of the window, so flows that opened AND closed inside it are invisible. The residual is structural, never 0.\n' \
+  "$ATTR" "$DRETR" "$COVPCT" "$UNATTR"
+printf '  flows    : %s\n' "$CENSUS"
+if [ -s "$TD/rows" ]; then
+  printf '  %6s %7s %8s %9s  %-11s %-22s %s\n' "Δretr" "Δsegs" "ratio" "minrtt" "path" "owner" "peer"
+  head -n "$TOPN" "$TD/rows" | render_rows | while IFS="$(printf '\t')" read -r dr ds ratio mrtt path own peer name; do
+    printf '  %6s %7s %8s %9s  %-11s %-22s %s %s\n' "$dr" "$ds" "$ratio" "$mrtt" "$path" "$own" "$peer" "$name"
+  done
+else
+  printf '  (no flow survived both ends of the window — nothing to attribute. na, not a clean path.)\n'
+fi
+printf '  path  is read AT SAMPLE TIME from `tailscale status` CurAddr/Relay and `tailscale debug derp-map`, never inferred from rtt: a 137ms minrtt was measured on a DIRECT tailnet flow and on an unrelated non-tailscale flow in the same pass — it is distance, not a relay penalty. na = not a tailnet/DERP address, or tailscale/jq absent.\n'
+printf '  owner na(not-ours) = the socket belongs to root or another uid; `ss -p` names only our own. Measured: the two lossiest flows of a pass (27%% of the global delta) were tailscaled'"'"'s and rendered blank at uid 1000 — hence na, never "no process". Peer-side attribution still holds for those rows.\n'
+exit 0
