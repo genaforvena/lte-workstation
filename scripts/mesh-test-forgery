@@ -1,0 +1,310 @@
+#!/usr/bin/env bash
+# mesh-test-forgery — catch a `--test` that FORGES its own liveness record: the dry-run writes the
+# durable log a human or a watchdog reads to answer "did this organ ever fire". Named shape
+# (mesh-guardian, 09f7914; mesh-gpu-lid, 180e578 — where 100% of ~/.mesh/gpu-lid.log's 26 lines were
+# written by --test, because mesh-doctor runs every --test hourly, i.e. the checker MINTS the
+# evidence it checks).
+#
+#   mesh-test-forgery [--tool <name>]     sweep one tool (default: every mesh-* that declares --test)
+#   mesh-test-forgery --sweep             the scheduled full pass (== bare invocation, cron form)
+#   mesh-test-forgery --json              machine-readable verdicts
+#   mesh-test-forgery --test              smoke test (hermetic scratch HOME; red AND green fixtures)
+#
+# WHY THE STATIC SCAN IS NOT ENOUGH (health@, board 2026-08-15T07:41Z): grepping for `>> $LOG` inside
+# the `--test` arm misses every INDIRECT writer — gpu-lid's forgery went through do_off → log_event,
+# a function defined far above the arm. Only running the test and watching the logs sees it. That is
+# this tool: ATTRIBUTION by measurement, not by reading source.
+#
+# THE TWO TRAPS, both built in (both were hit while specifying this):
+#
+#  1. CRON NOISE MAKES A SINGLE PASS UNATTRIBUTABLE. On this node ~150 logs move on their own every
+#     ten minutes. A one-pass size diff therefore attributes nothing and is NEVER reported as a
+#     finding. Every candidate must survive two independent legs: it must grow AGAIN on a second run
+#     of the same tool (confirm), and it must NOT grow in a CONTROL window of the same length with
+#     the tool not running. A log that grows in the control too is reported `unattributable`, which
+#     is an honest n/a — never folded into the finding count. (`na-must-be-a-claim-about-the-node`.)
+#
+#  2. THE DETECTOR MUST NOT BE THE THING IT DETECTS. This tool writes ~/.mesh/forgery-sweep.log; its
+#     own `--test` diverts that to a scratch file and then ASSERTS the production log's size is
+#     unchanged (the `_reallog_untouched` guard mesh-gpu-lid earned). A forgery detector that forges
+#     its own liveness record would be the joke writing itself.
+#
+# WHAT COUNTS AS THE DEFECT — narrower than "a test wrote a file". A test may freely write a log it
+# OWNS as a fixture; the fault is writing the DURABLE record. So a candidate whose basename reads as
+# a dedicated dry-run sink (*test*/*dry*/*sandbox*/*fixture*) is EXEMPT by name, and the exemption is
+# reported (`exempt` rows) rather than silently dropped — an exemption you cannot see is a blind spot.
+#
+# SEEN RED, twice, and that is the point (`a-gate-you-have-not-seen-fail-is-not-a-gate`):
+#   · in --test, against hermetic fixtures — a forger, an honest tool, and a NOISY log (a background
+#     writer appending through both passes) that must come back unattributable, not as a finding;
+#   · against the real instance — `git revert 180e578` in a scratch copy of mesh-gpu-lid, run under a
+#     scratch HOME so the mutant cannot forge the REAL gpu-lid.log, and the sweep names
+#     mesh-gpu-lid → gpu-lid.log. Reproducer in the board [done] for test-writes-production-log-detector.
+#
+# COST: 2 `--test` runs per tool that produced a candidate, 1 for every other tool, plus one control
+# sleep per candidate. Candidates are rare, so a full pass is ~one doctor-equivalent sweep. DAILY,
+# not hourly: the thing it looks for is a code property, and it changes at commit rate.
+#
+# reflex-cadence: 41 4 * * *
+# reflex-args: --sweep
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+
+MESH="${MESH_HOME:-$HOME/.mesh}"
+BIN="${MESH_BIN_DIR:-$HOME/.local/bin}"
+LOG="$MESH/forgery-sweep.log"
+STATE="$MESH/.forgery-sweep.state"          # pairs already reported to the board (edge-only posting)
+TEST_TIMEOUT="${MESH_TEST_FORGERY_TIMEOUT:-30}"
+CTRL_MIN="${MESH_TEST_FORGERY_CTRL_MIN:-2}"   # control window floor, seconds
+
+ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+# ---- log snapshot -----------------------------------------------------------------------------
+# "<path> <size>" per line. A file that does not exist yet is absent here, so its first appearance
+# reads as growth from 0 — a test that CREATES the production log is the same defect.
+snapshot() {
+  local f
+  for f in "$MESH"/*.log; do
+    [ -f "$f" ] || continue
+    printf '%s %s\n' "$f" "$(stat -c %s "$f" 2>/dev/null || echo 0)"
+  done
+}
+
+size_of() { stat -c %s "$1" 2>/dev/null || echo 0; }
+
+# grown <before-snapshot> <after-snapshot> → paths whose size increased (or which appeared)
+grown() {
+  awk -v before="$1" '
+    BEGIN { while ((getline line < before) > 0) { n=split(line, a, " "); s[a[1]]=a[2] } }
+    { if (!($1 in s)) { if ($2+0 > 0) print $1 } else if ($2+0 > s[$1]+0) print $1 }
+  ' <<<"$2"
+}
+
+# a basename that reads as a dedicated dry-run sink — writing THAT is the fix, not the defect
+is_exempt_log() {
+  case "$(basename "$1")" in
+    *test*|*dry*|*sandbox*|*fixture*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# run one tool's --test the way mesh-doctor does (same env + timeout), output discarded, rc ignored:
+# a FAILING test that writes the production log is still a forgery, so the verdict never reads rc.
+run_test() {
+  # </dev/null: the sweep loop reads tool_list on stdin — a swept tool must never eat it
+  MESH_TEST_SANDBOX=1 timeout "$TEST_TIMEOUT" nice -n 10 "$1" --test </dev/null >/dev/null 2>&1
+  return 0
+}
+
+# ---- one tool ---------------------------------------------------------------------------------
+# emits: "<verdict> <tool> <log>" for each candidate. Verdicts:
+#   forgery         — grew on both runs, did NOT grow in the control window
+#   unattributable  — grew in the control window too (cron noise; NOT a finding)
+#   noise           — did not reproduce on the second run (single-pass diff, discarded)
+#   exempt          — a dedicated dry-run sink by name
+sweep_tool() {
+  local tool="$1" name before after cands c t0 dur ctl_before ctl_after b2 a2
+  name="$(basename "$tool")"
+  before="$(snapshot)"
+  t0=$SECONDS
+  run_test "$tool"
+  dur=$(( SECONDS - t0 ))
+  after="$(snapshot)"
+  cands="$(grown <(printf '%s\n' "$before") "$after")"
+  [ -n "$cands" ] || return 0
+
+  [ "$dur" -lt "$CTRL_MIN" ] && dur="$CTRL_MIN"
+  for c in $cands; do
+    if is_exempt_log "$c"; then printf 'exempt %s %s\n' "$name" "$c"; continue; fi
+    # CONTROL first: same wallclock length, tool NOT running. This is the cron-noise leg.
+    ctl_before="$(size_of "$c")"; sleep "$dur"; ctl_after="$(size_of "$c")"
+    # CONFIRM: the same tool again, same log.
+    b2="$(size_of "$c")"; run_test "$tool"; a2="$(size_of "$c")"
+    if [ "$a2" -le "$b2" ]; then
+      printf 'noise %s %s\n' "$name" "$c"
+    elif [ "$ctl_after" -gt "$ctl_before" ]; then
+      printf 'unattributable %s %s\n' "$name" "$c"
+    else
+      printf 'forgery %s %s\n' "$name" "$c"
+    fi
+  done
+}
+
+# ---- the sweep --------------------------------------------------------------------------------
+tool_list() {
+  local t
+  if [ -n "${ONE_TOOL:-}" ]; then
+    [ -x "$BIN/$ONE_TOOL" ] && printf '%s\n' "$BIN/$ONE_TOOL"
+    return 0
+  fi
+  for t in "$BIN"/mesh-*; do
+    [ -x "$t" ] || continue
+    [ -f "$t" ] || continue
+    # only tools that DECLARE a --test. Conservative INCLUSION filter (a match in a comment merely
+    # costs one run, the same run mesh-doctor already makes hourly); the point is never to hand
+    # `--test` to a tool that would read it as its default ACTION.
+    grep -q -- '--test' "$t" 2>/dev/null || continue
+    printf '%s\n' "$t"
+  done
+}
+
+do_sweep() {
+  local out t n_forge=0 n_un=0 n_noise=0 n_ex=0 line verdict tool lg new_pairs=""
+  out=""
+  while read -r t; do
+    [ -n "$t" ] || continue
+    line="$(sweep_tool "$t")"
+    [ -n "$line" ] && out="${out}${line}"$'\n'
+  done < <(tool_list)
+
+  while read -r verdict tool lg; do
+    [ -n "${verdict:-}" ] || continue
+    case "$verdict" in
+      forgery)        n_forge=$((n_forge+1)); grep -qxF "$tool $lg" "$STATE" 2>/dev/null || new_pairs="${new_pairs}${tool}→$(basename "$lg") " ;;
+      unattributable) n_un=$((n_un+1)) ;;
+      noise)          n_noise=$((n_noise+1)) ;;
+      exempt)         n_ex=$((n_ex+1)) ;;
+    esac
+  done <<<"$out"
+
+  if [ "${JSON:-0}" = 1 ]; then
+    printf '{"ts":"%s","forgery":%d,"unattributable":%d,"noise_discarded":%d,"exempt":%d,"rows":[' \
+      "$(ts)" "$n_forge" "$n_un" "$n_noise" "$n_ex"
+    local first=1
+    while read -r verdict tool lg; do
+      [ -n "${verdict:-}" ] || continue
+      [ "$first" = 1 ] || printf ','; first=0
+      printf '{"verdict":"%s","tool":"%s","log":"%s"}' "$verdict" "$tool" "$lg"
+    done <<<"$out"
+    printf ']}\n'
+  else
+    printf '%s' "$out" | sort | sed 's/^/  /'
+    printf 'test-forgery: %d forged, %d unattributable (cron noise), %d single-pass discarded, %d exempt dry-run sinks\n' \
+      "$n_forge" "$n_un" "$n_noise" "$n_ex"
+  fi
+
+  # durable record + edge-only board post (a pair already reported never re-posts)
+  {
+    printf '%s sweep forged=%d unattributable=%d noise=%d exempt=%d\n' "$(ts)" "$n_forge" "$n_un" "$n_noise" "$n_ex"
+    while read -r verdict tool lg; do
+      [ "${verdict:-}" = forgery ] && printf '%s FORGERY %s -> %s\n' "$(ts)" "$tool" "$lg"
+    done <<<"$out"
+  } >> "$LOG"
+
+  if [ -n "$new_pairs" ] && command -v mesh-chat >/dev/null 2>&1; then
+    mesh-chat "[fyi] test-forgery: a --test is writing the durable liveness log it exists to check — $new_pairs(confirmed on a re-run, and the log did NOT grow in an equal control window). Give the dry-run its own log (mesh-gpu-lid 180e578 is the pattern)." >/dev/null 2>&1
+    while read -r verdict tool lg; do
+      [ "${verdict:-}" = forgery ] && printf '%s %s\n' "$tool" "$lg" >> "$STATE"
+    done <<<"$out"
+  fi
+
+  [ "$n_forge" -eq 0 ]
+}
+
+# ---- smoke test -------------------------------------------------------------------------------
+smoke_test() {
+  local fail=0
+  _f() { echo "smoke-test: FAIL ($*)"; fail=1; }
+
+  # sandbox honesty, LOG half: this tool's own --test must not append to the record it publishes.
+  local REALLOG="$LOG" REALLOG_SZ; REALLOG_SZ="$(size_of "$LOG")"
+
+  local d; d="$(mktemp -d)"
+  mkdir -p "$d/.mesh" "$d/bin"
+
+  # (1) RED fixture — a forger: its --test appends to the durable log its real path writes.
+  cat > "$d/bin/mesh-forger" <<'EOF'
+#!/usr/bin/env bash
+L="${MESH_HOME:-$HOME/.mesh}/forger.log"
+log_event(){ echo "$(date -u +%s) event" >> "$L"; }   # INDIRECT writer, defined above the --test arm
+case "${1:-}" in --test) log_event; echo "smoke-test: ok"; exit 0 ;; esac
+log_event
+EOF
+  # (2) GREEN fixture — an honest tool: its --test writes only its own dry-run sink.
+  cat > "$d/bin/mesh-honest" <<'EOF'
+#!/usr/bin/env bash
+L="${MESH_HOME:-$HOME/.mesh}/honest.log"
+case "${1:-}" in --test) echo "dry" >> "${MESH_HOME:-$HOME/.mesh}/honest-test.log"; echo "smoke-test: ok"; exit 0 ;; esac
+echo real >> "$L"
+EOF
+  # (3) NOISE fixture — writes nothing itself; a background writer moves noisy.log all the while.
+  cat > "$d/bin/mesh-quiet" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in --test) sleep 0.4; echo "smoke-test: ok"; exit 0 ;; esac   # a window wide enough for the noise writer
+EOF
+  chmod +x "$d/bin/"mesh-*
+
+  # a stub mesh-chat EARLIER on PATH than the real one, so the post path is genuinely exercised
+  # and cannot reach the board ($HOME/.local/bin is prepended by the script itself and is empty here)
+  cat > "$d/bin/mesh-chat" <<EOF
+#!/usr/bin/env bash
+echo "\$*" >> "$d/chat.capture"
+EOF
+  chmod +x "$d/bin/mesh-chat"
+
+  run_detector() {  # $1 = tool name → verdict rows
+    HOME="$d" MESH_HOME="$d/.mesh" MESH_BIN_DIR="$d/bin" MESH_TEST_FORGERY_CTRL_MIN=2 \
+      PATH="$d/bin:$PATH" bash "$0" --tool "$1" 2>/dev/null
+  }
+
+  local out
+  out="$(run_detector mesh-forger)"
+  grep -q "^ *forgery mesh-forger .*forger\.log" <<<"$out" \
+    || _f "RED fixture: an indirect --test writer of the production log must be named — got: $(tr '\n' '|' <<<"$out")"
+
+  grep -q 'forger.log' "$d/chat.capture" 2>/dev/null \
+    || _f "RED fixture: a confirmed forgery must reach the board once — no [fyi] captured"
+  run_detector mesh-forger >/dev/null
+  [ "$(wc -l < "$d/chat.capture" 2>/dev/null || echo 0)" = 1 ] \
+    || _f "edge-only: an already-reported pair must not re-post every sweep ($(wc -l < "$d/chat.capture" 2>/dev/null || echo 0) posts)"
+
+  out="$(run_detector mesh-honest)"
+  grep -q "forgery mesh-honest" <<<"$out" \
+    && _f "GREEN fixture: a --test writing only its dedicated dry-run sink must NOT be a finding"
+  grep -q "exempt mesh-honest .*honest-test\.log" <<<"$out" \
+    || _f "GREEN fixture: the dry-run sink must be REPORTED as exempt, not silently dropped"
+
+  # cron-noise leg: the log moves on its own through BOTH passes and the control window.
+  ( while :; do echo noise >> "$d/.mesh/noisy.log"; sleep 0.05; done ) &
+  local noisepid=$!
+  out="$(run_detector mesh-quiet)"
+  kill "$noisepid" 2>/dev/null; wait "$noisepid" 2>/dev/null
+  grep -q "forgery mesh-quiet" <<<"$out" \
+    && _f "NOISE leg: a log growing in the control window must never be a finding (single-pass attribution)"
+  grep -q "unattributable mesh-quiet .*noisy\.log" <<<"$out" \
+    || _f "NOISE leg: cron noise must render unattributable, not vanish — got: $(tr '\n' '|' <<<"$out")"
+
+  # the exemption is by SINK name, and it must not swallow a durable log whose name merely contains
+  # the tool's own word — assert the classifier both ways rather than trusting the case list.
+  is_exempt_log "$d/.mesh/gpu-lid.log"     && _f "exemption: a durable log must not be exempt"
+  is_exempt_log "$d/.mesh/guardian-test.log" || _f "exemption: a dedicated dry-run sink must be exempt"
+
+  # grown(): a log that APPEARS (did not exist before) is growth from 0, not an absence
+  local b; b="$(printf '%s\n' "/x/a.log 10")"
+  [ "$(grown <(printf '%s\n' "$b") "$(printf '%s\n' "/x/a.log 10"$'\n'"/x/new.log 5")")" = "/x/new.log" ] \
+    || _f "grown(): a newly created log must read as growth from 0"
+
+  rm -rf "$d"
+  [ "$(size_of "$REALLOG")" = "$REALLOG_SZ" ] \
+    || _f "sandbox: --test APPENDED to the production log $REALLOG — the detector forged its own record"
+
+  [ "$fail" = 0 ] || return 1
+  echo "smoke-test: ok (red forger named · honest dry-run sink exempt · cron noise → unattributable · own log untouched)"
+}
+
+# ---- entry ------------------------------------------------------------------------------------
+JSON=0; ONE_TOOL=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --test)  smoke_test; exit $? ;;
+    --json)  JSON=1 ;;
+    --tool)  ONE_TOOL="${2:-}"; shift ;;
+    --sweep) : ;;
+    -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
+    *) echo "mesh-test-forgery: unknown arg $1" >&2; exit 64 ;;
+  esac
+  shift
+done
+
+mkdir -p "$MESH"
+do_sweep
