@@ -25,7 +25,11 @@
 #    on this node (no separate /home) a mark "on ~/.mesh" silently observes the whole root fs and
 #    costs ~50 events/s. One mark per named artifact keeps the scope the scope you asked for.
 #  * IDENTITY IS CAPTURED INSIDE THE EVENT LOOP. A pid read late is a recycled-number risk, not just
-#    a missing name; an already-exited writer records comm=<exited> and is never attributed.
+#    a missing name; an already-exited writer records comm=<exited> and is never attributed. An EMPTY
+#    cmdline is three facts, not one — a departing writer (the kernel zeroes argv during exit while
+#    comm still reads), a kernel thread, an argv-less process — so each gets a sentinel and cmd is
+#    never blank. CLOSE_WRITE is the last event a writer emits, i.e. the newest row for a path is
+#    systematically the exit row, so --last replays the RICHEST row for that pid, not the newest.
 # No fanotify (or no `sudo -n`) → honest exit 2. Never a silent fallback to mtime or inotify.
 # orphan-ok: on-demand attribution probe — invoked by a mind or a consumer, deliberately not cronned
 # (a standing node-wide writer census is a different, costlier tool; this one is scoped to named files)
@@ -55,17 +59,50 @@ def now():
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
+PF_KTHREAD = 0x00200000
+# Every way a cmd field can be non-argv. cmd is NEVER rendered blank: "" is legacy rows only.
+SENTINELS = ("<exiting>", "<kthread>", "<no-argv>", "<exited>", "")
+
+
+def proc_state(pid):
+    """(state_char, is_kthread, has_mm) — the only place the three empty-cmdline facts separate."""
+    try:
+        st = open("/proc/%d/stat" % pid).read()
+    except OSError:
+        return "", False, False
+    tail = st[st.rfind(")") + 1:].split()          # comm may hold spaces/parens; split past it
+    state = tail[0] if tail else ""                # tail[0]=state(3) … tail[6]=flags(9)
+    flags = int(tail[6]) if len(tail) > 6 else 0
+    try:
+        has_mm = any(int(x) for x in open("/proc/%d/statm" % pid).read().split())
+    except OSError:
+        has_mm = False
+    return state, bool(flags & PF_KTHREAD), has_mm
+
+
 def identify(pid):
-    """comm + cmdline, read AT EVENT TIME. An exited writer is unknown, never attributed."""
+    """comm + cmdline, read AT EVENT TIME. An exited writer is unknown, never attributed.
+
+    AN EMPTY /proc/<pid>/cmdline IS THREE DIFFERENT FACTS and blank renders them alike. The kernel
+    zeroes argv during exit while /proc/<pid>/comm still reads (measured: a zombie reads state=Z,
+    comm='bash', cmdline=b'' — the same bytes as kthreadd's), so the LAST event a writer produces,
+    CLOSE_WRITE, is systematically the least-identified row. Each fact gets its own sentinel; the
+    row stays an honest record of what /proc said at that instant, and the enrichment lives in the
+    query (last()), never in a fabricated value here."""
     try:
         comm = open("/proc/%d/comm" % pid).read().strip()
     except OSError:
-        return "<exited>", ""
+        return "<exited>", "<exited>"
     try:
         cmd = open("/proc/%d/cmdline" % pid, "rb").read().replace(b"\0", b" ").decode(
             "utf-8", "replace").strip()
     except OSError:
         cmd = ""
+    if not cmd:
+        state, kthread, has_mm = proc_state(pid)
+        cmd = ("<kthread>" if kthread else                        # never had an argv
+               "<exiting>" if state in ("Z", "X") or not has_mm   # mm torn down: argv already gone
+               else "<no-argv>")                                  # alive, holding an empty argv
     return comm or "<exited>", cmd
 
 
@@ -152,20 +189,39 @@ def listen(paths, window, logpath):
     return 0
 
 
+ROW_RE = re.compile(r"^(?P<ts>\S+) fswriter pid=(?P<pid>\d+) comm=(?P<comm>\S+) n=\d+ "
+                    r"path=(?P<path>.*) cmd=\"(?P<cmd>.*)\"$")
+
+
 def last(path, logpath):
-    want = "path=%s " % os.path.abspath(path)
-    hit = None
+    """Replay the RICHEST row for the last writer's pid, not merely the NEWEST row.
+
+    CLOSE_WRITE is the last event a writer produces and it lands during exit, so the newest row for
+    a path is systematically the one whose argv the kernel has already zeroed — while a fully named
+    row for the same pid sits a line above. Preferring newest hands a consumer the least-identified
+    record; the cmdline is exactly the field that separates `mesh-mag --test` from `mesh-mag`."""
+    want = os.path.abspath(path)
+    rows = []
     try:
         for line in open(logpath):
-            if want in line:
-                hit = line.rstrip()
+            m = ROW_RE.match(line.rstrip())
+            if m and m.group("path") == want:
+                rows.append(m)
     except OSError:
         pass
-    if not hit:
+    if not rows:
         print("mesh-fswriter: no writer ever observed for %s (absence of an observation is not a "
               "claim about the writer)" % path)
         return 2
-    print(hit)
+    newest = best = rows[-1]
+    if newest.group("cmd") in SENTINELS:
+        for m in rows:                     # same pid, real argv → the same writer, better named
+            if m.group("pid") == newest.group("pid") and m.group("cmd") not in SENTINELS:
+                best = m
+    print(best.string)
+    if best is not newest:
+        print("# richest row for pid=%s; that writer was last seen %s cmd=\"%s\""
+              % (newest.group("pid"), newest.group("ts"), newest.group("cmd")))
     return 0
 
 
@@ -259,12 +315,41 @@ def smoke():
         print("  FAIL: leg5 — --last on a never-observed path must exit 2, got %d" % p.returncode)
         f = 1
 
+    # leg 6 — A DEPARTING WRITER IS NOT A BLANK FIELD. The writer holds the file open past its
+    # write, so CLOSE_WRITE lands as it exits — where the kernel has already zeroed
+    # /proc/<pid>/cmdline while /proc/<pid>/comm still reads. Two rows for one pid: the MODIFY row
+    # fully named, the exit row sentinelled. Falsify: drop the sentinel branch in identify() → the
+    # exit row renders cmd="" (an argv-less process and a kernel thread's own bytes), red.
+    # (the trailing `true` stops bash tail-exec'ing into sleep — mid-execve the argv is momentarily
+    #  empty on a LIVE process, which is a real third state but not the one this leg is aiming at)
+    out, wpid = run(8, writer=["bash", "-c", "exec 3>>%s; echo hi >&3; sleep 2; true" % watched])
+    mine = [l for l in out.splitlines() if ("pid=%d " % wpid) in l]
+    if any('cmd=""' in l for l in out.splitlines()):
+        print("  FAIL: leg6 — an empty cmdline was rendered blank; a departing writer, a kernel "
+              "thread and an argv-less process must not read alike:\n%s" % out)
+        f = 1
+    if len(mine) < 2 or not any('cmd="<exit' in l for l in mine):
+        print("  FAIL: leg6 — expected a named MODIFY row + a sentinelled exit row for pid=%s; "
+              "got:\n%s" % (wpid, out))
+        f = 1
+
+    # leg 7 — --last returns the RICHEST row for that pid, not the newest. Falsify: return rows[-1]
+    # → the replayed row carries the exit sentinel instead of the argv, red.
+    p = subprocess.run([sys.executable, os.path.abspath(__file__), "--_log", logp, "--last", watched],
+                       capture_output=True, text=True)
+    head = p.stdout.splitlines()[0] if p.stdout.strip() else ""
+    if p.returncode != 0 or ("pid=%d " % wpid) not in head or "exec 3>>" not in head:
+        print("  FAIL: leg7 — --last must replay the named row for pid=%s, not the exit row "
+              "(rc=%d out=%s)" % (wpid, p.returncode, p.stdout))
+        f = 1
+
     subprocess.call(["rm", "-rf", T])
     if f:
         print("smoke-test: FAIL (see asserts above)")
         return 1
     print("smoke-test: ok (writer pid+comm exact + inode mark does not leak the mount + NOTIF blocks "
-          "no write + silent window attributes nobody + --last replays / exits 2 unobserved)")
+          "no write + silent window attributes nobody + --last replays / exits 2 unobserved + a "
+          "departing writer is <exiting>, never blank, and --last prefers its named row)")
     return 0
 
 
