@@ -1,0 +1,418 @@
+#!/usr/bin/env bash
+# orphan-ok: on-demand ACTUATOR — a port cycle is a software unplug of somebody's hardware. It is
+#   driven when a wedged organ needs one, never on a cadence. NEVER cron-wire it.
+# mesh-usb-port — per-PORT USB software unplug: the rung below the device-level `authorized` write.
+#
+# WHAT IT IS. Every USB hub exposes, per downstream port, a writable `disable` attribute:
+#   /sys/bus/usb/devices/<hub>/<hub>:1.0/<hub>-port<N>/disable
+# Writing 1 electrically de-configures the port — the device vanishes from the bus (lsusb, /dev/*,
+# its sysfs node) and the port reads `not attached`. Writing 0 brings it back as a NEW device
+# number: a real re-enumeration at the port, not a driver rebind and not a cached node waking.
+# Nothing in this mesh used it before this tool (verified by discover, senses and health,
+# 2026-08-16); brief: ~/.mesh/knowledge/capability-usb-per-port-disable-actuator-mesh-home-20260816.md
+#
+#   mesh-usb-port --list                      every port, its state, what is on it, protected or not
+#   mesh-usb-port --cycle <port|devpath>      disable -> settle -> enable, with the round trip proven
+#   mesh-usb-port --cycle X --verify-cmd CMD  ...and retry until CMD exits 0 (see THE TRAP below)
+#   mesh-usb-port --cycle X --tries N         attempts when --verify-cmd is given (default 1)
+#   mesh-usb-port --state <port|devpath>      one line: state + child + devnum
+#   mesh-usb-port --test                      smoke (drives a full cycle against a FIXTURE sysfs)
+#
+# THE TRAP — READ THIS BEFORE WIRING IT ANYWHERE. A port that re-enumerates is not an organ that
+# works. senses drove this lever against a LIVE webcam wedge (uvcvideo -110, ~7h) and got a real
+# frame back in 2 of 5 trials. On all five, `present` was 1: lsusb, /dev/video0+1, the 1-2.3 sysfs
+# node and port state=`configured` were IDENTICAL on the winning and losing rows, and fswebcam
+# exited rc=0 with a ZERO-BYTE file — so rc=0 appears in three failures and both successes. Frame
+# BYTES was the only axis that separated them. Therefore this tool reports EXACTLY what it can
+# prove — the state flip and the devnum change — and refuses to call that a heal. The artifact for
+# "the organ works" belongs to the organ, and you hand it in via --verify-cmd.
+#   It is an on-demand "give me one frame now" lever that must RETRY, not a fix. A 2/5 lever does
+# not become a cron reflex.
+#
+# WHY THIS TOOL DOES NOT CAPTURE A FRAME ITSELF. That would be the obvious way to gate the retry
+# loop, and it is not ours to do: capture on this node is consent-gated by operator rule (mesh-eye
+# REFUSES without ~/.mesh/consent, and no grant exists here). A liveness probe is still a capture.
+# So the loop is here and the artifact is the caller's: --verify-cmd runs whatever the organ's own
+# consent-holding path is, and its exit code is the only thing that ends the retry.
+#
+# SAFETY — PROTECTED PORTS, and why the refusal has no override flag. A change is SELF-DEFEATING
+# when it disables the channel through which it would be undone. This node's sole uplink is a USB
+# wifi station on the SAME hub as the camera; cycling its port from this node severs the path the
+# rollback would travel over, and no dead-man's switch fires on a node nobody can reach. So:
+#   - the protected set is derived LIVE from the default route's interface, never from a hardcoded
+#     port name (a predicate that names a node ages out and goes silently false);
+#   - it includes every ANCESTOR port on the path from the root hub down, not just the leaf — the
+#     uplink hangs off 1-2-port4, but 1-2 itself hangs off usb1-port2, and disabling THAT severs the
+#     uplink exactly as dead while looking like a different port;
+#   - there is NO --force. A flag that says "yes, sever my own uplink" is the self-defeating edge,
+#     not a guard against it. Cycling the uplink port is a peer-vantage + mesh-dms procedure driven
+#     from ANOTHER node, and it is not this local tool's business.
+#
+# THE MODE BIT IS NOT THE WRITE, AND THE SUDO YOU REACHED FOR IS NOT A REFUSAL YOU SAW. `disable`
+# is a kernel pseudo-file: never gate on `[ -w ]`, ATTEMPT the write and check the result — that is
+# what write_port() does, unprivileged FIRST, escalating only on a refusal actually observed. The
+# inverse half was measured on this same file the same day: health reported `disable` as root-read
+# only, having reached for sudo out of habit on the first read; it is mode 0644 and reads fine as
+# uid 1000, and the unprivileged read was already in its own transcript. A privilege you never
+# tested is not a privilege you know. READ is unprivileged here; only the WRITE escalates.
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+
+SYSFS="${MESH_USB_PORT_SYSFS:-/sys/bus/usb/devices}"   # --test points this at a fixture tree
+SETTLE="${MESH_USB_PORT_SETTLE:-2}"                    # seconds held in the disabled state
+REENUM_WAIT="${MESH_USB_PORT_REENUM_WAIT:-8}"          # seconds to wait for the device to come back
+LOG="${MESH_USB_PORT_LOG:-$HOME/.mesh/usb-port.log}"
+stamp(){ date -u +%FT%TZ; }
+note(){ mkdir -p "$(dirname "$LOG")" 2>/dev/null; echo "$(stamp) $*" >> "$LOG"; }
+die(){ echo "mesh-usb-port: $*" >&2; exit 1; }
+
+# ── path algebra ───────────────────────────────────────────────────────────────────────────────
+# A port dir lives under the hub's INTERFACE, not under the hub device:
+#   hub 1-2   (child of another hub) -> $SYSFS/1-2/1-2:1.0/1-2-port3
+#   hub usb1  (a root hub)           -> $SYSFS/usb1/1-0:1.0/usb1-port7
+# The interface suffix is GLOBBED, never assumed to be ':1.0' — a hub with a different interface
+# layout would otherwise resolve to a path that does not exist, and an ENOENT whose rc is swallowed
+# reports a heal that never happened (this exact path cost health two dead reads).
+port_dirs(){ ls -d "$SYSFS"/*/*/*-port* 2>/dev/null | sort -V; }
+
+# devpath (1-2.3, 1-3) -> the port dir it is plugged into
+port_dir_of_devpath(){
+  local d="$1" hub port hits
+  case "$d" in
+    *.*) hub="${d%.*}"; port="${d##*.}" ;;                       # under an intermediate hub
+    *-*) hub="usb${d%%-*}"; port="${d##*-}" ;;                   # directly on a root hub
+    *)   return 1 ;;
+  esac
+  hits="$(ls -d "$SYSFS/$hub"/*/"$hub-port$port" 2>/dev/null | head -1)"
+  [ -n "$hits" ] && { printf '%s' "$hits"; return 0; }
+  return 1
+}
+port_name_of_dir(){ basename "$1"; }
+# the child device sitting on a port, if any (the hub's own child whose number matches)
+child_of_port(){
+  local pd="$1" name hub port dev
+  name="$(basename "$pd")"; hub="${name%-port*}"; port="${name##*-port}"
+  case "$hub" in usb*) dev="${hub#usb}-$port" ;; *) dev="$hub.$port" ;; esac
+  [ -e "$SYSFS/$dev" ] && { printf '%s' "$dev"; return 0; }
+  return 1
+}
+read_attr(){ cat "$1" 2>/dev/null; }                            # READ is unprivileged. Never sudo it.
+port_state(){ read_attr "$1/state"; }                            # world-readable: configured/not attached
+devnum_of(){ read_attr "$SYSFS/$1/devnum"; }
+idpair_of(){ printf '%s:%s' "$(read_attr "$SYSFS/$1/idVendor")" "$(read_attr "$SYSFS/$1/idProduct")"; }
+product_of(){ read_attr "$SYSFS/$1/product"; }
+
+# ── the protected set: every port on the path to the default route ─────────────────────────────
+# Derived live. If the default route is NOT on USB (ethernet, or a node with a PCIe NIC) the set is
+# empty and that is honest — there is no USB port here whose loss severs the control plane.
+protected_ports(){
+  local dev real d chain
+  dev="$(ip route show default 2>/dev/null | awk '/^default/{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
+  [ -n "$dev" ] || return 0
+  real="$(readlink -f "/sys/class/net/$dev/device" 2>/dev/null)" || return 0
+  case "$real" in *"/usb"*) ;; *) return 0 ;; esac                # not a USB uplink: nothing to protect
+  # walk the sysfs chain upward; every usb devpath component contributes its own port
+  chain="$(printf '%s' "$real" | tr '/' '\n' | grep -E '^[0-9]+-[0-9]+(\.[0-9]+)*$' | sort -u)"
+  local pd
+  for d in $chain; do
+    # command substitution, NOT a pipe into `while read`: port_dir_of_devpath printf's without a
+    # trailing newline, so `read` returns non-zero and DISCARDS the value — the protected set came
+    # back empty while every port resolved fine, which is the worst possible direction for this bug.
+    pd="$(port_dir_of_devpath "$d" 2>/dev/null)" || continue
+    [ -n "$pd" ] && basename "$pd"
+  done
+}
+PROTECTED=""
+load_protected(){ PROTECTED=" $(protected_ports | tr '\n' ' ') "; }
+is_protected(){ case "$PROTECTED" in *" $1 "*) return 0 ;; esac; return 1; }
+
+# ── the write: PROBE it, never gate on the mode bit ────────────────────────────────────────────
+# Attempt unprivileged first and escalate ONLY on a refusal actually observed. sudo is reached for
+# only when the target really is under /sys — a fixture write that fails must FAIL, not get quietly
+# rescued by root, or the gate proves nothing about the real path.
+write_port(){
+  local f="$1" v="$2"
+  # The BRACES matter. `printf ... > "$f" 2>/dev/null` does NOT silence a failing redirection:
+  # bash applies redirections left to right, so when `> "$f"` is refused it reports on the stderr
+  # in force AT THAT MOMENT — before `2>/dev/null` exists. Live first run printed a bare
+  # "Permission denied" from the unprivileged probe and then succeeded via sudo, which reads as a
+  # broken tool doing the exact thing it was designed to do. Group it, and the whole block's stderr
+  # (redirection failure included) is redirected before anything runs.
+  { printf '%s' "$v" > "$f"; } 2>/dev/null && return 0
+  case "$f" in
+    /sys/*) command -v sudo >/dev/null 2>&1 || return 1
+            printf '%s' "$v" | sudo -n tee "$f" >/dev/null 2>&1 && return 0 ;;
+  esac
+  return 1
+}
+
+resolve_target(){                                                # accepts a port name OR a devpath
+  local spec="$1" pd
+  case "$spec" in
+    *-port*) pd="$(ls -d "$SYSFS"/*/*/"$spec" 2>/dev/null | head -1)" ;;
+    *)       pd="$(port_dir_of_devpath "$spec" 2>/dev/null)" ;;
+  esac
+  [ -n "$pd" ] && [ -d "$pd" ] || return 1
+  printf '%s' "$pd"
+}
+
+cmd_list(){
+  local pd name st child extra
+  [ -n "$(port_dirs)" ] || { echo "mesh-usb-port: no USB port attributes under $SYSFS — this host exposes no per-port lever (n/a)"; exit 2; }
+  load_protected
+  printf '%-14s %-14s %-16s %s\n' PORT STATE DEVICE NOTE
+  while read -r pd; do
+    [ -n "$pd" ] || continue
+    name="$(port_name_of_dir "$pd")"; st="$(port_state "$pd")"; st="${st:--}"
+    if child="$(child_of_port "$pd")"; then
+      extra="$child $(idpair_of "$child") $(product_of "$child")"
+    else extra="-"; fi
+    if is_protected "$name"; then
+      printf '%-14s %-14s %-16s %s\n' "$name" "$st" "${child:--}" "PROTECTED — carries the default route (cycling it severs the rollback path); $extra"
+    else
+      printf '%-14s %-14s %-16s %s\n' "$name" "$st" "${child:--}" "$extra"
+    fi
+  done <<< "$(port_dirs)"
+}
+
+cmd_state(){
+  local pd; pd="$(resolve_target "$1")" || die "no such port or device: $1"
+  local name child; name="$(port_name_of_dir "$pd")"
+  child="$(child_of_port "$pd" || true)"
+  printf '%s state=%s child=%s devnum=%s protected=%s\n' \
+    "$name" "$(port_state "$pd")" "${child:--}" \
+    "$([ -n "$child" ] && devnum_of "$child" || echo -)" \
+    "$(load_protected; is_protected "$name" && echo yes || echo no)"
+}
+
+# ── the cycle ──────────────────────────────────────────────────────────────────────────────────
+CYCLE_PD=""                                                      # for the crash-safe re-enable trap
+reenable_trap(){
+  [ -n "$CYCLE_PD" ] || return 0
+  local cur; cur="$(read_attr "$CYCLE_PD/disable")"
+  if [ "$cur" = "1" ]; then
+    write_port "$CYCLE_PD/disable" 0 \
+      && note "TRAP re-enabled $(port_name_of_dir "$CYCLE_PD") on exit" \
+      || note "TRAP FAILED to re-enable $(port_name_of_dir "$CYCLE_PD") — the port is STILL DISABLED"
+  fi
+}
+
+one_cycle(){                                                     # $1=port dir; echoes the artifact
+  local pd="$1" name child_pre dn_pre st_pre child_post dn_post st_post waited
+  name="$(port_name_of_dir "$pd")"
+  child_pre="$(child_of_port "$pd" || true)"
+  dn_pre="$([ -n "$child_pre" ] && devnum_of "$child_pre" || echo -)"
+  st_pre="$(port_state "$pd")"
+
+  CYCLE_PD="$pd"; trap reenable_trap EXIT INT TERM
+  write_port "$pd/disable" 1 || { CYCLE_PD=""; trap - EXIT INT TERM
+    echo "  WRITE REFUSED: could not set $name/disable=1 (unprivileged write failed and sudo -n did not rescue it)"
+    return 1; }
+  sleep "$SETTLE"
+  st_post="$(port_state "$pd")"
+  echo "  disabled: state '$st_pre' -> '$st_post'$([ -n "$child_pre" ] && echo ", $child_pre gone: $([ -e "$SYSFS/$child_pre" ] && echo NO || echo yes)")"
+
+  write_port "$pd/disable" 0 || { echo "  RE-ENABLE REFUSED — the port is left DISABLED, this is the bad case"; return 1; }
+  CYCLE_PD=""; trap - EXIT INT TERM
+  waited=0
+  while [ "$waited" -lt "$REENUM_WAIT" ]; do
+    child_post="$(child_of_port "$pd" || true)"
+    [ -n "$child_post" ] && break
+    sleep 1; waited=$((waited+1))
+  done
+  child_post="$(child_of_port "$pd" || true)"
+  dn_post="$([ -n "$child_post" ] && devnum_of "$child_post" || echo -)"
+  echo "  enabled:  state '$(port_state "$pd")' child=${child_post:--} devnum ${dn_pre} -> ${dn_post} (waited ${waited}s)"
+  if [ -n "$dn_pre" ] && [ -n "$dn_post" ] && [ "$dn_pre" != "-" ] && [ "$dn_post" != "-" ] && [ "$dn_pre" != "$dn_post" ]; then
+    echo "  re-enumeration PROVEN: the device number moved, so this was a port-level unplug, not a driver rebind."
+  elif [ -z "$child_post" ]; then
+    echo "  DEVICE DID NOT COME BACK within ${REENUM_WAIT}s — worse than the state we found."
+    return 1
+  else
+    echo "  re-enumeration NOT proven: devnum unchanged (${dn_pre}). The port flipped; whether the device re-attached is unestablished."
+  fi
+  return 0
+}
+
+cmd_cycle(){
+  local spec="$1" verify="${2:-}" tries="${3:-1}" pd name i rc=1
+  pd="$(resolve_target "$spec")" || die "no such port or device: $spec"
+  name="$(port_name_of_dir "$pd")"
+  load_protected
+  if is_protected "$name"; then
+    echo "mesh-usb-port: REFUSED — $name is on the path to this node's default route." >&2
+    echo "  Cycling it severs the channel any rollback would travel over, and there is no --force:" >&2
+    echo "  a change that disables the channel through which it would be undone is not made safer" >&2
+    echo "  by a flag. Drive it from a PEER under mesh-dms, with the vantage outside this node." >&2
+    echo "  protected set (default-route ancestry): $(echo "$PROTECTED" | tr -s ' ')" >&2
+    exit 3
+  fi
+  [ "$tries" -ge 1 ] 2>/dev/null || die "--tries must be >= 1"
+  echo "mesh-usb-port: cycling $name ($(child_of_port "$pd" || echo 'no device on this port'))"
+  for i in $(seq 1 "$tries"); do
+    [ "$tries" -gt 1 ] && echo " attempt $i/$tries:"
+    if one_cycle "$pd"; then rc=0; else rc=1; fi
+    note "CYCLE $name attempt=$i/$tries rc=$rc verify=${verify:+set}"
+    if [ -n "$verify" ]; then
+      if eval "$verify" >/dev/null 2>&1; then
+        echo "  VERIFY PASSED: the caller's artifact check exited 0 — the organ produced something, not just a device node."
+        note "CYCLE $name VERIFY-PASS attempt=$i"; return 0
+      else
+        echo "  verify failed: the port cycled but the organ still produced nothing. Re-enumerated is not working."
+        rc=1
+      fi
+    else
+      [ "$rc" -eq 0 ] && {
+        echo "  NOTE: no --verify-cmd was given, so this reports a PORT round trip and nothing about the organ."
+        echo "        A device that re-enumerated is not an eye that sees (2/5 measured, presence=1 on all five)."
+        return 0; }
+    fi
+  done
+  [ -n "$verify" ] && echo "  EXHAUSTED: ${tries} cycle(s), the artifact check never passed."
+  return "$rc"
+}
+
+# ── smoke ──────────────────────────────────────────────────────────────────────────────────────
+TMPD=""                                                          # global: the EXIT trap outlives a local
+run_test(){
+  local fail=0 rc; TMPD="$(mktemp -d)"; local tmp="$TMPD"; trap 'rm -rf "$TMPD"' EXIT
+  # A FIXTURE sysfs tree: the full cycle is driven end to end without touching real hardware, so
+  # the gate exercises the write path itself and not a stub of it.
+  mk_fixture(){
+    local root="$1"; rm -rf "$root"; mkdir -p "$root"
+    mkdir -p "$root/1-2/1-2:1.0/1-2-port3" "$root/1-2/1-2:1.0/1-2-port4" "$root/1-2.3" "$root/1-2.4"
+    echo 0 > "$root/1-2/1-2:1.0/1-2-port3/disable"; echo configured > "$root/1-2/1-2:1.0/1-2-port3/state"
+    echo 0 > "$root/1-2/1-2:1.0/1-2-port4/disable"; echo configured > "$root/1-2/1-2:1.0/1-2-port4/state"
+    echo 23 > "$root/1-2.3/devnum"; echo 1871 > "$root/1-2.3/idVendor"; echo 0142 > "$root/1-2.3/idProduct"
+    echo "USB2.0 Camera" > "$root/1-2.3/product"
+    echo 17 > "$root/1-2.4/devnum"
+  }
+  local F="$tmp/sysfs"; mk_fixture "$F"
+
+  echo "== a bogus port is an honest error, never a silent success =="
+  if MESH_USB_PORT_SYSFS="$F" MESH_USB_PORT_LOG="$tmp/l" bash "$0" --state 9-99 >/dev/null 2>&1; then
+    echo "  FAIL: a nonexistent port must not resolve"; fail=1
+  else echo "  ok: unresolvable target exits non-zero (an ENOENT whose rc is swallowed reports a heal that never happened)"; fi
+
+  echo "== the port dir is found under the hub's INTERFACE, not the hub =="
+  local st; st="$(MESH_USB_PORT_SYSFS="$F" MESH_USB_PORT_LOG="$tmp/l" bash "$0" --state 1-2.3 2>/dev/null)"
+  case "$st" in *"1-2-port3 state=configured child=1-2.3"*) echo "  ok: 1-2.3 -> 1-2/1-2:1.0/1-2-port3 ($st)" ;;
+    *) echo "  FAIL: devpath->port resolution wrong: '$st'"; fail=1 ;; esac
+
+  echo "== a full cycle proves the round trip AND the re-enumeration (devnum must move) =="
+  # The fixture's device comes back with a NEW devnum, as a real port cycle does. The bump must be
+  # ordered AFTER the tool has read dn_pre, so it waits for disable=1 rather than racing the launch:
+  # a bare `echo 24 & ` landed before the tool started, dn_pre read 24, and the gate reported "not
+  # proven" against a fixture that had already changed. A fixture that mutates on a timer tests the
+  # scheduler, not the code.
+  local out
+  ( for _ in $(seq 1 100); do
+      [ "$(cat "$F/1-2/1-2:1.0/1-2-port3/disable" 2>/dev/null)" = "1" ] && { echo 24 > "$F/1-2.3/devnum"; exit 0; }
+      sleep 0.05
+    done ) &
+  out="$(MESH_USB_PORT_SYSFS="$F" MESH_USB_PORT_LOG="$tmp/l" MESH_USB_PORT_SETTLE=1 MESH_USB_PORT_REENUM_WAIT=1 \
+        bash "$0" --cycle 1-2-port3 2>&1)"
+  wait
+  printf '%s\n' "$out" | grep -q 're-enumeration PROVEN' \
+    && echo "  ok: devnum 23 -> 24 read as a port-level unplug" \
+    || { echo "  FAIL: a devnum change must read as re-enumeration proven"; printf '%s\n' "$out" | sed 's/^/    /'; fail=1; }
+  printf '%s\n' "$out" | grep -q 'is not an eye that sees' \
+    && echo "  ok: with no --verify-cmd it refuses to call a port round trip a heal" \
+    || { echo "  FAIL: an unverified cycle must state that it proves nothing about the organ"; fail=1; }
+  [ "$(cat "$F/1-2/1-2:1.0/1-2-port3/disable")" = "0" ] \
+    && echo "  ok: the port was left ENABLED" \
+    || { echo "  FAIL: the cycle left the port disabled"; fail=1; }
+
+  echo "== RED-first: a REFUSED write must fail the cycle, not pass it =="
+  mk_fixture "$F"; chmod 0444 "$F/1-2/1-2:1.0/1-2-port3/disable"
+  out="$(MESH_USB_PORT_SYSFS="$F" MESH_USB_PORT_LOG="$tmp/l" MESH_USB_PORT_SETTLE=0 bash "$0" --cycle 1-2-port3 2>&1)"; rc=$?
+  chmod 0644 "$F/1-2/1-2:1.0/1-2-port3/disable"
+  if [ "$rc" -ne 0 ] && printf '%s\n' "$out" | grep -q 'WRITE REFUSED'; then
+    echo "  ok: an unwritable pseudo-file is reported as a refusal (probe the write; never gate on the mode bit)"
+  else
+    echo "  FAIL: a refused write must not read as a completed cycle (rc=$rc)"; printf '%s\n' "$out" | sed 's/^/    /'; fail=1
+  fi
+
+  echo "== the unprivileged probe is SILENT when it falls through to sudo =="
+  # Measured on the live cycle: `> "$f" 2>/dev/null` leaks the redirection failure, because bash
+  # applies redirections left to right and reports before 2>/dev/null is in force. The escalation
+  # worked and the tool still looked broken. Assert the probe writes nothing to stderr.
+  mk_fixture "$F"; chmod 0444 "$F/1-2/1-2:1.0/1-2-port3/disable"
+  local errtxt
+  errtxt="$(MESH_USB_PORT_SYSFS="$F" MESH_USB_PORT_LOG="$tmp/l" MESH_USB_PORT_SETTLE=0 \
+            bash "$0" --cycle 1-2-port3 2>&1 >/dev/null)"
+  chmod 0644 "$F/1-2/1-2:1.0/1-2-port3/disable"
+  case "$errtxt" in
+    *"Permission denied"*|*"cannot create"*)
+      echo "  FAIL: the refused probe leaked a shell redirection error to stderr: $errtxt"; fail=1 ;;
+    *) echo "  ok: the refused write produces no shell noise — only the tool's own reported refusal" ;;
+  esac
+
+  echo "== --verify-cmd decides, BOTH directions (a gate you have not seen fail is not a gate) =="
+  mk_fixture "$F"
+  out="$(MESH_USB_PORT_SYSFS="$F" MESH_USB_PORT_LOG="$tmp/l" MESH_USB_PORT_SETTLE=0 MESH_USB_PORT_REENUM_WAIT=0 \
+        bash "$0" --cycle 1-2-port3 --verify-cmd true 2>&1)"
+  printf '%s\n' "$out" | grep -q 'VERIFY PASSED' \
+    && echo "  ok: artifact check exits 0 -> the loop stops and says the organ produced something" \
+    || { echo "  FAIL: a passing verify must end the loop"; fail=1; }
+  mk_fixture "$F"
+  out="$(MESH_USB_PORT_SYSFS="$F" MESH_USB_PORT_LOG="$tmp/l" MESH_USB_PORT_SETTLE=0 MESH_USB_PORT_REENUM_WAIT=0 \
+        bash "$0" --cycle 1-2-port3 --verify-cmd false --tries 3 2>&1)"; rc=$?
+  if [ "$rc" -ne 0 ] && printf '%s\n' "$out" | grep -q 'EXHAUSTED: 3 cycle' \
+     && [ "$(printf '%s\n' "$out" | grep -c 'verify failed')" = "3" ]; then
+    echo "  ok: a failing artifact check retries all 3 and exits non-zero — 'present' can never end the loop"
+  else
+    echo "  FAIL: a failing verify must retry --tries times and fail (rc=$rc)"; printf '%s\n' "$out" | sed 's/^/    /'; fail=1
+  fi
+
+  echo "== the uplink's WHOLE ancestry is protected, on live sysfs =="
+  local dev real live_prot=""
+  dev="$(ip route show default 2>/dev/null | awk '/^default/{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
+  real="$(readlink -f "/sys/class/net/$dev/device" 2>/dev/null || true)"
+  case "$real" in
+    *"/usb"*)
+      live_prot="$(bash "$0" --list 2>/dev/null | awk '/PROTECTED/{print $1}' | tr '\n' ' ')"
+      local n; n="$(printf '%s' "$live_prot" | wc -w)"
+      if [ "$n" -ge 2 ]; then
+        echo "  ok: default route on $dev ($real) -> protected: $live_prot (leaf AND the hub's own port)"
+      else
+        echo "  FAIL: a USB uplink must protect its leaf port AND every ancestor port, got '$live_prot'"; fail=1
+      fi
+      local leaf; leaf="$(printf '%s' "$live_prot" | awk '{print $NF}')"
+      if [ -z "$leaf" ]; then
+        echo "  FAIL: no protected port to test the refusal against — the refusal gate would be vacuous"; fail=1
+      elif bash "$0" --cycle "$leaf" >/dev/null 2>&1; then
+        echo "  FAIL: cycling a protected port must be REFUSED"; fail=1
+      else echo "  ok: --cycle $leaf refused (exit 3, no --force exists)"; fi ;;
+    *) echo "  n/a: this node's default route is not on USB — the protected set is honestly empty" ;;
+  esac
+
+  echo
+  if [ "$fail" -eq 0 ]; then echo "mesh-usb-port --test: PASS"; else echo "mesh-usb-port --test: FAIL"; fi
+  return "$fail"
+}
+
+# ── args ───────────────────────────────────────────────────────────────────────────────────────
+[ $# -gt 0 ] || { sed -n '/^#   mesh-usb-port /,/^#$/p' "$0" | sed 's/^# \{0,2\}//'; exit 0; }
+VERIFY=""; TRIES=1; ACTION=""; TARGET=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --list)       ACTION=list ;;
+    --state)      ACTION=state; TARGET="${2:-}"; shift ;;
+    --cycle)      ACTION=cycle; TARGET="${2:-}"; shift ;;
+    --verify-cmd) VERIFY="${2:-}"; shift ;;
+    --tries)      TRIES="${2:-1}"; shift ;;
+    --test)       ACTION=test ;;
+    -h|--help)    sed -n '/^#   mesh-usb-port /,/^#$/p' "$0" | sed 's/^# \{0,2\}//'; exit 0 ;;
+    *)            die "unknown argument: $1" ;;
+  esac
+  shift
+done
+case "$ACTION" in
+  list)  cmd_list ;;
+  state) [ -n "$TARGET" ] || die "--state needs a port or devpath"; cmd_state "$TARGET" ;;
+  cycle) [ -n "$TARGET" ] || die "--cycle needs a port or devpath"; cmd_cycle "$TARGET" "$VERIFY" "$TRIES" ;;
+  test)  run_test ;;
+  *)     die "nothing to do" ;;
+esac
