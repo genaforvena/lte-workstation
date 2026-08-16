@@ -484,7 +484,7 @@ load-bearing tools — run `mesh-tools <category>` for the rest and the full con
 - **Minds control:** `mesh-mind-control` (`--allocate`/`--dispatch`/`--classify`/`--watch`) · `mesh-mind-compact` · `mesh-spend` · `mesh-usage`/`mesh-load` · `mesh-mode` · `mesh-gate-watch`.
 - **Channels / streams:** `mesh-stream` · `mesh-channels` · `mesh-nodestate` · `mesh-fleet-feed` · `mesh-channel-tg`.
 - **Organs / actuators:** `mesh-organ` (capability router) · `mesh-tv-dlna` · `mesh-sms` · `mesh-phone-*` (`-ip`/`-watch`/`-ear`/`-sensors`/`-convo`) · `mesh-sensor-log`.
-- **On-demand / audit:** `mesh-tools` (the index itself) · `mesh-doctor` · `mesh-digest`/`mesh-since`/`mesh-morning`/`mesh-novelty` · `mesh-review`/`mesh-study`/`mesh-claude-check` · `mesh-chaos`(+`-doctor`/`-verify`) · `mesh-guardian` · `mesh-fleet-health`/`mesh-fleet-states` · `mesh-browse`/`mesh-eye`/`mesh-hear`/`mesh-ear`/`mesh-transcribe` — plus the rest under `mesh-tools audit`.
+- **On-demand / audit:** `mesh-tools` (the index itself) · `mesh-doctor` · `mesh-digest`/`mesh-since`/`mesh-morning`/`mesh-novelty` · `mesh-review`/`mesh-study`/`mesh-claude-check` · `mesh-test-forgery` (daily: runs one tool's `--test` and watches which `~/.mesh/*.log` grew — a dry-run writing the durable liveness record forges the evidence it exists to check; a candidate is only a finding if it repeats AND does not grow in an equal control window) · `mesh-chaos`(+`-doctor`/`-verify`) · `mesh-guardian` · `mesh-fleet-health`/`mesh-fleet-states` · `mesh-browse`/`mesh-eye`/`mesh-hear`/`mesh-ear`/`mesh-transcribe` — plus the rest under `mesh-tools audit`.
 
 ## On-demand canon (intentionally unwired — NOT orphans)
 
