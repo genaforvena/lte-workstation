@@ -37,6 +37,8 @@ export PATH="$HOME/.local/bin:$PATH"
 
 STATE="$HOME/.mesh/.disk-space.state"
 TEST_FILE="$HOME/.mesh/.fs_write_test_$$"
+WRITE_SOFT_S="${MESH_DISK_WRITE_SOFT_S:-2}"
+WRITE_HARD_S="${MESH_DISK_WRITE_HARD_S:-15}"
 MIN_KB="${MESH_DISK_MIN_KB:-65536}"   # ignore mounts under 64 MiB (see header)
 DF_X="-x squashfs -x iso9660 -x devtmpfs -x efivarfs -x tracefs -x fuse.snapfuse -x fuse.portal"
 
@@ -68,27 +70,56 @@ scan_rows() {
       printf "%d|%s|%s|%s\n", bu, bm, (im=="" ? "OFFLINE" : bi""), (im=="" ? "-" : im) }'
 }
 
-classify_disk() { # <use_pct> <inode_pct> <writeable> [use_mount] [inode_mount] -> "LABEL|reason"
+# WRITE PROBE — three outcomes, not two (2026-08-16, the false-CRITICAL on mesh-home).
+#   The probe was `timeout 2 touch`, and ANY non-zero rc became writeable=0 -> CRITICAL
+#   "filesystem is read-only or unwritable". But a timeout is not a refusal: at 07:30 this node
+#   was under a write-latency stall (mesh-disk-latency logged dm-0 write=1392ms/2199ms in the
+#   same minutes) and the 2s touch simply did not finish. The capacity axis published CRITICAL
+#   for a filesystem that was 23% full, writeable, and SMART-clean, and mesh-storage-health then
+#   fused it with latency=STALLED into "capacity=CRITICAL,latency=STALLED (imminent storage
+#   failure)". The whole point of that fusion is CORROBORATION ACROSS INDEPENDENT AXES — and the
+#   writeability leg is latency-sensitive, so one slow write tripped both axes and got counted
+#   twice. (Tell in the artifact: that CRITICAL carried no `@<mount>`, because no mount was full.)
+#   So separate the claims by the rc the kernel actually gave us:
+#     rc=0                      -> yes   writeable
+#     rc!=0 and not a timeout   -> no    a real refusal (EROFS/EACCES/ENOSPC) — CRITICAL, as before
+#     timed out, retry SUCCEEDS -> slow  a LATENCY symptom; capacity says nothing, and must not
+#     timed out, retry TIMES OUT-> hung  genuinely unresponsive — CRITICAL, but NOT "read-only"
+#   `hung` keeps the emergency detectable; `slow` is the one that used to lie.
+probe_write() { # <file> [soft_s] [hard_s] -> yes|slow|hung|no
+  local f="$1" soft="${2:-$WRITE_SOFT_S}" hard="${3:-$WRITE_HARD_S}" rc
+  timeout "$soft" touch "$f" 2>/dev/null; rc=$?
+  if [ "$rc" -eq 0 ]; then rm -f "$f" 2>/dev/null; echo yes; return; fi
+  if [ "$rc" -ne 124 ] && [ "$rc" -ne 137 ]; then echo no; return; fi
+  timeout "$hard" touch "$f" 2>/dev/null; rc=$?
+  if [ "$rc" -eq 0 ]; then rm -f "$f" 2>/dev/null; echo slow; return; fi
+  if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then echo hung; return; fi
+  echo no
+}
+
+classify_disk() { # <use_pct> <inode_pct> <write_probe> [use_mount] [inode_mount] -> "LABEL|reason"
   local use="$1" inode="$2" writeable="$3" um="${4:-}" im="${5:-}"
-  local uw iw
+  local uw iw note=""
   uw="${um:+ on $um}"; iw="${im:+ on $im}"
-  if [ "$writeable" -ne 1 ] 2>/dev/null; then
-    echo "CRITICAL|filesystem is read-only or unwritable"
-    return
-  fi
+  case "$writeable" in
+    1|yes) ;;
+    slow)  note=" [write probe slow: >${WRITE_SOFT_S}s, completed under ${WRITE_HARD_S}s — a latency symptom, not capacity; see mesh-disk-latency]" ;;
+    hung)  echo "CRITICAL|write probe HUNG >${WRITE_HARD_S}s — filesystem unresponsive (not a read-only remount)"; return ;;
+    *)     echo "CRITICAL|filesystem is read-only or unwritable"; return ;;
+  esac
   if [ "$use" = "OFFLINE" ] || [ "$inode" = "OFFLINE" ]; then
-    echo "OFFLINE|could not read filesystem metrics"
+    echo "OFFLINE|could not read filesystem metrics${note}"
     return
   fi
   if [ "$use" -ge 95 ] 2>/dev/null || [ "$inode" -ge 95 ] 2>/dev/null; then
-    echo "CRITICAL|exhausted (use=${use}%${uw} inode=${inode}%${iw})"
+    echo "CRITICAL|exhausted (use=${use}%${uw} inode=${inode}%${iw})${note}"
     return
   fi
   if [ "$use" -ge 85 ] 2>/dev/null || [ "$inode" -ge 85 ] 2>/dev/null; then
-    echo "WARNING|low space (use=${use}%${uw} inode=${inode}%${iw})"
+    echo "WARNING|low space (use=${use}%${uw} inode=${inode}%${iw})${note}"
     return
   fi
-  echo "NORMAL|space OK (use=${use}%${uw} inode=${inode}%${iw})"
+  echo "NORMAL|space OK (use=${use}%${uw} inode=${inode}%${iw})${note}"
 }
 
 # --- Test mode ---
@@ -112,6 +143,50 @@ if [ "${1:-}" = --test ]; then
   
   r="$(classify_disk 50 8 0)"
   echo "$r" | grep -q '^CRITICAL' || { echo "  FAIL classify CRITICAL writeable: got=$r"; fail=1; }
+
+  # --- WRITE-PROBE leg (the 2026-08-16 false CRITICAL): a slow write is not a full disk ---
+  # A probe that TIMED OUT but then completed is a latency symptom. Calling it CRITICAL
+  # "read-only or unwritable" hands mesh-storage-health a second, non-independent CRITICAL axis
+  # and it escalates to "imminent storage failure" on a 23%-full, SMART-clean filesystem.
+  r="$(classify_disk 50 8 slow)"
+  echo "$r" | grep -q '^NORMAL' || { echo "  FAIL classify slow-probe must NOT be a capacity verdict: got=$r"; fail=1; }
+  echo "$r" | grep -q 'write probe slow' || { echo "  FAIL classify slow-probe must SAY it was slow: got=$r"; fail=1; }
+  # ...and a genuinely wedged fs must still raise, without claiming a read-only remount it never saw
+  r="$(classify_disk 50 8 hung)"
+  echo "$r" | grep -q '^CRITICAL' || { echo "  FAIL classify hung-probe must raise CRITICAL: got=$r"; fail=1; }
+  echo "$r" | grep -q 'read-only or unwritable' && { echo "  FAIL classify hung-probe must not claim the fs is read-only: got=$r"; fail=1; }
+  r="$(classify_disk 50 8 no)"
+  echo "$r" | grep -q 'read-only or unwritable' || { echo "  FAIL classify refused-probe: got=$r"; fail=1; }
+
+  # REAL probe_write, all three non-happy paths driven against the kernel (no stubs):
+  _pd="$(mktemp -d)" || { echo "  FAIL probe_write: mktemp -d"; fail=1; _pd=""; }
+  if [ -n "$_pd" ]; then
+    r="$(probe_write "$_pd/ok" 2 5)"
+    [ "$r" = yes ] || { echo "  FAIL probe_write real write: expected yes got=$r"; fail=1; }
+    # a real refusal (ENOENT on a missing dir) must stay 'no' — the errno path, not the clock path
+    r="$(probe_write "$_pd/nodir/x" 2 5)"
+    [ "$r" = no ] || { echo "  FAIL probe_write refusal: expected no got=$r"; fail=1; }
+    # The CLOCK path. A wedged filesystem cannot be conjured here, so the slowness is synthetic —
+    # but everything that decides the verdict is real: timeout(1) really SIGTERMs a write that
+    # overran, the kernel really returns 124, and probe_write really reads that rc. (A reader-less
+    # FIFO does NOT work: GNU touch opens O_NONBLOCK and returns instantly — measured, not assumed.)
+    _sd="$_pd/shim"; mkdir -p "$_sd"
+    _oldpath="$PATH"
+    printf '#!/bin/sh\nsleep 30\n' > "$_sd/touch"; chmod +x "$_sd/touch"
+    PATH="$_sd:$PATH"
+    r="$(probe_write "$_pd/wedged" 1 1)"
+    [ "$r" = hung ] || { echo "  FAIL probe_write overran both deadlines: expected hung got=$r"; fail=1; }
+    # ...and the SAME overrun, completing before the HARD deadline, must read 'slow' — never 'no',
+    # and never the read-only CRITICAL that made 07:34 look like imminent storage failure.
+    printf '#!/bin/sh\nsleep 2\nexec /usr/bin/touch "$@"\n' > "$_sd/touch"; chmod +x "$_sd/touch"
+    r="$(probe_write "$_pd/late" 1 8)"
+    [ "$r" = slow ] || { echo "  FAIL probe_write overran soft deadline only: expected slow got=$r"; fail=1; }
+    PATH="$_oldpath"
+    # and the verdict that reaches storage-health from that 'slow' must not be a capacity CRITICAL
+    r="$(classify_disk 23 2 slow / /)"
+    echo "$r" | grep -q '^CRITICAL' && { echo "  FAIL slow probe still escalates capacity: got=$r"; fail=1; }
+    rm -rf "$_pd"
+  fi
 
   r="$(classify_disk OFFLINE 8 1)"
   echo "$r" | grep -q '^OFFLINE' || { echo "  FAIL classify OFFLINE blocks: got=$r"; fail=1; }
@@ -158,18 +233,15 @@ if [ "${1:-}" = --test ]; then
     ''|*[!0-9]*) echo "  FAIL real-read: live worst use% not numeric: got=$_lw"; fail=1 ;;
   esac
 
-  [ "$fail" = 0 ] && { echo "smoke-test: ok (classifier x7 + multi-mount x6 + real-read x3; live mounts: $_n, worst: $_lw)"; exit 0; } || { echo "smoke-test: FAIL"; exit 1; }
+  [ "$fail" = 0 ] && { echo "smoke-test: ok (classifier x7 + write-probe x5 + real-probe x5 + multi-mount x6 + real-read x3; live mounts: $_n, worst: $_lw)"; exit 0; } || { echo "smoke-test: FAIL"; exit 1; }
 fi
 
 # --- Live read path ---
 TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
-# 1. Check writeability of $HOME/.mesh
-writeable=0
-if timeout 2 touch "$TEST_FILE" 2>/dev/null; then
-  writeable=1
-  rm -f "$TEST_FILE"
-fi
+# 1. Check writeability of $HOME/.mesh — yes|slow|hung|no (see probe_write: a timeout is not a refusal)
+writeable="$(probe_write "$TEST_FILE")"
+rm -f "$TEST_FILE" 2>/dev/null || true
 
 # 2+3. Worst block% and worst inode% across EVERY real local mount (see header: reading only
 # $HOME's fs published NORMAL on a node whose /tmp was 100% and refusing every write).
@@ -220,7 +292,7 @@ fi
 
 # --- Output ---
 if [ "${1:-}" = --json ]; then
-  printf '{"label":"%s","reason":"%s","use_pct":%s,"inode_pct":%s,"writeable":%s,"ts":"%s"}\n' \
+  printf '{"label":"%s","reason":"%s","use_pct":%s,"inode_pct":%s,"writeable":"%s","ts":"%s"}\n' \
     "$label" "$reason" "${use_pct:-null}" "${inode_pct:-null}" "$writeable" "$TS"
   exit 0
 fi
