@@ -8,6 +8,9 @@
 #   mesh-voice-say "текст" /tmp/out.wav      synth to out.wav (24kHz mono), rc=0 on success
 #   mesh-voice-say "текст"                   synth to a fresh /tmp wav, print its path on stdout
 #   mesh-voice-say --test                    LIVE gate: real synth via the daemon yields a valid wav
+#   mesh-voice-say --test-live [--nolock]    ONE live fixture synth, under the shared test lock
+#                                            (--nolock = the same thing without it: the RED leg the
+#                                            serialization gate in --test drives every run)
 #
 # rc!=0 (+ a LOUD stderr warning) means the clone is unavailable — callers MUST fall back to piper
 # rather than go silent, but the fallback is a fault to fix, never the quiet normal (the mesh's
@@ -23,6 +26,9 @@ usage(){ sed -n '2,/^[^#]/p' "$0" | sed -n 's/^# \?//p'; }
 #   0 ok · 3 empty text · 4 daemon replied ERR · 5 daemon UNREACHABLE (socket absent/refused)
 #   6 other exception · 7 synth TIMEOUT (daemon reachable but no reply within MESH_CLONE_TIMEOUT,
 #     default 180s — the cap a long text can legitimately outrun; NOT a daemon-down signal)
+#   8 BUSY — the daemon REFUSED admission (queue at MESH_CLONE_MAXDEPTH). Healthy, saturated, and
+#     it answered in milliseconds: fall back to piper NOW. Distinct from 5 (down: fix the service),
+#     from 7 (we waited and gave up) and from 4 (the synth was attempted and failed).
 _call(){
   local out="$1" text="$2"
   OUT="$out" TEXT="$text" SOCK="$SOCK" TMO="${MESH_CLONE_TIMEOUT:-180}" python3 - <<'PY'
@@ -45,7 +51,9 @@ try:
         buf += c
     line = buf.split(b"\n", 1)[0].decode("utf-8", "replace")
     print(line)
-    sys.exit(0 if line.startswith("OK\t") else 4)
+    if line.startswith("OK\t"):
+        sys.exit(0)
+    sys.exit(8 if line.startswith("BUSY\t") else 4)   # prefix, not a substring scan of the prose
 except socket.timeout:
     print("ERR\tsynth timeout after %.0fs on %d chars — daemon busy/slow, NOT down; chunk the text or raise MESH_CLONE_TIMEOUT" % (tmo, len(text))); sys.exit(7)
 except (FileNotFoundError, ConnectionRefusedError):
@@ -54,6 +62,46 @@ except Exception as e:
     print("ERR\t" + str(e)); sys.exit(6)
 PY
 }
+
+# ── the TEST synth path, serialized (task:synth-depth-unbounded) ──────────────────────────────
+# The daemon already serializes real callers (one GPU, one `_lock`), so a client-side lock buys a
+# REAL caller nothing — it would just move the wait. This lock is scoped to the --test path on
+# purpose: mesh-doctor's hourly sweep fires every tool's --test at once, and this fixture synth was
+# 45% of the daemon's entire completion corpus, arriving CONCURRENTLY (mesh-voice-say + whatever
+# else asks for a live synth) and then being killed at the sweep's 12s window — measured 88% of all
+# overlapped fixture synths land in the sweep's minutes 36-41. One tester in the queue at a time,
+# so the record measures the mesh and not itself.
+# The lock file lives beside the socket, NOT under $TMPDIR: doctor gives each child --test its own
+# private TMPDIR, so a lock there would be a different file per tool and serialize nothing.
+SYNTH_LOCK="${MESH_VOICE_SAY_TEST_LOCK:-$HOME/.mesh/voice-clone/.test-synth.lock}"
+
+_live_synth_once(){   # one live fixture synth → "LIVE <t_start> <t_end> <bytes> <daemon reply>"
+  local tw t0 t1 sz rc rep
+  tw="$(mktemp "${TMPDIR:-/tmp}"/mesh-voice-say-test-XXXXXX.wav)"
+  t0="$(date +%s.%N)"
+  rep="$(_call "$tw" "Проверка голоса." 2>/dev/null)"; rc=$?
+  t1="$(date +%s.%N)"
+  sz=$(stat -c%s "$tw" 2>/dev/null || echo 0); rm -f "$tw"
+  printf 'LIVE %s %s %s %s\n' "$t0" "$t1" "$sz" "$rep"
+  return "$rc"
+}
+
+_live_synth_locked(){ # same, holding the cross-process test lock (fd 8; doctor reserves 9)
+  mkdir -p "$(dirname "$SYNTH_LOCK")" 2>/dev/null
+  exec 8>>"$SYNTH_LOCK" 2>/dev/null || { _live_synth_once; return $?; }
+  flock -w 300 8 2>/dev/null || :   # unlockable → still synth; a stuck peer must not mute the gate
+  _live_synth_once; local rc=$?
+  exec 8>&-
+  return "$rc"
+}
+
+# --test-live [--nolock]: ONE live fixture synth, the way --test does it. Exists so the serialization
+# gate below can fire N of these concurrently against a stub daemon and read the intervals back —
+# and so the RED direction (--nolock) is the same code minus the lock, nothing else.
+if [ "${1:-}" = "--test-live" ]; then
+  if [ "${2:-}" = "--nolock" ]; then _live_synth_once; else _live_synth_locked; fi
+  exit $?
+fi
 
 if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then usage; exit 0; fi
 
@@ -79,16 +127,102 @@ PY
   rm -rf "$_td"
   [ "$_rc" = 7 ] || { echo "smoke-test: FAIL (rc-contract: no-reply daemon gave rc=$_rc, want 7=timeout)"; exit 1; }
   case "$_rep" in *timeout*) : ;; *) echo "smoke-test: FAIL (rc-contract: timeout reply lacks 'timeout': $_rep)"; exit 1;; esac
-  echo "rc-contract: ok (unreachable=5, no-reply=7 timeout)"
+  # a daemon that REFUSES admission (queue full) → rc=8 BUSY, distinct from 4/5/7: it is healthy,
+  # it answered instantly, and the caller must go to piper NOW instead of retrying into the queue.
+  _bd="$(mktemp -d "${TMPDIR:-/tmp}"/mvs-busy-XXXXXX)"
+  python3 - "$_bd/busy.sock" <<'PY' &
+import socket, sys, threading
+s = socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.listen(4)
+def h(c):
+    b=b""
+    while b"\n" not in b:
+        d=c.recv(65536)
+        if not d: break
+        b+=d
+    c.sendall(b"BUSY\t3/3\n"); c.close()
+while True:
+    c,_=s.accept(); threading.Thread(target=h,args=(c,),daemon=True).start()
+PY
+  _bpid=$!
+  for _i in $(seq 30); do [ -S "$_bd/busy.sock" ] && break; sleep 0.1; done
+  _bmsg="$(SOCK="$_bd/busy.sock"; _call "$_bd/o.wav" "тест" 2>&1)"; _rc=$?
+  [ "$_rc" = 8 ] || { kill "$_bpid" 2>/dev/null; rm -rf "$_bd"; echo "smoke-test: FAIL (rc-contract: BUSY reply gave rc=$_rc, want 8)"; exit 1; }
+  # and the OPERATOR-FACING hint must not read as a dead service (the 07-18 misdiagnosis shape)
+  _bhint="$(SOCK="$_bd/busy.sock" MESH_CLONE_SOCK="$_bd/busy.sock" "$0" "тест" "$_bd/o.wav" 2>&1 >/dev/null)"
+  kill "$_bpid" 2>/dev/null; wait "$_bpid" 2>/dev/null; rm -rf "$_bd"
+  case "$_bhint" in *SATURATED*) : ;; *) echo "smoke-test: FAIL (rc8 hint missing SATURATED: $_bhint)"; exit 1;; esac
+  case "$_bhint" in *UNAVAILABLE*|*"clone-down"*) echo "smoke-test: FAIL (rc8 hint reads as a dead daemon: $_bhint)"; exit 1;; esac
+  echo "rc-contract: ok (unreachable=5, no-reply=7 timeout, refused=8 busy)"
+
+  # SERIALIZATION GATE (task:synth-depth-unbounded). N=8 concurrent test synths against a CONCURRENT
+  # stub daemon (threaded on purpose — a serial stub would serialize them for us and the gate would
+  # assert nothing). Green: the stub's handling intervals do not overlap. RED: the same 8 with the
+  # lock removed DO overlap — driven here, every run, because a gate that has not been seen fail is
+  # not a gate.
+  _cd="$(mktemp -d "${TMPDIR:-/tmp}"/mvs-conc-XXXXXX)"
+  _conc(){ # $1=nolock flag ("" or --nolock) $2=log → prints "<n> <overlaps>"
+    : > "$2"
+    local _i
+    for _i in $(seq 8); do
+      MESH_CLONE_SOCK="$_cd/c.sock" MESH_VOICE_SAY_TEST_LOCK="$_cd/lock" \
+        "$0" --test-live $1 >/dev/null 2>&1 &
+    done
+    wait
+    python3 - "$2" <<'PY'
+import sys
+iv = sorted(tuple(map(float, l.split())) for l in open(sys.argv[1]) if l.strip())
+ov = 0; end = 0.0
+for s, e in iv:
+    if s < end - 1e-6: ov += 1
+    end = max(end, e)
+print(f"{len(iv)} {ov}")
+PY
+  }
+  python3 - "$_cd/c.sock" "$_cd/served.log" 0.15 <<'PY' &
+import socket, sys, threading, time
+sp, logf, slp = sys.argv[1], sys.argv[2], float(sys.argv[3])
+s = socket.socket(socket.AF_UNIX); s.bind(sp); s.listen(16)
+lk = threading.Lock()
+def h(c):
+    t0 = time.time(); b = b""
+    while b"\n" not in b:
+        d = c.recv(65536)
+        if not d: break
+        b += d
+    out = b.split(b"\n", 1)[0].decode("utf-8", "replace").split("\t", 1)[0]
+    time.sleep(slp)
+    try: open(out, "wb").write(b"\0" * 30000)
+    except Exception: pass
+    t1 = time.time()
+    with lk: open(logf, "a").write("%.4f %.4f\n" % (t0, t1))
+    try: c.sendall(("OK\t%s\t1.50\n" % out).encode())
+    except Exception: pass
+    c.close()
+while True:
+    c, _ = s.accept(); threading.Thread(target=h, args=(c,), daemon=True).start()
+PY
+  _cpid=$!
+  for _i in $(seq 50); do [ -S "$_cd/c.sock" ] && break; sleep 0.1; done
+  _green="$(_conc "" "$_cd/served.log")"
+  _red="$(_conc --nolock "$_cd/served.log")"
+  kill "$_cpid" 2>/dev/null; wait "$_cpid" 2>/dev/null; rm -rf "$_cd"
+  case "$_green" in "8 0") : ;; *) echo "smoke-test: FAIL (serialize: 8 locked synths gave '<n> <overlaps>'=$_green, want '8 0')"; exit 1;; esac
+  case "$_red" in "8 0"|"8") echo "smoke-test: FAIL (serialize gate is VACUOUS: without the lock the same 8 still did not overlap ($_red) — the stub is not concurrent)"; exit 1;; esac
+  case "$_red" in 8\ *) : ;; *) echo "smoke-test: FAIL (serialize red leg lost requests: $_red)"; exit 1;; esac
+  echo "serialize: ok (8 locked → 0 overlaps; unlocked → ${_red#8 } overlaps, so the gate is live)"
   # LIVE gate: the daemon must actually synthesize the operator's voice into a valid wav. A daemon
   # that is down is n/a here (exit 2 — honest "organ absent", not a defect), so --test can run under
   # mesh-doctor without demanding the service be up; a daemon that is UP but produces junk FAILs.
   if [ ! -S "$SOCK" ]; then echo "smoke-test: n/a (clone daemon not running — socket $SOCK absent)"; exit 2; fi
-  tw="$(mktemp "${TMPDIR:-/tmp}"/mesh-voice-say-test-XXXXXX.wav)"
-  rep="$(_call "$tw" "Проверка голоса." )"; rc=$?
-  if [ "$rc" != 0 ]; then rm -f "$tw"; echo "smoke-test: FAIL (daemon up but synth failed: $rep)"; exit 1; fi
-  sz=$(stat -c%s "$tw" 2>/dev/null || echo 0)
-  rm -f "$tw"
+  # UNDER THE TEST LOCK, like every other --test synth: this leg is the mesh-doctor sweep's own
+  # contribution to the daemon's queue, and it used to arrive concurrently with its own retries.
+  _liveout="$(_live_synth_locked)"; rc=$?
+  sz="$(printf '%s\n' "$_liveout" | awk '{print $4+0}')"
+  rep="$(printf '%s\n' "$_liveout" | cut -d' ' -f5-)"
+  # rc=8: the daemon is UP and healthy but refused admission — we could not get a slot, so the live
+  # synth is UNASSESSED, not failed. Calling that a defect would cry wolf at a working organ.
+  if [ "$rc" = 8 ]; then echo "smoke-test: n/a (daemon healthy but saturated: $rep — no slot to assert the live synth)"; exit 2; fi
+  if [ "$rc" != 0 ]; then echo "smoke-test: FAIL (daemon up but synth failed: $rep)"; exit 1; fi
   if [ "$sz" -gt 20000 ]; then echo "smoke-test: ok (live clone synth -> ${sz}B wav)"; exit 0; fi
   echo "smoke-test: FAIL (synth produced ${sz}B wav, expected a real clip)"; exit 1
 fi
@@ -103,6 +237,7 @@ if [ "$rc" = 0 ]; then
   exit 0
 fi
 case "$rc" in
+  8) echo "mesh-voice-say: SYNTH REFUSED — daemon healthy but SATURATED (queue full, it answered in ms); fall back to piper NOW rather than retry into the queue (rc=$rc: ${rep#ERR	})" >&2;;
   7) echo "mesh-voice-say: SYNTH TIMEOUT — daemon reachable, text outran the cap; chunk it or raise MESH_CLONE_TIMEOUT (rc=$rc: ${rep#ERR	})" >&2;;
   *) echo "mesh-voice-say: CLONE UNAVAILABLE — falling back to piper is the caller's job (rc=$rc: ${rep#ERR	})" >&2;;
 esac

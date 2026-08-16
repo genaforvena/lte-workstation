@@ -12,15 +12,36 @@ Protocol (newline-terminated request, single line):
 Reply (single line):
     OK\t<out_wav_path>\t<audio_secs>\n     synth ok, 24kHz mono PCM wav at out_wav_path
     ERR\t<message>\n                       synth failed (caller falls back to piper — LOUDLY)
+    BUSY\t<depth>/<max>\n                  ADMISSION REFUSED — queue full (caller: mesh-voice-say
+                                           rc=8; fall back to piper NOW, do not queue behind it)
+
+ADMISSION CONTROL (task:synth-depth-unbounded, 2026-08-16). The synth is single-writer (`_lock`) and
+was UNBOUNDED behind it: every accepted request queued no matter how deep, and a client killed by its
+caller's `timeout` kept its place — the GPU finished work nobody was on the socket for, then failed
+`sendall` with EPIPE. Measured over 4438 completed synths in this log: 79% overlapped, max depth 18,
+and on the SAME 1.4-1.6s fixture the median wall goes 10.6s solo → 17.9 / 26.3 / 32.7 / 35.9 / 41.4 /
+36.6 / 50.8s at depth 1..7+ — i.e. each queue level costs one whole synth. 3240 of those completions
+are followed by `[Errno 32] Broken pipe`, 100% of them preceded by their own `synth ok` line: not an
+error rate, work done for an absent client. 88% of the overlapped fixture starts land in minutes
+36-41 = the hourly `mesh-doctor --cron` sweep, whose per-tool `timeout 12` is BELOW the p50 wall of
+the very synth it triggers, so the sweep killed its own clients and its retries deepened the queue —
+a self-sustaining congestion loop in front of the operator-facing speech path. Two teeth, both here
+(a client-side lock would only move the wait): drop work whose client is GONE (checked before and
+while queueing, and again before the reply), and refuse at MESH_CLONE_MAXDEPTH instead of queueing
+forever. The queue wait stays INSIDE the reported wall (`in <W>s`) on purpose — that is the axis the
+depth table is derived from; timing only the inference would erase it.
 
 Env:
     MESH_CLONE_SOCK    unix socket path   (default ~/.mesh/voice-clone/xtts.sock)
     MESH_CLONE_REFS    ':'-joined ref wavs (default: operator-ref + front/usb multi-mic)
     MESH_CLONE_LANG    xtts language      (default ru)
     MESH_CLONE_LOG     log file           (default ~/.mesh/voice-clone/daemon.log)
+    MESH_CLONE_MAXDEPTH  in-flight requests admitted before BUSY (default 3)
 
---test : offline contract check (imports, refs exist, socket path writable) — does NOT load the
-         model or synthesize (that is the LIVE gate in mesh-voice-say --test). exit 0 ok / 2 n/a.
+--test : socket-protocol fixtures (admission + abandoned-client drop, driven through the REAL
+         serve()/handle() with a stubbed synth) + offline contract check (imports, refs exist,
+         socket path writable). Does NOT load the model (that is the LIVE gate in mesh-voice-say
+         --test). exit 0 ok / 1 fail / 2 n/a.
 """
 import os, sys, socket, threading, time, traceback
 
@@ -36,10 +57,17 @@ DEFAULT_REFS = ":".join([
     os.path.join(MESH, "voiceref", "usb-235334.wav"),
 ])
 REFS = [p for p in os.environ.get("MESH_CLONE_REFS", DEFAULT_REFS).split(":") if p]
+MAXDEPTH = int(os.environ.get("MESH_CLONE_MAXDEPTH", "3"))
+
+
+_LOG_SINK = None   # --test redirects here: a dry-run must never write the log a watchdog reads
 
 
 def log(msg):
     line = f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {msg}"
+    if _LOG_SINK is not None:
+        _LOG_SINK.append(line)
+        return
     try:
         with open(LOGF, "a") as f:
             f.write(line + "\n")
@@ -48,8 +76,150 @@ def log(msg):
     print(line, flush=True)
 
 
+def _proto_fixtures():
+    """ADMISSION + ABANDONED-DROP gates (task:synth-depth-unbounded). 0 ok / 1 fail.
+
+    Drives the REAL serve()/handle() over a real Unix socket with the model swapped for a stub, so
+    everything under test is the shipped code path: the admission check, the cancellable lock wait,
+    and the liveness peek. HONEST LIMIT: the stub means this asserts nothing about xtts itself —
+    inference correctness is mesh-voice-say --test's live gate, not this one.
+
+    Both legs are driven in BOTH directions: with the guard (green) and with the guard disabled
+    (must go RED), because a gate that has not been seen fail is not a gate.
+    """
+    global SOCK, MAXDEPTH, _synth_fn, _LIVENESS, _LOG_SINK, _inflight
+    import tempfile
+    td = tempfile.mkdtemp(prefix="mvcd-proto-")
+    calls = []
+
+    def _stub(out_path, text):
+        time.sleep(0.02)
+        with open(out_path, "wb") as f:
+            f.write(b"RIFF" + b"\0" * 64)
+        calls.append(text)
+        return 1.5
+
+    _synth_fn = _stub
+
+    def _spawn(tag):
+        global SOCK, _inflight
+        SOCK = os.path.join(td, tag + ".sock")
+        _inflight = 0
+        del calls[:]
+        _LOG_SINK[:] = []
+        threading.Thread(target=serve, daemon=True).start()
+        for _ in range(100):
+            if os.path.exists(SOCK):
+                return SOCK
+            time.sleep(0.02)
+        return SOCK
+
+    def _send(sock_path, text, abandon=False):
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(15)
+        s.connect(sock_path)
+        s.sendall((os.path.join(td, "o.wav") + "\t" + text + "\n").encode())
+        if abandon:                       # exactly what `timeout` does to mesh-voice-say --test
+            s.close()
+            return None
+        buf = b""
+        while b"\n" not in buf:
+            c = s.recv(65536)
+            if not c:
+                break
+            buf += c
+        s.close()
+        return buf.split(b"\n", 1)[0].decode("utf-8", "replace")
+
+    def _abandon_round(liveness):
+        # 6 clients queue behind a held lock and then die. With the drop: none of their work runs.
+        # MAXDEPTH is lifted out of the way — this leg measures the DROP, and the default 3 would
+        # otherwise refuse clients 3-5 and green the count for the other guard's reason.
+        global _LIVENESS, MAXDEPTH
+        _LIVENESS = liveness
+        MAXDEPTH = 99
+        sp = _spawn("aband-" + ("on" if liveness else "off"))
+        _lock.acquire()
+        try:
+            for i in range(6):
+                _send(sp, f"dead-{i}", abandon=True)
+            time.sleep(0.2)               # > one poll of the cancellable acquire
+        finally:
+            _lock.release()
+        # settle: with the check ON every client is already dropped before the release; with it OFF
+        # all 6 must be given time to actually RUN, or the red direction would pass for the wrong
+        # reason (a slow fixture reading as a working guard).
+        time.sleep(0.2 if liveness else 1.0)
+        # count the MARKER, never a substring the fixture text could also spell — the request text
+        # is «dead-N» precisely so it cannot forge (or mask) the verdict it is being judged by
+        return len(calls), sum(1 for l in _LOG_SINK if "synth abandoned" in l)
+
+    _LOG_SINK = []
+    fails = []
+    ran, dropped = _abandon_round(True)
+    if ran != 0 or dropped != 6:
+        fails.append(f"abandoned-drop: {ran} of 6 dead clients' synths still RAN, {dropped}/6 dropped")
+    red_ran, red_dropped = _abandon_round(False)
+    if red_ran != 6 or red_dropped != 0:
+        fails.append(f"abandoned-drop RED direction is vacuous: without the liveness check the same "
+                     f"fixture ran {red_ran}/6 (want 6) and dropped {red_dropped} (want 0)")
+    _LIVENESS = True
+
+    def _admit_round(maxdepth):
+        # Every client runs in its own thread INCLUDING the third: at MAXDEPTH=99 (the red
+        # direction) it is admitted and blocks on the lock this function is holding, so sending it
+        # inline would deadlock the fixture instead of measuring it.
+        global MAXDEPTH
+        MAXDEPTH = maxdepth
+        sp = _spawn(f"admit-{maxdepth}")
+        third, ths = [], []
+        _lock.acquire()
+        try:
+            for i in range(2):
+                t = threading.Thread(target=lambda i=i: _send(sp, f"holder-{i}"))
+                t.daemon = True
+                t.start()
+                ths.append(t)
+            time.sleep(0.2)               # let both be admitted and start queueing
+            t3 = threading.Thread(target=lambda: third.append(_send(sp, "third")))
+            t3.daemon = True
+            t3.start()
+            ths.append(t3)
+            time.sleep(0.25)              # a refusal lands inside this window; an admit does not
+        finally:
+            _lock.release()
+        for t in ths:
+            t.join(5)
+        return third[0] if third else None
+
+    third = _admit_round(2)
+    if not (third or "").startswith("BUSY\t2/2"):
+        fails.append(f"admission: 3rd request at MAXDEPTH=2 was not refused (reply: {third!r})")
+    red_third = _admit_round(99)
+    if not (red_third or "").startswith("OK\t"):
+        fails.append(f"admission RED direction is vacuous: at MAXDEPTH=99 the 3rd request should be "
+                     f"ADMITTED, got {red_third!r}")
+    MAXDEPTH = int(os.environ.get("MESH_CLONE_MAXDEPTH", "3"))
+    _synth_fn = synth
+    _LOG_SINK = None
+    import shutil
+    shutil.rmtree(td, ignore_errors=True)
+    if fails:
+        for f in fails:
+            print("smoke-test: FAIL (" + f + ")")
+        return 1
+    print("proto: ok (abandoned work dropped 6/6 and RED without the check; BUSY at depth 2/2 and "
+          "admitted at 99)")
+    return 0
+
+
 def selftest():
     # offline contract only — never loads the model here (that is the live gate downstream)
+    # PROTOCOL FIXTURES FIRST: they are node-independent (stubbed synth, no model, no refs), so they
+    # must run ABOVE the refs/TTS n/a gate below or they would be dead code on every node that lacks
+    # the xtts venv — the prereq-guard-above-the-test trap.
+    if _proto_fixtures() != 0:
+        return 1
     refs_ok = [p for p in REFS if os.path.isfile(p) and os.path.getsize(p) > 1000]
     if not refs_ok:
         print(f"smoke-test: n/a (no operator reference wavs — {REFS})")
@@ -80,6 +250,9 @@ _model = None
 _gpt = None
 _spk = None
 _lock = threading.Lock()  # GPU is single-writer; serialize synth
+_inflight = 0             # admitted requests not yet finished (queued + running)
+_depth_lock = threading.Lock()
+_LIVENESS = True          # abandoned-client drop; --test flips it to drive the gate RED
 
 
 def _install_isin_shim():
@@ -168,6 +341,7 @@ def _detect_lang(text):
 
 
 def synth(out_path, text):
+    # CALLED WITH _lock HELD (handle() owns the acquire so the wait is cancellable — see _peer_gone).
     import numpy as np
     import soundfile as sf
     chunks = _split(text)
@@ -175,10 +349,9 @@ def synth(out_path, text):
         raise ValueError("empty text")
     lang = _detect_lang(text)
     wavs = []
-    with _lock:
-        for ch in chunks:
-            o = _model.inference(ch, lang, _gpt, _spk)
-            wavs.append(np.asarray(o["wav"], dtype="float32"))
+    for ch in chunks:
+        o = _model.inference(ch, lang, _gpt, _spk)
+        wavs.append(np.asarray(o["wav"], dtype="float32"))
     audio = np.concatenate(wavs) if len(wavs) > 1 else wavs[0]
     tmp = out_path + ".tmp.wav"
     sf.write(tmp, audio, 24000)
@@ -186,7 +359,37 @@ def synth(out_path, text):
     return len(audio) / 24000.0
 
 
+_synth_fn = synth   # indirection: --test drives the REAL handle()/serve() with a stubbed synth
+
+
+def _peer_gone(conn):
+    """True iff the client closed its end — i.e. this request is ABANDONED work.
+
+    The protocol is one line in, one line out: after we have read the request the client is blocked
+    reading the reply and sends nothing more, so a readable EOF can only mean it died (its caller's
+    `timeout` killed it — mesh-doctor's 12s window around mesh-voice-say --test is the volume case).
+    PEEK, never consume; a live-but-silent client raises BlockingIOError.
+    """
+    if not _LIVENESS:
+        return False
+    try:
+        conn.setblocking(False)
+        try:
+            return conn.recv(1, socket.MSG_PEEK) == b""
+        except BlockingIOError:
+            return False
+        except OSError:
+            return True           # reset/aborted — also gone
+    finally:
+        try:
+            conn.settimeout(120)
+        except Exception:
+            pass
+
+
 def handle(conn):
+    global _inflight
+    admitted = False
     try:
         conn.settimeout(120)
         buf = b""
@@ -201,17 +404,44 @@ def handle(conn):
             return
         out_path, text = line.split("\t", 1)
         out_path = out_path.strip()
+        # ADMISSION: refuse rather than queue without bound. The caller (mesh-voice-say rc=8) can
+        # fall back to piper in ~0s; queueing would have cost it one whole synth per level ahead.
+        with _depth_lock:
+            depth = _inflight
+            if depth >= MAXDEPTH:
+                log(f"BUSY refused at depth {depth}/{MAXDEPTH}  «{text[:40]}»")
+                conn.sendall(f"BUSY\t{depth}/{MAXDEPTH}\n".encode())
+                return
+            _inflight += 1
+            admitted = True
+        # t0 BEFORE the queue wait, deliberately: the reported wall is what the CALLER experienced,
+        # and it is the axis the depth dose-response is measured on.
+        t0 = time.time()
+        while not _lock.acquire(timeout=0.1):   # poll, not block: a dead client must vacate fast
+            if _peer_gone(conn):
+                log(f"synth abandoned in queue after {time.time()-t0:.2f}s (client gone)  «{text[:40]}»")
+                return
         try:
-            t0 = time.time()
-            secs = synth(out_path, text)
-            log(f"synth ok {secs:.1f}s audio in {time.time()-t0:.2f}s -> {out_path}  «{text[:60]}»")
-            conn.sendall(f"OK\t{out_path}\t{secs:.2f}\n".encode())
+            if _peer_gone(conn):
+                log(f"synth abandoned at head after {time.time()-t0:.2f}s (client gone)  «{text[:40]}»")
+                return
+            secs = _synth_fn(out_path, text)
         except Exception as e:
             log(f"synth ERR: {e}\n{traceback.format_exc()}")
             conn.sendall(f"ERR\t{e}\n".encode())
+            return
+        finally:
+            _lock.release()
+        tail = "" if not _peer_gone(conn) else "  (client gone — reply dropped)"
+        log(f"synth ok {secs:.1f}s audio in {time.time()-t0:.2f}s -> {out_path}{tail}  «{text[:60]}»")
+        if not tail:
+            conn.sendall(f"OK\t{out_path}\t{secs:.2f}\n".encode())
     except Exception as e:
         log(f"handle ERR: {e}")
     finally:
+        if admitted:
+            with _depth_lock:
+                _inflight -= 1
         try:
             conn.close()
         except Exception:
