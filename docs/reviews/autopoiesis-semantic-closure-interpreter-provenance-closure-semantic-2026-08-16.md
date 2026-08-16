@@ -83,21 +83,46 @@ Rung: `IMPOSED` (0) · `PARTIAL` · `CLOSED` (1) · `n/a`.
 ## The live reading (mesh-home, 2026-08-16, 637 tools)
 
 ```
-decision sites: SELF=3  IMPOSED=1008  UNRESOLVED=522 (honest n/a)
+decision sites: SELF=6  IMPOSED=1068  UNRESOLVED=459 (honest n/a)
 TRIVIAL=888 excluded    OPAQUE=175 tools
-SCI = 0.0030 over 1011 assessable sites
+SCI = 0.0056 over 1074 assessable sites          -> rung PARTIAL
 ```
 
-**And the three SELF sites do not survive being read.** All three are gate assertions inside smoke
-probes — `mesh-chat` comparing its `chat.log` line count before/after a post (×2), `mesh-dispatch`
-comparing two line numbers it greps out of its own source. So the shell-visible **production**
-reading is **SCI = 0 — rung 1, the whole sensorium**. This is why the tool prints every SELF site in
-full rather than a count: a bare `SELF=3` would have read as partial closure.
+**CORRECTED 2026-08-16 (same day, this section only).** The first reading of this axis was
+`SELF=3 IMPOSED=1008 SCI=0.0030`, and it concluded *"the production reading is SCI = 0 — rung 1, the
+whole sensorium."* **That was the scan's limit, not the mesh's, and the conclusion is now false.**
+Provenance stopped at the assignment RHS, and in this codebase the record read is normally ONE HOP
+away — the site says `$(band)` and the *body* of `band` touches the log — or one ALIAS away
+(`WARM="$WARM_ABS"; SRC=absolute`, a compound line the assignment matcher could not even parse).
+Both hops are followed now. Note IMPOSED *rose* by the same fix: compound assignments were invisible
+in both directions, so the denominator was under-counted too. Re-derive, never quote the figure.
+
+**Three of the six SELF sites still do not survive being read** — gate assertions inside smoke probes
+(`mesh-chat` comparing its `chat.log` line count before/after a post ×2, `mesh-dispatch` comparing
+two line numbers it greps out of its own source). This is why the tool prints every SELF site in full
+rather than a count.
+
+**The other three are real, and they are one idiom repeated.** `mesh-node-health`'s `PSI_STALE_S` and
+`PSIMEM_STALE_S`, and `mesh-window-state`'s `WIFI_STALE_S`, each read the **live crontab** and set
+the lease to 2× the producer's own stride (`cron_stale_s` / `wifi_stale_s`). The mesh has exactly one
+working pattern of semantic closure and it is `a-lease-must-exceed-its-producers-cadence`: a
+cut-point nobody authored, derived from the organization's own schedule. That is the shape to
+propagate — not "turn constants into ledger rows".
+
+**What deliberately did NOT move: the threshold-ledger hop stays IMPOSED.** The 20 tools that resolve
+a default through `mesh-sexpr-gate --const` are reading a number a human wrote into a data row.
+Externalizing a magic number to the ledger is a real engineering good — recalibration becomes a diff
+on data, not a script edit — and it is *not* closure. Counting the hop as SELF would have minted 30+
+SELF sites in one commit and made SCI a measure of indirection. `mesh-stress` is the case that forced
+the call: its WARM band is genuinely self-calibrated (`min(ledger, this node's own therm.log p50 +
+delta)`) and it **still reads UNRESOLVED**, because the p50 arm enters through
+`read -r CURVE_P50 … <<EOF` and the scan does not follow a heredoc. A named blind spot beats a
+flattering class.
 
 Deepest interpretive debt (freestanding cut-points per tool):
 
 ```
-mesh-dash 43 · mesh-light 30 · mesh-socket-state 23 · mesh-dispatch 21 · mesh-stress 19
+mesh-dash 43 · mesh-light 31 · mesh-dispatch 23 · mesh-socket-state 23 · mesh-stress 21
 mesh-ambient-clock 17 · mesh-ideate 17 · mesh-sensorium 16 · mesh-mind-control 15 · mesh-bruno 12
 … 282 further tools carry at least one
 ```
@@ -123,30 +148,51 @@ mesh-ambient-clock 17 · mesh-ideate 17 · mesh-sensorium 16 · mesh-mind-contro
   percentage bound). This axis measures who wrote the interpreter, never whether the value is
   correct. Report-only, advisory, judges nothing, touches no state.
 
-## Gate — RED-first, 6 mutants each seen red for the right reason
+## Gate — RED-first, 11 mutants each seen red for the right reason
 
-Fixture: 6 synthetic tools pinning one instance of each class, asserted as an **exact set** (not
-just counts — a class landing on the wrong tool would keep every count green).
+Fixture: 10 synthetic tools pinning one instance of each class **and each provenance hop**, asserted
+as an **exact set** (not just counts — a class landing on the wrong tool would keep every count green).
 
 | mutant | observed |
 |---|---|
-| drop the TRIVIAL set (driven from outside via `MESH_CLOSURE_SEM_TRIVIAL=""`, so this leg is executable, not asserted in a comment) | TRIVIAL 2→0, IMPOSED 4→6, SCI moves off 0.2000 |
+| drop the TRIVIAL set (driven from outside via `MESH_CLOSURE_SEM_TRIVIAL=""`, so this leg is executable, not asserted in a comment) | TRIVIAL 2→0, IMPOSED 5→7, SCI moves off 0.2857 |
 | `kindof()` command-substitution arm → `IMPOSED` | SELF 1→0, rung PARTIAL→IMPOSED, closed-organ line gone |
 | delete the pass-2 full-line-comment skip | fs2's prose threshold 99 becomes a 5th IMPOSED |
 | `varclass()` → always `IMPOSED` (fold the honest n/a away) | SELF 1→0, IMPOSED 4→6, UNRESOLVED 1→0 |
 | drop the OPAQUE emit | OPAQUE 1→0, the blind-spot line disappears |
 | depth-blind test-body skip (first column-0 `}`) | fs6's fixture literal 77 enters: IMPOSED 4→5 |
+| drop the helper-function hop (`callclass` → `""`) | fs7 SELF→UNRESOLVED **and** fs8 IMPOSED→UNRESOLVED (the ledger leg rides the same hop): SELF 2→1, IMPOSED 5→4, UNRESOLVED 3→5 |
+| drop `const_lookup` (let the ledger hop count as a record read) | fs8 IMPOSED→SELF: SELF 2→3, IMPOSED 5→4, SCI 0.2857→0.4286 |
+| one-liner detected by *ends in* `}` instead of brace balance | fs9's `rankit(){ … }  # comment` swallows the next function whole and inherits its record read: SELF 2→3, UNRESOLVED 3→2 |
+| stop splitting compound `A=…; B=…` assignment lines | fs7's alias hop is unparseable: SELF 2→1, UNRESOLVED 3→4 |
+| ignore `read -r a b <<<…` as an assignment | fs10's runtime value files as a constant: IMPOSED 5→6, UNRESOLVED 3→2 |
 
-`mesh-closure --test`: **PASS**, 3.3s, every pre-existing leg (graph / cadences / timescale /
+`mesh-closure --test`: **PASS**, 3.4s, every pre-existing leg (graph / cadences / timescale /
 enacted / symmetry / leakage guard) still green.
+
+One candidate rule was **dropped for being unfalsifiable**: `X="${X:-30}"` classified UNRESOLVED as a
+nullity guard over a runtime value. Its mutant stayed GREEN — the `read` leg already covers every
+case in the fixture — and on reading, that idiom is *also* the canonical env-override-with-a-literal-
+default this axis defines as IMPOSED. No fixture separates the two readings, so the rule is out
+rather than asserted. It had been silently moving 21 live sites.
 
 ## What it does NOT do, and the next step
 
 It does not recalibrate anything and must not: a value-norm that rewrites a live threshold is the
 false-revert danger the `mesh-fitness` normativity review is already held on. The honest next step is
-the one the metric now makes cheap — take the top of the debt list (`mesh-stress`'s thermal bands are
-already a *known* dead-regime calibration) and derive those specific cut-points from the node's own
-recorded distribution, turning them SELF one organ at a time, with the SCI trajectory as the receipt.
+the one the metric now makes cheap — take the top of the debt list and derive those specific
+cut-points from the node's own recorded distribution, turning them SELF one organ at a time, with the
+SCI trajectory as the receipt.
+
+**And the pattern to copy is already in the tree.** The correction above found it: the only genuine
+production SELF sites in 637 tools are three **cadence-derived leases** — `cron_stale_s` /
+`wifi_stale_s` read the live crontab and set the budget to 2× the producer's own stride. That is a
+cut-point nobody authored. The two shapes that are *not* it, both encountered here: moving a constant
+into the threshold ledger (an engineering good, still the constant a human wrote), and rewriting a
+tool so a provenance scanner can see it (a shim that changes nothing). `mesh-stress` is the standing
+example of the honest middle — its WARM band already fuses the ledger with this node's own therm.log
+p50, and it reads UNRESOLVED here because the scan cannot follow a heredoc, not because the organ is
+freestanding.
 
 **Why the number is not an indictment:** the paper's own claim is conditional — an imposed
 interpreter is fine *while the environment keeps supplying it*. A mesh whose thresholds are authored
