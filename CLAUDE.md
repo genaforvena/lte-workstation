@@ -484,7 +484,15 @@ load-bearing tools — run `mesh-tools <category>` for the rest and the full con
 - **Minds control:** `mesh-mind-control` (`--allocate`/`--dispatch`/`--classify`/`--watch`) · `mesh-mind-compact` · `mesh-spend` · `mesh-usage`/`mesh-load` · `mesh-mode` · `mesh-gate-watch`.
 - **Channels / streams:** `mesh-stream` · `mesh-channels` · `mesh-nodestate` · `mesh-fleet-feed` · `mesh-channel-tg`.
 - **Organs / actuators:** `mesh-organ` (capability router) · `mesh-tv-dlna` · `mesh-sms` · `mesh-phone-*` (`-ip`/`-watch`/`-ear`/`-sensors`/`-convo`) · `mesh-sensor-log`.
-- **On-demand / audit:** `mesh-tools` (the index itself) · `mesh-doctor` · `mesh-digest`/`mesh-since`/`mesh-morning`/`mesh-novelty` · `mesh-review`/`mesh-study`/`mesh-claude-check` · `mesh-test-forgery` (daily: runs one tool's `--test` and watches which `~/.mesh/*.log` grew — a dry-run writing the durable liveness record forges the evidence it exists to check; a candidate is only a finding if it repeats AND does not grow in an equal control window) · `mesh-chaos`(+`-doctor`/`-verify`) · `mesh-guardian` · `mesh-fleet-health`/`mesh-fleet-states` · `mesh-browse`/`mesh-eye`/`mesh-hear`/`mesh-ear`/`mesh-transcribe` — plus the rest under `mesh-tools audit`.
+- **On-demand / audit:** `mesh-tools` (the index itself) · `mesh-doctor` · `mesh-digest`/`mesh-since`/`mesh-morning`/`mesh-novelty` · `mesh-review`/`mesh-study`/`mesh-claude-check` · `mesh-test-forgery` (daily: runs one tool's `--test` and watches which `~/.mesh/*.log` grew — a dry-run writing the durable liveness record forges the evidence it exists to check; a candidate is only a finding if it repeats AND does not grow in an equal control window) ·
+  `mesh-fswriter` (the ATTRIBUTION probe — fanotify names the pid/comm/cmdline that wrote a named
+  artifact, which inotify structurally cannot: its event struct has no pid field. Turns mtime from a
+  touch into a sign relation, the gap behind `writer-redundancy-blinds-mtime-liveness`. Arms as root
+  via one `sudo -n`, then setuid()s back before listening — the long-lived listener holds no
+  privilege. Inode marks only: `FAN_MARK_MOUNT` marks the MOUNT, so a mark "on ~/.mesh" would
+  silently watch the whole root fs. `FAN_CLASS_NOTIF` only, never a `*_PERM` class — those BLOCK
+  every matching syscall node-wide until the listener answers, wedging the ssh/tmux path you would
+  kill it from) · `mesh-chaos`(+`-doctor`/`-verify`) · `mesh-guardian` · `mesh-fleet-health`/`mesh-fleet-states` · `mesh-browse`/`mesh-eye`/`mesh-hear`/`mesh-ear`/`mesh-transcribe` — plus the rest under `mesh-tools audit`.
 
 ## On-demand canon (intentionally unwired — NOT orphans)
 

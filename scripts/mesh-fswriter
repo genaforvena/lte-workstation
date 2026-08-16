@@ -1,0 +1,314 @@
+#!/usr/bin/env python3
+# mesh-fswriter — name the PROCESS that wrote an artifact (discover find
+# fanotify-writer-attribution, 2026-08-16). mtime says a touch happened; this says WHICH pid, running
+# WHICH cmdline, wrote WHICH path, WHEN. inotify structurally cannot: its event struct has no pid
+# field. This is not mesh-fsnotify (inotify, wired, answers "did chat.log change" for a 4ms board
+# wake, zero attribution) — it is the attribution the mtime-reading liveness apparatus lacks
+# (writer-redundancy-blinds-mtime-liveness, mtime-proves-a-touch-not-a-sign-relation; and
+# mesh-test-forgery infers a self-forging --test from WHICH log grew, where this names the writer).
+#
+#   mesh-fswriter [--window S] <path>...   watch those artifacts, print+log every write's writer
+#   mesh-fswriter --last <path>            last recorded writer for <path> (exit 2 if never observed)
+#   mesh-fswriter --test                   smoke test (exit 2 where fanotify cannot be armed)
+#
+# ARMING NEEDS ROOT, LISTENING DOES NOT (measured, brief §"the privilege is needed to ARM"): the
+# process re-execs itself under `sudo -n`, calls fanotify_init + fanotify_mark, then setuid()s back to
+# the invoking uid IMMEDIATELY. The hours-long listener holds no privilege — post-drop fanotify_mark
+# is EPERM while events keep flowing with pid, comm and full path readable.
+#
+# THREE BOUNDARIES, each with a gate in --test:
+#  * FAN_CLASS_NOTIF ONLY. The PERM classes (FAN_OPEN_PERM/FAN_ACCESS_PERM) BLOCK every matching
+#    syscall node-wide until the listener answers — a wedged listener freezes the filesystem for every
+#    process including the ssh/tmux path you would kill it from. Self-defeating in its sharpest form.
+#    That is the boundary of the capability, not a knob: there is no flag here to ask for it.
+#  * INODE MARKS ONLY, never FAN_MARK_MOUNT/FILESYSTEM. A mount mark marks the MOUNT, not the path:
+#    on this node (no separate /home) a mark "on ~/.mesh" silently observes the whole root fs and
+#    costs ~50 events/s. One mark per named artifact keeps the scope the scope you asked for.
+#  * IDENTITY IS CAPTURED INSIDE THE EVENT LOOP. A pid read late is a recycled-number risk, not just
+#    a missing name; an already-exited writer records comm=<exited> and is never attributed.
+# No fanotify (or no `sudo -n`) → honest exit 2. Never a silent fallback to mtime or inotify.
+# orphan-ok: on-demand attribution probe — invoked by a mind or a consumer, deliberately not cronned
+# (a standing node-wide writer census is a different, costlier tool; this one is scoped to named files)
+
+import ctypes, errno, os, pwd, re, select, struct, subprocess, sys, tempfile, time
+
+FAN_CLOEXEC        = 0x00000001
+FAN_CLASS_NOTIF    = 0x00000000          # notify-only. The *_PERM classes are deliberately absent.
+FAN_MARK_ADD       = 0x00000001
+FAN_MODIFY         = 0x00000002
+FAN_CLOSE_WRITE    = 0x00000008
+METADATA_VERSION   = 3
+EV_HDR             = struct.Struct("IBHQiI")   # event_len,vers,_,metadata_len,mask,fd,pid  (24 B)
+
+HOME = os.path.expanduser("~")
+LOG_DEFAULT = os.path.join(HOME, ".mesh", "fswriter.log")
+
+
+def usage():
+    for line in open(__file__).read().splitlines()[1:]:
+        if not line.startswith("#"):
+            break
+        print(line[2:] if line.startswith("# ") else line[1:])
+
+
+def now():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def identify(pid):
+    """comm + cmdline, read AT EVENT TIME. An exited writer is unknown, never attributed."""
+    try:
+        comm = open("/proc/%d/comm" % pid).read().strip()
+    except OSError:
+        return "<exited>", ""
+    try:
+        cmd = open("/proc/%d/cmdline" % pid, "rb").read().replace(b"\0", b" ").decode(
+            "utf-8", "replace").strip()
+    except OSError:
+        cmd = ""
+    return comm or "<exited>", cmd
+
+
+def listen(paths, window, logpath):
+    """Runs as root only long enough to init+mark, then drops to the invoking uid."""
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    fd = libc.fanotify_init(FAN_CLASS_NOTIF | FAN_CLOEXEC, os.O_RDONLY)
+    if fd < 0:
+        e = ctypes.get_errno()
+        sys.stderr.write("mesh-fswriter: n/a — fanotify_init: %s\n" % errno.errorcode.get(e, e))
+        return 2
+    marked = []
+    for p in paths:
+        rc = libc.fanotify_mark(fd, FAN_MARK_ADD,
+                                ctypes.c_uint64(FAN_MODIFY | FAN_CLOSE_WRITE), -100, p.encode())
+        if rc < 0:
+            e = ctypes.get_errno()
+            sys.stderr.write("mesh-fswriter: cannot mark %s: %s\n" % (p, errno.errorcode.get(e, e)))
+        else:
+            marked.append(p)
+    if not marked:
+        sys.stderr.write("mesh-fswriter: n/a — no artifact could be marked\n")
+        return 2
+
+    drop_to = os.environ.get("SUDO_UID")
+    if os.geteuid() == 0 and drop_to:
+        uid, gid = int(drop_to), int(os.environ.get("SUDO_GID", drop_to))
+        os.setgroups([])
+        os.setgid(gid)
+        os.setuid(uid)                      # privilege gone; the fd keeps delivering
+        os.environ["HOME"] = pwd.getpwuid(uid).pw_dir
+
+    stall = float(os.environ.get("MESH_FSWRITER_TEST_STALL", 0))   # --test only: prove NOTIF blocks
+    if stall:                                                      # nothing while we are not reading
+        time.sleep(stall)
+
+    log = open(logpath, "a")
+    deadline = time.time() + window
+    cur, rows = None, 0
+
+    def flush():
+        nonlocal cur
+        if cur:
+            (path, pid, comm, cmd), n, (ts, _mono) = cur
+            line = '%s fswriter pid=%d comm=%s n=%d path=%s cmd="%s"' % (ts, pid, comm, n, path, cmd)
+            print(line, flush=True)
+            log.write(line + "\n")
+            log.flush()
+            cur = None
+
+    while time.time() < deadline:
+        if not select.select([fd], [], [], min(1.0, max(0.05, deadline - time.time())))[0]:
+            if cur and time.time() - cur[2][1] > 5:
+                flush()
+            continue
+        buf = os.read(fd, 4096)
+        off = 0
+        while off + EV_HDR.size <= len(buf):
+            ev_len, vers, _mlen, _mask, evfd, pid = EV_HDR.unpack_from(buf, off)
+            off += ev_len
+            if vers != METADATA_VERSION:
+                sys.stderr.write("mesh-fswriter: kernel fanotify metadata v%d != %d — refusing to "
+                                 "guess the struct\n" % (vers, METADATA_VERSION))
+                return 2
+            path = "<unresolved>"
+            if evfd >= 0:
+                try:
+                    path = os.readlink("/proc/self/fd/%d" % evfd)
+                except OSError:
+                    pass
+                os.close(evfd)
+            comm, cmd = identify(pid)       # inside the loop — late is a recycled-pid risk
+            key = (path, pid, comm, cmd)
+            if cur and cur[0] == key:
+                cur = (key, cur[1] + 1, cur[2])
+            else:
+                flush()
+                cur = (key, 1, (now(), time.time()))
+            rows += 1
+    flush()
+    if rows == 0:
+        print("%s fswriter: no writes to %d marked artifact(s) in %gs"
+              % (now(), len(marked), window), flush=True)
+    return 0
+
+
+def last(path, logpath):
+    want = "path=%s " % os.path.abspath(path)
+    hit = None
+    try:
+        for line in open(logpath):
+            if want in line:
+                hit = line.rstrip()
+    except OSError:
+        pass
+    if not hit:
+        print("mesh-fswriter: no writer ever observed for %s (absence of an observation is not a "
+              "claim about the writer)" % path)
+        return 2
+    print(hit)
+    return 0
+
+
+def rearm(argv):
+    """Re-exec under sudo -n so init+mark can succeed; the child drops back immediately."""
+    if subprocess.call(["sudo", "-n", "true"], stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL) != 0:
+        sys.stderr.write("mesh-fswriter: n/a — arming needs root and `sudo -n` is unavailable "
+                         "(listening does not, but the mark does)\n")
+        return 2
+    os.execvp("sudo", ["sudo", "-n", "--preserve-env=MESH_FSWRITER_TEST_STALL",
+                       sys.executable, os.path.abspath(__file__), "--_armed"] + argv)
+
+
+def smoke():
+    if subprocess.call(["sudo", "-n", "true"], stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL) != 0:
+        print("smoke-test: n/a (arming fanotify needs root; `sudo -n` unavailable here)")
+        return 2
+    f = 0
+    T = tempfile.mkdtemp(prefix="fswriter-test-")
+    watched, decoy, logp = T + "/watched", T + "/decoy", T + "/log"
+    open(watched, "w").close()
+    open(decoy, "w").close()
+    env = dict(os.environ, MESH_FSWRITER_TEST_STALL="0")
+
+    def run(window, extra_env=None, writer=None, delay=0.8):
+        p = subprocess.Popen([sys.executable, os.path.abspath(__file__), "--_log", logp,
+                              "--window", str(window), watched],
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             env=dict(env, **(extra_env or {})), text=True)
+        time.sleep(delay)
+        w = subprocess.Popen(writer) if writer else None
+        out = p.communicate()[0]
+        if w:
+            w.wait()
+        return out, (w.pid if w else None)
+
+    # leg 1 — REAL attribution: the recorded pid must be the writer child's pid, exactly.
+    # Falsify: report os.getpid() instead of the event's pid → the pids differ, red.
+    out, wpid = run(5, writer=["bash", "-c", "echo hi >> %s" % watched])
+    if ("pid=%d " % wpid) not in out or "comm=bash" not in out:
+        print("  FAIL: leg1 — event must name the writer pid=%s comm=bash; got:\n%s" % (wpid, out))
+        f = 1
+    # leg 1b — the row is a parseable record, not a repr. Falsify: print the (ts, mono) tuple the
+    # coalescer carries instead of its ts field → the line opens with "('2026-…', 178…)", red.
+    if not re.match(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ fswriter pid=\d+ comm=\S+ n=\d+ path=/",
+                    out.strip().splitlines()[0] if out.strip() else ""):
+        print("  FAIL: leg1b — attribution row must start with an ISO ts and parseable fields; got:\n"
+              "%s" % out)
+        f = 1
+
+    # leg 2 — SCOPE: an inode mark must NOT report a write to an unwatched file on the same mount.
+    # Falsify: swap FAN_MARK_ADD for FAN_MARK_ADD|FAN_MARK_MOUNT → the decoy shows up, red.
+    out, _ = run(4, writer=["bash", "-c", "echo x >> %s" % decoy])
+    if "decoy" in out:
+        print("  FAIL: leg2 — inode mark leaked a write to an unwatched path on the same mount:\n%s"
+              % out)
+        f = 1
+
+    # leg 3 — NOTIF BLOCKS NOTHING: with the listener deliberately not reading for 3s, a write to the
+    # watched file must still complete immediately. Falsify: a *_PERM class → the writer hangs, red.
+    t0 = time.time()
+    subprocess.Popen([sys.executable, os.path.abspath(__file__), "--_log", logp, "--window", "6",
+                      watched], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     env=dict(env, MESH_FSWRITER_TEST_STALL="3"))
+    time.sleep(1.2)
+    subprocess.call(["bash", "-c", "echo blocked? >> %s" % watched])
+    dt = time.time() - t0 - 1.2
+    if dt > 1.0:
+        print("  FAIL: leg3 — a write took %.1fs while the listener was not reading; "
+              "FAN_CLASS_NOTIF must never gate a syscall" % dt)
+        f = 1
+
+    # leg 4 — silence: no write in the window → no attribution row, exit 0.
+    out, _ = run(3)
+    if "pid=" in out:
+        print("  FAIL: leg4 — a silent window must record no writer; got:\n%s" % out)
+        f = 1
+
+    # leg 5 — --last reads back the attribution, and an unobserved path is exit 2, not a guess.
+    p = subprocess.run([sys.executable, os.path.abspath(__file__), "--_log", logp, "--last", watched],
+                       capture_output=True, text=True)
+    if p.returncode != 0 or "comm=" not in p.stdout:
+        print("  FAIL: leg5 — --last must replay the recorded writer (rc=%d out=%s)"
+              % (p.returncode, p.stdout))
+        f = 1
+    p = subprocess.run([sys.executable, os.path.abspath(__file__), "--_log", logp, "--last", decoy],
+                       capture_output=True, text=True)
+    if p.returncode != 2:
+        print("  FAIL: leg5 — --last on a never-observed path must exit 2, got %d" % p.returncode)
+        f = 1
+
+    subprocess.call(["rm", "-rf", T])
+    if f:
+        print("smoke-test: FAIL (see asserts above)")
+        return 1
+    print("smoke-test: ok (writer pid+comm exact + inode mark does not leak the mount + NOTIF blocks "
+          "no write + silent window attributes nobody + --last replays / exits 2 unobserved)")
+    return 0
+
+
+def main():
+    argv = sys.argv[1:]
+    if not argv or argv[0] in ("-h", "--help"):
+        usage()
+        return 0
+    if argv[0] == "--test":
+        return smoke()
+
+    armed = False
+    if argv and argv[0] == "--_armed":
+        armed, argv = True, argv[1:]
+    logpath = LOG_DEFAULT
+    window = 30.0
+    paths, mode_last = [], None
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--window":
+            window = float(argv[i + 1]); i += 2
+        elif a == "--_log":
+            logpath = argv[i + 1]; i += 2
+        elif a == "--last":
+            mode_last = argv[i + 1]; i += 2
+        else:
+            paths.append(os.path.abspath(a)); i += 1
+
+    if mode_last:
+        return last(mode_last, logpath)
+    if not paths:
+        usage()
+        return 64
+    missing = [p for p in paths if not os.path.exists(p)]
+    if missing:
+        sys.stderr.write("mesh-fswriter: n/a — artifact does not exist: %s\n" % ", ".join(missing))
+        return 2
+
+    if not armed and os.geteuid() != 0:
+        rc = rearm(["--_log", logpath, "--window", str(window)] + paths)
+        return rc if rc else 1          # rearm only returns on failure
+    return listen(paths, window, logpath)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
