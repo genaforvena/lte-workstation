@@ -10,6 +10,72 @@
 #   mesh-supervise           check all; restart any dead child
 #   mesh-supervise --status  show each child's state
 set -uo pipefail
+# ── LIVENESS IS A CLAIM ABOUT *OUR* CHILD, NOT A SUBSTRING OF ANYONE'S CMDLINE ──────────────────
+# `pgrep -u $uid -f -- "$pat"` greens the child whenever ANY of this user's cmdlines contains the
+# pattern text. Two ways that fires with no child alive, both demonstrated on this node 2026-08-16
+# (witness, task supervise-liveness-is-a-substring-not-a-child):
+#   · PATH-BLIND — the supervised `/home/…/.local/bin/mesh-dram-bw --sampler` was dead (2 RESTARTs,
+#     none since) while a developer's hand-run `bash scripts/mesh-dram-bw --sampler` held the
+#     pattern. A run at 18:37 returned rc=0 and wrote nothing: a healthy verdict over a corpse.
+#   · A PROBE STRING IS ITSELF A CMDLINE — `exec -a 'cat <pat>' sleep 8` reads ALIVE, and the
+#     observer's own probe shell self-matched before the decoy even existed.
+# The fix is not a better regex; it is to stop asking about TEXT. pgrep still selects candidates
+# (cheap, portable), then each candidate must prove it is running the registered START-CMD's own
+# program: an argv ELEMENT equal to it — `bash /home/…/mesh-dram-bw --sampler` has that element,
+# `bash -lc "<the whole line as one arg>"` and `exec -a` never do. Same shape as mesh-dram-bw's
+# perf_sessions(): match on the question, then confirm against the answer.
+# The token to match on is the thing that IDENTIFIES the child, which is not always argv[0]: for a
+# start-cmd of the form `bash /path/foo --loop` the interpreter name matches every other bash on the
+# node (argv[0] is literally `bash`), so the script path is the identifying token. Skip leading
+# VAR=… assignments; step past an interpreter to its script; never step onto a flag.
+prog_token(){   # $1 = start-cmd → the token that names this child
+  local t first= next=
+  for t in $1; do
+    case "$t" in [A-Za-z_]*=*) continue;; esac
+    if [ -z "$first" ]; then first="$t"; continue; fi
+    next="$t"; break
+  done
+  [ -n "$first" ] || return 1
+  case "${first##*/}" in
+    bash|sh|dash|zsh|ksh|ash|busybox|env|python|python3|perl|ruby|node)
+      # …and a start-cmd that is an interpreter with NO script (`bash -lc '<inline loop>'`) has no
+      # identifying token at all. Say so (rc 1) instead of matching on "bash", which would green the
+      # child off any shell on the node — the caller degrades loudly.
+      case "$next" in ''|-*) return 1;; *) printf '%s' "$next"; return 0;; esac ;;
+  esac
+  printf '%s' "$first"
+}
+child_pids(){   # $1=pgrep-pattern $2=start-cmd → pids of OUR child (empty = genuinely DOWN)
+  local pat="$1" prog base pid comm
+  prog="$(prog_token "$2")" || {
+    # UNVERIFIABLE ROW — an inline `bash -lc '…'` start-cmd names nothing this can bind to. Degrade
+    # to the old substring match rather than declare it dead forever (that would restart-loop), and
+    # LOG it: the weakness is then visible in the artifact a human reads instead of silent.
+    [ -f "$MESH/.sup-unverifiable" ] || { echo "$(stamp) DEGRADED: start-cmd names no program to bind to (inline interpreter) — liveness for it falls back to a bare cmdline substring" >> "$LOG"; touch "$MESH/.sup-unverifiable"; }
+    pgrep -u "$uid" -f -- "$pat" 2>/dev/null; return 0
+  }
+  base="${prog##*/}"
+  # Honest degradation: without a readable /proc there is no argv to confirm against, so fall back
+  # to the old text match rather than declaring every child dead and restart-looping. Says so once.
+  if [ ! -r /proc/self/cmdline ]; then
+    [ -f "$MESH/.sup-noproc" ] || { echo "$(stamp) DEGRADED: no readable /proc — liveness falls back to a bare cmdline substring (see supervise-liveness-is-a-substring-not-a-child)" >> "$LOG"; touch "$MESH/.sup-noproc"; }
+    pgrep -u "$uid" -f -- "$pat" 2>/dev/null; return 0
+  fi
+  for pid in $(pgrep -u "$uid" -f -- "$pat" 2>/dev/null); do
+    [ "$pid" = "$$" ] && continue
+    [ -r "/proc/$pid/cmdline" ] || continue
+    if tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null | grep -Fxq -- "$prog"; then echo "$pid"; continue; fi
+    # A child that re-execs under its own name (a compiled binary, or one that rewrites argv) has
+    # no such element — accept comm, but NEVER for an interpreter name: a script child's comm is
+    # `bash`, and so is every probe shell's, so that leg would hand the blindness straight back.
+    comm="$(cat "/proc/$pid/comm" 2>/dev/null)"
+    case "$comm" in
+      bash|sh|dash|zsh|ksh|ash|busybox|env|timeout|setsid|nohup|flock|sudo|python3|perl|'') continue;;
+    esac
+    [ "$comm" = "$base" ] && echo "$pid"
+  done
+}
+
 [ "${1:-}" = --test ] && {
   command -v pgrep  >/dev/null 2>&1 || { echo "smoke-test: FAIL (no pgrep)"; exit 1; }
   command -v flock  >/dev/null 2>&1 || { echo "smoke-test: FAIL (no flock)"; exit 1; }
@@ -129,7 +195,82 @@ EOF
   [ "$precount" = "$postcount" ] || {
     echo "smoke-test: FAIL (absent-registry FAIL path touched the heartbeat — broken state must not look alive)"; exit 1; }
   rm -rf "$tmp2"
-  echo "smoke-test: ok"; exit 0
+
+  # ── LIVENESS IS A CLAIM ABOUT OUR CHILD, NOT A SUBSTRING (task
+  #    supervise-liveness-is-a-substring-not-a-child, witness 2026-08-16 18:38Z). All three legs
+  #    were watched RED against the pre-fix `pgrep -u $uid -f -- "$pat"`: it greened the decoy, it
+  #    greened the wrong-path copy, and it logged NOTHING where a RESTART was owed.
+  _sup_kill(){ local p; for p in $(pgrep -f -- "$1" 2>/dev/null); do [ "$p" = "$$" ] || kill "$p" 2>/dev/null; done; }
+  rm -f "$tmp/.mesh/supervise.log" "$tmp/.mesh/.sup-restarts-supchild"
+  mkdir -p "$tmp/deployed" "$tmp/repo"
+  printf '#!/usr/bin/env bash\nsleep 45\n' > "$tmp/deployed/supchild-$$"
+  cp "$tmp/deployed/supchild-$$" "$tmp/repo/supchild-$$"
+  chmod +x "$tmp/deployed/supchild-$$" "$tmp/repo/supchild-$$"
+  cat > "$tmp/.mesh/supervise.list" <<EOF
+supchild|supchild-$$ --loop|$tmp/deployed/supchild-$$ --loop
+EOF
+  # (1) POSITIVE FIRST — a check this strict is worthless if it can never green. The real deployed
+  #     child, started exactly as the supervisor starts it, must read UP.
+  setsid bash -lc "$tmp/deployed/supchild-$$ --loop" >/dev/null 2>&1 &
+  sleep 0.5
+  out="$(HOME="$tmp" MESH_SUP_NOTIFY=0 timeout 10 "$0" --status 2>&1)"
+  case "$out" in *"UP   supchild"*) :;;
+    *) _sup_kill "supchild-$$"; echo "smoke-test: FAIL (the genuinely-running deployed child must read UP: $out)"; exit 1;; esac
+  _sup_kill "$tmp/deployed/supchild-$$"; sleep 0.3
+  # (2) PATH-BLIND — a hand-run copy at a DIFFERENT path with the same basename and the same
+  #     pattern must not stand in for the deployed child. This is the live 18:37Z incident.
+  setsid bash -lc "$tmp/repo/supchild-$$ --loop" >/dev/null 2>&1 &
+  sleep 0.5
+  out="$(HOME="$tmp" MESH_SUP_NOTIFY=0 timeout 10 "$0" --status 2>&1)"
+  case "$out" in *"DOWN supchild"*) :;;
+    *) _sup_kill "supchild-$$"; echo "smoke-test: FAIL (a hand-run copy at another path masked the dead supervised child: $out)"; exit 1;; esac
+  _sup_kill "$tmp/repo/supchild-$$"; sleep 0.3
+  # (3) DECOY + THE RESTART IT OWES — a process whose cmdline merely CONTAINS the pattern must not
+  #     green it, and the real run must log RESTART. Pre-fix this wrote nothing at all.
+  setsid bash -c "exec -a 'supchild-$$ --loop' sleep 45" >/dev/null 2>&1 &
+  sleep 0.5
+  out="$(HOME="$tmp" MESH_SUP_NOTIFY=0 timeout 10 "$0" --status 2>&1)"
+  case "$out" in *"DOWN supchild"*) :;;
+    *) _sup_kill "supchild-$$"; echo "smoke-test: FAIL (an exec -a decoy holding the pattern read as the live child: $out)"; exit 1;; esac
+  HOME="$tmp" MESH_SUP_NOTIFY=0 timeout 10 "$0" >/dev/null 2>&1
+  grep -q "RESTART supchild (was dead)" "$tmp/.mesh/supervise.log" 2>/dev/null || {
+    _sup_kill "supchild-$$"; echo "smoke-test: FAIL (child dead behind a decoy — supervisor logged no RESTART: $(cat "$tmp/.mesh/supervise.log" 2>/dev/null))"; exit 1; }
+  _sup_kill "supchild-$$"; sleep 0.2
+  # (4) AN INTERPRETER IS NOT AN IDENTITY. A start-cmd of `bash <script>` has argv[0] == "bash" on
+  #     the child AND on every probe shell on the node, so matching the first token would hand the
+  #     blindness straight back. The script path is the identifying token.
+  [ "$(prog_token "FOO=1 BAR=2 /usr/bin/thing --flag")" = /usr/bin/thing ] || {
+    echo "smoke-test: FAIL (prog_token must skip leading VAR= assignments)"; exit 1; }
+  [ "$(prog_token "bash /opt/x/child.sh --loop")" = /opt/x/child.sh ] || {
+    echo "smoke-test: FAIL (prog_token must step past an interpreter to its script)"; exit 1; }
+  prog_token "bash -lc 'thing'" >/dev/null 2>&1 && {
+    echo "smoke-test: FAIL (an inline interpreter start-cmd names nothing bindable — prog_token must say so, not answer 'bash')"; exit 1; }
+  # …and that row must degrade LOUDLY, not silently: the fallback writes its own DEGRADED line.
+  rm -f "$tmp/.mesh/supervise.log" "$tmp/.mesh/.sup-unverifiable"
+  cat > "$tmp/.mesh/supervise.list" <<EOF
+inline|no-such-inline-child-pattern-$$|bash -lc 'sleep 45'
+EOF
+  HOME="$tmp" MESH_SUP_NOTIFY=0 timeout 10 "$0" --status >/dev/null 2>&1
+  grep -q 'DEGRADED: start-cmd names no program to bind to' "$tmp/.mesh/supervise.log" 2>/dev/null || {
+    echo "smoke-test: FAIL (an unverifiable row fell back to substring matching without saying so)"; exit 1; }
+  rm -f "$tmp/.mesh/supervise.log" "$tmp/.mesh/.sup-restarts-interp"
+  printf '#!/usr/bin/env bash\nsleep 45\n' > "$tmp/deployed/supkid-$$"; chmod +x "$tmp/deployed/supkid-$$"
+  cat > "$tmp/.mesh/supervise.list" <<EOF
+interp|supkid-$$ --loop|bash $tmp/deployed/supkid-$$ --loop
+EOF
+  setsid bash -c "sleep 45 # supkid-$$ --loop" >/dev/null 2>&1 &   # a shell merely MENTIONING it
+  sleep 0.5
+  out="$(HOME="$tmp" MESH_SUP_NOTIFY=0 timeout 10 "$0" --status 2>&1)"
+  case "$out" in *"DOWN interp"*) :;;
+    *) _sup_kill "supkid-$$"; echo "smoke-test: FAIL (a bash shell mentioning the pattern greened a 'bash <script>' child: $out)"; exit 1;; esac
+  setsid bash -lc "bash $tmp/deployed/supkid-$$ --loop" >/dev/null 2>&1 &
+  sleep 0.5
+  out="$(HOME="$tmp" MESH_SUP_NOTIFY=0 timeout 10 "$0" --status 2>&1)"
+  case "$out" in *"UP   interp"*) :;;
+    *) _sup_kill "supkid-$$"; echo "smoke-test: FAIL (the real 'bash <script>' child must still read UP: $out)"; exit 1;; esac
+  _sup_kill "supkid-$$"; sleep 0.2
+
+  echo "smoke-test: ok (registry/cause-of-death/announce/heartbeat + liveness bound to OUR child: positive UP, wrong-path DOWN, decoy DOWN + RESTART logged)"; exit 0
 }
 export PATH="$HOME/.local/bin:$PATH"
 MESH="$HOME/.mesh"; REG="$MESH/supervise.list"; LOG="$MESH/supervise.log"; LOCK="$MESH/.supervise.lock"; HB="$MESH/.supervise.heartbeat"
@@ -263,15 +404,19 @@ while IFS='|' read -r name pat start; do
   name="${name#"${name%%[![:space:]]*}"}"; name="${name%"${name##*[![:space:]]}"}"   # trim
   case "$name" in ''|\#*) continue;; esac
   pat="$(printf '%s' "$pat" | xargs)"; start="$(printf '%s' "$start" | xargs)"
-  if pgrep -u "$uid" -f -- "$pat" >/dev/null 2>&1; then
+  pids="$(child_pids "$pat" "$start")"
+  if [ -n "$pids" ]; then
     # WEDGED check: process is up, but if it publishes a liveness beat and the beat is stale
     # (>1800s, longer than any loop interval), the loop is hung — restart it (intel audit 2026-06-10)
     beat="$MESH/$name.beat"
     if [ -f "$beat" ] && [ $(( $(date +%s) - $(stat -c %Y "$beat") )) -gt 1800 ]; then
       if [ "$STATUS" = 1 ]; then echo "  WEDGED $name  (beat stale, would restart: $start)"
       elif ok_to_restart "$name"; then
-        echo "$(stamp) WEDGED $name (beat stale) -> kill+restart $start" >> "$LOG"
-        pkill -u "$uid" -f -- "$pat" 2>/dev/null
+        echo "$(stamp) WEDGED $name (beat stale) -> kill+restart $start [pids: $(echo $pids)]" >> "$LOG"
+        # by PID, never `pkill -f -- "$pat"`: the kill direction of the same blindness is worse than
+        # the read direction — it reaps every shell, pane or mesh-tell whose cmdline merely MENTIONS
+        # the pattern, including the operator's own (memory: pkill-f-kills-its-own-wrapper-shell).
+        kill $pids 2>/dev/null
         setsid bash -lc "$start" 9>&- >/dev/null 2>&1 &
         announce_down "$name" " (wedged: beat stale)"
       fi
