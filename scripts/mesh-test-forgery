@@ -41,9 +41,45 @@
 #     scratch HOME so the mutant cannot forge the REAL gpu-lid.log, and the sweep names
 #     mesh-gpu-lid → gpu-lid.log. Reproducer in the board [done] for test-writes-production-log-detector.
 #
+# THE THIRD LEG: ATTRIBUTION, not inference (mesh-fswriter, f38f454). The two legs above are both
+# INFERENCE FROM SIZE — they ask "did it grow while the tool ran, and not while it didn't". fanotify
+# answers the question directly: WHICH pid, in WHICH session, wrote that path. So the CONFIRM run is
+# now made with `mesh-fswriter` armed on the candidate and the `--test` placed in a FRESH SESSION
+# (`setsid`); a row carrying that session id is the defect NAMED, not inferred.
+#
+# ATTRIBUTION IS BY SESSION, NOT BY CMDLINE, AND THAT IS NOT A STYLE CHOICE — the first version of
+# this leg matched the writer's argv for the tool name + `--test`, and it attributed NOTHING. The
+# writer here is by construction a process that appends one line and exits immediately, so by the
+# time the event is dequeued the kernel has already zeroed its argv: the only row is
+# `comm=bash cmd="<exiting>"` (reproduced in the fixture below before the gate went green). The
+# session id survives that teardown and is INHERITED, so it also catches the write done by a CHILD
+# of the run — a `touch`/`date >>` whose own argv never mentions the tool, which is precisely the
+# shape of the first live find this probe produced. Three things it buys, in order of worth:
+#
+#  * IT RECOVERS FINDINGS TRAP 1 THROWS AWAY. `unattributable` is the honest verdict when a log moves
+#    in the control window too — but a busy log (chat.log, traces.log) is unattributable FOREVER by
+#    that rule, so a forger writing one is permanently invisible. A named writer settles it in one
+#    window: cron noise cannot explain a row that carries the tool's own `--test` argv.
+#  * IT NAMES THE WRITER IN THE REPORT. "mesh-gpu-lid → gpu-lid.log" becomes a pid + comm + argv, so
+#    the fix goes to the right line instead of to a grep of the whole tool.
+#  * IT SEES A WRITE THAT IS NOT A GROWTH (rewrite-in-place), which a size diff cannot see at all.
+#
+# It NEVER downgrades. A writer outside our session is not proof of innocence — the write may have
+# landed a hair outside the listener's window, or through a path fanotify did not see — so an
+# `other:`/`none` attribution leaves the size verdict exactly as it was. Only the promotion is acted
+# on, because only the promotion rests on direct evidence. And if fanotify cannot be armed (no
+# `sudo -n`, no `setsid --wait`), the writer field reads `na` and the tool is precisely the tool it
+# was yesterday: an absent attribution is REPORTED, never a silent fallback to the weaker legs
+# pretending to be the stronger one.
+#
+# ITS SINK IS A DOTFILE ON PURPOSE. Attribution rows go to $MESH/.forgery-attrib.log, and snapshot()
+# globs `*.log`, which in bash does not match a leading dot. A visible sink would grow on every
+# candidate and the detector would name ITSELF as the forger of every tool it sweeps. Gated below.
+#
 # COST: 2 `--test` runs per tool that produced a candidate, 1 for every other tool, plus one control
-# sleep per candidate. Candidates are rare, so a full pass is ~one doctor-equivalent sweep. DAILY,
-# not hourly: the thing it looks for is a code property, and it changes at commit rate.
+# sleep per candidate and one armed listener (a `sudo -n` re-exec) per candidate. Candidates are
+# rare, so a full pass is ~one doctor-equivalent sweep. DAILY, not hourly: the thing it looks for is
+# a code property, and it changes at commit rate.
 #
 # reflex-cadence: 41 4 * * *
 # reflex-args: --sweep
@@ -54,8 +90,10 @@ MESH="${MESH_HOME:-$HOME/.mesh}"
 BIN="${MESH_BIN_DIR:-$HOME/.local/bin}"
 LOG="$MESH/forgery-sweep.log"
 STATE="$MESH/.forgery-sweep.state"          # pairs already reported to the board (edge-only posting)
+ATTRIB_LOG="$MESH/.forgery-attrib.log"      # DOTFILE: snapshot()'s *.log glob must never see it
 TEST_TIMEOUT="${MESH_TEST_FORGERY_TIMEOUT:-30}"
 CTRL_MIN="${MESH_TEST_FORGERY_CTRL_MIN:-2}"   # control window floor, seconds
+ATTRIB="${MESH_TEST_FORGERY_ATTRIB:-1}"       # 0 disables the fanotify leg (verdicts read `na`)
 
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
@@ -96,14 +134,81 @@ run_test() {
   return 0
 }
 
+# ---- attribution (mesh-fswriter) ---------------------------------------------------------------
+# Can this node name a writer at all? Arming fanotify needs root; listening does not. Absence here
+# is honest n/a, and it is carried in the verdict row — never quietly folded into the size legs.
+attrib_available() {
+  [ "$ATTRIB" = 1 ] || return 1
+  command -v mesh-fswriter >/dev/null 2>&1 || return 1
+  # --wait, because setsid FORKS when the caller is already a process-group leader: without it the
+  # run returns before the test it is supposed to be watching has finished.
+  setsid --wait true >/dev/null 2>&1 || return 1
+  sudo -n true >/dev/null 2>&1 || return 1
+}
+
+# the same run as run_test, in a FRESH SESSION whose id (== the leader's pid) lands in $2. Every
+# process the test spawns inherits it, so the session is the membership test for "our run wrote it".
+run_test_sid() {
+  setsid --wait bash -c 'echo $$ >"$2"; exec env MESH_TEST_SANDBOX=1 timeout "$3" nice -n 10 "$1" --test' \
+    _ "$1" "$2" "$TEST_TIMEOUT" </dev/null >/dev/null 2>&1
+  return 0
+}
+
+# attributed_run <tool> <path> <window> → runs the tool's --test with the candidate marked, and
+# prints ONE writer token (never blank, never containing a space):
+#   self:<comm>   a row from OUR run's session — the defect, named (the tool or anything it spawned)
+#   other:<comm>  something else wrote it during the window (evidence, never innocence)
+#   none          armed, and nothing wrote the path in the window
+#   na            fanotify could not be armed here (or the listener never announced)
+attributed_run() {
+  local tool="$1" path="$2" win="$3" errf lp mark waited=0 new selfrow row sidf sid
+  if ! attrib_available; then run_test "$tool"; printf 'na'; return 0; fi
+
+  # byte offset first: the sink is append-only and shared across candidates, so OUR window is the
+  # tail past this mark. Reading the whole file would attribute an earlier candidate's writer here.
+  mark="$(size_of "$ATTRIB_LOG")"
+  errf="$(mktemp)"
+  MESH_FSWRITER_LOG="$ATTRIB_LOG" mesh-fswriter --window "$win" "$path" >/dev/null 2>"$errf" &
+  lp=$!
+  # BLOCK ON THE HANDSHAKE, never on a sleep: a mark set a hair after the test starts misses the
+  # very write we are here to catch, and misses it silently. Bounded — a listener that never arms
+  # (or dies arming) is n/a, which is a claim about this node, not about the tool.
+  while ! grep -q armed "$errf" 2>/dev/null; do
+    kill -0 "$lp" 2>/dev/null || break
+    sleep 0.2; waited=$((waited + 1)); [ "$waited" -gt 50 ] && break
+  done
+  if ! grep -q armed "$errf" 2>/dev/null; then
+    wait "$lp" 2>/dev/null; rm -f "$errf"; run_test "$tool"; printf 'na'; return 0
+  fi
+
+  sidf="$(mktemp)"
+  run_test_sid "$tool" "$sidf"
+  wait "$lp" 2>/dev/null            # the listener owns the window; it flushes its last row at the end
+  sid="$(cat "$sidf" 2>/dev/null)"; rm -f "$errf" "$sidf"
+
+  new="$(tail -c "+$((mark + 1))" "$ATTRIB_LOG" 2>/dev/null | grep -F " path=$path cmd=" || true)"
+  [ -n "$new" ] || { printf 'none'; return 0; }
+  # membership, not text: a row whose session is the one we just created was written by this run or
+  # by something it spawned. Guard the empty sid — a grep for " sid= " would match every row.
+  selfrow=""
+  [ -n "$sid" ] && selfrow="$(grep -F -- " sid=$sid " <<<"$new" | head -1)"
+  row="${selfrow:-$(head -1 <<<"$new")}"
+  local comm; comm="$(sed -n 's/.* comm=\([^ ]*\) .*/\1/p' <<<"$row" | head -1)"
+  printf '%s:%s' "$([ -n "$selfrow" ] && echo self || echo other)" "${comm:-?}"
+}
+
 # ---- one tool ---------------------------------------------------------------------------------
-# emits: "<verdict> <tool> <log>" for each candidate. Verdicts:
-#   forgery         — grew on both runs, did NOT grow in the control window
-#   unattributable  — grew in the control window too (cron noise; NOT a finding)
+# emits: "<verdict> <tool> <log> <writer>" for each candidate. Verdicts:
+#   forgery         — grew on both runs, did NOT grow in the control window — OR fanotify named the
+#                     tool's own `--test` as the writer, which no amount of cron noise can explain
+#   unattributable  — grew in the control window too (cron noise; NOT a finding) and unnamed
 #   noise           — did not reproduce on the second run (single-pass diff, discarded)
 #   exempt          — a dedicated dry-run sink by name
+# <writer> is self:<comm> / other:<comm> / none / na — see attributed_run. `na` is a claim about
+# THIS NODE (no `sudo -n`), and it is printed rather than dropped, so a weaker sweep never reads
+# like a stronger one.
 sweep_tool() {
-  local tool="$1" name before after cands c t0 dur ctl_before ctl_after b2 a2
+  local tool="$1" name before after cands c t0 dur ctl_before ctl_after b2 a2 w
   name="$(basename "$tool")"
   before="$(snapshot)"
   t0=$SECONDS
@@ -115,17 +220,23 @@ sweep_tool() {
 
   [ "$dur" -lt "$CTRL_MIN" ] && dur="$CTRL_MIN"
   for c in $cands; do
-    if is_exempt_log "$c"; then printf 'exempt %s %s\n' "$name" "$c"; continue; fi
+    if is_exempt_log "$c"; then printf 'exempt %s %s %s\n' "$name" "$c" "-"; continue; fi
     # CONTROL first: same wallclock length, tool NOT running. This is the cron-noise leg.
     ctl_before="$(size_of "$c")"; sleep "$dur"; ctl_after="$(size_of "$c")"
-    # CONFIRM: the same tool again, same log.
-    b2="$(size_of "$c")"; run_test "$tool"; a2="$(size_of "$c")"
-    if [ "$a2" -le "$b2" ]; then
-      printf 'noise %s %s\n' "$name" "$c"
+    # CONFIRM: the same tool again, same log — this time with the candidate MARKED, so the run
+    # answers "who wrote it" and not only "did it grow". The listener's window outlasts a test of
+    # the length we just measured; a test that runs long past it degrades to `none`, i.e. back to
+    # yesterday's two legs, never to a claim the evidence does not carry.
+    b2="$(size_of "$c")"; w="$(attributed_run "$tool" "$c" "$((dur + 3))")"; a2="$(size_of "$c")"
+    if [ "${w#self:}" != "$w" ]; then
+      # NAMED. The tool's own `--test` argv wrote the durable log; the size legs are moot.
+      printf 'forgery %s %s %s\n' "$name" "$c" "$w"
+    elif [ "$a2" -le "$b2" ]; then
+      printf 'noise %s %s %s\n' "$name" "$c" "$w"
     elif [ "$ctl_after" -gt "$ctl_before" ]; then
-      printf 'unattributable %s %s\n' "$name" "$c"
+      printf 'unattributable %s %s %s\n' "$name" "$c" "$w"
     else
-      printf 'forgery %s %s\n' "$name" "$c"
+      printf 'forgery %s %s %s\n' "$name" "$c" "$w"
     fi
   done
 }
@@ -157,10 +268,11 @@ do_sweep() {
     [ -n "$line" ] && out="${out}${line}"$'\n'
   done < <(tool_list)
 
-  while read -r verdict tool lg; do
+  while read -r verdict tool lg w; do
     [ -n "${verdict:-}" ] || continue
     case "$verdict" in
-      forgery)        n_forge=$((n_forge+1)); grep -qxF "$tool $lg" "$STATE" 2>/dev/null || new_pairs="${new_pairs}${tool}→$(basename "$lg") " ;;
+      forgery)        n_forge=$((n_forge+1)); grep -qxF "$tool $lg" "$STATE" 2>/dev/null \
+                        || new_pairs="${new_pairs}${tool}→$(basename "$lg")[writer=${w:-na}] " ;;
       unattributable) n_un=$((n_un+1)) ;;
       noise)          n_noise=$((n_noise+1)) ;;
       exempt)         n_ex=$((n_ex+1)) ;;
@@ -171,10 +283,10 @@ do_sweep() {
     printf '{"ts":"%s","forgery":%d,"unattributable":%d,"noise_discarded":%d,"exempt":%d,"rows":[' \
       "$(ts)" "$n_forge" "$n_un" "$n_noise" "$n_ex"
     local first=1
-    while read -r verdict tool lg; do
+    while read -r verdict tool lg w; do
       [ -n "${verdict:-}" ] || continue
       [ "$first" = 1 ] || printf ','; first=0
-      printf '{"verdict":"%s","tool":"%s","log":"%s"}' "$verdict" "$tool" "$lg"
+      printf '{"verdict":"%s","tool":"%s","log":"%s","writer":"%s"}' "$verdict" "$tool" "$lg" "${w:-na}"
     done <<<"$out"
     printf ']}\n'
   else
@@ -185,15 +297,16 @@ do_sweep() {
 
   # durable record + edge-only board post (a pair already reported never re-posts)
   {
-    printf '%s sweep forged=%d unattributable=%d noise=%d exempt=%d\n' "$(ts)" "$n_forge" "$n_un" "$n_noise" "$n_ex"
-    while read -r verdict tool lg; do
-      [ "${verdict:-}" = forgery ] && printf '%s FORGERY %s -> %s\n' "$(ts)" "$tool" "$lg"
+    printf '%s sweep forged=%d unattributable=%d noise=%d exempt=%d attrib=%s\n' \
+      "$(ts)" "$n_forge" "$n_un" "$n_noise" "$n_ex" "$(attrib_available && echo fanotify || echo na)"
+    while read -r verdict tool lg w; do
+      [ "${verdict:-}" = forgery ] && printf '%s FORGERY %s -> %s writer=%s\n' "$(ts)" "$tool" "$lg" "${w:-na}"
     done <<<"$out"
   } >> "$LOG"
 
   if [ -n "$new_pairs" ] && command -v mesh-chat >/dev/null 2>&1; then
-    mesh-chat "[fyi] test-forgery: a --test is writing the durable liveness log it exists to check — $new_pairs(confirmed on a re-run, and the log did NOT grow in an equal control window). Give the dry-run its own log (mesh-gpu-lid 180e578 is the pattern)." >/dev/null 2>&1
-    while read -r verdict tool lg; do
+    mesh-chat "[fyi] test-forgery: a --test is writing the durable liveness log it exists to check — $new_pairs(writer=self:* is fanotify NAMING the pid whose argv carries --test; writer=none/other/na means the older evidence: it grew on a re-run and did NOT grow in an equal control window). Give the dry-run its own log (mesh-gpu-lid 180e578 is the pattern)." >/dev/null 2>&1
+    while read -r verdict tool lg w; do
       [ "${verdict:-}" = forgery ] && printf '%s %s\n' "$tool" "$lg" >> "$STATE"
     done <<<"$out"
   fi
@@ -242,9 +355,9 @@ echo "\$*" >> "$d/chat.capture"
 EOF
   chmod +x "$d/bin/mesh-chat"
 
-  run_detector() {  # $1 = tool name → verdict rows
+  run_detector() {  # $1 = tool name, $2 = MESH_TEST_FORGERY_ATTRIB (default 0) → verdict rows
     HOME="$d" MESH_HOME="$d/.mesh" MESH_BIN_DIR="$d/bin" MESH_TEST_FORGERY_CTRL_MIN=2 \
-      PATH="$d/bin:$PATH" bash "$0" --tool "$1" 2>/dev/null
+      MESH_TEST_FORGERY_ATTRIB="${2:-0}" PATH="$d/bin:$PATH" bash "$0" --tool "$1" 2>/dev/null
   }
 
   local out
@@ -278,6 +391,47 @@ EOF
   # the tool's own word — assert the classifier both ways rather than trusting the case list.
   is_exempt_log "$d/.mesh/gpu-lid.log"     && _f "exemption: a durable log must not be exempt"
   is_exempt_log "$d/.mesh/guardian-test.log" || _f "exemption: a dedicated dry-run sink must be exempt"
+
+  # ---- the attribution leg (mesh-fswriter) ------------------------------------------------------
+  # (4) THE RECOVERED CLASS — a forger writing a BUSY log. Its --test appends to the durable record
+  # AND a background writer moves the same log through every window, so the control leg is polluted
+  # and the size-only verdict is `unattributable` forever. fanotify names the writer and settles it.
+  cat > "$d/bin/mesh-noisyforger" <<'EOF'
+#!/usr/bin/env bash
+L="${MESH_HOME:-$HOME/.mesh}/noisyforger.log"
+case "${1:-}" in --test) echo "dry" >> "$L"; echo "smoke-test: ok"; exit 0 ;; esac
+echo real >> "$L"
+EOF
+  chmod +x "$d/bin/mesh-noisyforger"
+
+  # the sink is a DOTFILE so the sweep cannot detect its own attribution writes as everyone's
+  # forgery. Assert the glob, not the intention. Falsify: rename it to forgery-attrib.log → listed.
+  : > "$d/.mesh/.forgery-attrib.log"
+  ( MESH="$d/.mesh"; snapshot ) | grep -q 'forgery-attrib' \
+    && _f "attribution sink: the dotfile sink is visible to snapshot() — the detector would report \
+itself as the writer of every candidate"
+
+  if ! attrib_available; then
+    echo "  n/a: attribution legs skipped (no fanotify arm here: mesh-fswriter or \`sudo -n\` absent)"
+  else
+    local noisepid2
+    ( while :; do echo noise >> "$d/.mesh/noisyforger.log"; sleep 0.05; done ) &
+    noisepid2=$!
+    out="$(run_detector mesh-noisyforger 1)"
+    grep -qE "^ *forgery mesh-noisyforger .*noisyforger\.log self:" <<<"$out" \
+      || _f "attribution: a --test writing a BUSY durable log must be NAMED (writer=self:<comm>) — \
+this is the class the control leg discards; got: $(tr '\n' '|' <<<"$out")"
+
+    # …and the SAME fixture with the fanotify leg off must fall back to the honest `unattributable`,
+    # which proves the promotion above came from attribution and not from the size legs agreeing
+    # anyway (`a-gate-can-be-vacuous-because-the-live-reading-agrees`).
+    rm -f "$d/chat.capture"
+    out="$(run_detector mesh-noisyforger 0)"
+    kill "$noisepid2" 2>/dev/null; wait "$noisepid2" 2>/dev/null
+    grep -qE "^ *unattributable mesh-noisyforger .*noisyforger\.log na$" <<<"$out" \
+      || _f "attribution off: the writer field must read \`na\` and the verdict must fall back to \
+unattributable — an absent attribution may never read like a present one; got: $(tr '\n' '|' <<<"$out")"
+  fi
 
   # grown(): a log that APPEARS (did not exist before) is growth from 0, not an absence
   local b; b="$(printf '%s\n' "/x/a.log 10")"
