@@ -15,6 +15,12 @@
 #   quietly ("listener active"), so cron */5 + window 290 can never stack listeners.
 #   No inotifywait → honest exit 2 (n/a), never a silent fallback to polling.
 #
+#   mesh-fsnotify --caps [--json] [--no-sudo] [--uid N]... [--comm NAME]
+#       saturation sense over the four PER-UID fsnotify budgets (inotify instances/watches,
+#       fanotify groups/marks): used/limit + top holders by comm, banded on HEADROOM. Defaults to
+#       this uid + root (root's fanotify groups are where mesh-fswriter's listener lives). An
+#       unreadable uid renders n/a, never 0. No sysctls → exit 2.
+#
 # Wired for the board: an extra mesh-dispatch pass per board burst; dispatch's own pace/spend gates
 # decide whether the pass DOES anything — this only collapses the seen-latency.
 # reflex-cadence: */5 * * * *
@@ -25,6 +31,269 @@ usage(){ sed -n '2,/^[^#]/p' "$0" | sed -n 's/^# \?//p'; }
 case "${1:-}" in -h|--help|"") usage; exit 0 ;; esac
 
 MESH="$HOME/.mesh"
+
+# ── PER-UID CAP SATURATION (--caps) ──────────────────────────────────────────────────────────────
+# The four fsnotify caps are PER-UID, not per-process and not system-wide:
+#   fs.inotify.max_user_instances  fs.inotify.max_user_watches
+#   fs.fanotify.max_user_groups    fs.fanotify.max_user_marks
+# Nothing in the genome measured them, and this listener plus mesh-fswriter, mesh-guardian, every
+# editor/IDE and systemd itself all draw on the same per-UID budget.
+#
+# THE ERRNO MISDIRECTION — name it here so the next reader does not lose a day:
+#   · instances/groups exhausted → the syscall returns **EMFILE** ("too many open files"), which
+#     sends you to `ulimit -n` and /proc/sys/fs/file-max. Both can be wide open while this cap binds.
+#   · watches/marks exhausted   → **ENOSPC** ("no space left on device"), which sends you to `df`.
+#     There is no disk involved at all.
+#   The kernel names a plausible cause; it is not the cause ([[an-error-message-names-a-cause-not-the-cause]]).
+#
+# FOUR THINGS THIS GETS RIGHT, each a live trap on this node:
+#  1. UID-SCOPED, and it SAYS SO. A whole-/proc count is neither our usage nor the system's — the
+#     caps are per-UID, so summing two users against one limit is meaningless. One row per uid.
+#  2. ROOT IS A SEPARATE BUDGET AND IS USUALLY INVISIBLE. mesh-fswriter calls fanotify_init as ROOT
+#     and only then setuid()s back, so its group is charged to ROOT for the listener's whole life; a
+#     uid-1000 scan reads 0 while it is running. We scan root when we can (already root, or `sudo -n`
+#     succeeds) and otherwise render root's row **n/a with the reason** — never 0.
+#  3. UNREADABLE RENDERS n/a, NEVER 0. A zero on a saturation axis is a fabricated all-clear. A
+#     partially readable uid reports `≥N (partial)` and its headroom is explicitly an UPPER bound.
+#     A process that DIES mid-walk is not "unreadable" — it is gone, and is not counted either way.
+#  4. NO ALLOCATION TEST. Proving the cap binds by opening 128 inotify instances would break every
+#     other watcher on the node while the test runs ([[a-real-hardware-test-leg-is-an-attack-when-the-device-is-wedged]]).
+#     The gate asserts the DERIVATION against a known process instead: spawn one inotifywait, assert
+#     the count rises by exactly 1, kill it, assert it falls back.
+# Banding is on HEADROOM, not an absolute — every one of these limits is per-node tunable, so
+# "2000 watches" means nothing without its denominator.
+#
+# FIFTH THING, and it is a whole second SURFACE — every one of these caps is published TWICE and the
+# two views answer different questions (health's 2026-08-17T15:18Z verify of the discover find):
+#   /proc/sys/fs/{inotify,fanotify}/max_user_*   → init_user_ns's limit (what a host sysctl sets)
+#   /proc/sys/user/max_{inotify,fanotify}_*      → the CURRENT user namespace's limit
+# Measured here 2026-08-17: identical on the host (128 / 249173 / 128 / 264943), and inside a fresh
+# `unshare -Ur` the ucount view reads **2147483647** while the fs view still reads the ancestor's
+# 128 — and the ucount view is WRITABLE in that ns (set to 8; the fs view stayed 128). Charges
+# propagate UP the userns chain, so the cap that actually binds is the MINIMUM over the chain:
+#   · reading only ucount → INFINITE headroom reported on a saturated node (the fresh-ns read)
+#   · reading only fs     → a userns that TIGHTENED its own budget is invisible: 8 used against a
+#                           printed 128 renders 94% headroom on a budget that is already full
+# So: read BOTH, take the min, and NAME the surface that bound — a limit is not a number, it is a
+# number plus which view produced it. LIMIT of this, stated because it is real: an INTERMEDIATE
+# ancestor namespace that tightened its own limit appears in NEITHER view, so off-host the reported
+# limit is an UPPER bound. (On the host both views are the same ucount knob — writing either moves
+# both, which is exactly how the probe for this comment briefly dropped this node's live cap to 9.)
+FSN_HR_TIGHT="${MESH_FSN_HR_TIGHT:-50}"     # headroom % below which the axis reads TIGHT
+FSN_HR_CRIT="${MESH_FSN_HR_CRIT:-20}"       # ... CRITICAL
+FSN_HR_SAT="${MESH_FSN_HR_SAT:-5}"          # ... SATURATED
+
+# fsn_band <used> <limit> → "<BAND> <headroom-pct>". Either input n/a (empty or non-numeric) →
+# "UNKNOWN n/a": a missing measurement is a claim about the READ, never a headroom of 100.
+fsn_band() {
+  local u="${1:-}" l="${2:-}" hr
+  case "$u" in ''|*[!0-9]*) printf 'UNKNOWN n/a\n'; return 0 ;; esac
+  case "$l" in ''|*[!0-9]*) printf 'UNKNOWN n/a\n'; return 0 ;; esac
+  [ "$l" -le 0 ] && { printf 'UNKNOWN n/a\n'; return 0; }
+  hr=$(( (l - u) * 100 / l ))
+  [ "$hr" -lt 0 ] && hr=0
+  if   [ "$hr" -lt "$FSN_HR_SAT" ];   then printf 'SATURATED %s\n' "$hr"
+  elif [ "$hr" -lt "$FSN_HR_CRIT" ];  then printf 'CRITICAL %s\n'  "$hr"
+  elif [ "$hr" -lt "$FSN_HR_TIGHT" ]; then printf 'TIGHT %s\n'     "$hr"
+  else                                     printf 'OK %s\n'        "$hr"; fi
+}
+
+# fsn_limit <fs-view-path> <ucount-view-path> → sets FSN_LIM (effective = min of the readable
+# views, "" when neither reads) and FSN_SURF (which view bound: both|fs|userns|fs-only|userns-only|
+# n/a). Globals, not stdout: the pair must travel together — a bare number here is the trap above.
+FSN_LIM=""; FSN_SURF=""
+fsn_limit() {
+  local a b
+  a="$(cat "$1" 2>/dev/null)"; b="$(cat "$2" 2>/dev/null)"
+  case "$a" in ''|*[!0-9]*) a="" ;; esac
+  case "$b" in ''|*[!0-9]*) b="" ;; esac
+  if [ -n "$a" ] && [ -n "$b" ]; then
+    if   [ "$b" -lt "$a" ]; then FSN_LIM="$b"; FSN_SURF="userns"   # this ns tightened it
+    elif [ "$b" -gt "$a" ]; then FSN_LIM="$a"; FSN_SURF="fs"       # this ns is loose; ancestor binds
+    else                         FSN_LIM="$a"; FSN_SURF="both"; fi
+  elif [ -n "$a" ]; then FSN_LIM="$a"; FSN_SURF="fs-only"
+  elif [ -n "$b" ]; then FSN_LIM="$b"; FSN_SURF="userns-only"
+  else                   FSN_LIM="";   FSN_SURF="n/a"; fi
+}
+
+# The /proc walk, as a string so the identical code can run direct OR under `sudo -n` for root.
+# Emits one JSON object for the requested uid. Distinguishes EACCES (unreadable → n/a-bearing) from
+# ESRCH/ENOENT (the process exited mid-walk → not counted, not an error).
+FSN_SCAN_PY='
+import os, sys, json
+from collections import Counter
+want = int(sys.argv[1])
+# optional comm filter: count only processes whose comm matches. The gate needs an EXACT +1 against
+# a node where claude/chrome open and close inotify fds constantly; a comm-scoped count is immune to
+# that churn, where a uid-wide delta would be flaky.
+only = sys.argv[2] if len(sys.argv) > 2 else None
+inst = watch = grp = mark = 0
+procs = unread = fdinfo_unread = 0
+hold = {"inotify_instances":Counter(),"inotify_watches":Counter(),
+        "fanotify_groups":Counter(),"fanotify_marks":Counter()}
+for pid in os.listdir("/proc"):
+    if not pid.isdigit(): continue
+    try:
+        if os.stat("/proc/"+pid).st_uid != want: continue
+    except OSError:
+        continue                      # gone mid-walk: not ours to count, not an unreadable
+    procs += 1
+    try:
+        comm = open("/proc/%s/comm"%pid).read().strip()
+    except OSError:
+        comm = "?"
+    if only is not None and comm != only:
+        procs -= 1; continue
+    d = "/proc/%s/fd"%pid
+    try:
+        fds = os.listdir(d)
+    except PermissionError:
+        unread += 1; continue
+    except OSError:
+        continue                      # exited between stat and listdir
+    for fd in fds:
+        try:
+            tgt = os.readlink(d+"/"+fd)
+        except OSError:
+            continue
+        if tgt == "anon_inode:inotify":   kind = "i"
+        elif "fanotify" in tgt:           kind = "f"
+        else:                             continue
+        try:
+            info = open("/proc/%s/fdinfo/%s"%(pid,fd)).read()
+        except OSError:
+            info = None; fdinfo_unread += 1
+        if kind == "i":
+            inst += 1; hold["inotify_instances"][comm] += 1
+            if info is not None:
+                w = sum(1 for ln in info.splitlines() if ln.startswith("inotify "))
+                watch += w; hold["inotify_watches"][comm] += w
+        else:
+            grp += 1; hold["fanotify_groups"][comm] += 1
+            if info is not None:
+                m = sum(1 for ln in info.splitlines() if ln.startswith("fanotify "))
+                mark += m; hold["fanotify_marks"][comm] += m
+readable = procs - unread
+out = {"uid":want,"procs":procs,"unreadable":unread,"fdinfo_unreadable":fdinfo_unread,
+       "inotify_instances":inst,"inotify_watches":watch,
+       "fanotify_groups":grp,"fanotify_marks":mark,
+       "holders":{k:v.most_common(3) for k,v in hold.items()}}
+if procs and not readable:            # every process of this uid opaque → a count would be fiction
+    for k in ("inotify_instances","inotify_watches","fanotify_groups","fanotify_marks"):
+        out[k] = None
+print(json.dumps(out, separators=(",",":")))
+'
+
+if [ "${1:-}" = --caps ]; then
+  shift
+  JSON=0; NOSUDO=0; UIDS=""; COMM=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json)    JSON=1; shift ;;
+      --no-sudo) NOSUDO=1; shift ;;
+      --uid)     UIDS="$UIDS ${2:?}"; shift 2 ;;
+      --comm)    COMM="${2:?}"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  # sysctl roots are overridable ONLY so the gate can drive the absent-sysctl and two-surface paths;
+  # the scan itself always walks the real /proc (a faked /proc would make the count fiction, not a
+  # fixture).
+  SCTL="${MESH_FSN_SYSCTL_ROOT:-/proc/sys/fs}"
+  UCNT="${MESH_FSN_UCOUNT_ROOT:-/proc/sys/user}"
+  fsn_limit "$SCTL/inotify/max_user_instances" "$UCNT/max_inotify_instances"
+  lim_i_inst="$FSN_LIM"; srf_i_inst="$FSN_SURF"
+  fsn_limit "$SCTL/inotify/max_user_watches"   "$UCNT/max_inotify_watches"
+  lim_i_watch="$FSN_LIM"; srf_i_watch="$FSN_SURF"
+  fsn_limit "$SCTL/fanotify/max_user_groups"   "$UCNT/max_fanotify_groups"
+  lim_f_grp="$FSN_LIM"; srf_f_grp="$FSN_SURF"
+  fsn_limit "$SCTL/fanotify/max_user_marks"    "$UCNT/max_fanotify_marks"
+  lim_f_mark="$FSN_LIM"; srf_f_mark="$FSN_SURF"
+  [ -n "$lim_i_inst$lim_i_watch$lim_f_grp$lim_f_mark" ] || {
+    echo "mesh-fsnotify --caps: n/a — neither cap surface readable on this kernel ($SCTL/{inotify,fanotify}, $UCNT)"; exit 2; }
+  self_uid="$(id -u)"
+  [ -n "$UIDS" ] || UIDS="$self_uid 0"
+  rows=""; self_row=""
+  for u in $UIDS; do
+    if [ "$u" = "$self_uid" ]; then
+      row="$(python3 -c "$FSN_SCAN_PY" "$u" $COMM 2>/dev/null)"; how="direct"; self_row="$row"
+    elif [ "$self_uid" = 0 ]; then
+      row="$(python3 -c "$FSN_SCAN_PY" "$u" $COMM 2>/dev/null)"; how="direct(root)"
+    elif [ "$NOSUDO" = 0 ] && sudo -n true 2>/dev/null; then
+      row="$(sudo -n python3 -c "$FSN_SCAN_PY" "$u" $COMM 2>/dev/null)"; how="sudo -n"
+    else
+      row=""; how="n/a"
+    fi
+    if [ -z "$row" ]; then
+      # NEVER 0 here: another uid's /proc is opaque to us, which is a fact about the READ.
+      why="uid $u is not us and $( [ "$NOSUDO" = 1 ] && echo 'sudo was declined (--no-sudo)' || echo 'sudo -n is unavailable' ) — its /proc/*/fd are unreadable"
+      [ "$JSON" = 1 ] && rows="$rows{\"uid\":$u,\"read\":\"n/a\",\"why\":\"$why\"}
+" \
+                      || rows="$rows  uid $u: n/a — $why (a 0 here would be a fabricated all-clear; fanotify groups armed as root by mesh-fswriter live in exactly this blind spot)
+"
+      continue
+    fi
+    if [ "$JSON" = 1 ]; then
+      rows="$rows$(printf '%s' "$row" | python3 -c 'import sys,json; d=json.load(sys.stdin); d["read"]=sys.argv[1]; print(json.dumps(d,separators=(",",":")))' "$how")
+"
+      continue
+    fi
+    # text render: one line per cap, band on HEADROOM
+    rows="$rows$(printf '%s' "$row" | \
+      LIM_I="$lim_i_inst" LIM_W="$lim_i_watch" LIM_G="$lim_f_grp" LIM_M="$lim_f_mark" HOW="$how" \
+      python3 -c '
+import sys, json, os
+d = json.load(sys.stdin)
+lim = {"inotify_instances":os.environ["LIM_I"],"inotify_watches":os.environ["LIM_W"],
+       "fanotify_groups":os.environ["LIM_G"],"fanotify_marks":os.environ["LIM_M"]}
+part = d["unreadable"] > 0
+head = "  uid %d (%s): %d proc(s), %d unreadable, %d fdinfo unreadable" % (
+        d["uid"], os.environ["HOW"], d["procs"], d["unreadable"], d["fdinfo_unreadable"])
+print(head)
+for k in ("inotify_instances","inotify_watches","fanotify_groups","fanotify_marks"):
+    u = d[k]; L = lim[k]
+    hold = ", ".join("%s:%d" % (c, n) for c, n in d["holders"][k]) or "-"
+    if u is None:
+        print("    %-20s n/a (every process of this uid unreadable) limit=%s" % (k, L or "n/a"))
+        continue
+    print("    %-20s %s%d / %s  holders[%s]%s" % (
+        k, "≥" if part else "", u, L or "n/a", hold,
+        "  (partial — headroom is an UPPER bound)" if part else ""))
+' )
+"
+  done
+  if [ "$JSON" = 1 ]; then
+    # limits FIRST and each with its surface: a used-count with no denominator is not a saturation
+    # reading, and a denominator with no surface is the two-view trap in machine-readable form.
+    printf '{"limits":{"inotify_instances":%s,"inotify_watches":%s,"fanotify_groups":%s,"fanotify_marks":%s},"surfaces":{"inotify_instances":"%s","inotify_watches":"%s","fanotify_groups":"%s","fanotify_marks":"%s"}}\n' \
+      "${lim_i_inst:-null}" "${lim_i_watch:-null}" "${lim_f_grp:-null}" "${lim_f_mark:-null}" \
+      "$srf_i_inst" "$srf_i_watch" "$srf_f_grp" "$srf_f_mark"
+    printf '%s' "$rows"
+  else
+    printf 'mesh-fsnotify --caps — per-UID fsnotify budgets (limits are per-node tunable; band on HEADROOM)\n'
+    printf '  limits: inotify.instances=%s[%s] watches=%s[%s] · fanotify.groups=%s[%s] marks=%s[%s]\n' \
+      "${lim_i_inst:-n/a}" "$srf_i_inst" "${lim_i_watch:-n/a}" "$srf_i_watch" \
+      "${lim_f_grp:-n/a}" "$srf_f_grp" "${lim_f_mark:-n/a}" "$srf_f_mark"
+    # the surface tag is only silent when BOTH views agree everywhere — the moment they diverge the
+    # reader is told which one bound and why the other cannot be trusted alone.
+    case "$srf_i_inst$srf_i_watch$srf_f_grp$srf_f_mark" in
+      bothbothbothboth) : ;;
+      *) printf '  surfaces disagree — effective = min(fs %s, userns %s); a userns view can read 2147483647 while the ancestor cap still binds, and a tightened userns is invisible to fs\n' "$SCTL" "$UCNT" ;;
+    esac
+    printf '%s' "$rows"
+    # band summary over the invoking uid's own row (the one budget we can always read). REUSES the
+    # row rendered above — a second walk would be a second sample, and the band would then describe a
+    # different instant than the holders line it sits under.
+    own="${self_row:-}"
+    for pair in "inotify_instances $lim_i_inst" "inotify_watches $lim_i_watch" \
+                "fanotify_groups $lim_f_grp" "fanotify_marks $lim_f_mark"; do
+      set -- $pair
+      v="$(printf '%s' "$own" | python3 -c 'import sys,json;d=json.load(sys.stdin);x=d[sys.argv[1]];print("" if x is None else x)' "$1" 2>/dev/null)"
+      printf '  band %-20s %s\n' "$1" "$(fsn_band "$v" "$2")"
+    done
+  fi
+  exit 0
+fi
 
 if [ "${1:-}" = --test ]; then
   command -v inotifywait >/dev/null 2>&1 || { echo "smoke-test: n/a (no inotifywait — install inotify-tools)"; exit 2; }
@@ -53,8 +322,56 @@ if [ "${1:-}" = --test ]; then
   MESH_FSNOTIFY_LOCK="$T/l4" "$0" --window 4 --debounce 0 "$tgt" -- true >/dev/null; _rc2=$?
   _dt=$(( $(date +%s) - _t0 )); wait
   { [ "$_rc2" = 0 ] && [ "$_dt" -le 1 ]; } || { echo "  FAIL: second listener on a held lock must exit 0 immediately (rc=$_rc2 took ${_dt}s)"; f=1; }
+  # ── --caps legs ────────────────────────────────────────────────────────────────────────────────
+  # leg 5 — the DERIVATION, asserted against a KNOWN allocation. There is no kernel usage counter,
+  # so the whole sense rests on the /proc walk being a real measurement: spawn ONE inotifywait,
+  # assert the comm-scoped count rises by exactly 1, kill it, assert it falls back. Deliberately
+  # NOT an allocation test against the cap — opening 128 instances to prove the limit binds would
+  # break every other watcher on this node while the gate ran. The comm scope is load-bearing: a
+  # uid-wide delta is flaky here because the claude fleet opens and closes inotify fds constantly.
+  _c(){ "$0" --caps --json --no-sudo --uid "$(id -u)" --comm inotifywait 2>/dev/null | tail -n1 \
+        | python3 -c 'import sys,json;d=json.load(sys.stdin);print("" if d["inotify_instances"] is None else d["inotify_instances"])' 2>/dev/null; }
+  base="$(_c)"
+  if [ -z "$base" ]; then
+    echo "  FAIL: --caps produced no inotify_instances count for our own uid"; f=1
+  else
+    inotifywait -qq -t 8 -e modify "$tgt" >/dev/null 2>&1 & _w=$!
+    sleep 1; during="$(_c)"; kill "$_w" 2>/dev/null; wait "$_w" 2>/dev/null; sleep 0.5; after="$(_c)"
+    { [ "$during" = "$((base+1))" ] && [ "$after" = "$base" ]; } || {
+      echo "  FAIL: --caps must track a real allocation: base=$base during=$during after=$after (want N, N+1, N)"; f=1; }
+  fi
+  # leg 6 — an unreadable uid renders n/a, NEVER 0 (a 0 on a saturation axis is a fabricated
+  # all-clear, and root's fanotify groups — where mesh-fswriter's listener lives — are exactly that
+  # blind spot). Falsify: default the row to 0 instead of the n/a branch.
+  _other=0; [ "$(id -u)" = 0 ] && _other=1000
+  _o="$("$0" --caps --no-sudo --uid "$_other" 2>/dev/null)"
+  case "$_o" in *"uid $_other: n/a"*) : ;;
+    *) echo "  FAIL: an unreadable uid must render n/a with a reason, never 0 (got: $_o)"; f=1 ;; esac
+  # leg 7 — TWO SURFACES, effective = min, both directions. Fixtures are the two real readings:
+  # a fresh userns publishes 2147483647 while the ancestor's 128 still binds (must NOT override),
+  # and a userns that tightened its own budget to 8 must bind OVER the fs view's 128 — with ~20
+  # instances live on this node, that fixture has to come out SATURATED, not 94% free.
+  # Falsify: drop the min() (use the fs view alone) → the tightened fixture reads 128 and OK.
+  mkdir -p "$T/s/inotify" "$T/s/fanotify" "$T/u"
+  echo 128    > "$T/s/inotify/max_user_instances"; echo 249173 > "$T/s/inotify/max_user_watches"
+  echo 128    > "$T/s/fanotify/max_user_groups";   echo 264943 > "$T/s/fanotify/max_user_marks"
+  echo 2147483647 > "$T/u/max_inotify_instances";  echo 249173 > "$T/u/max_inotify_watches"
+  echo 2147483647 > "$T/u/max_fanotify_groups";    echo 264943 > "$T/u/max_fanotify_marks"
+  _o1="$(MESH_FSN_SYSCTL_ROOT="$T/s" MESH_FSN_UCOUNT_ROOT="$T/u" "$0" --caps --no-sudo --uid "$(id -u)" 2>/dev/null)"
+  case "$_o1" in *"inotify.instances=128[fs]"*) : ;;
+    *) echo "  FAIL: a 2147483647 userns view must not override the ancestor's 128 (got: $(printf '%s' "$_o1" | sed -n 2p))"; f=1 ;; esac
+  echo 8 > "$T/u/max_inotify_instances"
+  _o2="$(MESH_FSN_SYSCTL_ROOT="$T/s" MESH_FSN_UCOUNT_ROOT="$T/u" "$0" --caps --no-sudo --uid "$(id -u)" 2>/dev/null)"
+  case "$_o2" in *"inotify.instances=8[userns]"*) : ;;
+    *) echo "  FAIL: a TIGHTER userns limit (8) must bind over the fs view's 128 (got: $(printf '%s' "$_o2" | sed -n 2p))"; f=1 ;; esac
+  printf '%s' "$_o2" | grep -q '^  band inotify_instances  *SATURATED' || {
+    echo "  FAIL: this uid's live instance count over a limit of 8 must band SATURATED (got: $(printf '%s' "$_o2" | grep 'band inotify_instances'))"; f=1; }
+  # leg 8 — neither surface readable → honest exit 2 (n/a), never a limit invented from a default.
+  mkdir -p "$T/none"
+  MESH_FSN_SYSCTL_ROOT="$T/none" MESH_FSN_UCOUNT_ROOT="$T/none" "$0" --caps >/dev/null 2>&1; _rc8=$?
+  [ "$_rc8" = 2 ] || { echo "  FAIL: absent cap sysctls must exit 2 (n/a), got rc=$_rc8"; f=1; }
   [ "$f" = 0 ] || { echo "smoke-test: FAIL (see asserts above)"; exit 1; }
-  echo "smoke-test: ok (event fires cmd + 5-write burst coalesces to 1 + silent window runs nothing rc0 + held lock exits immediately)"; exit 0
+  echo "smoke-test: ok (event fires cmd + 5-write burst coalesces to 1 + silent window runs nothing rc0 + held lock exits immediately + --caps counts a real +1/-1 allocation + unreadable uid n/a not 0 + effective limit = min(fs,userns) both directions + no surface exits 2)"; exit 0
 fi
 
 WINDOW=290; DEBOUNCE=4
