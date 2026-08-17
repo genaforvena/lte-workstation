@@ -39,6 +39,13 @@ COOLER_T="${MESH_CARE_COOLER_TEMP:-80}"   # hot threshold for the dead-cooler ch
 COOLER_L="${MESH_CARE_COOLER_LOAD:-0.40}" # norm-load BELOW which hot=cooler-fault (not load-heat)
 DISK_MAX="${MESH_CARE_DISK_MAX:-90}"
 MEM_MAX="${MESH_CARE_MEM_MAX:-92}"
+# TWO DIFFERENT BUDGETS, deliberately not one. PROBE_T caps the liveness read that runs every 5 min
+# for every node — polled, so it stays tight. RECOV_T caps the forensic RECOVERY CAPTURE, which
+# fires at most once per node per freeze and is the only record that event will ever have; paying
+# 60s once is not the same kind of cost. They were 12 and 14 — near-identical, and the 14 severed
+# 2 of 15 real phaedra captures.
+PROBE_T="${MESH_CARE_PROBE_TIMEOUT:-12}"
+RECOV_T="${MESH_CARE_RECOVERY_TIMEOUT:-60}"
 
 ts() { date -u +%Y-%m-%dT%H:%MZ; }
 
@@ -55,9 +62,15 @@ ts() { date -u +%Y-%m-%dT%H:%MZ; }
 # mesh-hw-fault-watch (`sudo -n dmesg` + an explicit BLIND path); mesh-heartbeat:72 documents the
 # same dmesg_restrict emptiness. UNREADABLE and HOLLOW are DISTINCT: refused-read vs a genuinely
 # empty ring are different facts about the node and must not collapse into one blank section.
+# ORDER MATTERS: uptime (free) → dmesg (a ring read, cheap and bounded) → journalctl -b -1 (a disk
+# journal walk, the expensive and unbounded one). The whole grab is under a wall-clock cap, so
+# whatever runs LAST is what a truncation eats — and the kernel ring is the evidence this block
+# exists to collect. Measured: 2 of 15 phaedra captures (2026-07-15 01:40Z/10:20Z) end immediately
+# after the '-- prev-boot errors --' heading with BOTH dmesg headings absent, i.e. the old order
+# spent the budget on the journal and lost the ring. Ends with a COMPLETION SENTINEL so truncation
+# is detected from the artifact itself, not inferred from an exit code that may not survive the pipe.
 recovery_payload() { cat <<'RPAYLOAD'
 echo "-- uptime --"; uptime
-echo "-- prev-boot errors --"; journalctl -b -1 -p err --no-pager 2>/dev/null | tail -40
 DM=""; DMESG_OUT=""; DMESG_ERR=""
 if dmesg >/dev/null 2>&1; then DM="dmesg"; DMESG_OUT="$(dmesg 2>/dev/null)"
 elif sudo -n dmesg >/dev/null 2>&1; then DM="sudo -n dmesg"; DMESG_OUT="$(sudo -n dmesg 2>/dev/null)"
@@ -67,7 +80,7 @@ if [ -z "$DM" ]; then
   echo "-- dmesg: UNREADABLE (dmesg_restrict / no sudo -n) — ABSENCE OF EVIDENCE, NOT EVIDENCE OF ABSENCE --"
   echo "   reader error: ${DMESG_ERR:-(dmesg absent or produced no error text)}"
   echo "   the kernel ring was NOT captured — do not read this as 'no kernel cause'. Use the"
-  echo "   prev-boot journalctl section above, and re-grab with: sudo dmesg (or set dmesg_restrict=0)."
+  echo "   prev-boot journalctl section below, and re-grab with: sudo dmesg (or set dmesg_restrict=0)."
 elif [ -z "$DMESG_OUT" ]; then
   echo "-- dmesg: HOLLOW (read via '$DM' SUCCEEDED, ring is genuinely EMPTY) --"
   echo "   this is a real read of an empty buffer, not a refused one."
@@ -77,7 +90,21 @@ else
   echo "-- dmesg full tail (read via '$DM') (do NOT pre-filter: a narrow thermal grep hid the ds wifi/bt-module fault, 2026-06-24) --"
   printf '%s\n' "$DMESG_OUT" | tail -80
 fi
+echo "-- prev-boot errors --"; journalctl -b -1 -p err --no-pager 2>/dev/null | tail -40
+echo "-- CAPTURE COMPLETE --"
 RPAYLOAD
+}
+
+# Completeness verdict for one capture → echoes the marker to append ("" = complete). Read off the
+# ARTIFACT (the sentinel); the rc only NAMES the cause. rc alone is the weaker test — the outer
+# 2>/dev/null eats ssh's "Killed by signal" notice, and a stream severed mid-flight can still exit 0.
+capture_verdict() { # $1=capture file  $2=ssh rc  $3=addr
+  grep -q '^-- CAPTURE COMPLETE --$' "$1" 2>/dev/null && return 0
+  case "$2" in
+    124) echo "-- CAPTURE TRUNCATED: ssh killed by the ${RECOV_T}s cap before the grab finished. Evidence above is PARTIAL — this is NOT 'no kernel cause found'. Re-grab by hand: ssh $3 'sudo dmesg | tail -200'. --" ;;
+    0)   echo "-- CAPTURE TRUNCATED: stream ended without the completion sentinel although ssh exited 0 (connection dropped mid-stream). PARTIAL — absence below is not evidence of absence. --" ;;
+    *)   echo "-- CAPTURE FAILED: ssh to $3 exited rc=$2 (connect/auth/link) — NO kernel evidence was collected for this recovery. --" ;;
+  esac
 }
 
 # Pure classifier — dry-runnable by --test (the decision boundary is the tool's reason to exist).
@@ -281,9 +308,36 @@ if [ "${1:-}" = "--test" ]; then
   case "$_rp" in *"read via 'dmesg'"*) ;; *) echo "FAIL rpayload-plain-reader (an unrestricted node must use bare dmesg)"; fail=1 ;; esac
   case "$_rp" in *"critical temperature"*) ;; *) echo "FAIL rpayload-plain-filter (the error filter must still surface a thermal hit)"; fail=1 ;; esac
   case "$_rp" in *"benign chatter"*) ;; *) echo "FAIL rpayload-plain-fulltail (the unfiltered tail must still carry non-matching lines — the 2026-06-24 lesson)"; fail=1 ;; esac
+  # ORDER: the ring must be collected BEFORE the journal walk, so a truncation eats the expensive
+  # unbounded read and not the evidence this block exists for (the 2026-07-15 loss shape).
+  _rp="$(_rp_run)"
+  _dl="$(printf '%s\n' "$_rp" | grep -n '^-- dmesg' | head -1 | cut -d: -f1)"
+  _jl="$(printf '%s\n' "$_rp" | grep -n '^-- prev-boot errors' | head -1 | cut -d: -f1)"
+  [ -n "$_dl" ] && [ -n "$_jl" ] && [ "$_dl" -lt "$_jl" ] \
+    || { echo "FAIL rpayload-order (dmesg must precede journalctl -b -1: a truncation eats whatever runs last)"; fail=1; }
+  case "$_rp" in *"-- CAPTURE COMPLETE --"*) ;; *) echo "FAIL rpayload-sentinel (a finished grab must end with the completion sentinel)"; fail=1 ;; esac
   rm -rf "$_rpd"
 
-  [ "$fail" = 0 ] && echo "mesh-node-care --test: OK (6 boundary + 6 hysteresis + 83<->86 flap + 5 cooling-load-gate + 5 local-label + 6 outdoor-forensics + 5 link-bracket + 9 recovery-payload asserts pass)" && exit 0
+  # CAPTURE COMPLETENESS verdict (node-care-recovery-capture-silently-truncates-under-load).
+  # Reproduces the two real 2026-07-15 losses: a file that ends after a heading, with no sentinel.
+  _cv="$(mktemp)"
+  printf -- '-- uptime --\n 01:40:11 up 32 days, load average: 7.64\n-- prev-boot errors --\n' > "$_cv"
+  [ -n "$(capture_verdict "$_cv" 124 peer)" ] || { echo "FAIL cv-truncated-silent (a sentinel-less capture killed by the cap must NOT verdict complete)"; fail=1; }
+  case "$(capture_verdict "$_cv" 124 peer)" in *TRUNCATED*"is NOT 'no kernel cause found'"*) ;; *) echo "FAIL cv-truncated-wording (the marker must forbid reading absence as absence of cause)"; fail=1 ;; esac
+  case "$(capture_verdict "$_cv" 255 peer)" in *"CAPTURE FAILED"*rc=255*) ;; *) echo "FAIL cv-failed (a dead ssh must be named FAILED with its rc, not TRUNCATED)"; fail=1 ;; esac
+  # rc=0 with no sentinel = severed mid-stream: rc alone would call this a clean capture
+  case "$(capture_verdict "$_cv" 0 peer)" in *TRUNCATED*"exited 0"*) ;; *) echo "FAIL cv-rc0-severed (sentinel-less + rc=0 must still be TRUNCATED — rc is the weaker test)"; fail=1 ;; esac
+  # a COMPLETE capture verdicts clean and stays silent
+  printf -- '-- uptime --\n-- dmesg full tail --\nx\n-- prev-boot errors --\n-- CAPTURE COMPLETE --\n' > "$_cv"
+  [ -z "$(capture_verdict "$_cv" 0 peer)" ] || { echo "FAIL cv-complete (a sentinel-terminated capture must verdict clean)"; fail=1; }
+  rm -f "$_cv"
+  # The forensic grab and the 5-min liveness probe are DIFFERENT budgets and must not be collapsed:
+  # the probe is polled (stay tight), the capture fires once per freeze and is the only forensic
+  # record that event will ever have. Asserted as a relationship, not a magic number.
+  [ "$RECOV_T" -gt "$PROBE_T" ] \
+    || { echo "FAIL recov-budget (the once-per-freeze capture cap ${RECOV_T}s must exceed the polled probe's ${PROBE_T}s)"; fail=1; }
+
+  [ "$fail" = 0 ] && echo "mesh-node-care --test: OK (6 boundary + 6 hysteresis + 83<->86 flap + 5 cooling-load-gate + 5 local-label + 6 outdoor-forensics + 5 link-bracket + 18 recovery-capture asserts pass)" && exit 0
   echo "mesh-node-care --test: FAIL" && exit 1
 fi
 
@@ -307,7 +361,7 @@ for entry in $NODES; do
   if [ "$addr" = "local" ]; then
     read -r maxt load np disk mem up < <(bash -c "$PROBE" 2>/dev/null)
   else
-    read -r maxt load np disk mem up < <(timeout 12 ssh -o BatchMode=yes -o ConnectTimeout=6 -o StrictHostKeyChecking=no "$addr" "$PROBE" 2>/dev/null)
+    read -r maxt load np disk mem up < <(timeout "$PROBE_T" ssh -o BatchMode=yes -o ConnectTimeout=6 -o StrictHostKeyChecking=no "$addr" "$PROBE" 2>/dev/null)
   fi
   # Read the prior COMMITTED verdict FIRST — it is the Schmitt-trigger memory the classifier needs
   # (hysteresis exit line depends on the state currently being emitted).
@@ -361,16 +415,29 @@ for entry in $NODES; do
     # crash/kernel-panic/overheat cause is caught even unattended (the ds-2026-06-17 freeze case).
     if [ "$committed" = UNREACHABLE ] && [ "$addr" != local ]; then
       rec="$STATEDIR/$label.recovery.log"
+      # The capture lands in a temp file FIRST so its completeness can be asserted before it is
+      # committed to $rec. Appending straight into $rec ('{ … } >> $rec') takes whatever arrived and
+      # can no longer tell a finished grab from a severed one — that is how 2 of 15 phaedra captures
+      # became silently-partial files that the board still announced as "kernel logs captured".
+      cap="$(mktemp)"; sshrc=0
+      timeout "$RECOV_T" ssh -o BatchMode=yes -o ConnectTimeout=6 -o StrictHostKeyChecking=no "$addr" \
+        "sh -s" <<< "$(recovery_payload)" > "$cap" 2>/dev/null || sshrc=$?
+      # Completeness is read off the ARTIFACT (the sentinel), with the rc only NAMING the cause —
+      # rc alone is the weaker test: the outer 2>/dev/null eats ssh's "Killed by signal" notice, and
+      # a connection severed mid-stream can still exit 0.
+      note="$(capture_verdict "$cap" "$sshrc" "$addr")"
       { echo "==== $(ts) $label recovered ($committed -> $newc) ===="
-        sshrc=0
-        timeout 14 ssh -o BatchMode=yes -o ConnectTimeout=6 -o StrictHostKeyChecking=no "$addr" \
-          "sh -s" <<< "$(recovery_payload)" 2>/dev/null || sshrc=$?
-        # Same silent-fallback shape one level up: a dead ssh yields an empty capture that reads as
-        # "nothing was wrong". Name it rather than leaving the section blank.
-        [ "$sshrc" = 0 ] || echo "-- CAPTURE INCOMPLETE: ssh to $addr exited rc=$sshrc (timeout/auth/link) — sections above may be truncated or absent --"
+        cat "$cap"
+        [ -n "$note" ] && echo "$note"
       } >> "$rec"
+      rm -f "$cap"
+      # The board line must carry the same verdict as the file. Telling a steward "kernel logs
+      # captured (diagnose)" over a severed capture is the silence one level up: they open it, find
+      # no kernel section, and read that as a clean node.
+      if [ -z "$note" ]; then bmsg="kernel logs captured to $rec (steward: diagnose)"
+      else bmsg="capture INCOMPLETE — ${note#-- }; partial file at $rec (steward: re-grab by hand before concluding)"; fi
       command -v mesh-chat >/dev/null 2>&1 && MESH_WHO="node-care@$(hostname)" \
-        mesh-chat "[node-recovered] $label back after freeze — kernel logs captured to $rec (steward: diagnose)" >/dev/null 2>&1
+        mesh-chat "[node-recovered] $label back after freeze — $bmsg" >/dev/null 2>&1
     fi
   fi
 done
