@@ -1,6 +1,25 @@
 #!/usr/bin/env bash
 # reflex-cadence: 17 * * * *
-# mesh-kernel-taint — the kernel's own permanent fault LATCH, read from /proc/sys/kernel/tainted.
+# mesh-kernel-taint — the kernel's own fault record: the permanent LATCH (/proc/sys/kernel/tainted)
+# AND the two ACCUMULATORS beside it (/sys/kernel/warn_count, /sys/kernel/oops_count).
+#
+# THE LATCH SATURATES — that is why the accumulators are here (2026-08-17). A taint bit is a STICKY
+# BOOLEAN: TAINT_WARN is set by WARN #1 and is bit-identical at WARN #10000. On this node it latched on
+# day 1 of a 2.5-day uptime, so for the rest of that boot a WARN storm changed NOTHING in the only file
+# this tool read, and it kept printing OK. Same shape as a-senses-coverage-is-window-over-cadence:
+# prefer the kernel's own ACCUMULATOR, delta'd across the reflex interval, which covers 100% of it.
+# warn_count/oops_count landed in 6.2, are 0444 root:root, and read fine as an unprivileged uid — no
+# sudo. Corroborated on 6.8.0-137 the day they were wired in: warn_count 1 == exactly one "[ cut here ]"
+# in `journalctl -k -b`, oops_count 0 == zero "Oops:|kernel BUG at".
+#
+# THE COUNTER RULES (all three are guardrails against a fabricated calm):
+#   * Alarm on the DELTA across the interval, NEVER the absolute. The standing 1 is old news
+#     permanently; an absolute threshold would either shout forever or be baselined to silence.
+#   * The counters are BOOT-SCOPED, so a DECREASE is a REBOOT, never a heal. The boot_id already gates
+#     the mask baseline and gates these too.
+#   * A boot change, a first sample, or an unreadable counter renders the delta `na` — never 0. A
+#     reboot-reset counter read as 0 is a fabricated calm. The ABSOLUTE after a reboot is genuinely 0
+#     and is printed as such; it is the delta across the boundary that is unknowable.
 #
 # The kernel sets a taint bit when something happened that it will never forget: a machine check, a
 # bad page, a WARN_ON(), a CPU run out of spec, a module force-loaded. The bits are WRITE-ONCE — there
@@ -43,18 +62,24 @@
 # would be reported as a fault. The state file carries the boot_id, and a boot_id change re-baselines
 # instead of alarming.
 #
-# Verdicts: BASELINE (first sample this boot) · OK (mask unchanged) · LATCH (new bit(s) since the
-# baseline — the alarm, and it keeps reporting rather than firing once) · n/a (unreadable).
+# Verdicts, worst first — the fold NAMES its winner, and any other axis that also fired is listed in
+# `also=`, so nothing is effaced: OOPS (oops_count rose this interval) · LATCH (new taint bit) · WARNS
+# (warn_count rose) · BASELINE (first sample this boot / boot change) · OK (nothing moved) · n/a (the
+# taint file is unreadable — an unreadable COUNTER is not fatal, it renders na and the mask still
+# reports).
 set -uo pipefail
 export PATH="$HOME/.local/bin:$PATH"
 
 MESH="${MESH_DIR:-$HOME/.mesh}"
 TAINT_FILE="${MESH_TAINT_FILE:-/proc/sys/kernel/tainted}"
+WARN_FILE="${MESH_WARN_COUNT_FILE:-/sys/kernel/warn_count}"
+OOPS_FILE="${MESH_OOPS_COUNT_FILE:-/sys/kernel/oops_count}"
 BOOTID_FILE="${MESH_BOOTID_FILE:-/proc/sys/kernel/random/boot_id}"
 STATE="${MESH_TAINT_STATE:-$MESH/.kernel-taint-state}"
 LOG="${MESH_TAINT_LOG:-$MESH/kernel-taint.log}"
 HDR_GLOB="${MESH_TAINT_HDR_GLOB:-/usr/src/linux-headers-*/include/linux/panic.h}"
 POST_REFRESH="${MESH_TAINT_POST_REFRESH:-86400}"   # debounce the board post for a standing latch
+FAULT_POST_REFRESH="${MESH_TAINT_FAULT_POST_REFRESH:-3600}"  # counter-delta post: one per interval, at most
 
 # Pinned fallback table — verified 2026-08-15 against
 # /usr/src/linux-headers-6.8.0-137/include/linux/panic.h:57-75 on mesh-home. Used ONLY when no kernel
@@ -85,9 +110,21 @@ derive_table(){ # $1 = header path
   return 0
 }
 
+# load_table — prefer the header of the RUNNING kernel. The glob's shell sort is lexicographic, so a
+# node carrying both 6.8.0-136 and 6.8.0-137 headers derived from -136 while running -137. Bits are
+# stable across a point release so nothing was wrong, but a table derived from a kernel you are not
+# running is a claim about the wrong kernel; ordering costs three lines.
 load_table(){
-  local f
+  local f kr pref=() rest=()
+  kr="$(uname -r 2>/dev/null)" || kr=""
   for f in $HDR_GLOB; do
+    [ -r "$f" ] || continue
+    if [ -n "$kr" ]; then
+      case "$f" in *"$kr"*) pref+=("$f"); continue ;; esac
+    fi
+    rest+=("$f")
+  done
+  for f in ${pref[@]+"${pref[@]}"} ${rest[@]+"${rest[@]}"}; do
     if derive_table "$f"; then TABLE_SRC="derived($f)"; return 0; fi
   done
   TABLE=("${PINNED[@]}")
@@ -121,6 +158,32 @@ read_mask(){ # → mask on stdout, rc0; rc1 on any unreadable/unparseable read (
 
 read_bootid(){ local b; b="$(cat "$BOOTID_FILE" 2>/dev/null)" || b=""; printf '%s' "${b//[[:space:]]/}"; }
 
+# read_counter — a kernel accumulator (warn_count/oops_count) → integer on stdout, rc0. rc1 on any
+# unreadable/unparseable read and it NEVER prints 0: on a pre-6.2 kernel these files do not exist, and
+# a missing counter rendered as 0 is exactly the fabricated calm this tool exists to refuse.
+read_counter(){ # $1 = path
+  local v
+  [ -r "$1" ] || return 1
+  v="$(cat "$1" 2>/dev/null)" || return 1
+  v="${v//[[:space:]]/}"
+  case "$v" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s' "$v"
+}
+
+# cdelta <cur> <prev> <rebaselined> → the delta across the interval, or `na`.
+# `na` for: a rebaseline (first sample / boot change / corrupt state), an absent counter on either
+# side, or a DECREASE within one boot. These accumulators are monotone within a boot, so a decrease is
+# not a heal — it is a boot the boot_id somehow missed, or a hand-edited state file. Never negative,
+# never silently 0.
+cdelta(){ # $1 cur  $2 prev  $3 rebaselined(0|1)
+  local cur="$1" prev="$2" reb="$3"
+  [ "$reb" = 1 ] && { printf 'na'; return; }
+  case "$cur" in ''|na|*[!0-9]*) printf 'na'; return ;; esac
+  case "$prev" in ''|na|*[!0-9]*) printf 'na'; return ;; esac
+  [ "$cur" -lt "$prev" ] && { printf 'na'; return; }
+  printf '%s' $(( cur - prev ))
+}
+
 main(){
   load_table
   local mask bootid prev_mask="" prev_boot="" verdict new_bits="" names
@@ -129,56 +192,93 @@ main(){
     exit 2
   fi
   bootid="$(read_bootid)"
+  local warn oops prev_warn="" prev_oops="" d_warn d_oops reb=0 also=""
+  warn="$(read_counter "$WARN_FILE")" || warn="na"
+  oops="$(read_counter "$OOPS_FILE")" || oops="na"
   if [ -r "$STATE" ]; then
     # shellcheck disable=SC1090
     prev_mask="$(sed -nE 's/^MASK=([0-9]+).*/\1/p' "$STATE" 2>/dev/null)"
     prev_boot="$(sed -nE 's/^BOOT=(.*)$/\1/p' "$STATE" 2>/dev/null)"
+    prev_warn="$(sed -nE 's/^WARN=(.*)$/\1/p' "$STATE" 2>/dev/null)"
+    prev_oops="$(sed -nE 's/^OOPS=(.*)$/\1/p' "$STATE" 2>/dev/null)"
   fi
   case "$prev_mask" in ''|*[!0-9]*) prev_mask="" ;; esac
 
   if [ -z "$prev_mask" ] || [ "$prev_boot" != "$bootid" ]; then
-    verdict="BASELINE"
-  elif [ "$mask" = "$prev_mask" ]; then
-    verdict="OK"
+    verdict="BASELINE"; reb=1
   elif [ $(( mask & ~prev_mask )) -ne 0 ]; then
     verdict="LATCH"
     new_bits="$(decode $(( mask & ~prev_mask )))"
+  elif [ "$mask" = "$prev_mask" ]; then
+    verdict="OK"
   else
     # Bits vanished WITHIN a boot. The kernel has no clearing path, so this is not a kernel event —
     # it is a corrupt state file or a hand-edited baseline. Say which, do not report it as recovery.
-    verdict="BASELINE"
+    verdict="BASELINE"; reb=1
     new_bits=""
   fi
 
+  d_warn="$(cdelta "$warn" "$prev_warn" "$reb")"
+  d_oops="$(cdelta "$oops" "$prev_oops" "$reb")"
+
+  # Fold the two axes into ONE verdict that names its winner, and list every other axis that fired in
+  # `also=`. A first WARN of a boot moves BOTH (the W bit latches and warn_count increments) and the
+  # max must not efface either.
+  local fired=""
+  [ "$d_oops" != na ] && [ "$d_oops" -gt 0 ] 2>/dev/null && fired="$fired OOPS"
+  [ "$verdict" = LATCH ] && fired="$fired LATCH"
+  [ "$d_warn" != na ] && [ "$d_warn" -gt 0 ] 2>/dev/null && fired="$fired WARNS"
+  if [ -n "$fired" ]; then
+    verdict="${fired#* }"; verdict="${verdict%% *}"
+    also="$(printf '%s' "${fired# }" | tr ' ' ',')"
+    also="${also#"$verdict"}"; also="${also#,}"
+  fi
+
   names="$(decode "$mask")"; [ -n "$names" ] || names="none"
-  local line="TAINT=$mask|BITS=$names|$verdict table=$TABLE_SRC"
-  [ "$verdict" = "LATCH" ] && line="$line new=$new_bits baseline=$prev_mask"
+  local line="TAINT=$mask|BITS=$names|$verdict warn=$warn(+$d_warn) oops=$oops(+$d_oops) table=$TABLE_SRC"
+  case " $fired " in *" LATCH "*) line="$line new=$new_bits baseline=$prev_mask" ;; esac
+  [ -n "$also" ] && line="$line also=$also"
   echo "kernel-taint: $line"
 
   # State is written only when the mask or the boot changes; mtime is refreshed on EVERY successful
   # eval via mesh-state-touch, so the mtime-aging watchdogs read liveness while the content stays
   # change-gated (the liveness-touch convention — a taint mask that legitimately holds for months
   # would otherwise read as a dead reflex).
-  if [ "$mask" != "$prev_mask" ] || [ "$prev_boot" != "$bootid" ]; then
+  # The COUNTERS are part of the change gate: their baseline must advance every interval they move, or
+  # the next delta is measured against an ancient sample and the same rise reports forever.
+  if [ "$mask" != "$prev_mask" ] || [ "$prev_boot" != "$bootid" ] \
+     || [ "$warn" != "$prev_warn" ] || [ "$oops" != "$prev_oops" ]; then
     mkdir -p "$(dirname "$STATE")" 2>/dev/null || true
     { printf 'MASK=%s\n' "$mask"; printf 'BOOT=%s\n' "$bootid"
-      printf 'BITS=%s\n' "$names"; printf 'SINCE=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      printf 'BITS=%s\n' "$names"; printf 'WARN=%s\n' "$warn"; printf 'OOPS=%s\n' "$oops"
+      printf 'SINCE=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     } > "$STATE.tmp" 2>/dev/null && mv -f "$STATE.tmp" "$STATE" 2>/dev/null || true
     printf '%s  %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$line" >> "$LOG" 2>/dev/null || true
   fi
   command -v mesh-state-touch >/dev/null 2>&1 && mesh-state-touch "$STATE" >/dev/null 2>&1 || true
 
-  if [ "$verdict" = "LATCH" ]; then
-    local pstate="$MESH/.kernel-taint-posted" now last=0
+  # post_once <state-file> <refresh-seconds> <message> — debounce a board post per axis.
+  post_once(){
+    local pstate="$1" refresh="$2" msg="$3" now last=0
     now="$(date +%s)"
     [ -f "$pstate" ] && last="$(cat "$pstate" 2>/dev/null)"
     case "$last" in ''|*[!0-9]*) last=0 ;; esac
-    if [ $(( now - last )) -ge "$POST_REFRESH" ] && command -v mesh-chat >/dev/null 2>&1; then
-      MESH_WHO="kernel-taint@$(hostname)" mesh-chat "[fyi] kernel-taint: NEW LATCH on $(hostname) — the kernel set $new_bits (mask $prev_mask → $mask, $TABLE_SRC). Taint bits are write-once until reboot, so this is permanent for this boot and names something the kernel will never forget (a WARN_ON, a machine check, a bad page, a forced module). Not an outage by itself; it is the record that one happened." >/dev/null 2>&1 || true
-      echo "$now" > "$pstate" 2>/dev/null || true
-    fi
-    exit 1
-  fi
+    [ $(( now - last )) -ge "$refresh" ] || return 0
+    command -v mesh-chat >/dev/null 2>&1 || return 0
+    MESH_WHO="kernel-taint@$(hostname)" mesh-chat "$msg" >/dev/null 2>&1 || true
+    echo "$now" > "$pstate" 2>/dev/null || true
+  }
+
+  case " $fired " in *" LATCH "*)
+    post_once "$MESH/.kernel-taint-posted" "$POST_REFRESH" \
+      "[fyi] kernel-taint: NEW LATCH on $(hostname) — the kernel set $new_bits (mask $prev_mask → $mask, $TABLE_SRC). Taint bits are write-once until reboot, so this is permanent for this boot and names something the kernel will never forget (a WARN_ON, a machine check, a bad page, a forced module). Not an outage by itself; it is the record that one happened." ;;
+  esac
+  case " $fired " in *" OOPS "*|*" WARNS "*)
+    post_once "$MESH/.kernel-fault-posted" "$FAULT_POST_REFRESH" \
+      "[fyi] kernel-taint: kernel fault RATE on $(hostname) — warn_count +$d_warn (now $warn), oops_count +$d_oops (now $oops) since the last sample. The taint LATCH cannot show this: its W bit was already set, so a storm reads OK there forever. Deltas are boot-scoped; check 'journalctl -k -b | grep -A25 \"cut here\"' for the splat and its subsystem." ;;
+  esac
+
+  case " $fired " in *" OOPS "*|*" LATCH "*|*" WARNS "*) exit 1 ;; esac
   exit 0
 }
 
@@ -249,7 +349,9 @@ if [ "${1:-}" = --test ]; then
   # 5. BASELINE → OK → LATCH, all on a sandboxed fake sysctl. Note what is NOT done here: no bit is
   #    set on the running kernel at any point.
   printf '4096\n' > "$tmp/mask"; printf 'boot-aaa\n' > "$tmp/boot"
+  printf '0\n' > "$tmp/warn"; printf '0\n' > "$tmp/oops"
   run(){ MESH_TAINT_FILE="$tmp/mask" MESH_BOOTID_FILE="$tmp/boot" MESH_TAINT_STATE="$tmp/st" \
+         MESH_WARN_COUNT_FILE="$tmp/warn" MESH_OOPS_COUNT_FILE="$tmp/oops" \
          MESH_TAINT_LOG="$tmp/lg" MESH_DIR="$tmp" "$0" 2>&1; }
   o1="$(run)"; r1=$?
   case "$o1" in *BASELINE*) : ;; *) echo "test: first sample must be BASELINE, got '$o1' FAIL"; e=1 ;; esac
@@ -280,13 +382,76 @@ if [ "${1:-}" = --test ]; then
   o6="$(run)"
   case "$o6" in *BASELINE*) : ;; *) echo "test: bits vanishing within one boot must re-baseline, got '$o6' FAIL"; e=1 ;; esac
 
-  # 7. THE LIVE READ — a real, unprivileged read of this node's own sysctl, asserted separately from
-  #    the decoder. Without this the whole test is a decoder unit-test that never touches a kernel.
+  # 6b. THE ACCUMULATORS — the axis the LATCH is structurally blind to. Every leg here is about a
+  #     delta that must NOT be fabricated as 0.
+  #     First: a baseline sample must render the delta `na`, never +0. The absolute IS printed (a
+  #     freshly-booted 0 is a real read); it is the delta across the boundary that is unknowable.
+  printf '4096\n' > "$tmp/mask"; printf 'boot-ccc\n' > "$tmp/boot"
+  printf '7\n' > "$tmp/warn"; printf '0\n' > "$tmp/oops"
+  c1="$(run)"
+  case "$c1" in *"warn=7(+na)"*) : ;; *) echo "test: a BASELINE sample must render the warn delta na, got '$c1' FAIL"; e=1 ;; esac
+  case "$c1" in *"oops=0(+na)"*) : ;; *) echo "test: a BASELINE sample must render the oops delta na (a +0 here is a fabricated calm), got '$c1' FAIL"; e=1 ;; esac
+  #     Unchanged counters → +0 and OK. This is the only place +0 is honest: two real reads, same boot.
+  c2="$(run)"; rc2=$?
+  case "$c2" in *"|OK "*"warn=7(+0)"*"oops=0(+0)"*) : ;; *) echo "test: unchanged counters must read +0 and OK, got '$c2' FAIL"; e=1 ;; esac
+  [ "$rc2" = 0 ] || { echo "test: unchanged counters must exit 0, got $rc2 FAIL"; e=1; }
+  #     A WARN STORM with the taint mask FROZEN — the exact blindness this axis was added for. The
+  #     mask does not move (W was latched long ago), so the old tool said OK; the counter says +5.
+  printf '12\n' > "$tmp/warn"
+  c3="$(run)"; rc3=$?
+  case "$c3" in *"|WARNS "*) : ;; *) echo "test: a warn_count rise with a FROZEN mask must render WARNS (the saturated-latch blindness), got '$c3' FAIL"; e=1 ;; esac
+  case "$c3" in *"warn=12(+5)"*) : ;; *) echo "test: WARNS must NAME the delta (+5), got '$c3' FAIL"; e=1 ;; esac
+  case "$c3" in *TAINT=4096*) : ;; *) echo "test: the mask must be unchanged in the warn-storm leg (else the leg proves nothing) FAIL"; e=1 ;; esac
+  [ "$rc3" = 1 ] || { echo "test: WARNS must exit 1, got $rc3 FAIL"; e=1; }
+  #     …and the delta must be absorbed: the same standing 12 is not re-reported forever.
+  c4="$(run)"
+  case "$c4" in *"|OK "*"warn=12(+0)"*) : ;; *) echo "test: an absorbed warn delta must return to OK, got '$c4' FAIL"; e=1 ;; esac
+  #     An OOPS outranks everything, and a simultaneous WARNS is named in also= rather than effaced.
+  printf '1\n' > "$tmp/oops"; printf '13\n' > "$tmp/warn"
+  c5="$(run)"; rc5=$?
+  case "$c5" in *"|OOPS "*) : ;; *) echo "test: an oops_count rise must win the fold, got '$c5' FAIL"; e=1 ;; esac
+  case "$c5" in *"also=WARNS"*) : ;; *) echo "test: the fold must NAME the other axis that fired (also=WARNS), got '$c5' FAIL"; e=1 ;; esac
+  [ "$rc5" = 1 ] || { echo "test: OOPS must exit 1, got $rc5 FAIL"; e=1; }
+  #     A REBOOT resets the counters. A decrease is never a heal: the delta is na, never negative,
+  #     never 0 — the fabricated-calm case this whole axis is guarded against.
+  printf '0\n' > "$tmp/warn"; printf '0\n' > "$tmp/oops"; printf 'boot-ddd\n' > "$tmp/boot"
+  c6="$(run)"; rc6=$?
+  case "$c6" in *BASELINE*) : ;; *) echo "test: a reboot must re-baseline the counters, got '$c6' FAIL"; e=1 ;; esac
+  case "$c6" in *"warn=0(+na)"*) : ;; *) echo "test: a reboot-reset counter must render +na, NEVER +0 (that is a fabricated calm), got '$c6' FAIL"; e=1 ;; esac
+  case "$c6" in *"(+-"*) echo "test: a delta must never render negative, got '$c6' FAIL"; e=1 ;; esac
+  [ "$rc6" = 0 ] || { echo "test: a reboot re-baseline must not alarm, got $rc6 FAIL"; e=1; }
+  #     A decrease WITHIN one boot (corrupt/hand-edited state) is also na, not a negative and not a heal.
+  printf '9\n' > "$tmp/warn"; run >/dev/null 2>&1
+  printf '4\n' > "$tmp/warn"
+  c7="$(run)"
+  case "$c7" in *"warn=4(+na)"*) : ;; *) echo "test: a counter DECREASE within one boot must render na, got '$c7' FAIL"; e=1 ;; esac
+  #     An ABSENT counter (a pre-6.2 kernel) renders na and must NOT be fatal — the mask still reports.
+  c8="$(MESH_TAINT_FILE="$tmp/mask" MESH_BOOTID_FILE="$tmp/boot" MESH_TAINT_STATE="$tmp/st2" \
+        MESH_WARN_COUNT_FILE="$tmp/no-such" MESH_OOPS_COUNT_FILE="$tmp/no-such" \
+        MESH_TAINT_LOG="$tmp/lg" MESH_DIR="$tmp" "$0" 2>&1)"; rc8=$?
+  case "$c8" in *"warn=na"*"oops=na"*) : ;; *) echo "test: an absent counter must render na, got '$c8' FAIL"; e=1 ;; esac
+  case "$c8" in *"warn=0"*|*"oops=0("*) echo "test: an absent counter must NEVER render 0, got '$c8' FAIL"; e=1 ;; esac
+  case "$c8" in *TAINT=4096*) : ;; *) echo "test: an absent counter must not suppress the mask report, got '$c8' FAIL"; e=1 ;; esac
+  [ "$rc8" = 0 ] || { echo "test: an absent counter is not an alarm and not fatal, got $rc8 FAIL"; e=1; }
+  #     A non-numeric counter is treated as absent, never coerced.
+  printf 'garbage\n' > "$tmp/warn2"
+  read_counter "$tmp/warn2" >/dev/null 2>&1 && { echo "test: a non-numeric counter must fail to parse FAIL"; e=1; }
+  read_counter "$tmp/no-such" >/dev/null 2>&1 && { echo "test: a missing counter must fail to parse FAIL"; e=1; }
+
+  # 7. THE LIVE READ — a real, unprivileged read of this node's own sysctl AND its own accumulators,
+  #    asserted separately from the decoder. Without this the whole test is a decoder unit-test that
+  #    never touches a kernel. The counters are 0444 root:root and readable as an ordinary uid; where
+  #    the kernel predates 6.2 they are honestly absent and the leg says so rather than passing blank.
   if lm="$(read_mask)"; then
     live="live read ok: TAINT=$lm BITS=$(load_table; decode "$lm")"
     [ -n "$lm" ] || { echo "test: live read returned empty FAIL"; e=1; }
   else
     live="live read n/a (exit 2 path — $TAINT_FILE unreadable on this node)"
+  fi
+  if lw="$(read_counter "$WARN_FILE")" && lo="$(read_counter "$OOPS_FILE")"; then
+    live="$live; live accumulators ok unprivileged as uid $(id -u): warn_count=$lw oops_count=$lo"
+  else
+    live="$live; live accumulators ABSENT on this kernel $(uname -r) (pre-6.2 or restricted) — rendered na, not 0"
   fi
 
   # 8. the production state/log were not written by any of the above.
@@ -296,7 +461,7 @@ if [ "${1:-}" = --test ]; then
   [ "$rl_pre" = "$rl_post" ] || { echo "test: --test WROTE the production log $real_log ($rl_pre → $rl_post) FAIL"; e=1; }
 
   [ "$e" = 0 ] || { echo "smoke-test: FAIL"; exit 1; }
-  echo "smoke-test: ok — $xcheck; decoder asserted on 12 synthetic masks incl. the 512=WARN inversion that broke the original table and an unnamed bit19; thin/missing headers refused rather than silently truncating the table; unreadable and unparseable sources both exit 2 with no fabricated TAINT=0; BASELINE→OK→LATCH→OK walked, reboot and within-boot mask drops both re-baseline instead of alarming; $live; no taint bit was set and the production state/log are byte-unchanged"
+  echo "smoke-test: ok — $xcheck; decoder asserted on 12 synthetic masks incl. the 512=WARN inversion that broke the original table and an unnamed bit19; thin/missing headers refused rather than silently truncating the table; unreadable and unparseable sources both exit 2 with no fabricated TAINT=0; BASELINE→OK→LATCH→OK walked, reboot and within-boot mask drops both re-baseline instead of alarming; ACCUMULATORS: a warn_count rise under a FROZEN mask renders WARNS+exit1 (the saturated-latch blindness this axis exists for) then absorbs to OK, an oops rise wins the fold and names also=WARNS, and every un-knowable delta renders na and never +0 or a negative — baseline, reboot reset, within-boot decrease, absent counter (which is also non-fatal: the mask still reports); $live; no taint bit was set and the production state/log are byte-unchanged"
   exit 0
 fi
 
