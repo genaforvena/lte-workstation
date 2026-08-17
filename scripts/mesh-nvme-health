@@ -2,7 +2,8 @@
 # reflex-cadence: 0 */6 * * *
 # reflex-args: --edge
 # mesh-nvme-health — NVMe controller's own SMART wear-out self-report (percentage_used, available_spare,
-# media/data integrity errors, critical_warning bitmask) via `smartctl -A`.
+# media/data integrity errors, critical_warning bitmask) via `smartctl -A`, PLUS the ext4 superblock
+# write accumulators that give the FILESYSTEM side of the same wear axis.
 #
 # Why this is new:
 #   mesh-nvme-temp already senses controller TEMPERATURE; mesh-disk-health senses PERFORMANCE (await via
@@ -10,8 +11,40 @@
 #   itself uses to predict its remaining life, and the one that catches degradation (spare blocks
 #   consumed, uncorrectable media errors) *before* it ever shows up as a latency blip or heat.
 #
+# The ext4 leg (2026-08-17, board task ext4-write-accumulator-leg):
+#   /sys/fs/ext4/<blockdev>/{lifetime_write_kbytes,session_write_kbytes} are SUPERBLOCK-persistent /
+#   since-mount accumulators. Three things they buy that SMART alone cannot:
+#     (a) THIS-BOOT write volume from a COLD stateless read — no previous run's state file, unlike
+#         mesh-diskio's across-run interval. Credit where due: mesh-diskio is NOT blind to the
+#         sample-vs-interval trap (it folds a 1s instantaneous window with an across-run interval);
+#         this is simply the leg that needs no prior run.
+#     (b) WRITE AMPLIFICATION = SMART Data Units Written / ext4 lifetime — the diagnostic separating
+#         "the workload got heavier" from "amplification below the fs got worse". NEITHER input
+#         yields it alone.
+#     (c) a per-boot log line of lifetime_write_kbytes ($MESH/nvme-fs-write.log). Nothing recorded it
+#         before, so the across-REBOOT write rate was underivable and "is this boot's mean rate
+#         representative?" was unanswerable. One line per boot per fs (re-armed every 6h) makes the
+#         delta between two boots a real mean rate.
+#
+#   MEASURED CONTEXT (mesh-home, KINGSTON ser 50026B738382AFD3, boot+root, the disk CLAUDE.local.md
+#   marks do-not-use-for-scratch): this boot wrote 578 GB in 6.2h — mean 26018 KB/s — while the
+#   INSTANTANEOUS rate read 678 KB/s, with ext4 and /proc/diskstats agreeing exactly on that 678. The
+#   instantaneous number is CORRECT and still misses ~563 GB of bursts: a 38x gap between a right
+#   sample and the interval it sits in (the coverage = window/cadence trap, CLAUDE.md).
+#
+#   UNIT TRAP — the board [task] quoted this amplification as "1.32x (34.9 TB device vs 26.37 TB
+#   filesystem)". Those two are not the same unit: 34.9 is DECIMAL TB (SMART data units = 1000x512 B),
+#   26.37 is TiB (ext4 kbytes = KiB). Byte-consistent, the same two readings give 1.204x, not 1.32x.
+#   This tool computes the ratio in BYTES on both sides; do not "restore" 1.32.
+#
+#   Wear is reported, NEVER projected: "10% used at 1328 POH" is the defensible statement, a
+#   remaining-life date from one boot is not. Hence poh= is printed and no endurance estimate is.
+#
 # Honest contract:
 #   no smartctl / no NVMe device / no sudo / unparseable output -> exit 2, never fabricate a reading
+#   a controller carrying no readable ext4 (the bare XF-256 spare here) -> fs_boot/fs_life/wa = n/a.
+#   A 0 volume or a 1.0 amplification on a wear axis is a FABRICATED CALM and is what the --test
+#   black-holed-EXT4_ROOT gate exists to forbid.
 #
 #   mesh-nvme-health            one read → one classified line
 #   mesh-nvme-health --json     machine-readable
@@ -26,6 +59,10 @@ STATE="$MESH/.nvme-health.state"
 OFFLINEFILE="$MESH/.nvme-health-offline"
 ROOT="${MESH_NVME_HEALTH_ROOT:-/sys/class/nvme}"
 SMARTCTL="${MESH_NVME_HEALTH_SMARTCTL:-sudo -n smartctl}"
+EXT4_ROOT="${MESH_NVME_HEALTH_EXT4_ROOT:-/sys/fs/ext4}"
+BLOCK_ROOT="${MESH_NVME_HEALTH_BLOCK_ROOT:-/sys/class/block}"
+FSLOG="${MESH_NVME_HEALTH_FSLOG:-$MESH/nvme-fs-write.log}"
+FSLOG_MIN_S="${MESH_NVME_HEALTH_FSLOG_MIN_S:-21600}"
 mkdir -p "$MESH" 2>/dev/null || true
 
 discover_dev() {
@@ -60,7 +97,14 @@ discover_devs() {
   return $found
 }
 
-# reads smartctl -A output on stdin, emits: critwarn\tspare\tsparethr\tused\tmediaerr
+# reads smartctl -A output on stdin, emits US(0x1f)-separated:
+#   critwarn US spare US sparethr US used US mediaerr US dataunits US poh
+# The separator is US, NOT tab, and that is load-bearing: tab is IFS *whitespace*, so bash `read`
+# COLLAPSES consecutive tabs into one delimiter and an absent middle field silently SHIFTS every
+# later column (a drive omitting Available Spare would have had its percentage_used read out of the
+# mediaerr slot). US is non-whitespace, so empty fields survive as empty.
+# dataunits/poh are emitted RAW (empty when the drive did not report them) — never defaulted to 0,
+# because a 0 Data Units Written would silently render a write-amplification of 0.00x as if measured.
 parse_smart() {
   awk '
     /^Critical Warning:/            { gsub(/^0[xX]/,"",$3); cw=$3 }
@@ -68,11 +112,107 @@ parse_smart() {
     /^Available Spare Threshold:/    { gsub(/%/,"",$4); sparethr=$4 }
     /^Percentage Used:/              { gsub(/%/,"",$3); used=$3 }
     /^Media and Data Integrity Errors:/ { mediaerr=$NF }
+    /^Data Units Written:/           { gsub(/,/,"",$4); if ($4 ~ /^[0-9]+$/) duw=$4 }
+    /^Power On Hours:/               { gsub(/,/,"",$4); if ($4 ~ /^[0-9]+$/) poh=$4 }
     END {
       if (used == "" ) exit 1
-      printf "%s\t%s\t%s\t%s\t%s\n", cw, spare, sparethr, used, mediaerr+0
+      printf "%s\037%s\037%s\037%s\037%s\037%s\037%s\n", cw, spare, sparethr, used, mediaerr+0, duw, poh
     }
   '
+}
+
+# ---- ext4 superblock write accumulators (the FILESYSTEM side of the wear axis) ----
+
+# which NVMe CONTROLLER backs a block device name. A mounted ext4 sits on dm-0 (LVM) or a bare
+# partition; only the physical path names the controller, so walk down through slaves/ for
+# device-mapper/md stacks. Emits e.g. "nvme0"; rc=1 when the fs is not on an NVMe at all (a USB
+# stick, an iSCSI LUN) — which must render n/a, never get folded into some other drive's ratio.
+fs_backing_ctrl() {
+  local name="$1" depth="${2:-0}" real slave got
+  [ "$depth" -lt 6 ] || return 1          # cycle/depth guard on a stacked dm tree
+  real="$(readlink -f "$BLOCK_ROOT/$name" 2>/dev/null)" || return 1
+  [ -n "$real" ] || return 1
+  if [[ "$real" =~ /nvme/(nvme[0-9]+)/ ]]; then printf '%s\n' "${BASH_REMATCH[1]}"; return 0; fi
+  if [ -d "$real/slaves" ]; then
+    shopt -s nullglob
+    for slave in "$real"/slaves/*; do
+      got="$(fs_backing_ctrl "$(basename "$slave")" "$((depth+1))")" || continue
+      printf '%s\n' "$got"; shopt -u nullglob; return 0
+    done
+    shopt -u nullglob
+  fi
+  return 1
+}
+
+# every readable ext4 under $EXT4_ROOT that maps to an NVMe controller.
+# Emits: ctrl \t fsname \t lifetime_kbytes \t session_kbytes   (rc=1 when NONE — the n/a case)
+# A dir whose counters are absent/unreadable/non-numeric is SKIPPED, never emitted as 0.
+ext4_rows() {
+  local d name life sess ctrl found=1
+  shopt -s nullglob
+  for d in "$EXT4_ROOT"/*/; do
+    name="$(basename "$d")"
+    life="$(cat "$d/lifetime_write_kbytes" 2>/dev/null)" || continue
+    sess="$(cat "$d/session_write_kbytes"  2>/dev/null)" || continue
+    case "$life" in ''|*[!0-9]*) continue ;; esac
+    case "$sess" in ''|*[!0-9]*) continue ;; esac
+    ctrl="$(fs_backing_ctrl "$name")" || continue
+    printf '%s\t%s\t%s\t%s\n' "$ctrl" "$name" "$life" "$sess"
+    found=0
+  done
+  shopt -u nullglob
+  return $found
+}
+
+# $1=lifetime_kb (may be empty) $2=session_kb (may be empty) $3=smart data units written (may be empty)
+# -> "fs_boot_gib \t fs_life_tib \t write_amplification", each independently "n/a".
+# BOTH sides of the ratio are converted to BYTES first: ext4 kbytes are KiB, a SMART data unit is
+# 1000x512 B. Comparing 34.9 "TB" with 26.37 "TiB" is what produced the wrong 1.32x (see header).
+fs_render() {
+  local life="${1:-}" sess="${2:-}" duw="${3:-}"
+  case "$life" in ''|*[!0-9]*) life="" ;; esac
+  case "$sess" in ''|*[!0-9]*) sess="" ;; esac
+  case "$duw"  in ''|*[!0-9]*) duw=""  ;; esac
+  [ -n "$life" ] && [ "$life" -gt 0 ] 2>/dev/null || { printf 'n/a\tn/a\tn/a\n'; return 0; }
+  awk -v life="$life" -v sess="$sess" -v duw="$duw" 'BEGIN{
+    lb = life * 1024.0
+    if (sess == "") printf "n/a\t"; else printf "%.1f\t", (sess * 1024.0) / 1073741824.0
+    printf "%.2f\t", lb / 1099511627776.0
+    if (duw == "" || duw + 0 <= 0) print "n/a"; else printf "%.3f\n", (duw * 512000.0) / lb
+  }'
+}
+
+# unit suffix that never manufactures "n/aGiB"
+fs_unit() { if [ "$1" = n/a ]; then printf 'n/a'; else printf '%s%s' "$1" "$2"; fi; }
+# JSON: an n/a axis is null — never 0, which a consumer would read as a measured zero
+jnum() { case "${1:-}" in ''|n/a) printf null ;; *) printf '%s' "$1" ;; esac; }
+
+# (c) the per-boot record. lifetime_write_kbytes is superblock-PERSISTENT, so a line per boot makes
+# the across-reboot mean write rate derivable (delta lifetime / delta epoch) — the one question a
+# single boot's session counter structurally cannot answer. Re-armed every $FSLOG_MIN_S so a long
+# uptime still lays down a series, while hand-runs inside the window do not spam it.
+fs_log() {
+  local boot now up row ctrl fsname life sess last lastboot lastepoch
+  boot="$(tr -d '-' < /proc/sys/kernel/random/boot_id 2>/dev/null | cut -c1-12)"
+  [ -n "$boot" ] || boot=unknown
+  now="$(date -u +%s)"
+  up="$(cut -d. -f1 < /proc/uptime 2>/dev/null)"
+  case "$up" in ''|*[!0-9]*) up=0 ;; esac
+  for row in "$@"; do
+    IFS=$'\t' read -r ctrl fsname life sess <<<"$row"
+    [ -n "${fsname:-}" ] || continue
+    last="$(grep -a " fs=$fsname " "$FSLOG" 2>/dev/null | tail -n1)"
+    lastboot=""; lastepoch=0
+    if [ -n "$last" ]; then
+      lastboot="$(sed -n 's/.* boot=\([^ ]*\).*/\1/p' <<<"$last")"
+      lastepoch="$(sed -n 's/.* epoch=\([0-9]*\).*/\1/p' <<<"$last")"
+      case "$lastepoch" in ''|*[!0-9]*) lastepoch=0 ;; esac
+    fi
+    # same boot AND inside the re-arm window -> already recorded
+    if [ "$lastboot" = "$boot" ] && [ "$(( now - lastepoch ))" -lt "$FSLOG_MIN_S" ]; then continue; fi
+    printf '%s epoch=%s boot=%s ctrl=%s fs=%s lifetime_kb=%s session_kb=%s uptime_s=%s\n' \
+      "$TS" "$now" "$boot" "$ctrl" "$fsname" "$life" "$sess" "$up" >> "$FSLOG"
+  done
 }
 
 classify() {
@@ -104,7 +244,7 @@ Percentage Used:                    7%
 Media and Data Integrity Errors:    0
 EOF
   got="$(parse_smart < "$fake")" || { echo "smoke-test: FAIL (parse healthy fixture)"; exit 1; }
-  IFS=$'\t' read -r cw spare sparethr used mediaerr <<<"$got"
+  IFS=$'\037' read -r cw spare sparethr used mediaerr duw poh <<<"$got"
   [ "$(classify "$cw" "$spare" "$sparethr" "$used" "$mediaerr")" = HEALTHY ] \
     || { echo "smoke-test: FAIL (healthy fixture misclassified: $got)"; exit 1; }
 
@@ -117,7 +257,7 @@ Percentage Used:                    93%
 Media and Data Integrity Errors:    0
 EOF
   got="$(parse_smart < "$fake")"
-  IFS=$'\t' read -r cw spare sparethr used mediaerr <<<"$got"
+  IFS=$'\037' read -r cw spare sparethr used mediaerr duw poh <<<"$got"
   [ "$(classify "$cw" "$spare" "$sparethr" "$used" "$mediaerr")" = WORN ] \
     || { echo "smoke-test: FAIL (worn fixture misclassified: $got)"; exit 1; }
 
@@ -130,7 +270,7 @@ Percentage Used:                    12%
 Media and Data Integrity Errors:    0
 EOF
   got="$(parse_smart < "$fake")"
-  IFS=$'\t' read -r cw spare sparethr used mediaerr <<<"$got"
+  IFS=$'\037' read -r cw spare sparethr used mediaerr duw poh <<<"$got"
   [ "$(classify "$cw" "$spare" "$sparethr" "$used" "$mediaerr")" = CRITICAL ] \
     || { echo "smoke-test: FAIL (critical-warning fixture misclassified: $got)"; exit 1; }
 
@@ -143,7 +283,7 @@ Percentage Used:                    40%
 Media and Data Integrity Errors:    0
 EOF
   got="$(parse_smart < "$fake")"
-  IFS=$'\t' read -r cw spare sparethr used mediaerr <<<"$got"
+  IFS=$'\037' read -r cw spare sparethr used mediaerr duw poh <<<"$got"
   [ "$(classify "$cw" "$spare" "$sparethr" "$used" "$mediaerr")" = CRITICAL ] \
     || { echo "smoke-test: FAIL (spare-exhausted fixture misclassified: $got)"; exit 1; }
 
@@ -156,7 +296,7 @@ Percentage Used:                    12%
 Media and Data Integrity Errors:    3
 EOF
   got="$(parse_smart < "$fake")"
-  IFS=$'\t' read -r cw spare sparethr used mediaerr <<<"$got"
+  IFS=$'\037' read -r cw spare sparethr used mediaerr duw poh <<<"$got"
   [ "$(classify "$cw" "$spare" "$sparethr" "$used" "$mediaerr")" = CRITICAL ] \
     || { echo "smoke-test: FAIL (media-error fixture misclassified: $got)"; exit 1; }
 
@@ -180,15 +320,158 @@ EOF
   [ "$(sev_rank WORN)" -gt "$(sev_rank HEALTHY)" ] \
     || { echo "smoke-test: FAIL (sev_rank does not rank WORN above HEALTHY — a worn spare would not surface)"; exit 1; }
 
+  # ---- ext4 write-accumulator leg ----
+
+  # parse_smart must carry Data Units Written + Power On Hours, comma-stripped, and leave them EMPTY
+  # (not 0) when the drive omits them — fixtures 1-5 above have no such lines and must stay empty.
+  cat > "$fake" <<'EOF'
+Critical Warning:                   0x00
+Available Spare:                    100%
+Available Spare Threshold:          10%
+Percentage Used:                    10%
+Power On Hours:                     1,328
+Data Units Written:                 68,204,080 [34.9 TB]
+Media and Data Integrity Errors:    0
+EOF
+  got="$(parse_smart < "$fake")" || { echo "smoke-test: FAIL (parse wear fixture)"; exit 1; }
+  IFS=$'\037' read -r cw spare sparethr used mediaerr duw poh <<<"$got"
+  [ "$duw" = 68204080 ] || { echo "smoke-test: FAIL (Data Units Written not parsed/comma-stripped: '$duw')"; exit 1; }
+  [ "$poh" = 1328 ]     || { echo "smoke-test: FAIL (Power On Hours not parsed/comma-stripped: '$poh')"; exit 1; }
+  cat > "$fake" <<'EOF'
+Critical Warning:                   0x00
+Percentage Used:                    7%
+Media and Data Integrity Errors:    0
+EOF
+  IFS=$'\037' read -r cw spare sparethr used mediaerr duw poh <<<"$(parse_smart < "$fake")"
+  [ -z "$duw" ] || { echo "smoke-test: FAIL (absent Data Units Written defaulted to '$duw' instead of empty)"; exit 1; }
+
+  # arithmetic gate: BOTH sides in bytes. 68204080 units x 512000 B = 34.92 TB(dec) over
+  # 28324851692 KiB x 1024 = 29.00 TB(dec) -> 1.204x. The board task said 1.32x, which is
+  # 34.9 TB(dec) / 26.37 TiB — a unit MIX. If this ever reads 1.32 the conversion regressed.
+  IFS=$'\t' read -r g_boot g_life g_wa < <(fs_render 28324851692 588141151 68204080)
+  [ "$g_wa" = "1.204" ] || { echo "smoke-test: FAIL (write-amplification $g_wa != 1.204 — unit mix or bad conversion)"; exit 1; }
+  [ "$g_life" = "26.38" ] || { echo "smoke-test: FAIL (fs lifetime $g_life TiB != 26.38)"; exit 1; }
+  [ "$g_boot" = "560.9" ] || { echo "smoke-test: FAIL (this-boot volume $g_boot GiB != 560.9)"; exit 1; }
+
+  # THE n/a GATE (red-first): with no readable ext4 the axes must render n/a — never a 0 volume and
+  # never a 1.0 ratio. Both of those are the fabricated calm this leg exists to refuse.
+  IFS=$'\t' read -r n_boot n_life n_wa < <(fs_render "" "" 68204080)
+  [ "$n_boot" = n/a ] && [ "$n_life" = n/a ] && [ "$n_wa" = n/a ] \
+    || { echo "smoke-test: FAIL (unreadable ext4 rendered '$n_boot/$n_life/$n_wa', not n/a — a fabricated calm)"; exit 1; }
+  case "$n_boot$n_life$n_wa" in *0.0*|*1.000*) echo "smoke-test: FAIL (n/a path emitted a numeric wear value)"; exit 1 ;; esac
+  # a readable fs but a drive that reported no Data Units Written: volume is real, ratio must be n/a
+  IFS=$'\t' read -r p_boot p_life p_wa < <(fs_render 28324851692 588141151 "")
+  [ "$p_wa" = n/a ] && [ "$p_boot" = "560.9" ] \
+    || { echo "smoke-test: FAIL (missing Data Units Written gave wa='$p_wa' instead of n/a)"; exit 1; }
+  # a readable lifetime but an unreadable SESSION counter: the this-boot volume alone goes n/a, while
+  # lifetime and the ratio stay real — the three axes fail INDEPENDENTLY, never as one collapsed n/a
+  # (and never as a 0.0 GiB boot, which would read as "this boot wrote nothing")
+  IFS=$'\t' read -r s_boot s_life s_wa < <(fs_render 28324851692 "" 68204080)
+  [ "$s_boot" = n/a ] && [ "$s_life" = "26.38" ] && [ "$s_wa" = "1.204" ] \
+    || { echo "smoke-test: FAIL (unreadable session counter gave '$s_boot/$s_life/$s_wa' — axes not independent)"; exit 1; }
+  # and a zero data-units read must NOT render 0.000x as if measured
+  IFS=$'\t' read -r z_boot z_life z_wa < <(fs_render 28324851692 588141151 0)
+  [ "$z_wa" = n/a ] || { echo "smoke-test: FAIL (zero Data Units Written rendered wa=$z_wa, a measured-looking zero)"; exit 1; }
+  [ "$(fs_unit n/a GiB)" = "n/a" ] || { echo "smoke-test: FAIL (fs_unit manufactured a unit on n/a)"; exit 1; }
+  [ "$(jnum n/a)" = null ] || { echo "smoke-test: FAIL (jnum did not map n/a to JSON null)"; exit 1; }
+
+  # fs_backing_ctrl: a partition resolves to its controller; a dm stack resolves THROUGH slaves/;
+  # a non-NVMe fs resolves to nothing (rc=1) so it can never be folded into a drive's ratio
+  broot="$(mktemp -d)" || { echo "smoke-test: FAIL (mktemp -d)"; exit 1; }
+  trap 'rm -f "$fake"; rm -rf "${troot:-}" "${broot:-}" "${eroot:-}"' EXIT
+  mkdir -p "$broot/dev/pci0000:00/nvme/nvme7/nvme7n1/nvme7n1p2" \
+           "$broot/dev/pci0000:00/nvme/nvme7/nvme7n1/nvme7n1p3" \
+           "$broot/dev/virtual/dm-9/slaves" "$broot/dev/usb-sda"
+  ln -s "$broot/dev/pci0000:00/nvme/nvme7/nvme7n1/nvme7n1p2" "$broot/nvme7n1p2"
+  ln -s "$broot/dev/pci0000:00/nvme/nvme7/nvme7n1/nvme7n1p3" "$broot/nvme7n1p3"
+  ln -s "$broot/dev/virtual/dm-9" "$broot/dm-9"
+  ln -s "$broot/dev/usb-sda"      "$broot/usb-sda"
+  ln -s "$broot/dev/pci0000:00/nvme/nvme7/nvme7n1/nvme7n1p2" "$broot/dev/virtual/dm-9/slaves/nvme7n1p2"
+  [ "$(BLOCK_ROOT="$broot" fs_backing_ctrl nvme7n1p2)" = nvme7 ] \
+    || { echo "smoke-test: FAIL (fs_backing_ctrl missed the partition's controller)"; exit 1; }
+  [ "$(BLOCK_ROOT="$broot" fs_backing_ctrl dm-9)" = nvme7 ] \
+    || { echo "smoke-test: FAIL (fs_backing_ctrl did not walk dm slaves/ to the controller — LVM roots would render n/a)"; exit 1; }
+  BLOCK_ROOT="$broot" fs_backing_ctrl usb-sda >/dev/null 2>&1 \
+    && { echo "smoke-test: FAIL (a non-NVMe fs was attributed to a controller)"; exit 1; }
+
+  # ext4_rows: a black-holed EXT4_ROOT yields NO rows (rc=1), never a synthesized zero row
+  ext4_rows_out="$(EXT4_ROOT=/nonexistent-ext4-root ext4_rows; echo "rc=$?")"
+  [ "$ext4_rows_out" = "rc=1" ] || { echo "smoke-test: FAIL (black-holed EXT4_ROOT emitted rows: $ext4_rows_out)"; exit 1; }
+
+  # ...and the row filter itself, driven against the FAKE block root so the attribution step cannot
+  # mask it: 2 good fs survive; features/ (no counters), a non-numeric counter, and a NON-NVMe fs are
+  # each dropped. Without the fake block root these dirs resolve to nothing and every leg passes for
+  # the wrong reason — that vacuity is what let a "life=0 instead of skip" mutant survive.
+  eroot="$(mktemp -d)" || { echo "smoke-test: FAIL (mktemp -d)"; exit 1; }
+  mkdir -p "$eroot/features" "$eroot/nvme7n1p2" "$eroot/dm-9" "$eroot/nvme7n1p3" "$eroot/usb-sda"
+  printf '111\n' > "$eroot/nvme7n1p2/lifetime_write_kbytes"; printf '11\n' > "$eroot/nvme7n1p2/session_write_kbytes"
+  printf '222\n' > "$eroot/dm-9/lifetime_write_kbytes";      printf '22\n' > "$eroot/dm-9/session_write_kbytes"
+  printf 'notanumber\n' > "$eroot/nvme7n1p3/lifetime_write_kbytes"; printf '33\n' > "$eroot/nvme7n1p3/session_write_kbytes"
+  printf '444\n' > "$eroot/usb-sda/lifetime_write_kbytes";   printf '44\n' > "$eroot/usb-sda/session_write_kbytes"
+  rows_out="$(EXT4_ROOT="$eroot" BLOCK_ROOT="$broot" ext4_rows)"
+  n_rows="$(printf '%s\n' "$rows_out" | grep -c . )"
+  [ "$n_rows" = 2 ] || { echo "smoke-test: FAIL (ext4_rows emitted $n_rows row(s), expected 2 — filter or attribution broke: $rows_out)"; exit 1; }
+  grep -q 'nvme7n1p3' <<<"$rows_out" \
+    && { echo "smoke-test: FAIL (a non-numeric lifetime counter was emitted as a row — a fabricated zero)"; exit 1; }
+  grep -q 'usb-sda' <<<"$rows_out" \
+    && { echo "smoke-test: FAIL (a non-NVMe fs was folded into a controller's ratio)"; exit 1; }
+  grep -q $'nvme7\tdm-9\t222\t22' <<<"$rows_out" \
+    || { echo "smoke-test: FAIL (ext4_rows lost the dm-backed fs or its counters: $rows_out)"; exit 1; }
+
+  # column-shift gate: US-separated, NOT tab. A drive omitting Available Spare must still put
+  # percentage_used in the used slot — with tab (IFS whitespace) the empty fields collapse and every
+  # later column shifts by two, so `used` would silently be read out of another field.
+  cat > "$fake" <<'EOF'
+Critical Warning:                   0x00
+Percentage Used:                    41%
+Media and Data Integrity Errors:    0
+Data Units Written:                 9,000
+EOF
+  IFS=$'\037' read -r cw spare sparethr used mediaerr duw poh <<<"$(parse_smart < "$fake")"
+  [ "$used" = 41 ] && [ -z "$spare" ] && [ "$duw" = 9000 ] \
+    || { echo "smoke-test: FAIL (absent middle fields shifted the columns: used='$used' spare='$spare' duw='$duw')"; exit 1; }
+
+  # (c) the per-boot log: one line per fs per boot, re-armed after FSLOG_MIN_S, and NEVER the durable
+  # log during --test (a dry-run writing the liveness record forges the evidence it exists to check)
+  tlog="$(mktemp)" || { echo "smoke-test: FAIL (mktemp)"; exit 1; }
+  trap 'rm -f "$fake" "${tlog:-}"; rm -rf "${troot:-}" "${eroot:-}" "${broot:-}"' EXIT
+  TS="fixture-ts"
+  FSLOG="$tlog" FSLOG_MIN_S=21600 fs_log "$(printf 'nvme7\tdm-9\t123456\t789')"
+  FSLOG="$tlog" FSLOG_MIN_S=21600 fs_log "$(printf 'nvme7\tdm-9\t123999\t999')"
+  [ "$(wc -l < "$tlog" | tr -d ' ')" = 1 ] \
+    || { echo "smoke-test: FAIL (fs_log wrote $(wc -l < "$tlog") lines for one boot — the per-boot dedupe is dead)"; exit 1; }
+  grep -q 'lifetime_kb=123456' "$tlog" \
+    || { echo "smoke-test: FAIL (fs_log line missing lifetime_kb — the across-reboot rate stays underivable)"; exit 1; }
+  FSLOG="$tlog" FSLOG_MIN_S=0 fs_log "$(printf 'nvme7\tdm-9\t124000\t1200')"
+  [ "$(wc -l < "$tlog" | tr -d ' ')" = 2 ] \
+    || { echo "smoke-test: FAIL (fs_log did not re-arm after its window — a long uptime would log once, forever)"; exit 1; }
+  unset TS
+
   # real-read gate: a live device must actually produce a numeric percentage_used, not just exercise
   # the offline classifier
   dev="$(discover_dev)" || { echo "smoke-test: n/a (no NVMe device node on this node)"; exit 2; }
   real="$($SMARTCTL -A "$dev" 2>/dev/null | parse_smart)" || {
     echo "smoke-test: n/a (smartctl unreadable — a missing DEP, not a missing drive: 'sudo apt install smartmontools'; a reimage must reprovision it)"; exit 2;
   }
-  IFS=$'\t' read -r cw spare sparethr used mediaerr <<<"$real"
+  IFS=$'\037' read -r cw spare sparethr used mediaerr duw poh <<<"$real"
   case "$used" in ''|*[!0-9]*) echo "smoke-test: FAIL (live read missing numeric percentage_used: $real)"; exit 1 ;; esac
-  echo "smoke-test: ok (fixture classify x5 + garbage-rejected + live NVMe SMART read: used=${used}% spare=${spare}%)"
+
+  # LIVE ext4 real-read gate: a fixture-only pass would let a broken sysfs read ship green. Where a
+  # real ext4 exists, it must yield a POSITIVE lifetime and — with the live Data Units Written — a
+  # numeric amplification. Where none does, exit 2 (honest n/a: the organ is absent, not broken).
+  mapfile -t live_rows < <(ext4_rows) || true
+  if [ "${#live_rows[@]}" -eq 0 ]; then
+    echo "smoke-test: n/a (no ext4 under $EXT4_ROOT maps to an NVMe controller — device side gated ok: used=${used}%)"; exit 2
+  fi
+  IFS=$'\t' read -r l_ctrl l_fs l_life l_sess <<<"${live_rows[0]}"
+  [ "${l_life:-0}" -gt 0 ] 2>/dev/null \
+    || { echo "smoke-test: FAIL (live ext4 $l_fs read lifetime_write_kbytes='$l_life' — not a positive accumulator)"; exit 1; }
+  IFS=$'\t' read -r l_boot l_lifetib l_wa < <(fs_render "$l_life" "$l_sess" "$duw")
+  case "$l_lifetib" in ''|n/a) echo "smoke-test: FAIL (live ext4 lifetime rendered n/a from a readable counter)"; exit 1 ;; esac
+  if [ -n "${duw:-}" ]; then
+    case "$l_wa" in ''|n/a|0.000) echo "smoke-test: FAIL (live wa='$l_wa' despite a live Data Units Written=$duw)"; exit 1 ;; esac
+  fi
+  echo "smoke-test: ok (fixture classify x5 + garbage-rejected + ext4 leg: wa-in-bytes, n/a-not-zero, dm-slaves walk, per-boot log dedupe + live NVMe SMART read used=${used}% spare=${spare}% poh=${poh:-n/a} + live ext4 ${l_fs} life=${l_lifetib}TiB boot=${l_boot}GiB wa=${l_wa}x)"
   exit 0
 fi
 
@@ -211,6 +494,20 @@ TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 PREV_LABEL=""
 [ -f "$STATE" ] && PREV_LABEL="$(head -n1 "$STATE" 2>/dev/null | cut -d'|' -f1 | sed 's/^AGG://' || true)"
 
+# ext4 accumulators, summed per backing controller (a drive can carry several ext4 — here dm-0 for /
+# plus nvme0n1p2 for /boot). A controller with no readable ext4 stays UNSET, so fs_render gives n/a.
+mapfile -t EXT4_ROWS < <(ext4_rows) || true
+declare -A FS_LIFE FS_SESS FS_NAMES
+for row in "${EXT4_ROWS[@]:-}"; do
+  [ -n "$row" ] || continue
+  IFS=$'\t' read -r c fsn l s <<<"$row"
+  [ -n "${c:-}" ] || continue
+  FS_LIFE["$c"]=$(( ${FS_LIFE["$c"]:-0} + l ))
+  FS_SESS["$c"]=$(( ${FS_SESS["$c"]:-0} + s ))
+  FS_NAMES["$c"]="${FS_NAMES["$c"]:+${FS_NAMES["$c"]},}$fsn"
+done
+[ "${#EXT4_ROWS[@]}" -eq 0 ] || fs_log "${EXT4_ROWS[@]}"
+
 # per-device readouts; a drive whose smartctl is unreadable is UNKNOWN (honest partial), never a
 # fabricated pass and never a hard exit that drops its healthy siblings
 declare -a LINES JSON_OBJS HUMAN
@@ -225,15 +522,20 @@ for DEV in "${DEVS[@]}"; do
     continue
   }
   READ_ANY=0
-  IFS=$'\t' read -r CW SPARE SPARETHR USED MEDIAERR <<<"$READOUT"
+  IFS=$'\037' read -r CW SPARE SPARETHR USED MEDIAERR DUW POH <<<"$READOUT"
   LABEL="$(classify "$CW" "$SPARE" "$SPARETHR" "$USED" "$MEDIAERR")"
   r="$(sev_rank "$LABEL")"
   if [ "$r" -gt "$AGG_RANK" ]; then AGG_RANK="$r"; AGG_LABEL="$LABEL"; fi
-  LINES+=("$LABEL|$USED|$SPARE|$SPARETHR|$MEDIAERR|0x$CW|$DEV|$TS")
-  JSON_OBJS+=("$(printf '{"label":"%s","percentage_used":%s,"available_spare":%s,"available_spare_threshold":%s,"media_errors":%s,"critical_warning":"0x%s","device":"%s","ts":"%s"}' \
-    "$LABEL" "$USED" "${SPARE:-null}" "${SPARETHR:-null}" "$MEDIAERR" "$CW" "$DEV" "$TS")")
-  HUMAN+=("$(printf '[nvme-health] %s — used=%s%% spare=%s%%(thr=%s%%) media_err=%s crit=0x%s device=%s @ %s %s' \
-    "$LABEL" "$USED" "${SPARE:-?}" "${SPARETHR:-?}" "$MEDIAERR" "$CW" "$DEV" "$(hostname)" "$TS")")
+  CTRL="$(basename "$DEV")"
+  IFS=$'\t' read -r FSBOOT FSLIFE FSWA < <(fs_render "${FS_LIFE[$CTRL]:-}" "${FS_SESS[$CTRL]:-}" "${DUW:-}")
+  LINES+=("$LABEL|$USED|$SPARE|$SPARETHR|$MEDIAERR|0x$CW|$DEV|$TS|fs_boot_gib=$FSBOOT|fs_life_tib=$FSLIFE|wa=$FSWA|poh=${POH:-n/a}")
+  JSON_OBJS+=("$(printf '{"label":"%s","percentage_used":%s,"available_spare":%s,"available_spare_threshold":%s,"media_errors":%s,"critical_warning":"0x%s","power_on_hours":%s,"data_units_written":%s,"fs_session_gib":%s,"fs_lifetime_tib":%s,"write_amplification":%s,"ext4":"%s","device":"%s","ts":"%s"}' \
+    "$LABEL" "$USED" "$(jnum "${SPARE:-}")" "$(jnum "${SPARETHR:-}")" "$MEDIAERR" "$CW" \
+    "$(jnum "${POH:-}")" "$(jnum "${DUW:-}")" "$(jnum "$FSBOOT")" "$(jnum "$FSLIFE")" "$(jnum "$FSWA")" \
+    "${FS_NAMES[$CTRL]:-}" "$DEV" "$TS")")
+  HUMAN+=("$(printf '[nvme-health] %s — used=%s%% @ %sh poh · spare=%s%%(thr=%s%%) media_err=%s crit=0x%s · fs_boot=%s fs_life=%s wa=%s device=%s @ %s %s' \
+    "$LABEL" "$USED" "${POH:-?}" "${SPARE:-?}" "${SPARETHR:-?}" "$MEDIAERR" "$CW" \
+    "$(fs_unit "$FSBOOT" GiB)" "$(fs_unit "$FSLIFE" TiB)" "$(fs_unit "$FSWA" x)" "$DEV" "$(hostname)" "$TS")")
 done
 
 # every controller unreadable → same honest UNREACHABLE as no-device (don't write a state of UNKNOWNs)
