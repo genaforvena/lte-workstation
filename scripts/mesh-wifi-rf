@@ -22,7 +22,46 @@
 #   mesh-wifi-rf            one-shot quality verdict to stdout
 #   mesh-wifi-rf --edge     emit only on quality-class change (2-consecutive debounce)
 #   mesh-wifi-rf --json     machine-readable JSON
+#   mesh-wifi-rf --phy      PHY-layer burst read (rtw88 debugfs phy_info; --phy --json)
 #   mesh-wifi-rf --test     smoke test (parser fixture + live real-read gate)
+#
+# --phy — the PHY lane (rtw88 only, needs root via `sudo -n`)
+# ------------------------------------------------------------------
+# /sys/kernel/debug/ieee80211/phy*/rtw88/phy_info exposes what /proc/net/wireless
+# cannot: per-modulation CRC ok/err, CCA vs False Alarm, EVM/SNR/CFO and Rx Beacon
+# Count. On mesh-home this is the ONLY instrument that sees the sole uplink's air —
+# `mesh-nic-drops` reads netdev error counters that `rtw_8822bu` never fills (all
+# zero against 8.7M rx packets), so it reports CLEAN through a 20% PHY discard.
+# Brief: ~/.mesh/knowledge/capability-rtw88-phy-info-2s-window-crc-false-alarm-beacon-loss-unread-mesh-home-20260817.md
+#
+# Three measured facts that decide how it may be read:
+#
+#  1. NOT accumulators — the driver's dynamic-mechanism (DM) watchdog RESETS these
+#     counters each cycle, so consecutive reads go DOWN as well as up (measured
+#     2026-08-17: CCA 848 -> 807 -> 501 -> 586). The value IS a ~2 s interval rate;
+#     delta arithmetic on it is meaningless. Beacon count (100 ms interval, 19-20
+#     when healthy) is what calibrates the window.
+#  2. Coverage = window / cadence. A 2 s window at a 600 s tick is 0.33% of
+#     wallclock, and the events here are ~2-6 s bursts, so a single read reports a
+#     sample and not a state (`a-senses-coverage-is-window-over-cadence`). --phy
+#     therefore BURSTS (default 10 reads / 2 s apart) and publishes `window=`.
+#  3. A FROZEN counter block is not a calm one. When the DM watchdog is not running
+#     (a scan is in flight, or — the wedge case — the device stopped answering) the
+#     file keeps returning the LAST cycle's numbers, instantly. Measured: 4 reads 3 s
+#     apart returned a byte-identical counter block while the channel field flipped
+#     4 -> 48 -> 4 (a scan). Repeat reads of one frozen cycle would otherwise fake
+#     independent confirmations, so identical consecutive blocks are counted as
+#     `frozen=` and excluded from the sample count; an all-frozen burst is STALE, a
+#     verdict of its own, never CLEAN.
+#
+# On the wedge question (`a-real-hardware-test-leg-is-an-attack-when-the-device-is-wedged`):
+# phy_info is served from the driver's cached dm_info struct, NOT from the USB path.
+# Measured on this node: phy_info reads in ~1.1 ms while `rf_dump` (a real RF
+# register read over the same USB) takes ~3.2 s — three orders of magnitude apart.
+# So this read cannot block on a wedged dongle; it goes STALE, which leg 3 above
+# detects. Every read is still `timeout`-capped, and a timeout is reported as `to=`
+# rather than swallowed. Do NOT add an rf_dump/reg-read leg here — THAT one is the
+# attack during a wedge.
 #
 # Signals:
 #   link:    driver-reported link quality (raw units, driver-dependent max — informational)
@@ -41,6 +80,8 @@
 # Exit codes (honest-exit contract):
 #   0 = quality assessed
 #   2 = no wireless interface present/associated on this node — never faked
+#       (--phy: no rtw88 phy_info node, or no passwordless root to read it — n/a,
+#        never a fabricated CLEAN)
 set -uo pipefail
 export PATH="$HOME/.local/bin:$PATH"
 [ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
@@ -108,6 +149,209 @@ classify() {   # $1=level -> quality string
   else echo "POOR"; fi
 }
 
+# ------------------------------------------------------------------ PHY lane
+PHY_READS="${MESH_WIFI_RF_PHY_READS:-10}"
+PHY_GAP="${MESH_WIFI_RF_PHY_GAP:-2}"
+PHY_TIMEOUT="${MESH_WIFI_RF_PHY_TIMEOUT:-5}"
+
+# The phy index MOVES (phy5 in the 2026-07-16 coex brief, phy1 today — it renumbers
+# like the dongle's USB path does), so glob it; never hardcode phyN. debugfs is
+# root-only, so even the glob has to run under sudo.
+phy_path() {   # echo phy_info path; rc 2 = no rtw88 phy_info reachable here
+  local p
+  p="$(timeout "$PHY_TIMEOUT" sudo -n sh -c \
+        'ls -d /sys/kernel/debug/ieee80211/*/rtw88/phy_info 2>/dev/null | head -1' 2>/dev/null)"
+  [ -n "$p" ] || return 2
+  printf '%s' "$p"
+}
+
+# Burst-read phy_info. Every read is timeout-capped and its rc reported, so a
+# non-answering device shows up as `to=` instead of a swallowed blank sample.
+phy_burst() {  # $1=path -> "===SAMPLE <ts> rc=<rc>" delimited records on stdout
+  local path="$1" cap=$(( (PHY_READS * PHY_GAP) + PHY_TIMEOUT + 10 ))
+  timeout "$cap" sudo -n sh -c '
+    p="$1"; n="$2"; gap="$3"; to="$4"; i=0
+    while [ "$i" -lt "$n" ]; do
+      i=$((i+1))
+      out="$(timeout "$to" cat "$p" 2>/dev/null)"; rc=$?
+      printf "===SAMPLE %s rc=%s\n%s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$rc" "$out"
+      [ "$i" -lt "$n" ] && sleep "$gap"
+    done
+  ' _ "$path" "$PHY_READS" "$PHY_GAP" "$PHY_TIMEOUT" 2>/dev/null
+}
+
+# Pure stdin->verdict aggregator (no hardware, no side effects) so --test can drive
+# the whole classification on a fixture burst.
+#
+# Thresholds are calibrated against THIS node's live corpus (20 samples, 2 s apart,
+# 2026-08-17T23:06-23:07Z), not against an assumed 0..1 scale:
+#   beacon      19-20 healthy · 8-17 in every burst window      -> burst at <= 13
+#   fa/cca      0.13-0.38 healthy · 0.72-1.36 in bursts         -> burst at >= 0.60
+#               (it is NOT a bounded percentage — False Alarm and CCA have different
+#                denominators and FA > CCA was measured; > 1 is a strong signal)
+#   cck cca     EXACTLY 0 in every healthy sample, 12-143 in bursts (2.4 GHz energy
+#               from nothing) -> corroboration only, it co-occurred with all bursts
+#   HT err      ~5-7% healthy -> alarm at >= 15%, and only with n >= 50 behind it
+#   OFDM err    15-25% even when healthy (it counts other BSSs mgmt frames at low
+#               rate) -> REPORTED, never an alarm axis. A naive "err>0 is bad" leg
+#               would fire permanently.
+PHY_PY='
+import sys, re, json, math
+
+def ints(pat, body, n):
+    m = re.search(pat, body)
+    if not m: return None
+    g = m.groups()[:n]
+    try: return [int(x) for x in g]
+    except ValueError: return None
+
+samples, bad, timeouts, frozen = [], 0, 0, 0
+prev_key = None
+for blk in sys.stdin.read().split("===SAMPLE ")[1:]:
+    head, _, body = blk.partition("\n")
+    m = re.match(r"(\S+)\s+rc=(\d+)", head)
+    ts = m.group(1) if m else ""
+    rc = int(m.group(2)) if m else 1
+    if rc != 0:
+        timeouts += 1; continue
+    beacon = ints(r"\[Rx Beacon Count\]\s*=\s*(\d+)", body, 1)
+    cca    = ints(r"CCA \(CCK, OFDM, Total\) = \((\d+), (\d+), (\d+)\)", body, 3)
+    fa     = ints(r"False Alarm \(CCK, OFDM, Total\) = \((\d+), (\d+), (\d+)\)", body, 3)
+    cnt    = {}
+    for mod in ("CCK", "OFDM", "HT", "VHT"):
+        cnt[mod] = ints(r"\* %s cnt \(ok, err\) = \((\d+), (\d+)\)" % mod, body, 2)
+    if beacon is None or cca is None or fa is None or any(v is None for v in cnt.values()):
+        bad += 1; continue
+    key = (tuple(beacon), tuple(cca), tuple(fa), tuple(tuple(v) for v in cnt.values()))
+    if key == prev_key:
+        # Same DM cycle re-read, not a second observation of the air. Counting it
+        # would fake an independent confirmation of whatever that cycle said.
+        frozen += 1; continue
+    prev_key = key
+    rssi = re.search(r"\[RSSI\(dBm\)\]\s*=\s*\{(-?\d+)", body)
+    samples.append({
+        "ts": ts, "beacon": beacon[0],
+        "cca_cck": cca[0], "cca_total": cca[2],
+        "fa_cck": fa[0], "fa_total": fa[2],
+        "cnt": cnt,
+        "rssi": int(rssi.group(1)) if rssi else None,
+        "link": "Is link = Y" in body,
+    })
+
+n = len(samples)
+out = {"samples": n, "frozen": frozen, "timeouts": timeouts, "unparsed": bad}
+
+if n == 0:
+    if timeouts and timeouts >= (frozen + bad + 1):
+        out["verdict"] = "BLIND"; out["reason"] = "every phy_info read timed out (to=%d)" % timeouts
+    elif frozen:
+        out["verdict"] = "STALE"
+        out["reason"] = "counter block identical across %d reads — DM watchdog not cycling (scan in flight, or the device stopped answering)" % (frozen + 1)
+    else:
+        out["verdict"] = "BLIND"; out["reason"] = "no parseable phy_info sample (unparsed=%d)" % bad
+    print(json.dumps(out)); sys.exit(0)
+
+def fa_cca(s):
+    return (s["fa_total"] / s["cca_total"]) if s["cca_total"] else None
+
+beacons = [s["beacon"] for s in samples]
+fr = [x for x in (fa_cca(s) for s in samples) if x is not None]
+pool_cca = sum(s["cca_total"] for s in samples)
+pool_fa  = sum(s["fa_total"] for s in samples)
+cck_samples = sum(1 for s in samples if s["cca_cck"] > 0)
+rssis = [s["rssi"] for s in samples if s["rssi"] is not None]
+
+BURST_BEACON, FA_BURST, FA_POOL_HIGH, HT_ERR_HIGH, HT_N_MIN = 13, 0.60, 0.45, 0.15, 50
+bursty = [s for s in samples if s["beacon"] <= BURST_BEACON or (fa_cca(s) or 0) >= FA_BURST]
+
+err = {}
+for mod in ("CCK", "OFDM", "HT", "VHT"):
+    ok  = sum(s["cnt"][mod][0] for s in samples)
+    e   = sum(s["cnt"][mod][1] for s in samples)
+    err[mod] = {"ok": ok, "err": e, "n": ok + e,
+                "ratio": (e / (ok + e)) if (ok + e) else None}
+
+pooled_fa = (pool_fa / pool_cca) if pool_cca else None
+ht = err["HT"]
+ht_alarm = ht["n"] >= HT_N_MIN and ht["ratio"] is not None and ht["ratio"] >= HT_ERR_HIGH
+
+if len(bursty) >= max(2, math.ceil(0.25 * n)):
+    verdict = "STORMY"
+elif bursty or (pooled_fa is not None and pooled_fa >= FA_POOL_HIGH) or ht_alarm:
+    verdict = "NOISY"
+else:
+    verdict = "CLEAN"
+if not any(s["link"] for s in samples):
+    verdict = "UNLINKED"
+# A burst that advanced the counter block fewer than twice is not a reading of the
+# air, it is one DM cycle re-read: the watchdog was not cycling (scan in flight, or
+# the device stopped answering). Say STALE — never let it land as CLEAN off n=1.
+if (n + frozen) >= 3 and n < 2:
+    verdict = "STALE"
+    out["reason"] = "counter block advanced %d time(s) across %d reads — DM watchdog not cycling (scan in flight, or the device stopped answering)" % (n, n + frozen)
+
+out.update({
+    "verdict": verdict,
+    "beacon_min": min(beacons), "beacon_max": max(beacons),
+    "beacon_med": sorted(beacons)[len(beacons) // 2],
+    "burst_samples": len(bursty),
+    "fa_cca_max": round(max(fr), 3) if fr else None,
+    "fa_cca_pooled": round(pooled_fa, 3) if pooled_fa is not None else None,
+    "cck_energy_samples": cck_samples,
+    "err": {k: (round(v["ratio"], 4) if v["ratio"] is not None else None) for k, v in err.items()},
+    "err_n": {k: v["n"] for k, v in err.items()},
+    "rssi_med": sorted(rssis)[len(rssis) // 2] if rssis else None,
+})
+print(json.dumps(out))
+'
+
+if [ "${1:-}" = --phy ]; then
+  PHY_JSON=0; [ "${2:-}" = --json ] && PHY_JSON=1
+  TS_PHY=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  ppath="$(phy_path)" || {
+    echo "mesh-wifi-rf --phy: no rtw88 phy_info on this node (or no passwordless root) — no PHY sense here" >&2
+    exit 2
+  }
+  t0=$(date +%s)
+  agg="$(phy_burst "$ppath" | python3 -c "$PHY_PY" 2>/dev/null)"
+  span=$(( $(date +%s) - t0 ))
+  [ -n "$agg" ] || { echo "mesh-wifi-rf --phy: aggregation failed" >&2; exit 1; }
+  phyname="$(printf '%s' "$ppath" | awk -F/ '{print $(NF-2)}')"
+  if [ "$PHY_JSON" = 1 ]; then
+    printf '%s' "$agg" | python3 -c '
+import sys, json
+d = json.load(sys.stdin)
+d["path"] = sys.argv[1]; d["phy"] = sys.argv[2]
+d["window_s"] = d["samples"] * int(sys.argv[3]); d["span_s"] = int(sys.argv[4])
+d["ts"] = sys.argv[5]
+print(json.dumps(d))' "$ppath" "$phyname" "$PHY_GAP" "$span" "$TS_PHY"
+  else
+    printf '%s' "$agg" | python3 -c '
+import sys, json
+d = json.load(sys.stdin)
+gap, span, phy = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
+v = d["verdict"]
+if d["samples"] == 0:
+    body = d.get("reason", "")
+else:
+    def pct(x): return "n/a" if x is None else "%.0f%%" % (100 * x)
+    body = ("beacons %d/%d/%d (min/med/max, 19-20 healthy) fa/cca max=%s pooled=%s "
+            "cck-energy=%d/%d bursty=%d/%d ht_err=%s (n=%d) ofdm_err=%s (n=%d, informational) rssi=%sdBm") % (
+        d["beacon_min"], d["beacon_med"], d["beacon_max"],
+        ("%.2f" % d["fa_cca_max"]) if d["fa_cca_max"] is not None else "n/a",
+        ("%.2f" % d["fa_cca_pooled"]) if d["fa_cca_pooled"] is not None else "n/a",
+        d["cck_energy_samples"], d["samples"], d["burst_samples"], d["samples"],
+        pct(d["err"]["HT"]), d["err_n"]["HT"], pct(d["err"]["OFDM"]), d["err_n"]["OFDM"],
+        d["rssi_med"] if d["rssi_med"] is not None else "n/a")
+# window= is the coverage claim: samples actually observed x the DM window, over the
+# wallclock span they were taken in. A consumer must never read it as a state.
+print("[wifi-phy] %s — %s [window=%ds/%ds samples=%d frozen=%d to=%d unparsed=%d phy=%s]" % (
+    v, body, d["samples"] * gap, span, d["samples"], d["frozen"], d["timeouts"], d["unparsed"], phy))
+' "$PHY_GAP" "$span" "$phyname"
+  fi
+  exit 0
+fi
+
 if [ "${1:-}" = --test ]; then
   f=0
   # (1) PURE parser fixture — deterministic, no hardware needed
@@ -135,6 +379,49 @@ EOF
   printf 'Inter-| sta-|   Quality\n face | tus | link\n' > "$td/empty"
   row_empty="$(python3 -c "$PARSE_PY" "$td/empty" "" 2>/dev/null)"
   [ -z "$row_empty" ] || { echo "  FAIL: header-only file must parse to empty (got: '$row_empty')"; f=1; }
+
+  # (1b) PHY AGGREGATOR fixtures — pure stdin->verdict, no hardware.
+  # phy_sample <beacon> <cck_cca> <ofdm_cca> <cck_fa> <ofdm_fa> <ht_ok> <ht_err>
+  phy_sample() {
+    printf '===SAMPLE 2026-01-01T00:00:00Z rc=0\nIs link = Y\n[Rx Beacon Count] = %s\n[RSSI(dBm)] = {-62, -49}\n' "$1"
+    printf ' * CCA (CCK, OFDM, Total) = (%s, %s, %s)\n' "$2" "$3" "$(( $2 + $3 ))"
+    printf ' * False Alarm (CCK, OFDM, Total) = (%s, %s, %s)\n' "$4" "$5" "$(( $4 + $5 ))"
+    printf ' * CCK cnt (ok, err) = (8, 0)\n * OFDM cnt (ok, err) = (100, 22)\n'
+    printf ' * HT cnt (ok, err) = (%s, %s)\n * VHT cnt (ok, err) = (5, 0)\n' "$6" "$7"
+  }
+  phy_field() { python3 -c 'import sys,json; print(json.load(sys.stdin)[sys.argv[1]])' "$1"; }
+
+  # healthy burst (calibrated to the live corpus: beacons 19-20, fa/cca ~0.2, cck cca 0)
+  healthy="$( { for b in 20 19 20 19 20; do phy_sample "$b" 0 800 0 170 800 40; done; } | python3 -c "$PHY_PY")"
+  [ "$(printf '%s' "$healthy" | phy_field verdict)" = "CLEAN" ] \
+    || { echo "  FAIL: healthy fixture should be CLEAN (got: $healthy)"; f=1; }
+  # OFDM err is 22% in that fixture and must NOT alarm — it is 15-25% on healthy air
+  [ "$(printf '%s' "$healthy" | phy_field samples)" = 5 ] \
+    || { echo "  FAIL: healthy fixture should yield 5 samples (got: $healthy)"; f=1; }
+
+  # burst window: beacon loss + CCK energy from nothing + FA above CCA
+  stormy="$( { phy_sample 20 0 800 0 170 800 40; phy_sample 8 59 411 97 71 133 4
+               phy_sample 11 64 1090 113 721 110 7; phy_sample 10 143 2575 406 2139 6 0
+               phy_sample 20 0 700 0 160 700 30; } | python3 -c "$PHY_PY")"
+  [ "$(printf '%s' "$stormy" | phy_field verdict)" = "STORMY" ] \
+    || { echo "  FAIL: burst fixture should be STORMY (got: $stormy)"; f=1; }
+
+  # THE FREEZE LEG: three byte-identical reads are ONE DM cycle, not three
+  # confirmations. All-identical must read STALE, never CLEAN.
+  froz="$( { phy_sample 20 0 800 0 170 800 40; phy_sample 20 0 800 0 170 800 40
+             phy_sample 20 0 800 0 170 800 40; } | python3 -c "$PHY_PY")"
+  [ "$(printf '%s' "$froz" | phy_field verdict)" = "STALE" ] \
+    || { echo "  FAIL: identical-counter burst must be STALE, not a calm (got: $froz)"; f=1; }
+  [ "$(printf '%s' "$froz" | phy_field frozen)" = 2 ] \
+    || { echo "  FAIL: frozen count should be 2 (got: $froz)"; f=1; }
+  [ "$(printf '%s' "$froz" | phy_field samples)" = 1 ] \
+    || { echo "  FAIL: a frozen re-read must not count as a second sample (got: $froz)"; f=1; }
+
+  # every read timed out -> BLIND, never CLEAN
+  blind="$(printf '===SAMPLE 2026-01-01T00:00:00Z rc=124\n\n===SAMPLE 2026-01-01T00:00:02Z rc=124\n\n' | python3 -c "$PHY_PY")"
+  [ "$(printf '%s' "$blind" | phy_field verdict)" = "BLIND" ] \
+    || { echo "  FAIL: all-timeout burst must be BLIND (got: $blind)"; f=1; }
+
   [ "$f" = 0 ] || { echo "smoke-test: FAIL"; exit 1; }
 
   # (2) REAL-READ GATE: on THIS node, assert a live /proc/net/wireless read produces numeric fields.
@@ -144,8 +431,27 @@ EOF
   fi
   live_row="$(read_wireless)" || { echo "smoke-test: n/a (no associated wireless interface — no WiFi RF sense here)"; exit 2; }
   live_level="$(printf '%s' "$live_row" | awk '{print $3}')"
+
+  # (3) LIVE PHY GATE — where an rtw88 phy_info exists, assert a REAL burst read
+  # yields parseable counters. A node without that node (any other driver, or no
+  # passwordless root) honestly has no PHY lane; that is n/a for this leg only, not
+  # a FAIL, so the tool stays portable and the /proc lane above still gates.
+  phy_note="phy: n/a (no rtw88 phy_info here)"
+  if ppath="$(phy_path)"; then
+    # PHY_READS/PHY_GAP were bound at load time from the env, so an env prefix on the
+    # call would NOT rebind them (`export-does-not-rebind-a-load-time-global`) — the
+    # gate would silently run a full 10-read/20s burst. Set the shell vars.
+    live_phy="$(PHY_READS=3 PHY_GAP=2; phy_burst "$ppath" | python3 -c "$PHY_PY" 2>/dev/null)"
+    lv="$(printf '%s' "$live_phy" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("verdict",""))' 2>/dev/null)"
+    case "$lv" in
+      CLEAN|NOISY|STORMY|STALE|UNLINKED) phy_note="phy: LIVE $lv ($live_phy)" ;;
+      "") echo "  FAIL: live phy_info burst produced no verdict (got: '$live_phy')"; exit 1 ;;
+      *)  echo "  FAIL: live phy_info burst read nothing usable — $lv ($live_phy)"; exit 1 ;;
+    esac
+  fi
+
   case "$live_level" in
-    -[0-9]*|[0-9]*) echo "smoke-test: ok (fixture parse + classify unit + LIVE read: $live_row)"; exit 0 ;;
+    -[0-9]*|[0-9]*) echo "smoke-test: ok (fixture parse + classify unit + LIVE read: $live_row; $phy_note)"; exit 0 ;;
     *) echo "  FAIL: live read did not yield a numeric level (got: '$live_row')"; exit 1 ;;
   esac
 fi
