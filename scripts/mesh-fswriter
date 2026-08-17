@@ -10,6 +10,10 @@
 #   mesh-fswriter [--window S] <path>...   watch those artifacts, print+log every write's writer
 #   mesh-fswriter --last <path>            last recorded writer for <path> (exit 2 if never observed)
 #   mesh-fswriter --test                   smoke test (exit 2 where fanotify cannot be armed)
+#   MESH_FSWRITER_LOG=<path>               consumer sink (keeps a sweep out of the durable record)
+#
+# FOR A CONSUMER ARMING THIS AROUND SOMEONE ELSE'S RUN: it announces `armed N artifact(s)` on STDERR
+# once the marks are set — block on that line, never on a sleep. stdout carries the attribution rows.
 #
 # ARMING NEEDS ROOT, LISTENING DOES NOT (measured, brief §"the privilege is needed to ARM"): the
 # process re-execs itself under `sudo -n`, calls fanotify_init + fanotify_mark, then setuid()s back to
@@ -30,6 +34,10 @@
 #    comm still reads), a kernel thread, an argv-less process — so each gets a sentinel and cmd is
 #    never blank. CLOSE_WRITE is the last event a writer emits, i.e. the newest row for a path is
 #    systematically the exit row, so --last replays the RICHEST row for that pid, not the newest.
+#    And because a SHORT-LIVED writer has no argv left by the time its event is dequeued — the whole
+#    shape a test-forgery sweep hunts — every row also carries `sid=`, the writer's session id: it
+#    survives the argv teardown and it is INHERITED, so a consumer that runs its subject under
+#    `setsid` attributes by kernel-maintained membership (children included) instead of by substring.
 # No fanotify (or no `sudo -n`) → honest exit 2. Never a silent fallback to mtime or inotify.
 # orphan-ok: on-demand attribution probe — invoked by a mind or a consumer, deliberately not cronned
 # (a standing node-wide writer census is a different, costlier tool; this one is scoped to named files)
@@ -45,7 +53,10 @@ METADATA_VERSION   = 3
 EV_HDR             = struct.Struct("IBHQiI")   # event_len,vers,_,metadata_len,mask,fd,pid  (24 B)
 
 HOME = os.path.expanduser("~")
-LOG_DEFAULT = os.path.join(HOME, ".mesh", "fswriter.log")
+# MESH_FSWRITER_LOG lets a CONSUMER (mesh-test-forgery) point attribution at its own sink instead of
+# reaching for the internal --_log flag — and keeps a sweep's rows out of the durable record a human
+# reads with --last. Read here, before the sudo re-exec, so it survives sudo's env scrub as --_log.
+LOG_DEFAULT = os.environ.get("MESH_FSWRITER_LOG") or os.path.join(HOME, ".mesh", "fswriter.log")
 
 
 def usage():
@@ -81,7 +92,23 @@ def proc_state(pid):
 
 
 def identify(pid):
-    """comm + cmdline, read AT EVENT TIME. An exited writer is unknown, never attributed.
+    """(comm, cmd, sid) read AT EVENT TIME. An exited writer is unknown, never attributed.
+
+    ORDER IS THE MEASUREMENT HERE, and it is not a micro-optimisation — it is the difference between
+    naming the writer and naming nobody. /proc/<pid>/stat is read FIRST, and yields comm AND the
+    session from ONE open, because the writer this exists to name is typically a process that appends
+    a line and exits: the whole identity window is about two syscalls wide. Measured on this node
+    against 16 one-line-and-exit writers, each a cold wake for the listener: stat first → 16/16
+    named; the same code reading comm+cmdline before stat → 0/16, every row sid=-1. (fanotify MERGES
+    the MODIFY and CLOSE_WRITE of one such writer into a single queued event, so there is no second
+    event to learn the identity from — a cache across events was tried and measured to add exactly
+    nothing, 15/16 either way, and was removed.) A few percent are still lost under load; that is a
+    -1, which attributes NOBODY. It is never the wrong one.
+    THE SESSION ID IS THE ATTRIBUTION KEY (mesh-test-forgery): unlike argv it survives mm teardown,
+    and unlike the pid it is INHERITED, so it also names a write done by a CHILD of a run — a
+    `touch`/`date >>` whose own argv never mentions the tool. -1 means unreadable, never 0 — 0 is a
+    real session (kernel threads). A lost race renders -1, which attributes NOBODY; it never
+    attributes the wrong one.
 
     AN EMPTY /proc/<pid>/cmdline IS THREE DIFFERENT FACTS and blank renders them alike. The kernel
     zeroes argv during exit while /proc/<pid>/comm still reads (measured: a zombie reads state=Z,
@@ -89,10 +116,24 @@ def identify(pid):
     CLOSE_WRITE, is systematically the least-identified row. Each fact gets its own sentinel; the
     row stays an honest record of what /proc said at that instant, and the enrichment lives in the
     query (last()), never in a fabricated value here."""
+    st, comm, sid = None, "", -1
     try:
-        comm = open("/proc/%d/comm" % pid).read().strip()
+        st = open("/proc/%d/stat" % pid).read()          # comm + session, one read, first
     except OSError:
-        return "<exited>", "<exited>"
+        pass
+    if st:
+        i, j = st.find("("), st.rfind(")")
+        comm = st[i + 1:j] if 0 <= i < j else ""
+        tail = st[j + 1:].split()                        # tail[3] = session (field 6)
+        try:
+            sid = int(tail[3])
+        except (IndexError, ValueError):
+            sid = -1
+    if not comm:
+        try:
+            comm = open("/proc/%d/comm" % pid).read().strip()
+        except OSError:
+            return "<exited>", "<exited>", sid
     try:
         cmd = open("/proc/%d/cmdline" % pid, "rb").read().replace(b"\0", b" ").decode(
             "utf-8", "replace").strip()
@@ -103,7 +144,7 @@ def identify(pid):
         cmd = ("<kthread>" if kthread else                        # never had an argv
                "<exiting>" if state in ("Z", "X") or not has_mm   # mm torn down: argv already gone
                else "<no-argv>")                                  # alive, holding an empty argv
-    return comm or "<exited>", cmd
+    return comm or "<exited>", cmd, sid
 
 
 def listen(paths, window, logpath):
@@ -135,6 +176,15 @@ def listen(paths, window, logpath):
         os.setuid(uid)                      # privilege gone; the fd keeps delivering
         os.environ["HOME"] = pwd.getpwuid(uid).pw_dir
 
+    # READINESS, on stderr, once the marks are set: a consumer that must not miss the first write
+    # (mesh-test-forgery arms this around a --test run) needs a handshake, not a sleep — a sleep
+    # that is a hair too short drops the very event the consumer exists to catch, and drops it
+    # SILENTLY, reading as "nobody wrote it". stderr, because stdout is the attribution stream and
+    # its first line is a parseable row by contract. Kernel-queued from this instant, so announcing
+    # before the stall/read loop is honest: armed is what the consumer needs, not reading.
+    sys.stderr.write("mesh-fswriter: armed %d artifact(s)\n" % len(marked))
+    sys.stderr.flush()
+
     stall = float(os.environ.get("MESH_FSWRITER_TEST_STALL", 0))   # --test only: prove NOTIF blocks
     if stall:                                                      # nothing while we are not reading
         time.sleep(stall)
@@ -146,8 +196,9 @@ def listen(paths, window, logpath):
     def flush():
         nonlocal cur
         if cur:
-            (path, pid, comm, cmd), n, (ts, _mono) = cur
-            line = '%s fswriter pid=%d comm=%s n=%d path=%s cmd="%s"' % (ts, pid, comm, n, path, cmd)
+            (path, pid, sid, comm, cmd), n, (ts, _mono) = cur
+            line = '%s fswriter pid=%d sid=%d comm=%s n=%d path=%s cmd="%s"' % (
+                ts, pid, sid, comm, n, path, cmd)
             print(line, flush=True)
             log.write(line + "\n")
             log.flush()
@@ -167,6 +218,9 @@ def listen(paths, window, logpath):
                 sys.stderr.write("mesh-fswriter: kernel fanotify metadata v%d != %d — refusing to "
                                  "guess the struct\n" % (vers, METADATA_VERSION))
                 return 2
+            # IDENTITY FIRST, path second: the writer may be exiting, the event fd cannot. Every
+            # syscall spent before reading /proc is a chance for the task to be reaped.
+            comm, cmd, sid = identify(pid)  # inside the loop — late is a recycled-pid risk
             path = "<unresolved>"
             if evfd >= 0:
                 try:
@@ -174,8 +228,7 @@ def listen(paths, window, logpath):
                 except OSError:
                     pass
                 os.close(evfd)
-            comm, cmd = identify(pid)       # inside the loop — late is a recycled-pid risk
-            key = (path, pid, comm, cmd)
+            key = (path, pid, sid, comm, cmd)
             if cur and cur[0] == key:
                 cur = (key, cur[1] + 1, cur[2])
             else:
@@ -189,7 +242,8 @@ def listen(paths, window, logpath):
     return 0
 
 
-ROW_RE = re.compile(r"^(?P<ts>\S+) fswriter pid=(?P<pid>\d+) comm=(?P<comm>\S+) n=\d+ "
+ROW_RE = re.compile(r"^(?P<ts>\S+) fswriter pid=(?P<pid>\d+) sid=(?P<sid>-?\d+) "
+                    r"comm=(?P<comm>\S+) n=\d+ "
                     r"path=(?P<path>.*) cmd=\"(?P<cmd>.*)\"$")
 
 
@@ -262,13 +316,14 @@ def smoke():
 
     # leg 1 — REAL attribution: the recorded pid must be the writer child's pid, exactly.
     # Falsify: report os.getpid() instead of the event's pid → the pids differ, red.
-    out, wpid = run(5, writer=["bash", "-c", "echo hi >> %s" % watched])
+    out, wpid = run(3, writer=["bash", "-c", "echo hi >> %s" % watched])
     if ("pid=%d " % wpid) not in out or "comm=bash" not in out:
         print("  FAIL: leg1 — event must name the writer pid=%s comm=bash; got:\n%s" % (wpid, out))
         f = 1
     # leg 1b — the row is a parseable record, not a repr. Falsify: print the (ts, mono) tuple the
     # coalescer carries instead of its ts field → the line opens with "('2026-…', 178…)", red.
-    if not re.match(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ fswriter pid=\d+ comm=\S+ n=\d+ path=/",
+    if not re.match(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ fswriter pid=\d+ sid=\d+ comm=\S+ n=\d+ "
+                    r"path=/",
                     out.strip().splitlines()[0] if out.strip() else ""):
         print("  FAIL: leg1b — attribution row must start with an ISO ts and parseable fields; got:\n"
               "%s" % out)
@@ -276,7 +331,7 @@ def smoke():
 
     # leg 2 — SCOPE: an inode mark must NOT report a write to an unwatched file on the same mount.
     # Falsify: swap FAN_MARK_ADD for FAN_MARK_ADD|FAN_MARK_MOUNT → the decoy shows up, red.
-    out, _ = run(4, writer=["bash", "-c", "echo x >> %s" % decoy])
+    out, _ = run(3, writer=["bash", "-c", "echo x >> %s" % decoy])
     if "decoy" in out:
         print("  FAIL: leg2 — inode mark leaked a write to an unwatched path on the same mount:\n%s"
               % out)
@@ -322,7 +377,7 @@ def smoke():
     # exit row renders cmd="" (an argv-less process and a kernel thread's own bytes), red.
     # (the trailing `true` stops bash tail-exec'ing into sleep — mid-execve the argv is momentarily
     #  empty on a LIVE process, which is a real third state but not the one this leg is aiming at)
-    out, wpid = run(8, writer=["bash", "-c", "exec 3>>%s; echo hi >&3; sleep 2; true" % watched])
+    out, wpid = run(6, writer=["bash", "-c", "exec 3>>%s; echo hi >&3; sleep 2; true" % watched])
     mine = [l for l in out.splitlines() if ("pid=%d " % wpid) in l]
     if any('cmd=""' in l for l in out.splitlines()):
         print("  FAIL: leg6 — an empty cmdline was rendered blank; a departing writer, a kernel "
@@ -343,13 +398,86 @@ def smoke():
               "(rc=%d out=%s)" % (wpid, p.returncode, p.stdout))
         f = 1
 
+    # leg 8 — THE HANDSHAKE IS THE SYNCHRONIZATION. A consumer that arms this around someone else's
+    # run must know the mark is set before starting them; a fixed sleep that is a hair short drops
+    # the first write and reads as "nobody wrote it". Drive it the way mesh-test-forgery does: block
+    # on the stderr readiness line, THEN write, and require the write to be attributed.
+    # Falsify: delete the announce in listen() → readline() returns only at process exit (bounded by
+    # the window), the write lands before the assert can order itself, and the leg goes red.
+    p = subprocess.Popen([sys.executable, os.path.abspath(__file__), "--_log", logp,
+                          "--window", "3", watched], stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, env=env, text=True)
+    ready = p.stderr.readline()
+    if "armed" not in ready:
+        print("  FAIL: leg8 — no readiness line before the consumer's write (got %r); a consumer "
+              "can only fall back to a blind sleep" % ready)
+        f = 1
+    subprocess.call(["bash", "-c", "echo handshook >> %s" % watched])
+    out = p.communicate()[0]
+    if "handshook" not in open(watched).read() or "pid=" not in out:
+        print("  FAIL: leg8 — a write issued strictly after the readiness line was not "
+              "attributed:\n%s" % out)
+        f = 1
+
+    # leg 9 — MESH_FSWRITER_LOG is the consumer's sink, and taking it must leave the durable record
+    # alone. Falsify: read the env after the sudo re-exec (scrubbed) or ignore it → rows land in
+    # ~/.mesh/fswriter.log, the size moves, red — and a sweep would be polluting the log --last reads.
+    envlog, real = T + "/envlog", LOG_DEFAULT
+    real_sz = os.path.getsize(real) if os.path.exists(real) else -1
+    p = subprocess.Popen([sys.executable, os.path.abspath(__file__), "--window", "3", watched],
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                         env=dict(env, MESH_FSWRITER_LOG=envlog))
+    p.stderr.readline()
+    subprocess.call(["bash", "-c", "echo viaenv >> %s" % watched])
+    p.communicate()
+    if not os.path.exists(envlog) or "pid=" not in open(envlog).read():
+        print("  FAIL: leg9 — MESH_FSWRITER_LOG did not receive the attribution rows")
+        f = 1
+    now_sz = os.path.getsize(real) if os.path.exists(real) else -1
+    if now_sz != real_sz:
+        print("  FAIL: leg9 — the durable record %s grew while a consumer sink was set (%s → %s)"
+              % (real, real_sz, now_sz))
+        f = 1
+
+    # leg 10 — SESSION ATTRIBUTION, AND WHAT IT COSTS TO READ /proc LATE. Eight short-lived writers,
+    # each a shell that appends one line and exits at once, SPACED so every one is a COLD WAKE for
+    # the listener — a back-to-back burst is drained inside one already-awake read loop and never
+    # loses the race, i.e. an unspaced fixture silently stops testing the hard case (it was written
+    # unspaced first, and the read-order mutant passed it). Two claims, and only the first is
+    # absolute: a recorded sid is NEVER the wrong one, and most of them are recorded.
+    # Falsify: read comm+cmdline before stat (the natural order) → 0 of 16 named in the same
+    # harness, so this goes red on the majority assert every time.
+    sidf = T + "/sid"
+    out, _ = run(6, writer=["setsid", "bash", "-c",
+                            "echo $$ > %s; for i in 1 2 3 4 5 6 7 8; do "
+                            "bash -c 'echo quick >> %s'; sleep 0.3; done" % (sidf, watched)])
+    time.sleep(0.3)
+    leader = open(sidf).read().strip() if os.path.exists(sidf) else "?"
+    sids = re.findall(r" sid=(-?\d+) ", out)
+    wrong = [x for x in sids if x not in (leader, "-1")]
+    named = [x for x in sids if x == leader]
+    if wrong:
+        print("  FAIL: leg10 — a row was attributed to session %s; every writer here belongs to %s "
+              "and a lost race must render -1, never another session:\n%s" % (wrong[0], leader, out))
+        f = 1
+    if len(named) < 6:
+        print("  FAIL: leg10 — only %d of %d writers were named (need the identity read to win the "
+              "race for most of them; stat must be read FIRST):\n%s" % (len(named), len(sids), out))
+        f = 1
+    if not any(('cmd="<' in l) for l in out.splitlines()):
+        print("  FAIL: leg10 — expected the argv to be GONE for this shape (that is why sid exists); "
+              "if it is now present, the leg no longer covers the hard case:\n%s" % out)
+        f = 1
+
     subprocess.call(["rm", "-rf", T])
     if f:
         print("smoke-test: FAIL (see asserts above)")
         return 1
     print("smoke-test: ok (writer pid+comm exact + inode mark does not leak the mount + NOTIF blocks "
           "no write + silent window attributes nobody + --last replays / exits 2 unobserved + a "
-          "departing writer is <exiting>, never blank, and --last prefers its named row)")
+          "departing writer is <exiting>, never blank, and --last prefers its named row + a consumer "
+          "gets a readiness handshake, not a sleep, its own sink leaves the record alone, and a "
+          "one-line-and-exit writer is still attributed by sid where its argv is already gone)")
     return 0
 
 
