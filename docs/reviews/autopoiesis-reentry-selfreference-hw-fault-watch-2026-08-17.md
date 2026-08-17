@@ -162,6 +162,19 @@ Two consequences worth naming:
 | annotate every driver, not just radio | the nvme leg |
 | `--selfprobe` ignores the seconds window | late-second leg (see below) |
 
+Five more, added with the `--legs` speed-up and each seen RED from a scratch copy: a non-exclusive
+fixture override (falls through to the live source) · an unknown leg name accepted · the
+module-settles short-circuit removed (reports a journal count it never read) · the leg filter
+ignored (`--legs rtw` reports all ten, silently costing the 26s scan) · plus the exactly-once and
+opposite-sides classification legs the fixture now drives.
+
+**One of those mutants survived, and the reason is the finding.** `--legs rtw` **never ran inside
+`--test`**: its guard was `lsmod | grep -qiE '^rtw'`, and this script runs under `set -o pipefail`,
+so `grep -q` exiting at the first match SIGPIPEs `lsmod` and the pipeline returns **141** — false —
+on a node with four rtw modules loaded. The block I had just written and called *live coverage* was
+skipped in silence, and the leg-filter mutant sailed through green. Written with `grep -c` and a
+count compare, it runs and the mutant goes red. (`pipefail-turns-sigpipe-into-a-false-verdict`.)
+
 The `--selfprobe` gate is the substantive one: a synthetic log with faults **planted** inside the
 scan window must rank `mesh-wifiscan` LEAD at ≥3x, and a **phase-uniform control log** of the same
 size must not (≤2x). A report that cannot fail on uniform noise is a decoration.
@@ -176,11 +189,35 @@ reads ~0x; the mutant reads a full hit. Added, and the mutant now goes RED.
 
 **Cost:** the new legs are free. `--test` measured **33.06s at HEAD** and **33.13s after** (the
 `--selfprobe` null runs at a coarse `MESH_HW_FAULT_SHIFT_STEP=60` under test, 7s in real use).
-That measurement surfaced a **pre-existing** fact worth its own line: `mesh-autowire:273` gates on
-`timeout 30 "$tool" --test`, and this tool's suite has been over that gate before this change. It
-sits in cron already (autowire is add-only) so nothing is currently broken — but a fresh node would
-never wire it. Reported as `[fyi]`, not fixed here: shrinking an unrelated 33s suite is not this
-task's scope.
+
+That measurement surfaced a **pre-existing** fact first reported as an out-of-scope `[fyi]` — and it
+turned out to be the thing blocking this work from landing at all, so it is **fixed here**:
+
+> **A suite that cannot finish inside its runners' timeout is unlandable and unwirable.** Both
+> `mesh-land:288` (the unattended `--autoland` arm) and `mesh-autowire:273` gate on
+> `timeout 30 <tool> --test`. Measured RED: `timeout 30 … --test` → **rc=124**. The tool sits in
+> cron already (autowire is add-only), so nothing looked broken — the runners simply record a
+> failing test, and the fix above would have stranded silently every tick.
+
+Profiled rather than guessed: **31.7s of the 33.4s was `--legs`**, none of it this task's code.
+Two measurements decided the shape — `journalctl -k -b` is **376685 lines / 26.0s** on this node
+(the rtw storm this very tool watches writes ~37k lines a day into it), and the cost is **proving
+ABSENCE**: `-g rtw -n 1` returns in **0.01s** because the backwards read hits a match immediately,
+while `-g iwlwifi -n 1` still scans the whole boot at **22.5s**. The old shape paid the full read
+unconditionally and then re-piped the 376k-line result through `grep -c` **once per leg**.
+
+- **modules first** — a loaded module settles presence with no journal read at all, and the report
+  now prints `journal-lines=not-read[module settles presence]` rather than `0`, because a `0` on a
+  demonstrably-present driver is a fabricated absence.
+- **one journal pass for all still-undecided legs**, streamed into a single `awk` (`tolower()`, not
+  gawk's `IGNORECASE` — this node's awk is mawk).
+- **`--legs [leg…]`** — ask about one leg and pay only its cost (0.01s live). Unknown names exit 2
+  rather than reading as absent hardware.
+
+`--test` **33.37s → 2.28s** (`timeout 30` now rc=0). The full live report still costs ~26s, which is
+the honest price of proving two INERT legs absent; the suite no longer pays it, driving the
+classification from **exclusive** fixture sources (`MESH_HW_FAULT_LEGS_MODSRC`/`_JRNLSRC`) with the
+live path covered separately by the now-free single-leg read.
 
 ## 5. What this does NOT establish
 
