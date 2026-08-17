@@ -10,6 +10,14 @@
 #   mesh-tg-typing --test    dependency + dry-run test (no real send)
 set -uo pipefail
 
+# SELF — an ABSOLUTE path to THIS file. start() and --test re-invoke the tool as a child; a bare "$0"
+# has no slash when the tool is run off PATH, so bash resolves it THROUGH PATH and the child is the
+# DEPLOYED copy, not the file under test. Caught live 2026-08-17 while fixing this very tool: `bash
+# mesh-tg-typing --test` from scripts/ spawned the deployed OLD loop, and the new gate correctly
+# reported a survivor that the new code does not produce. A test that runs a different file than the
+# one you edited cannot gate the edit.
+SELF="$(cd "$(dirname "$0")" 2>/dev/null && pwd)/$(basename "$0")"
+
 ENVF="$HOME/.config/remote-access/env"
 PIDFILE="${MESH_TG_TYPING_PIDFILE:-$HOME/.mesh/.tg-typing.pid}"
 INTERVAL="${MESH_TG_TYPING_INTERVAL:-4}"
@@ -66,14 +74,30 @@ loop() {
   # dedup then can't see it, so every ingress spawns another survivor → unbounded leak (123 zombies +
   # held doctor lock + 28h operator typing-flood, 2026-06-21). exit-on-signal makes --stop actually stop.
   trap 'rm -f "$PIDFILE"' EXIT
-  trap 'exit 0' INT TERM
+  _sleeper=""
+  trap '[ -n "$_sleeper" ] && kill "$_sleeper" 2>/dev/null; exit 0' INT TERM
   printf '%s\n' "$$" > "$PIDFILE"
-  local waited=0
+  # SAFETY CAP IN WALL TIME, NOT ITERATIONS (tg-typing-test-leaks-an-immortal-loop, 2026-08-17).
+  # This used to be `waited=$((waited + ${INTERVAL%.*}))`. The parameter expansion strips everything
+  # from the '.', so ANY sub-second interval truncates to 0 — measured: 0.1 → 0 and 0.5 → 0 — the
+  # accumulator never moves and MAX=120 is unreachable. The loop then runs FOREVER at 10 sends/sec.
+  # That is not a hypothetical: --test itself sets INTERVAL=0.1, so the tool's own smoke test is what
+  # minted the leak; 9 such loops were found still spinning on phaedra, ages 5.6-13.6d and one 58.9d.
+  # Elapsed epoch seconds is correct for EVERY interval, integer or fractional, and it also survives a
+  # slow or hung send() — an iteration count silently assumes each pass costs exactly INTERVAL.
+  local start now
+  start="$(date +%s)"
   while :; do
     send_once || true
-    sleep "$INTERVAL"
-    waited=$((waited + ${INTERVAL%.*}))
-    [ "${waited:-0}" -ge "$MAX" ] 2>/dev/null && break   # safety cap: never refresh typing forever
+    # Interruptible sleep: backgrounded + `wait`, so a trapped TERM runs the handler IMMEDIATELY.
+    # A plain `sleep "$INTERVAL"` is a foreground child and bash defers the trap until it returns, so
+    # --stop left the process alive for up to INTERVAL seconds after returning success — which to any
+    # caller that re-checks is indistinguishable from a kill that missed.
+    sleep "$INTERVAL" & _sleeper=$!
+    wait "$_sleeper" 2>/dev/null
+    _sleeper=""
+    now="$(date +%s)"
+    [ "$((now - start))" -ge "$MAX" ] && break   # safety cap: never refresh typing forever
   done
 }
 
@@ -90,16 +114,64 @@ start() {
     MESH_TG_TYPING_CURL="$CURL_BIN" \
     MESH_TG_TYPING_PIDFILE="$PIDFILE" \
     MESH_TG_TYPING_INTERVAL="$INTERVAL" \
-    "$0" --loop >/dev/null 2>&1 &
+    "$SELF" --loop >/dev/null 2>&1 &
   echo $! > "$PIDFILE"
 }
 
+# _is_our_loop <pid> — is this pid actually OUR typing loop? A pidfile can outlive its process and the
+# number can be recycled onto something unrelated, and stop() escalates to SIGKILL. /proc/<pid>/environ
+# carries the MESH_TG_TYPING_PIDFILE start() exported, which identifies the loop exactly. If /proc is
+# unreadable we do NOT refuse to stop — an unverifiable pid is treated as ours, the pre-existing
+# behaviour; this guard only ever PREVENTS killing a stranger, never blocks a real stop.
+# NOTE ON THE READ: `[ -r /proc/<pid>/environ ]` is not "this read will succeed" — for another user's
+# process the mode bit reads TRUE and the open is still EACCES (seen live here on pid 1242). Attempt the
+# read and judge the RESULT, and put `2>/dev/null` BEFORE the input redirect: redirections apply left to
+# right, so a trailing one lands after the failing open and the denial still prints
+# ([[redirect-order-defeats-stderr-null]]). A denied read means the process is not ours anyway — our
+# loop always runs as us — so falling through to "not our loop" is the safe verdict.
+_is_our_loop() {
+  local env="/proc/$1/environ"
+  [ -e "$env" ] || return 0
+  tr '\0' '\n' 2>/dev/null < "$env" | grep -qxF "MESH_TG_TYPING_PIDFILE=$PIDFILE"
+}
+
+# stop() — kill, then PROVE it died. The old body was
+#     [ -n "$pid" ] && kill "$pid" 2>/dev/null || true; rm -f "$PIDFILE"
+# which removed the pidfile whether or not the kill landed and threw the status away, so a survivor
+# left no trace anywhere: the pidfile was gone (so start()'s dedup could not see it and every ingress
+# spawned another), stop() reported success, and the caller had nothing to check. That silence is why
+# "the kill misses on phaedra" sat unattributed. Now: bounded grace → SIGKILL → re-check, keep the
+# pidfile and return non-zero if it is STILL alive, so a leak stays visible and addressable.
 stop() {
-  if [ -f "$PIDFILE" ]; then
-    pid="$(cat "$PIDFILE" 2>/dev/null || true)"
-    [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
-    rm -f "$PIDFILE"
+  [ -f "$PIDFILE" ] || return 0
+  local pid n
+  pid="$(cat "$PIDFILE" 2>/dev/null || true)"
+  if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+    rm -f "$PIDFILE"; return 0            # stale pidfile, nothing running under it
   fi
+  if ! _is_our_loop "$pid"; then
+    echo "mesh-tg-typing: pid $pid is not our loop (recycled pidfile) — not signalling it" >&2
+    rm -f "$PIDFILE"; return 0
+  fi
+  kill "$pid" 2>/dev/null
+  n=0; while kill -0 "$pid" 2>/dev/null && [ "$n" -lt "${MESH_TG_TYPING_GRACE_TENTHS:-30}" ]; do
+    sleep 0.1; n=$((n + 1))
+  done
+  if kill -0 "$pid" 2>/dev/null; then     # ignored SIGTERM (or wedged in a send) — escalate
+    kill -9 "$pid" 2>/dev/null
+    n=0; while kill -0 "$pid" 2>/dev/null && [ "$n" -lt 20 ]; do sleep 0.1; n=$((n + 1)); done
+  fi
+  if kill -0 "$pid" 2>/dev/null; then
+    echo "mesh-tg-typing: pid $pid SURVIVED SIGTERM+SIGKILL — pidfile KEPT so the leak stays visible" >&2
+    # …and say it somewhere durable. Both live callers (mesh-voice-tx:25, mesh-tg:271) invoke --stop as
+    # `--stop >/dev/null 2>&1 || true`, so the rc AND the stderr above are swallowed on the reply path.
+    # A survivor that only reports through channels nobody reads is how 9 of these ran 5.6-58.9 days
+    # unnoticed. This branch fires only when TERM *and* KILL both failed — rare, so it may be loud.
+    command -v mesh-trace >/dev/null 2>&1 && \
+      mesh-trace "[tg-typing-leak] $(hostname): pid $pid survived SIGTERM+SIGKILL; pidfile $PIDFILE kept. Discriminator: /proc/$pid/environ carries MESH_TG_TYPING_PIDFILE=$PIDFILE — do NOT pkill -f the tool name, it matches live prod loops." >/dev/null 2>&1 || true
+    return 1
+  fi
+  rm -f "$PIDFILE"
 }
 
 test_mode() {
@@ -125,19 +197,86 @@ EOF
     MESH_TG_TYPING_PIDFILE="$tmp/pid" \
     MESH_TG_TYPING_INTERVAL=0.1 \
     MESH_TG_TYPING_LOG="$log" \
-    "$0" --start || { echo "smoke-test: FAIL (start)"; exit 1; }
+    "$SELF" --start || { echo "smoke-test: FAIL (start)"; exit 1; }
 
   sleep 0.35
 
-  MESH_TG_TYPING_PIDFILE="$tmp/pid" "$0" --stop
+  # THE GATE ASSERTS THE PROCESS, NEVER THE PIDFILE (tg-typing-test-leaks-an-immortal-loop).
+  # It used to assert `[ ! -f "$tmp/pid" ]` — an artifact stop()'s own `rm -f` guaranteed, so the test
+  # could not fail on a survivor. Proven vacuous 2026-08-17: with kill made a no-op, --test printed
+  # "smoke-test: ok" while leaving a live loop spinning at 10 sends/sec. Capture the pid FIRST, then
+  # assert it is gone.
+  loop_pid="$(cat "$tmp/pid" 2>/dev/null || true)"
+  [ -n "$loop_pid" ] || { echo "smoke-test: FAIL (no pid recorded — start() never wrote one)"; exit 1; }
+  kill -0 "$loop_pid" 2>/dev/null || { echo "smoke-test: FAIL (loop pid $loop_pid not alive before --stop)"; exit 1; }
+
+  MESH_TG_TYPING_PIDFILE="$tmp/pid" "$SELF" --stop \
+    || { echo "smoke-test: FAIL (--stop reported failure: the loop survived TERM+KILL)"; exit 1; }
+  if kill -0 "$loop_pid" 2>/dev/null; then
+    kill -9 "$loop_pid" 2>/dev/null
+    echo "smoke-test: FAIL (loop pid $loop_pid SURVIVED --stop — this is the immortal-loop leak)"; exit 1
+  fi
   [ ! -f "$tmp/pid" ] || { echo "smoke-test: FAIL (pidfile not cleared)"; exit 1; }
+  # LEAK SWEEP: not just the pid we know about — NOTHING may remain whose environ carries THIS run's
+  # pidfile path. Catches a survivor that start()'s bookkeeping lost track of entirely.
+  leaked=""
+  for _p in /proc/[0-9]*; do
+    tr '\0' '\n' 2>/dev/null < "$_p/environ" | grep -qxF "MESH_TG_TYPING_PIDFILE=$tmp/pid" \
+      && leaked="$leaked ${_p##*/}"
+  done
+  [ -z "$leaked" ] || { echo "smoke-test: FAIL (leaked typing loop(s) still running:$leaked)"; \
+                        for _l in $leaked; do kill -9 "$_l" 2>/dev/null; done; exit 1; }
   [ -s "$log" ] || { echo "smoke-test: FAIL (no typing sent)"; exit 1; }
   n="$(wc -l < "$log" 2>/dev/null || echo 0)"
   [ "$n" -ge 2 ] || { echo "smoke-test: FAIL (loop did not re-send; calls=$n)"; exit 1; }
   grep -q 'sendChatAction' "$log" || { echo "smoke-test: FAIL (wrong API method)"; exit 1; }
   grep -q 'chat_id=51010427' "$log" || { echo "smoke-test: FAIL (wrong chat_id)"; exit 1; }
   grep -q 'action=typing' "$log" || { echo "smoke-test: FAIL (wrong action)"; exit 1; }
-  echo "smoke-test: ok (typing loop + dry-run sendChatAction verified)"
+
+  # --- THE SAFETY CAP MUST FIRE UNDER A FRACTIONAL INTERVAL ------------------------------------
+  # The cap is the last line of defence when every --stop path is missed, and it is exactly what the
+  # old iteration arithmetic zeroed. Drive it with NO --stop at all: a loop at INTERVAL=0.1 with
+  # MAX=1 must self-terminate on its own. With the old `waited + ${INTERVAL%.*}` this arm hangs to
+  # its timeout and goes red — which is the whole point, since --test's own 0.1 is what minted the
+  # 9 immortal loops found on phaedra.
+  BOT_TOKEN="test-token" CHAT_ID="$OWNER_CHAT" \
+    MESH_TG_TYPING_CURL="$stubdir/curl" \
+    MESH_TG_TYPING_PIDFILE="$tmp/cap.pid" \
+    MESH_TG_TYPING_INTERVAL=0.1 \
+    MESH_TG_TYPING_MAX=1 \
+    MESH_TG_TYPING_LOG="$tmp/cap.log" \
+    "$SELF" --start || { echo "smoke-test: FAIL (cap-arm start)"; exit 1; }
+  cap_pid="$(cat "$tmp/cap.pid" 2>/dev/null || true)"
+  [ -n "$cap_pid" ] || { echo "smoke-test: FAIL (cap-arm: no pid)"; exit 1; }
+  waited=0
+  while kill -0 "$cap_pid" 2>/dev/null; do
+    sleep 0.2; waited=$((waited + 1))
+    [ "$waited" -ge 50 ] && break        # 10s: five times the 1s cap it is supposed to honour
+  done
+  if kill -0 "$cap_pid" 2>/dev/null; then
+    kill -9 "$cap_pid" 2>/dev/null
+    echo "smoke-test: FAIL (safety cap never fired: MAX=1 at INTERVAL=0.1 still alive after 10s — the cap is counting iterations, not wall time, so ANY sub-second interval makes the loop immortal)"
+    exit 1
+  fi
+  [ ! -f "$tmp/cap.pid" ] || { echo "smoke-test: FAIL (cap-arm: self-terminating loop left its pidfile)"; exit 1; }
+
+  # --- stop() must REPORT a survivor, not silently succeed --------------------------------------
+  # A pidfile pointing at a live process that ignores TERM and KILL cannot exist to order, so drive
+  # the honest half we can: a pidfile pointing at a pid that is NOT our loop must not be signalled
+  # (recycled-pidfile guard), and a stale pidfile must clear cleanly.
+  sleep 300 & stranger=$!
+  printf '%s\n' "$stranger" > "$tmp/stranger.pid"
+  MESH_TG_TYPING_PIDFILE="$tmp/stranger.pid" "$SELF" --stop >/dev/null 2>&1
+  if ! kill -0 "$stranger" 2>/dev/null; then
+    echo "smoke-test: FAIL (stop() killed a pid that was not our loop — a recycled pidfile is a loaded gun)"; exit 1
+  fi
+  kill -9 "$stranger" 2>/dev/null; wait "$stranger" 2>/dev/null
+  echo 999999 > "$tmp/stale.pid"
+  MESH_TG_TYPING_PIDFILE="$tmp/stale.pid" "$SELF" --stop \
+    || { echo "smoke-test: FAIL (stop() on a stale pidfile must succeed, not error)"; exit 1; }
+  [ ! -f "$tmp/stale.pid" ] || { echo "smoke-test: FAIL (stale pidfile not cleared)"; exit 1; }
+
+  echo "smoke-test: ok (typing loop + dry-run sendChatAction; + the PROCESS is asserted dead after --stop with a full environ leak sweep, the wall-clock safety cap fires at a fractional interval, stop() spares a recycled pid and clears a stale pidfile)"
 }
 
 case "${1:-}" in
