@@ -4,11 +4,40 @@
 # The IdeaPad's BLE radio perceives RSSI; this tool translates it to millimetres.
 #
 # Usage:
-#   mesh-proximity                  one-shot: nearest named device distance + zone
-#   mesh-proximity --edge           only emit when zone changes (for cron wiring)
+#   mesh-proximity                  one-shot: nearest named device distance + zone (LIVE scan)
+#   mesh-proximity --edge           only emit when zone changes; reads presence.log, NEVER scans
 #   mesh-proximity --json           machine-readable JSON
-#   mesh-proximity --test           smoke test (no scan)
+#   mesh-proximity --test           smoke test (no scan, no log)
 #   mesh-proximity --device "Name"  filter to specific device
+#   mesh-proximity --from-log       force the reuse path (read ~/.mesh/presence.log)
+#   mesh-proximity --scan           force a live BLE scan (the on-demand default)
+#
+# TWO SOURCES, and which one a mode takes is deliberate.
+#   --edge is the CRON-facing mode, and it must never drive the radio. On this node the BLE
+#   half is the btusb side of the same 0bda:b82c combo device that carries the SOLE uplink,
+#   and it wedges; `mesh-presence` ALREADY scans on a */10 cadence, so a second cadence here
+#   would be a second scan on wedged silicon for a reading that already exists on disk
+#   ("a real hardware test leg is an attack"). So --edge REUSES mesh-presence's newest
+#   snapshot line instead of producing a rival one. An operator's on-demand read still scans.
+#
+# THE LEASE — and the direction it must point.
+#   A reused snapshot is only a measurement while it is fresh, so the reuse path refuses a
+#   stale line (UNCERTAIN/exit 2) rather than reporting an hours-old zone as now. The lease
+#   must EXCEED the producer's cadence, never fall under it: mesh-presence runs */10 (600s),
+#   so a sub-600s lease is unsatisfiable by construction — it expires at the end of every
+#   healthy cycle and renders a perfectly live feeder as a dead one (the mesh-bruno
+#   LEASE_WIFI=600 trap, 2026-07-15). The default is not a new number either: mesh-sensorium
+#   already defines "presence.log is fresh" as <900s (`mark "$M/presence.log" ... 900`), and
+#   mesh-presence's own cadence header cites that same 900s as the threshold its */10 keeps
+#   it under. One definition, two readers.
+#
+# RE-READING THE SAME SNAPSHOT IS NOT A SECOND SAMPLE.
+#   --edge confirms a zone change over EDGE_WINDOW consecutive samples. Reading a cached
+#   artifact faster than its producer rewrites it would let one snapshot satisfy the whole
+#   debounce by itself — a fabricated confirmation. So the pending record carries the SOURCE
+#   line's epoch and the count only advances when that epoch MOVES. The cadence below is
+#   already presence-paced; the guard is what makes that a property of the code rather than
+#   of a cron line someone may retune.
 #
 # Zones (IEEE 802.15.1 inspired):
 #   HERE     = < 1500mm  (right next to you — same desk, in-hand)
@@ -32,14 +61,29 @@
 #
 # Exit codes:
 #   0 = verdict assessed
-#   2 = cannot assess (BLE scan failed entirely, or its output no longer parses)
+#   2 = cannot assess (BLE scan failed entirely, its output no longer parses, or — on the
+#       reuse path — presence has landed no fresh, non-degraded snapshot to reuse)
+#
+# reflex-cadence: 4-59/10 * * * *
+# reflex-args: --edge
+# Paced to mesh-presence's own */10 and offset +4min so each run reads a line that landed this
+# cycle. This is the writer for ~/.mesh/.proximity.state, which mesh-operator-context reads for
+# its prox axis; with no writer that axis was permanently unreachable and dragged the whole
+# meta-fusion to UNCERTAIN (honestly — it renders [unreachable:prox] — but permanently).
+# It costs NO radio time: see the two-sources note above.
 
 set -euo pipefail
 
 STATE_DIR="${MESH_STATE_DIR:-$HOME/.mesh}"
 STATE="$STATE_DIR/.proximity.state"
 PENDING="$STATE_DIR/.proximity.pending"
+PRESENCE_LOG="${MESH_PRESENCE_LOG:-$STATE_DIR/presence.log}"
+# See the LEASE note in the header: 900s is mesh-sensorium's existing presence.log freshness
+# threshold, and it EXCEEDS mesh-presence's 600s cadence. Do not lower it below 600.
+PRESENCE_LEASE_S="${MESH_PROXIMITY_PRESENCE_LEASE_S:-900}"
 MODE="oneshot"
+SOURCE=""          # "" = pick from MODE below; else "log" | "scan"
+SRC_EPOCH=""       # epoch of the reused snapshot line (empty on the scan path)
 EDGE_WINDOW=2
 TARGET_DEVICE=""
 
@@ -48,9 +92,20 @@ for arg in "$@"; do
     --edge) MODE=edge ;;
     --json) MODE=json ;;
     --test) MODE=test ;;
+    --from-log) SOURCE=log ;;
+    --scan) SOURCE=scan ;;
     --device) shift; TARGET_DEVICE="${1:-}"; shift || true ;;
   esac
 done
+
+# Mode default, applied only where the operator did not say: --edge is the cron mode and must
+# not touch the radio; every other mode is an operator asking for a reading NOW.
+if [ -z "$SOURCE" ]; then
+  case "$MODE" in
+    edge) SOURCE=log ;;
+    *)    SOURCE=scan ;;
+  esac
+fi
 
 mkdir -p "$STATE_DIR"
 
@@ -162,6 +217,119 @@ assess() {
   fi
 }
 
+# --- Reuse path: mesh-presence's newest snapshot instead of a rival scan ---
+#
+# A snapshot line is:
+#   <iso-ts> <host> n=<N> devices=[<row> <row> ...] attribution=... unidentified=...
+# where each row is the SAME `rssi|mac|name` mesh-presence prints. Two shapes of that line
+# carry no rows at all and MUST NOT be read as an empty room:
+#   n=0 SUSPECT known=K        — the adapter knew devices, none gave a fresh RSSI
+#   n=0 SUSPECT-wedge ...      — discovery stuck on after our scan; suspected wedged radio
+# mesh-presence grades both as "NOT an authoritative empty" and exits 3; neither carries a
+# `devices=[` field, so their absence is the discriminator. A CONFIDENT empty does carry
+# `devices=[]` — that one is a real absence and reads OUT_OF_RANGE, exit 0.
+
+# The devices=[...] field is SPACE-joined and names contain spaces ("LE-Bose Revolve
+# SoundLink"), so the only safe row boundary is the START of the next row: ` -<rssi>|<MAC>|`.
+# Split there and nowhere else.
+expand_devices_field() {
+  printf '%s' "$1" | sed -E 's/ (-[0-9]+\|[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}\|)/\n\1/g'
+}
+
+# Sets ble_out + ec (+ verdict/reason and SRC_EPOCH). Never runs a scan.
+read_presence_log() {
+  local line ts_field epoch now age rest devs
+  ble_out=""; ec=0; SRC_EPOCH=""
+
+  if [ ! -s "$PRESENCE_LOG" ]; then
+    verdict="UNCERTAIN"; ec=2
+    reason="no presence snapshot at $PRESENCE_LOG — the presence cadence has never landed one"
+    return
+  fi
+  # tr -d '\000': one NUL byte blinds plain grep for a whole log, and a crash-truncated append
+  # can leave one. sed '/^$/d': a trailing blank line would make `tail -1` a death certificate.
+  line="$(tail -40 "$PRESENCE_LOG" 2>/dev/null | tr -d '\000' | sed '/^[[:space:]]*$/d' | tail -1)"
+  if [ -z "$line" ]; then
+    verdict="UNCERTAIN"; ec=2
+    reason="presence.log holds no non-blank line"
+    return
+  fi
+
+  ts_field="${line%% *}"
+  epoch="$(date -u -d "$ts_field" +%s 2>/dev/null || true)"
+  case "$epoch" in
+    ''|*[!0-9]*)
+      verdict="UNCERTAIN"; ec=2
+      reason="newest presence line carries no parseable timestamp ('$ts_field') — format drift"
+      return ;;
+  esac
+  now="$(date -u +%s)"
+  age=$(( now - epoch ))
+  if [ "$age" -gt "$PRESENCE_LEASE_S" ]; then
+    verdict="UNCERTAIN"; ec=2
+    reason="newest presence snapshot is ${age}s old (lease ${PRESENCE_LEASE_S}s) — presence cadence not landing"
+    return
+  fi
+
+  case "$line" in
+    *'devices=['*) : ;;
+    *)
+      rest="${line#* }"; rest="${rest#* }"   # drop the ts and host fields
+      verdict="UNCERTAIN"; ec=2
+      reason="presence graded its own read degraded, no device rows: $rest"
+      return ;;
+  esac
+
+  devs="${line#*devices=[}"
+  devs="${devs%]*}"        # to the LAST ']' — a device NAME may contain one ("[TV] Samsung ...")
+  SRC_EPOCH="$epoch"
+  [ -n "$devs" ] && ble_out="$(expand_devices_field "$devs")"
+  return 0
+}
+
+# --- Edge step: 2-consecutive-sample debounce, guarded against re-reading one snapshot ---
+# Reads $verdict/$reason/$SRC_EPOCH; writes $STATE/$PENDING; echoes only on a confirmed change.
+# Pending record is `verdict:count:src_epoch` (epoch, not the ISO ts — that carries colons and
+# would break the cut). The count advances ONLY when src_epoch moves, so one snapshot read
+# twice cannot confirm a change by itself.
+edge_step() {
+  local confirmed pending pcount pts
+  confirmed="UNKNOWN"
+  [ -f "$STATE" ] && confirmed="$(head -1 "$STATE" | awk '{print $1}')"
+  pending=""; pcount=0; pts=""
+  if [ -f "$PENDING" ]; then
+    pending="$(head -1 "$PENDING" | cut -d: -f1)"
+    pcount="$(head -1 "$PENDING" | cut -d: -f2)"
+    pts="$(head -1 "$PENDING" | cut -d: -f3)"
+    case "$pcount" in ''|*[!0-9]*) pcount=0 ;; esac
+  fi
+
+  if [ "$verdict" = "$confirmed" ]; then
+    rm -f "$PENDING"          # a bounce back to the confirmed zone is not a pending change
+  elif [ "$verdict" = "$pending" ]; then
+    if [ -n "$SRC_EPOCH" ] && [ "$SRC_EPOCH" = "$pts" ]; then
+      : # same presence snapshot re-read — carries no new information, cannot confirm
+    else
+      pcount=$((pcount + 1))
+      printf '%s:%s:%s\n' "$pending" "$pcount" "$SRC_EPOCH" > "$PENDING"
+      if [ "$pcount" -ge "$EDGE_WINDOW" ]; then
+        echo "$verdict" > "$STATE"
+        rm -f "$PENDING"
+        echo "[proximity] $verdict — $reason"
+      fi
+    fi
+  else
+    printf '%s:1:%s\n' "$verdict" "$SRC_EPOCH" > "$PENDING"
+  fi
+
+  # Liveness-touch: mtime means "this reflex RAN", content means "the zone changed". Without
+  # this a zone that legitimately holds for hours freezes the mtime and reads as a dead reflex.
+  # Only on a successful eval — an UNCERTAIN read must still be allowed to go honestly stale.
+  if [ "${ec:-0}" = "0" ] && [ -f "$STATE" ]; then
+    command -v mesh-state-touch >/dev/null 2>&1 && mesh-state-touch "$STATE" >/dev/null 2>&1 || touch "$STATE"
+  fi
+}
+
 # --- Test mode ---
 if [ "$MODE" = "test" ]; then
   # 9 assertions on RSSI → millimetre distance → zone
@@ -236,54 +404,149 @@ if [ "$MODE" = "test" ]; then
   [ "$verdict" = "OUT_OF_RANGE" ] || { echo "  FAIL: a filtered-out device is absence, not drift (got $verdict)"; exit 1; }
   [ "$ec" = "0" ] || { echo "  FAIL: --device filter must not exit 2 (got $ec)"; exit 1; }
 
-  echo "smoke-test: ok (10 zone assertions + 8 row-parser + 6 verdict-path fixtures through assess(), incl. the format-drift regression: rows seen, 0 parsed → UNCERTAIN/exit 2)"; exit 0
+  # ---------------------------------------------------------------------------------------
+  # --- REUSE PATH: drive read_presence_log() + edge_step() against fixture files ---
+  # No radio, no live log: MESH_STATE_DIR is redirected so the gate can never read or write
+  # the real ~/.mesh artifacts (a --test that writes the durable liveness record forges the
+  # evidence it exists to check).
+  # ---------------------------------------------------------------------------------------
+  _td="$(mktemp -d)" || { echo "  FAIL: mktemp"; exit 1; }
+  trap 'rm -rf "$_td"' EXIT
+  PRESENCE_LOG="$_td/presence.log"
+  STATE="$_td/.proximity.state"
+  PENDING="$_td/.proximity.pending"
+  _iso() { date -u -d "@$1" '+%Y-%m-%dT%H:%M:%SZ'; }
+  _now="$(date -u +%s)"
+
+  # the row shape is VERBATIM from a live snapshot: a name with SPACES, and a name with a ']'
+  _ROWS='-62|28:11:A5:B8:9E:A2|LE-Bose Revolve SoundLink -66|E7:4D:F9:65:B0:65|Bluetooth -84|5C:49:7D:92:1E:58|[TV] Samsung 5 Series (40)'
+  _TAIL='attribution=personal:1,appliance:2,ambiguous:1 unidentified=public:0,random:1,unknown:0'
+
+  # the space-joined field must expand back into exactly 3 rows, names intact
+  _exp="$(expand_devices_field "$_ROWS")"
+  [ "$(printf '%s\n' "$_exp" | wc -l)" = "3" ] || { echo "  FAIL: devices=[...] should expand to 3 rows (got $(printf '%s\n' "$_exp" | wc -l))"; exit 1; }
+  printf '%s\n' "$_exp" | grep -Fqx -- '-62|28:11:A5:B8:9E:A2|LE-Bose Revolve SoundLink' \
+    || { echo "  FAIL: a name with SPACES must survive the split"; exit 1; }
+  printf '%s\n' "$_exp" | grep -Fqx -- '-84|5C:49:7D:92:1E:58|[TV] Samsung 5 Series (40)' \
+    || { echo "  FAIL: a name containing ']' must survive the split"; exit 1; }
+
+  # (1) a FRESH snapshot is reused: rows parse, verdict from the strongest named device
+  printf '%s mesh-home n=3 devices=[%s] %s\n' "$(_iso $((_now - 120)))" "$_ROWS" "$_TAIL" > "$PRESENCE_LOG"
+  ec=0; verdict=""; reason=""; read_presence_log; assess
+  [ "$ec" = "0" ] || { echo "  FAIL: a fresh snapshot must exit 0 (got $ec — $reason)"; exit 1; }
+  [ "$device_count" = "3" ] || { echo "  FAIL: 3 reused rows should parse (got $device_count)"; exit 1; }
+  [ "$verdict" = "NEAR" ] || { echo "  FAIL: -62 dBm reused should read NEAR (got $verdict)"; exit 1; }
+  [ "$nearest_name" = "LE-Bose Revolve SoundLink" ] || { echo "  FAIL: nearest reused device should keep its spaces (got '$nearest_name')"; exit 1; }
+  [ "$SRC_EPOCH" = "$((_now - 120))" ] || { echo "  FAIL: SRC_EPOCH must be the snapshot's own epoch (got $SRC_EPOCH)"; exit 1; }
+  # the devices=[...] field must be cut at the LAST ']', not the first: a device NAME contains
+  # one, and cutting early truncates that row's name while still yielding a plausible row count
+  # (which is exactly why the row-count assertion above cannot catch it).
+  printf '%s\n' "$ble_out" | grep -Fqx -- '-84|5C:49:7D:92:1E:58|[TV] Samsung 5 Series (40)' \
+    || { echo "  FAIL: a reused row whose NAME contains ']' must survive field extraction intact"; exit 1; }
+
+  # (2) THE LEASE: a snapshot past the lease is refused, never reported as now.
+  #     Direction matters — the lease must EXCEED the producer's 600s cadence.
+  [ "$PRESENCE_LEASE_S" -gt 600 ] || { echo "  FAIL: lease ${PRESENCE_LEASE_S}s must exceed mesh-presence's 600s cadence or it expires every healthy cycle"; exit 1; }
+  printf '%s mesh-home n=3 devices=[%s] %s\n' "$(_iso $((_now - PRESENCE_LEASE_S - 60)))" "$_ROWS" "$_TAIL" > "$PRESENCE_LOG"
+  ec=0; verdict=""; reason=""; read_presence_log; assess
+  [ "$verdict" = "UNCERTAIN" ] || { echo "  FAIL: a snapshot past the lease must render UNCERTAIN (got $verdict)"; exit 1; }
+  [ "$ec" = "2" ] || { echo "  FAIL: a stale snapshot must exit 2 (got $ec)"; exit 1; }
+  case "$reason" in *lease*) : ;; *) echo "  FAIL: the stale reason must name the lease (got '$reason')"; exit 1 ;; esac
+  # and one second INSIDE the lease still reads — the gate must not be vacuous in both directions
+  printf '%s mesh-home n=3 devices=[%s] %s\n' "$(_iso $((_now - PRESENCE_LEASE_S + 30)))" "$_ROWS" "$_TAIL" > "$PRESENCE_LOG"
+  ec=0; verdict=""; reason=""; read_presence_log; assess
+  [ "$ec" = "0" ] || { echo "  FAIL: a snapshot just inside the lease must be reused (got $ec — $reason)"; exit 1; }
+
+  # (3) presence's OWN degraded grades carry no devices=[ — they must NOT read as an empty room
+  for _sus in "n=0 SUSPECT known=4" "n=0 SUSPECT-wedge known=0 discovering=yes"; do
+    printf '%s mesh-home %s\n' "$(_iso $((_now - 60)))" "$_sus" > "$PRESENCE_LOG"
+    ec=0; verdict=""; reason=""; read_presence_log; assess
+    [ "$verdict" = "UNCERTAIN" ] || { echo "  FAIL: '$_sus' must render UNCERTAIN, not '$verdict' — it is NOT an authoritative empty"; exit 1; }
+    [ "$ec" = "2" ] || { echo "  FAIL: '$_sus' must exit 2 (got $ec)"; exit 1; }
+  done
+
+  # (4) a CONFIDENT empty (presence's own devices=[] ) IS a real absence: exit 0
+  printf '%s mesh-home n=0 devices=[] %s\n' "$(_iso $((_now - 60)))" "$_TAIL" > "$PRESENCE_LOG"
+  ec=0; verdict=""; reason=""; read_presence_log; assess
+  [ "$verdict" = "OUT_OF_RANGE" ] || { echo "  FAIL: devices=[] is a confident empty → OUT_OF_RANGE (got $verdict)"; exit 1; }
+  [ "$ec" = "0" ] || { echo "  FAIL: a confident empty exits 0 (got $ec)"; exit 1; }
+
+  # (5) no log at all / blank-only / unparseable ts — each loud, never a zero
+  rm -f "$PRESENCE_LOG"
+  ec=0; verdict=""; reason=""; read_presence_log; assess
+  [ "$verdict" = "UNCERTAIN" ] && [ "$ec" = "2" ] || { echo "  FAIL: a missing presence.log must be UNCERTAIN/2 (got $verdict/$ec)"; exit 1; }
+  printf '\n\n' > "$PRESENCE_LOG"
+  ec=0; verdict=""; reason=""; read_presence_log; assess
+  [ "$verdict" = "UNCERTAIN" ] && [ "$ec" = "2" ] || { echo "  FAIL: a blank-only presence.log must be UNCERTAIN/2 (got $verdict/$ec)"; exit 1; }
+  printf 'not-a-timestamp mesh-home n=3 devices=[%s]\n' "$_ROWS" > "$PRESENCE_LOG"
+  ec=0; verdict=""; reason=""; read_presence_log; assess
+  [ "$verdict" = "UNCERTAIN" ] && [ "$ec" = "2" ] || { echo "  FAIL: an unparseable ts must be UNCERTAIN/2 (got $verdict/$ec)"; exit 1; }
+  # a TRAILING BLANK LINE must not become the death certificate for a healthy feeder
+  { printf '%s mesh-home n=3 devices=[%s] %s\n' "$(_iso $((_now - 60)))" "$_ROWS" "$_TAIL"; printf '\n'; } > "$PRESENCE_LOG"
+  ec=0; verdict=""; reason=""; read_presence_log; assess
+  [ "$ec" = "0" ] || { echo "  FAIL: a trailing blank line must not hide the newest snapshot (got $ec — $reason)"; exit 1; }
+
+  # ---------------------------------------------------------------------------------------
+  # (6) THE DEBOUNCE GUARD: re-reading ONE snapshot cannot confirm a change by itself.
+  # ---------------------------------------------------------------------------------------
+  rm -f "$STATE" "$PENDING"
+  printf 'FAR\n' > "$STATE"                       # confirmed zone
+  ec=0; verdict="HERE"; reason="fixture"; SRC_EPOCH="1000"
+  edge_step                                       # sample 1 of the new zone
+  [ "$(cut -d: -f2 "$PENDING")" = "1" ] || { echo "  FAIL: first differing sample should pend at 1 (got '$(cat "$PENDING")')"; exit 1; }
+  edge_step                                       # SAME snapshot again — must NOT advance
+  [ "$(cut -d: -f2 "$PENDING")" = "1" ] || { echo "  FAIL: re-reading one snapshot must not advance the debounce (got '$(cat "$PENDING")')"; exit 1; }
+  [ "$(head -1 "$STATE")" = "FAR" ] || { echo "  FAIL: one snapshot must not confirm a zone change (STATE=$(head -1 "$STATE"))"; exit 1; }
+  SRC_EPOCH="1600"                                # a genuinely NEW snapshot
+  _out="$(edge_step)"
+  [ "$(head -1 "$STATE")" = "HERE" ] || { echo "  FAIL: 2 independent samples must confirm (STATE=$(head -1 "$STATE"))"; exit 1; }
+  [ ! -f "$PENDING" ] || { echo "  FAIL: pending must clear on confirm"; exit 1; }
+  case "$_out" in *'[proximity] HERE'*) : ;; *) echo "  FAIL: a confirmed change must emit (got '$_out')"; exit 1 ;; esac
+
+  # liveness-touch: a HELD zone must still refresh mtime, or the watchdogs read live as dead
+  touch -d '2 hours ago' "$STATE"
+  _old="$(stat -c %Y "$STATE")"
+  ec=0; verdict="HERE"; SRC_EPOCH="2200"; edge_step
+  [ "$(stat -c %Y "$STATE")" -gt "$_old" ] || { echo "  FAIL: a held zone must still liveness-touch STATE (mtime frozen)"; exit 1; }
+  [ "$(head -1 "$STATE")" = "HERE" ] || { echo "  FAIL: liveness-touch must not alter content"; exit 1; }
+  # ...but an UNCERTAIN read must NOT touch — a dead feeder has to be allowed to go stale
+  touch -d '2 hours ago' "$STATE"; _old="$(stat -c %Y "$STATE")"
+  ec=2; verdict="UNCERTAIN"; SRC_EPOCH=""; edge_step
+  [ "$(stat -c %Y "$STATE")" = "$_old" ] || { echo "  FAIL: an UNCERTAIN read must not touch STATE — it would green over a dead feeder"; exit 1; }
+  ec=0
+
+  echo "smoke-test: ok (10 zone assertions + 8 row-parser + 6 verdict-path fixtures through assess(); + 19 reuse-path assertions through read_presence_log()/edge_step(): field expansion incl. spaces and ']', lease both directions, presence's SUSPECT grades ≠ empty room, confident-empty, missing/blank/undated log, trailing-blank-line, the same-snapshot debounce guard, and liveness-touch on a held zone but NOT on UNCERTAIN)"; exit 0
 fi
 
 TS=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 
-# --- BLE scan: get raw output, parse in main scope ---
+# --- Acquire the reading, from whichever source this mode takes ---
 ble_out=""
-if ! command -v mesh-presence >/dev/null 2>&1; then
-  verdict="UNCERTAIN"; reason="mesh-presence not found"; ec=2
-  ble_out=""
+if [ "$SOURCE" = "log" ]; then
+  read_presence_log
 else
-  ble_rc=0
-  ble_out="$(timeout 25 mesh-presence 2>/dev/null)" || ble_rc=$?
-  if [ "$ble_rc" = "124" ]; then
-    verdict="UNCERTAIN"; reason="BLE scan timed out"; ec=2
-    ble_out=""
-  elif [ "$ble_rc" = "2" ]; then
-    verdict="UNCERTAIN"; reason="BLE scan failed"; ec=2
+  if ! command -v mesh-presence >/dev/null 2>&1; then
+    verdict="UNCERTAIN"; reason="mesh-presence not found"; ec=2
     ble_out=""
   else
-    ec=0
+    ble_rc=0
+    ble_out="$(timeout 25 mesh-presence 2>/dev/null)" || ble_rc=$?
+    if [ "$ble_rc" = "124" ]; then
+      verdict="UNCERTAIN"; reason="BLE scan timed out"; ec=2
+      ble_out=""
+    elif [ "$ble_rc" = "2" ]; then
+      verdict="UNCERTAIN"; reason="BLE scan failed"; ec=2
+      ble_out=""
+    else
+      ec=0
+    fi
   fi
 fi
 
 assess
 
 # --- Edge mode ---
-if [ "$MODE" = "edge" ]; then
-  confirmed="UNKNOWN"
-  [ -f "$STATE" ] && confirmed="$(head -1 "$STATE")"
-  pending=""
-  pcount=0
-  [ -f "$PENDING" ] && { pending="$(head -1 "$PENDING" | cut -d: -f1)"; pcount="$(head -1 "$PENDING" | cut -d: -f2)"; }
-
-  if [ "$verdict" = "$confirmed" ]; then
-    : # stable
-  elif [ "$verdict" = "$pending" ]; then
-    pcount=$((pcount + 1))
-    echo "${pending}:${pcount}" > "$PENDING"
-    if [ "$pcount" -ge "$EDGE_WINDOW" ]; then
-      echo "$verdict" > "$STATE"
-      rm -f "$PENDING"
-      echo "[proximity] $verdict — $reason"
-    fi
-  else
-    echo "${verdict}:1" > "$PENDING"
-  fi
-fi
+if [ "$MODE" = "edge" ]; then edge_step; fi
 
 # --- Output ---
 case "$MODE" in

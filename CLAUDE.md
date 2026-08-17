@@ -520,8 +520,13 @@ dead-on-arrival orphan stays visible.
   exists, i.e. phaedra, and `--test` exits 2 → autowire SKIPs it on every other node)
 - **On-demand senses / fusion / queries (pulled when asked or consumed by a caller — not scheduled):**
   `mesh-overview` · `mesh-operator-context` · `mesh-operator-engagement` (these two overlap — operator-activity
-  fusion) · `mesh-social-fusion` · `mesh-net-io` · `mesh-socket-state` · `mesh-power-source` · `mesh-proximity` ·
+  fusion) · `mesh-social-fusion` · `mesh-net-io` · `mesh-socket-state` · `mesh-power-source` ·
   `mesh-travels`
+  (`mesh-proximity` LEFT this list 2026-08-17: it is now cron-wired `--edge`, because it is the only
+  writer of `~/.mesh/.proximity.state` and mesh-operator-context's prox axis was permanently
+  unreachable without it. Wiring it cost no radio time — `--edge` reuses mesh-presence's existing
+  */10 snapshot instead of raising a second scan cadence on the combo chip that carries the sole
+  uplink. Its on-demand modes still scan.)
 - **Operator instruments (music + mic, played on demand):** `mesh-drone` · `mesh-metronome` ·
   `mesh-changes` · `mesh-looper` · `mesh-oscilloscope` · `mesh-mic-correlate` · `mesh-mic-crossvalidate` ·
   `mesh-tuner-web` (bass-clef practice page: serves the live `mesh-tuner` reading on a staff + browser metronome)
