@@ -122,12 +122,39 @@ LONG_SECS="${GW_LONG_SECS:-75}"    # fresh-record length (macmic self-bounds); a
 CAP_SECS="${GW_CAP_SECS:-600}"     # hard feed cap — generous, not the stale ~65s mixer myth (see above)
 SESSION_MIN="${GW_SESSION_MIN:-45}"   # look back this many minutes to gather session captures for the medley
 MIN_SRC_SECS="${GW_MIN_SRC_SECS:-14}" # a source shorter than this -> not worth a 5-mix batch, use the sample
-# stop_periods=-1 (not 1): a mac-fanout chunk spans ~2min and often has a real pause INSIDE it (between
-# phrases/songs/adjusting the guitar), not just at the edges. periods=1 strips only ONE leading and ONE
-# trailing silence run, so every internal pause rode straight through into the shipped medley — the
-# "HUGE windows of silence" the operator heard. -1 = unlimited repeats, so ffmpeg strips every silent
-# run wherever it falls in the stream, edges and interior alike.
-SILENCE_TRIM="silenceremove=start_periods=1:start_threshold=-45dB:start_silence=0.15:stop_periods=-1:stop_threshold=-45dB:stop_silence=0.25:detection=rms"
+
+# ---- THE CUTTER: a FLOOR-RELATIVE gate, not an absolute constant ------------
+# WHAT IT REPLACED, MEASURED (board task guitar-cut-floor-relative-gate; the before-snapshot is
+# ~/.mesh/fixtures/guitar-calib/SEGMENTATION-BEFORE-20260816.md, reproducible with segdelta.py /
+# floors.py). The old cutter was ONE ffmpeg filter with ONE ABSOLUTE threshold used for BOTH edges:
+#     silenceremove=start_periods=1:start_threshold=-45dB:...:stop_threshold=-45dB:detection=rms
+# The mac room mic's own noise floor is -19.7 … -47.4 dBFS ACROSS A SINGLE SESSION. -45 dBFS sits
+# ABOVE that floor on 11 of 12 captures, so the gate never closed and the whole filter was an
+# IDENTITY TRANSFORM: guitar-song-medley.wav and the shipped original came out byte-for-byte the
+# same length (113.24s, floor -33.9, 0.129s "silent"), while the caption said "silence to silence"
+# and every phrase gap and stretch of room tone rode into the grind. Downstream it was paid for
+# twice — song-verify's dead-gaps check rejected c4e9a202 (0.257) and ea13108a (0.561).
+# The tuning direction was never "which number" but RELATIVE TO WHAT: the floor is a property of
+# each recording, so it has to be MEASURED PER INPUT and the levels expressed as offsets from it.
+# Four things the single constant structurally could not express, now each its own knob:
+#   * open ≠ close  — hysteresis, so room tone that grazes the open level cannot chatter the gate
+#   * hang time     — the close level must HOLD before the gate closes, so a cut never lands
+#                     mid-decay on a note that is still ringing down through the floor
+#   * pre-roll      — kept BEFORE the opening frame, so the pick transient (which by definition
+#                     precedes the frame that crosses the threshold) survives the cut
+#   * post-roll     — kept AFTER the close, so the ring-out is not truncated
+# `silenceremove` cannot express pre-roll at all (it only ever KEEPS trailing silence), which is why
+# the gate is now computed here — frame RMS from ffmpeg's own astats, a hysteretic state machine in
+# awk, and an atrim/concat graph — rather than tuned into the old filter's numbers.
+GW_OPEN_DB="${GW_OPEN_DB:-6}"          # open: a frame this far ABOVE the input's own floor
+GW_CLOSE_DB="${GW_CLOSE_DB:-3}"        # close: stay open until it falls below floor+this (hysteresis)
+GW_HANG_S="${GW_HANG_S:-0.35}"         # ... and stays below THIS LONG — no cut lands mid-decay
+GW_PREROLL_S="${GW_PREROLL_S:-0.08}"   # kept before the opening frame — the pick transient
+GW_POSTROLL_S="${GW_POSTROLL_S:-0.20}" # kept after the close — the ring-out
+GW_MIN_SEG_S="${GW_MIN_SEG_S:-0.20}"   # a kept region shorter than this is a click/chair creak
+GW_FRAME_N="${GW_FRAME_N:-1024}"       # analysis window in samples (46ms @22050) = segdelta.py's grid
+GW_MAX_SEGS="${GW_MAX_SEGS:-300}"      # filter-graph guard; excess merged smallest-gap-first, logged
+GW_FADE_S="${GW_FADE_S:-0.005}"        # de-click fade at every join
 N_MIXES="${GW_N_MIXES:-5}"         # diverse grinds per session
 GENERATOR="${GW_GENERATOR:-$HOME/.local/bin/mesh-grind-params.py}"
 
@@ -185,10 +212,116 @@ send_audio(){
 # duration of a wav/mp3 in seconds (0 on failure)
 dur_of(){ ffprobe -v error -show_entries format=duration -of csv=p=0 "$1" 2>/dev/null || echo 0; }
 
-# trim leading/trailing silence -> "silence to silence", then hard-cap to CAP_SECS. $1=in $2=out
+# per-frame RMS in dBFS -> "<t> <db>" lines. Pure ffmpeg, no second analyzer: asetnsamples PINS the
+# window so astats' reset=1 emits exactly one RMS per fixed window — the same 46ms grid segdelta.py
+# measures on, so the tool and its calibration harness read the same axis. A digitally-silent window
+# prints -inf/nan; it is clamped to -120 rather than allowed to poison the arithmetic.
+frame_db(){
+  ffmpeg -v error -nostdin -i "$1" -af \
+    "asetnsamples=n=${GW_FRAME_N}:p=0,astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.Overall.RMS_level:file=-" \
+    -f null - 2>/dev/null \
+  | awk '/^frame:/{ split($3,a,":"); t=a[2] }
+         /RMS_level=/{ split($0,b,"="); v=b[2]+0; if (b[2] ~ /inf|nan/) v=-120; print t, v }'
+}
+
+# THE INPUT'S OWN NOISE FLOOR: 5th percentile of the frame-dB distribution (segdelta.py's definition,
+# so a floor quoted here and a floor quoted by the harness are the same quantity). rc!=0 = too few
+# frames to have a distribution at all — the caller must render that as unmeasurable, never as 0 dB.
+floor_db(){
+  local n p
+  n=$(wc -l < "$1" 2>/dev/null || echo 0)
+  [ "${n:-0}" -ge 20 ] || return 1
+  p=$(( n * 5 / 100 )); [ "$p" -lt 1 ] && p=1
+  awk '{print $2}' "$1" | sort -g | sed -n "${p}p"
+}
+
+# hysteretic segmentation -> "<start> <end>" seconds. $1=frames file $2=floor dBFS $3=duration.
+# rc 3 = too few frames, rc 4 = nothing ever crossed the open level (the input IS silence).
+plan_segments(){
+  awk -v FL="$2" -v DUR="$3" -v OP="$GW_OPEN_DB" -v CL="$GW_CLOSE_DB" -v HANG="$GW_HANG_S" \
+      -v PRE="$GW_PREROLL_S" -v POST="$GW_POSTROLL_S" -v MIN="$GW_MIN_SEG_S" -v CAP="$GW_MAX_SEGS" '
+    { t[n]=$1+0; d[n]=$2+0; n++ }
+    END{
+      if (n < 4) exit 3
+      op = FL + OP; cl = FL + CL
+      st = 0; ns = 0
+      for (i = 0; i < n; i++) {
+        if (!st) { if (d[i] >= op) { st = 1; s0 = t[i]; last = t[i] } }
+        else if (d[i] >= cl) last = t[i]
+        else if (t[i] - last >= HANG) { st = 0; A[ns] = s0; B[ns] = last; ns++ }
+      }
+      if (st) { A[ns] = s0; B[ns] = t[n-1]; ns++ }
+      if (ns == 0) exit 4
+      # MIN is applied to the RAW region, BEFORE the rolls. Applied after, it can never fire: a
+      # single-frame click is inflated to PRE+POST (0.42s here) and sails past any sane minimum —
+      # measured, it kept a 0.30s blip at t=0 of the operator take as its own "region".
+      m = 0
+      for (i = 0; i < ns; i++) if (B[i] - A[i] >= MIN) { A[m] = A[i]; B[m] = B[i]; m++ }
+      ns = m
+      if (ns == 0) exit 4
+      for (i = 0; i < ns; i++) {                       # pre/post-roll, clamped to the file
+        A[i] -= PRE; if (A[i] < 0)   A[i] = 0
+        B[i] += POST; if (B[i] > DUR) B[i] = DUR
+      }
+      m = 0                                            # merge overlaps the rolls just created
+      for (i = 0; i < ns; i++) {
+        if (m > 0 && A[i] <= B[m-1]) { if (B[i] > B[m-1]) B[m-1] = B[i] }
+        else { A[m] = A[i]; B[m] = B[i]; m++ }
+      }
+      ns = m
+      while (ns > CAP) {                               # graph guard: swallow the smallest gap first
+        gi = -1; gv = 1e9
+        for (i = 1; i < ns; i++) { g = A[i] - B[i-1]; if (g < gv) { gv = g; gi = i } }
+        if (gi < 0) break
+        B[gi-1] = B[gi]
+        for (i = gi; i < ns-1; i++) { A[i] = A[i+1]; B[i] = B[i+1] }
+        ns--
+      }
+      for (i = 0; i < ns; i++) printf "%.4f %.4f\n", A[i], B[i]
+    }' "$1"
+}
+
+# cut $1 -> $2 keeping only the sounding regions. rc 0 on success.
+# The two failure paths COPY THROUGH and say so IN THE LOG: an unmeasurable or all-silent input is
+# rare, and a silent identity fallback here is precisely the bug this replaces (CLAUDE.md: a fallback
+# must be rare and LOUD; a default indistinguishable from success will be one).
+trim_silence(){
+  local in="$1" out="$2" fr script fl dur segs n i a b d fo
+  fr=$(mktemp) || return 1; script=$(mktemp) || { rm -f "$fr"; return 1; }
+  frame_db "$in" > "$fr"
+  dur=$(dur_of "$in")
+  if ! fl=$(floor_db "$fr"); then
+    log "trim: UNMEASURABLE $(basename "$in") ($(wc -l < "$fr") frames) — COPIED THROUGH UNTRIMMED"
+    rm -f "$fr" "$script"; cp -f "$in" "$out" && [ -s "$out" ]; return
+  fi
+  if ! segs=$(plan_segments "$fr" "$fl" "$dur"); then
+    log "trim: NO SOUNDING REGION in $(basename "$in") (floor ${fl}dBFS dur ${dur}s) — COPIED THROUGH UNTRIMMED"
+    rm -f "$fr" "$script"; cp -f "$in" "$out" && [ -s "$out" ]; return
+  fi
+  n=$(printf '%s\n' "$segs" | grep -c .)
+  i=0
+  while read -r a b; do
+    [ -n "$a" ] || continue
+    d=$(awk -v a="$a" -v b="$b" 'BEGIN{printf "%.4f", b-a}')
+    fo=$(awk -v d="$d" -v f="$GW_FADE_S" 'BEGIN{x=d-f; if(x<0)x=0; printf "%.4f", x}')
+    printf '[0:a]atrim=start=%s:end=%s,asetpts=N/SR/TB,afade=t=in:st=0:d=%s,afade=t=out:st=%s:d=%s[s%d];\n' \
+      "$a" "$b" "$GW_FADE_S" "$fo" "$GW_FADE_S" "$i" >> "$script"
+    i=$((i+1))
+  done <<<"$segs"
+  { seq 0 $((n-1)) | sed 's/^/[s/;s/$/]/' | tr -d '\n'; printf 'concat=n=%d:v=0:a=1[out]\n' "$n"; } >> "$script"
+  if ! ffmpeg -v error -nostdin -y -i "$in" -filter_complex_script "$script" -map '[out]' "$out" >/dev/null 2>&1; then
+    log "trim: FILTER FAILED on $(basename "$in") ($n regions) — COPIED THROUGH UNTRIMMED"
+    rm -f "$fr" "$script"; cp -f "$in" "$out" && [ -s "$out" ]; return
+  fi
+  log "trim: $(basename "$in") floor=${fl}dBFS open=$(awk -v a="$fl" -v b="$GW_OPEN_DB" 'BEGIN{printf "%.1f",a+b}') close=$(awk -v a="$fl" -v b="$GW_CLOSE_DB" 'BEGIN{printf "%.1f",a+b}') regions=$n ${dur}s -> $(dur_of "$out")s"
+  rm -f "$fr" "$script"
+  [ -s "$out" ]
+}
+
+# trim silence -> "silence to silence", then hard-cap to CAP_SECS. $1=in $2=out
 trim_and_cap(){
   local in="$1" out="$2" tmp="${2%.wav}.trim.wav"
-  ffmpeg -v error -y -i "$in" -af "$SILENCE_TRIM" "$tmp" >/dev/null 2>&1 || return 1
+  trim_silence "$in" "$tmp" || return 1
   local d; d=$(dur_of "$tmp")
   if awk -v d="$d" -v c="$CAP_SECS" 'BEGIN{exit !(d+0>c)}'; then
     ffmpeg -v error -y -i "$tmp" -t "$CAP_SECS" "$out" >/dev/null 2>&1 || return 1
@@ -222,7 +355,7 @@ build_session_source(){
     m=$(mesh-soundscape --measure "$f" 2>/dev/null) || continue
     tone=$(printf '%s' "$m"|grep -oP 'tone=\K[0-9.]+'); rms=$(printf '%s' "$m"|grep -oP 'rms=\K[0-9.]+'); beats=$(printf '%s' "$m"|grep -oP 'beats=\K[0-9]+')
     awk -v t="$tone" -v r="$rms" -v b="$beats" 'BEGIN{exit !(t+0>=0.82 && r+0>=0.06 && b+0>=4)}' || continue
-    ffmpeg -v error -y -i "$f" -af "$SILENCE_TRIM" "$work/$(printf %03d $idx).wav" >/dev/null 2>&1 && idx=$((idx+1))
+    trim_silence "$f" "$work/$(printf %03d $idx).wav" && idx=$((idx+1))
   done < <(find "$CAPDIR" -type f -name '*.wav' -newermt "-${SESSION_MIN} min" 2>/dev/null | sort)
   [ "$idx" -gt 0 ] || { rm -rf "$work"; return 1; }
   ls "$work"/*.wav | sort | sed "s/^/file '/;s/$/'/" > "$work/list.txt"
@@ -340,6 +473,11 @@ deliver_session(){
 # parser); it renders SKIP where the fixtures are absent rather than passing hollow.
 selftest(){
   local tmp; tmp=$(mktemp -d); local rc=0
+  # The dry-run gets its OWN log. `log()` reads $LOG and bash scopes locals dynamically, so this
+  # redirects every line the test provokes away from the durable liveness record — a --test that
+  # writes the log a human or watchdog reads for liveness forges the evidence it exists to check
+  # (CLAUDE.md, mesh-guardian). Leg 4e asserts ON this file, so the assertion still has an artifact.
+  local LOG="$tmp/selftest.log"; : > "$LOG"
   # 1. gate arithmetic: clears / rejects.  args: chent voiced beats
   is_guitar 0.985 0.46 6   || { echo "FAIL: guitar-shaped axes rejected"; rc=1; }
   ! is_guitar 0.996 0.05 4 || { echo "FAIL: ambient-shaped axes accepted"; rc=1; }
@@ -403,6 +541,74 @@ selftest(){
   else
     echo "SKIP generator test: $GENERATOR absent"
   fi
+  # 4. THE CUTTER, on synthesized audio whose FLOOR IS THE VARIABLE. Two fixtures, identical
+  #    structure (a 220Hz burst at 2.0–4.0s and 5.5–7.5s, silence between) over pink noise at two
+  #    levels: one floor ABOVE the retired -45 dBFS constant (~-42), one far BELOW it (~-76).
+  #    The retired filter is RUN HERE, live, so the bug is asserted rather than remembered — and it
+  #    is exactly the pair of readings that makes an absolute threshold untenable.
+  #    The noise is SEEDED and the first burst starts at 2.0s on purpose: unseeded pink noise crosses
+  #    its own p5+6dB often enough to open the gate at t=0, which silently made the pre-roll leg (4d)
+  #    unfalsifiable — a clamped 0.0000 boundary cannot move earlier, so the leg passed or failed on
+  #    the noise draw rather than on the code.
+  if command -v ffmpeg >/dev/null 2>&1; then
+    local mkfx dhi dlo shi slo khi
+    mkfx(){ ffmpeg -v error -y -f lavfi -i "sine=frequency=220:duration=9" -f lavfi -i "anoisesrc=d=9:c=pink:a=$1:seed=7" \
+        -filter_complex "[0:a]volume='0.35*(between(t,2.0,4.0)+between(t,5.5,7.5))':eval=frame[t];[t][1:a]amix=inputs=2:duration=shortest:normalize=0[o]" \
+        -map "[o]" -ac 1 -ar 22050 "$2" >/dev/null 2>&1; }
+    mkfx 0.05  "$tmp/hifloor.wav"; mkfx 0.001 "$tmp/lofloor.wav"
+    local RETIRED="silenceremove=start_periods=1:start_threshold=-45dB:start_silence=0.15:stop_periods=-1:stop_threshold=-45dB:stop_silence=0.25:detection=rms"
+    if [ -s "$tmp/hifloor.wav" ] && [ -s "$tmp/lofloor.wav" ]; then
+      # 4a. the RETIRED absolute cutter, run live: identity on the raised floor, active on the low one.
+      ffmpeg -v error -y -i "$tmp/hifloor.wav" -af "$RETIRED" "$tmp/ret-hi.wav" >/dev/null 2>&1
+      ffmpeg -v error -y -i "$tmp/lofloor.wav" -af "$RETIRED" "$tmp/ret-lo.wav" >/dev/null 2>&1
+      dhi=$(dur_of "$tmp/ret-hi.wav"); dlo=$(dur_of "$tmp/ret-lo.wav")
+      awk -v d="$dhi" 'BEGIN{exit !(d+0>8.9)}' \
+        || { echo "FAIL: the retired -45dB cutter no longer reproduces its own bug on a raised floor (${dhi}s of 9s) — leg 4 asserts nothing"; rc=1; }
+      awk -v d="$dlo" 'BEGIN{exit !(d+0<7.0)}' \
+        || { echo "FAIL: the retired -45dB cutter did not fire on a LOW floor either (${dlo}s of 9s) — the fixture, not the threshold, is wrong"; rc=1; }
+      # 4b. the LIVE gate must find both bursts on BOTH fixtures — the floor is not supposed to matter.
+      frame_db "$tmp/hifloor.wav" > "$tmp/fhi"; frame_db "$tmp/lofloor.wav" > "$tmp/flo"
+      local flhi fllo; flhi=$(floor_db "$tmp/fhi"); fllo=$(floor_db "$tmp/flo")
+      shi=$(plan_segments "$tmp/fhi" "$flhi" 9 2>/dev/null | grep -c .)
+      slo=$(plan_segments "$tmp/flo" "$fllo" 9 2>/dev/null | grep -c .)
+      [ "${shi:-0}" -ge 2 ] || { echo "FAIL: floor-relative gate found $shi region(s) on the RAISED-floor fixture — it must find 2 (this is the whole fix)"; rc=1; }
+      [ "${slo:-0}" -ge 2 ] || { echo "FAIL: floor-relative gate found $slo region(s) on the LOW-floor fixture — it regressed the case the old constant handled"; rc=1; }
+      # 4c. and it must actually CUT the raised-floor file, where the retired one was an identity transform.
+      if trim_silence "$tmp/hifloor.wav" "$tmp/cut-hi.wav" >/dev/null 2>&1; then
+        khi=$(dur_of "$tmp/cut-hi.wav")
+        awk -v d="$khi" 'BEGIN{exit !(d+0<7.5 && d+0>3.0)}' \
+          || { echo "FAIL: trim_silence kept ${khi}s of the 9s raised-floor fixture (expected ~4.5-5.5s: a 2.0s + a 2.0s burst plus rolls)"; rc=1; }
+        echo "cutter: raised floor — retired -45dB kept ${dhi}s of 9s (identity), floor-relative kept ${khi}s in $shi region(s); low floor $slo region(s)"
+      else
+        echo "FAIL: trim_silence returned non-zero on the raised-floor fixture"; rc=1
+      fi
+      # 4d. HANG and PRE-ROLL are WIRED, not decoration: forcing each axis must move the boundaries.
+      #     Each override runs in a SUBSHELL — `VAR=x some_function` persists after the call in bash,
+      #     so an inline assignment here would silently retune every later leg.
+      local s_hang s_pre0 s_pred
+      s_hang=$( GW_HANG_S=5; plan_segments "$tmp/fhi" "$flhi" 9 2>/dev/null | grep -c . )
+      [ "${s_hang:-0}" = 1 ] \
+        || { echo "FAIL: hang=5s did not merge the two bursts into one region (got $s_hang) — the hang axis is not wired"; rc=1; }
+      s_pre0=$( GW_PREROLL_S=0; plan_segments "$tmp/flo" "$fllo" 9 2>/dev/null | awk '$1>1.0{print $1; exit}' )
+      s_pred=$(plan_segments "$tmp/flo" "$fllo" 9 2>/dev/null | awk '$1>0.9{print $1; exit}')
+      [ -n "$s_pre0" ] && [ -n "$s_pred" ] \
+        || { echo "FAIL: no region opens on the 2.0s burst — the pre-roll leg has nothing to assert on"; rc=1; s_pre0=0; s_pred=0; }
+      awk -v a="$s_pre0" -v b="$s_pred" 'BEGIN{exit !(a+0 > b+0)}' \
+        || { echo "FAIL: pre-roll does not move the first onset earlier (pre=0 -> $s_pre0, default -> $s_pred) — the pre-roll axis is not wired"; rc=1; }
+      # 4e. the all-silent input takes the COPY-THROUGH path and SAYS SO in the log (rare and loud).
+      ffmpeg -v error -y -f lavfi -i "anullsrc=r=22050:cl=mono:d=3" "$tmp/silent.wav" >/dev/null 2>&1
+      local before after
+      before=$(wc -l < "$LOG" 2>/dev/null || echo 0)
+      trim_silence "$tmp/silent.wav" "$tmp/silent-out.wav" >/dev/null 2>&1
+      after=$(tail -n +$((before+1)) "$LOG" 2>/dev/null | grep -c 'COPIED THROUGH UNTRIMMED')
+      [ -s "$tmp/silent-out.wav" ] || { echo "FAIL: all-silent input produced no output at all"; rc=1; }
+      [ "${after:-0}" -ge 1 ] || { echo "FAIL: the copy-through fallback fired SILENTLY — a default indistinguishable from success will be one"; rc=1; }
+    else
+      echo "SKIP cutter: could not synthesize the floor fixtures"
+    fi
+  else
+    echo "SKIP cutter: ffmpeg absent"
+  fi
   rm -rf "$tmp"
   [ "$rc" = 0 ] && echo "mesh-guitar-watch: --test OK" || echo "mesh-guitar-watch: --test FAILED"
   return $rc
@@ -422,6 +628,18 @@ case "${1:-}" in
       _fence_rc=0; "$0" "$@" || _fence_rc=$?; exit "$_fence_rc"
     fi
     selftest; exit $? ;;
+  --segments)
+    # what the LIVE cutter would keep, as "<start> <end>" seconds — the artifact the calibration
+    # harness consumes (segdelta.py --cut), so the reported deltas are the tool's own boundaries and
+    # not a re-implementation of them in the harness.
+    f="${2:-}"; [ -n "$f" ] && [ -f "$f" ] || { echo "usage: $0 --segments <audio>" >&2; exit 1; }
+    frames=$(mktemp); frame_db "$f" > "$frames"; d=$(dur_of "$f")
+    if ! fl=$(floor_db "$frames"); then rm -f "$frames"; echo "n/a: unmeasurable ($f)" >&2; exit 2; fi
+    printf '# file=%s dur=%ss floor=%sdBFS open=%.1f close=%.1f hang=%ss pre=%ss post=%ss min=%ss\n' \
+      "$f" "$d" "$fl" "$(awk -v a="$fl" -v b="$GW_OPEN_DB" 'BEGIN{print a+b}')" \
+      "$(awk -v a="$fl" -v b="$GW_CLOSE_DB" 'BEGIN{print a+b}')" \
+      "$GW_HANG_S" "$GW_PREROLL_S" "$GW_POSTROLL_S" "$GW_MIN_SEG_S"
+    plan_segments "$frames" "$fl" "$d"; rc=$?; rm -f "$frames"; exit $rc ;;
   --status)
     wm=$([ -f "$WATERMARK" ] && cat "$WATERMARK" || echo 0)
     echo "watermark=$wm ($([ "$wm" -gt 0 ] 2>/dev/null && date -d @"$wm" -u +%FT%TZ || echo unset))"
