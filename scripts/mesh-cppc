@@ -1,0 +1,473 @@
+#!/usr/bin/env bash
+# reflex-cadence: */10 * * * *
+# reflex-args: --edge
+# mesh-cppc — ACPI CPPC per-core delivered-frequency / C0-residency / preferred-core-rank sense.
+#
+# WHY: /sys/devices/system/cpu/cpu*/acpi_cppc/ exposes three things nothing else on this node does:
+#   feedback_ctrs  ref:<N> del:<N>  — two MONOTONIC accumulators. `ref` advances at nominal_freq
+#                                     ONLY while the core is in C0 (not halted); `del` advances at
+#                                     the frequency actually delivered. So del/ref is the DELIVERED
+#                                     AVERAGE frequency over the delta, and ref alone divided by
+#                                     wallclock is the C0 RESIDENCY over the same delta.
+#   highest_perf                    — AMD's per-core preferred-core ORDINAL (166..196 on this part).
+#   nominal_perf / nominal_freq     — the scale (121 <-> 3401 MHz) that turns perf units into MHz.
+#
+# THREE MEASURED TRAPS, each of which this tool encodes rather than documents:
+#
+# 1. DELIVERED_AVG IS MEANINGLESS BELOW A RESIDENCY FLOOR, and nothing in the number says so.
+#    del/ref is a ratio over the time the core was AWAKE. On a core awake 1-3% of the window that
+#    ratio is computed from a few milliseconds of scattered C0 and swings wildly while looking like
+#    a steady reading. Measured on mesh-home 2026-08-18, 12x1s samples, one pinned spinner:
+#        cpu2  residency 99.96%  delivered 4650MHz  swing  0.4%
+#        cpu0  residency  3.11%  delivered 3904MHz  swing 23.8%
+#        cpu3  residency  1.25%  delivered 3794MHz  swing 13.4%
+#    Same column, two different quantities: one is the core's clock, the other is a sample of noise.
+#    So residency is published BESIDE delivered_avg always, and delivered_avg renders `na` below
+#    MESH_CPPC_RESIDENCY_FLOOR (default 5.0%). A suppressed reading is not a zero.
+#
+# 2. highest_perf MUST NOT BE CONVERTED TO MHz. The obvious conversion is arithmetically clean and
+#    numerically wrong: highest_perf/nominal_perf*nominal_freq = 196/121*3401 = 5509 MHz against a
+#    cpuinfo_max_freq of 4663 MHz — an 18.1% OVERSHOOT. The CPPC perf scale is linear only up to
+#    nominal; above it the units are a preference ordering the firmware uses to pick favoured cores,
+#    not a frequency scale. This tool therefore emits highest_perf as an ORDINAL RANK ONLY and never
+#    renders an MHz value derived from it (--test asserts that).
+#
+# 3. A NEGATIVE DELTA IS `na`, NEVER 0. wraparound_time here reads 0xFFFFFFFFFFFFFFFF (unknown), a
+#    core can go offline and come back, and a counter reset would otherwise render as a plausible
+#    "0 MHz / 0% residency" — a fabricated calm of exactly the shape the doctrine warns about.
+#
+# COVERAGE (the sample-is-not-the-interval rule): a short in-run sample covers a sliver of the cron
+# cadence, so this tool keeps BOTH windows and says which it is quoting. `inst` is a live
+# sub-second sample; `iv` is the delta against the previous run's persisted snapshot, which covers
+# 100% of the interval at zero extra cost because the counters accumulate. The band folds with a max
+# that NAMES its winner (BOOST(iv) vs BOOST(inst)) so a narrow claim can never be read as a wide one.
+#
+# HONEST: no acpi_cppc/ directory (every node but this one so far) => UNREACHABLE, exit 2.
+#
+#   mesh-cppc            one-shot reading
+#   mesh-cppc --all      per-cpu table
+#   mesh-cppc --json     machine-readable
+#   mesh-cppc --edge     emit only on band change (liveness touches STATE every success)
+#   mesh-cppc --test     fixture + real-read smoke test
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+
+MESH="${MESH_DIR:-$HOME/.mesh}"
+STATE="${MESH_CPPC_STATE:-$MESH/.cppc.state}"
+SNAP="${MESH_CPPC_SNAP:-$MESH/.cppc.snap}"
+ROOT="${MESH_CPPC_ROOT:-/sys/devices/system/cpu}"
+SAMPLE_MS="${MESH_CPPC_SAMPLE_MS:-600}"
+# residency floor in TENTHS of a percent (50 = 5.0%)
+FLOOR="${MESH_CPPC_RESIDENCY_FLOOR:-50}"
+# minimum interval-window length. Two runs back to back leave a snapshot only milliseconds old, and
+# a 0.6s `iv` delta is arithmetically fine and epistemically a lie: the whole point of the interval
+# window is that it covers the CADENCE, so quoting a sub-second one under the name `iv` hands the
+# reader the narrow claim wearing the wide one's label. Below this, there is no iv window at all.
+MIN_IV_MS="${MESH_CPPC_MIN_IV_MS:-5000}"
+mkdir -p "$MESH" 2>/dev/null || true
+
+is_uint() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
+
+# ---------------------------------------------------------------- pure helpers (fixture-testable)
+
+# residency in TENTHS of a percent = ref_delta / (nominal_mhz * elapsed_ms)
+# ref advances at nominal_freq while in C0, so ref_delta/(nom_hz*el_s) is the C0 fraction.
+# `na` for a non-positive elapsed or a NEGATIVE ref delta (counter reset / core offline).
+residency_tenths() {
+  local ref_delta="$1" nom_mhz="$2" el_ms="$3"
+  [ "$el_ms" -gt 0 ] 2>/dev/null || { echo na; return; }
+  [ "$nom_mhz" -gt 0 ] 2>/dev/null || { echo na; return; }
+  [ "$ref_delta" -ge 0 ] 2>/dev/null || { echo na; return; }
+  echo $(( ref_delta / (nom_mhz * el_ms) ))
+}
+
+# delivered average frequency in TENTHS of a MHz over the delta.
+#   delivered_perf = reference_perf * del_delta/ref_delta ; freq = delivered_perf*nom_mhz/nominal_perf
+# `na` when either delta is negative (reset/offline) or ref_delta is 0 (core never woke: there is no
+# delivered frequency to report, and 0 would be a lie about the clock rather than about the sleep).
+delivered_mhz10() {
+  local ref_delta="$1" del_delta="$2" nom_mhz="$3" ref_perf="$4" nom_perf="$5"
+  [ "$ref_delta" -gt 0 ] 2>/dev/null || { echo na; return; }
+  [ "$del_delta" -ge 0 ] 2>/dev/null || { echo na; return; }
+  [ "$nom_perf" -gt 0 ] 2>/dev/null || { echo na; return; }
+  local base=$(( del_delta * nom_mhz * 10 / ref_delta ))
+  echo $(( base * ref_perf / nom_perf ))
+}
+
+# band of the busiest core. Suppressed to IDLE below the residency floor: with no core awake long
+# enough, there IS no trustworthy delivered figure, and that is the honest report.
+classify_band() {
+  local res_tenths="${1:-na}" mhz10="${2:-na}" nom_mhz="${3:-0}" floor="${4:-50}"
+  if [ "$res_tenths" = na ]; then echo "UNKNOWN|busiest-core residency unreadable"; return 0; fi
+  if [ "$res_tenths" -lt "$floor" ] 2>/dev/null; then
+    echo "IDLE|no core above the ${floor}-tenths residency floor; delivered_avg suppressed"; return 0
+  fi
+  if [ "$mhz10" = na ]; then echo "UNKNOWN|busiest-core delivered delta unusable"; return 0; fi
+  [ "$nom_mhz" -gt 0 ] 2>/dev/null || { echo "UNKNOWN|no nominal_freq scale"; return 0; }
+  local ratio=$(( mhz10 * 10 / nom_mhz ))
+  if   [ "$ratio" -lt 70  ]; then echo "THROTTLED|busiest core far under nominal"
+  elif [ "$ratio" -lt 95  ]; then echo "REDUCED|busiest core below nominal"
+  elif [ "$ratio" -lt 110 ]; then echo "NOMINAL|busiest core at nominal"
+  else                             echo "BOOST|busiest core above nominal"
+  fi
+}
+
+band_rank() {
+  case "${1:-}" in
+    UNKNOWN) echo 0 ;; IDLE) echo 1 ;; THROTTLED) echo 2 ;;
+    REDUCED) echo 3 ;; NOMINAL) echo 4 ;; BOOST) echo 5 ;; *) echo 0 ;;
+  esac
+}
+
+fmt_tenths() { # 1234 -> 123.4 ; na -> na
+  local v="${1:-na}"
+  [ "$v" = na ] && { printf 'na'; return; }
+  printf '%s.%s' "$(( v / 10 ))" "$(( v % 10 ))"
+}
+
+# ---------------------------------------------------------------- sysfs readers
+
+read_ctrs() { # -> "<cpu> <ref> <del>" per line, sorted by cpu index
+  local d cpu line ref del
+  for d in "$ROOT"/cpu[0-9]*/acpi_cppc; do
+    [ -d "$d" ] || continue
+    cpu="$(basename "$(dirname "$d")")"
+    line="$(cat "$d/feedback_ctrs" 2>/dev/null || true)"
+    ref="${line%% *}"; ref="${ref#ref:}"
+    del="${line##* }"; del="${del#del:}"
+    is_uint "$ref" && is_uint "$del" || continue
+    printf '%s %s %s\n' "$cpu" "$ref" "$del"
+  done | sort -k1.4n
+}
+
+now_ms() { echo $(( $(date +%s%N) / 1000000 )); }
+
+# ---------------------------------------------------------------- self-test
+
+if [ "${1:-}" = --test ]; then
+  fail=0
+  ck() { [ "$1" = "$2" ] || { echo "  FAIL: $3 (got '$1', want '$2')"; fail=1; }; }
+
+  # -- residency: 3.401e9 ref ticks in 1000ms at 3401MHz nominal == 100.0% C0
+  ck "$(residency_tenths 3401000000 3401 1000)" "1000" "residency 100%"
+  ck "$(residency_tenths 340100000 3401 1000)"  "100"  "residency 10%"
+  # -- NEGATIVE DELTA => na, NEVER 0 (counter reset / core offline)
+  ck "$(residency_tenths -5 3401 1000)" "na" "negative ref delta is na"
+  ck "$(delivered_mhz10 1000 -5 3401 121 121)" "na" "negative del delta is na"
+  ck "$(delivered_mhz10 0 1000 3401 121 121)" "na" "zero ref delta is na (not 0 MHz)"
+  ck "$(residency_tenths 1000 3401 0)" "na" "zero elapsed is na"
+  # -- delivered: del/ref == 1.0 must land exactly on nominal
+  ck "$(delivered_mhz10 1000000 1000000 3401 121 121)" "34010" "delivered == nominal"
+  ck "$(delivered_mhz10 1000000 1367000 3401 121 121)" "46491" "delivered boost ~4649MHz"
+  ck "$(fmt_tenths 46491)" "4649.1" "tenths format"
+  ck "$(fmt_tenths na)" "na" "tenths format na"
+
+  # -- band + the RESIDENCY FLOOR: identical delivered figure, two residencies, two verdicts.
+  ck "$(classify_band 1000 46491 3401 50)" "BOOST|busiest core above nominal" "boost band"
+  ck "$(classify_band 31 46491 3401 50)" \
+     "IDLE|no core above the 50-tenths residency floor; delivered_avg suppressed" \
+     "3.1% residency suppresses an otherwise-BOOST delivered figure"
+  ck "$(classify_band 1000 34010 3401 50)" "NOMINAL|busiest core at nominal" "nominal band"
+  ck "$(classify_band 1000 30000 3401 50)" "REDUCED|busiest core below nominal" "reduced band"
+  ck "$(classify_band 1000 20000 3401 50)" "THROTTLED|busiest core far under nominal" "throttled band"
+  ck "$(classify_band na 46491 3401 50)" "UNKNOWN|busiest-core residency unreadable" "unknown residency"
+  ck "$(classify_band 1000 na 3401 50)" "UNKNOWN|busiest-core delivered delta unusable" "unknown delivered"
+  ck "$(band_rank BOOST)" "5" "band rank boost"
+  ck "$(band_rank IDLE)" "1" "band rank idle"
+
+  # -- FIXTURE: a synthetic acpi_cppc tree drives the whole render path, including a core whose
+  #    counters go BACKWARDS between the two snapshots (offline/reset) -> must render na, not 0.
+  td="$(mktemp -d)" || { echo "  FAIL: mktemp"; exit 1; }
+  trap 'rm -rf "$td"' EXIT
+  mk() { # mk <cpu> <highest> <ref> <del>
+    local c="$td/cpu$1/acpi_cppc"; mkdir -p "$c"
+    printf '%s\n' "$2" > "$c/highest_perf"
+    printf '121\n' > "$c/nominal_perf"; printf '121\n' > "$c/reference_perf"
+    printf '3401\n' > "$c/nominal_freq"; printf '550\n' > "$c/lowest_freq"
+    printf 'ref:%s del:%s\n' "$3" "$4" > "$c/feedback_ctrs"
+  }
+  mk 0 166 1000000000 1200000000
+  mk 1 196 5000000000 6800000000
+  mk 2 181 2000000000 2100000000
+  # seed a snapshot 10s in the past so the `iv` window exists and is deterministic
+  snapf="$td/snap"; statef="$td/state"
+  { echo "ts_ms $(( $(now_ms) - 10000 ))"
+    echo "cpu0 0 0"; echo "cpu1 0 0"; echo "cpu2 9000000000 9000000000"; } > "$snapf"
+  got="$(MESH_CPPC_ROOT="$td" MESH_CPPC_SNAP="$snapf" MESH_CPPC_STATE="$statef" \
+         MESH_CPPC_SAMPLE_MS=1 "$0" --json 2>/dev/null || true)"
+  printf '%s\n' "$got" | grep -q '"cpus":3' || { echo "  FAIL: fixture cpus ($got)"; fail=1; }
+  # cpu2's iv counters go backwards (9e9 -> 2e9): na, and the word 0 must not appear for it
+  cpu2obj="$(printf '%s\n' "$got" | grep -o '{"cpu":"cpu2"[^}]*}')"
+  printf '%s\n' "$cpu2obj" | grep -q '"iv_residency_pct":"na"' \
+    || { echo "  FAIL: backwards iv ref delta must render na, not 0 ($cpu2obj)"; fail=1; }
+  printf '%s\n' "$cpu2obj" | grep -q '"iv_delivered_mhz":"na"' \
+    || { echo "  FAIL: backwards iv del delta must render na, not 0 ($cpu2obj)"; fail=1; }
+  printf '%s\n' "$cpu2obj" | grep -q '"iv_[a-z_]*":"0' \
+    && { echo "  FAIL: a reset counter rendered as 0 — a fabricated calm ($cpu2obj)"; fail=1; }
+  # the fixture's two snapshots are identical, so every inst ref delta is 0: no core woke at all.
+  # That is `na` (there is no delivered frequency), never 0 MHz.
+  printf '%s\n' "$got" | grep -q '"inst_residency_pct":"0.0","inst_delivered_mhz":"na"' \
+    || { echo "  FAIL: zero inst ref delta must give residency 0.0 with delivered na ($got)"; fail=1; }
+  # rank map: highest_perf 196 > 181 > 166  =>  cpu1 rank 1, cpu2 rank 2, cpu0 rank 3, NO MHz
+  printf '%s\n' "$got" | grep -q '"rank1":\["cpu1"\]' || { echo "  FAIL: rank map ($got)"; fail=1; }
+  printf '%s\n' "$got" | grep -q '"highest_perf_mhz"' && {
+    echo "  FAIL: highest_perf must never be rendered as MHz"; fail=1; }
+  # the 18% trap, asserted numerically: had we scaled highest_perf to MHz it would read 5509,
+  # over this part's 4663MHz cpuinfo_max_freq. No emitted MHz figure may reach that.
+  for m in $(printf '%s\n' "$got" | grep -o '"[a-z_]*mhz[a-z_]*":[0-9]*' | cut -d: -f2); do
+    [ "$m" -lt 5000 ] 2>/dev/null || {
+      echo "  FAIL: emitted an MHz value of $m — highest_perf leaked into the frequency scale"; fail=1; }
+  done
+  rm -rf "$td"; trap - EXIT
+
+  # -- MINIMUM INTERVAL WINDOW: reseed the same fixture snapshot as 200ms old. That is a perfectly
+  #    computable delta and must still be REFUSED as an `iv` reading — a sub-second window quoted
+  #    under the interval label is the narrow claim wearing the wide one's name.
+  td2="$(mktemp -d)" || { echo "  FAIL: mktemp"; exit 1; }
+  trap 'rm -rf "$td2"' EXIT
+  mkdir -p "$td2/cpu0/acpi_cppc"
+  printf '166\n' > "$td2/cpu0/acpi_cppc/highest_perf"; printf '121\n' > "$td2/cpu0/acpi_cppc/nominal_perf"
+  printf '121\n' > "$td2/cpu0/acpi_cppc/reference_perf"; printf '3401\n' > "$td2/cpu0/acpi_cppc/nominal_freq"
+  printf 'ref:5000000000 del:6000000000\n' > "$td2/cpu0/acpi_cppc/feedback_ctrs"
+  { echo "ts_ms $(( $(now_ms) - 200 ))"; echo "cpu0 1000000000 1200000000"; } > "$td2/snap"
+  got2="$(MESH_CPPC_ROOT="$td2" MESH_CPPC_SNAP="$td2/snap" MESH_CPPC_STATE="$td2/st" \
+          MESH_CPPC_SAMPLE_MS=1 "$0" --json 2>/dev/null || true)"
+  printf '%s\n' "$got2" | grep -q '"iv_ms":0' \
+    || { echo "  FAIL: a 200ms-old snapshot must not become an iv window ($got2)"; fail=1; }
+  printf '%s\n' "$got2" | grep -q '"iv_residency_pct":"na"' \
+    || { echo "  FAIL: sub-floor iv window must render na per cpu ($got2)"; fail=1; }
+  printf '%s\n' "$got2" | grep -q '"window_winner":"inst"' \
+    || { echo "  FAIL: with no usable iv window the band must be quoted as inst ($got2)"; fail=1; }
+  # and the same snapshot aged past the floor MUST become a usable iv window (else the assertion
+  # above would pass on a tool that simply never produces one)
+  { echo "ts_ms $(( $(now_ms) - 20000 ))"; echo "cpu0 1000000000 1200000000"; } > "$td2/snap"
+  got3="$(MESH_CPPC_ROOT="$td2" MESH_CPPC_SNAP="$td2/snap" MESH_CPPC_STATE="$td2/st" \
+          MESH_CPPC_SAMPLE_MS=1 "$0" --json 2>/dev/null || true)"
+  printf '%s\n' "$got3" | grep -q '"iv_residency_pct":"[0-9]' \
+    || { echo "  FAIL: a 20s-old snapshot must yield a real iv window ($got3)"; fail=1; }
+  rm -rf "$td2"; trap - EXIT
+
+  # -- ABSENT ORGAN: exit 2, and the state file must be untouched by the attempt
+  MESH_CPPC_ROOT='/nonexistent/cpu' MESH_CPPC_STATE="$td/none" MESH_CPPC_SNAP="$td/none.snap" \
+    "$0" >/dev/null 2>&1
+  [ "$?" -eq 2 ] || { echo "  FAIL: absent acpi_cppc must exit 2"; fail=1; }
+
+  [ "$fail" = 0 ] || { echo "smoke-test: FAIL"; exit 1; }
+
+  # -- REAL-READ gate: everything above is pure/fixture. This drives the LIVE sysfs tree and asserts
+  #    a genuine hardware read produced parseable per-cpu residency for every cpu, with its own
+  #    state/snap paths so the dry-run can never write the durable liveness artifacts it checks.
+  rtd="$(mktemp -d)"; trap 'rm -rf "$rtd"' EXIT
+  live_rc=0
+  live="$(MESH_CPPC_STATE="$rtd/s" MESH_CPPC_SNAP="$rtd/n" "$0" --json 2>&1)" || live_rc=$?
+  if [ "$live_rc" = 2 ]; then
+    echo "smoke-test: n/a — no acpi_cppc/ organ on $(hostname) ($ROOT/cpu*/acpi_cppc absent). Pure-function, band, floor, negative-delta, rank-map, no-MHz and exit-2 assertions all passed."
+    exit 2
+  fi
+  [ "$live_rc" = 0 ] || { echo "smoke-test: FAIL — live read rc=$live_rc ($live)"; exit 1; }
+  ncpu="$(printf '%s\n' "$live" | grep -o '"cpus":[0-9]*' | cut -d: -f2)"
+  [ "${ncpu:-0}" -ge 2 ] 2>/dev/null || { echo "smoke-test: FAIL — live read saw ${ncpu:-0} cpus"; exit 1; }
+  printf '%s\n' "$live" | grep -q '"agg_delivered_mhz":"[0-9]' \
+    || { echo "smoke-test: FAIL — live read produced no package aggregate (mesh-cpu-avgfreq's source)"; exit 1; }
+  aggm="$(printf '%s\n' "$live" | grep -o '"agg_delivered_mhz":"[0-9.]*"' | cut -d'"' -f4 | cut -d. -f1)"
+  aggr="$(printf '%s\n' "$live" | grep -o '"agg_residency_pct":"[0-9.]*"' | cut -d'"' -f4 | cut -d. -f1)"
+  [ "${aggr:-101}" -le 100 ] 2>/dev/null || { echo "smoke-test: FAIL — aggregate residency ${aggr}% > 100"; exit 1; }
+  nres="$(printf '%s\n' "$live" | grep -o '"inst_residency_pct":"[0-9.]*"' | wc -l)"
+  [ "$nres" -ge "$ncpu" ] 2>/dev/null || {
+    echo "smoke-test: FAIL — only $nres/$ncpu cpus produced a real residency reading"; exit 1; }
+  # every live delivered figure must sit under the part's own cpuinfo_max_freq (the no-MHz-leak
+  # invariant, re-asserted against real silicon rather than the fixture)
+  maxk="$(cat "$ROOT/cpu0/cpufreq/cpuinfo_max_freq" 2>/dev/null || echo 0)"
+  if is_uint "$maxk" && [ "$maxk" -gt 0 ]; then
+    for m in ${aggm:-} $(printf '%s\n' "$live" | grep -o '"inst_delivered_mhz":"[0-9.]*"' | cut -d'"' -f4 | cut -d. -f1); do
+      [ "$m" -le $(( maxk / 1000 )) ] 2>/dev/null || {
+        echo "smoke-test: FAIL — live delivered ${m}MHz exceeds cpuinfo_max_freq $(( maxk / 1000 ))MHz"; exit 1; }
+    done
+  fi
+  rm -rf "$rtd"; trap - EXIT
+  echo "smoke-test: ok (bands + residency floor + negative-delta-na + rank-map + no-MHz-leak + exit2 + real-read gate: $ncpu live cpus, all with real residency)"
+  exit 0
+fi
+
+# ---------------------------------------------------------------- main
+
+mode=one
+case "${1:-}" in
+  --edge) mode=edge ;;
+  --json) mode=json ;;
+  --all)  mode=all ;;
+  '')     mode=one ;;
+  *) echo "usage: mesh-cppc [--all|--json|--edge|--test]" >&2; exit 64 ;;
+esac
+
+cpu0d="$ROOT/cpu0/acpi_cppc"
+nom_mhz="$(cat "$cpu0d/nominal_freq" 2>/dev/null || true)"
+nom_perf="$(cat "$cpu0d/nominal_perf" 2>/dev/null || true)"
+ref_perf="$(cat "$cpu0d/reference_perf" 2>/dev/null || true)"
+is_uint "${nom_mhz:-}" && is_uint "${nom_perf:-}" && is_uint "${ref_perf:-}" \
+  && [ "$nom_mhz" -gt 0 ] && [ "$nom_perf" -gt 0 ] || {
+  echo "cppc: UNREACHABLE — no readable acpi_cppc scale under $ROOT/cpu*/acpi_cppc (this node exposes no CPPC organ)" >&2
+  exit 2
+}
+
+ts="$(date -u +%FT%TZ)"
+t0="$(now_ms)"
+snap_a="$(read_ctrs)"
+[ -n "$snap_a" ] || { echo "cppc: UNREACHABLE — no readable feedback_ctrs under $ROOT/cpu*/acpi_cppc" >&2; exit 2; }
+[ "$SAMPLE_MS" -gt 0 ] 2>/dev/null && sleep "$(printf '%d.%03d' "$(( SAMPLE_MS / 1000 ))" "$(( SAMPLE_MS % 1000 ))")"
+t1="$(now_ms)"
+snap_b="$(read_ctrs)"
+inst_ms=$(( t1 - t0 )); [ "$inst_ms" -gt 0 ] || inst_ms=1
+
+# previous run's snapshot -> the INTERVAL window (100% coverage of the cron cadence)
+declare -A prev_ref=() prev_del=()
+prev_ms=0
+if [ -r "$SNAP" ]; then
+  while read -r k a b; do
+    if [ "$k" = ts_ms ]; then is_uint "$a" && prev_ms="$a"
+    elif is_uint "${a:-}" && is_uint "${b:-}"; then prev_ref["$k"]="$a"; prev_del["$k"]="$b"; fi
+  done < "$SNAP"
+fi
+iv_ms=0; iv_why="first run / no prior snapshot"
+if [ "$prev_ms" -gt 0 ] 2>/dev/null; then
+  iv_ms=$(( t1 - prev_ms ))
+  if [ "$iv_ms" -lt "$MIN_IV_MS" ] 2>/dev/null; then
+    iv_why="prior snapshot only ${iv_ms}ms old, under the ${MIN_IV_MS}ms floor"
+    iv_ms=0
+  fi
+fi
+[ "$iv_ms" -gt 0 ] 2>/dev/null || iv_ms=0
+
+declare -A a_ref=() a_del=() b_ref=() b_del=() hi=()
+cpus=()
+while read -r c r d; do a_ref["$c"]="$r"; a_del["$c"]="$d"; done <<< "$snap_a"
+while read -r c r d; do
+  b_ref["$c"]="$r"; b_del["$c"]="$d"; cpus+=("$c")
+  hi["$c"]="$(cat "$ROOT/$c/acpi_cppc/highest_perf" 2>/dev/null || true)"
+  is_uint "${hi[$c]}" || hi["$c"]=0
+done <<< "$snap_b"
+
+# ---- preferred-core RANK MAP: ordinal only. highest_perf is NEVER scaled to MHz (18% overshoot).
+mapfile -t hi_sorted < <(for c in "${cpus[@]}"; do echo "${hi[$c]}"; done | sort -rn | uniq)
+declare -A rank_of=()
+r=0
+for v in "${hi_sorted[@]}"; do r=$(( r + 1 )); for c in "${cpus[@]}"; do [ "${hi[$c]}" = "$v" ] && rank_of["$c"]="$r"; done; done
+rank1_cpus=""
+for c in "${cpus[@]}"; do [ "${rank_of[$c]}" = 1 ] && rank1_cpus="${rank1_cpus:+$rank1_cpus,}$c"; done
+
+# ---- per-cpu, both windows
+declare -A i_res=() i_mhz=() v_res=() v_mhz=()
+best_i_res=-1; best_i_cpu=""; best_i_mhz=na
+best_v_res=-1; best_v_cpu=""; best_v_mhz=na
+for c in "${cpus[@]}"; do
+  ird=$(( ${b_ref[$c]} - ${a_ref[$c]:-0} )); idd=$(( ${b_del[$c]} - ${a_del[$c]:-0} ))
+  i_res["$c"]="$(residency_tenths "$ird" "$nom_mhz" "$inst_ms")"
+  i_mhz["$c"]="$(delivered_mhz10 "$ird" "$idd" "$nom_mhz" "$ref_perf" "$nom_perf")"
+  if [ "$iv_ms" -gt 0 ] && [ -n "${prev_ref[$c]:-}" ]; then
+    vrd=$(( ${b_ref[$c]} - ${prev_ref[$c]} )); vdd=$(( ${b_del[$c]} - ${prev_del[$c]} ))
+    v_res["$c"]="$(residency_tenths "$vrd" "$nom_mhz" "$iv_ms")"
+    v_mhz["$c"]="$(delivered_mhz10 "$vrd" "$vdd" "$nom_mhz" "$ref_perf" "$nom_perf")"
+    # a negative ref delta poisons BOTH axes for that cpu: the window is not interpretable
+    [ "${v_res[$c]}" = na ] && v_mhz["$c"]=na
+  else
+    v_res["$c"]=na; v_mhz["$c"]=na
+  fi
+  if [ "${i_res[$c]}" != na ] && [ "${i_res[$c]}" -gt "$best_i_res" ] 2>/dev/null; then
+    best_i_res="${i_res[$c]}"; best_i_cpu="$c"; best_i_mhz="${i_mhz[$c]}"
+  fi
+  if [ "${v_res[$c]}" != na ] && [ "${v_res[$c]}" -gt "$best_v_res" ] 2>/dev/null; then
+    best_v_res="${v_res[$c]}"; best_v_cpu="$c"; best_v_mhz="${v_mhz[$c]}"
+  fi
+done
+[ "$best_i_res" -lt 0 ] && best_i_res=na
+[ "$best_v_res" -lt 0 ] && best_v_res=na
+
+# ---- PACKAGE AGGREGATE: sum the deltas, then take the ratio. Summing first is what makes this
+# well-conditioned where a per-core mean is not — each core is weighted by the time it was actually
+# AWAKE, so a core in C0 for 1% of the window contributes 1% of the weight instead of injecting its
+# noisy ratio at full weight. This is the same quantity amd-pstate publishes as cpuinfo_avg_freq
+# (it is the APERF/MPERF ratio under another name), which is why mesh-cpu-avgfreq can consume it.
+agg_ref=0; agg_del=0; agg_ms=0; agg_win=""
+for c in "${cpus[@]}"; do
+  if [ "$iv_ms" -gt 0 ] && [ -n "${prev_ref[$c]:-}" ] && [ "${v_res[$c]}" != na ]; then
+    agg_ref=$(( agg_ref + ${b_ref[$c]} - ${prev_ref[$c]} )); agg_del=$(( agg_del + ${b_del[$c]} - ${prev_del[$c]} ))
+    agg_win=iv
+  elif [ "${i_res[$c]}" != na ]; then
+    agg_ref=$(( agg_ref + ${b_ref[$c]} - ${a_ref[$c]:-0} )); agg_del=$(( agg_del + ${b_del[$c]} - ${a_del[$c]:-0} ))
+    [ -n "$agg_win" ] || agg_win=inst
+  fi
+done
+[ "$agg_win" = iv ] && agg_ms="$iv_ms" || agg_ms="$inst_ms"
+agg_res="$(residency_tenths "$agg_ref" "$(( nom_mhz * ${#cpus[@]} ))" "$agg_ms")"
+agg_mhz="$(delivered_mhz10 "$agg_ref" "$agg_del" "$nom_mhz" "$ref_perf" "$nom_perf")"
+[ -n "$agg_win" ] || { agg_win=none; agg_res=na; agg_mhz=na; }
+
+# ---- band per window, folded with a max that NAMES its winner
+ib="$(classify_band "$best_i_res" "$best_i_mhz" "$nom_mhz" "$FLOOR")"
+i_label="${ib%%|*}"; i_reason="${ib#*|}"
+if [ "$iv_ms" -gt 0 ] && [ "$best_v_res" != na ]; then
+  vb="$(classify_band "$best_v_res" "$best_v_mhz" "$nom_mhz" "$FLOOR")"
+  v_label="${vb%%|*}"; v_reason="${vb#*|}"
+  window="inst$(( inst_ms / 1000 )).$(( (inst_ms % 1000) / 100 ))s+iv$(( iv_ms / 1000 ))s"
+else
+  v_label=""; v_reason=""
+  window="inst$(( inst_ms / 1000 )).$(( (inst_ms % 1000) / 100 ))s (no iv: $iv_why)"
+fi
+label="$i_label"; reason="$i_reason"; winner=inst
+if [ -n "$v_label" ] && [ "$(band_rank "$v_label")" -gt "$(band_rank "$i_label")" ]; then
+  label="$v_label"; reason="$v_reason"; winner=iv
+fi
+if [ "$winner" = iv ]; then
+  busiest="$best_v_cpu"; busiest_res="$best_v_res"; busiest_mhz="$best_v_mhz"
+else
+  busiest="$best_i_cpu"; busiest_res="$best_i_res"; busiest_mhz="$best_i_mhz"
+fi
+# the floor is the whole point: a suppressed delivered_avg must not be printed as a number
+shown_mhz="$busiest_mhz"
+[ "$busiest_res" = na ] && shown_mhz=na
+[ "$busiest_res" != na ] && [ "$busiest_res" -lt "$FLOOR" ] 2>/dev/null && shown_mhz=na
+ratio=na
+[ "$shown_mhz" != na ] && ratio=$(( shown_mhz * 10 / nom_mhz ))
+
+# ---- persist the snapshot for the next run's interval window (never in --test: own paths there)
+{ echo "ts_ms $t1"; for c in "${cpus[@]}"; do echo "$c ${b_ref[$c]} ${b_del[$c]}"; done; } > "$SNAP" 2>/dev/null || true
+
+if [ "$mode" = edge ]; then
+  prev="$(cat "$STATE" 2>/dev/null || true)"
+  if [ "$prev" = "$label" ]; then
+    mesh-state-touch "$STATE" 2>/dev/null || true
+    exit 0
+  fi
+  printf '%s\n' "$label" > "$STATE"
+  mesh-state-touch "$STATE" 2>/dev/null || true
+fi
+
+if [ "$mode" = json ]; then
+  per=""
+  for c in "${cpus[@]}"; do
+    per="${per:+$per,}$(printf '{"cpu":"%s","rank":%s,"highest_perf":%s,"inst_residency_pct":"%s","inst_delivered_mhz":"%s","iv_residency_pct":"%s","iv_delivered_mhz":"%s"}' \
+      "$c" "${rank_of[$c]}" "${hi[$c]}" "$(fmt_tenths "${i_res[$c]}")" "$(fmt_tenths "${i_mhz[$c]}")" \
+      "$(fmt_tenths "${v_res[$c]}")" "$(fmt_tenths "${v_mhz[$c]}")")"
+  done
+  r1=""; for c in ${rank1_cpus//,/ }; do r1="${r1:+$r1,}\"$c\""; done
+  printf '{"label":"%s","reason":"%s","window_winner":"%s","busiest":"%s","busiest_residency_pct":"%s","busiest_delivered_mhz":"%s","ratio_pct":"%s","residency_floor_pct":"%s","agg_window":"%s","agg_residency_pct":"%s","agg_delivered_mhz":"%s","nominal_mhz":%s,"cpus":%s,"inst_ms":%s,"iv_ms":%s,"rank1":[%s],"per_cpu":[%s],"ts":"%s"}\n' \
+    "$label" "$reason" "$winner" "${busiest:-na}" "$(fmt_tenths "$busiest_res")" "$(fmt_tenths "$shown_mhz")" \
+    "$ratio" "$(fmt_tenths "$FLOOR")" "$agg_win" "$(fmt_tenths "$agg_res")" "$(fmt_tenths "$agg_mhz")" "$nom_mhz" "${#cpus[@]}" "$inst_ms" "$iv_ms" "$r1" "$per" "$ts"
+  exit 0
+fi
+
+if [ "$mode" = all ]; then
+  printf '%-7s %-5s %-5s  %9s %10s  %9s %10s\n' cpu rank hi_perf inst_res% inst_MHz iv_res% iv_MHz
+  for c in "${cpus[@]}"; do
+    im="$(fmt_tenths "${i_mhz[$c]}")"; vm="$(fmt_tenths "${v_mhz[$c]}")"
+    [ "${i_res[$c]}" != na ] && [ "${i_res[$c]}" -lt "$FLOOR" ] 2>/dev/null && im="na(<floor)"
+    [ "${v_res[$c]}" != na ] && [ "${v_res[$c]}" -lt "$FLOOR" ] 2>/dev/null && vm="na(<floor)"
+    printf '%-7s %-5s %-5s  %9s %10s  %9s %10s\n' \
+      "$c" "${rank_of[$c]}" "${hi[$c]}" "$(fmt_tenths "${i_res[$c]}")" "$im" \
+      "$(fmt_tenths "${v_res[$c]}")" "$vm"
+  done
+fi
+
+printf '[cppc] %s(%s) — busiest=%s res=%s%% delivered=%sMHz ratio=%s%% floor=%s%% cpus=%s window=%s rank1=%s (%s)\n' \
+  "$label" "$winner" "${busiest:-na}" "$(fmt_tenths "$busiest_res")" "$(fmt_tenths "$shown_mhz")" \
+  "$ratio" "$(fmt_tenths "$FLOOR")" "${#cpus[@]}" "$window" "${rank1_cpus:-na}" "$reason"
