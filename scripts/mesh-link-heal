@@ -24,7 +24,8 @@
 # reload is strictly better than waiting for a human. It is exactly what the reboot that "fixed"
 # past wedges did, minus the reboot.
 #
-# THE LADDER (one rung per consecutive down-check; cadence is 1/min so a rung ~= a minute)
+# THE LADDER (one rung per consecutive down-check OR per elapsed cadence-interval, whichever is
+# further along — see "the epistemic cut" below; a tick count is NOT a duration)
 #   1              observe only    — a normal deauth recovers by itself; do not fight the supplicant
 #   REASSOC_AFTER  wpa_cli reassociate
 #   BOUNCE_AFTER   ip link down/up + reassociate
@@ -55,7 +56,9 @@
 # gateway does not answer two pings.
 #
 #   mesh-link-heal            one check + at most one action; prints the verdict line
-#   mesh-link-heal --status   read-only: current link state + the escalation counter, acts never
+#   mesh-link-heal --status   read-only: link state, BOTH escalation axes (down_checks and
+#                             down_secs), which one is carrying the climb, and the settle window
+#                             left on the last action. Acts never.
 #   mesh-link-heal --json     machine-readable verdict
 #   mesh-link-heal --layer    read-only ONE WORD: which layer owns a "cannot reach the internet"
 #                             moment (UP|WEDGED|DEAUTHED|ROUTELESS|UNKNOWN). Answers on EVERY node,
@@ -79,8 +82,10 @@
 #   3 = the ladder is exhausted and the link is still down (a human is needed)
 #
 # State: $MESH_LINK_HEAL_STATE (default ~/.mesh/.link-heal.state) — "<consecutive_down> <last_rung>
-# <epoch>". Rewritten on EVERY run so its mtime is ran-live, per the liveness-touch convention: a
-# long-healthy link must not decay into a false STALE.
+# <epoch> <iface> <gateway> <first_down_epoch> <last_action_epoch>". Rewritten on EVERY run so its
+# mtime is ran-live, per the liveness-touch convention: a long-healthy link must not decay into a
+# false STALE. Fields are APPEND-ONLY: a state file written by an older copy is read with the trailing
+# fields at 0, which reads as "no episode open" and never as a fault dating from the epoch.
 # Log:   $MESH_LINK_HEAL_LOG   (default ~/.mesh/link-heal.log) — the durable record of every action.
 set -uo pipefail
 
@@ -112,6 +117,59 @@ PING_W="${MESH_LINK_HEAL_PING_W:-2}"
 # Driver reload is the only rung that unloads hardware support; a node whose adapter does not
 # re-probe would be left dark, so it is overridable per node.
 ALLOW_RELOAD="${MESH_LINK_HEAL_ALLOW_RELOAD:-1}"
+
+# ---------------------------------------------------------------- the epistemic cut
+# THE LADDER IS COUNTED IN TICKS AND THE FAULT RUNS IN SECONDS, AND THOSE ARE NOT THE SAME QUANTITY.
+# down_checks is a RATE-INDEPENDENT symbol: it advances once per run that observed the link down. The
+# wedge is RATE-DEPENDENT: it lasts wall-clock seconds whether or not anyone counted. The two agree
+# only while every scheduled tick actually lands, and on this node they do not — 1727 runs delivered
+# in a 2177-minute window (79.3%, measured 2026-08-18 from link-heal.cron.log's line count over its
+# birth time). Worse, every honest n/a exit (no radio, ambiguous radios, missing tool) returns before
+# the counter is touched, so physical time passes while the symbol is frozen. That freeze is not
+# hypothetical: 2026-08-17T01:10:07Z ACTION at down_checks=2 -> 01:18:01Z RECOVERED still at
+# down_checks=2, i.e. 7m54s of live fault recorded as ZERO further checks (and 15:09:07 -> 15:14:01,
+# 4m54s recorded as one). Those two froze via the disarm bug fixed in 5a04e4f, but the disarm was
+# only ONE of the paths that freeze it; the conversion itself was never there.
+# The consequence was in the alert text: SHOUT_AFTER=14 checks was announced to the board as "after
+# 14 min", so the one line that summons a human understated a 55-minute outage as a 14-minute one.
+#
+# So the ladder now reads BOTH axes and the fold NAMES ITS WINNER (effective_n): the tick count, and
+# the elapsed seconds divided by the nominal cadence. A frozen counter can no longer stall the climb,
+# because the clock carries it; a fast burst of extra runs cannot outrun the clock either.
+#
+# The other half of the cut is the CONTROL side. An act is not instantaneous: a driver reload or a USB
+# re-enumeration takes tens of seconds before the link COULD be up, and a measurement taken inside
+# that transient reads "still down" as evidence of the FAULT when it is evidence of the CURE. Those
+# checks are named `settling`: they still observe and still print, they do not advance down_checks and
+# they never act. The clock axis keeps running through them, so a settle window can delay a rung but
+# can never cancel the escalation.
+TICK="${MESH_LINK_HEAL_TICK:-60}"          # nominal seconds between scheduled checks (the cadence)
+
+# How long after each rung the link COULD not yet be back, in seconds — the rate-dependent half.
+# Measured from when the action RETURNS, so the sleeps already inside do_reload/do_replug are not
+# double-counted. A rung absent from this table settles instantly.
+settle_secs() {
+  case "$1" in
+    reassociate) printf 15  ;;   # supplicant re-attach + DHCP
+    bounce)      printf 25  ;;   # + carrier down/up
+    reload)      printf 60  ;;   # + module unload/load and USB re-probe
+    replug)      printf 75  ;;   # + full device re-enumeration
+    *)           printf 0   ;;
+  esac
+}
+
+# max(ticks, clock) -> "<n_eff> <winner>". Two renderings of "how long has this been down" must be
+# folded by something that says WHICH one won, or a reader cannot tell a counted minute from a
+# measured one.
+effective_n() {
+  local n="$1" secs="${2:-0}" byclock
+  case "$n"    in (*[!0-9]*|'') n=0    ;; esac
+  case "$secs" in (*[!0-9]*|'') secs=0 ;; esac
+  byclock=$(( secs / TICK ))
+  if   [ "$byclock" -gt "$n" ]; then printf '%s clock' "$byclock"
+  elif [ "$n" -gt "$byclock" ]; then printf '%s ticks' "$n"
+  else                               printf '%s agree' "$n"; fi
+}
 
 ts() { date -u +%FT%TZ; }
 say() { printf '%s\n' "$*"; }
@@ -220,18 +278,24 @@ gw_answers() {
 # the two facts the wedge deletes. They are appended, so a reader of the old three-field format is
 # unaffected.
 read_state() {
-  DOWN_N=0; LAST_RUNG=none; KNOWN_IFACE=""; KNOWN_GW=""
+  DOWN_N=0; LAST_RUNG=none; KNOWN_IFACE=""; KNOWN_GW=""; FIRST_DOWN=0; ACTED_AT=0
   if [ -r "$STATE" ]; then
-    read -r DOWN_N LAST_RUNG _ KNOWN_IFACE KNOWN_GW <"$STATE" 2>/dev/null || {
-      DOWN_N=0; LAST_RUNG=none; KNOWN_IFACE=""; KNOWN_GW=""; }
+    read -r DOWN_N LAST_RUNG _ KNOWN_IFACE KNOWN_GW FIRST_DOWN ACTED_AT <"$STATE" 2>/dev/null || {
+      DOWN_N=0; LAST_RUNG=none; KNOWN_IFACE=""; KNOWN_GW=""; FIRST_DOWN=0; ACTED_AT=0; }
   fi
   case "$DOWN_N" in (*[!0-9]*|'') DOWN_N=0 ;; esac
   [ -n "${LAST_RUNG:-}" ]   || LAST_RUNG=none
   [ -n "${KNOWN_IFACE:-}" ] || KNOWN_IFACE=""
   [ -n "${KNOWN_GW:-}" ]    || KNOWN_GW=""
+  # Fields 6-7 are the epistemic cut's clock half and are ABSENT from every state file written
+  # before it existed. A missing timestamp must read as "no episode open", never as epoch 0 — the
+  # latter would render a 56-year-old fault and fire the top rung on the first down check.
+  case "${FIRST_DOWN:-}" in (*[!0-9]*|'') FIRST_DOWN=0 ;; esac
+  case "${ACTED_AT:-}"   in (*[!0-9]*|'') ACTED_AT=0   ;; esac
 }
 write_state() {
-  printf '%s %s %s %s %s\n' "$1" "$2" "$(date +%s)" "${3:-${KNOWN_IFACE:-}}" "${4:-${KNOWN_GW:-}}" \
+  printf '%s %s %s %s %s %s %s\n' "$1" "$2" "$(date +%s)" "${3:-${KNOWN_IFACE:-}}" \
+    "${4:-${KNOWN_GW:-}}" "${5:-0}" "${6:-0}" \
     >"$STATE" 2>/dev/null || true
 }
 
@@ -276,11 +340,19 @@ layer_verdict() {
 # ---------------------------------------------------------------- the ladder
 # THE one place the escalation is decided. main() calls it and so does --test; a test that
 # re-implements this arithmetic asserts its own copy and stays green while the real ladder rots.
-#   choose_rung <consecutive_down_checks> <last_rung_attempted>  ->  prints the action
+#   choose_rung <consecutive_down_checks> <last_rung_attempted> [down_secs] [settle_left_secs]
+#                                                                ->  prints the action
 # A rung never fires twice in a row: without that guard a reassociate would re-fire every minute,
 # which is a storm, not an escalation.
+# Args 3-4 are the epistemic cut and both DEFAULT TO 0, so a two-argument call decides on the tick
+# count alone exactly as before. Arg 3 lets the clock outvote a frozen counter; arg 4 suppresses any
+# action taken inside the previous rung's settling transient — measuring the cure and scoring it as
+# the disease is how a ladder stacks a re-plug on top of a reload that had not finished yet.
 choose_rung() {
-  local n="$1" last="$2"
+  local n="$1" last="$2" secs="${3:-0}" settle_left="${4:-0}"
+  case "$settle_left" in (*[!0-9]*|'') settle_left=0 ;; esac
+  [ "$settle_left" -gt 0 ] && { printf settling; return 0; }
+  n="$(effective_n "$n" "$secs")"; n="${n%% *}"
   if   [ "$n" -ge "$SHOUT_AFTER" ];                                 then printf shout
   elif [ "$n" -ge "$REPLUG_AFTER" ] && [ "$last" != replug ];       then printf replug
   elif [ "$n" -ge "$RELOAD_AFTER" ] && [ "$last" != reload ] \
@@ -382,9 +454,23 @@ main() {
     state_word=DEAUTHED
   fi
 
+  # The clock half of the cut. down_secs is the PHYSICAL age of the open fault episode; it is 0
+  # while the link is up, and it keeps running through ticks that were never delivered.
+  local now down_secs eff eff_n eff_by settle_left
+  now="$(date +%s)"
+  if [ "$state_word" = UP ]; then down_secs=0
+  elif [ "$FIRST_DOWN" -gt 0 ] && [ "$FIRST_DOWN" -le "$now" ]; then down_secs=$(( now - FIRST_DOWN ))
+  else down_secs=0; fi          # episode opens on this run (or the stamp is unusable) -> age 0
+  eff="$(effective_n "$DOWN_N" "$down_secs")"; eff_n="${eff%% *}"; eff_by="${eff##* }"
+  settle_left=0
+  if [ "$ACTED_AT" -gt 0 ] && [ "$ACTED_AT" -le "$now" ]; then
+    settle_left=$(( $(settle_secs "$LAST_RUNG") - (now - ACTED_AT) ))
+    [ "$settle_left" -lt 0 ] && settle_left=0
+  fi
+
   if [ "$mode" = "--status" ]; then
-    say "link-heal: iface=$w state=$state_word route=$route_mode assoc=$assoc gw=$gw traffic=$traffic down_checks=$DOWN_N last_rung=$LAST_RUNG (read-only)"
-    write_state "$DOWN_N" "$LAST_RUNG" "$w" "$gw"
+    say "link-heal: iface=$w state=$state_word route=$route_mode assoc=$assoc gw=$gw traffic=$traffic down_checks=$DOWN_N down_secs=${down_secs}s escalation=$eff_n by=$eff_by settle_left=${settle_left}s last_rung=$LAST_RUNG (read-only)"
+    write_state "$DOWN_N" "$LAST_RUNG" "$w" "$gw" "$FIRST_DOWN" "$ACTED_AT"
     exit 0
   fi
 
@@ -392,19 +478,46 @@ main() {
     # Name the rung that preceded the recovery, so the log can answer WHICH rung worked rather
     # than merely that the link returned.
     if [ "$DOWN_N" -gt 0 ]; then
-      logline "RECOVERED iface=$w after ${DOWN_N} down-check(s); last rung attempted: $LAST_RUNG"
+      # Both quantities, never collapsed: the checks are what we COUNTED, the seconds are what the
+      # node actually spent dark. Their gap is the ticks that never landed plus the runs that
+      # returned n/a — the number a "down_checks == minutes" reading silently throws away.
+      logline "RECOVERED iface=$w after ${DOWN_N} down-check(s) / ${down_secs}s of real outage; last rung attempted: $LAST_RUNG"
     fi
     # An UP run is the only moment the gateway is known for certain — record it here so the routeless
-    # branch has something real to probe with later.
-    write_state 0 none "$w" "$gw"
+    # branch has something real to probe with later. The episode clock and the settle stamp are
+    # cleared here and ONLY here: recovery is what closes an episode.
+    write_state 0 none "$w" "$gw" 0 0
     [ "$mode" = "--json" ] && say "{\"iface\":\"$w\",\"state\":\"UP\",\"route\":\"$route_mode\",\"down_checks\":0,\"action\":\"none\"}"
     [ "$mode" = "--json" ] || say "link-heal: UP iface=$w gw=$gw"
     exit 0
   fi
 
-  DOWN_N=$((DOWN_N + 1))
+  # The episode clock starts at the FIRST down observation and is never restarted by a later one.
+  [ "$FIRST_DOWN" -gt 0 ] && [ "$FIRST_DOWN" -le "$now" ] || FIRST_DOWN="$now"
+
+  # ONE call to the ladder, made against the count this check WOULD reach — so a settling verdict can
+  # decline the increment while a real verdict keeps the pre-existing "act on the Nth down check"
+  # arithmetic byte for byte.
+  local down_next=$(( DOWN_N + 1 ))
+  action="$(choose_rung "$down_next" "$LAST_RUNG" "$down_secs" "$settle_left")"
+
+  # A settling check is a measurement of our own cure, not of the fault: it prints, it keeps the
+  # episode clock running (so the ladder can still be carried by wall-clock through a long settle),
+  # and it advances NOTHING. Scoring it as another down-check is what would stack a re-plug on a
+  # driver reload that had not finished re-enumerating yet.
+  if [ "$action" = settling ]; then
+    write_state "$DOWN_N" "$LAST_RUNG" "$w" "${gw:-$KNOWN_GW}" "$FIRST_DOWN" "$ACTED_AT"
+    if [ "$mode" = "--json" ]; then
+      say "{\"iface\":\"$w\",\"state\":\"$state_word\",\"route\":\"$route_mode\",\"down_checks\":$DOWN_N,\"down_secs\":$down_secs,\"action\":\"settling\",\"settle_left\":$settle_left}"
+    else
+      say "link-heal: $state_word iface=$w route=$route_mode down_checks=$DOWN_N down_secs=${down_secs}s action=settling settle_left=${settle_left}s after=$LAST_RUNG"
+    fi
+    exit 0
+  fi
+
+  DOWN_N="$down_next"
+  eff="$(effective_n "$DOWN_N" "$down_secs")"; eff_n="${eff%% *}"; eff_by="${eff##* }"
   rung="$LAST_RUNG"
-  action="$(choose_rung "$DOWN_N" "$LAST_RUNG")"
 
   case "$action" in
     reassociate) do_reassociate "$w"; rung=reassociate
@@ -427,21 +540,27 @@ main() {
                    logline "SKIP usb re-enumerate — MESH_LINK_HEAL_ALLOW_RELOAD=0 on this node (down_checks=$DOWN_N)"
                    rung=replug-skipped
                  fi ;;
-    shout)       logline "EXHAUSTED iface=$w still $state_word after ${DOWN_N} check(s) — a human is needed"
+    shout)       logline "EXHAUSTED iface=$w still $state_word after ${DOWN_N} check(s) / ${down_secs}s (escalation=$eff_n by=$eff_by) — a human is needed"
+                 # NEVER print a tick count with a time unit. This line used to say "after ${DOWN_N}
+                 # min", which is only true if every scheduled tick landed; on this node 79.3% do,
+                 # so the one message that summons a human understated the outage it was reporting.
                  command -v mesh-chat >/dev/null 2>&1 && \
-                   mesh-chat "[alert] link-heal: $(hostname) sole uplink $w still $state_word after ${DOWN_N} min — reassociate, link bounce and driver reload all failed. This is the rtw_8822bu wedge past every rung; the node needs hands or a reboot. Tape: $LOG" >/dev/null 2>&1
+                   mesh-chat "[alert] link-heal: $(hostname) sole uplink $w still $state_word after $(( down_secs / 60 ))m$(( down_secs % 60 ))s wall-clock (${DOWN_N} down-checks; escalation carried by=$eff_by) — reassociate, link bounce and driver reload all failed. This is the rtw_8822bu wedge past every rung; the node needs hands or a reboot. Tape: $LOG" >/dev/null 2>&1
                  rung=exhausted ;;
   esac
 
   # Keep the remembered iface/gw across a down run: they are what the NEXT routeless check needs, and
   # overwriting them with the empty values a wedge produces would erase the memory at the one moment
   # it becomes load-bearing.
-  write_state "$DOWN_N" "$rung" "$w" "${gw:-$KNOWN_GW}"
+  # An acting rung stamps the moment the action RETURNED, which is when its settle window opens.
+  # A non-acting check leaves the previous stamp alone.
+  case "$action" in (none|shout) : ;; (*) ACTED_AT="$(date +%s)" ;; esac
+  write_state "$DOWN_N" "$rung" "$w" "${gw:-$KNOWN_GW}" "$FIRST_DOWN" "$ACTED_AT"
 
   if [ "$mode" = "--json" ]; then
-    say "{\"iface\":\"$w\",\"state\":\"$state_word\",\"route\":\"$route_mode\",\"down_checks\":$DOWN_N,\"action\":\"$action\"}"
+    say "{\"iface\":\"$w\",\"state\":\"$state_word\",\"route\":\"$route_mode\",\"down_checks\":$DOWN_N,\"down_secs\":$down_secs,\"escalation\":$eff_n,\"by\":\"$eff_by\",\"action\":\"$action\"}"
   else
-    say "link-heal: $state_word iface=$w route=$route_mode down_checks=$DOWN_N action=$action"
+    say "link-heal: $state_word iface=$w route=$route_mode down_checks=$DOWN_N down_secs=${down_secs}s escalation=$eff_n by=$eff_by action=$action"
   fi
 
   [ "$action" = shout ] && exit 3
@@ -547,6 +666,101 @@ run_test() {
       echo "  FAIL repeat guard: $last re-fired at down=$((n+1))"; fails=$((fails+1))
     fi
   done
+
+  # 4b. THE EPISTEMIC CUT — the clock axis. A frozen tick counter must NOT be able to stall the
+  #     ladder: 2026-08-17T01:10:07Z->01:18:01Z is 7m54s of live fault that advanced down_checks by
+  #     ZERO. With the counter pinned at 1, elapsed seconds alone must carry the climb to every rung.
+  #     Driven through the REAL choose_rung, and paired with a control row at secs=0 so the gate
+  #     fails if the clock argument is ignored AND if it is applied when it should not be.
+  for pair in "2:reassociate:none" "4:bounce:reassociate" "7:reload:bounce" "10:replug:reload" "14:shout:replug"; do
+    n="${pair%%:*}"; want="$(printf %s "$pair" | cut -d: -f2)"; last="${pair##*:}"
+    got="$(choose_rung 1 "$last" "$(( n * TICK ))" 0)"
+    if [ "$got" = "$want" ]; then echo "  ok   clock axis: down_checks frozen at 1, ${n}x cadence elapsed -> $want"
+    else echo "  FAIL clock axis: frozen counter + $((n*TICK))s elapsed wanted $want got $got"; fails=$((fails+1)); fi
+  done
+  got="$(choose_rung 1 none 0 0)"
+  if [ "$got" = none ]; then echo "  ok   clock axis does not fire on a fresh episode (0s elapsed -> none)"
+  else echo "  FAIL clock axis fired at 0s elapsed: got $got"; fails=$((fails+1)); fi
+  #     and the fold must NAME its winner rather than silently maxing.
+  case "$(effective_n 3 "$(( 9 * TICK ))")" in
+    "9 clock") echo "  ok   effective_n names the clock when the clock is ahead" ;;
+    *) echo "  FAIL effective_n(3, 9 cadences) = '$(effective_n 3 $((9*TICK)))', wanted '9 clock'"; fails=$((fails+1)) ;;
+  esac
+  case "$(effective_n 9 "$(( 3 * TICK ))")" in
+    "9 ticks") echo "  ok   effective_n names the ticks when the ticks are ahead" ;;
+    *) echo "  FAIL effective_n(9, 3 cadences) = '$(effective_n 9 $((3*TICK)))', wanted '9 ticks'"; fails=$((fails+1)) ;;
+  esac
+
+  # 4c. THE CONTROL HALF — a check taken inside the previous rung's settling transient measures the
+  #     CURE, not the fault, and must act on nothing. Without this, a driver reload whose USB
+  #     re-probe has not finished reads as further evidence of the wedge and the next rung stacks on
+  #     top of it. Asserted at the count where each rung's SUCCESSOR would otherwise fire.
+  for pair in "10:reload" "14:replug"; do
+    n="${pair%%:*}"; last="${pair##*:}"
+    got="$(choose_rung "$n" "$last" "$(( n * TICK ))" 1)"
+    if [ "$got" = settling ]; then echo "  ok   settle window: 1s left after $last -> no action at down=$n"
+    else echo "  FAIL settle window ignored: down=$n after $last with 1s left chose '$got'"; fails=$((fails+1)); fi
+  done
+  #     ...and it must EXPIRE — a settle window that never closes is a healer that stops healing.
+  got="$(choose_rung 14 replug "$(( 14 * TICK ))" 0)"
+  if [ "$got" = shout ]; then echo "  ok   settle window expires: 0s left -> the ladder resumes (shout)"
+  else echo "  FAIL settle window did not expire: got '$got' wanted shout"; fails=$((fails+1)); fi
+  #     every rung in the table must claim a POSITIVE window, or the suppression is decorative.
+  for last in reassociate bounce reload replug; do
+    if [ "$(settle_secs "$last")" -gt 0 ]; then echo "  ok   settle_secs $last = $(settle_secs "$last")s"
+    else echo "  FAIL settle_secs $last is 0 — that rung's transient is unmodelled"; fails=$((fails+1)); fi
+  done
+
+  # 4d. THE UNIT LIE — asserted against the EMITTED ALERT, not against the source. The board line
+  #     used to announce "still ... after ${DOWN_N} min" while DOWN_N counts RUNS; on this node only
+  #     79.3% of scheduled runs land, so the one message that summons a human understated the outage
+  #     it was reporting. A grep for the old string would only prove a string is absent (and the
+  #     first draft of this gate matched its own comment quoting it). So: drive the real shout branch
+  #     with a fixture whose two axes DISAGREE ON PURPOSE — 14 down-checks but 900s of wall-clock —
+  #     capture what mesh-chat was actually handed, and require the alert to carry the 15 minutes
+  #     that elapsed rather than the 14 that were counted.
+  mkdir -p "$tmpd/shoutbin"; cp "$tmpd/fakebin/ip" "$tmpd/fakebin/iw" "$tmpd/shoutbin/"
+  printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "$MESH_TEST_CHAT_CAPTURE"\n' > "$tmpd/shoutbin/mesh-chat"
+  chmod +x "$tmpd/shoutbin/mesh-chat"
+  printf '13 replug %s wlt0 10.0.0.1 %s 0\n' "$(date +%s)" "$(( $(date +%s) - 900 ))" > "$tmpd/s-shout"
+  : > "$tmpd/chat-capture"
+  out="$(MESH_LINK_HEAL_STATE=$tmpd/s-shout MESH_LINK_HEAL_LOG=$tmpd/l-shout \
+         MESH_LINK_HEAL_NETDIR=$tmpd/netdir-one MESH_TEST_CHAT_CAPTURE=$tmpd/chat-capture \
+         PATH="$tmpd/shoutbin:$PATH" "$0" run 2>&1)"; rc=$?
+  local alert; alert="$(cat "$tmpd/chat-capture" 2>/dev/null)"
+  if [ "$rc" = 3 ] && [ -n "$alert" ]; then
+    echo "  ok   the shout rung fires and reaches the board (exit 3)"
+  else
+    echo "  FAIL shout rung did not fire or posted nothing (rc=$rc, verdict: $out)"; fails=$((fails+1))
+  fi
+  case "$alert" in
+    *15m*) echo "  ok   the alert reports the 900s that ELAPSED (15m), not the 14 ticks that were counted" ;;
+    *)     echo "  FAIL the alert does not carry wall-clock minutes: $alert"; fails=$((fails+1)) ;;
+  esac
+  case "$alert" in
+    *"14 min"*|*"14min"*) echo "  FAIL the alert spells the tick count as a duration again: $alert"
+                          fails=$((fails+1)) ;;
+    *) echo "  ok   the alert never spells the tick count as a duration" ;;
+  esac
+  case "$alert" in
+    *"14 down-checks"*) echo "  ok   the counted axis is still reported, beside the clock, not instead of it" ;;
+    *) echo "  FAIL the alert dropped the down-check count entirely: $alert"; fails=$((fails+1)) ;;
+  esac
+
+  # 4e. STATE ROUND-TRIP, both formats. The clock half is APPENDED, so a file written by the previous
+  #     copy must still read — and its missing timestamps must read as "no episode", never as epoch 0
+  #     (which would date the fault to 1970 and fire the top rung on the first down check).
+  local sv; sv="$STATE"
+  STATE="$tmpd/st-new"; write_state 5 reload wlt0 10.0.0.1 1700000000 1700000300; read_state
+  if [ "$DOWN_N:$LAST_RUNG:$KNOWN_IFACE:$KNOWN_GW:$FIRST_DOWN:$ACTED_AT" \
+       = "5:reload:wlt0:10.0.0.1:1700000000:1700000300" ]; then
+    echo "  ok   7-field state round-trips"
+  else echo "  FAIL state round-trip: got $DOWN_N:$LAST_RUNG:$KNOWN_IFACE:$KNOWN_GW:$FIRST_DOWN:$ACTED_AT"; fails=$((fails+1)); fi
+  STATE="$tmpd/st-old"; printf '5 reload 1700000000 wlt0 10.0.0.1\n' >"$STATE"; read_state
+  if [ "$DOWN_N:$LAST_RUNG:$FIRST_DOWN:$ACTED_AT" = "5:reload:0:0" ]; then
+    echo "  ok   a pre-cut 5-field state reads with no episode open (0/0), not epoch 0"
+  else echo "  FAIL old-format state read as $DOWN_N:$LAST_RUNG:$FIRST_DOWN:$ACTED_AT"; fails=$((fails+1)); fi
+  STATE="$sv"; read_state
 
   # 5. THE CRON-PATH LEG. The reflex runs from cron, whose PATH is /usr/bin:/bin — and `iw` lives in
   #    /usr/sbin. The first wired version of this tool read a healthy link as DEAUTHED under exactly
