@@ -1,0 +1,185 @@
+#!/usr/bin/env bash
+# mesh-cam-lock — THE device mutex for /dev/video*. The missing primitive.
+#
+# WHY THIS EXISTS (board [task] 2026-08-17T03:04Z, owner mesh-land/senses):
+# several reflexes open the SAME /dev/video0 on overlapping cron minutes with no mutual
+# exclusion of any kind. `grep -c flock` over every opener returned 0 — the one flock in the
+# tree (mesh-cam-watch) is a DAEMON-SINGLETON lock on a lockfile, which stops two daemons
+# stacking and says nothing about the device. So "the camera is wedged" could not be told
+# apart from "two of our own reflexes grabbed it in the same second", and the cost is not
+# cosmetic: this webcam shares a USB-2.0 hub with the node's SOLE uplink (see 584d0e4 /
+# 6eb054e), so contention over the camera is paid for in network.
+#
+# It is a WRAPPER, not a library: `mesh-cam-lock -- <cmd...>` runs cmd holding an exclusive
+# flock on a per-device lockfile. A wrapper because the openers are five different tools in
+# two languages invoking three different capture binaries; a sourced helper would have to be
+# deployed, PATH-resolved and version-matched into every one of them, whereas a wrapper is a
+# single token in front of an existing command line and degrades to "run it anyway" if absent.
+#
+# CONTENTION IS THE POINT, NOT JUST THE FIX. Every wait and every refusal is logged to
+# ~/.mesh/cam-lock.log with the waiter, the holder's tag and the wait in ms. Before this,
+# contention left NO trace anywhere: mesh-capture-inuse can see a device held, but it is
+# advisory, nobody consults it, and it samples — it cannot catch a 300ms overlap. A lock that
+# silently serialises would have fixed the symptom and destroyed the evidence.
+#
+#   mesh-cam-lock [--dev DEV] [--wait S] [--why TAG] -- <cmd...>
+#     --dev   device to lock (default /dev/video0). The LOCKFILE is derived from it, so two
+#             different cameras never contend with each other.
+#     --wait  seconds to wait for the lock. Default 25. `--wait 0` = non-blocking.
+#     --why   short tag naming the caller, recorded in the lockfile and the log so the NEXT
+#             waiter can name who it waited on. Defaults to the parent's comm.
+#
+#   exit: the command's own exit code, EXCEPT
+#         75 (EX_TEMPFAIL) — could not take the lock within --wait. The command DID NOT RUN.
+#            Callers must treat 75 as "skip this cycle", never as a capture failure: a busy
+#            device is a scheduling fact, not a broken sense, and folding it into the failure
+#            counter is what would turn a healthy contended camera into a false WEDGE.
+#
+# reflex-cadence: none — this is a wrapper invoked by other tools, never scheduled.
+# orphan-ok: primitive wrapper; its callers are the reflexes, it has no cadence of its own.
+set -u
+
+MESH="${MESH_DIR:-$HOME/.mesh}"
+LOG="${MESH_CAM_LOCK_LOG:-$MESH/cam-lock.log}"
+DEV="${MESH_CAM_LOCK_DEV:-/dev/video0}"
+WAIT="${MESH_CAM_LOCK_WAIT:-25}"
+WHY=""
+LOCKDIR="${MESH_CAM_LOCK_DIR:-$MESH}"
+
+_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+_ms()  { date +%s%3N; }
+
+log_evt() {
+  mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
+  printf '%s %s\n' "$(_now)" "$1" >> "$LOG" 2>/dev/null || true
+}
+
+usage() {
+  echo "usage: mesh-cam-lock [--dev DEV] [--wait SECS] [--why TAG] -- <cmd...>" >&2
+  echo "       mesh-cam-lock --test" >&2
+}
+
+# ---- --test: hermetic. NEVER touches a real /dev/video* ----
+# The device this tool guards shares a USB hub with the node's only uplink, and a wedged UVC
+# node answers an open() with minutes of urb errors — so a gate that "proves the lock works"
+# by racing two real captures is an ATTACK on the thing it is protecting (the same trap that
+# made mesh-doctor's hourly bruno-watch --test cost 15.5k urb errors, 6eb054e). Every leg here
+# runs against a temp lockfile and `sleep`/`true`, and asserts the ORDERING ARTIFACT — a file
+# whose lines could only have been written in a serialised order.
+if [ "${1:-}" = "--test" ]; then
+  f=0
+  command -v flock >/dev/null 2>&1 || { echo "smoke-test: SKIP (flock absent)"; exit 2; }
+  wd="$(mktemp -d)"; trap 'rm -rf "$wd"' EXIT
+  export MESH_CAM_LOCK_DIR="$wd" MESH_CAM_LOCK_LOG="$wd/cam-lock.log"
+  self="$0"
+
+  # LEG 1 — MUTUAL EXCLUSION, asserted on an ordering artifact rather than on timing.
+  # Two workers each append "in", sleep, append "out". If the lock holds, the file must read
+  # in/out/in/out; interleaved in/in/... is only reachable if both ran at once. A pure
+  # wall-clock assertion ("the second took >0.3s") would also pass on a machine that merely
+  # scheduled them apart, which is why the artifact is the transcript, not the duration.
+  ord="$wd/order"; : > "$ord"
+  worker() { "$self" --dev "$wd/fakecam" --why "$1" -- \
+    sh -c "printf 'in-%s\n' '$1' >> '$ord'; sleep 0.4; printf 'out-%s\n' '$1' >> '$ord'"; }
+  worker A & wA=$!
+  sleep 0.05
+  worker B & wB=$!
+  wait $wA; wait $wB
+  seq="$(tr '\n' ' ' < "$ord")"
+  case "$seq" in
+    "in-A out-A in-B out-B "|"in-B out-B in-A out-A ") : ;;
+    *) echo "  FAIL: captures INTERLEAVED — the device lock did not exclude (order: $seq)"; f=1 ;;
+  esac
+
+  # LEG 2 — a lock we cannot get within --wait must REFUSE (75) and must NOT run the command.
+  # Both halves matter: an implementation that returned 75 after running the command would
+  # pass a rc-only check while doing the exact double-open the tool exists to prevent.
+  ran="$wd/ran"
+  ( exec 9>"$wd/.cam-fakecam.lock"; flock 9; sleep 1.2 ) & hold=$!
+  sleep 0.15
+  "$self" --dev "$wd/fakecam" --wait 0 --why probe -- sh -c "echo yes > '$ran'" >/dev/null 2>&1
+  rc=$?
+  wait $hold 2>/dev/null
+  [ "$rc" = 75 ] || { echo "  FAIL: contended --wait 0 must exit 75 (EX_TEMPFAIL), got rc=$rc"; f=1; }
+  [ -s "$ran" ] && { echo "  FAIL: refused lock STILL RAN the command — the double-open is unguarded"; f=1; }
+
+  # LEG 3 — the refusal must leave EVIDENCE naming the holder. A silent serialiser destroys
+  # the only record that our own reflexes are racing, which is the question the board task
+  # asked (self-inflicted contention vs a genuinely wedged device).
+  /usr/bin/grep -q 'refused' "$MESH_CAM_LOCK_LOG" 2>/dev/null \
+    || { echo "  FAIL: a refusal wrote no line to cam-lock.log — contention left no trace"; f=1; }
+  /usr/bin/grep -q 'why=probe' "$MESH_CAM_LOCK_LOG" 2>/dev/null \
+    || { echo "  FAIL: the log does not name the WAITER (--why tag missing)"; f=1; }
+
+  # LEG 4 — uncontended must be transparent: the command's own exit code passes through,
+  # both directions. A wrapper that swallowed a non-zero rc would silently convert every
+  # capture failure into a success in five reflexes at once.
+  "$self" --dev "$wd/fakecam" -- true  >/dev/null 2>&1 || { echo "  FAIL: uncontended rc=0 not passed through"; f=1; }
+  "$self" --dev "$wd/fakecam" -- sh -c 'exit 42' >/dev/null 2>&1
+  [ "$?" = 42 ] || { echo "  FAIL: command exit code not passed through (expected 42)"; f=1; }
+
+  # LEG 5 — two DIFFERENT devices must not contend. One global lock would serialise unrelated
+  # cameras and manufacture the very stalls this tool exists to remove.
+  ( exec 9>"$wd/.cam-fakecam.lock"; flock 9; sleep 0.8 ) & hold=$!
+  sleep 0.1
+  "$self" --dev "$wd/othercam" --wait 0 -- true >/dev/null 2>&1
+  rc=$?
+  wait $hold 2>/dev/null
+  [ "$rc" = 0 ] || { echo "  FAIL: an unrelated device was blocked by another device's lock (rc=$rc)"; f=1; }
+
+  [ "$f" = 0 ] && { echo "smoke-test: ok"; exit 0; }
+  echo "smoke-test: FAIL"; exit 1
+fi
+
+# ---- arg parse ----
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dev)  DEV="${2:-}"; shift 2 ;;
+    --wait) WAIT="${2:-}"; shift 2 ;;
+    --why)  WHY="${2:-}"; shift 2 ;;
+    --)     shift; break ;;
+    -h|--help) usage; exit 0 ;;
+    *) usage; exit 64 ;;
+  esac
+done
+[ $# -gt 0 ] || { usage; exit 64; }
+[ -n "$WHY" ] || WHY="$(ps -o comm= -p "$PPID" 2>/dev/null | tr -d ' ' || true)"
+[ -n "$WHY" ] || WHY="unknown"
+
+LOCK="$LOCKDIR/.cam-$(basename "$DEV").lock"
+mkdir -p "$LOCKDIR" 2>/dev/null || true
+
+# flock missing: run anyway, but LOUDLY. A missing coreutil must never silently disable a
+# reflex — but it must equally never look like the lock held. Rare and loud, per doctrine.
+if ! command -v flock >/dev/null 2>&1; then
+  log_evt "cam-lock: UNGUARDED — flock(1) is not installed; ran why=$WHY dev=$DEV WITHOUT exclusion"
+  "$@"; exit $?
+fi
+
+exec 9>"$LOCK" 2>/dev/null || { log_evt "cam-lock: UNGUARDED — cannot open lockfile $LOCK; ran why=$WHY dev=$DEV"; "$@"; exit $?; }
+
+t0="$(_ms)"
+if [ "${WAIT:-25}" = "0" ]; then
+  flock -n 9; got=$?
+else
+  flock -w "$WAIT" 9; got=$?
+fi
+t1="$(_ms)"; waited=$(( t1 - t0 ))
+
+if [ "$got" != 0 ]; then
+  holder="$(cat "$LOCK" 2>/dev/null | tr -d '\n' | cut -c1-60)"
+  log_evt "cam-lock: refused dev=$DEV why=$WHY wait=${WAIT}s waited=${waited}ms holder=[${holder:-unknown}]"
+  exit 75
+fi
+
+# Record who holds it, so the next waiter's log line can NAME the holder rather than saying
+# "something". Truncate-then-write inside the lock: only the holder ever writes this file.
+printf '%s pid=%s why=%s dev=%s\n' "$(_now)" "$$" "$WHY" "$DEV" >&9 2>/dev/null || true
+
+[ "$waited" -ge 50 ] && log_evt "cam-lock: waited dev=$DEV why=$WHY waited=${waited}ms (contention — our own organs raced)"
+
+"$@"
+rc=$?
+flock -u 9 2>/dev/null || true
+exec 9>&-
+exit $rc
