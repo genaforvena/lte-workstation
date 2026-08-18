@@ -14,7 +14,7 @@
 #
 #   mesh-psi            one line: level + dominant resource + the three readings
 #   mesh-psi --json     machine-readable
-#   mesh-psi --edge     emit only on level change (2-consecutive debounce) — board reflex
+#   mesh-psi --edge     emit only on level change (rolling 3-tick debounce) — board reflex
 #   mesh-psi --test     smoke test (pure, no /proc read before the gate)
 #
 # Levels (per resource, worst wins; tunable via env):
@@ -58,6 +58,17 @@ MIN_DT="${MESH_PSI_MIN_DT:-60}"   # an interval average below this is noise, not
 # grinder — had it at `cpu some avg10=78%, STALLED` the moment a human looked. The band was never
 # dead (it fired on 07-31 and re-fires on demand); the sense was simply looking 1.7% of the time and
 # its CALM was being read as a claim about the node.
+#
+# ── AND THE DEBOUNCE OUTLIVED THAT FIX (2026-08-18) ──
+# Widening the window (above) made every tick a 100%-coverage reading, but the commit rule on top of
+# it still demanded TWO CONSECUTIVE ticks of the SAME level. A node whose 600s interval means
+# alternate — this one, where the reflex fleet's own io bursts land in every other window — never
+# supplies that, so `.psi.state` froze at CALM for 42.3h while `.psi.pending` cycled `BUSY:1` and was
+# reset each tick. Both failures publish an honest, live, mtime-fresh CALM; only the rule that turns
+# ticks into a committed value differs. The general shape: a debounce phrased as "N CONSECUTIVE" has
+# an input sequence it can never accept, and on that sequence it does not degrade — it silently
+# republishes the last value forever. Phrase it as a majority over a BOUNDED window instead, where a
+# verdict is always reachable, and log the ticks it holds back (see the edge block at the foot).
 #
 # The kernel already publishes the un-aliased quantity: `total=` on each some/full line is a
 # MONOTONIC accumulator of microseconds stalled since boot. A delta between two ticks covers 100% of
@@ -414,8 +425,77 @@ if [ "${1:-}" = --test ]; then
     else
       _mech_gate="mech live severity gate SKIPPED (cpu stall total ${_ecs}us < 599s needed to pin a verdict)"
     fi
+    # ── THE --edge DEBOUNCE, driven END-TO-END at a scratch state file ──
+    # The bug this gates: the old "2 CONSECUTIVE ticks of the same level" rule cannot fire on a node
+    # whose pressure alternates tick-to-tick, so `.psi.state` froze at CALM for 42.3h here while the
+    # ticks themselves raised BUSY/STALLED. Levels are forced by moving the THRESHOLDS, never by
+    # stubbing the reading — the real /proc parse, fold, quarantine and classify all run, so these
+    # gates drive the shipped edge path rather than a mock of it.
+    _dd="$(mktemp -d)"
+    _tick() {
+      case "$1" in
+        CALM)    _sb=9999; _ss=9999;;
+        BUSY)    _sb=0;    _ss=9999;;
+        STALLED) _sb=0;    _ss=0;;
+      esac
+      MESH_PSI_STATE="$_dd/x.state" MESH_PSI_TOTALS="$_dd/totals" MESH_PSI_DISKUTIL=999 \
+      MESH_PSI_DISKUTIL_IV=999 MESH_PSI_ATTRIB_BIN="$_dd/no-attrib" MESH_PSI_WCHAN_LOG="$_dd/no-wchan" \
+      MESH_PSI_SOME_BUSY="$_sb" MESH_PSI_SOME_STALL="$_ss" MESH_PSI_FULL_STALL=9999 \
+      MESH_PSI_MEM_FULL_STALL=9999 "$0" --edge 2>&1
+    }
+    _st() { cat "$_dd/x.state" 2>/dev/null; }
+    _pend() { cat "$_dd/x.pending" 2>/dev/null; }
+    _reseed() { rm -f "$_dd/x.state" "$_dd/x.pending"; _tick CALM >/dev/null; }
+    # Vacuity guard FIRST: if threshold forcing does not actually move the classifier, every
+    # sequence below drives one constant level and passes without asserting anything.
+    _reseed; [ "$(_st)" = CALM ] || fail "threshold-forced CALM did not seed the state: got '$(_st)'"
+    rm -f "$_dd/x.state" "$_dd/x.pending"; _tick STALLED >/dev/null
+    [ "$(_st)" = STALLED ] || fail "threshold forcing does not drive the classifier — every debounce gate below is VACUOUS: got '$(_st)'"
+    # 1. THE REGRESSION: a strictly alternating sequence must still commit. Red on the old rule.
+    _reseed; _held=""
+    for _l in BUSY CALM BUSY; do _held="$_held$(_tick "$_l")"; done
+    [ "$(_st)" = BUSY ] || fail "an ALTERNATING tick sequence never committed — this is the 42.3h-CALM freeze the 2-consecutive debounce caused: state='$(_st)'"
+    # 2. ...and a suppressed tick must SAY it was suppressed. A commit-only log cannot tell a quiet
+    #    node from a debounce that can never fire — that is why nothing but value-frozen saw this.
+    case "$_held" in *'[psi-hold]'*) :;; *) fail "a tick held back by the debounce logged NOTHING: '$_held'";; esac
+    # 3. A single isolated spike must STILL be suppressed (the one thing the old rule got right).
+    _reseed; _tick CALM >/dev/null; _tick CALM >/dev/null; _tick BUSY >/dev/null
+    [ "$(_st)" = CALM ] || fail "a single isolated spike committed — the debounce no longer suppresses one tick: '$(_st)'"
+    _tick CALM >/dev/null
+    [ "$(_st)" = CALM ] || fail "one spike inside an otherwise calm window must leave CALM standing: '$(_st)'"
+    # 4. The committed name is the WORST of the window, in BOTH orders — a burst is not made calmer
+    #    by the calm tick beside it, and the newest tick is not automatically the verdict.
+    _reseed; _tick BUSY >/dev/null; _tick STALLED >/dev/null
+    [ "$(_st)" = STALLED ] || fail "BUSY then STALLED must commit STALLED: '$(_st)'"
+    _reseed; _tick STALLED >/dev/null; _tick BUSY >/dev/null
+    [ "$(_st)" = STALLED ] || fail "STALLED then BUSY must commit STALLED, not the newest tick: '$(_st)'"
+    # 5. Release is SLOWER than attack, deliberately — and it must still happen, or the freeze just
+    #    moves to the non-CALM side.
+    _tick CALM >/dev/null; [ "$(_st)" = STALLED ] || fail "one calm tick released a stall — release must need a FULL clean window: '$(_st)'"
+    _tick CALM >/dev/null; [ "$(_st)" = STALLED ] || fail "two calm ticks released a stall — all three slots must be clean: '$(_st)'"
+    _tick CALM >/dev/null; [ "$(_st)" = CALM ] || fail "three consecutive clean ticks did NOT release — the state can now freeze non-CALM instead: '$(_st)'"
+    # 5b. ...and a PARTIAL window is not a clean one. The only path that reaches the release branch
+    #     with fewer than 3 slots is the upgrade boundary (a legacy pending discarded under a
+    #     non-CALM confirmed level) — where a single calm tick would otherwise cancel a live stall.
+    _reseed; _tick STALLED >/dev/null; _tick STALLED >/dev/null
+    [ "$(_st)" = STALLED ] || fail "setup for the partial-window gate did not reach STALLED: '$(_st)'"
+    printf 'STALLED:1\n' > "$_dd/x.pending"
+    _tick CALM >/dev/null
+    [ "$(_st)" = STALLED ] || fail "one calm tick against a PARTIAL window released a live stall — release must need three clean slots, not merely no dirty ones: '$(_st)'"
+    # 6. A pending file left by the OLD rule ("LEVEL:N") is a counter, not a tick window: read as a
+    #    ring it would inject a phantom tick on the upgrade boundary.
+    _reseed; printf 'BUSY:1\n' > "$_dd/x.pending"; _tick BUSY >/dev/null
+    [ "$(_st)" = CALM ] || fail "a legacy 'LEVEL:N' pending was parsed as ticks — one BUSY tick committed: '$(_st)'"
+    case "$(_pend)" in *:*) fail "the legacy pending survived instead of being replaced by a ring: '$(_pend)'";; esac
+    # 7. The window is BOUNDED — an unbounded ring would make the majority a lifetime average.
+    _reseed; for _l in BUSY BUSY BUSY BUSY BUSY; do _tick "$_l" >/dev/null; done
+    _rn="$(set -- $(_pend); echo $#)"
+    [ "$_rn" -ge 1 ] || fail "the ring gate read an EMPTY pending — it would pass however the ring grew: is the pending path right?"
+    [ "$_rn" -le 3 ] || fail "the tick ring grew past 3 slots ($_rn) — the debounce is now a lifetime average"
+    rm -rf "$_dd"
+    _debounce="debounce: 7 gates end-to-end (alternation, spike, worst-of-window, slow release, legacy pending, bound)"
     rm -rf "$_td"; trap - EXIT
-    echo "smoke-test: ok (incl. phantom-io quarantine: 5 pure + 2 forced-util live; ${_iv_e2e}; ${_seam}; ${_mech_gate})"
+    echo "smoke-test: ok (incl. phantom-io quarantine: 5 pure + 2 forced-util live; ${_iv_e2e}; ${_seam}; ${_mech_gate}; ${_debounce})"
   else
     echo "smoke-test: ok (no /proc/pressure — kernel without CONFIG_PSI, sense reports UNAVAILABLE)"
   fi
@@ -591,22 +671,48 @@ if [ "$EDGE" = 1 ]; then
     > "$TOTALS" 2>/dev/null || true
   PENDING="${STATE%.state}.pending"
   confirmed="$(cat "$STATE" 2>/dev/null || true)"
-  pending_line="$(cat "$PENDING" 2>/dev/null || true)"
-  pending="${pending_line%%:*}"; pcount="${pending_line##*:}"; pcount="${pcount:-0}"
+  # ── THE DEBOUNCE IS A ROLLING 3-WINDOW, NOT "2 CONSECUTIVE" (2026-08-18) ──
+  # The old rule committed a level only after TWO CONSECUTIVE ticks of the SAME level. On a node
+  # whose pressure alternates tick-to-tick that condition is simply never met, so the committed
+  # state freezes at whatever it last was — measured here: `.psi.state` read CALM for 42.3h while
+  # the ticks themselves were raising BUSY/STALLED (`.psi.pending` cycling `BUSY:1`, reset every
+  # tick). Note the shape that hid it: psi.log records COMMITS, so a debounce that never commits is
+  # invisible in the tool's own log BY CONSTRUCTION, and only reflex-health's `value-frozen` flag —
+  # a lead, never a verdict — pointed at it. A rolling 3-window CANNOT freeze: two classes over
+  # three slots always have a majority, so the committed state is never more than 3 ticks stale.
+  # Deliberately ASYMMETRIC (fast attack / slow release), and the asymmetry is the claim: 2 of the
+  # last 3 ticks non-CALM RAISES, naming the WORST level in the window — a burst is not made calmer
+  # by the calm tick beside it — while returning to CALM needs all 3 slots clean. A single isolated
+  # spike still cannot commit, which is the one thing the old rule got right and this keeps.
+  ring="$(cat "$PENDING" 2>/dev/null || true)"
+  case "$ring" in *:*) ring="";; esac   # legacy "LEVEL:N" pending from the old rule — start fresh
+  set -- $ring "$level"
+  while [ "$#" -gt 3 ]; do shift; done
+  ring="$*"; rn="$#"
+  printf '%s\n' "$ring" > "$PENDING" 2>/dev/null || true
+  nc=0; worst=""
+  for t in $ring; do
+    case "$t" in
+      STALLED) nc=$((nc + 1)); worst=STALLED;;
+      BUSY)    nc=$((nc + 1)); [ "$worst" = STALLED ] || worst=BUSY;;
+    esac
+  done
+  target=""
   if [ -z "$confirmed" ]; then
-    printf '%s\n' "$level" > "$STATE"; rm -f "$PENDING"
-  elif [ "$level" = "$confirmed" ]; then
-    rm -f "$PENDING"
-  elif [ "$level" = "$pending" ]; then
-    pcount=$((pcount + 1))
-    if [ "$pcount" -ge 2 ]; then
-      printf '%s\n' "$level" > "$STATE"; rm -f "$PENDING"
-      printf '[psi-%s] %s — %s | %s\n' "$(printf '%s' "$level" | tr '[:upper:]' '[:lower:]')" "$level" "$reason" "$signals"
-    else
-      printf '%s:%d\n' "$level" "$pcount" > "$PENDING"
-    fi
-  else
-    printf '%s:1\n' "$level" > "$PENDING"
+    target="$level"                                  # first sight: nothing to debounce against
+  elif [ "$nc" -ge 2 ]; then
+    target="$worst"                                  # attack: 2 of 3 non-calm → the worst of them
+  elif [ "$nc" = 0 ] && [ "$rn" -ge 3 ]; then
+    target=CALM                                      # release: a full clean window, never fewer
+  fi
+  if [ -n "$target" ] && [ "$target" != "$confirmed" ]; then
+    printf '%s\n' "$target" > "$STATE"
+    printf '[psi-%s] %s — %s | %s\n' "$(printf '%s' "$target" | tr '[:upper:]' '[:lower:]')" "$target" "$reason" "$signals"
+  elif [ "$level" != "$confirmed" ]; then
+    # HELD: this tick disagreed with the committed level and the window did not carry it. Logged
+    # because the failure above was invisible precisely for want of this line — a commit-only log
+    # cannot distinguish "quiet node" from "debounce that can never fire".
+    printf '[psi-hold] %s (window %s) held=%s — %s\n' "$level" "$ring" "${confirmed:-none}" "$reason"
   fi
   # touch on EVERY --edge run (liveness-touch convention): mtime = ran-live, content = confirmed level.
   # Touching only on the unchanged-level branch left the pending/debounce paths dark — an OSCILLATING
