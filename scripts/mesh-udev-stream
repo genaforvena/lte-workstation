@@ -36,13 +36,33 @@
 #      mesh-device-churn's is never touched). If the counter advanced and the stream named nothing
 #      across a fully-covered window, that is verdict GAP (rc 2), not quiet: two instruments
 #      disagreeing is a reason to distrust this one, not to publish its silence.
-#   Plus the stream witnesses ITSELF: SEQNUM is globally monotonic, so a jump of more than 1 between
-#   consecutive delivered events means events we were not given — emitted per line as `sgap=N`.
+#      BUT THE TWO INSTRUMENTS COUNT DIFFERENT POPULATIONS AND CAN NEVER FULLY AGREE (measured
+#      2026-08-18): uevent_seqnum is a GLOBAL counter, while kobject_uevent_net_broadcast() sends a
+#      netns-TAGGED uevent only into its own network namespace. Creating one throwaway netns with a
+#      dummy interface raised the counter by 7 while a raw netlink listener on init_net groups 1|2
+#      saw exactly 1 — the untagged module load. This node has non-init namespaces (a
+#      PrivateNetwork= unit today, docker whenever a container runs), so GAP has a permanent
+#      structural FLOOR that no listener fix can drive to zero. GAP therefore means "this window is
+#      unattributable", never "a device event was lost".
+#   Plus the stream witnesses ITSELF via `sgap=N` — but NOT as a delta between consecutive delivered
+#   events, because SEQNUM being globally monotonic does not make DELIVERY ordered. Measured here
+#   2026-08-18, three instruments side by side (udevadm --kernel, udevadm --udev, a raw netlink
+#   listener on groups 1|2): the kernel broadcast is strictly monotonic, udev's re-broadcast is NOT
+#   (udevd forks a worker per event and re-emits on completion, so order follows rule-processing
+#   duration). On a 173-event `udevadm trigger` burst where the set was PROVABLY COMPLETE — kernel
+#   counted 173, --kernel delivered 173, --udev delivered 173, this daemon logged 173 — the old
+#   delta arithmetic reported sgap totalling 1364 across 83 events, 7.9x the entire population.
+#   So `sgap` is now an OUTSTANDING gauge: seqnums below the stream's high-water mark that have not
+#   arrived YET. A late arrival takes itself back off, so reordering settles to 0 and only a real
+#   loss stays counted. It is read as the window's LAST value, never summed.
 #
 # WHAT IT STILL CANNOT DO:
 #   - It sees only from its own start. Whatever happened before the first listener started is gone;
 #     that is what the counter is for, and why both halves exist.
-#   - `sgap` counts seqnums we did not receive; it cannot say which, or whether they were kernel-only.
+#   - `sgap` counts seqnums we did not receive; it cannot say which. It is also NOT the same
+#     population as the accumulator: a residual set of uevents bumps /sys/kernel/uevent_seqnum
+#     without ever being netlink-broadcast at all, so they are unreachable to ANY listener — see
+#     the GAP verdict's own note. sgap only ever speaks about what the udev group did deliver.
 #   - A named device is not a fault. A plugged stick and the sole-uplink dongle re-enumerating both
 #     read as EVENTS; the name is what lets a human tell them apart, which is the entire point.
 #
@@ -122,14 +142,29 @@ listener_alive(){
 # with no timestamps.
 fold_awk(){
 cat <<'AWK'
-BEGIN{ have=0; prev=-1 }
+BEGIN{ have=0; hi=-1; out=0 }
 /^(UDEV|KERNEL)[ \t]*\[/ { delete kv; have=1; next }
 /^[A-Z][A-Z0-9_]*=/ && have==1 { i=index($0,"="); kv[substr($0,1,i-1)]=substr($0,i+1); next }
 /^[ \t]*$/ {
   if (have==1 && ("ACTION" in kv)) {
     sq = ("SEQNUM" in kv) ? kv["SEQNUM"] : "na"
+    # sgap is an OUTSTANDING gauge, not a delta against the previous delivered seqnum. udev
+    # re-broadcasts on WORKER COMPLETION, not in seqnum order (measured 2026-08-18: --kernel is
+    # strictly monotonic, --udev is not), so a delta-based gap counts every reordering as a loss
+    # and never takes it back. Here a seqnum above the high-water mark ADDS the seqnums it skipped
+    # and a late arrival below it SUBTRACTS itself, so a complete-but-reordered burst settles to 0
+    # and only a genuinely never-delivered seqnum stays counted.
     gap = 0
-    if (sq ~ /^[0-9]+$/) { if (prev >= 0 && sq-prev > 1) gap = sq-prev-1; prev = sq+0 }
+    if (sq ~ /^[0-9]+$/) {
+      s = sq+0
+      if (hi < 0) { hi = s }
+      else if (s > hi) { out += s - hi - 1; hi = s }
+      else if (!(s in seen)) { out -= 1 }
+      seen[s] = 1
+      if (out < 0) out = 0
+      gap = out
+      if (length(seen) > 8192) { for (k in seen) if (k+0 < hi-4096) delete seen[k] }
+    }
     dn = ("DEVNAME" in kv) ? kv["DEVNAME"] : "-"
     usb = "-"
     if (("ID_VENDOR_ID" in kv) && ("ID_MODEL_ID" in kv)) usb = kv["ID_VENDOR_ID"] ":" kv["ID_MODEL_ID"]
@@ -225,7 +260,10 @@ names_since(){
     END{ for(key in c) printf "%d\t%s(x%d)\n", o[key], key, c[key] }' \
     | sort -n | head -n "$max" | cut -f2 | paste -sd, - 2>/dev/null
 }
-sgap_since(){ scan_since "$1" | awk '{for(i=3;i<=NF;i++){split($i,p,"="); if(p[1]=="sgap") g+=p[2]}} END{print g+0}'; }
+# sgap is a GAUGE (outstanding seqnums below the stream's high-water mark), so the window's
+# reading is its LAST value, never a sum — summing a gauge adds the same outstanding seqnum once
+# per event that followed it. No event in the window means no fresh reading: na, never 0.
+sgap_since(){ scan_since "$1" | awk '{for(i=3;i<=NF;i++){split($i,p,"="); if(p[1]=="sgap") g=p[2]}} END{print (g=="")?"na":g+0}'; }
 
 # --- the verdict (pure) ---------------------------------------------------------------------------
 # in:  live(1/0) start(epoch|na) now window(s|na) events seq_delta(int|na) bootchanged(0/1)
@@ -257,7 +295,7 @@ decide(){
   fi
   case "$sdelta" in ''|na|*[!0-9]*) : ;; *)
     if [ "$sdelta" -gt 0 ]; then
-      printf 'GAP|2|%s|the seqnum accumulator counted %s uevent(s) in a window this listener claims it covered fully and named NONE — two instruments disagree, so this one is not trusted for the window; go read mesh-device-churn and the daemon log\n' "$cov" "$sdelta"; return
+      printf 'GAP|2|%s|the seqnum accumulator counted %s uevent(s) in a window this listener claims it covered fully and named NONE — this window is unattributable, NOT proof the listener dropped anything. /sys/kernel/uevent_seqnum is GLOBAL, but a netns-tagged uevent is broadcast only into its OWN network namespace, so any uevent in a non-init netns (docker, a PrivateNetwork= unit) raises the counter while being unreachable to every listener here — measured 2026-08-18: one throwaway netns + dummy iface raised the counter by 7 and only 1 of the 7, the untagged module load, reached init_net. So GAP has a permanent structural floor; rc 2 says we cannot attribute it, never that a device event was lost. To attribute it, diff --kernel against --udev; go read mesh-device-churn and the daemon log\n' "$cov" "$sdelta"; return
     fi;;
   esac
   printf 'QUIET|0|%s|no device event in the last %ss, listener up for all of it and the seqnum accumulator agrees (delta %s)\n' "$cov" "$win" "$sdelta"
@@ -377,6 +415,29 @@ run_test(){
   # 5269 -> 5273 is 3 undelivered seqnums; the stream must witness its own gap.
   case "$out" in *"sgap=3"*) : ;; *) F "the fold did not witness the 3-seqnum gap between delivered events (got: $out)";; esac
   case "$(printf '%s\n' "$out" | head -1)" in *sgap=0*) : ;; *) F "the first event of a stream invented a gap against no predecessor";; esac
+  # (8b) THE REORDERING GATE — the bug this field was rebuilt for. udev re-broadcasts on worker
+  #      COMPLETION, not in seqnum order, so a COMPLETE burst arrives shuffled. Measured live
+  #      2026-08-18: --udev delivered 5323 5324 5325 5327 5326 5328 5331 5332 5333 5329 5330 while
+  #      --kernel delivered the same 11 strictly in order. A delta-based sgap called that 4 losses;
+  #      on a 173-event burst it called 1364. The set is complete, so the gauge MUST settle to 0.
+  blocks(){ local sq; for sq in "$@"; do printf '%s\n' \
+      "UDEV  [1.0] change   /devices/virtual/mem/null (mem)" 'ACTION=change' \
+      'DEVPATH=/devices/virtual/mem/null' 'SUBSYSTEM=mem' "SEQNUM=$sq" ''; done; }
+  out="$(blocks 5323 5324 5325 5327 5326 5328 5331 5332 5333 5329 5330 | gawk "$prog")"
+  [ "$(printf '%s\n' "$out" | grep -c .)" = 11 ] || F "the reordered burst did not fold to 11 events (got: $out)"
+  case "$(printf '%s\n' "$out" | tail -1)" in *sgap=0*) : ;; *) F "a COMPLETE but reordered burst did not settle sgap to 0 — the delta-vs-gauge regression is back (got: $(printf '%s\n' "$out" | tail -1))";; esac
+  # ...and the gauge must still be able to SAY a loss: 202/203 never arrive, so it must not settle.
+  out="$(blocks 200 201 204 | gawk "$prog")"
+  case "$(printf '%s\n' "$out" | tail -1)" in *sgap=2*) : ;; *) F "two genuinely undelivered seqnums did not leave sgap=2 — the gauge cannot report a real loss (got: $(printf '%s\n' "$out" | tail -1))";; esac
+  # ...and a late arrival takes ITSELF back off, one at a time, not all at once.
+  out="$(blocks 300 303 301 | gawk "$prog")"
+  case "$(printf '%s\n' "$out" | tail -1)" in *sgap=1*) : ;; *) F "one late arrival out of two missing did not leave sgap=1 (got: $(printf '%s\n' "$out" | tail -1))";; esac
+  # ...and the OVER-reporting direction, which the measured 5323-burst above cannot expose (its own
+  # tail happens to land back in order, so the broken delta reads 0 there too): a COMPLETE set whose
+  # reordering reaches the LAST event. The delta arithmetic scores 403 against 401 and invents a
+  # loss on a set that is entire; the gauge has already taken 402 back off.
+  out="$(blocks 400 402 401 403 | gawk "$prog")"
+  case "$(printf '%s\n' "$out" | tail -1)" in *sgap=0*) : ;; *) F "a complete set reordered at its tail still reported a loss — the delta arithmetic is back (got: $(printf '%s\n' "$out" | tail -1))";; esac
   # ...and each half of the header guard is load-bearing on its own: the block-start pattern alone
   # (a header line wearing the word UDEV), and the ACTION requirement alone (a block that starts but
   # carries no event). Fed separately, either one leaking would emit a phantom event.
@@ -391,7 +452,7 @@ run_test(){
   printf '%s\n' \
     "$((NOW-1000)) old action=add subsystem=usb seqnum=1 sgap=0 dev=/d/old name=- usb=-" \
     "$((NOW-100)) x action=add subsystem=usb seqnum=2 sgap=2 dev=/d/1-2.3 name=- usb=0bda:b82c" \
-    "$((NOW-50)) x action=remove subsystem=block seqnum=3 sgap=0 dev=/d/sda name=/dev/sda usb=-" > "$L"
+    "$((NOW-50)) x action=remove subsystem=block seqnum=3 sgap=4 dev=/d/sda name=/dev/sda usb=-" > "$L"
   printf '%s\n' "$((NOW-80)) x action=change subsystem=hwmon seqnum=9 sgap=1 dev=/d/hwmon2 name=- usb=-" > "$L.1"
   local LOG_SAVE="$LOG"; LOG="$L"     # the scanners read $LOG; point them at the fixture tree
   [ "$(count_since $((NOW-200)))" = 3 ] || F "count_since missed the rotated generation or the window edge (got: $(count_since $((NOW-200))))"
@@ -402,7 +463,10 @@ run_test(){
   case "$out" in *"remove:block:/dev/sda"*) : ;; *) F "names_since dropped a REMOVAL — the case the age-based candidate list is structurally blind to (got: $out)";; esac
   case "$out" in *hwmon2*) : ;; *) F "names_since did not read the rotated generation (got: $out)";; esac
   case "$out" in *old*) F "names_since named an event outside the window";; esac
-  [ "$(sgap_since $((NOW-200)))" = 3 ] || F "sgap_since did not sum the witnessed gaps (got: $(sgap_since $((NOW-200))))"
+  # the gauge's reading is the window's LAST value (4), never the sum (1+2+4=7) — summing a gauge
+  # re-counts the same outstanding seqnum once per event that followed it.
+  [ "$(sgap_since $((NOW-200)))" = 4 ] || F "sgap_since did not read the gauge's last value (got: $(sgap_since $((NOW-200))))"
+  [ "$(sgap_since $((NOW+10)))" = na ] || F "a window with no delivered event manufactured an sgap of 0 instead of na (got: $(sgap_since $((NOW+10))))"
   LOG="$LOG_SAVE"; rm -rf "$d"
 
   # (10) LIVE, and END TO END: a real listener, a real event through the real udevadm, a real read.
