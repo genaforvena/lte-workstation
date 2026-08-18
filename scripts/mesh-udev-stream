@@ -80,6 +80,7 @@ STATE="${MESH_UDEV_STREAM_STATE:-$HOME/.mesh/.udev-stream.state}"
 BASE="${MESH_UDEV_STREAM_BASE:-$HOME/.mesh/.udev-stream.baseline}"
 LOCKF="${MESH_UDEV_STREAM_LOCK:-$HOME/.mesh/.udev-stream.lock}"
 STARTF="${MESH_UDEV_STREAM_STARTF:-$HOME/.mesh/.udev-stream.started}"
+PIDF="${MESH_UDEV_STREAM_PIDF:-$HOME/.mesh/.udev-stream.pid}"
 DLOG="${MESH_UDEV_STREAM_DLOG:-$HOME/.mesh/.udev-stream.daemon.log}"
 MARK="${MESH_UDEV_STREAM_MARK:-$HOME/.mesh/.udev-stream.posted}"
 SEQF="${MESH_UDEV_STREAM_SEQ:-/sys/kernel/uevent_seqnum}"
@@ -150,6 +151,7 @@ daemon(){
   exec 9>>"$LOCKF" || return 2
   if ! flock -n 9; then echo "$(stamp) another listener already holds $LOCKF — refusing to double-start"; return 0; fi
   printf '%s\n' "$(now_epoch)" > "$STARTF"
+  printf '%s\n' "$$" > "$PIDF"
   local prog; prog="$(fold_awk)"
   # The rotation lives HERE, in the appending shell, because an outside `mv` against a writer that
   # holds the fd orphans it: the file keeps growing invisibly under a name nothing reads.
@@ -181,16 +183,29 @@ ensure(){
 
 stop_listener(){
   listener_alive || { echo "listener: not running"; return 0; }
-  # Kill by SESSION, not by name: setsid put the daemon and its udevadm/gawk children in their own
-  # session, so signalling the session group reaps the whole tree — where a `pkill -f mesh-udev-stream`
-  # would also match this very shell (pkill-f-kills-its-own-wrapper-shell).
-  local sid mysid; mysid="$(ps -o sid= -p $$ 2>/dev/null | tr -d ' ')"
-  for sid in $(ps -eo sid=,args= 2>/dev/null | awk '/mesh-udev-stream --daemon/ && !/awk/ {print $1}' | sort -u); do
-    [ -n "$sid" ] || continue; [ "$sid" = "$mysid" ] && continue
-    kill -TERM -- -"$sid" 2>/dev/null
-  done
-  local i; for i in 1 2 3 4 5 6 7 8 9 10; do listener_alive || { echo "listener: stopped"; return 0; }; sleep 0.3; done
-  echo "listener: still holding the lock after TERM"; return 1
+  # SCOPED BY THIS INSTANCE'S OWN PIDFILE, never by a name match across the node. `pkill -f
+  # mesh-udev-stream --daemon` (or a ps|awk over the same string) is not "stop MY listener" — it is
+  # "stop every listener on this machine", so a sandboxed --test would reach out and kill the node's
+  # real reflex, and it also matches the very shell running it (pkill-f-kills-its-own-wrapper-shell).
+  # The pid is only trusted when it still holds THIS lock file, which pins identity to the artifact.
+  local pid; pid="$(tr -dc '0-9' < "$PIDF" 2>/dev/null)"
+  if [ -z "$pid" ] || [ ! -r "/proc/$pid/cmdline" ]; then
+    echo "listener: the lock is held but $PIDF names no live process — refusing to guess which pid to kill"; return 1
+  fi
+  case "$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)" in
+    *mesh-udev-stream*--daemon*) : ;;
+    *) echo "listener: pid $pid is not a listener (pid reused) — refusing to kill it"; return 1;;
+  esac
+  # The whole PROCESS GROUP, because the readers of the pipe (udevadm, gawk, the appending shell) are
+  # the part that actually holds the udev socket: killing the parent alone orphans them, and an
+  # orphaned udevadm monitor lives forever with nothing draining it.
+  local pgid; pgid="$(ps -o pgid= -p "$pid" 2>/dev/null | tr -dc '0-9')"
+  [ -n "$pgid" ] || pgid="$pid"
+  kill -TERM -- -"$pgid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
+  local i; for i in 1 2 3 4 5 6 7 8 9 10; do listener_alive || { rm -f "$PIDF"; echo "listener: stopped"; return 0; }; sleep 0.3; done
+  kill -KILL -- -"$pgid" 2>/dev/null
+  for i in 1 2 3 4 5; do listener_alive || { rm -f "$PIDF"; echo "listener: stopped (KILL)"; return 0; }; sleep 0.3; done
+  echo "listener: still holding the lock after TERM+KILL"; return 1
 }
 
 # --- reading the captured stream ------------------------------------------------------------------
@@ -395,7 +410,7 @@ run_test(){
   local sb; sb="$(mktemp -d)"
   local E=( "MESH_UDEV_STREAM_LOG=$sb/e.log" "MESH_UDEV_STREAM_STATE=$sb/e.state" "MESH_UDEV_STREAM_BASE=$sb/e.base"
             "MESH_UDEV_STREAM_LOCK=$sb/e.lock" "MESH_UDEV_STREAM_STARTF=$sb/e.start" "MESH_UDEV_STREAM_DLOG=$sb/e.dlog"
-            "MESH_UDEV_STREAM_MARK=$sb/e.mark" "MESH_UDEV_STREAM_CHAT=0" )
+            "MESH_UDEV_STREAM_MARK=$sb/e.mark" "MESH_UDEV_STREAM_PIDF=$sb/e.pid" "MESH_UDEV_STREAM_CHAT=0" )
   if ! command -v gawk >/dev/null 2>&1 || ! command -v udevadm >/dev/null 2>&1; then
     rm -rf "$sb"; echo "n/a: gawk or udevadm absent — the listener cannot be armed here" >&2; exit 2
   fi
@@ -430,8 +445,44 @@ run_test(){
   env "${E[@]}" bash "${BASH_SOURCE[0]}" --check >/dev/null 2>&1
   [ -e "$sb/e.state" ] && F "--check wrote the state artifact"
   [ "$(cat "$sb/e.base" 2>/dev/null)" = "$before" ] || F "--check advanced the baseline"
-  # a write pass writes both, and a DOWN pass (lock free) is rc 2 and says blind.
+  # (11) --stop is SCOPED and it REAPS. A second sandbox listener must survive the first's --stop
+  #      (a name-matching stop would kill every listener on the node, including the real reflex), and
+  #      the first's whole process group must be gone — killing the parent alone orphans the udevadm
+  #      that actually holds the udev socket, which then lives forever with nothing draining it.
+  local sb2; sb2="$(mktemp -d)"
+  local E2=( "MESH_UDEV_STREAM_LOG=$sb2/e.log" "MESH_UDEV_STREAM_STATE=$sb2/e.state" "MESH_UDEV_STREAM_BASE=$sb2/e.base"
+             "MESH_UDEV_STREAM_LOCK=$sb2/e.lock" "MESH_UDEV_STREAM_STARTF=$sb2/e.start" "MESH_UDEV_STREAM_DLOG=$sb2/e.dlog"
+             "MESH_UDEV_STREAM_MARK=$sb2/e.mark" "MESH_UDEV_STREAM_PIDF=$sb2/e.pid" "MESH_UDEV_STREAM_CHAT=0" )
+  env "${E2[@]}" bash "${BASH_SOURCE[0]}" --ensure >/dev/null 2>&1
+  local p1 g1; p1="$(tr -dc '0-9' < "$sb/e.pid" 2>/dev/null)"
+  g1="$(ps -o pgid= -p "${p1:-0}" 2>/dev/null | tr -dc '0-9')"
+  [ -n "$p1" ] || F "the daemon wrote no pidfile, so --stop has nothing to scope itself by"
   env "${E[@]}" bash "${BASH_SOURCE[0]}" --stop >/dev/null 2>&1
+  if [ -n "$g1" ]; then
+    local left; left="$(ps -eo pgid=,args= 2>/dev/null | awk -v g="$g1" '$1==g && /udevadm monitor/' | wc -l)"
+    [ "${left:-0}" = 0 ] || F "--stop left $left orphaned udevadm monitor(s) from its own process group — a leaked listener holds the udev socket forever"
+  fi
+  env "${E2[@]}" bash -c 'exec 8>>"$MESH_UDEV_STREAM_LOCK"; flock -n 8 && exit 1 || exit 0' \
+    || F "--stop reached across sandboxes and killed a DIFFERENT listener — a name match is not a scope"
+  env "${E2[@]}" bash "${BASH_SOURCE[0]}" --stop >/dev/null 2>&1
+  env "${E2[@]}" bash -c 'exec 8>>"$MESH_UDEV_STREAM_LOCK"; flock -n 8 && exit 0 || exit 1' \
+    || F "the second listener survived its OWN --stop"
+  rm -rf "$sb2"
+  # (11b) ...and the pidfile is trusted only while it still names a LISTENER. A pid is reused; if the
+  #       recorded one now belongs to something else, --stop must refuse rather than kill a stranger.
+  local sb3; sb3="$(mktemp -d)"
+  bash -c 'exec 8>>"'"$sb3"'/e.lock"; flock 8; exec sleep 20' >/dev/null 2>&1 &
+  local holder=$!
+  sleep 0.5
+  bash -c 'exec sleep 20' >/dev/null 2>&1 &
+  local stranger=$!
+  printf '%s\n' "$stranger" > "$sb3/e.pid"
+  out="$(MESH_UDEV_STREAM_LOCK="$sb3/e.lock" MESH_UDEV_STREAM_PIDF="$sb3/e.pid" bash "${BASH_SOURCE[0]}" --stop 2>&1)"
+  case "$out" in *"not a listener"*) : ;; *) F "--stop trusted a pidfile naming a non-listener (got: $out)";; esac
+  kill -0 "$stranger" 2>/dev/null || F "--stop KILLED a stranger whose pid the pidfile happened to name"
+  kill -TERM "$stranger" "$holder" 2>/dev/null; wait "$stranger" "$holder" 2>/dev/null
+  rm -rf "$sb3"
+  # a DOWN pass (lock free) is rc 2 and says blind.
   local d2; d2="$(mktemp -d)"
   out="$(MESH_UDEV_STREAM_LOG=$d2/n.log MESH_UDEV_STREAM_STATE=$d2/n.state MESH_UDEV_STREAM_BASE=$d2/n.base \
          MESH_UDEV_STREAM_LOCK=$d2/n.lock MESH_UDEV_STREAM_STARTF=$d2/n.start MESH_UDEV_STREAM_MARK=$d2/n.mark \
@@ -441,7 +492,7 @@ run_test(){
   rm -rf "$sb" "$d2"
 
   [ "$fails" = 0 ] || { echo "smoke-test: FAILED ($fails)" >&2; exit 1; }
-  echo "smoke-test: ok (EVENTS/QUIET/DOWN/PARTIAL/GAP/REBOOT/BASELINE each driven; a dead listener never reads quiet; coverage rendered and a partial count labelled a floor; the counter cross-check overrides silence; the fold driven on REAL udevadm output incl. its header and a seqnum gap; scanners span a rotation and name a REMOVAL; a real listener armed, singleton by lock, capturing a real triggered uevent and named by the read; --check writes nothing)"
+  echo "smoke-test: ok (EVENTS/QUIET/DOWN/PARTIAL/GAP/REBOOT/BASELINE each driven; a dead listener never reads quiet; coverage rendered and a partial count labelled a floor; the counter cross-check overrides silence; the fold driven on REAL udevadm output incl. its header and a seqnum gap; scanners span a rotation and name a REMOVAL; a real listener armed, singleton by lock, capturing a real triggered uevent and named by the read; --check writes nothing; --stop is scoped by its own pidfile, reaps its whole process group and leaves a second listener untouched)"
   exit 0
 }
 
