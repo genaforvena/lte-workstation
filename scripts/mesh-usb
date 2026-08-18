@@ -67,7 +67,9 @@
 #   <product>\t<vid:pid>\t<removable>\t<speed> lines — consumed by mesh-usb-events'
 #   delta layer; treat the 4-column shape as a consumer contract; the age axis is
 #   deliberately NOT bolted on here, it has its own mode) · --age · --bt ·
-#   --xhci [busid] (the host controller's own verdict; defaults to the uplink) · --test
+#   --xhci [busid] (the host controller's own verdict; defaults to the uplink) ·
+#   --urb [busid] (the URB BALANCE — enqueue minus giveback over two bounded windows in a
+#   PRIVATE tracing instance; the only axis here that separates idle from wedged) · --test
 set -u
 
 ROOT_HUB_VID="1d6b"   # Linux Foundation — the controllers' own root hubs, not peripherals
@@ -578,6 +580,235 @@ xhci_line() {
   printf '%s\n' "$dump" | xhci_verdict "$ctx"
 }
 
+# ── THE URB BALANCE: submitted work that never completes (2026-08-18) ───────────────
+# --xhci above is a LEVEL (ring pointers, endpoint state) and so is every other uplink
+# instrument on this node (/proc/interrupts, mesh-nic-drops, the ep-context backlog). A
+# level cannot separate IDLE from WEDGED — both read "nothing is moving". The xhci-hcd
+# tracepoint pair CAN, because a wedge is not the absence of traffic: it is submitted work
+# that never comes back. rtw88 exports ZERO tracepoints of its own, so the controller side
+# is the only vantage there is.
+#   THE AXIS IS THE BALANCE, NOT THE RATE. Measured here: a 1s window read 1824 lines and a
+#   3s window 660 — events/s is bursty and would flap, so it is published as context and
+#   NEVER as a health axis. enqueue-minus-giveback over the window is the axis, and its
+#   healthy value is 0 (464/464 and 337/337 in two independent live windows).
+#   NOT the same as "nothing is in flight": this uplink permanently holds ~5 URBs on the
+#   wire (ep4in-bulk pre-submits its RX ring), which shows up as givebacks with no in-window
+#   enqueue. That standing DEPTH is published separately and explicitly labelled, because a
+#   reader who mistakes it for the balance sees a permanent false wedge. The balance is the
+#   CHANGE in that depth across the window; the depth itself is a level like all the others.
+#   DEBOUNCE: >0 in ONE window is a straddle artifact (a burst enqueued just before the
+#   window closed), so a single run takes TWO consecutive windows and only calls the wedge
+#   when both are positive.
+# SAFETY — the most dangerous thing this tool does. tracefs is a SHARED, GLOBAL instrument:
+#   writing tracing_on/current_tracer/set_event at the top level would silently commandeer
+#   whatever else on the node is tracing. So this NEVER touches the global files. It mkdirs a
+#   PRIVATE INSTANCE (its own ring buffer, its own events/, its own trace), enables exactly
+#   two tracepoints inside it, traces for a bounded window, then disables and rmdirs. A trap
+#   tears the instance down on INT/TERM/HUP so a killed run cannot leave tracepoints armed,
+#   and the arm path crash-reaps a leaked instance under the same lock first. --test reads
+#   the three global files before and after a REAL run and fails if any moved.
+# HONESTY GATES the brief did not have:
+#   • the trace header's `entries-in-buffer/entries-written` IS a drop detector. If the ring
+#     overflowed, some givebacks were thrown away and the balance reads as a wedge that never
+#     happened → na(EOVERFLOW), never a number.
+#   • a window with NO URB events at all cannot be assessed: on this axis idle and dead read
+#     alike → na(ENODATA), never CLEAN. A device whose driver stopped submitting is exactly
+#     the case that would otherwise be reported as healthy.
+# COST, stated because --test pays it: mesh-doctor runs every --test hourly, so this arms two
+#   xhci tracepoints on the sole uplink for 2x3s every hour (~1-2k buffered events, freed with
+#   the instance). Bounded and self-tearing-down, but it is not free and it is not zero-touch.
+# PRIVILEGE: /sys/kernel/tracing is 0700 root here — EVERY read needs root, including the
+#   trace copy. It is read INSIDE the same `sudo -n` (not copied to /tmp and chmod'ed), so
+#   there is no root-owned artifact left behind for a later reader to EACCES on.
+URB_WIN="${MESH_USB_URB_WIN:-3}"          # s per window; two windows are taken
+URB_BUFKB="${MESH_USB_URB_BUFKB:-2048}"   # per-cpu ring for the private instance
+URB_INST="${MESH_USB_URB_INST:-mesh-urb}"
+# A FIXED path on purpose: honouring TMPDIR would give two callers two different locks and
+# serialise nothing, which is worse than no lock (the reap would race a live sibling run).
+URB_LOCK="${MESH_USB_URB_LOCK:-/tmp/.mesh-usb-urb.lock}"
+trace_root() { echo "${MESH_USB_TRACE_DIR:-/sys/kernel/tracing}"; }
+# `-` not `:-`: a fixture sets it EMPTY to drive the same path unprivileged.
+USUDO="${MESH_USB_URB_SUDO-sudo -n}"
+
+_urun() {  # <cap_s> <sh-script> [args...] — run under the (possibly empty) privilege prefix
+  local cap="$1"; shift
+  local script="$1"; shift
+  if [ -n "$USUDO" ]; then timeout "$cap" $USUDO sh -c "$script" _ "$@" 2>&1
+  else                     timeout "$cap" sh -c "$script" _ "$@" 2>&1; fi
+}
+
+# urb_globals — the three GLOBAL tracefs files this tool must never move, as one token.
+# Read under the same privilege prefix; "na" when unreadable (never a fabricated "unchanged").
+urb_globals() {
+  _urun 5 '
+    tr="$1"
+    [ -d "$tr" ] || { echo na; exit 2; }
+    on=$(cat "$tr/tracing_on" 2>/dev/null)   || { echo na; exit 2; }
+    tc=$(cat "$tr/current_tracer" 2>/dev/null) || { echo na; exit 2; }
+    se=$(cksum < "$tr/set_event" 2>/dev/null)  || { echo na; exit 2; }
+    printf "on=%s|tracer=%s|set_event=%s\n" "$on" "$tc" "$se"
+  ' "$(trace_root)"
+}
+
+# urb_capture <secs> — ONE privileged call: arm a private instance, take two consecutive
+# windows, tear it down. Emits a marked stream on stdout. Markers, never bare emptiness:
+#   __NOTRACE__  tracefs absent/unreadable · __NOINST__ instance dir refused
+#   __NOEVENT__  the xhci_urb_* tracepoints are not enableable here
+urb_capture() {
+  local secs="$1"
+  _urun $(( secs * 2 + 20 )) '
+    tr="$1"; inst="$2"; secs="$3"; bufkb="$4"
+    [ -d "$tr" ] || { echo "__NOTRACE__"; exit 3; }
+    # present-but-unreadable is a DIFFERENT fact from absent (fix sudo vs there is no tracefs),
+    # and collapsing them sends the reader to the wrong place.
+    cat "$tr/tracing_on" >/dev/null 2>&1 || { echo "__NOPERM__"; exit 3; }
+    I="$tr/instances/$inst"
+    cleanup() {
+      [ -d "$I" ] || return 0
+      ( echo 0 > "$I/tracing_on" ) 2>/dev/null
+      ( echo 0 > "$I/events/xhci-hcd/xhci_urb_enqueue/enable" ) 2>/dev/null
+      ( echo 0 > "$I/events/xhci-hcd/xhci_urb_giveback/enable" ) 2>/dev/null
+      rmdir "$I" 2>/dev/null
+    }
+    # A killed previous run leaves the instance armed. The caller holds the lock, so nothing
+    # of ours is live: reap it before arming rather than wedging every future run.
+    trap "cleanup" EXIT INT TERM HUP
+    cleanup
+    mkdir "$I" 2>/dev/null || { echo "__NOINST__"; exit 4; }
+    # a pseudo-file mode bit is not the write (`[ -w ]` lies on procfs/sysfs): every write
+    # below is PROBED by its result, never gated on the bit.
+    ( echo "$bufkb" > "$I/buffer_size_kb" ) 2>/dev/null
+    ( echo 0 > "$I/tracing_on" ) 2>/dev/null
+    for e in xhci_urb_enqueue xhci_urb_giveback; do
+      ( echo 1 > "$I/events/xhci-hcd/$e/enable" ) 2>/dev/null || { echo "__NOEVENT__ $e"; exit 5; }
+      [ "$(cat "$I/events/xhci-hcd/$e/enable" 2>/dev/null)" = 1 ] || { echo "__NOEVENT__ $e"; exit 5; }
+    done
+    w=1
+    while [ "$w" -le 2 ]; do
+      ( : > "$I/trace" ) 2>/dev/null
+      ( echo 1 > "$I/tracing_on" ) 2>/dev/null
+      sleep "$secs"
+      ( echo 0 > "$I/tracing_on" ) 2>/dev/null
+      echo "=== WINDOW $w"
+      cat "$I/trace" 2>/dev/null
+      w=$(( w + 1 ))
+    done
+    exit 0
+  ' "$(trace_root)" "$URB_INST" "$secs" "$URB_BUFKB"
+}
+
+# urb_verdict <ctx> <slot> <secs> — PURE parser: capture stream on stdin → the reading on
+# stdout. Every na names its errno-ish cause and its evidence; nothing here reads the bus.
+urb_verdict() {
+  awk -v ctx="$1" -v slot="$2" -v secs="$3" '
+    /^__NOTRACE__/ { blind="ENOENT: no tracefs at the trace root — this kernel/host exposes no tracepoints (the case on every node but this one)"; next }
+    /^__NOPERM__/  { blind="EPERM: tracefs is present but unreadable — it is 0700 root here and the sudo -n did not land"; next }
+    /^__NOINST__/  { blind="EACCES: could not create the private tracing instance — refused, or tracefs is read-only"; next }
+    /^__NOEVENT__/ { blind="ENOENT: xhci-hcd/" $2 " is not enableable in a private instance on this kernel"; next }
+    /^=== WINDOW /  { w = $3 + 0; nw = (w > nw ? w : nw); next }
+    # the ring-overflow detector: written > in-buffer means givebacks were DISCARDED and the
+    # balance would read as a wedge that never happened.
+    /entries-in-buffer\/entries-written:/ {
+      for (i = 1; i <= NF; i++) if ($i ~ /^[0-9]+\/[0-9]+$/) {
+        split($i, a, "/"); if (a[2] > a[1]) drop[w] += a[2] - a[1]
+      }
+      next
+    }
+    /^#/ { next }
+    / xhci_urb_enqueue: | xhci_urb_giveback: / {
+      ev = ""; ep = ""; urb = ""; sl = ""
+      for (i = 1; i <= NF; i++) {
+        if ($i == "xhci_urb_enqueue:" || $i == "xhci_urb_giveback:") { ev = $i; ep = $(i+1) }
+        else if ($i == "urb")  urb = $(i+1)
+        else if ($i == "slot") sl  = $(i+1) + 0
+      }
+      if (ev == "" || urb == "") next
+      if (sl != slot + 0) { off[sl]++; next }
+      sub(/:$/, "", ep)
+      seen[w] = 1
+      if (ev == "xhci_urb_enqueue:") { enq[w]++; eenq[w SUBSEP ep]++; live[w SUBSEP urb]++ }
+      else {
+        giv[w]++; egiv[w SUBSEP ep]++
+        # a giveback whose enqueue predates the window: that URB was ALREADY on the wire.
+        # It is the standing ring DEPTH, not an imbalance — counted separately, never folded in.
+        if (live[w SUBSEP urb] > 0) live[w SUBSEP urb]--
+        else { open[w]++; eopen[w SUBSEP ep]++ }
+      }
+      eps[ep] = 1
+      next
+    }
+    END {
+      if (blind != "") { printf "urb: %s na(%s) — cannot assess, NOT clear\n", ctx, blind; exit 2 }
+      if (nw < 2)      { printf "urb: %s na(ESTREAM: fewer than 2 windows returned — the capture did not complete) — cannot assess, NOT clear\n", ctx; exit 2 }
+      if (drop[1] + drop[2] > 0) {
+        printf "urb: %s na(EOVERFLOW: %d+%d event(s) lost to the ring buffer — a discarded giveback reads as an outstanding URB, so the balance is UNRELIABLE, not a wedge) — cannot assess, NOT clear\n", ctx, drop[1] + 0, drop[2] + 0
+        exit 2
+      }
+      for (i = 1; i <= 2; i++) if (!seen[i]) {
+        printf "urb: %s na(ENODATA: window %d carried NO URB events on slot %s over %ss — on this axis an idle device and a dead one read alike, so this is not a clean bill) — cannot assess, NOT clear\n", ctx, i, slot, secs
+        exit 2
+      }
+      n1 = enq[1] - giv[1]; n2 = enq[2] - giv[2]
+      verdict = (n1 > 0 && n2 > 0) ? "URB-WEDGE" : "CLEAN"
+      why = (verdict == "URB-WEDGE") \
+        ? sprintf("%d and %d URB(s) enqueued and never given back, in BOTH consecutive windows — submitted work that is not completing", n1, n2) \
+        : ((n1 > 0 || n2 > 0) \
+           ? sprintf("imbalance in one window only (%+d/%+d) — a burst straddling a window edge, not a wedge (the debounce needs both)", n1, n2) \
+           : "every enqueued URB came back inside its window")
+      printf "urb: %s — verdict=%s · net_outstanding_urbs w1=%+d w2=%+d · %s\n", ctx, verdict, n1, n2, why
+      printf "urb:   traffic enq/giveback %d/%d then %d/%d — the RATE is bursty on this link and is context, NOT a health axis\n", enq[1] + 0, giv[1] + 0, enq[2] + 0, giv[2] + 0
+      printf "urb:   in-flight at window open %d/%d urb(s) — the standing ring DEPTH (this uplink pre-submits its RX ring); a LEVEL, deliberately NOT folded into the balance\n", open[1] + 0, open[2] + 0
+      for (e in eps) {
+        printf "urb:   ep %-16s enq/giv %d/%d net %+d · %d/%d net %+d · depth %d/%d\n", e, \
+          eenq[1 SUBSEP e] + 0, egiv[1 SUBSEP e] + 0, eenq[1 SUBSEP e] - egiv[1 SUBSEP e], \
+          eenq[2 SUBSEP e] + 0, egiv[2 SUBSEP e] + 0, eenq[2 SUBSEP e] - egiv[2 SUBSEP e], \
+          eopen[1 SUBSEP e] + 0, eopen[2 SUBSEP e] + 0
+      }
+      no = 0; for (s in off) no += off[s]
+      printf "urb:   window: 2x%ss in a PRIVATE tracing instance (global tracing_on/current_tracer/set_event untouched) · %d line(s) on other slots ignored · ring drops %d/%d (entries-written == entries-in-buffer, so no giveback was discarded)\n", secs, no, drop[1] + 0, drop[2] + 0
+      exit 0
+    }
+  '
+}
+
+# urb_line [busid] — resolve the device to its LIVE xHCI slot, capture, judge.
+# Defaults to the uplink. rc 0 = a reading · rc 2 = honest blind.
+urb_line() {
+  local busid ref out rc slotdir hc slot ctx stream secs
+  secs="$URB_WIN"; [ "$secs" -gt 3 ] 2>/dev/null && secs=3   # the brief's bound: never trace longer
+  busid="${1:-}"
+  if [ -z "$busid" ]; then
+    if ref="$(uplink_ref)"; then busid="${ref%%	*}"
+    else echo "urb: na — no USB-attached net interface to resolve (the uplink is not on this bus)"; return 2; fi
+  fi
+  # THE SLOT IS RESOLVED, NEVER HARDCODED. It is a live xHCI slot id, reassigned on every
+  # re-enumeration, and this dongle has moved through five USB paths — a pinned "slot 5"
+  # would silently report another device's URBs (or none) after the next wedge.
+  out="$(xhci_slot_dir "$busid")"; rc=$?
+  case "$rc" in
+    0) slotdir="$out" ;;
+    3) echo "urb: na(ENOENT: no xhci debugfs at $(xhci_root)) — the trace lines carry a slot id and nothing here maps it to $busid; cannot assess, NOT clear"; return 2 ;;
+    1) echo "urb: $busid na(ENODEV: no slot under $(xhci_root) whose devices/*/name is $busid) — the device is not enumerated on any xHCI slot; cannot assess, NOT clear"; return 2 ;;
+    *) echo "urb: $busid na($(_errno_of "$out"): slot resolution unreadable) — [$(printf '%s' "$out" | head -1)]"; return 2 ;;
+  esac
+  hc="$(basename "$(dirname "$(dirname "$slotdir")")")"
+  slot=$(( 10#$(basename "$slotdir") ))   # debugfs zero-pads ("05"); the trace does not ("slot 5")
+  ctx="$busid @HC $hc slot $slot"
+  # One capture at a time: the instance name is fixed and the arm path crash-reaps a leaked
+  # one, so the reap must never race a live sibling. flock -n serialises; BUSY renders na
+  # rather than two runs fighting over the same instance dir.
+  if command -v flock >/dev/null 2>&1; then
+    exec 9>"$URB_LOCK" 2>/dev/null || true
+    if ! flock -n 9 2>/dev/null; then
+      exec 9>&- 2>/dev/null || true
+      echo "urb: $ctx na(EBUSY: another mesh-usb --urb capture holds $URB_LOCK — the private instance is single-writer; not a reading about the bus)"; return 2
+    fi
+  fi
+  stream="$(urb_capture "$secs")"
+  exec 9>&- 2>/dev/null || true
+  printf '%s\n' "$stream" | urb_verdict "$ctx" "$slot" "$secs"
+}
+
 # --- portable logic self-test (no real USB bus needed: runs against a fixture) ----
 if [ "${1:-}" = "--test" ]; then
   tmp=$(mktemp -d)
@@ -942,8 +1173,137 @@ STUB
     fi
   fi
 
+
+  # ── URB BALANCE: pure-parser gates on canned capture streams ───────────────────────
+  # The parser never touches the bus, so every verdict below is driven end-to-end on text.
+  # Each fixture is written to be the SMALLEST thing that separates the verdict from its
+  # neighbour — a gate against the obvious fixture is vacuous against the subtle one.
+  _uline() { # <ev> <ep> <urb> <slot>
+    printf '          <idle>-0       [015] d.h2. 59400.101699: xhci_urb_%s: %s: urb %s pipe 3221358208 slot %s length 0/32768 sgs 0/0 stream 0 flags 00010200\n' "$1" "$2" "$3" "$4"
+  }
+  _uhdr() { printf '# tracer: nop\n#\n# entries-in-buffer/entries-written: %s/%s   #P:16\n#\n' "$1" "$2"; }
+  # (1) BALANCED both windows ⇒ CLEAN. Note the leading giveback with no in-window enqueue:
+  #     that is the standing ring depth and MUST NOT read as an imbalance.
+  # DEPTH-CONSERVING, as a healthy RX ring actually is: the window opens with one URB already
+  # on the wire (its giveback has no in-window enqueue) and closes with one still on the wire.
+  # enq == giv, so the BALANCE is 0 while the standing depth is 1 — the two axes must not merge.
+  # Pointer 0xAAA is deliberately REUSED across submissions, which is what the driver does.
+  ubal() { local w; for w in 1 2; do echo "=== WINDOW $w"; _uhdr 6 6
+    _uline giveback ep4in-bulk 0xAAA 5; _uline enqueue ep4in-bulk 0xAAA 5
+    _uline giveback ep4in-bulk 0xAAA 5; _uline enqueue ep8out-bulk 0xBBB 5
+    _uline giveback ep8out-bulk 0xBBB 5; _uline enqueue ep4in-bulk 0xAAA 5; done; }
+  ub="$(ubal | urb_verdict "1-2.3 @HC pci slot 5" 5 3)"; ubrc=$?
+  [ "$ubrc" = 0 ] || fail="$fail urb-balanced-rc$ubrc"
+  case "$ub" in *"verdict=CLEAN"*) ;; *) fail="$fail urb-balanced-not-clean[$(printf '%s' "$ub" | head -1)]" ;; esac
+  case "$ub" in *"net_outstanding_urbs w1=+0 w2=+0"*) ;; *) fail="$fail urb-balanced-net-not-zero" ;; esac
+  # the pre-window giveback is published as DEPTH, and is not folded into the balance
+  case "$ub" in *"in-flight at window open 1/1"*) ;; *) fail="$fail urb-standing-depth-not-published[$ub]" ;; esac
+  case "$ub" in *"ep ep4in-bulk"*) ;; *) fail="$fail urb-no-per-endpoint-breakdown" ;; esac
+  # (2) IMBALANCED IN BOTH windows ⇒ URB-WEDGE, and the endpoint is named
+  uwedge() { local w; for w in 1 2; do echo "=== WINDOW $w"; _uhdr 4 4
+    _uline enqueue ep4in-bulk 0xA$w 5; _uline enqueue ep4in-bulk 0xB$w 5
+    _uline enqueue ep0out-control 0xC$w 5; _uline giveback ep0out-control 0xC$w 5; done; }
+  uw="$(uwedge | urb_verdict "1-2.3 @HC pci slot 5" 5 3)"; uwrc=$?
+  [ "$uwrc" = 0 ] || fail="$fail urb-wedge-rc$uwrc"
+  case "$uw" in *"verdict=URB-WEDGE"*) ;; *) fail="$fail urb-wedge-not-detected[$(printf '%s' "$uw" | head -1)]" ;; esac
+  case "$uw" in *"w1=+2 w2=+2"*) ;; *) fail="$fail urb-wedge-net-wrong[$(printf '%s' "$uw" | head -1)]" ;; esac
+  # attribution: the WEDGED endpoint carries the imbalance, the healthy one does not
+  printf '%s\n' "$uw" | grep -qE 'ep ep4in-bulk +enq/giv 2/0 net \+2' || fail="$fail urb-wedge-endpoint-unattributed"
+  printf '%s\n' "$uw" | grep -qE 'ep ep0out-control +enq/giv 1/1 net \+0' || fail="$fail urb-wedge-healthy-ep-implicated"
+  # (3) THE DEBOUNCE. Imbalance in window 1 ONLY ⇒ CLEAN. Without this the tool calls a wedge
+  #     on any burst that straddles a window edge, which is the common case, not the fault.
+  uone() { echo "=== WINDOW 1"; _uhdr 2 2; _uline enqueue ep4in-bulk 0xA1 5; _uline enqueue ep4in-bulk 0xB1 5
+           echo "=== WINDOW 2"; _uhdr 2 2; _uline enqueue ep4in-bulk 0xA2 5; _uline giveback ep4in-bulk 0xA2 5; }
+  uo="$(uone | urb_verdict "1-2.3 @HC pci slot 5" 5 3)"; uorc=$?
+  [ "$uorc" = 0 ] || fail="$fail urb-onewindow-rc$uorc"
+  case "$uo" in *"verdict=CLEAN"*) ;; *) fail="$fail urb-debounce-missing(one-window imbalance called a wedge)[$(printf '%s' "$uo" | head -1)]" ;; esac
+  case "$uo" in *"straddling a window edge"*) ;; *) fail="$fail urb-debounce-unexplained" ;; esac
+  # (4) NO EVENTS ⇒ na(ENODATA) exit 2, never CLEAN — idle and dead read alike on this axis
+  uz="$(printf '=== WINDOW 1\n=== WINDOW 2\n' | urb_verdict "1-2.3 @HC pci slot 5" 5 3)"; uzrc=$?
+  [ "$uzrc" = 2 ] || fail="$fail urb-empty-not-exit2($uzrc)"
+  case "$uz" in *"na(ENODATA"*) ;; *) fail="$fail urb-empty-not-na[$uz]" ;; esac
+  case "$uz" in *"verdict="*) fail="$fail urb-empty-rendered-a-verdict" ;; esac
+  # (5) RING OVERFLOW ⇒ na(EOVERFLOW) exit 2. A discarded giveback is indistinguishable from
+  #     an outstanding URB, so an overflowed buffer would MINT a wedge. Same shape as the
+  #     balanced fixture except the header — the drop detector is the only thing separating them.
+  udrop() { local w; for w in 1 2; do echo "=== WINDOW $w"; _uhdr 2 900
+    _uline enqueue ep4in-bulk 0xA$w 5; _uline enqueue ep4in-bulk 0xB$w 5; done; }
+  ud="$(udrop | urb_verdict "1-2.3 @HC pci slot 5" 5 3)"; udrc=$?
+  [ "$udrc" = 2 ] || fail="$fail urb-overflow-not-exit2($udrc)"
+  case "$ud" in *"na(EOVERFLOW"*) ;; *) fail="$fail urb-overflow-not-na[$ud]" ;; esac
+  case "$ud" in *"verdict=URB-WEDGE"*) fail="$fail urb-overflow-minted-a-wedge" ;; esac
+  # (6) SLOT FILTERING. The same wedge lines on ANOTHER slot must not implicate ours: the slot
+  #     is resolved live and reassigned on every re-enumeration, so cross-slot bleed is a
+  #     misattribution to a device that is fine.
+  uother() { local w; for w in 1 2; do echo "=== WINDOW $w"; _uhdr 4 4
+    _uline enqueue ep4in-bulk 0xA$w 9; _uline enqueue ep4in-bulk 0xB$w 9
+    _uline enqueue ep8out-bulk 0xC$w 5; _uline giveback ep8out-bulk 0xC$w 5; done; }
+  uof="$(uother | urb_verdict "1-2.3 @HC pci slot 5" 5 3)"
+  case "$uof" in *"verdict=CLEAN"*) ;; *) fail="$fail urb-other-slot-bled-in[$(printf '%s' "$uof" | head -1)]" ;; esac
+  case "$uof" in *"4 line(s) on other slots ignored"*) ;; *) fail="$fail urb-other-slot-not-counted[$uof]" ;; esac
+  # (7) capture-layer markers ⇒ na exit 2, each naming its own cause
+  for m in __NOTRACE__:ENOENT __NOINST__:EACCES; do
+    um="$(printf '%s\n=== WINDOW 1\n=== WINDOW 2\n' "${m%%:*}" | urb_verdict c 5 3)"; umrc=$?
+    [ "$umrc" = 2 ] || fail="$fail urb-marker-${m%%:*}-not-exit2($umrc)"
+    case "$um" in *"na(${m##*:}"*) ;; *) fail="$fail urb-marker-${m%%:*}-wrong-errno[$um]" ;; esac
+  done
+  # a truncated capture (one window) is not two windows — never judged on half the evidence
+  ut="$(printf '=== WINDOW 1\n' | _uhdr 1 1 | cat; printf '')" >/dev/null
+  ut="$( { echo "=== WINDOW 1"; _uhdr 2 2; _uline enqueue ep4in-bulk 0xA 5; _uline giveback ep4in-bulk 0xA 5; } | urb_verdict c 5 3)"; utrc=$?
+  [ "$utrc" = 2 ] || fail="$fail urb-single-window-not-exit2($utrc)"
+  case "$ut" in *"na(ESTREAM"*) ;; *) fail="$fail urb-single-window-not-na[$ut]" ;; esac
+
+  # ── REAL-READ GATE, URB half — the whole point of contract (g) ─────────────────────
+  # A tracefs-exists check is 'executable and loadable are different claims'. This ARMS the
+  # instance, traces the live uplink, and asserts real givebacks were parsed. It also brackets
+  # the run with a read of the three GLOBAL tracefs files: commandeering global tracing on a
+  # shared node is the single most dangerous thing this tool can do, so the gate is that they
+  # did not move — asserted on the kernel's own values, not on our source text.
+  urb_note="no tracefs"; urb_here=0; urb_gates="7 parser gates (balanced/wedge/one-window-debounce/no-events/ring-overflow/other-slot/markers), the REAL private-instance leg NOT RUN"
+  gbefore="$(urb_globals)"
+  case "$gbefore" in
+    na|"") urb_note="tracefs unreadable (needs root; sudo -n did not land, or no tracefs on this host)" ;;
+    on=*)  urb_here=1 ;;
+    *)     urb_note="tracefs globals unreadable [$(printf '%s' "$gbefore" | head -1)]" ;;
+  esac
+  if [ "$urb_here" = 1 ]; then
+    urb_gates="7 parser gates (balanced/wedge/one-window-debounce/no-events/ring-overflow/other-slot/markers) + a REAL private-instance trace with global tracing_on+current_tracer+set_event asserted unmoved and the instance asserted torn down"
+    ru="$(urb_line)"; rurc=$?
+    gafter="$(urb_globals)"
+    # THE SAFETY ASSERTION. Not "we did not write them" (source text is never behaviour) —
+    # the kernel's own tracing_on / current_tracer / set_event, read before and after a REAL run.
+    [ "$gbefore" = "$gafter" ] || fail="$fail urb-MOVED-GLOBAL-TRACING(before[$gbefore] after[$gafter])"
+    # and the private instance must be gone: a leaked one keeps two tracepoints armed forever
+    linst="$(_urun 5 '[ -d "$1/instances/$2" ] && echo LEAKED || echo gone' "$(trace_root)" "$URB_INST")"
+    case "$linst" in *gone*) ;; *) fail="$fail urb-instance-leaked-after-run[$linst]" ;; esac
+    case "$rurc" in
+      0) printf '%s\n' "$ru" | grep -qE 'verdict=(CLEAN|URB-WEDGE)' || fail="$fail live-urb-bogus-verdict[$(printf '%s' "$ru" | head -1)]"
+         # (g): assert real GIVEBACK lines were parsed, not merely that the trace file existed
+         rgiv="$(printf '%s\n' "$ru" | sed -n 's/.*traffic enq\/giveback \([0-9]*\)\/\([0-9]*\) then \([0-9]*\)\/\([0-9]*\).*/\2 \4/p')"
+         set -- ${rgiv:-0 0}
+         if [ "${1:-0}" -lt 1 ] || [ "${2:-0}" -lt 1 ]; then
+           fail="$fail live-urb-no-giveback-parsed(${1:-0}/${2:-0} — the capture ran but nothing came back from the parser; a tracefs-exists check would have passed here)"
+         fi
+         printf '%s\n' "$ru" | grep -q 'in-flight at window open' || fail="$fail live-urb-depth-not-published"
+         urb_note="live: $(printf '%s\n' "$ru" | head -1 | sed 's/^urb: //')" ;;
+      2) printf '%s\n' "$ru" | grep -q 'na(' || fail="$fail live-urb-blind-without-errno"
+         # NOT every na is honest HERE. tracefs read fine a moment ago, so an na that means
+         # "the instance could not be armed / the tracepoints are not enableable / the capture
+         # did not return two windows" is the REAL PATH BEING BROKEN, and passing on it is
+         # exactly the tracefs-exists vacuity contract (g) forbids. Only the na's that are
+         # genuine statements about the BUS (no xhci debugfs to map the slot, the device is on
+         # no slot, no traffic to balance, the ring overflowed) are a legitimate n/a.
+         case "$ru" in
+           *"na(EACCES"*|*"na(ESTREAM"*|*"xhci-hcd/"*"not enableable"*)
+             fail="$fail live-urb-real-path-broken[$(printf '%s' "$ru" | head -1)]" ;;
+         esac
+         urb_note="live urb n/a (honest): $(printf '%s\n' "$ru" | head -1)" ;;
+      *) fail="$fail live-urb-rc$rurc" ;;
+    esac
+  fi
+
   if [ -n "$fail" ]; then echo "smoke-test: FAIL ($fail )"; exit 1; fi
-  base="3 devices, root hub excluded, --list still 4-col; age ms→s + na-never-0 + 4 bands; young uplink flagged NOT healthy, old one since-boot, absent one ABSENT; bt bare-pinned argv=hci0, down→na exit2 not 0, age-stamped with cover<=; xhci verdicts driven on canned dumps (drained→CLEAN, backlogged-but-ADVANCING→CLEAN, backlogged+FROZEN→LINK-WEDGE, halted/error→DEVICE-STALL, slot≠configured→DE-ENUMERATED, EPERM→na+errno exit2, 1-sample→na), slot resolved by name past a decoy at the historical slot 05; $real_note; $xhci_note"
+  base="3 devices, root hub excluded, --list still 4-col; age ms→s + na-never-0 + 4 bands; young uplink flagged NOT healthy, old one since-boot, absent one ABSENT; bt bare-pinned argv=hci0, down→na exit2 not 0, age-stamped with cover<=; xhci verdicts driven on canned dumps (drained→CLEAN, backlogged-but-ADVANCING→CLEAN, backlogged+FROZEN→LINK-WEDGE, halted/error→DEVICE-STALL, slot≠configured→DE-ENUMERATED, EPERM→na+errno exit2, 1-sample→na), slot resolved by name past a decoy at the historical slot 05; $real_note; $xhci_note; urb balance: $urb_gates — $urb_note"
   if [ "$xhci_here" != 1 ]; then
     echo "smoke-test: n/a — every portable gate passed, but this host exposes no xHCI endpoint contexts ($xhci_note), so the wedge leg is unassessable here ($base)"
     exit 2
@@ -976,6 +1336,14 @@ fi
 # plus a XHCI_GAP-second window, and neither of those belongs in an inventory query.
 if [ "${1:-}" = "--xhci" ]; then
   xhci_line "${2:-}"
+  exit $?
+fi
+
+# --- the URB balance: submitted work that never completes ------------------------
+# Also deliberately out of the default read and --json: it needs root, arms two kernel
+# tracepoints, and costs two bounded windows. An inventory query pays none of that.
+if [ "${1:-}" = "--urb" ]; then
+  urb_line "${2:-}"
   exit $?
 fi
 
