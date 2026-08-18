@@ -1,0 +1,268 @@
+#!/usr/bin/env bash
+# mesh-device-churn — the EDGE half of this node's device instrumentation: did ANYTHING enumerate
+# between two ticks?
+#
+# WHY (proven gap, discover 2026-08-18; writeup ~/.mesh/knowledge/capability-uevent-seqnum-zero-floor-
+# device-churn-accumulator-mesh-home-20260818.md): every USB/uplink instrument here is a LEVEL sampled
+# by cron — URB balance (enqueue-giveback), the xhci ep-context ring backlog, rtw88 rf_dump,
+# /proc/net/wireless, power/runtime_*. A device that re-enumerates BETWEEN two ticks leaves all of them
+# healthy: the ring resets, the URB balance returns to its floor of 0, and the levels are back to
+# normal by the time anything looks. The node had NO edge source at all. Corroboration that it matters:
+# the sole-uplink dongle (0bda:b82c at 1-2.3) carries runtime_active+suspended = 22.44h against an
+# uptime of 26.08h — it re-enumerated ~3.6h into that boot and not one instrument recorded it.
+#
+# /sys/kernel/uevent_seqnum is mode 0444, readable as uid 1000, and is a MONOTONIC ACCUMULATOR of every
+# device uevent since boot — so one integer read covers 100% of the interval (CLAUDE.md: "the sample is
+# not the interval"), where a level sample covers only the instant it was taken. Its IDLE FLOOR is
+# exactly 0 (re-measured while writing this: 5228 -> 5228 over 15.0s with minds, grinder and room ear
+# live), which is what makes it usable: a nonzero interval delta is a real device event, not noise.
+#
+# WHAT IT CANNOT DO — these are in the rendering, not just this comment:
+#   - seqnum NAMES NO DEVICE. It is a "something churned" bit and answers *did anything enumerate in
+#     this window*, never *what*. A candidate list IS emitted on churn, but it comes from a DIFFERENT
+#     and weaker instrument (per-device age = runtime_active+suspended vs uptime) and can legitimately
+#     be empty for a real churn — a REMOVAL leaves no sysfs node to age, and non-USB subsystems are not
+#     scanned at all. It is labelled `candidates=` and never presented as the seqnum's answer.
+#   - THE LIFETIME TOTAL IS NOT A RATE. 5154 events / 26.08h = 197.6/h is arithmetic, not a rate: boot
+#     enumeration dominates the total and the live idle rate is 0. Same trap as RTF-on-a-short-clip in
+#     CLAUDE.local.md. Only the measured interval delta is quoted as an event count; the total is
+#     rendered as `total-since-boot=` and never divided.
+#   - THE COUNTER RESETS AT REBOOT. A delta straddling a reboot renders `na` — never 0 (a reboot-reset
+#     counter read as 0 is a fabricated calm) and never a negative.
+#   - `udevadm monitor --kernel` is NOT claimed here: as uid 1000 it printed nothing at all, not even a
+#     header, and whether that is a silent refusal is untested. The `--udev` stream IS proven
+#     unprivileged (it captured a change event with ACTION/DEVPATH/SEQNUM) but needs a long-lived
+#     listener — a different wiring cost, deliberately filed apart from this cron read.
+#   - This does NOT replace the level instruments. It is the missing edge half beside them.
+#
+#   mesh-device-churn           one delta pass: read, emit, advance the baseline, board a churn
+#   mesh-device-churn --check   read-only: same reading, no baseline advance, no board post
+#   mesh-device-churn --status  last reading, no new read
+#   mesh-device-churn --test    every verdict from fixtures + a real read of this node's counter
+#
+# exit 0 = QUIET or BASELINE · 1 = CHURN (an EVENT in the interval — go look; not by itself a fault:
+# a plugged stick and a wedged uplink re-enumerating produce the same bit) · 2 = honest n/a
+# (counter unreadable, or the interval straddles a reboot so no delta exists)
+#
+# reflex-cadence: */5 * * * *
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"   # cron self-defense (siblings by bare name)
+
+SEQF="${MESH_DEVICE_CHURN_SEQ:-/sys/kernel/uevent_seqnum}"
+BOOTF="${MESH_DEVICE_CHURN_BOOTID:-/proc/sys/kernel/random/boot_id}"
+BASE="${MESH_DEVICE_CHURN_BASE:-$HOME/.mesh/.device-churn.baseline}"
+STATE="${MESH_DEVICE_CHURN_STATE:-$HOME/.mesh/.device-churn.state}"
+OLOG="${MESH_DEVICE_CHURN_LOG:-$HOME/.mesh/device-churn.log}"
+MARK="${MESH_DEVICE_CHURN_MARK:-$HOME/.mesh/.device-churn.posted}"
+USBROOT="${MESH_DEVICE_CHURN_USBROOT:-/sys/bus/usb/devices}"
+MIN="${MESH_DEVICE_CHURN_MIN:-1}"                 # delta >= this is a CHURN
+SLACK_S="${MESH_DEVICE_CHURN_SLACK:-60}"          # candidate window = interval + this
+DEBOUNCE_MIN="${MESH_DEVICE_CHURN_DEBOUNCE_MIN:-30}"
+CHAT="${MESH_DEVICE_CHURN_CHAT:-1}"
+
+stamp(){ date -u +%FT%TZ; }
+now_epoch(){ date -u +%s; }
+
+# --- the accumulator ------------------------------------------------------------------------------
+# Non-numeric or unreadable renders `na`. Never 0: a 0 here would be a claim that nothing has ever
+# enumerated on this machine, which no failed read can support.
+read_seq(){
+  local SEQF="${MESH_DEVICE_CHURN_SEQ:-/sys/kernel/uevent_seqnum}"
+  local v
+  v="$(cat "$SEQF" 2>/dev/null)" || { echo na; return; }
+  case "$v" in ''|*[!0-9]*) echo na; return;; esac
+  printf '%s\n' "$v"
+}
+# boot_id is the reboot detector, not uptime: uptime regression only catches a reboot that happened to
+# shorten the clock, while boot_id changes on EVERY boot and cannot be faked by a suspend/resume.
+read_bootid(){ local BOOTF="${MESH_DEVICE_CHURN_BOOTID:-/proc/sys/kernel/random/boot_id}" v
+  v="$(cat "$BOOTF" 2>/dev/null)"; [ -n "$v" ] && printf '%s\n' "$v" || echo na; }
+read_uptime(){ awk '{printf "%d\n", $1}' /proc/uptime 2>/dev/null || echo na; }
+
+# --- the candidate list (a DIFFERENT, weaker instrument) ------------------------------------------
+# Per the deployed rule usb-device-age-is-runtime-active-plus-suspended-ms, a USB device's age is
+# runtime_active_time + runtime_suspended_time. A device younger than the interval enumerated DURING
+# it. This is corroboration, not attribution: removals leave nothing to age, and only USB is scanned.
+# $1 = the interval in seconds. Takes USBROOT from the env so the test can build a fake sysfs tree.
+fresh_devices(){
+  local USBROOT="${MESH_DEVICE_CHURN_USBROOT:-/sys/bus/usb/devices}"
+  local win="$1" d a s age out=""
+  [ -d "$USBROOT" ] || { echo na; return; }
+  for d in "$USBROOT"/*/; do
+    a="$(cat "$d/power/runtime_active_time" 2>/dev/null)"; s="$(cat "$d/power/runtime_suspended_time" 2>/dev/null)"
+    case "$a$s" in ''|*[!0-9]*) continue;; esac
+    age=$(( (a + s) / 1000 ))
+    [ "$age" -le "$win" ] && out="$out${out:+,}$(basename "$d")@${age}s"
+  done
+  printf '%s\n' "${out:-none}"
+}
+
+# --- the verdict ----------------------------------------------------------------------------------
+# Pure: baseline fields in, reading fields in, `<verdict>|<rc>|<delta>|<sentence>` out. Separated from
+# every read so the test drives each branch without a reboot, a churn, or an unreadable sysfs.
+decide(){
+  local MIN="${MESH_DEVICE_CHURN_MIN:-1}" SEQF="${MESH_DEVICE_CHURN_SEQ:-/sys/kernel/uevent_seqnum}"
+  local bseq="$1" bboot="$2" seq="$3" boot="$4" iv="$5"
+  if [ "$seq" = na ]; then
+    printf 'NA|2|na|%s is unreadable or non-numeric — we did not look, which is not the same as nothing churned; the baseline is left UNTOUCHED so the next pass still spans this gap\n' "$SEQF"; return
+  fi
+  if [ -z "$bseq" ] || [ "$bseq" = na ]; then
+    printf 'BASELINE|0|na|first sight: recorded seqnum %s as the baseline and claimed NO delta — replaying a lifetime total as fresh events is the reviving-offset trap\n' "$seq"; return
+  fi
+  if [ "$boot" != na ] && [ "$bboot" != na ] && [ "$boot" != "$bboot" ]; then
+    printf 'REBOOT|2|na|the interval straddles a reboot (boot_id changed) so the counter reset and NO delta exists for it — rendered na, never 0, because a reset counter read as 0 is a fabricated calm; re-baselined at %s\n' "$seq"; return
+  fi
+  if [ "$seq" -lt "$bseq" ] 2>/dev/null; then
+    printf 'REBOOT|2|na|seqnum went BACKWARDS (%s -> %s) with no boot_id change — a monotonic counter cannot, so the reading is untrustworthy rather than negative; rendered na and re-baselined\n' "$bseq" "$seq"; return
+  fi
+  local d=$(( seq - bseq ))
+  if [ "$d" -ge "$MIN" ] 2>/dev/null; then
+    printf 'CHURN|1|%s|%s device uevent(s) in the last %ss — the idle floor here is 0, so this is a real enumeration event, invisible to every level instrument (URB balance, xhci ring, rf_dump, runtime_*) which are all back to healthy by now. seqnum names NO device\n' "$d" "$d" "$iv"; return
+  fi
+  printf 'QUIET|0|%s|no device uevent in the last %ss (100%% interval coverage — an accumulator delta, not a sample)\n' "$d" "$iv"
+}
+
+# --- one pass -------------------------------------------------------------------------------------
+pass(){   # $1 = 1 write / 0 --check
+  local write="$1" seq boot up bseq="" bboot="" bepoch="" iv v rc delta msg cand line nowe
+  seq="$(read_seq)"; boot="$(read_bootid)"; up="$(read_uptime)"; nowe="$(now_epoch)"
+  if [ -s "$BASE" ]; then
+    IFS=$'\t' read -r bseq bboot bepoch < "$BASE"
+  fi
+  case "$bepoch" in ''|*[!0-9]*) iv=na;; *) iv=$(( nowe - bepoch ));; esac
+  v="$(decide "${bseq:-}" "${bboot:-na}" "$seq" "$boot" "$iv")"
+  rc="${v#*|}"; rc="${rc%%|*}"
+  delta="${v#*|*|}"; delta="${delta%%|*}"
+  msg="${v#*|*|*|}"; v="${v%%|*}"
+  cand=""
+  if [ "$v" = CHURN ]; then
+    case "$iv" in ''|*[!0-9]*) cand="$(fresh_devices "$SLACK_S")";; *) cand="$(fresh_devices "$(( iv + SLACK_S ))")";; esac
+  fi
+  # `total-since-boot` is deliberately never divided by uptime: the lifetime total is dominated by boot
+  # enumeration, so an events/h figure would be arithmetic wearing a rate's clothes.
+  line="$(stamp) $v delta=$delta interval=${iv}s total-since-boot=$seq uptime=${up}s boot=${boot:0:8} baseline=${bseq:-none}${cand:+ candidates=$cand} :: $msg"
+  [ -n "$cand" ] && line="$line || candidates come from device-age-vs-uptime, a DIFFERENT instrument — 'none' is compatible with a real churn (a removal leaves no node to age; only USB is scanned)"
+  printf '%s\n' "$line"
+  [ "$write" = 1 ] || return "$rc"
+  mkdir -p "$(dirname "$STATE")" 2>/dev/null
+  printf '%s\n' "$line" > "$STATE"
+  printf '%s\n' "$line" >> "$OLOG"
+  # A BLIND pass must not advance or drop the baseline: skipping past leaves the churn during the
+  # blindness permanently unaccounted, and rebuilding it would replay the whole lifetime total.
+  if [ "$v" != NA ]; then printf '%s\t%s\t%s\n' "$seq" "$boot" "$nowe" > "$BASE"; fi
+  # mtime = ran-live, content = the change-gated reading (liveness-touch convention: a node that is
+  # quiet for days must not read as a dead reflex to mesh-reflex-health/mesh-pulse).
+  command -v mesh-state-touch >/dev/null 2>&1 && mesh-state-touch "$STATE" >/dev/null 2>&1
+  if [ "$v" = CHURN ] && [ "$CHAT" = 1 ] && command -v mesh-chat >/dev/null 2>&1; then
+    local last=0
+    [ -f "$MARK" ] && last="$(cat "$MARK" 2>/dev/null | tr -dc '0-9')"
+    [ -n "$last" ] || last=0
+    if [ "$(( nowe - last ))" -ge "$(( DEBOUNCE_MIN * 60 ))" ]; then
+      MESH_WHO="device-churn@$(hostname)" mesh-chat "[fyi] device-churn on $(hostname): $line" >/dev/null 2>&1 || true
+      printf '%s\n' "$nowe" > "$MARK"
+    fi
+  fi
+  return "$rc"
+}
+
+# --- test -----------------------------------------------------------------------------------------
+run_test(){
+  local fails=0 out
+  F(){ echo "smoke-test: FAIL ($1)" >&2; fails=$((fails+1)); }
+  local B=aaaa-bbbb
+  # (1) the reading this sense exists for: a delta the level instruments cannot see.
+  out="$(decide 100 $B 104 $B 300)"
+  case "$out" in CHURN\|1\|4\|*) : ;; *) F "a +4 delta did not read CHURN with delta 4 (got: $out)";; esac
+  # (2) ...and its complement. The idle floor is 0, so QUIET must be reachable — a sense whose quiet
+  #     state cannot occur is an alarm, not a sense.
+  out="$(decide 100 $B 100 $B 300)"
+  case "$out" in QUIET\|0\|0\|*) : ;; *) F "a 0 delta did not read QUIET (got: $out)";; esac
+  # (3) FIRST SIGHT records, never replays. A node whose counter is already at 5228 must not report
+  #     5228 fresh events on the reflex's first ever run.
+  out="$(decide "" na 5228 $B na)"
+  case "$out" in BASELINE\|0\|na\|*) : ;; *) F "first sight did not baseline with delta na (got: $out)";; esac
+  case "$out" in *"|5228|"*) F "first sight replayed the lifetime total as a delta";; esac
+  # (4) REBOOT renders na, never 0 and never negative — the fabricated-calm gate, driven BOTH ways
+  #     (boot_id change, and a backwards counter with no boot_id change).
+  out="$(decide 9000 $B 12 cccc-dddd 300)"
+  case "$out" in REBOOT\|2\|na\|*) : ;; *) F "a boot_id change did not render REBOOT/na (got: $out)";; esac
+  case "$out" in *"|0|"*|*"|-"*) F "a reboot rendered a fabricated 0 or a negative delta";; esac
+  out="$(decide 9000 $B 12 $B 300)"
+  case "$out" in REBOOT\|2\|na\|*) : ;; *) F "a backwards counter did not render REBOOT/na (got: $out)";; esac
+  # (5) an unreadable counter is `na`, NOT quiet — and it must say we did not look.
+  out="$(decide 100 $B na $B 300)"
+  case "$out" in NA\|2\|na\|*) : ;; *) F "an unreadable counter did not render NA (got: $out)";; esac
+  case "$out" in *"did not look"*) : ;; *) F "the NA sentence does not distinguish blind from quiet";; esac
+  # (6) the threshold decides, both directions.
+  out="$(MESH_DEVICE_CHURN_MIN=5 decide 100 $B 103 $B 300)"; case "$out" in CHURN*) F "delta 3 fired a MIN=5 threshold";; esac
+  out="$(MESH_DEVICE_CHURN_MIN=5 decide 100 $B 105 $B 300)"; case "$out" in CHURN*) : ;; *) F "delta 5 did not reach a MIN=5 threshold";; esac
+  # (7) the candidate list is a real sysfs scan, driven against a FAKE tree so both answers are seen.
+  local sr; sr="$(mktemp -d)"
+  mkdir -p "$sr/1-2.3/power" "$sr/usb1/power"
+  printf '9000\n' > "$sr/1-2.3/power/runtime_active_time"; printf '0\n' > "$sr/1-2.3/power/runtime_suspended_time"
+  printf '108000000\n' > "$sr/usb1/power/runtime_active_time"; printf '0\n' > "$sr/usb1/power/runtime_suspended_time"
+  out="$(MESH_DEVICE_CHURN_USBROOT="$sr" fresh_devices 60)"
+  case "$out" in *1-2.3@9s*) : ;; *) F "a 9s-old device was not listed as a candidate in a 60s window (got: $out)";; esac
+  case "$out" in *usb1*) F "a 108000s-old device was listed as freshly enumerated";; esac
+  out="$(MESH_DEVICE_CHURN_USBROOT="$sr" fresh_devices 1)"
+  [ "$out" = none ] || F "a 1s window still matched a 9s-old device (got: $out)"
+  out="$(MESH_DEVICE_CHURN_USBROOT="$sr/nonexistent" fresh_devices 60)"
+  [ "$out" = na ] || F "an absent usb root did not render na (got: $out)"
+  rm -rf "$sr"
+  # (8) the na-vs-0 rule at the READ layer, not just the verdict layer.
+  out="$(MESH_DEVICE_CHURN_SEQ=/nonexistent-seqnum read_seq)"; [ "$out" = na ] || F "an absent counter file did not read na (got: $out)"
+  local tf; tf="$(mktemp)"; printf 'not-a-number\n' > "$tf"
+  out="$(MESH_DEVICE_CHURN_SEQ="$tf" read_seq)"; [ "$out" = na ] || F "a non-numeric counter did not read na (got: $out)"
+  rm -f "$tf"
+  # (9) END TO END, sandboxed. A blind pass must leave the baseline BYTE-IDENTICAL — advancing past a
+  #     gap loses the churn inside it, dropping it replays the lifetime total.
+  local bb ss ll mm; bb="$(mktemp)"; ss="$(mktemp)"; ll="$(mktemp)"; mm="$(mktemp)"; rm -f "$ss" "$ll" "$mm"
+  printf '100\t%s\t%s\n' "$(read_bootid)" "$(( $(now_epoch) - 300 ))" > "$bb"
+  local before; before="$(cat "$bb")"
+  local E="MESH_DEVICE_CHURN_BASE=$bb MESH_DEVICE_CHURN_STATE=$ss MESH_DEVICE_CHURN_LOG=$ll MESH_DEVICE_CHURN_MARK=$mm MESH_DEVICE_CHURN_CHAT=0"
+  env $E MESH_DEVICE_CHURN_SEQ=/nonexistent-seqnum bash "${BASH_SOURCE[0]}" >/dev/null 2>&1
+  [ "$(cat "$bb")" = "$before" ] || F "a BLIND pass advanced or dropped the baseline"
+  case "$(cat "$ss" 2>/dev/null)" in *NA*) : ;; *) F "a blind pass did not write the NA verdict";; esac
+  # ...a real churn advances it and writes the delta.
+  local sf; sf="$(mktemp)"; printf '107\n' > "$sf"
+  env $E MESH_DEVICE_CHURN_SEQ="$sf" MESH_DEVICE_CHURN_BOOTID="$BOOTF" bash "${BASH_SOURCE[0]}" >/dev/null 2>&1
+  case "$(cat "$ss")" in *"CHURN delta=7"*) : ;; *) F "a +7 pass did not write CHURN delta=7 (got: $(cat "$ss"))";; esac
+  case "$(cat "$ss")" in *candidates=*) : ;; *) F "a churn line carries no candidates field";; esac
+  case "$(cat "$ss")" in *"total-since-boot=107"*) : ;; *) F "the line does not carry the lifetime total, labelled";; esac
+  [ "$(cut -f1 "$bb")" = 107 ] || F "a real pass did not advance the baseline (got $(cut -f1 "$bb"))"
+  # ...and the immediate re-run is QUIET, i.e. a delta is consumed exactly once.
+  env $E MESH_DEVICE_CHURN_SEQ="$sf" MESH_DEVICE_CHURN_BOOTID="$BOOTF" bash "${BASH_SOURCE[0]}" >/dev/null 2>&1
+  case "$(cat "$ss")" in *"QUIET delta=0"*) : ;; *) F "the same delta was replayed on the next pass (got: $(cat "$ss"))";; esac
+  # (10) --check MUST NOT write — a sense that writes its own liveness artifact forges it.
+  local b2 s2; b2="$(mktemp)"; s2="$(mktemp)"; rm -f "$s2"
+  cp "$bb" "$b2"; before="$(cat "$b2")"
+  MESH_DEVICE_CHURN_BASE="$b2" MESH_DEVICE_CHURN_STATE="$s2" MESH_DEVICE_CHURN_LOG="$s2.log" \
+    MESH_DEVICE_CHURN_MARK="$s2.mark" MESH_DEVICE_CHURN_CHAT=0 MESH_DEVICE_CHURN_SEQ="$sf" \
+    bash "${BASH_SOURCE[0]}" --check >/dev/null 2>&1
+  { [ -e "$s2" ] || [ -e "$s2.log" ]; } && F "--check wrote the state/log artifact"
+  [ "$(cat "$b2")" = "$before" ] || F "--check advanced the baseline"
+  rm -f "$bb" "$ss" "$ll" "$mm" "$sf" "$b2" "$s2" "$s2.log" "$s2.mark"
+  # (11) NEVER A RATE: no rendered line may carry an events-per-hour style figure derived from the
+  #      lifetime total. Boot enumeration dominates it; the live idle rate is 0.
+  out="$(decide 100 $B 104 $B 300)$(decide 100 $B 100 $B 300)"
+  case "$out" in *"/h"*|*"per hour"*|*"events/s"*) F "a rendered line quotes the lifetime total as a rate";; esac
+  # (12) REAL READ of this node's own counter — a test that only drives stubs has never touched the
+  #      thing it wraps. Monotonic and numeric, read twice.
+  local r1 r2
+  r1="$(read_seq)"; r2="$(read_seq)"
+  case "$r1" in ''|*[!0-9]*) F "real read of $SEQF returned no integer (got: $r1)";; esac
+  case "$r2" in ''|*[!0-9]*) : ;; *) [ "$r2" -ge "$r1" ] 2>/dev/null || F "the real counter went backwards within one pass ($r1 -> $r2)";; esac
+  [ "$(read_bootid)" = na ] && F "real boot_id read returned na — the reboot gate would be permanently blind"
+  case "$(fresh_devices 0)" in na) F "real usb scan rendered na — the candidate leg is blind on this node";; esac
+  [ "$fails" = 0 ] || { echo "smoke-test: FAILED ($fails)" >&2; exit 1; }
+  echo "smoke-test: ok (CHURN/QUIET/BASELINE/REBOOT/NA each driven; reboot + backwards counter render na never 0; first sight never replays the lifetime total; a blind pass leaves the baseline byte-identical; a delta is consumed once; candidates scan a real sysfs tree both ways; --check writes nothing; no line quotes a rate; real counter+boot_id+usb scan read on this node)"
+  exit 0
+}
+
+case "${1:-}" in
+  --test)   run_test ;;
+  --check)  pass 0; exit $? ;;
+  --status) [ -s "$STATE" ] && { cat "$STATE"; exit 0; }; echo "no reading yet ($STATE)"; exit 2 ;;
+  ""|--run) pass 1; exit $? ;;
+  *) echo "usage: mesh-device-churn [--check|--status|--test]" >&2; exit 64 ;;
+esac
