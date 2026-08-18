@@ -1,0 +1,350 @@
+#!/usr/bin/env bash
+# mesh-tg-inbound — the INBOUND-LIVENESS sense for the operator's Telegram channel.
+#
+# WHY (incident 2026-08-18, priority:incident): the mesh was TG-DEAF for 20.5h and NOTHING noticed,
+# because the only sign of "we are receiving" was `systemctl --user is-active mesh-voice-rx` reading
+# `active/running`. ACTIVE IS NOT RECEIVING. mesh-voice-rx's poll loop prints nothing on a successful
+# getUpdates (scripts/mesh-voice-rx:1020 poll_once — only the FAILURE branch logs), and it never dies
+# on a 409, it backs off and keeps looping. So a second poller on the same token puts the unit in a
+# permanent, silent, green-looking wedge: Telegram answers exactly ONE getUpdates and 409s the other,
+# every operator message lands in whichever node won that race, and the losing node shows no missing
+# line, no failed unit, no stale mtime on anything a watchdog reads. Measured on this node while
+# writing this tool: 19241 `Conflict: terminated by other getUpdates request` lines in 26h, still
+# firing, unit `active/running` the whole time. The OPERATOR noticed before any reflex did.
+#
+# mesh-guardian already carries the CURE for that shape (the primary/standby leg, 2026-08-18) — this
+# is the missing SENSE. A cure with no sense heals a fault nobody can see start or stop.
+#
+# THE ARTIFACT is the AGE of the last inbound line in ~/.mesh/voice-in.log carried TOGETHER WITH the
+# unit state — neither alone is a reading. Age alone cannot tell a quiet operator from a deaf mesh;
+# unit state alone is the very lie that cost 20.5h.
+#
+# THE DISCRIMINATOR — 'входящих не было' vs 'мы не слышим' must be different strings, and this tool
+# earns the difference with a real artifact instead of a guess: `getWebhookInfo` returns
+# `pending_update_count`, the count of updates Telegram is HOLDING for this token. It neither consumes
+# updates nor competes with getUpdates (verified live: probe returned ok while our poller was mid-409),
+# so it is safe to call from a cron sense. queue=0 is POSITIVE evidence that nothing is waiting →
+# the silence is the operator's. queue>0 and undrained → messages exist and nobody is taking them →
+# we are deaf, proven. queue=na (no token / probe failed) is NEITHER — it renders `na`, never 0, and
+# a stale inbound under a blind probe is RED-as-UNPROVEN, never green-as-quiet.
+# The queue probe alone is NOT sufficient and never replaces the conflict leg: when a COMPETING poller
+# drains the token, the queue reads 0 while WE hear nothing. That is exactly this node's live state
+# (queue=0, conflict streak firing) and it is why both legs exist.
+#
+# VERDICTS (precedence order; each is its own string — nothing collapses into "quiet"):
+#   NOEAR    unit not active AND no poller process — we are not listening at all.          RED
+#   CONFLICT trailing consecutive `Conflict: terminated by other getUpdates request` streak
+#            >= M with its last line inside the window — a second poller holds the token.  RED
+#   BACKLOG  queue >= K — Telegram is holding updates and nobody drains them.              RED
+#   UNPROVEN unit active, no conflict, last inbound older than N, queue BLIND — we cannot
+#            tell a quiet operator from a deaf mesh, and unproven is not green.            RED
+#   QUIET    unit active, no conflict, queue==0 (probe LIVE), last inbound older than N —
+#            nothing is waiting for us; the silence is the operator's, not our deafness.   ok
+#   NODATA   voice-in.log absent/empty/unparseable — we have never had an inbound line to
+#            age. NOT rendered as silence, NOT rendered as 0.                              see below
+#   HEARING  unit active, no conflict, last inbound within N.                              ok
+#
+#   NODATA is RED when the queue probe is blind or the queue is non-empty, and `na` (exit 2) on a
+#   fresh install where the unit is up and the queue is provably empty — a node that has simply never
+#   been messaged is not a fault, and inventing an age of 0 for it would be the fabricated-calm shape.
+#
+#   mesh-tg-inbound            one pass: read, write state, append log, board-post a RED (debounced)
+#   mesh-tg-inbound --check    read-only: same reading, no state write, no board post
+#   mesh-tg-inbound --status   last state line, no new read
+#   mesh-tg-inbound --test     drives every verdict from fixtures, VISIBLE-RED gate on the two
+#                              incident conditions, + a REAL read of all four legs on this node
+#
+# exit 0 = ok (HEARING/QUIET) · 1 = RED · 2 = honest n/a (no organ here / never messaged)
+#
+# reflex-cadence: */10 * * * *
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"   # cron self-defense (siblings by bare name)
+
+UNIT="${MESH_TG_IN_UNIT:-mesh-voice-rx.service}"
+VLOG="${MESH_TG_IN_LOG:-$HOME/.mesh/voice-in.log}"
+STATE="${MESH_TG_IN_STATE:-$HOME/.mesh/.tg-inbound.state}"
+OLOG="${MESH_TG_IN_LOGFILE:-$HOME/.mesh/tg-inbound.log}"
+MARK="${MESH_TG_IN_MARK:-$HOME/.mesh/.tg-inbound.posted}"
+CRED="${MESH_TG_IN_CRED:-$HOME/.config/remote-access/env}"
+MAX_AGE_MIN="${MESH_TG_IN_MAX_AGE_MIN:-240}"      # N — inbound older than this is stale
+CONFLICT_M="${MESH_TG_IN_CONFLICT_STREAK:-3}"     # M — consecutive Conflict lines that mean a rival poller
+WINDOW_MIN="${MESH_TG_IN_WINDOW_MIN:-15}"         # the streak's last line must be this recent
+QUEUE_K="${MESH_TG_IN_QUEUE_RED:-1}"              # queue >= K is a backlog
+DEBOUNCE_MIN="${MESH_TG_IN_DEBOUNCE_MIN:-60}"     # one board post per verdict per this many minutes
+CHAT="${MESH_TG_IN_CHAT:-1}"
+CONFLICT_RE='Conflict: terminated by other getUpdates request'   # the EXACT Telegram string, not a guess
+
+now_epoch(){ date -u +%s; }
+stamp(){ date -u +%FT%TZ; }
+
+# --- leg 1: the unit ------------------------------------------------------------------------------
+# Reads systemd first, falls back to a process probe, because mesh-guardian's takeover path starts the
+# poller with setsid (tg_start) and NOT as a unit — a systemd-only read would call that running poller
+# absent. Renders which source answered, so a reader is never guessing.
+# stdin = `ps -eo comm,args`. Counts ONLY the poller: comm is the python interpreter AND the argv
+# mentions mesh-voice-rx. A bare `grep -c mesh-voice-rx` over argv counts the READER's own children —
+# this tool's `journalctl --user -u mesh-voice-rx.service` is a live process whose cmdline contains the
+# string, so the naive probe reported proc=1 with the unit STOPPED and the whole sense read HEARING
+# while the mesh was deaf. Caught only by driving the gate red for real (2026-08-18); a fixture-only
+# test would have passed it. Same family as pkill-f-kills-its-own-wrapper-shell.
+_count_poller(){ awk '$1 ~ /^python3?/ && /mesh-voice-rx/' | wc -l; }
+
+read_unit(){
+  if [ -n "${MESH_TG_IN_UNIT_CMD:-}" ]; then eval "$MESH_TG_IN_UNIT_CMD"; return; fi
+  local load act sub n
+  load="$(systemctl --user show "$UNIT" -p LoadState --value 2>/dev/null)"
+  act="$(systemctl --user show "$UNIT" -p ActiveState --value 2>/dev/null)"
+  sub="$(systemctl --user show "$UNIT" -p SubState --value 2>/dev/null)"
+  n="$(ps -eo comm,args 2>/dev/null | _count_poller)"
+  [ -n "$load" ] || load=absent
+  printf '%s|%s|%s|%s\n' "$load" "${act:-unknown}" "${sub:-unknown}" "${n:-0}"
+}
+
+# --- leg 2: the age of the last INBOUND line ------------------------------------------------------
+# The line format is `<ISO8601Z>  <KIND>  <text>` (mesh-voice-rx write()). An unparseable/absent/empty
+# log yields `nodata`, never an age of 0 — a fabricated 0 would read as "an inbound arrived just now",
+# the exact inverse of the truth.
+read_lastin(){
+  # Resolved HERE, not at load: a load-time global cannot be re-pointed by an env prefix on an
+  # in-process call, so the test would silently read the node's real log while believing it drove a
+  # fixture — a fixture that never reached the code under test.
+  local VLOG="${MESH_TG_IN_LOG:-$HOME/.mesh/voice-in.log}"
+  local ts age
+  [ -s "$VLOG" ] || { echo "nodata|nodata"; return; }
+  ts="$(grep -oE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z' "$VLOG" 2>/dev/null | tail -1)"
+  [ -n "$ts" ] || { echo "nodata|nodata"; return; }
+  age="$(date -u -d "$ts" +%s 2>/dev/null)" || { echo "nodata|nodata"; return; }
+  [ -n "$age" ] || { echo "nodata|nodata"; return; }
+  printf '%s|%s\n' "$ts" "$(( ( $(now_epoch) - age ) / 60 ))"
+}
+
+# --- leg 3: the conflict streak -------------------------------------------------------------------
+# CONSECUTIVE trailing lines, not a count: a chronic rival poller writes thousands of these, but so
+# would a single bad minute during a restart — what separates them is that the tail is UNBROKEN and
+# CURRENT. A blind journal (no unit loaded / journalctl refused) renders `na`, never 0: "we saw no
+# conflict" and "we could not look" are the difference between a green reflex and an honest one.
+read_conflict(){
+  if [ -n "${MESH_TG_IN_JOURNAL_CMD:-}" ]; then
+    local out; out="$(eval "$MESH_TG_IN_JOURNAL_CMD" 2>/dev/null)" || { echo "na|na"; return; }
+    printf '%s\n' "$out" | _streak; return
+  fi
+  local load; load="$(systemctl --user show "$UNIT" -p LoadState --value 2>/dev/null)"
+  [ "$load" = loaded ] || { echo "na|na"; return; }
+  local out
+  out="$(journalctl --user -u "$UNIT" --since "-${WINDOW_MIN}min" --no-pager -q -o short-iso 2>/dev/null)" \
+    || { echo "na|na"; return; }
+  printf '%s\n' "$out" | _streak
+}
+# stdin = the unit's journal lines for the window, oldest first. Emits `<streak>|<total>`.
+_streak(){
+  awk -v re="$CONFLICT_RE" '
+    NF==0 { next }
+    { total++; if (index($0, re)) streak++; else streak=0 }
+    END { printf "%d|%d\n", streak+0, total+0 }'
+}
+
+# --- leg 4: the queue (the discriminator) ---------------------------------------------------------
+# getWebhookInfo.pending_update_count — what Telegram is HOLDING for this token. Read-only w.r.t. the
+# update queue: it does not consume, does not advance the offset, does not 409 the live poller.
+read_queue(){
+  if [ -n "${MESH_TG_IN_PROBE_CMD:-}" ]; then eval "$MESH_TG_IN_PROBE_CMD"; return; fi
+  local CRED="${MESH_TG_IN_CRED:-$HOME/.config/remote-access/env}"
+  local tok body n
+  tok="$(grep -s '^[[:space:]]*BOT_TOKEN=' "$CRED" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"'"'"' \r')"
+  [ -n "$tok" ] || [ -n "${MESH_TG_IN_PROBE_BODY+x}" ] || { echo na; return; }
+  if [ -n "${MESH_TG_IN_PROBE_BODY+x}" ]; then body="$MESH_TG_IN_PROBE_BODY"
+  else body="$(curl -s --max-time 15 "https://api.telegram.org/bot${tok}/getWebhookInfo" 2>/dev/null)" || { echo na; return; }; fi
+  case "$body" in *'"ok":true'*) : ;; *) echo na; return;; esac
+  n="$(printf '%s' "$body" | grep -oE '"pending_update_count":[0-9]+' | grep -oE '[0-9]+$')"
+  [ -n "$n" ] || { echo na; return; }
+  printf '%s\n' "$n"
+}
+
+# --- the verdict ----------------------------------------------------------------------------------
+# Pure: takes the four legs, returns `<verdict>|<rc>|<sentence>`. Kept separate from the reads so the
+# test can drive every branch without a bot token, a journal, or a poller.
+decide(){
+  local uload="$1" uact="$2" usub="$3" uproc="$4" lastage="$5" streak="$6" queue="$7"
+  local running=0
+  { [ "$uact" = active ] && [ "$usub" = running ]; } && running=1
+  [ "${uproc:-0}" -ge 1 ] 2>/dev/null && running=1
+  if [ "$running" = 0 ]; then
+    printf 'NOEAR|1|no poller: unit %s is %s/%s and no mesh-voice-rx process is alive — the mesh is not listening to Telegram at all\n' \
+      "$UNIT" "$uact" "$usub"; return
+  fi
+  if [ "$streak" != na ] && [ "$streak" -ge "$CONFLICT_M" ] 2>/dev/null; then
+    printf 'CONFLICT|1|a SECOND poller holds this bot token: %s consecutive "%s" in the last %smin — Telegram answers one getUpdates and 409s ours, so operator messages are landing on the other node and are INVISIBLE here (no missing line, no failed unit)\n' \
+      "$streak" "$CONFLICT_RE" "$WINDOW_MIN"; return
+  fi
+  if [ "$queue" != na ] && [ "$queue" -ge "$QUEUE_K" ] 2>/dev/null; then
+    printf 'BACKLOG|1|Telegram is holding %s update(s) for this token and nobody is draining them — the poller is up but not receiving\n' "$queue"; return
+  fi
+  if [ "$lastage" = nodata ]; then
+    if [ "$queue" = na ]; then
+      printf 'NODATA|1|no inbound line has EVER been parsed from %s and the queue probe is blind — this is "we have no evidence we can hear", NOT "the operator is silent"\n' "$VLOG"; return
+    fi
+    printf 'NODATA|2|no inbound line has ever been parsed from %s; queue is provably empty (%s) so nothing is being lost — never messaged here, not a fault (n/a, not 0)\n' "$VLOG" "$queue"; return
+  fi
+  if [ "$lastage" -gt "$MAX_AGE_MIN" ] 2>/dev/null; then
+    if [ "$queue" = na ]; then
+      printf 'UNPROVEN|1|last inbound was %smin ago (> %smin) and the queue probe is BLIND — we cannot tell a quiet operator from a deaf mesh, and unproven is not green\n' "$lastage" "$MAX_AGE_MIN"; return
+    fi
+    printf 'QUIET|0|no inbound for %smin (> %smin), and Telegram is holding %s update(s) — nothing is waiting for us, so this is the OPERATOR being silent, not the mesh being deaf\n' "$lastage" "$MAX_AGE_MIN" "$queue"; return
+  fi
+  printf 'HEARING|0|last inbound %smin ago (<= %smin), no conflict streak, queue=%s\n' "$lastage" "$MAX_AGE_MIN" "$queue"
+}
+
+# --- one pass -------------------------------------------------------------------------------------
+pass(){   # $1 = write? (1 = advance state/log/board, 0 = --check read-only)
+  local write="$1" u ul ua us up li lts lage cf st tot q v rc msg line
+  u="$(read_unit)";     ul="${u%%|*}"; u="${u#*|}"; ua="${u%%|*}"; u="${u#*|}"; us="${u%%|*}"; up="${u##*|}"
+  li="$(read_lastin)";  lts="${li%%|*}"; lage="${li##*|}"
+  cf="$(read_conflict)"; st="${cf%%|*}"; tot="${cf##*|}"
+  q="$(read_queue)"
+  v="$(decide "$ul" "$ua" "$us" "$up" "$lage" "$st" "$q")"
+  rc="${v#*|}"; rc="${rc%%|*}"; msg="${v#*|*|}"; v="${v%%|*}"
+  # Every field is NAMED and every unknown says `na`. `last-in=nodata` and `last-in=<n>m` are
+  # different strings on purpose; so are `conflict=na` (could not look) and `conflict=0` (looked, none).
+  line="$(stamp) $v unit=$ua/$us(load=$ul,proc=$up) last-in=$( [ "$lage" = nodata ] && echo nodata || echo "${lage}m" ) last-in-ts=$lts conflict=$st/${tot}ln/${WINDOW_MIN}min queue=$q thresholds=N${MAX_AGE_MIN}m/M${CONFLICT_M}/K${QUEUE_K} :: $msg"
+  printf '%s\n' "$line"
+  [ "$write" = 1 ] || return "$rc"
+  mkdir -p "$(dirname "$STATE")" 2>/dev/null
+  printf '%s\n' "$line" > "$STATE"
+  printf '%s\n' "$line" >> "$OLOG"
+  # mtime = ran-live, content = the reading (liveness-touch convention: a value that holds for days
+  # must not read as a dead reflex to mesh-reflex-health/mesh-pulse).
+  command -v mesh-state-touch >/dev/null 2>&1 && mesh-state-touch "$STATE" >/dev/null 2>&1
+  if [ "$rc" = 1 ] && [ "$CHAT" = 1 ] && command -v mesh-chat >/dev/null 2>&1; then
+    local last=0 nowe; nowe="$(now_epoch)"
+    [ -f "$MARK" ] && last="$(awk -v v="$v" '$1==v{print $2}' "$MARK" 2>/dev/null | tail -1)"
+    [ -n "$last" ] || last=0
+    if [ "$(( nowe - last ))" -ge "$(( DEBOUNCE_MIN * 60 ))" ]; then
+      MESH_WHO="tg-inbound@$(hostname)" mesh-chat "[fyi] tg-inbound $v on $(hostname): $msg | $line" >/dev/null 2>&1 || true
+      { grep -v "^$v " "$MARK" 2>/dev/null; printf '%s %s\n' "$v" "$nowe"; } > "$MARK.tmp" && mv "$MARK.tmp" "$MARK"
+    fi
+  fi
+  return "$rc"
+}
+
+# --- test -----------------------------------------------------------------------------------------
+run_test(){
+  local fails=0 out
+  F(){ echo "smoke-test: FAIL ($1)" >&2; fails=$((fails+1)); }
+  # A gate you have not seen FAIL is not a gate: every verdict below is driven from injected legs, so
+  # the branch is exercised even on a node with no token, no journal and no poller.
+  #
+  # (1) VISIBLE RED #1 — the incident itself: unit active/running, a live conflict streak. This is the
+  #     state this node was in for 26h while every existing check read green.
+  out="$(decide loaded active running 1 5 9 0)"
+  case "$out" in CONFLICT\|1\|*) : ;; *) F "active+conflict-streak did not go RED CONFLICT (got: ${out%%|*})";; esac
+  # ...and the same conflict count BELOW M must not fire — a threshold that fires at every value is not
+  # a threshold.
+  out="$(decide loaded active running 1 5 2 0)"
+  case "$out" in CONFLICT*) F "conflict streak below M (2 < 3) fired anyway";; esac
+  # (2) VISIBLE RED #2 — reception stopped: unit active, no conflict, inbound stale, probe blind.
+  out="$(decide loaded active running 1 1300 0 na)"
+  case "$out" in UNPROVEN\|1\|*) : ;; *) F "active+stale+blind-probe did not go RED UNPROVEN (got: ${out%%|*})";; esac
+  # (3) THE DISCRIMINATOR — the identical staleness with a LIVE probe reading an empty queue is the
+  #     operator being quiet, and it must be a DIFFERENT string with a DIFFERENT rc. If these two ever
+  #     collapse into one verdict, the tool is back to rendering silence as deafness.
+  out="$(decide loaded active running 1 1300 0 0)"
+  case "$out" in QUIET\|0\|*) : ;; *) F "stale+empty-queue did not render QUIET (got: ${out%%|*})";; esac
+  [ "$(decide loaded active running 1 1300 0 na | cut -d'|' -f1)" \
+    != "$(decide loaded active running 1 1300 0 0  | cut -d'|' -f1)" ] \
+    || F "'we cannot hear' and 'the operator was silent' render the SAME verdict string"
+  # (4) queue backlog: updates exist, nobody drains them — deaf, proven, even with zero conflict.
+  out="$(decide loaded active running 1 5 0 7)"
+  case "$out" in BACKLOG\|1\|*) : ;; *) F "undrained queue did not go RED BACKLOG (got: ${out%%|*})";; esac
+  # (5) no poller at all — a different sentence from every flavour of "up but not hearing".
+  out="$(decide loaded inactive dead 0 5 na na)"
+  case "$out" in NOEAR\|1\|*) : ;; *) F "dead unit + no process did not go RED NOEAR (got: ${out%%|*})";; esac
+  # ...but a setsid-started poller with NO unit is still an ear (mesh-guardian's takeover path).
+  out="$(decide absent unknown unknown 1 5 na 0)"
+  case "$out" in NOEAR*) F "a running non-unit poller was called NOEAR";; esac
+  # (6) NODATA is never 0 and never 'quiet': blind → RED, provably-empty queue → honest n/a (rc 2).
+  out="$(decide loaded active running 1 nodata 0 na)"
+  case "$out" in NODATA\|1\|*) : ;; *) F "nodata+blind-probe was not RED (got: ${out%%|*})";; esac
+  out="$(decide loaded active running 1 nodata 0 0)"
+  case "$out" in NODATA\|2\|*) : ;; *) F "nodata+empty-queue was not honest n/a rc2 (got: ${out%%|*})";; esac
+  case "$out" in *"never messaged"*) : ;; *) F "the never-messaged sentence does not say so";; esac
+  # (7) green
+  out="$(decide loaded active running 1 3 0 0)"
+  case "$out" in HEARING\|0\|*) : ;; *) F "healthy reading was not HEARING (got: ${out%%|*})";; esac
+  # (8) the streak is CONSECUTIVE and CURRENT, not a count. A journal with conflicts followed by any
+  #     later line has streak 0 — otherwise a restart's brief 409 burst reads as a permanent rival.
+  out="$(printf 'a %s\nb %s\nc recovered\n' "$CONFLICT_RE" "$CONFLICT_RE" | _streak)"
+  [ "$out" = "0|3" ] || F "a broken streak was not reset (got $out)"
+  out="$(printf 'x quiet\ny %s\nz %s\n' "$CONFLICT_RE" "$CONFLICT_RE" | _streak)"
+  [ "$out" = "2|3" ] || F "trailing streak miscounted (got $out)"
+  # (9) an EMPTY journal window is 0 conflicts, and a REFUSED journal is na — collapsing these is how
+  #     a blind sense reads green.
+  out="$(MESH_TG_IN_JOURNAL_CMD='true' read_conflict)"
+  [ "$out" = "0|0" ] || F "empty journal window did not read 0 (got $out)"
+  out="$(MESH_TG_IN_JOURNAL_CMD='exit 1' read_conflict)"
+  [ "$out" = "na|na" ] || F "a refused journal did not render na (got $out)"
+  # (10) the queue probe renders na — never 0 — on every failure mode.
+  out="$(MESH_TG_IN_PROBE_BODY='{"ok":false,"error_code":401}' read_queue)"; [ "$out" = na ] || F "probe ok:false did not render na (got $out)"
+  out="$(MESH_TG_IN_PROBE_BODY='{"ok":true,"result":{"url":""}}' read_queue)"; [ "$out" = na ] || F "a body with no pending_update_count did not render na (got $out)"
+  out="$(MESH_TG_IN_PROBE_BODY='' read_queue)"; [ "$out" = na ] || F "an empty probe body did not render na (got $out)"
+  out="$(MESH_TG_IN_PROBE_BODY='{"ok":true,"result":{"pending_update_count":4}}' read_queue)"; [ "$out" = 4 ] || F "the queue count was not parsed out of a real getWebhookInfo body (got $out)"
+  out="$(MESH_TG_IN_CRED=/nonexistent-tg-cred read_queue)"; [ "$out" = na ] || F "missing token did not render na (got $out)"
+  # (11) last-in parses a REAL log shape, and refuses to invent an age for a junk/empty one.
+  local tmp; tmp="$(mktemp)"
+  printf '%s  VOICE  hi\n' "$(date -u -d '-90 min' +%FT%TZ)" > "$tmp"
+  out="$(MESH_TG_IN_LOG="$tmp" read_lastin)"
+  case "$out" in *\|89|*\|90|*\|91) : ;; *) F "a 90min-old inbound line did not age to ~90 (got $out)";; esac
+  : > "$tmp"; [ "$(MESH_TG_IN_LOG="$tmp" read_lastin)" = "nodata|nodata" ] || F "an empty voice-in.log did not render nodata"
+  printf 'no timestamp here\n' > "$tmp"
+  [ "$(MESH_TG_IN_LOG="$tmp" read_lastin)" = "nodata|nodata" ] || F "an unparseable voice-in.log did not render nodata"
+  rm -f "$tmp"
+  # (12) --check MUST NOT write. The sense that writes its own liveness artifact forges it.
+  local ts="$(mktemp)" tl="$(mktemp)" tm="$(mktemp)"; rm -f "$ts" "$tl" "$tm"
+  MESH_TG_IN_STATE="$ts" MESH_TG_IN_LOGFILE="$tl" MESH_TG_IN_MARK="$tm" MESH_TG_IN_CHAT=0 \
+    MESH_TG_IN_UNIT_CMD='echo "loaded|active|running|1"' MESH_TG_IN_JOURNAL_CMD='true' \
+    MESH_TG_IN_PROBE_CMD='echo 0' MESH_TG_IN_LOG=/nonexistent-voice-in \
+    bash "${BASH_SOURCE[0]}" --check >/dev/null 2>&1
+  { [ -e "$ts" ] || [ -e "$tl" ]; } && F "--check wrote the state/log artifact a watchdog reads for liveness"
+  # ...and a real pass DOES write, with the verdict in it (a sandboxed state, never ~/.mesh).
+  MESH_TG_IN_STATE="$ts" MESH_TG_IN_LOGFILE="$tl" MESH_TG_IN_MARK="$tm" MESH_TG_IN_CHAT=0 \
+    MESH_TG_IN_UNIT_CMD='echo "loaded|active|running|1"' \
+    MESH_TG_IN_JOURNAL_CMD="printf 'a %s\nb %s\nc %s\n' '$CONFLICT_RE' '$CONFLICT_RE' '$CONFLICT_RE'" \
+    MESH_TG_IN_PROBE_CMD='echo 0' MESH_TG_IN_LOG=/nonexistent-voice-in \
+    bash "${BASH_SOURCE[0]}" >/dev/null 2>&1
+  out="$(cat "$ts" 2>/dev/null)"
+  case "$out" in *CONFLICT*) : ;; *) F "a real pass did not write the RED verdict to its state (got: ${out:-EMPTY})";; esac
+  case "$out" in *"queue=0"*) : ;; *) F "the state line does not carry the queue leg";; esac
+  rm -f "$ts" "$tl" "$tm"
+  # (12b) THE PROCESS PROBE MUST NOT COUNT ITS OWN READER. This is the gate for the bug that made the
+  #       first draft read HEARING with the unit stopped: the tool's own journalctl child carries
+  #       "mesh-voice-rx.service" in its cmdline.
+  out="$(printf 'journalctl journalctl --user -u mesh-voice-rx.service --since -15min\nbash /bin/bash -c mesh-tg-inbound --check\ngrep grep -c mesh-voice-rx\n' | _count_poller)"
+  [ "$out" = 0 ] || F "the poller probe counted its own reader's processes (got $out, want 0)"
+  out="$(printf 'python3 python3 /home/x/.local/bin/mesh-voice-rx\njournalctl journalctl -u mesh-voice-rx.service\n' | _count_poller)"
+  [ "$out" = 1 ] || F "the poller probe missed a real python3 mesh-voice-rx (got $out, want 1)"
+  # ...and end to end: unit failed + only decoy processes MUST be NOEAR, the reading that was green.
+  out="$(decide loaded failed failed 0 44 0 0)"
+  case "$out" in NOEAR\|1\|*) : ;; *) F "unit failed with no poller did not go RED NOEAR (got: ${out%%|*})";; esac
+
+  # (13) REAL READ — every leg must produce a parseable value from THIS node's actual kernel/systemd/
+  #      filesystem, not just from fixtures. A tool whose test only drives stubs has never touched the
+  #      thing it wraps.
+  out="$(read_unit)"
+  case "$out" in *\|*\|*\|*) : ;; *) F "real unit read did not return 4 fields (got: $out)";; esac
+  out="$(read_lastin)"
+  case "$out" in nodata\|nodata|*Z\|[0-9]*) : ;; *) F "real voice-in.log read returned neither a timestamp nor nodata (got: $out)";; esac
+  out="$(read_conflict)"
+  case "$out" in na\|na|[0-9]*\|[0-9]*) : ;; *) F "real journal read returned neither a streak nor na (got: $out)";; esac
+  out="$(read_queue)"
+  case "$out" in na|[0-9]*) : ;; *) F "real queue probe returned neither a count nor na (got: $out)";; esac
+  [ "$fails" = 0 ] || { echo "smoke-test: FAILED ($fails)" >&2; exit 1; }
+  echo "smoke-test: ok (CONFLICT/UNPROVEN/BACKLOG/NOEAR/NODATA/QUIET/HEARING each driven RED-or-green; 'we cannot hear' != 'operator was silent'; streak is consecutive+reset; blind journal/probe render na not 0; --check writes nothing; all four legs really read on this node)"
+  exit 0
+}
+
+case "${1:-}" in
+  --test)   run_test ;;
+  --check)  pass 0; exit $? ;;
+  --status) [ -s "$STATE" ] && { cat "$STATE"; exit 0; }; echo "no reading yet ($STATE)"; exit 2 ;;
+  ""|--run) pass 1; exit $? ;;
+  *) echo "usage: mesh-tg-inbound [--check|--status|--test]" >&2; exit 64 ;;
+esac
