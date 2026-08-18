@@ -1,0 +1,458 @@
+#!/usr/bin/env bash
+# mesh-udev-stream — the NAMING half of this node's device-edge instrumentation: WHICH device
+# enumerated, not just that something did.
+#
+# WHY (discover 2026-08-18, ~/.mesh/knowledge/capability-uevent-seqnum-zero-floor-device-churn-
+# accumulator-mesh-home-20260818.md; filed apart from the counter half on purpose). mesh-device-churn
+# reads /sys/kernel/uevent_seqnum — an accumulator, 100% interval coverage, one cheap cron read — and
+# it structurally CANNOT name a device: it is a "something churned" bit. Its live output already shows
+# the gap (`CHURN delta=33 ... candidates=none`): 33 real uevents in 300s and not one name, because
+# the only naming instrument beside it (device-age-vs-uptime) is blind to removals and to every
+# non-USB subsystem. `udevadm monitor` carries ACTION/DEVPATH/SUBSYSTEM/SEQNUM per event — but it is
+# a STREAM, so it needs a long-lived listener, which is a different wiring cost from a cron read.
+# This tool is that listener plus the cron-side reader of what it captured.
+#
+# MEASURED HERE (mesh-home, kernel 6.8.0-137, uid 1000, 2026-08-18):
+#   - `udevadm monitor --udev` runs unprivileged and delivers events: captured
+#     `change /devices/pci0000:00/0000:00:18.3/hwmon/hwmon2 (hwmon) SEQNUM=5269` as uid 1000.
+#   - `udevadm monitor --kernel` ALSO runs unprivileged here and delivered the SAME event
+#     (SEQNUM=5269, 2.5ms earlier). The prior note — "as uid 1000 it printed nothing at all, not even
+#     a header" — DID NOT REPRODUCE: with stdout on a pipe it printed its header and the event. So
+#     `--kernel` is no longer unclaimed; it is claimed and working. We still listen on `--udev`
+#     because the post-rule event carries the resolved properties (DEVNAME, ID_*) that name a device
+#     to a human, and its ~2ms lag is irrelevant at any cron cadence.
+#
+# THE FAILURE THIS TOOL IS MOST LIKELY TO COMMIT, and what stops it: a stream listener that DIED
+# leaves an empty log, and an empty log reads exactly like "no device events" — the fabricated calm,
+# one layer up from the reboot-reset counter. So the reading never trusts the log's silence on its
+# own. Three independent guards, all rendered in the line:
+#   1. LISTENER LIVENESS is the lock, not a pid: the daemon holds an exclusive flock for its whole
+#      life, so "someone answers" is a kernel fact, not a name match (a pid can be reused, a cmdline
+#      can be spoofed). No listener => verdict DOWN and rc 2 — we did not look. Never QUIET.
+#   2. COVERAGE is published, never assumed: the listener's start epoch is compared against the read
+#      window, so a restart renders `coverage=<x>%` and a 0-event partial window is `na`, not quiet.
+#      A sense whose window is narrower than its interval reports a sample, not a state.
+#   3. CROSS-CHECK against the accumulator: uevent_seqnum is read independently (its own baseline —
+#      mesh-device-churn's is never touched). If the counter advanced and the stream named nothing
+#      across a fully-covered window, that is verdict GAP (rc 2), not quiet: two instruments
+#      disagreeing is a reason to distrust this one, not to publish its silence.
+#   Plus the stream witnesses ITSELF: SEQNUM is globally monotonic, so a jump of more than 1 between
+#   consecutive delivered events means events we were not given — emitted per line as `sgap=N`.
+#
+# WHAT IT STILL CANNOT DO:
+#   - It sees only from its own start. Whatever happened before the first listener started is gone;
+#     that is what the counter is for, and why both halves exist.
+#   - `sgap` counts seqnums we did not receive; it cannot say which, or whether they were kernel-only.
+#   - A named device is not a fault. A plugged stick and the sole-uplink dongle re-enumerating both
+#     read as EVENTS; the name is what lets a human tell them apart, which is the entire point.
+#
+# LIFETIME / RESTART / LOG GROWTH (the three open questions the task named, answered concretely):
+#   - lifetime: one foreground listener per node, singleton by flock, no systemd unit (a unit file in
+#     scripts/ deploys where systemd never reads; and this needs no privilege, no boot ordering).
+#   - restart: the */5 cron pass IS the restart policy — every read first ensures the listener, so a
+#     death costs at most one cadence of blindness AND that blindness is rendered as coverage, never
+#     silently absorbed. `@reboot mesh-restore` is not needed: the next tick re-raises it.
+#   - log growth: the writer rotates at MAXB bytes keeping ONE generation, so the on-disk cost is
+#     hard-bounded at 2*MAXB (default 2 MiB) regardless of how hard the node churns. Measured line
+#     size ~150 B; the measured idle rate is 0 events/s and the worst burst observed by the counter
+#     is 33 events / 300s (~0.11/s ≈ 60 KiB/h), so the cap is ~17 h of continuous worst-case burst.
+#     Rotation is done by the appending shell (reopen per line), never by an outside mv against a
+#     held fd, which would orphan the writer's file descriptor and lose every later line.
+#
+#   mesh-udev-stream            ensure the listener, then one read pass: emit, board, advance baseline
+#   mesh-udev-stream --check    read-only: same reading, no ensure, no write, no board post
+#   mesh-udev-stream --status   last reading, no new read
+#   mesh-udev-stream --tail [N] the last N named events (default 20)
+#   mesh-udev-stream --daemon   the listener itself (foreground; refuses to double-start)
+#   mesh-udev-stream --ensure   start the listener if none holds the lock; print what it did
+#   mesh-udev-stream --stop     stop the listener
+#   mesh-udev-stream --test     every verdict from fixtures + a real listener capturing a real event
+#
+# exit 0 = QUIET (listening, fully covered, nothing enumerated) · 1 = EVENTS (named enumerations in
+# the window) · 2 = honest n/a (listener DOWN, coverage PARTIAL, reboot, or GAP vs the counter)
+#
+# reflex-cadence: */5 * * * *
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"   # cron self-defense (siblings by bare name)
+
+LOG="${MESH_UDEV_STREAM_LOG:-$HOME/.mesh/udev-stream.log}"
+STATE="${MESH_UDEV_STREAM_STATE:-$HOME/.mesh/.udev-stream.state}"
+BASE="${MESH_UDEV_STREAM_BASE:-$HOME/.mesh/.udev-stream.baseline}"
+LOCKF="${MESH_UDEV_STREAM_LOCK:-$HOME/.mesh/.udev-stream.lock}"
+STARTF="${MESH_UDEV_STREAM_STARTF:-$HOME/.mesh/.udev-stream.started}"
+DLOG="${MESH_UDEV_STREAM_DLOG:-$HOME/.mesh/.udev-stream.daemon.log}"
+MARK="${MESH_UDEV_STREAM_MARK:-$HOME/.mesh/.udev-stream.posted}"
+SEQF="${MESH_UDEV_STREAM_SEQ:-/sys/kernel/uevent_seqnum}"
+BOOTF="${MESH_UDEV_STREAM_BOOTID:-/proc/sys/kernel/random/boot_id}"
+MAXB="${MESH_UDEV_STREAM_MAXB:-1048576}"          # rotate at this size, keep one generation
+FIRST_WIN="${MESH_UDEV_STREAM_FIRST_WIN:-300}"    # window used on first sight only
+NAMES_MAX="${MESH_UDEV_STREAM_NAMES:-6}"          # how many named events go in the line
+DEBOUNCE_MIN="${MESH_UDEV_STREAM_DEBOUNCE_MIN:-30}"
+CHAT="${MESH_UDEV_STREAM_CHAT:-1}"
+MONITOR_CMD="${MESH_UDEV_STREAM_MONITOR:-}"       # test seam: a producer standing in for udevadm
+
+stamp(){ date -u +%FT%TZ; }
+now_epoch(){ date -u +%s; }
+mkdirp(){ mkdir -p "$(dirname "$1")" 2>/dev/null; }
+
+# --- the accumulator, read independently of mesh-device-churn -------------------------------------
+# Unreadable or non-numeric renders `na`, never 0: a 0 would claim nothing has ever enumerated on
+# this machine, which no failed read can support.
+read_seq(){ local f="${MESH_UDEV_STREAM_SEQ:-/sys/kernel/uevent_seqnum}" v
+  v="$(cat "$f" 2>/dev/null)" || { echo na; return; }
+  case "$v" in ''|*[!0-9]*) echo na; return;; esac; printf '%s\n' "$v"; }
+read_bootid(){ local f="${MESH_UDEV_STREAM_BOOTID:-/proc/sys/kernel/random/boot_id}" v
+  v="$(cat "$f" 2>/dev/null)"; [ -n "$v" ] && printf '%s\n' "$v" || echo na; }
+
+# --- listener liveness = the LOCK, not a pid ------------------------------------------------------
+# "Is a process with this name alive" is a weaker claim than "someone still holds the exclusive
+# lock": pids are reused and a cmdline is a string anyone can wear. The fd is closed on every path.
+listener_alive(){
+  local f="${MESH_UDEV_STREAM_LOCK:-$HOME/.mesh/.udev-stream.lock}"
+  mkdir -p "$(dirname "$f")" 2>/dev/null
+  exec 8>>"$f" 2>/dev/null || return 1
+  if flock -n 8 2>/dev/null; then flock -u 8 2>/dev/null; exec 8>&-; return 1; fi
+  exec 8>&-; return 0
+}
+
+# --- the listener ---------------------------------------------------------------------------------
+# One udevadm, one gawk folding each property block into one line, one appending shell that rotates.
+# gawk (not mawk) for systime()/strftime(); without it we render an honest n/a rather than a stream
+# with no timestamps.
+fold_awk(){
+cat <<'AWK'
+BEGIN{ have=0; prev=-1 }
+/^(UDEV|KERNEL)[ \t]*\[/ { delete kv; have=1; next }
+/^[A-Z][A-Z0-9_]*=/ && have==1 { i=index($0,"="); kv[substr($0,1,i-1)]=substr($0,i+1); next }
+/^[ \t]*$/ {
+  if (have==1 && ("ACTION" in kv)) {
+    sq = ("SEQNUM" in kv) ? kv["SEQNUM"] : "na"
+    gap = 0
+    if (sq ~ /^[0-9]+$/) { if (prev >= 0 && sq-prev > 1) gap = sq-prev-1; prev = sq+0 }
+    dn = ("DEVNAME" in kv) ? kv["DEVNAME"] : "-"
+    usb = "-"
+    if (("ID_VENDOR_ID" in kv) && ("ID_MODEL_ID" in kv)) usb = kv["ID_VENDOR_ID"] ":" kv["ID_MODEL_ID"]
+    dp = ("DEVPATH" in kv) ? kv["DEVPATH"] : "-"
+    sb = ("SUBSYSTEM" in kv) ? kv["SUBSYSTEM"] : "-"
+    printf "%d %s action=%s subsystem=%s seqnum=%s sgap=%d dev=%s name=%s usb=%s\n", \
+      systime(), strftime("%Y-%m-%dT%H:%M:%SZ", systime(), 1), kv["ACTION"], sb, sq, gap, dp, dn, usb
+    fflush()
+  }
+  have=0; delete kv; next
+}
+AWK
+}
+
+daemon(){
+  command -v gawk >/dev/null 2>&1 || { echo "$(stamp) n/a: gawk absent — the fold needs systime()/strftime(), mawk has neither" >&2; return 2; }
+  [ -n "$MONITOR_CMD" ] || command -v udevadm >/dev/null 2>&1 || { echo "$(stamp) n/a: udevadm absent" >&2; return 2; }
+  mkdirp "$LOCKF"; mkdirp "$LOG"
+  exec 9>>"$LOCKF" || return 2
+  if ! flock -n 9; then echo "$(stamp) another listener already holds $LOCKF — refusing to double-start"; return 0; fi
+  printf '%s\n' "$(now_epoch)" > "$STARTF"
+  local prog; prog="$(fold_awk)"
+  # The rotation lives HERE, in the appending shell, because an outside `mv` against a writer that
+  # holds the fd orphans it: the file keeps growing invisibly under a name nothing reads.
+  if [ -n "$MONITOR_CMD" ]; then
+    eval "$MONITOR_CMD"
+  else
+    stdbuf -oL -eL udevadm monitor --udev --property 2>/dev/null
+  fi | gawk "$prog" | while IFS= read -r line; do
+        if [ -f "$LOG" ]; then
+          local sz; sz="$(stat -c %s "$LOG" 2>/dev/null || echo 0)"
+          [ "${sz:-0}" -ge "$MAXB" ] 2>/dev/null && mv -f "$LOG" "$LOG.1" 2>/dev/null
+        fi
+        printf '%s\n' "$line" >> "$LOG"
+      done
+  return 0
+}
+
+ensure(){
+  if listener_alive; then echo "listener: already running (holds $LOCKF)"; return 0; fi
+  mkdirp "$DLOG"
+  setsid nohup bash "${BASH_SOURCE[0]}" --daemon >>"$DLOG" 2>&1 &
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    listener_alive && { echo "listener: started"; return 0; }
+    sleep 0.3
+  done
+  echo "listener: FAILED to start (see $DLOG)"; return 1
+}
+
+stop_listener(){
+  listener_alive || { echo "listener: not running"; return 0; }
+  # Kill by SESSION, not by name: setsid put the daemon and its udevadm/gawk children in their own
+  # session, so signalling the session group reaps the whole tree — where a `pkill -f mesh-udev-stream`
+  # would also match this very shell (pkill-f-kills-its-own-wrapper-shell).
+  local sid mysid; mysid="$(ps -o sid= -p $$ 2>/dev/null | tr -d ' ')"
+  for sid in $(ps -eo sid=,args= 2>/dev/null | awk '/mesh-udev-stream --daemon/ && !/awk/ {print $1}' | sort -u); do
+    [ -n "$sid" ] || continue; [ "$sid" = "$mysid" ] && continue
+    kill -TERM -- -"$sid" 2>/dev/null
+  done
+  local i; for i in 1 2 3 4 5 6 7 8 9 10; do listener_alive || { echo "listener: stopped"; return 0; }; sleep 0.3; done
+  echo "listener: still holding the lock after TERM"; return 1
+}
+
+# --- reading the captured stream ------------------------------------------------------------------
+# Counts and names events with epoch >= $1. Reads the rotated generation too, so a rotation inside
+# the window does not silently drop half of it.
+scan_since(){
+  local since="$1" f
+  for f in "$LOG.1" "$LOG"; do [ -f "$f" ] && cat "$f"; done 2>/dev/null \
+    | awk -v s="$since" '$1 ~ /^[0-9]+$/ && $1+0 >= s+0'
+}
+count_since(){ scan_since "$1" | wc -l | tr -d ' '; }
+names_since(){
+  local since="$1" max="${2:-6}"
+  scan_since "$since" | awk '{ a="?"; sb="?"; n="-";
+      for(i=3;i<=NF;i++){ split($i,p,"="); if(p[1]=="action")a=p[2]; else if(p[1]=="subsystem")sb=p[2]; else if(p[1]=="name")n=p[2]; else if(p[1]=="dev")d=p[2] }
+      key=a":"sb":"(n!="-"?n:d); c[key]++; if(!(key in o)){o[key]=++k} }
+    END{ for(key in c) printf "%d\t%s(x%d)\n", o[key], key, c[key] }' \
+    | sort -n | head -n "$max" | cut -f2 | paste -sd, - 2>/dev/null
+}
+sgap_since(){ scan_since "$1" | awk '{for(i=3;i<=NF;i++){split($i,p,"="); if(p[1]=="sgap") g+=p[2]}} END{print g+0}'; }
+
+# --- the verdict (pure) ---------------------------------------------------------------------------
+# in:  live(1/0) start(epoch|na) now window(s|na) events seq_delta(int|na) bootchanged(0/1)
+# out: <verdict>|<rc>|<coverage%>|<sentence>
+decide(){
+  local live="$1" start="$2" now="$3" win="$4" events="$5" sdelta="$6" bootchg="$7"
+  local cov=100
+  case "$win" in ''|na|*[!0-9]*) 
+      printf 'BASELINE|0|na|first sight: recorded the counter and the clock as the baseline and claimed NO events — there is no window to have covered yet\n'; return;;
+  esac
+  if [ "$live" != 1 ]; then
+    printf 'DOWN|2|0|no listener holds the lock, so the stream log is BLIND for this window, not quiet — an empty log from a dead listener is a fabricated calm; rc 2 says we did not look\n'; return
+  fi
+  case "$start" in ''|na|*[!0-9]*) start=$now;; esac
+  local covered=$(( now - start )); [ "$covered" -lt 0 ] && covered=0
+  [ "$covered" -gt "$win" ] && covered="$win"
+  if [ "$win" -gt 0 ]; then cov=$(( covered * 100 / win )); else cov=100; fi
+  if [ "$bootchg" = 1 ]; then
+    printf 'REBOOT|2|%s|the window straddles a reboot: the counter reset and the listener is younger than the window, so no delta and no coverage claim can be made for it — rendered na, never 0\n' "$cov"; return
+  fi
+  if [ "$events" -gt 0 ] 2>/dev/null; then
+    if [ "$cov" -lt 100 ]; then
+      printf 'EVENTS|1|%s|%s named device event(s), but the listener only covered %s%% of the last %ss (it started inside the window) — the count is a FLOOR for the window, not its total\n' "$cov" "$events" "$cov" "$win"; return
+    fi
+    printf 'EVENTS|1|%s|%s named device event(s) in the last %ss — each carries ACTION/SUBSYSTEM/DEVPATH, which the seqnum counter structurally cannot name\n' "$cov" "$events" "$win"; return
+  fi
+  if [ "$cov" -lt 100 ]; then
+    printf 'PARTIAL|2|%s|the listener covered only %s%% of the last %ss (started inside it), so "no events" is a claim about %ss of it and na about the rest — a window narrower than the interval reports a sample, not a state\n' "$cov" "$cov" "$win" "$covered"; return
+  fi
+  case "$sdelta" in ''|na|*[!0-9]*) : ;; *)
+    if [ "$sdelta" -gt 0 ]; then
+      printf 'GAP|2|%s|the seqnum accumulator counted %s uevent(s) in a window this listener claims it covered fully and named NONE — two instruments disagree, so this one is not trusted for the window; go read mesh-device-churn and the daemon log\n' "$cov" "$sdelta"; return
+    fi;;
+  esac
+  printf 'QUIET|0|%s|no device event in the last %ss, listener up for all of it and the seqnum accumulator agrees (delta %s)\n' "$cov" "$win" "$sdelta"
+}
+
+# --- one pass -------------------------------------------------------------------------------------
+pass(){   # $1 = 1 write / 0 read-only
+  local write="$1" seq boot nowe bseq="" bboot="" bepoch="" win live start events names sgap sdelta bootchg v rc cov msg line
+  seq="$(read_seq)"; boot="$(read_bootid)"; nowe="$(now_epoch)"
+  [ -s "$BASE" ] && IFS=' ' read -r bseq bboot bepoch < "$BASE"
+  case "${bepoch:-}" in ''|*[!0-9]*) win=na;; *) win=$(( nowe - bepoch ));; esac
+  [ "$win" = na ] || [ "$win" -gt 0 ] 2>/dev/null || win=1
+  bootchg=0
+  if [ "$boot" != na ] && [ -n "${bboot:-}" ] && [ "$bboot" != na ] && [ "$boot" != "$bboot" ]; then bootchg=1; fi
+  if listener_alive; then live=1; else live=0; fi
+  start="$(cat "$STARTF" 2>/dev/null | tr -dc '0-9')"; [ -n "$start" ] || start=na
+  [ "$live" = 1 ] || start=na
+  if [ "$win" = na ]; then events=0; names=""; sgap=0
+  else events="$(count_since "$(( nowe - win ))")"; names="$(names_since "$(( nowe - win ))" "$NAMES_MAX")"; sgap="$(sgap_since "$(( nowe - win ))")"; fi
+  if [ "$seq" = na ] || [ -z "${bseq:-}" ] || [ "$bseq" = na ] || [ "$bootchg" = 1 ]; then sdelta=na
+  elif [ "$seq" -lt "$bseq" ] 2>/dev/null; then sdelta=na
+  else sdelta=$(( seq - bseq )); fi
+  v="$(decide "$live" "$start" "$nowe" "$win" "$events" "$sdelta" "$bootchg")"
+  rc="${v#*|}"; rc="${rc%%|*}"; cov="${v#*|*|}"; cov="${cov%%|*}"; msg="${v#*|*|*|}"; v="${v%%|*}"
+  line="$(stamp) $v events=$events window=${win}s coverage=${cov}% seqdelta=$sdelta seq-total=$seq stream-sgap=$sgap listener=$( [ "$live" = 1 ] && echo up || echo down )$( [ "$live" = 1 ] && printf " since=%s" "$start" )${names:+ named=$names} :: $msg"
+  [ -n "$names" ] && line="$line || the names come from udev's own post-rule properties, the only naming instrument here that sees removals and non-USB subsystems"
+  printf '%s\n' "$line"
+  [ "$write" = 1 ] || return "$rc"
+  mkdirp "$STATE"; printf '%s\n' "$line" > "$STATE"
+  # A BLIND pass (DOWN/REBOOT) must still advance the baseline clock, or the next window would be
+  # claimed as covered by a listener that was not running for it. It advances the counter too: the
+  # blindness is already rendered as coverage, and replaying a stale delta would double-count.
+  printf '%s %s %s\n' "$seq" "$boot" "$nowe" > "$BASE"
+  # mtime = ran-live, content = the reading (liveness-touch convention: a node quiet for days must
+  # not read as a dead reflex to mesh-reflex-health/mesh-pulse).
+  command -v mesh-state-touch >/dev/null 2>&1 && mesh-state-touch "$STATE" >/dev/null 2>&1
+  if { [ "$v" = EVENTS ] || [ "$v" = GAP ]; } && [ "$CHAT" = 1 ] && command -v mesh-chat >/dev/null 2>&1; then
+    local last=0
+    [ -f "$MARK" ] && last="$(tr -dc '0-9' < "$MARK" 2>/dev/null)"
+    [ -n "$last" ] || last=0
+    if [ "$(( nowe - last ))" -ge "$(( DEBOUNCE_MIN * 60 ))" ]; then
+      MESH_WHO="udev-stream@$(hostname)" mesh-chat "[fyi] udev-stream on $(hostname): $line" >/dev/null 2>&1 || true
+      printf '%s\n' "$nowe" > "$MARK"
+    fi
+  fi
+  return "$rc"
+}
+
+# --- test -----------------------------------------------------------------------------------------
+run_test(){
+  local fails=0 out
+  F(){ echo "smoke-test: FAIL ($1)" >&2; fails=$((fails+1)); }
+  local NOW=1000000
+
+  # (1) the reading this tool exists for: named events in a fully covered window.
+  out="$(decide 1 $((NOW-600)) $NOW 300 4 4 0)"
+  case "$out" in EVENTS\|1\|100\|*) : ;; *) F "4 events in a covered window did not read EVENTS/1/100 (got: $out)";; esac
+  # (2) ...and its complement. QUIET must be reachable, or this is an alarm rather than a sense.
+  out="$(decide 1 $((NOW-600)) $NOW 300 0 0 0)"
+  case "$out" in QUIET\|0\|100\|*) : ;; *) F "a covered empty window did not read QUIET (got: $out)";; esac
+  # (3) THE FABRICATED CALM: a dead listener's empty log must never be quiet.
+  out="$(decide 0 na $NOW 300 0 0 0)"
+  case "$out" in DOWN\|2\|0\|*) : ;; *) F "a dead listener did not render DOWN/2 (got: $out)";; esac
+  case "$out" in *QUIET*) F "the DOWN sentence calls a blind window quiet";; esac
+  # (4) COVERAGE: a listener younger than the window renders the fraction, and 0 events under
+  #     partial coverage is na, not quiet.
+  out="$(decide 1 $((NOW-150)) $NOW 300 0 0 0)"
+  case "$out" in PARTIAL\|2\|50\|*) : ;; *) F "a half-covered empty window did not read PARTIAL/2/50 (got: $out)";; esac
+  # ...but a partial window that DID see something still names it, as a floor.
+  out="$(decide 1 $((NOW-150)) $NOW 300 2 2 0)"
+  case "$out" in EVENTS\|1\|50\|*) : ;; *) F "a half-covered window with events did not read EVENTS/1/50 (got: $out)";; esac
+  case "$out" in *FLOOR*) : ;; *) F "a partial-coverage count is not labelled a floor";; esac
+  # (5) THE CROSS-CHECK: counter saw events, stream named none, coverage full => GAP, never QUIET.
+  out="$(decide 1 $((NOW-600)) $NOW 300 0 7 0)"
+  case "$out" in GAP\|2\|100\|*) : ;; *) F "counter=7 stream=0 did not render GAP/2 (got: $out)";; esac
+  case "$out" in *QUIET*) F "a disagreeing cross-check still published quiet";; esac
+  # ...and an unreadable counter does not manufacture a GAP.
+  out="$(decide 1 $((NOW-600)) $NOW 300 0 na 0)"
+  case "$out" in QUIET\|0\|*) : ;; *) F "an na counter delta did not fall through to QUIET (got: $out)";; esac
+  # (6) reboot renders na, never 0 events-as-calm.
+  out="$(decide 1 $((NOW-10)) $NOW 300 0 na 1)"
+  case "$out" in REBOOT\|2\|*) : ;; *) F "a boot_id change did not render REBOOT/2 (got: $out)";; esac
+  # (7) first sight records, never replays.
+  out="$(decide 1 na $NOW na 0 na 0)"
+  case "$out" in BASELINE\|0\|na\|*) : ;; *) F "first sight did not baseline (got: $out)";; esac
+
+  # (8) THE FOLD is driven against REAL udevadm output, captured verbatim from this node as uid 1000
+  #     (including its header, which must not become an event), and the seqnum-gap witness is driven
+  #     by a jump the fold must notice.
+  local prog; prog="$(fold_awk)"
+  out="$(printf '%s\n' \
+    'monitor will print the received events for:' \
+    'UDEV - the event which udev sends out after rule processing' \
+    '' \
+    'UDEV  [108984.727654] change   /devices/pci0000:00/0000:00:18.3/hwmon/hwmon2 (hwmon)' \
+    'ACTION=change' \
+    'DEVPATH=/devices/pci0000:00/0000:00:18.3/hwmon/hwmon2' \
+    'SUBSYSTEM=hwmon' \
+    'SEQNUM=5269' \
+    'USEC_INITIALIZED=93835302343' \
+    '' \
+    'UDEV  [108990.100000] add   /devices/pci0000:00/0000:00:14.0/usb1/1-2/1-2.3 (usb)' \
+    'ACTION=add' \
+    'DEVPATH=/devices/pci0000:00/0000:00:14.0/usb1/1-2/1-2.3' \
+    'SUBSYSTEM=usb' \
+    'SEQNUM=5273' \
+    'DEVNAME=/dev/bus/usb/001/042' \
+    'ID_VENDOR_ID=0bda' \
+    'ID_MODEL_ID=b82c' \
+    '' | gawk "$prog")"
+  [ "$(printf '%s\n' "$out" | grep -c .)" = 2 ] || F "the fold did not emit exactly 2 events from a real 2-event capture (got: $out)"
+  case "$out" in *"action=change subsystem=hwmon seqnum=5269"*) : ;; *) F "the fold lost the hwmon event's fields (got: $out)";; esac
+  case "$out" in *"action=add subsystem=usb seqnum=5273"*) : ;; *) F "the fold lost the usb event's fields";; esac
+  case "$out" in *"usb=0bda:b82c"*) : ;; *) F "the fold dropped the usb vendor:model that names the sole-uplink dongle";; esac
+  case "$out" in *"name=/dev/bus/usb/001/042"*) : ;; *) F "the fold dropped DEVNAME";; esac
+  case "$out" in *"monitor will print"*|*"the event which udev sends"*) F "the fold turned the header into an event";; esac
+  # 5269 -> 5273 is 3 undelivered seqnums; the stream must witness its own gap.
+  case "$out" in *"sgap=3"*) : ;; *) F "the fold did not witness the 3-seqnum gap between delivered events (got: $out)";; esac
+  case "$(printf '%s\n' "$out" | head -1)" in *sgap=0*) : ;; *) F "the first event of a stream invented a gap against no predecessor";; esac
+  # ...and each half of the header guard is load-bearing on its own: the block-start pattern alone
+  # (a header line wearing the word UDEV), and the ACTION requirement alone (a block that starts but
+  # carries no event). Fed separately, either one leaking would emit a phantom event.
+  out="$(printf '%s\n' 'monitor will print the received events for:' 'UDEV - the event which udev sends out after rule processing' '' | gawk "$prog")"
+  [ -z "$(printf '%s' "$out" | tr -d '[:space:]')" ] || F "the udevadm header block alone emitted an event (got: $out)"
+  out="$(printf '%s\n' 'UDEV  [1.0] change   /devices/x (y)' 'SUBSYSTEM=y' 'SEQNUM=1' '' | gawk "$prog")"
+  [ -z "$(printf '%s' "$out" | tr -d '[:space:]')" ] || F "a block with no ACTION emitted an event (got: $out)"
+
+  # (9) the scanners: window filtering, naming, rotation-spanning, sgap summation.
+  local d; d="$(mktemp -d)"
+  local L="$d/s.log"
+  printf '%s\n' \
+    "$((NOW-1000)) old action=add subsystem=usb seqnum=1 sgap=0 dev=/d/old name=- usb=-" \
+    "$((NOW-100)) x action=add subsystem=usb seqnum=2 sgap=2 dev=/d/1-2.3 name=- usb=0bda:b82c" \
+    "$((NOW-50)) x action=remove subsystem=block seqnum=3 sgap=0 dev=/d/sda name=/dev/sda usb=-" > "$L"
+  printf '%s\n' "$((NOW-80)) x action=change subsystem=hwmon seqnum=9 sgap=1 dev=/d/hwmon2 name=- usb=-" > "$L.1"
+  local LOG_SAVE="$LOG"; LOG="$L"     # the scanners read $LOG; point them at the fixture tree
+  [ "$(count_since $((NOW-200)))" = 3 ] || F "count_since missed the rotated generation or the window edge (got: $(count_since $((NOW-200))))"
+  [ "$(count_since $((NOW-2000)))" = 4 ] || F "a wide window did not see all 4 lines (got: $(count_since $((NOW-2000))))"
+  [ "$(count_since $((NOW+10)))" = 0 ] || F "a future window still matched lines"
+  out="$(names_since $((NOW-200)) 6)"
+  case "$out" in *"add:usb:/d/1-2.3"*) : ;; *) F "names_since did not name the usb add (got: $out)";; esac
+  case "$out" in *"remove:block:/dev/sda"*) : ;; *) F "names_since dropped a REMOVAL — the case the age-based candidate list is structurally blind to (got: $out)";; esac
+  case "$out" in *hwmon2*) : ;; *) F "names_since did not read the rotated generation (got: $out)";; esac
+  case "$out" in *old*) F "names_since named an event outside the window";; esac
+  [ "$(sgap_since $((NOW-200)))" = 3 ] || F "sgap_since did not sum the witnessed gaps (got: $(sgap_since $((NOW-200))))"
+  LOG="$LOG_SAVE"; rm -rf "$d"
+
+  # (10) LIVE, and END TO END: a real listener, a real event through the real udevadm, a real read.
+  #      A wrapper's test that drives only stubs has never once touched the thing it wraps.
+  local sb; sb="$(mktemp -d)"
+  local E=( "MESH_UDEV_STREAM_LOG=$sb/e.log" "MESH_UDEV_STREAM_STATE=$sb/e.state" "MESH_UDEV_STREAM_BASE=$sb/e.base"
+            "MESH_UDEV_STREAM_LOCK=$sb/e.lock" "MESH_UDEV_STREAM_STARTF=$sb/e.start" "MESH_UDEV_STREAM_DLOG=$sb/e.dlog"
+            "MESH_UDEV_STREAM_MARK=$sb/e.mark" "MESH_UDEV_STREAM_CHAT=0" )
+  if ! command -v gawk >/dev/null 2>&1 || ! command -v udevadm >/dev/null 2>&1; then
+    rm -rf "$sb"; echo "n/a: gawk or udevadm absent — the listener cannot be armed here" >&2; exit 2
+  fi
+  env "${E[@]}" bash "${BASH_SOURCE[0]}" --ensure >/dev/null 2>&1
+  out="$(env "${E[@]}" bash "${BASH_SOURCE[0]}" --ensure 2>&1)"   # idempotent: must not double-start
+  case "$out" in *"already running"*) : ;; *) F "a second --ensure did not see the first listener (got: $out)";; esac
+  local held; held=0; env "${E[@]}" bash -c 'set -uo pipefail; LOCKF="$MESH_UDEV_STREAM_LOCK"
+      exec 8>>"$LOCKF"; if flock -n 8; then exit 1; else exit 0; fi' && held=1
+  [ "$held" = 1 ] || F "after --ensure nothing holds the listener lock"
+  # the header alone proves udevadm monitor runs unprivileged here; the EVENT proves it delivers.
+  local hdr; hdr="$(timeout 3 udevadm monitor --udev 2>&1 | head -2)"
+  case "$hdr" in *"monitor will print"*) : ;; *) F "udevadm monitor --udev printed no header as uid $(id -u) — the listener is not unprivileged here (got: $hdr)";; esac
+  if sudo -n true 2>/dev/null && [ -e /sys/class/hwmon/hwmon2 ]; then
+    sudo -n udevadm trigger --action=change --sysname-match=hwmon2 2>/dev/null
+    local i seen=0
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+      grep -q 'subsystem=hwmon' "$sb/e.log" 2>/dev/null && { seen=1; break; }
+      sleep 0.4
+    done
+    [ "$seen" = 1 ] || F "the live listener did not capture a REAL triggered hwmon event within 4s (log: $(cat "$sb/e.log" 2>/dev/null | tail -3))"
+    # ...and the read pass turns that real capture into EVENTS, naming it.
+    printf '%s %s %s\n' "$(read_seq)" "$(read_bootid)" "$(( $(now_epoch) - 120 ))" > "$sb/e.base"
+    out="$(env "${E[@]}" bash "${BASH_SOURCE[0]}" --check 2>&1)"
+    case "$out" in *"EVENTS events="*) : ;; *) F "a real captured event did not read EVENTS (got: $out)";; esac
+    case "$out" in *hwmon*) : ;; *) F "the reading did not NAME the captured device — the entire point of this half (got: $out)";; esac
+  else
+    echo "smoke-test: SKIPPED the real-event leg (no sudo -n or no hwmon2) — the listener was armed and the lock proven, but nothing triggered a real uevent here" >&2
+  fi
+  # --check must not write: a reading that writes its own liveness artifact forges it.
+  local before; before="$(cat "$sb/e.base" 2>/dev/null)"
+  rm -f "$sb/e.state"
+  env "${E[@]}" bash "${BASH_SOURCE[0]}" --check >/dev/null 2>&1
+  [ -e "$sb/e.state" ] && F "--check wrote the state artifact"
+  [ "$(cat "$sb/e.base" 2>/dev/null)" = "$before" ] || F "--check advanced the baseline"
+  # a write pass writes both, and a DOWN pass (lock free) is rc 2 and says blind.
+  env "${E[@]}" bash "${BASH_SOURCE[0]}" --stop >/dev/null 2>&1
+  local d2; d2="$(mktemp -d)"
+  out="$(MESH_UDEV_STREAM_LOG=$d2/n.log MESH_UDEV_STREAM_STATE=$d2/n.state MESH_UDEV_STREAM_BASE=$d2/n.base \
+         MESH_UDEV_STREAM_LOCK=$d2/n.lock MESH_UDEV_STREAM_STARTF=$d2/n.start MESH_UDEV_STREAM_MARK=$d2/n.mark \
+         MESH_UDEV_STREAM_CHAT=0 bash -c 'printf "1 x 100\n" > '"$d2"'/n.base; bash "$0" --check' "${BASH_SOURCE[0]}" 2>&1)"
+  case "$out" in *"DOWN events=0"*) : ;; *) F "with no listener the read did not render DOWN (got: $out)";; esac
+  case "$out" in *"listener=down"*) : ;; *) F "the DOWN line does not say the listener is down";; esac
+  rm -rf "$sb" "$d2"
+
+  [ "$fails" = 0 ] || { echo "smoke-test: FAILED ($fails)" >&2; exit 1; }
+  echo "smoke-test: ok (EVENTS/QUIET/DOWN/PARTIAL/GAP/REBOOT/BASELINE each driven; a dead listener never reads quiet; coverage rendered and a partial count labelled a floor; the counter cross-check overrides silence; the fold driven on REAL udevadm output incl. its header and a seqnum gap; scanners span a rotation and name a REMOVAL; a real listener armed, singleton by lock, capturing a real triggered uevent and named by the read; --check writes nothing)"
+  exit 0
+}
+
+case "${1:-}" in
+  --test)    run_test ;;
+  --daemon)  daemon; exit $? ;;
+  --ensure)  ensure; exit $? ;;
+  --stop)    stop_listener; exit $? ;;
+  --check)   pass 0; exit $? ;;
+  --status)  [ -s "$STATE" ] && { cat "$STATE"; exit 0; }; echo "no reading yet ($STATE)"; exit 2 ;;
+  --tail)    n="${2:-20}"; for f in "$LOG.1" "$LOG"; do [ -f "$f" ] && cat "$f"; done 2>/dev/null | tail -n "$n"; exit 0 ;;
+  ""|--run)  ensure >/dev/null 2>&1; pass 1; exit $? ;;
+  *) echo "usage: mesh-udev-stream [--check|--status|--tail N|--ensure|--daemon|--stop|--test]" >&2; exit 64 ;;
+esac
