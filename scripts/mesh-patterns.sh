@@ -76,6 +76,44 @@ rl_is_walled(){
   return 1
 }
 
+# ---- AUTH-DEAD (logged out) banner shape ----
+#
+# auth_is_dead — stdin: the bottom pane lines. Returns 0 iff a GENUINE logged-out ENGINE BANNER is
+# present. Same discipline, same reason as rl_is_walled above, learned the same way: a bare substring
+# scan turns a mind's PROSE into a verdict. Live 2026-08-18, minutes after channel-keepalive grew an
+# AUTH-DEAD arm that KILLS and relaunches on this verdict: mesh-home:health — a perfectly healthy mind
+# — was classified AUTH-DEAD off its own board message *about* the auth outage it had just survived
+# ("…my window was 403 auth-dead … only the handoff's tail showing Please run /login · API Error:
+# 403"). The arm's debounce does NOT save it: that text sits in the pane for many minutes, so two
+# consecutive passes agree and a healthy mind gets killed with its context. The FP also hurts today,
+# with no arm at all — mesh-tell REFUSES to send to an AUTH-DEAD pane and dispatch HOLDs on rc 9, so a
+# mind is silenced by discussing an auth incident, exactly when the mesh needs it talking.
+# TWO shape rules, both required, because either alone leaks:
+#   TERSE  — an engine banner is short; the FP line was ~200 chars of narrative.
+#   LEADS  — after stripping leading whitespace and any TUI result/bullet glyph (the glyph group is
+#            OPTIONAL — a banner is often just indented, and requiring a glyph made the anchor
+#            unreachable for those, i.e. the rule was carried entirely by TERSE), a real banner
+#            BEGINS with the phrase
+#            ('Please run /login · API Error: 403 Request not allowed'), while prose embeds it
+#            mid-sentence. Anchoring is what survives a SHORT quote of the same string.
+# Deliberately NOT reusing MESH_AUTH_RE (which includes '/login' bare and context-exhaustion tokens):
+# that pattern answers "does a steward action appear anywhere in this text", a different question.
+MESH_AUTHDEAD_RE='not logged in|please run /login|invalid api key'
+MESH_AUTHDEAD_BANNER_MAXLEN=100   # an engine banner is terse; a mind's prose is long-form
+export MESH_AUTHDEAD_RE MESH_AUTHDEAD_BANNER_MAXLEN
+auth_is_dead(){
+  local txt; txt="$(cat)"
+  # board-echo strip, same rationale as rl_is_walled: the mesh's own chatter relayed into a pane
+  # ("[mind-authdead] mesh-home:health is AUTH-DEAD…") is never that pane's engine banner.
+  txt="$(printf '%s\n' "$txt" | grep -vE '^[[:space:]]*[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:Z]+  [^ ]+  ::  ')"
+  printf '%s\n' "$txt" \
+    | grep -vE '^[[:space:]]*[❯›]' \
+    | sed -E 's/^[[:space:]]*([●⏺⎿│*•▪◆·>-]+[[:space:]]*)?//' \
+    | awk -v m="$MESH_AUTHDEAD_BANNER_MAXLEN" 'length($0)<=m' \
+    | grep -qiE "^($MESH_AUTHDEAD_RE)" && return 0
+  return 1
+}
+
 # ---- BLE device classification (shared by mesh-arrivals + mesh-ambient-clock) ----
 #
 # MESH_PERSON_RE  — KNOWN person-carried devices (operator + known items). Used for WEIGHTING
@@ -349,6 +387,20 @@ if [ "${1:-}" = --test ] && [ "${BASH_SOURCE[0]}" = "${0}" ]; then
   ckw clear  "statusline cache-delta +429" "main · 41% ctx · +429 cache tokens"
   ckw clear  "STALE banner + idle footer" "$(printf '⎿  You'"'"'ve hit your session limit · resets 2:20pm (Europe/Moscow)\n   /upgrade to increase your usage limit.\n✻ Worked for 1s\n❯ \n  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents')"
   ckw clear  "STALE banner + spinner"     "$(printf '⎿  You'"'"'ve hit your session limit · resets 2:20pm\n✻ Cogitating… (12s · esc to interrupt)')"
+  echo "auth_is_dead — banner-shape gate (a mind is never killed or silenced off its own prose):"
+  cka(){ local want="$1" label="$2" txt="$3"; if printf '%s\n' "$txt" | auth_is_dead; then got=dead; else got=clear; fi
+         if [ "$got" = "$want" ]; then echo "  ok: $label ($got)"; else echo "  FAIL: $label want=$want got=$got"; fail=1; fi; }
+  cka dead  "403 logged-out banner"   "● Please run /login · API Error: 403 Request not allowed"
+  cka dead  "not-logged-in banner"    "⎿  Not logged in · Please run /login"
+  cka dead  "indented banner, no glyph" "   Please run /login"
+  cka dead  "invalid api key banner"  "Invalid API key · Please run /login"
+  # the live 2026-08-18 FP verbatim: mesh-home:health acknowledging the outage it had just survived
+  cka clear "prose quoting the banner" "On (2): acknowledged, my window was 403 auth-dead - I have no record of the interval, only the handoff tail showing Please run /login · API Error: 403. Thanks for the relaunch."
+  # one fixture per RULE, so neither rule can be deleted while the other silently covers for it
+  cka clear "long line that LEADS with the phrase (TERSE rule)" "Please run /login was what the pane showed for seven hours, and I am quoting the banner verbatim here so a future reader can match the exact string."
+  cka clear "short mid-sentence quote (LEADS rule)"             "handoff tail showed Please run /login"
+  cka clear "input-box draft about /login"                      "❯ how do I fix Not logged in · Please run /login on phaedra?"
+  cka clear "board echo of an authdead post"                    "2026-08-18T20:16:18Z  channel-keepalive@mesh-home  ::  [mind-authdead] mesh-home:health is AUTH-DEAD - Please run /login"
   echo "weather_field — honest-fusion: fresh state parses, stale/absent/malformed renders UNKNOWN:"
   _wtd="$(mktemp -d)"
   printf 'OK 2026-07-07T10:00:00Z now_c=25.1 today_max_c=31.5 peak_hour=15 thermal_day=1 thresh_c=28\n' > "$_wtd/fresh"
