@@ -8,13 +8,14 @@
 # Inputs (all read from state files — no live probes, so this tool itself is cheap):
 #   mesh-selfcare      .selfcare-state    "<host> tg=up|down inet=up|down mesh=up|down"
 #   mesh-egress-health .egress-state      "OK" / "BAD" / "SKIP"
-#   mesh-vpn-health    (no state file; live call)
+#   mesh-vpn-health    .vpn-health.state  "OK" / "DEGRADED" / "DOWN" / "UNREACHABLE"
 #   mesh-watchtower    .watchtower-state  numeric hash
 #
 # Each input classifies as HEALTHY / DEGRADED / UNKNOWN:
 #   - selfcare HEALTHY iff all of tg/inet/mesh are 'up'; DEGRADED if any 'down'
 #   - egress HEALTHY iff 'OK'; DEGRADED iff 'BAD' or 'SKIP'
-#   - vpn HEALTHY iff reachable; DEGRADED iff down (live call, no state file)
+#   - vpn HEALTHY iff the vpn SENSE says OK; DEGRADED iff DOWN/DEGRADED; UNKNOWN iff the sense
+#     itself says UNREACHABLE. Only an ABSENT or STALE sense falls back to a live ssh probe.
 #   - watchtower HEALTHY iff state file present and recent; DEGRADED otherwise
 #
 # Combined verdict (FALSIFIABLE via --test):
@@ -43,6 +44,10 @@ STALE_S=600
 # own threshold sized to its actual cadence + a buffer, same "judge vs the reflex's own cadence,
 # not a flat threshold" fix as mesh-reflex-health's DEAD-vs-cadence-drift class.
 WT_STALE_S=3900
+# mesh-vpn-health is */10 and mesh-state-touch'es .vpn-health.state on EVERY run (mtime =
+# ran-live, content = the change-gated committed verdict), so 2.5 cadences of buffer is the
+# honest "the sense is still speaking" window — judged against ITS cadence, not a flat 600s.
+VPN_STALE_S=1500
 
 # classify_selfcare <state-file> → echoes HEALTHY|DEGRADED|UNKNOWN
 # state format: "<host> tg=up|down inet=up|down mesh=up|down"
@@ -71,28 +76,59 @@ classify_egress() {
   echo "DEGRADED"
 }
 
-# classify_vpn <host> <port> <user> → echoes HEALTHY|DEGRADED
-# mesh-vpn-health is read-only — but calling it on every fusion eval is too heavy. We do a
-# lightweight SSH reachability probe (one TCP+exec) — NOT the full VPN-cert check. The full check
-# is in mesh-vpn-health itself, which writes its own state; the fusion just needs liveness.
+# --- vpn: the SENSE is authoritative in BOTH directions -------------------------------------
+# The old classify_vpn opened .vpn-health.state and short-circuited ONLY on DOWN/DEGRADED, so a
+# positive OK had NO PATH TO THE VERDICT: every healthy reading fell through to a 3s ssh across
+# this node's flapping sole uplink, and a failure there rendered UNKNOWN → "missing: vpn". The
+# tool whose ENTIRE job is this question could only ever degrade the answer, never support it —
+# 604 of 1464 logged edges in mesh-state.log are flips into missing:vpn while the sense read OK
+# (found 2026-08-19, dash rendering "phaedra VPN OK" and "missing: vpn" in the SAME frame).
+# The file's content is change-gated and its mtime is state-touched every run, so a fresh mtime
+# means "the sense ran" and the content is the currently-committed verdict.
+
+# vpn_from_sense <content> <age_s> <stale_s> → "LEVEL|provenance"; LEVEL ∈ HEALTHY|DEGRADED|
+# UNKNOWN|FALLBACK. FALLBACK means "the sense has nothing to say — ask the ssh probe". Pure.
+vpn_from_sense() {
+  local v="$1" age="$2" stale="$3"
+  [ -n "$v" ] || { echo "FALLBACK|sense-absent"; return; }
+  { [ "$age" -le "$stale" ]; } 2>/dev/null || { echo "FALLBACK|sense-stale:${age}s"; return; }
+  case "$v" in
+    OK)          echo "HEALTHY|sense:OK" ;;
+    DEGRADED)    echo "DEGRADED|sense:DEGRADED" ;;
+    DOWN)        echo "DEGRADED|sense:DOWN" ;;
+    # the sense ADMITS it is blind — a weaker ssh must not overwrite an admitted blindness with
+    # confidence, so this renders UNKNOWN and never reaches the fallback.
+    UNREACHABLE) echo "UNKNOWN|sense:UNREACHABLE" ;;
+    *)           echo "FALLBACK|sense-unparsed:$v" ;;
+  esac
+}
+
+# vpn_from_ssh <rc> <why> → "LEVEL|provenance" — the DEMOTED fallback, reached only when the
+# sense is absent/stale/unparsed. rc=0 → HEALTHY; anything else → UNKNOWN, never DEGRADED: a
+# tripped 3s connect on a flapping uplink is OUR blindness, not a claim about the far end. Pure.
+vpn_from_ssh() {
+  [ "$1" = 0 ] && { echo "HEALTHY|ssh-fallback($2)"; return; }
+  echo "UNKNOWN|ssh-fallback-failed($2)"
+}
+
+# classify_vpn <target> → echoes "LEVEL|provenance" (the caller splits on '|' — provenance can
+# NOT come back through a variable, since this runs in a command substitution).
 classify_vpn() {
-  local target="$1"
-  [ -n "$target" ] || { echo "UNKNOWN"; return; }
-  if [ -f "$HOME/.mesh/.vpn-health.state" ]; then
-    local v
-    v="$(head -1 "$HOME/.mesh/.vpn-health.state" 2>/dev/null | awk '{print $1}')"
-    if [ "$v" = "DOWN" ] || [ "$v" = "DEGRADED" ]; then
-      echo "DEGRADED"
-      return
-    fi
+  local target="$1" f="$MESH/.vpn-health.state" v="" age=999999 r why rc now m
+  if [ -f "$f" ]; then
+    v="$(head -1 "$f" 2>/dev/null | awk '{print $1}')"
+    now=$(date +%s); m=$(stat -c %Y "$f" 2>/dev/null || echo "$now")
+    age=$((now - m))
   fi
-  if timeout 5 ssh -o BatchMode=yes -o ConnectTimeout=3 \
+  r="$(vpn_from_sense "$v" "$age" "$VPN_STALE_S")"
+  [ "${r%%|*}" = FALLBACK ] || { printf '%s\n' "$r"; return; }
+  why="${r#*|}"
+  [ -n "$target" ] || { printf 'UNKNOWN|no-target(%s)\n' "$why"; return; }
+  timeout 5 ssh -o BatchMode=yes -o ConnectTimeout=3 \
        -o StrictHostKeyChecking=accept-new "$target" \
-       'echo ok' </dev/null >/dev/null 2>&1; then
-    echo "HEALTHY"
-  else
-    echo "UNKNOWN"
-  fi
+       'echo ok' </dev/null >/dev/null 2>&1
+  rc=$?
+  vpn_from_ssh "$rc" "$why"
 }
 
 # classify_watchtower <state-file> → echoes HEALTHY|DEGRADED|UNKNOWN
@@ -199,10 +235,41 @@ if [ "${1:-}" = --test ]; then
   printf 'HEALTHY|all 4 mesh paths up\n' > "$_sf"
   [ "$(read_prev_label "$_sf")" = "HEALTHY" ] || { echo "  FAIL read_prev_label HEALTHY: got=$(read_prev_label "$_sf")"; fail=1; }
   rm -rf "$_wd"
+  # --- vpn sense-vs-fallback: the SENSE must be able to SUPPORT the verdict, not only degrade it.
+  #     Regression guard for "a positive reading with no path to the verdict" (2026-08-19). ---
+  r="$(vpn_from_sense OK 60 1500)"
+  [ "$r" = "HEALTHY|sense:OK" ] || { echo "  FAIL vpn sense OK→HEALTHY: got=$r"; fail=1; }
+  r="$(vpn_from_sense DEGRADED 60 1500)"
+  [ "$r" = "DEGRADED|sense:DEGRADED" ] || { echo "  FAIL vpn sense DEGRADED: got=$r"; fail=1; }
+  r="$(vpn_from_sense DOWN 60 1500)"
+  [ "$r" = "DEGRADED|sense:DOWN" ] || { echo "  FAIL vpn sense DOWN: got=$r"; fail=1; }
+  r="$(vpn_from_sense UNREACHABLE 60 1500)"
+  [ "$r" = "UNKNOWN|sense:UNREACHABLE" ] || { echo "  FAIL vpn sense UNREACHABLE→UNKNOWN: got=$r"; fail=1; }
+  # a fresh sense NEVER reaches the ssh fallback — that is the whole fix
+  for _v in OK DEGRADED DOWN UNREACHABLE; do
+    case "$(vpn_from_sense "$_v" 60 1500)" in FALLBACK*) echo "  FAIL vpn fresh $_v fell through to ssh"; fail=1 ;; esac
+  done
+  # absent / stale / unparsed → and ONLY those → the demoted fallback
+  r="$(vpn_from_sense "" 60 1500)"
+  [ "$r" = "FALLBACK|sense-absent" ] || { echo "  FAIL vpn absent→FALLBACK: got=$r"; fail=1; }
+  r="$(vpn_from_sense OK 1501 1500)"
+  [ "$r" = "FALLBACK|sense-stale:1501s" ] || { echo "  FAIL vpn stale→FALLBACK: got=$r"; fail=1; }
+  r="$(vpn_from_sense OK 1500 1500)"
+  [ "$r" = "HEALTHY|sense:OK" ] || { echo "  FAIL vpn at-boundary should still be fresh: got=$r"; fail=1; }
+  r="$(vpn_from_sense WAT 60 1500)"
+  [ "$r" = "FALLBACK|sense-unparsed:WAT" ] || { echo "  FAIL vpn unparsed→FALLBACK: got=$r"; fail=1; }
+  # the fallback is honest in both directions: ok→HEALTHY, fail→UNKNOWN (never DEGRADED — a
+  # tripped 3s connect is our blindness, not a claim about the far end)
+  r="$(vpn_from_ssh 0 sense-absent)"
+  [ "$r" = "HEALTHY|ssh-fallback(sense-absent)" ] || { echo "  FAIL vpn ssh ok: got=$r"; fail=1; }
+  r="$(vpn_from_ssh 255 sense-stale:2000s)"
+  [ "$r" = "UNKNOWN|ssh-fallback-failed(sense-stale:2000s)" ] || { echo "  FAIL vpn ssh fail: got=$r"; fail=1; }
+  case "$(vpn_from_ssh 124 sense-absent)" in DEGRADED*) echo "  FAIL vpn ssh timeout must not claim DEGRADED"; fail=1 ;; esac
   [ "$fail" = 1 ] && { echo "smoke-test: FAIL"; exit 1; }
   echo "  ok: classify (12 cases: HEALTHY×1, DEGRADED×4-by-path, BROKEN×3, 2+UNKNOWN×3, 1UNKNOWN×1, MIXED×1)"
   echo "  ok: read_prev_label (3 cases: missing→empty, BROKEN, HEALTHY) — guards the --edge prev-capture ordering"
-  echo "smoke-test: ok (12 fusion + 3 edge-ordering = 15 assertions)"
+  echo "  ok: vpn sense (13 cases) — OK/DEGRADED/DOWN/UNREACHABLE all decided BY THE SENSE, ssh reached only on absent/stale/unparsed"
+  echo "smoke-test: ok (12 fusion + 3 edge-ordering + 13 vpn-sense = 28 assertions)"
   exit 0
 fi
 
@@ -213,7 +280,8 @@ eg="$(classify_egress "$MESH/.egress-state")"
 wt="$(classify_watchtower "$MESH/.watchtower-state")"
 # vpn: live SSH reachability probe to phaedra (or the configured VPN host from .mesh/nodes)
 vpn_target="$(grep -oE 'phaedra:[^ ]+' ~/.mesh/nodes 2>/dev/null | head -1 | cut -d: -f2)"
-vp="$(classify_vpn "$vpn_target")"
+vpres="$(classify_vpn "$vpn_target")"
+vp="${vpres%%|*}"; vpn_src="${vpres#*|}"
 
 result="$(classify_mesh_state "$sc" "$eg" "$vp" "$wt")"
 label="${result%%|*}"
@@ -230,14 +298,14 @@ mesh-state-touch "$STATE"
 
 # --- Output ---
 if [ "${1:-}" = --json ]; then
-  printf '{"label":"%s","reason":"%s","inputs":{"selfcare":"%s","egress":"%s","vpn":"%s","watchtower":"%s"},"ts":"%s"}\n' \
-    "$label" "$reason" "$sc" "$eg" "$vp" "$wt" "$TS"
+  printf '{"label":"%s","reason":"%s","inputs":{"selfcare":"%s","egress":"%s","vpn":"%s","watchtower":"%s"},"vpn_src":"%s","ts":"%s"}\n' \
+    "$label" "$reason" "$sc" "$eg" "$vp" "$wt" "$vpn_src" "$TS"
   exit 0
 fi
 if [ "${1:-}" = --edge ]; then
   # prev_label was captured ABOVE, before the write — emit only on a real transition.
   [ "$prev_label" = "$label" ] && exit 0
-  printf '[mesh-%s] %s — %s\n' "$(printf '%s' "$label" | tr '[:upper:]' '[:lower:]')" "$label" "$reason"
+  printf '%s [mesh-%s] %s — %s (vpn %s)\n' "$TS" "$(printf '%s' "$label" | tr '[:upper:]' '[:lower:]')" "$label" "$reason" "$vpn_src"
   exit 0
 fi
-printf '[mesh-%s] %s — %s\n' "$(printf '%s' "$label" | tr '[:upper:]' '[:lower:]')" "$label" "$reason"
+printf '%s [mesh-%s] %s — %s (vpn %s)\n' "$TS" "$(printf '%s' "$label" | tr '[:upper:]' '[:lower:]')" "$label" "$reason" "$vpn_src"
