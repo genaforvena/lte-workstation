@@ -14,6 +14,33 @@
 #   mesh-body-power --test   smoke test
 #
 # Threshold: MESH_BODY_POWER_MIN (default 20). Registry-resolved phone (~/.mesh/nodes / mesh-peer-addr).
+#
+# ── HONEST-DEGRADED CONTRACT (2026-08-19) ──────────────────────────────────────────────────────────
+# EVERY line in $STATE is `VERDICT|k=v|...` — field 1 is always a bare verdict word, never payload.
+#   OK|level=83|status=DISCHARGING|ts=<iso>      a real reading, battery fine
+#   LOW|level=17|status=DISCHARGING|ts=<iso>     a real reading, below threshold and draining
+#   UNREACHABLE|why=no-ip|ts=<iso>|last=<OK|LOW> mesh-phone-ip yielded nothing — the LINK, pre-connect
+#   UNREACHABLE|why=ssh|ts=<iso>|last=…          ssh transport failed (rc 255) — the LINK
+#   TIMEOUT|why=read-timeout|ts=<iso>|last=…     the read wall-clocked out (rc 124) — layer UNDECIDABLE
+#   SENSOR-DARK|why=empty-read|ts=<iso>|last=…   ssh answered, battery organ returned ZERO bytes
+#   SENSOR-DARK|why=no-organ|ts=<iso>|last=…     ssh answered rc 127 — termux-battery-status not there
+#   UNREADABLE|why=parse|ts=<iso>|last=…         bytes arrived, no usable percentage in them
+#
+# ── WHY MORE THAN ONE n/a WORD (the collapse this tool carried until 2026-08-19) ──
+# Both n/a branches used to write the single literal `OFFLINE <ts>`: one fires when there is no IP at
+# all (the link), the other when the phone ACCEPTED ssh and its battery organ said nothing (the phone
+# is up; only the organ is silent). A reader cannot act on a cause that has been collapsed away — a
+# dead link is fixed by the link, a silent organ by a retry or by reviving termux-api. Census of
+# body-power.log at the time of the fix: 1373 of 1603 lines (86%) were that one word, and the LOG line
+# was BYTE-IDENTICAL for both branches too ("phone unreachable — can't read battery"), so the split
+# could not be recovered even by hand. `na_state()` below is the ONE place a cause maps to a word.
+# Same shape mesh-phone-prox was fixed for hours earlier (3280500); this is its named sibling.
+# ([[a-collapsed-reason-makes-blind-and-quiet-identical]], [[an-error-message-names-a-cause-not-the-cause]])
+#
+# TIMEOUT is deliberately its OWN word and not folded into either layer: a read that expires does not
+# tell you whether the link or the organ is at fault, and a probe that shares a failure mode with the
+# thing it measures must not name a culprit it cannot see ([[a-timeout-is-not-a-refusal]],
+# [[a-shared-failure-mode-lets-a-probe-blame-the-far-end]]).
 set -uo pipefail
 export PATH="$HOME/.local/bin:$PATH"
 [ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
@@ -50,72 +77,260 @@ THRESH="${MESH_BODY_POWER_MIN:-20}"
 STATE="$HOME/.mesh/.body-power-state"
 OFFLINEFILE="$HOME/.mesh/.body-power-offline"
 
+
+# ── THE CAUSE MAP + THE SHARED READ/PARSE/CLASSIFY PATH ───────────────────────────────────────────
+# na_state <cause> <ts> [last-reading] → the honest-n/a state line. THE ONE PLACE a cause maps to a
+# verdict word, so a new cause cannot silently inherit another cause's meaning. Pure and
+# offline-testable, which is the whole point: this phone is unreachable on ~86% of ticks, so a gate
+# that needed a live branch to be driven would assert nothing on exactly the runs that matter.
+na_state() {
+  local w
+  case "${1:-}" in
+    no-ip)        w='UNREACHABLE|why=no-ip' ;;
+    ssh)          w='UNREACHABLE|why=ssh' ;;
+    read-timeout) w='TIMEOUT|why=read-timeout' ;;
+    empty-read)   w='SENSOR-DARK|why=empty-read' ;;
+    no-organ)     w='SENSOR-DARK|why=no-organ' ;;
+    parse)        w='UNREADABLE|why=parse' ;;
+    *)            w="UNREADABLE|why=${1:-unknown}" ;;
+  esac
+  printf '%s|ts=%s%s\n' "$w" "${2:-}" "${3:+|last=$3}"
+}
+
+# ok_state <OK|LOW> <level> <status> <ts> → a READING line, in the SAME record shape as the n/a lines.
+ok_state() { printf '%s|level=%s|status=%s|ts=%s\n' "${1:-}" "${2:-}" "${3:-}" "${4:-}"; }
+
+# is_na_verdict <word> → 0 when the word is an n/a marker rather than a reading. Keyed on the marker
+# SET so adding a seventh cause cannot quietly make the edge logic treat it as a value.
+is_na_verdict() {
+  case "${1:-}" in UNREACHABLE|TIMEOUT|SENSOR-DARK|UNREADABLE) return 0 ;; *) return 1 ;; esac
+}
+
+# prev_reading <state-line> → the last CONFIRMED OK/LOW, seen THROUGH an n/a line via its carried
+# `last=`. Without this an n/a line reads as "prev is not LOW": a LOW→offline→LOW flap re-fires the
+# low alarm (cry-wolf) and a LOW→offline→OK recovery is swallowed silently — the n/a marker being
+# consumed as if it were a value. Legacy bare `OK`/`LOW` and the legacy `OFFLINE <ts>` still parse.
+prev_reading() {
+  local f1 l
+  f1="$(printf '%s' "${1:-}" | cut -d'|' -f1 | cut -d' ' -f1)"
+  case "$f1" in OK|LOW) printf '%s' "$f1"; return ;; esac
+  l="$(printf '%s' "${1:-}" | tr '|' '\n' | sed -n 's/^last=//p' | head -1)"
+  case "$l" in OK|LOW) printf '%s' "$l" ;; *) printf 'OK' ;; esac
+}
+
+# read_battery_json <ip> → the raw termux-battery-status stream on stdout; the RETURN CODE ENCODES THE
+# LAYER, which is the whole reason the two branches can be told apart at all:
+#   0 + bytes = a real read · 0 + empty = organ silent · 124 = read expired · 255 = ssh transport
+#   failed · 127 = the phone answered but termux-battery-status is not installed
+read_battery_json() {
+  local out rc
+  out="$(timeout 12 ssh -p "${PHONE_SSH_PORT:-8022}" -o BatchMode=yes -o ConnectTimeout=6 \
+    -o StrictHostKeyChecking=accept-new "${PHONE_USER:-u0_a380}@$1" \
+    'termux-battery-status 2>/dev/null' </dev/null 2>/dev/null)"; rc=$?
+  printf '%s' "$out"
+  return "$rc"
+}
+
+# read_battery_retry <ip> → the stream with ONE bounded retry on a non-answer. MEASURED on this phone
+# 2026-08-19, 6 back-to-back reads while `ssh … echo` answered instantly: 2 returned zero bytes (rc=124,
+# the 12s read expiring) and 4 returned 294 bytes. A single-shot read therefore reports the body dead on
+# roughly a third of ticks — the mesh-mag/mesh-gyro `-n 1` shape (d657375) and mesh-phone-prox's
+# (3280500). Retry only on the failure path: a first-read success costs nothing extra. Bounded at ONE
+# so a genuinely dead body still renders inside the cron stride.
+read_battery_retry() {
+  local out rc
+  out="$(read_battery_json "$1")"; rc=$?
+  if [ -z "$out" ]; then sleep "${MESH_BODY_POWER_RETRY_SLEEP:-3}"; out="$(read_battery_json "$1")"; rc=$?; fi
+  printf '%s' "$out"
+  return "$rc"
+}
+
+# parse_battery <json> → "<level> <status>" or "" (empty = unreadable). NO DEFAULTS: the old parser
+# answered `100 UNKNOWN` on ANY exception, so an unparseable stream was published as a FULL, healthy
+# battery — a silent fallback indistinguishable from success, on the one variable this reflex exists to
+# defend. Absence renders UNREADABLE now, never a fabricated 100%.
+parse_battery() {
+  printf '%s' "${1:-}" | python3 -c 'import json,sys
+try:
+    d = json.load(sys.stdin)
+    print(int(d["percentage"]), str(d.get("status", "UNKNOWN")))
+except Exception:
+    pass
+' 2>/dev/null
+}
+
+# classify_low <level> <status> → 1 when the body is genuinely draining below the threshold. BOTH the
+# read path and --test call THIS. The old --test re-implemented the comparison inline and asserted the
+# COPY — and the copy compared `Discharging` while the live code compared `DISCHARGING`, so the gate
+# could not fail on the thing it claimed to check (source text is never behaviour). Status is
+# upper-cased here, so a Termux build that returns mixed case cannot silently disarm the alarm.
+classify_low() {
+  local l="${1:-}" s
+  s="$(printf '%s' "${2:-}" | tr 'a-z' 'A-Z')"
+  case "$l" in ''|*[!0-9]*) echo 0; return ;; esac
+  if [ "$l" -lt "$THRESH" ] && [ "$s" = DISCHARGING ]; then echo 1; else echo 0; fi
+}
+
 if [ "${1:-}" = --test ]; then
   e=0
   command -v python3 >/dev/null 2>&1 || { echo "FAIL: dep python3"; e=$((e+1)); }
   mkdir -p "$HOME/.mesh" 2>/dev/null || { echo "FAIL: no ~/.mesh"; e=$((e+1)); }
-  # dry-run battery JSON parser with synthetic inputs
-  r="$(printf '{"percentage":85,"status":"Discharging","temperature":28.0}' | python3 -c 'import json,sys
-d=json.load(sys.stdin); print(int(d.get("percentage",100)), d.get("status","UNKNOWN"))' 2>/dev/null)"
-  [ "$r" = "85 Discharging" ] || { echo "FAIL: parse-85-discharging => '$r'"; e=$((e+1)); }
-  r="$(printf '{"percentage":5,"status":"Discharging"}' | python3 -c 'import json,sys
-d=json.load(sys.stdin); print(int(d.get("percentage",100)), d.get("status","UNKNOWN"))' 2>/dev/null)"
-  [ "$r" = "5 Discharging" ] || { echo "FAIL: parse-5-discharging => '$r'"; e=$((e+1)); }
-  r="$(printf '{"percentage":15,"status":"Charging"}' | python3 -c 'import json,sys
-d=json.load(sys.stdin); print(int(d.get("percentage",100)), d.get("status","UNKNOWN"))' 2>/dev/null)"
-  [ "$r" = "15 Charging" ] || { echo "FAIL: parse-15-charging => '$r'"; e=$((e+1)); }
-  r="$(printf '{}' | python3 -c 'import json,sys
-d=json.load(sys.stdin); print(int(d.get("percentage",100)), d.get("status","UNKNOWN"))' 2>/dev/null)"
-  [ "$r" = "100 UNKNOWN" ] || { echo "FAIL: parse-empty => '$r'"; e=$((e+1)); }
-  r="$(printf 'invalid' | python3 -c 'import json,sys
-try:
-    d=json.load(sys.stdin); print(int(d.get("percentage",100)), d.get("status","UNKNOWN"))
-except Exception:
-    print(100, "UNKNOWN")' 2>/dev/null)"
-  [ "$r" = "100 UNKNOWN" ] || { echo "FAIL: parse-invalid-json => '$r'"; e=$((e+1)); }
-  # classification logic: low = level < THRESH && status == DISCHARGING
-  THRESH=20; low=0
-  [ "$(printf '15 Discharging\n' | while read l s; do [ "$l" -lt "$THRESH" ] && [ "$s" = Discharging ] && echo 1 || echo 0; done)" = 1 ] || { echo "FAIL: classify-15-discharging-not-low"; e=$((e+1)); }
-  [ "$(printf '85 Discharging\n' | while read l s; do [ "$l" -lt "$THRESH" ] && [ "$s" = Discharging ] && echo 1 || echo 0; done)" = 0 ] || { echo "FAIL: classify-85-discharging-false-pos"; e=$((e+1)); }
-  [ "$(printf '15 Charging\n' | while read l s; do [ "$l" -lt "$THRESH" ] && [ "$s" = Discharging ] && echo 1 || echo 0; done)" = 0 ] || { echo "FAIL: classify-15-charging-false-pos"; e=$((e+1)); }
-  [ "$(printf '15 UNKNOWN\n' | while read l s; do [ "$l" -lt "$THRESH" ] && [ "$s" = Discharging ] && echo 1 || echo 0; done)" = 0 ] || { echo "FAIL: classify-15-unknown-false-pos"; e=$((e+1)); }
+  # --- PARSER: drives the REAL parse_battery the read path calls, never an inline copy of it ---
+  r="$(parse_battery '{"percentage":85,"status":"DISCHARGING","temperature":28.0}')"
+  [ "$r" = "85 DISCHARGING" ] || { echo "FAIL: parse-85-discharging => '$r'"; e=$((e+1)); }
+  r="$(parse_battery '{"percentage":5,"status":"DISCHARGING"}')"
+  [ "$r" = "5 DISCHARGING" ] || { echo "FAIL: parse-5-discharging => '$r'"; e=$((e+1)); }
+  r="$(parse_battery '{"percentage":15,"status":"CHARGING"}')"
+  [ "$r" = "15 CHARGING" ] || { echo "FAIL: parse-15-charging => '$r'"; e=$((e+1)); }
+  # NO-FABRICATION gate: absence must render EMPTY, never a healthy-looking default. The old parser
+  # answered `100 UNKNOWN` for all three of these — an unreadable stream published as a FULL battery,
+  # written to $STATE as a plain `OK` and indistinguishable from a real one.
+  r="$(parse_battery '{}')"
+  [ -z "$r" ] || { echo "FAIL: missing percentage must parse EMPTY, not a fabricated level => '$r'"; e=$((e+1)); }
+  r="$(parse_battery 'invalid')"
+  [ -z "$r" ] || { echo "FAIL: invalid JSON must parse EMPTY, not a fabricated level => '$r'"; e=$((e+1)); }
+  r="$(parse_battery '')"
+  [ -z "$r" ] || { echo "FAIL: empty stream must parse EMPTY => '$r'"; e=$((e+1)); }
+  # --- CLASSIFIER: the real classify_low, so the gate cannot pass on a copy that never runs ---
+  THRESH=20
+  [ "$(classify_low 15 DISCHARGING)" = 1 ] || { echo "FAIL: classify-15-discharging-not-low"; e=$((e+1)); }
+  [ "$(classify_low 85 DISCHARGING)" = 0 ] || { echo "FAIL: classify-85-discharging-false-pos"; e=$((e+1)); }
+  [ "$(classify_low 15 CHARGING)"    = 0 ] || { echo "FAIL: classify-15-charging-false-pos"; e=$((e+1)); }
+  [ "$(classify_low 15 UNKNOWN)"     = 0 ] || { echo "FAIL: classify-15-unknown-false-pos"; e=$((e+1)); }
+  [ "$(classify_low 15 Discharging)" = 1 ] || { echo "FAIL: mixed-case status must not disarm the low alarm"; e=$((e+1)); }
+  [ "$(classify_low '' UNKNOWN)"     = 0 ] || { echo "FAIL: an empty level must never classify LOW"; e=$((e+1)); }
+  # --- n/a CAUSE-WORD gates: the collapse this tool carried until 2026-08-19 (see header census) ---
+  # Gated OFFLINE, on the pure na_state, for the same reason the live read gate exits 2 rather than
+  # failing: the phone is unreachable on most ticks, and a mapping asserted only when a live branch
+  # can be driven is a mapping that is unasserted exactly when it is being used.
+  _v(){ printf '%s' "$1" | cut -d'|' -f1; }
+  [ "$(_v "$(na_state no-ip T)")"        = UNREACHABLE ] || { echo "FAIL: no phone IP must say UNREACHABLE"; e=$((e+1)); }
+  [ "$(_v "$(na_state ssh T)")"          = UNREACHABLE ] || { echo "FAIL: ssh refused must say UNREACHABLE"; e=$((e+1)); }
+  [ "$(_v "$(na_state read-timeout T)")" = TIMEOUT     ] || { echo "FAIL: a timeout must not name a layer it cannot see"; e=$((e+1)); }
+  [ "$(_v "$(na_state empty-read T)")"   = SENSOR-DARK ] || { echo "FAIL: a silent battery organ must NOT wear the link-down word"; e=$((e+1)); }
+  [ "$(_v "$(na_state no-organ T)")"     = SENSOR-DARK ] || { echo "FAIL: absent termux-api must render a sensor word"; e=$((e+1)); }
+  [ "$(_v "$(na_state parse T)")"        = UNREADABLE  ] || { echo "FAIL: parse-fail must say UNREADABLE"; e=$((e+1)); }
+  for _c in empty-read no-organ parse; do
+    [ "$(_v "$(na_state "$_c" T)")" != UNREACHABLE ] \
+      || { echo "FAIL: cause '$_c' fires with the phone UP — it must not claim the link is down"; e=$((e+1)); }
+  done
+  [ "$(_v "$(na_state ssh T)")" != "$(_v "$(na_state empty-read T)")" ] \
+    || { echo "FAIL: a down link and a silent organ must be distinguishable — that IS the bug"; e=$((e+1)); }
+  # a verdict word with no cause beside it is the same collapse in a new coat
+  for _c in no-ip ssh read-timeout empty-read no-organ parse; do
+    case "$(na_state "$_c" T)" in *"|why=$_c|"*) : ;; *) echo "FAIL: n/a line for '$_c' must carry why=$_c"; e=$((e+1)) ;; esac
+  done
+  # and nothing may resurrect the one collapsed word
+  for _c in no-ip ssh read-timeout empty-read no-organ parse future-cause; do
+    case "$(na_state "$_c" T)" in OFFLINE*) echo "FAIL: cause '$_c' still renders the collapsed OFFLINE word"; e=$((e+1)) ;; esac
+  done
+  # --- RECORD SHAPE: field 1 of EVERY line — n/a AND reading — is one bare verdict word, no payload.
+  # mesh-sensorium renders the value slot as `cut -d'|' -f1 | cut -d' ' -f1`; the old n/a line was
+  # space-delimited (`OFFLINE <ts>`) while nothing else was, which is how the pane came to show
+  # `power=OFFLINE 2026-08-19T08:57:04Z (fresh)` — the timestamp sitting in the VALUE slot (3280500).
+  # `future-cause` is what makes this gate INDEPENDENT of the word assertions above: only the `*)`
+  # fallback and the reading lines are covered by this gate alone.
+  for _l in "$(na_state no-ip 2026-08-19T00:00:00Z)" "$(na_state empty-read 2026-08-19T00:00:00Z LOW)" \
+            "$(na_state future-cause 2026-08-19T00:00:00Z)" \
+            "$(ok_state OK 83 DISCHARGING 2026-08-19T00:00:00Z)" \
+            "$(ok_state LOW 7 DISCHARGING 2026-08-19T00:00:00Z)"; do
+    _f1="$(printf '%s' "$_l" | cut -d'|' -f1)"
+    case "$_f1" in *[[:space:]]*) echo "FAIL: field 1 of '$_l' carries payload ('$_f1') — a reader renders it as the value"; e=$((e+1)) ;; esac
+    [ -n "$_f1" ] || { echo "FAIL: empty verdict field in '$_l'"; e=$((e+1)); }
+    case "$_l" in *'|ts='*) : ;; *) echo "FAIL: '$_l' carries no ts="; e=$((e+1)) ;; esac
+  done
+  # --- is_na_verdict must cover every marker and NO reading ---
+  for _w in UNREACHABLE TIMEOUT SENSOR-DARK UNREADABLE; do
+    is_na_verdict "$_w" || { echo "FAIL: is_na_verdict must accept marker '$_w'"; e=$((e+1)); }
+  done
+  for _w in OK LOW; do
+    if is_na_verdict "$_w"; then echo "FAIL: is_na_verdict must reject reading '$_w'"; e=$((e+1)); fi
+  done
+  # --- EDGE MEMORY: an n/a line is not a reading. Reading $STATE for the label alone made an offline
+  # blip read as "prev is not LOW", so a LOW→n/a→LOW flap re-fired the low alarm (cry-wolf) and a
+  # LOW→n/a→OK recovery was swallowed — and this phone flaps: 1373 n/a episodes in body-power.log.
+  [ "$(prev_reading "$(ok_state LOW 7 DISCHARGING T)")" = LOW ] || { echo "FAIL: prev_reading must read LOW off a reading line"; e=$((e+1)); }
+  [ "$(prev_reading "$(ok_state OK 83 DISCHARGING T)")" = OK ]  || { echo "FAIL: prev_reading must read OK off a reading line"; e=$((e+1)); }
+  [ "$(prev_reading "$(na_state ssh T LOW)")" = LOW ] || { echo "FAIL: an n/a line must CARRY the last reading, not erase it"; e=$((e+1)); }
+  [ "$(prev_reading "$(na_state empty-read T OK)")" = OK ] || { echo "FAIL: an n/a line must carry OK through"; e=$((e+1)); }
+  [ "$(prev_reading 'LOW')" = LOW ] || { echo "FAIL: a legacy bare LOW state must still parse"; e=$((e+1)); }
+  [ "$(prev_reading 'OFFLINE 2026-08-19T08:57:04Z')" = OK ] || { echo "FAIL: the legacy space-delimited line must degrade to OK, not to payload"; e=$((e+1)); }
+  [ "$(prev_reading '')" = OK ] || { echo "FAIL: an empty state must default OK"; e=$((e+1)); }
+  # --- RETRY, gated OFFLINE with a stub `ssh`. The live gate below exits 2 when the phone is away —
+  # which is precisely when a silently-lost retry would go unnoticed — so the retry is asserted here
+  # against the measured shape (2 of 6 back-to-back reads empty while ssh itself answered instantly).
+  # The stub is found because the tool prepends $HOME/.local/bin to PATH and `ssh` does not live there;
+  # PATH is changed inside a command substitution only, so nothing leaks into the live read below.
+  _sd="$(mktemp -d)"
+  printf '%s\n' '#!/usr/bin/env bash' \
+    'n=$(cat "$SSH_STUB_COUNT" 2>/dev/null || echo 0); n=$((n+1)); printf %s "$n" > "$SSH_STUB_COUNT"' \
+    '[ "$n" -le "${SSH_STUB_FAIL:-1}" ] && exit "${SSH_STUB_RC:-124}"' \
+    'printf %s "$SSH_STUB_OUT"' > "$_sd/ssh"
+  chmod +x "$_sd/ssh"
+  export SSH_STUB_COUNT="$_sd/n" SSH_STUB_OUT='{"percentage":42,"status":"CHARGING"}' \
+         SSH_STUB_FAIL=1 SSH_STUB_RC=124 MESH_BODY_POWER_RETRY_SLEEP=0
+  printf 0 > "$SSH_STUB_COUNT"
+  _out="$( PATH="$_sd:$PATH"; read_battery_retry 1.2.3.4 )"
+  [ "$(parse_battery "$_out")" = "42 CHARGING" ] || { echo "FAIL: a first-read miss must be RETRIED, not published as a dead body => '$_out'"; e=$((e+1)); }
+  [ "$(cat "$SSH_STUB_COUNT")" = 2 ] || { echo "FAIL: the retry must issue exactly one extra read (issued $(cat "$SSH_STUB_COUNT"))"; e=$((e+1)); }
+  printf 0 > "$SSH_STUB_COUNT"; SSH_STUB_FAIL=9
+  _out="$( PATH="$_sd:$PATH"; read_battery_retry 1.2.3.4 )"; _rc=$?
+  [ -z "$_out" ] || { echo "FAIL: a genuinely dead organ must render empty, not a value"; e=$((e+1)); }
+  [ "$(cat "$SSH_STUB_COUNT")" = 2 ] || { echo "FAIL: the retry must be BOUNDED at one (issued $(cat "$SSH_STUB_COUNT"))"; e=$((e+1)); }
+  [ "$_rc" = 124 ] || { echo "FAIL: the read's rc must survive the retry — it is the ONLY thing that names the layer (got $_rc)"; e=$((e+1)); }
+  SSH_STUB_FAIL=1; rm -rf "$_sd"
+  unset SSH_STUB_COUNT SSH_STUB_OUT SSH_STUB_FAIL SSH_STUB_RC MESH_BODY_POWER_RETRY_SLEEP
   [ "$e" -eq 0 ] || { echo "smoke: FAIL ($e fail(s))"; exit 1; }
+  NA=68
 
   # REAL-READ GATE (doctrine: --test must assert a live read PRODUCES data, not just that the
   # offline classifier compiles — that hollow gap is the mesh-mag/mesh-gyro dead-but-green class:
   # a synthetic-fixture-only --test stays green forever even if the live SSH/JSON pipeline breaks).
   # Honest contract: real numeric percentage => ok(0); unreachable/empty => n/a(2), never FAIL.
-  tpip="$(mesh-phone-ip 2>/dev/null)" || { echo "smoke: ok (11 fixture assertions); n/a live read (phone unreachable)"; exit 2; }
-  tj="$(timeout 12 ssh -p "${PHONE_SSH_PORT:-8022}" -o BatchMode=yes -o ConnectTimeout=6 \
-    -o StrictHostKeyChecking=accept-new "${PHONE_USER:-u0_a380}@$tpip" \
-    'termux-battery-status 2>/dev/null' </dev/null 2>/dev/null)"
-  [ -n "$tj" ] || { echo "smoke: ok (11 fixture assertions); n/a live read (ssh/termux-battery-status unreachable or empty — mesh-phone-ip can return a stale cached IP even when the phone is actually offline)"; exit 2; }
-  tlevel="$(printf '%s' "$tj" | python3 -c 'import json,sys
-try:
-    d=json.load(sys.stdin); print(int(d["percentage"]))
-except Exception:
-    pass' 2>/dev/null)"
-  [ -n "$tlevel" ] || { echo "smoke: FAIL (live read did not parse a real percentage: $tj)"; exit 1; }
-  echo "smoke: ok (11 fixture assertions + live read: ${tlevel}%)"; exit 0
+  # It drives read_battery_retry — the SAME call the read path makes, so the gate exercises the
+  # retry it is meant to cover rather than a second invocation nothing uses.
+  tpip="$(mesh-phone-ip 2>/dev/null)" || tpip=""
+  [ -n "$tpip" ] || { echo "smoke: ok ($NA fixture/cause-map assertions); n/a live read (no phone IP — link down)"; exit 2; }
+  tj="$(read_battery_retry "$tpip")"; trc=$?
+  [ -n "$tj" ] || { echo "smoke: ok ($NA fixture/cause-map assertions); n/a live read (empty after retry, rc=$trc — link down, organ silent, or read expired; mesh-phone-ip can return a stale cached IP even when the phone is offline)"; exit 2; }
+  tr="$(parse_battery "$tj")"
+  [ -n "$tr" ] || { echo "smoke: FAIL (live read returned bytes but no usable percentage: $tj)"; exit 1; }
+  echo "smoke: ok ($NA fixture/cause-map assertions + live read: ${tr%% *}% ${tr#* })"; exit 0
 fi
 
-pip="$(mesh-phone-ip 2>/dev/null)" || {
-    if [ ! -f "$OFFLINEFILE" ]; then echo "phone unreachable — can't read battery (not an alarm)"; touch "$OFFLINEFILE"; fi
-    printf 'OFFLINE %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$STATE"
-    mesh-state-touch "$STATE"
-    exit 2
+TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+LAST="$(prev_reading "$(cat "$STATE" 2>/dev/null || true)")"
+
+# na_out <cause> <human line> → render the honest n/a and leave: the distinct word + why= in $STATE,
+# the cause named in the LOG. The notice is per-CAUSE, not per-episode — the old gate printed once per
+# offline stretch, so a link outage that turned into a silent battery organ said nothing at all, and
+# the two log lines were byte-identical anyway. $LAST rides along so the alarm edge survives the gap.
+na_out() {
+  local prevcause
+  prevcause="$(cat "$OFFLINEFILE" 2>/dev/null || true)"
+  if [ "$prevcause" != "$1" ]; then echo "body-power: $2"; printf '%s\n' "$1" > "$OFFLINEFILE"; fi
+  na_state "$1" "$TS" "$LAST" > "$STATE"
+  mesh-state-touch "$STATE"
+  exit 2
 }
+
+pip="$(mesh-phone-ip 2>/dev/null)" || pip=""
+[ -n "$pip" ] || na_out no-ip "UNREACHABLE — no phone IP, the LINK is down (says nothing about the battery organ; not an alarm)"
+
+j="$(read_battery_retry "$pip")"; rrc=$?
+if [ -z "$j" ]; then
+  # The layer is read off the RETURN CODE, not guessed. Each of these used to write the same word.
+  case "$rrc" in
+    124) na_out read-timeout "TIMEOUT — the battery read expired twice; link vs organ undecidable from here (not an alarm)" ;;
+    255) na_out ssh         "UNREACHABLE — ssh transport failed, the LINK is down (not an alarm)" ;;
+    127) na_out no-organ    "SENSOR-DARK — the phone ANSWERED but termux-battery-status is not installed (not an alarm)" ;;
+    *)   na_out empty-read  "SENSOR-DARK — the phone IS reachable and its battery organ returned nothing after a retry (not an alarm)" ;;
+  esac
+fi
 rm -f "$OFFLINEFILE"
 
-j="$(timeout 12 ssh -p "${PHONE_SSH_PORT:-8022}" -o BatchMode=yes -o ConnectTimeout=6 "${PHONE_USER:-u0_a380}@$pip" 'termux-battery-status 2>/dev/null' </dev/null 2>/dev/null)"
-[ -n "$j" ] || { if [ ! -f "$OFFLINEFILE" ]; then echo "phone unreachable — can't read battery (not an alarm)"; touch "$OFFLINEFILE"; fi; printf 'OFFLINE %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$STATE"; mesh-state-touch "$STATE"; exit 2; }
-
-read -r level status < <(printf '%s' "$j" | python3 -c 'import json,sys
-try:
-    d=json.load(sys.stdin); print(int(d.get("percentage",100)), d.get("status","UNKNOWN"))
-except Exception:
-    print(100, "UNKNOWN")' 2>/dev/null)
-[ -n "${level:-}" ] || { echo "battery parse failed (not an alarm)"; exit 0; }
+read -r level status < <(parse_battery "$j")
+[ -n "${level:-}" ] || na_out parse "UNREADABLE — bytes arrived but carried no usable percentage (not an alarm)"
 
 if [ "${1:-}" = --status ]; then echo "body battery: ${level}% ${status}"; exit 0; fi
 
@@ -140,20 +355,20 @@ if [ "${1:-}" = --status ]; then echo "body battery: ${level}% ${status}"; exit 
 # projected <Xh) in addition to the fixed %. Held because alarm-tuning is the cry-wolf class —
 # instrument-first (log the rate, confirm it LEADS real lows) before touching the alarm.
 # See [[liveness-is-lease-not-cached-status]] (a graded margin beats a cached binary flag).
-prev="$(cat "$STATE" 2>/dev/null || echo OK)"
-low=0; [ "$level" -lt "$THRESH" ] && [ "$status" = DISCHARGING ] && low=1
+prev="$LAST"   # the last CONFIRMED reading — n/a lines carry it through, they do not erase it
+low="$(classify_low "$level" "$status")"
 alert(){ # MESH_ALERT_DRYRUN=1 → print, don't send (safe testing of the alarm path; learned the hard way)
          if [ -n "${MESH_ALERT_DRYRUN:-}" ]; then echo "[dryrun] would alert: $2" >&2; return; fi
          command -v mesh-tg >/dev/null 2>&1 && mesh-tg "$1" >/dev/null 2>&1
          command -v mesh-chat >/dev/null 2>&1 && MESH_WHO="body-power@$(hostname)" mesh-chat "$2" >/dev/null 2>&1; }
 
 if [ "$low" = 1 ]; then
-  echo LOW > "$STATE"
+  ok_state LOW "$level" "$status" "$TS" > "$STATE"
   [ "$prev" != LOW ] && alert "🔋 Phone (the mesh's body) at ${level}% and discharging — plug it in to keep its senses/voice online." \
                               "[body-power-low] phone ${level}% discharging — body will go offline if not charged."
   echo "body-power: LOW ${level}%"; exit 1
 else
-  echo OK > "$STATE"
+  ok_state OK "$level" "$status" "$TS" > "$STATE"
   [ "$prev" = LOW ] && alert "✅ Phone (mesh body) charging again at ${level}% — body power recovered." \
                             "[body-power-ok] phone ${level}% ${status} — body power recovered."
   echo "body-power: ok ${level}% ${status}"; exit 0
