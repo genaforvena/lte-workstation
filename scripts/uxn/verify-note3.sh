@@ -35,6 +35,28 @@ command -v "$CROSS" >/dev/null || { echo "need $CROSS (apt install gcc-arm-linux
 adb get-state >/dev/null 2>&1 || { echo "no adb device"; exit 2; }
 bind_ran=no; hop_ran=no   # a leg that did not run must not be claimed by the summary
 
+# 0) WHAT THE PHONE WAS ALREADY CARRYING, measured before anything is pushed. This is the
+#    only moment in this script when the on-device binary is not one we just installed, and
+#    it is the only moment the fleet's version skew is observable at all: a node with no
+#    compiler carries whatever was last pushed to it, through however many NET_IDENT bumps
+#    happened since, and a ROM needing a later step reads that stale build as an ordinary
+#    refusal — fail-closed, silent, and byte-identical to the far node saying no. Reported,
+#    never asserted: this script REPAIRS the skew three lines below, and a check that fixes
+#    what it measures can never be seen fail. The assertion is post-push, at step 2b.
+D=/data/local/tmp
+prev_ident=""
+if adb push net-ident.rom "$D/net-ident.rom" >/dev/null 2>&1; then
+  prev_ident="$(adb shell "su -c 'cd $D && ./uxncli net-ident.rom </dev/null'" 2>/dev/null | tr -dc '0-9a-fA-F' | tr 'A-F' 'a-f')"
+fi
+src_ident="$(grep -oE '#define[[:space:]]+NET_IDENT[[:space:]]+0x[0-9a-fA-F]{4}' src/devices/net.h \
+             | grep -oiE '0x[0-9a-f]{4}' | head -1 | sed 's/^0[xX]//' | tr 'A-F' 'a-f')"
+case "$prev_ident" in
+  "")            echo "note3  pre-push: no emulator on the phone yet (or it would not run) — first install" ;;
+  "$src_ident")  echo "note3  pre-push: the phone already carried $prev_ident, current with this source" ;;
+  0000)          echo "note3  pre-push: the phone carried a NET-BLIND build (identify 0000) — no 0xd0 device at all" ;;
+  *)             echo "note3  pre-push: SKEW — the phone carried $prev_ident, this source declares $src_ident (a ROM needing the later step read that as a refusal)" ;;
+esac
+
 # 1) static armhf emulator (bionic has no glibc loader; static = pure-syscall, runs under the
 #    Android kernel). The compile line itself lives in cross-build.sh — ONE copy, shared with
 #    build.sh's host build via emu-sources, because this file having its own copy is how a
@@ -42,11 +64,14 @@ bind_ran=no; hop_ran=no   # a leg that did not run must not be claimed by the su
 ./cross-build.sh armhf /tmp/uxncli.armhf || { echo "verify-note3: cross-build failed"; exit 2; }
 
 # 2) push the emulator + the UNMODIFIED rom
-D=/data/local/tmp
 adb push /tmp/uxncli.armhf "$D/uxncli" >/dev/null
 adb push lease-gate.rom    "$D/lease-gate.rom" >/dev/null
 adb push net-echo.rom      "$D/net-echo.rom" >/dev/null
 adb push net-listen.rom    "$D/net-listen.rom" >/dev/null
+adb push net-dgram.rom     "$D/net-dgram.rom" >/dev/null
+adb push gossip.rom        "$D/gossip.rom" >/dev/null   # the phone is the node the gossip
+                           # lane exists for: with only uxncli it is a full participant, not
+                           # something a node with a shell has to poll on its behalf
 adb push hop-serve.rom     "$D/hop-serve.rom" >/dev/null
 adb push rot13-net.rom     "$D/rot13-net.rom" >/dev/null
 adb push arith64-test.rom  "$D/arith64-test.rom" >/dev/null
@@ -55,6 +80,21 @@ adb pull "$D/lease-gate.rom" /tmp/rom.fromnote3 >/dev/null 2>&1
 if cmp -s lease-gate.rom /tmp/rom.fromnote3; then
   echo "rom byte-identical host<->note3: yes ($(wc -c <lease-gate.rom)b, sha1 $(sha1sum lease-gate.rom | awk '{print $1}'))"
 else echo "rom DIFFERS host<->note3"; exit 1; fi
+
+# 2b) THE PUSH LANDED AND IS WHAT RUNS. Asserted, not assumed: `adb push` reporting success
+#     says a file was written, not that the binary the phone EXECUTES is that file — a stale
+#     copy earlier on the path, a partial write, or a binary that will not start all leave
+#     the push looking fine. The identify word comes from the device pokeing NET_IDENT into
+#     the length register, so it is a claim about the running code and nothing else.
+adb push net-ident.rom "$D/net-ident.rom" >/dev/null
+now_ident="$(adb shell "su -c 'cd $D && ./uxncli net-ident.rom </dev/null'" 2>/dev/null | tr -dc '0-9a-fA-F' | tr 'A-F' 'a-f')"
+if [ -z "$src_ident" ]; then
+  echo "note3  NET_IDENT not parseable from src/devices/net.h — the version assertion did NOT run"; exit 1
+elif [ "$now_ident" = "$src_ident" ]; then
+  echo "note3  post-push: the phone now identifies $now_ident == source $src_ident"
+else
+  echo "note3  post-push: FAILED — the phone identifies '${now_ident:-<empty>}', source declares $src_ident; the push did not become the running binary"; exit 1
+fi
 
 # 3) run the SAME rom on-device, same truth table as the host (uxncli logs 'Loaded' to stderr;
 #    adb merges streams, so extract just the trailing verdict token)

@@ -96,6 +96,7 @@ resolution exactly where the numbers look most impressive.
 | `net-echo` | 297 B | dial a `tcp:host:port`, write, read, print the reply — the smallest real round trip |
 | `net-listen` | 328 B | bind, wait for a caller, answer with `uxn:`+payload — the far node needs no shell |
 | `net-dgram` | 335 B | bind a DATAGRAM on a named address, read one packet, answer `uxn:`+payload to its sender |
+| `gossip` | 926 B | merge trace rows arriving as datagrams into a ledger — idempotent under replay, refuses when it cannot decide |
 | `net-ident` | 72 B | probe which step of the device this emulator actually has (a net-blind build must not read as a refusal) |
 | `sysfs-serve` | 338 B | serve a phone's sysfs over TCP — a sense transport for a body whose ssh is gone |
 

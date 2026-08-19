@@ -577,6 +577,68 @@ resolved-sockaddr check removed, the datagram deadline removed (a silent wire th
 returns), an empty datagram read as a close, and an oversized datagram delivered instead of
 discarded.
 
+## The GOSSIP lane — a ledger that merges ROM-to-ROM (2026-08-19)
+
+`gossip.tal` is what step 3 was for. It binds a named datagram address, and for each packet —
+one row, `<id> <rest>` — it decides `new` / `dup` / `bad` / `ful` / `err`, appends only on
+`new`, and answers the sender with `uxn:` + that verdict. The same verdict goes to stdout, so
+the decision is readable from **both ends of the wire** and a gate need not trust either one
+alone. No central registry, no shell on either end: `ssh` starts the far ROM in the live gate
+and the ROW itself never passes through one. A node holding only `uxncli` is a participant
+rather than something a node with a shell has to poll on its behalf — which is the whole
+argument for the phone being a peer.
+
+**Idempotence is the contract, not a nicety.** A datagram carries no handshake and no
+identity; anyone who can see one can send it again, and the hop lane's token is replayable by
+construction. A receiver that appends what it is handed is a write amplifier pointed at its
+own ledger by whoever felt like replaying — and downstream the duplicates read as
+*corroboration*, because one row arriving twice looks exactly like two nodes agreeing. So
+every row is checked against **the ledger itself**, not against a recently-seen ring: a
+bounded memory of ids means a replay arriving after eviction is merged again, and "idempotent
+for a while" is not a property anything can rely on.
+
+Three refusals fall out of that, and each is a branch that has been driven:
+
+- **`ful` — it refuses when it cannot decide.** The scan window is 16 KB; a larger ledger
+  cannot be searched in one read, so the row is left alone. Reading "cannot search" as "not
+  seen" would switch idempotence off silently at exactly the size where duplicates start to
+  matter. The artifact is the file's size, unchanged.
+- **`err` — an append that did not land is never reported as merged.** The file device
+  sandboxes to the CWD and answers a path outside it with a warning and a count of zero, so
+  an unchecked write answers `new` forever while nothing is ever written: a merge that
+  reports success and leaves no artifact.
+- **`bad` — a row whose id cannot be read is refused**, not merged under some substitute
+  identity the sender never chose. The id is the sender's, first field, 1–16 bytes; this ROM
+  does not hash the row, because a checksum computed here makes two spellings of one event
+  two events and it cannot see what the sender meant.
+
+The dedupe is **line-anchored**: an id that appears in the middle of somebody's free text is
+a different fact from a row with that id, and a substring match would silently drop every row
+whose id was ever mentioned — a loss shaped exactly like the row never being sent. The append
+enforces a trailing newline for the same reason: a row without one swallows the next row into
+its line, whose id then starts no line at all and goes permanently invisible to the dedupe.
+
+**None of this is authentication and the ROM says so.** On this lane the authentication is
+the tailnet ACL plus the named bind address — which is precisely why the device refuses to
+bind anything else.
+
+Gate: `test-uxn-gossip`. The local legs assert the **ledger** (five packets with three
+replays → two rows), the verdicts at both ends, the `ful`/`err`/anchoring branches each
+driven live, and four source mutants RED: dedupe removed, over-window read as "not seen",
+append result unchecked, line anchor dropped. The live leg crosses a real node boundary
+ROM-to-ROM — phaedra's own `uxncli` runs `net-echo.rom` to send the row, ours runs
+`gossip.rom` to receive it on this node's tailscale address, the row lands **once**, and the
+replay comes back `dup` (measured 2026-08-19, `7f3a9c01 phaedra trace hop-lane-token-seen`).
+Peer or emulator absent → exit 2, honest n/a.
+
+**Fleet version.** The step bump left three nodes to move together, and they did: mesh-home
+(`build.sh`), phaedra (a static x86-64 `uxncli-d003` in `/root/.mesh-body/uxn-step3`, pushed
+beside the old d002 body-lane binary rather than over it), and the Note3 (`verify-note3.sh`,
+armhf). That script now reports what the phone was carrying **before** the push — it read
+`d002` against a `d003` source on 2026-08-19, the stale-binary shape made visible for the
+first time — and **asserts** the version after it, because `adb push` succeeding says a file
+was written, not that the binary the phone executes is that file.
+
 ## The hop's NET LANE — a ROM that receives a ROM (2026-07-24)
 
 The hop's pipe lane ships code over ssh: `mesh-uxn-hop --pack filter.rom < text | ssh node
