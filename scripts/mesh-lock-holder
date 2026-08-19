@@ -1,0 +1,298 @@
+#!/usr/bin/env bash
+# mesh-lock-holder — name the LIVE holder of an flock, and the live waiters blocked on it.
+#
+# /proc/locks is the only vantage where the kernel says a lock exists and who owns it. 75 tools in
+# scripts/ take flocks (`flock -n` single-instance guards, `flock -w N` blocking waits) and until
+# now nothing could name a blocker. Three measured facts shape this tool; each is a way the obvious
+# reader is WRONG, so each is asserted in --test:
+#
+#   1. THE PID COLUMN IS "WHO TOOK IT", NEVER "WHO HOLDS IT".  The mesh idiom takes the lock on
+#      fd 9 in a SUBSHELL; the subshell exits, the flock survives on the fd INHERITED BY THE
+#      SURVIVING CHILDREN, and the row keeps naming a pid that has not existed for hours. Measured
+#      2026-08-19 on this node: .dram-bw-sampler.lock named DEAD 4152 while 4139 mesh-dram-bw +
+#      988393 sudo perf + 988394 awk held it; .udev-stream.lock named DEAD 5532 with 5 live holders;
+#      .fsnotify-*.lock named DEAD 2793521 with 2. The pid is baked into the lock record at
+#      ACQUISITION and never re-pointed — visible directly in the holder's own
+#      /proc/<live>/fdinfo/9, which still prints the dead taker's pid. So a reader that resolves
+#      that pid renders "no holder"/"unknown" on a lock a live daemon is holding (an ABSENCE where
+#      a holder exists), and `kill` from it is a no-op today and kills an unrelated process after
+#      pid reuse. We therefore NEVER resolve the pid column; we join by DEVICE:INODE.
+#
+#   2. THE `->` PREFIX SHIFTS EVERY FIELD.  A blocked waiter is `16: -> FLOCK ADVISORY WRITE ...`
+#      (and a second waiter is indented further), so `awk '{print $5}'` yields the pid on a granted
+#      row and the literal string WRITE on a blocked one — it misparses EXACTLY the rows that carry
+#      the contention signal, silently. Parse by detecting $2=="->" and shifting the offset.
+#      Sibling of a-leading-empty-field-shifts-under-tab-read.
+#
+#   3. CONTENTION IS TRANSIENT AND CRON-INVISIBLE.  A 20 s / 20 Hz sweep caught 21 blocked rows,
+#      all gone from a hand-read seconds later; a 600 s reflex reading /proc/locks once sees a ~1 s
+#      blocking event with p~0.2%. So the contention lane is a BURST SAMPLER (--sample), never a
+#      cron point-read, and every reading prints its own window so the narrow claim can never be
+#      read as the wide one (a-senses-coverage-is-window-over-cadence).
+#
+# ATTRIBUTION IS UNPRIVILEGED FOR THE MESH'S OWN LOCKS (measured, and it CORRECTS the brief that
+# asked for a root fd scan): /proc/<pid>/fdinfo/<fd> carries a `lock:` line holding the verbatim
+# /proc/locks row, and it is readable for our own processes — 2372 of 2386 fdinfo entries on this
+# node without sudo. Root adds only OTHER UIDs' processes (systemd, root daemons). So we scan
+# unprivileged, and PUBLISH THE COVERAGE (attributed/total, plus how many rows were EACCES) rather
+# than rendering an unattributed row as "no holder" — an unreadable row is blindness, not absence.
+# fdinfo also beats matching st_ino over /proc/*/fd: a `stat -L` on an fd whose file was DELETED
+# fails, so an inode scan silently drops exactly the orphan locks worth seeing.
+#
+# Exit: 0 read ok · 2 honest n/a (/proc/locks unreadable — no locks is a VALID 0, not an n/a).
+# orphan-ok: on-demand instrument — the contention lane is a burst sampler, and a cron point-read
+# of it would be the p~0.2% blindness this tool exists to name. Called by hand or by a bouncing tool.
+set -u
+
+LOCKS="${MESH_LOCKS_FILE:-/proc/locks}"
+PROC="${MESH_LOCKS_PROC:-/proc}"
+HZ="${MESH_LOCKS_HZ:-20}"
+MODE=scan; SECS=20; ONLY=""
+
+usage() {
+  cat <<EOF
+mesh-lock-holder — name the live holder of an flock (never the pid /proc/locks prints)
+  --scan            (default) every FLOCK row: path, dead taker, LIVE holders, live waiters
+  --file <path>     just this lock file (resolves its inode itself)
+  --sample [secs]   burst-sample for blocked waiters at ${HZ} Hz; publishes its window
+  --test            self-test
+EOF
+}
+for a in "$@"; do :; done
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --scan) MODE=scan;;
+    --file) MODE=file; ONLY="${2:-}"; shift;;
+    --sample) MODE=sample; case "${2:-}" in ''|-*) :;; *) SECS="$2"; shift;; esac;;
+    --test) MODE=test;;
+    -h|--help) usage; exit 0;;
+    *) echo "unknown arg: $1" >&2; usage >&2; exit 64;;
+  esac
+  shift
+done
+
+now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+# --- fact 2: the shift-aware parse. state \t type \t mode \t taker-pid \t dev:inode -------------
+parse_locks() {
+  awk '
+    NF >= 6 {
+      if ($2 == "->") { st = "blocked"; o = 2 } else { st = "granted"; o = 1 }
+      if ($(o+5) == "") next
+      printf "%s\t%s\t%s\t%s\t%s\n", st, $(o+1), $(o+3), $(o+4), $(o+5)
+    }' "$1"
+}
+
+alive() { [ -d "$PROC/$1" ]; }
+cmd_of() { tr '\0' ' ' < "$PROC/$1/cmdline" 2>/dev/null | sed 's/ *$//' | cut -c1-70; }
+# an interpreter's argv[0] is the interpreter; the mesh tool is argv[1] — naming "bash" for every
+# holder would collapse five distinct daemons into one word.
+short_of() {
+  local c a b; c=$(cmd_of "$1"); a=${c%% *}; a=${a##*/}
+  case "$a" in bash|sh|dash|python3|python|perl|gawk|awk)
+    b=${c#* }; b=${b%% *}
+    # awk/python -c take PROGRAM TEXT as argv[1]; borrowing it would print `gawk:BEGIN{`
+    case "$b" in ''|-*|"$c") :;; */*|*.py|mesh-*) a="$a:${b##*/}";; esac;;
+  esac
+  [ -n "$a" ] || a="?"; echo "$a"
+}
+
+# --- attribution: join by dev:inode over fdinfo `lock:` lines (fact 1 + coverage) --------------
+# ONE index build for the whole run (~45 ms on 2.4k fds), never a per-row rescan — and the
+# Permission-denied count is captured, not swallowed, so an unreadable row renders as BLINDNESS
+# in the coverage figure instead of as "no holder".
+ATTR_DENIED=0
+ATTR_INDEX=""
+build_index() {
+  ATTR_INDEX=$(grep -H '^lock:' "$PROC"/[0-9]*/fdinfo/* 2>/dev/null)
+  # /proc/<pid>/fdinfo is mode 0500 owned by that process's uid, so for another uid the GLOB
+  # ITSELF yields nothing and grep is never even called — a stderr scrape for "Permission denied"
+  # counts ZERO and reports full coverage while being blind to every root daemon. Count the
+  # unreadable DIRECTORIES instead. (A silent fallback that renders as a plausible constant.)
+  local d n=0
+  for d in "$PROC"/[0-9]*/fdinfo; do [ -r "$d" ] || n=$((n+1)); done
+  ATTR_DENIED=$n
+}
+# "pid:fd" per live holder of dev:inode $1
+holders_of() {
+  printf '%s\n' "$ATTR_INDEX" | awk -v k=" $1 " '
+    index($0, k) > 0 {
+      i = index($0, ":lock:"); if (i == 0) next
+      n = split(substr($0, 1, i - 1), a, "/")     # <proc>/<pid>/fdinfo/<fd>
+      print a[n-2] ":" a[n]
+    }' | sort -u | tr "\n" " " | sed "s/ $//"
+}
+
+path_of_fd() { readlink "$PROC/$1/fd/$2" 2>/dev/null; }
+
+render_row() {
+  local st="$1" key="$2" taker="$3" hs path="" names="" h pid fd
+  hs=$(holders_of "$key")
+  for h in $hs; do
+    pid=${h%%:*}; fd=${h##*:}
+    [ -n "$path" ] || path=$(path_of_fd "$pid" "$fd")
+    names="$names,$pid:$(short_of "$pid")"
+  done
+  names=${names#,}
+  local takerstate=alive
+  case "$taker" in
+    -1)          takerstate=ofd ;;              # an OFD lock is owned by the fd, not by any pid
+    ''|*[!0-9]*) takerstate=not-sampled ;;      # sample mode never read the granted row's taker
+    *) alive "$taker" || takerstate=DEAD ;;
+  esac
+  local n; n=$(echo $hs | wc -w)
+  # a granted FLOCK implies an open fd somewhere: n=0 is OUR blindness (another uid's fdinfo),
+  # never "nobody holds it". Say which.
+  [ "$n" != 0 ] || names="BLIND-other-uid-fdinfo"
+  printf '%s inode=%s path=%s taker=%s(%s) holders=%s n_holders=%s\n' \
+    "$st" "$key" "${path:-unresolved}" "$taker" "$takerstate" "$names" "$n"
+}
+
+do_scan() {
+  [ -r "$LOCKS" ] || { echo "lock-holder na reason=locks-unreadable file=$LOCKS window=inst"; return 2; }
+  local rows=0 blocked=0 deadtaker=0 attributed=0 filt="$1"
+  build_index
+  echo "lock-holder $(now) host=$(hostname) window=inst source=$LOCKS"
+  while IFS=$'\t' read -r st type mode taker key; do
+    [ "$type" = "FLOCK" ] || continue
+    [ -z "$filt" ] || [ "$key" = "$filt" ] || continue
+    rows=$((rows+1))
+    [ "$st" = blocked ] && blocked=$((blocked+1))
+    if [ "$taker" != "-1" ] && ! alive "$taker"; then deadtaker=$((deadtaker+1)); fi
+    local line; line=$(render_row "$st" "$key" "$taker")
+    case "$line" in *n_holders=0*) :;; *) attributed=$((attributed+1));; esac
+    echo "$line"
+  done < <(parse_locks "$LOCKS")
+  printf 'summary flock_rows=%s blocked=%s taker_dead=%s/%s attributed=%s/%s fdinfo_blind_pids=%s window=inst\n' \
+    "$rows" "$blocked" "$deadtaker" "$rows" "$attributed" "$rows" "$ATTR_DENIED"
+  [ "$attributed" = "$rows" ] || echo "note $((rows-attributed)) row(s) unattributed = fdinfo of another uid ($ATTR_DENIED pids unreadable); re-run under sudo to cover them. A granted FLOCK always HAS a holder, so this is blindness, not absence."
+  [ "$rows" -gt 0 ] || echo "note no FLOCK rows matched — that is a real 0, not blindness"
+  return 0
+}
+
+do_file() {
+  local f="$1" ino dev key
+  [ -e "$f" ] || { echo "lock-holder na reason=no-such-file path=$f window=inst"; return 2; }
+  ino=$(stat -c %i "$f") || { echo "lock-holder na reason=stat-failed path=$f window=inst"; return 2; }
+  dev=$(stat -c %d "$f")
+  key=$(printf '%02x:%02x:%s' $(( (dev>>8) & 0xfff )) $(( dev & 0xff )) "$ino")
+  do_scan "$key"
+}
+
+# --- fact 3: the burst sampler. Blocked rows live ~1 s; a point-read cannot see them. ----------
+do_sample() {
+  [ -r "$LOCKS" ] || { echo "lock-holder na reason=locks-unreadable window=${SECS}s"; return 2; }
+  local end n=0 hits=0 tmp; tmp=$(mktemp) || return 2
+  trap 'rm -f "$tmp"' RETURN
+  end=$(( $(date +%s) + SECS ))
+  local sleep_for; sleep_for=$(awk -v h="$HZ" 'BEGIN{printf "%.3f", 1/h}')
+  while [ "$(date +%s)" -lt "$end" ]; do
+    n=$((n+1))
+    parse_locks "$LOCKS" | awk -F'\t' '$1=="blocked" && $2=="FLOCK" {print $5"\t"$4}' >> "$tmp"
+    sleep "$sleep_for"
+  done
+  hits=$(wc -l < "$tmp")
+  build_index
+  echo "lock-holder $(now) host=$(hostname) window=${SECS}s@${HZ}Hz samples=$n blocked_rows=$hits"
+  if [ "$hits" -gt 0 ]; then
+    # waiters first (who was blocked, and for how much of the window), then ONE holder row per
+    # contended inode. `gone-by-now` is the measured norm, not an error: 11 of 20 holder pids were
+    # already dead by the end of the 20 s sweep this tool was built from — attribution is a race
+    # you usually lose, so the sample records WHEN it saw the row, and the holder line is a
+    # best-effort read at report time.
+    sort "$tmp" | uniq -c | sort -rn | while read -r c key waiter; do
+      ws=alive; alive "$waiter" || ws=gone-by-now
+      printf 'waiter inode=%s seen=%s/%s waiter=%s(%s) cmd=%s\n' \
+        "$key" "$c" "$n" "$waiter" "$ws" "$(short_of "$waiter")"
+    done
+    cut -f1 "$tmp" | sort -u | while read -r key; do render_row contended "$key" na; done
+  else
+    echo "note zero blocked rows in this window — coverage is ${SECS}s of wallclock, NOT a claim about the interval"
+  fi
+  return 0
+}
+
+# ------------------------------------------------------------------------------------------------
+do_test() {
+  local p=0 f=0
+  ok()  { p=$((p+1)); echo "  ok   $1"; }
+  bad() { f=$((f+1)); echo "  FAIL $1"; }
+  echo "mesh-lock-holder --test"
+  build_index
+
+  # 1. fact 2: the -> shift, on a SYNTHETIC blocked row (the granted row must not be disturbed)
+  local fx; fx=$(mktemp)
+  printf '1: FLOCK  ADVISORY  WRITE 111 fc:00:999 0 EOF\n16: -> FLOCK  ADVISORY  WRITE 222 fc:00:998 0 EOF\n16:  -> POSIX  ADVISORY  READ 333 fc:00:998 0 EOF\n' > "$fx"
+  local got; got=$(parse_locks "$fx")
+  echo "$got" | grep -qP '^granted\tFLOCK\tWRITE\t111\tfc:00:999$' && ok "granted row parses (pid 111)" || bad "granted row"
+  echo "$got" | grep -qP '^blocked\tFLOCK\tWRITE\t222\tfc:00:998$' && ok "'->' row shifts: pid 222, not the string WRITE" || bad "'->' shift"
+  echo "$got" | grep -qP '^blocked\tPOSIX\tREAD\t333\tfc:00:998$' && ok "indented second waiter parses too" || bad "indented waiter"
+  # the naive parser must FAIL on the same fixture — a gate that cannot go red is not a gate
+  [ "$(awk '{print $5}' "$fx" | sed -n 2p)" = "WRITE" ] && ok "naive \$5 really does print WRITE on the blocked row" || bad "naive-parse control"
+  rm -f "$fx"
+
+  # 2. fact 1, LIVE: a real held lock, taken in a subshell, whose taker dies while a child holds it
+  local lk; lk="$(mktemp -d)/probe.lock"; : > "$lk"
+  ( exec 9>"$lk"; flock 9; sleep 6 & echo $! > "$lk.child"; ) &
+  sleep 1
+  local ino dev key; ino=$(stat -c %i "$lk"); dev=$(stat -c %d "$lk")
+  key=$(printf '%02x:%02x:%s' $(( (dev>>8) & 0xfff )) $(( dev & 0xff )) "$ino")
+  local row; row=$(parse_locks "$LOCKS" | awk -F'\t' -v k="$key" '$5==k{print; exit}')
+  if [ -n "$row" ]; then
+    ok "the probe lock appears in $LOCKS"
+    local taker; taker=$(echo "$row" | cut -f4)
+    build_index                      # the index must post-date the probe lock, not precede it
+    local hs; hs=$(holders_of "$key")
+    [ -n "$hs" ] && ok "fdinfo join names a live holder ($hs) unprivileged" || bad "fdinfo join found no holder for a held lock"
+    # END-TO-END on the probe: the RENDERED row must name the live child, never the dead taker.
+    # This is the gate that goes red if attribution ever falls back to the pid column.
+    local prow; prow=$(render_row granted "$key" "$taker")
+    case "$prow" in
+      *n_holders=0*) bad "rendered row attributes NO holder to a lock that is held (pid-column fallback?)";;
+      *) case "$prow" in
+           *"holders=$taker:"*) bad "rendered row names the taker $taker as a holder";;
+           *) ok "rendered row names the live child, not the taker: ${prow#*holders=}";;
+         esac;;
+    esac
+    if ! alive "$taker"; then
+      ok "taker pid $taker is ALREADY DEAD while the lock is held — fact 1 reproduced live"
+    else
+      echo "  note taker $taker still alive in this run; the dead-taker case is asserted on the live node below"
+    fi
+  else
+    bad "probe lock absent from $LOCKS"
+  fi
+  wait 2>/dev/null
+  rm -rf "$(dirname "$lk")"
+
+  # 3. the join must NEVER be the pid column
+  grep -q 'holders_of "\$key"' "$0" && ok "render_row joins by dev:inode" || bad "join key"
+  grep -qE 'alive "\$taker"|alive "\$1"' "$0" && ok "taker liveness is reported, not used to attribute" || bad "taker use"
+
+  # 4. honest n/a, not 0-with-empty, when the source cannot be read
+  ( MESH_LOCKS_FILE=/nonexistent-locks; LOCKS=/nonexistent-locks; do_scan "" >/dev/null 2>&1 ); local rc=$?
+  [ "$rc" = 2 ] && ok "unreadable /proc/locks exits 2 (honest n/a), not 0-with-empty" || bad "n/a leg returned $rc"
+
+  # 5. END-TO-END: drive the whole scan path off a blocked-only fixture. A self-grep would assert
+  #    source text, not behaviour; this asserts the rendered row.
+  local fx2; fx2=$(mktemp)
+  printf '16: -> FLOCK  ADVISORY  WRITE 222 fc:00:998 0 EOF\n' > "$fx2"
+  local out2; out2=$( LOCKS="$fx2" do_scan "" 2>/dev/null )
+  echo "$out2" | grep -q 'blocked inode=fc:00:998 .*taker=222' && ok "blocked row survives the FULL scan path as pid 222" || bad "scan path mangles the blocked row"
+  echo "$out2" | grep -q 'taker=WRITE' && bad "the scan path rendered the string WRITE as a pid" || ok "the scan path never renders WRITE as a pid"
+  rm -f "$fx2"
+
+  # 6. coverage is published, never silently dropped
+  do_scan "" 2>/dev/null | grep -q 'attributed=' && ok "scan publishes attributed/total coverage" || bad "coverage not published"
+  do_scan "" 2>/dev/null | grep -q 'window=inst' && ok "every reading names its window" || bad "window not published"
+
+  echo "  ---- passed=$p failed=$f"
+  [ "$f" = 0 ]
+}
+
+case "$MODE" in
+  scan)   do_scan ""; exit $?;;
+  file)   do_file "$ONLY"; exit $?;;
+  sample) do_sample; exit $?;;
+  test)   do_test; exit $?;;
+esac
