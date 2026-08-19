@@ -24,11 +24,30 @@
 # no schema change. Threshold is intentionally the established px==0, not a guessed cm mapping — the tmd2755
 # driver returns distance in MILLIMETRES, so never convert it to metres or imply centimetres.
 #
-# Honest-degraded contract (empty ≠ failed; never fake a reading):
-#   phone unreachable (SSH down)      → exit 2, state "UNREACHABLE <ts>"
-#   termux-sensor returns no JSON     → exit 2 (the -n 1 driver-race empty-read class; see read path)
-#   parse fails                       → exit 2
-#   A NEAR/FAR verdict is only emitted from a real tmd2755_p value. UNREACHABLE is visibly distinct.
+# Honest-degraded contract (empty ≠ failed; never fake a reading). Every n/a line is
+# `VERDICT|why=<cause>|ts=<iso>` — SAME record shape as a value line (`FAR|raw=5`), so field 1 is
+# always the verdict and a consumer that cuts at the first '|' can never read payload as a value:
+#   phone unreachable (SSH down)      → exit 2, state "UNREACHABLE|why=ssh|ts=<iso>"
+#   termux-sensor yields no JSON      → exit 2, state "SENSOR-DARK|why=empty-read|ts=<iso>"
+#   parse fails / non-numeric value   → exit 2, state "UNREADABLE|why=parse|ts=<iso>" (or why=nonnumeric)
+#   A NEAR/FAR verdict is only emitted from a real tmd2755_p value.
+#
+# ── WHY THREE n/a WORDS AND NOT ONE (2026-08-19) ──
+# All four branches above used to write the single literal `UNREACHABLE <ts>`. UNREACHABLE is a
+# mesh-wide convention meaning THE ORGAN COULD NOT BE REACHED — a claim about the LINK — and three of
+# the four branches fire with the phone demonstrably up. Census of phone-prox.log at the time of the
+# fix (47 runs): 13 genuinely unreachable, 23 empty-read, 3 parse-fail, 8 real reads — so 26 of 39
+# n/a writes (67%) named the wrong layer, and `mesh-sensorium`'s BODY line rendered
+# `prox=UNREACHABLE` beside a live `mesh-tamper` read of the SAME phone in the SAME tick. A reader
+# cannot act on a cause that has been collapsed away: an unreachable phone is fixed by the link, a
+# dark driver by a retry, an unreadable stream by the parser. `na_state()` below is the ONE place a
+# cause maps to a word, so a new cause cannot silently inherit another cause's meaning.
+# ([[a-collapsed-reason-makes-blind-and-quiet-identical]], [[an-error-message-names-a-cause-not-the-cause]])
+#
+# The old n/a line was ALSO space-delimited (`UNREACHABLE <ts>`) while the value line is
+# pipe-delimited, and `mesh-sensorium:850` cuts only at '|' — so the dash rendered
+# `prox=UNREACHABLE 2026-08-19T08:19:01Z (aging)`, the timestamp leaking into the VALUE slot. One
+# record shape for both cases is what closes that; the reader was hardened too, not just the writer.
 #
 #   mesh-phone-prox            one-line verdict + distance in millimetres
 #   mesh-phone-prox --edge     emit only on verdict change (2-consecutive debounce, for cron)
@@ -60,6 +79,45 @@ classify_prox() {
   [ "$r" -eq 0 ] 2>/dev/null && echo "NEAR" || echo "FAR"
 }
 
+# na_state <cause> <ts> → the honest-n/a state line. THE ONE PLACE a cause maps to a verdict word.
+# Pure, offline-testable — the --test distinctness gate below runs on this, not on the live branches,
+# so the mapping is asserted even when the phone is offline and no branch can be driven.
+na_state() {
+  case "${1:-}" in
+    ssh)        printf 'UNREACHABLE|why=ssh|ts=%s\n'         "${2:-}" ;;
+    empty-read) printf 'SENSOR-DARK|why=empty-read|ts=%s\n'  "${2:-}" ;;
+    parse)      printf 'UNREADABLE|why=parse|ts=%s\n'        "${2:-}" ;;
+    nonnumeric) printf 'UNREADABLE|why=nonnumeric|ts=%s\n'   "${2:-}" ;;
+    *)          printf 'UNREADABLE|why=%s|ts=%s\n'           "${1:-unknown}" "${2:-}" ;;
+  esac
+}
+
+# is_na_verdict <word> → 0 when the word is an n/a marker rather than a reading. --edge uses this to
+# decide "no confirmed value yet"; keyed on the marker SET, so adding a fourth cause word does not
+# silently make the debounce hold a phantom NEAR/FAR for two extra cycles before publishing.
+is_na_verdict() {
+  case "${1:-}" in UNREACHABLE|SENSOR-DARK|UNREADABLE) return 0 ;; *) return 1 ;; esac
+}
+
+# read_prox_json <ip> → one termux-sensor stream (may be empty). Shared by the read path and --test so
+# both exercise the same call; a --test that drove a different invocation would gate nothing.
+read_prox_json() {
+  timeout 14 ssh -p "${PHONE_SSH_PORT:-8022}" -o BatchMode=yes -o ConnectTimeout=6 \
+    -o StrictHostKeyChecking=accept-new "${PHONE_USER:-u0_a380}@$1" \
+    "termux-sensor -s $PROX_SENSOR -d 500 -n 2 2>/dev/null" </dev/null 2>/dev/null
+}
+
+# read_prox_json_retry <ip> → the stream, with ONE retry on empty. The empty read is a transient
+# driver race, not a dead sensor: measured 2026-08-19 over 8 back-to-back reads on this phone, 7
+# returned a value and 1 returned zero bytes. A single-shot read therefore reports a sensor as dark
+# roughly as often as the driver hiccups, which is exactly the mesh-mag/mesh-gyro `-n 1` shape
+# (d657375). The retry is on the DARK path only — a first-read success costs nothing extra.
+read_prox_json_retry() {
+  local out; out="$(read_prox_json "$1")"
+  if [ -z "$out" ]; then sleep 2; out="$(read_prox_json "$1")"; fi
+  printf '%s' "$out"
+}
+
 # parse_prox <json> → raw integer or "" (empty = unreadable). Uses raw_decode: with -n 2 termux-sensor
 # emits two JSON objects back-to-back; json.load would choke on the second. Mirrors mesh-light's parser.
 parse_prox() {
@@ -67,11 +125,22 @@ parse_prox() {
 import json, sys
 try:
     data = sys.stdin.read().strip()
-    d, _ = json.JSONDecoder().raw_decode(data)
-    x = d.get("tmd2755_p", {})
-    vals = x.get("values") if isinstance(x, dict) else None
-    if vals:
-        print(int(float(vals[0])))
+    dec = json.JSONDecoder()
+    i = 0
+    # termux-sensor emits one JSON object per sample, back-to-back. With another reader listening on
+    # the same chip the stream can also carry a MULTI-SENSOR bag whose first object lacks our key
+    # (measured 2026-08-19: a concurrent mesh-light read returned tmd2755_l/bma420 alongside it) —
+    # stopping at object one turned that into a bogus "parse failed". Scan until the key appears.
+    while i < len(data):
+        d, off = dec.raw_decode(data, i)
+        x = d.get("tmd2755_p", {})
+        vals = x.get("values") if isinstance(x, dict) else None
+        if vals:
+            print(int(float(vals[0])))
+            break
+        i = off
+        while i < len(data) and data[i] in " \t\r\n":
+            i += 1
 except Exception:
     pass
 ' 2>/dev/null
@@ -94,6 +163,47 @@ if [ "${1:-}" = --test ]; then
     || { echo "  FAIL: parser must yield empty when prox sensor absent"; exit 1; }
   [ -z "$(parse_prox 'not json')" ] \
     || { echo "  FAIL: parser must yield empty on garbage"; exit 1; }
+  # --- parser must find the value in a MULTI-SENSOR bag (a concurrent reader on the same chip) ---
+  [ "$(parse_prox '{"tmd2755_l":{"values":[58]},"tmd2755_p":{"values":[7]},"bma420":{"values":[1]}}')" = 7 ] \
+    || { echo "  FAIL: parser must read prox out of a multi-sensor bag"; exit 1; }
+  [ "$(parse_prox '{"tmd2755_l":{"values":[58]}}{"tmd2755_p":{"values":[3]}}')" = 3 ] \
+    || { echo "  FAIL: parser must scan past an object that lacks the prox key"; exit 1; }
+  # --- n/a CAUSE-WORD assertions: the collapse this tool used to carry (2026-08-19) ---
+  # Each is falsifiable offline, so the mapping is gated even when the phone is unreachable and the
+  # live branches cannot be driven. The load-bearing one is `empty-read must NOT say UNREACHABLE`.
+  _v(){ printf '%s' "$1" | cut -d'|' -f1; }
+  [ "$(_v "$(na_state ssh T)")"        = UNREACHABLE ] || { echo "  FAIL: link-down must say UNREACHABLE"; exit 1; }
+  [ "$(_v "$(na_state empty-read T)")" = SENSOR-DARK ] || { echo "  FAIL: a dark driver must NOT wear the link-down word"; exit 1; }
+  [ "$(_v "$(na_state parse T)")"      = UNREADABLE  ] || { echo "  FAIL: parse-fail must say UNREADABLE"; exit 1; }
+  [ "$(_v "$(na_state nonnumeric T)")" = UNREADABLE  ] || { echo "  FAIL: non-numeric must say UNREADABLE"; exit 1; }
+  for _c in empty-read parse nonnumeric; do
+    [ "$(_v "$(na_state "$_c" T)")" != UNREACHABLE ] \
+      || { echo "  FAIL: cause '$_c' fires with the phone UP — it must not claim the link is down"; exit 1; }
+  done
+  [ "$(_v "$(na_state empty-read T)")" != "$(_v "$(na_state parse T)")" ] \
+    || { echo "  FAIL: a dark sensor and an unreadable stream must be distinguishable"; exit 1; }
+  # why= must survive beside the verdict — a word with no cause is the collapse in a new coat
+  case "$(na_state empty-read T)" in *'|why=empty-read|'*) : ;; *) echo "  FAIL: n/a line must carry why="; exit 1 ;; esac
+  # --- RECORD-SHAPE gate: field 1 of EVERY line (value and n/a) is a bare verdict, no payload leak.
+  # mesh-sensorium:850 renders `cut -d'|' -f1` verbatim; the old space-delimited n/a line leaked the
+  # timestamp into the value slot (`prox=UNREACHABLE 2026-08-19T08:19:01Z`). Drive the reader's own
+  # extraction and assert the result is one bare word.
+  # The `some-future-cause` entry is what makes this gate INDEPENDENT of the word assertions above:
+  # those name three known causes, so only the `*)` fallback and the value line are covered here alone.
+  for _l in "$(na_state ssh 2026-08-19T00:00:00Z)" "$(na_state empty-read 2026-08-19T00:00:00Z)" \
+            "$(na_state parse 2026-08-19T00:00:00Z)" "$(na_state some-future-cause 2026-08-19T00:00:00Z)" \
+            "FAR|raw=5"; do
+    _f1="$(printf '%s' "$_l" | cut -d'|' -f1)"
+    case "$_f1" in *[[:space:]]*) echo "  FAIL: field 1 of '$_l' carries payload ('$_f1') — the reader renders it as the value"; exit 1 ;; esac
+    [ -n "$_f1" ] || { echo "  FAIL: empty verdict field in '$_l'"; exit 1; }
+  done
+  # --- is_na_verdict must cover every marker and NO reading ---
+  for _w in UNREACHABLE SENSOR-DARK UNREADABLE; do
+    is_na_verdict "$_w" || { echo "  FAIL: is_na_verdict must accept marker '$_w' (--edge would hold a phantom)"; exit 1; }
+  done
+  for _w in NEAR FAR; do
+    is_na_verdict "$_w" && { echo "  FAIL: is_na_verdict must reject reading '$_w'"; exit 1; }
+  done
   # --- LIVE real-read gate (the race-fix gate): if the phone is reachable, -n 2 MUST yield a value.
   # A reachable phone whose read is empty is the exact bug this gate exists to catch (stale-state-while-
   # cron-green). If the phone is OFFLINE, exit 2 honestly (mesh-land treats 2 as a pass) — we never fail
@@ -107,14 +217,14 @@ if [ "${1:-}" = --test ]; then
   if [ -z "$pip" ]; then
     echo "smoke-test: n/a (phone unreachable — no live proximity read; pure + parse assertions ok)"; exit 2
   fi
-  j="$(timeout 14 ssh -p "${PHONE_SSH_PORT:-8022}" -o BatchMode=yes -o ConnectTimeout=6 -o StrictHostKeyChecking=accept-new "${PHONE_USER:-u0_a380}@$pip" "termux-sensor -s $PROX_SENSOR -d 500 -n 2 2>/dev/null" </dev/null 2>/dev/null)"
+  j="$(read_prox_json_retry "$pip")"
   raw="$(parse_prox "$j")"
   if [ -z "$raw" ]; then
-    echo "smoke-test: FAIL (phone reachable but tmd2755_p read empty — driver race / wrong sensor name)"; exit 1
+    echo "smoke-test: FAIL (phone reachable but $PROX_SENSOR read empty AFTER RETRY — sensor down / wrong name)"; exit 1
   fi
   case "$raw" in *[!0-9-]*)
     echo "smoke-test: FAIL (tmd2755_p yielded non-numeric '$raw')"; exit 1 ;; esac
-  echo "smoke-test: ok (5 classifier + 4 parse assertions + LIVE read: tmd2755_p=$raw → $(classify_prox "$raw"))"; exit 0
+  echo "smoke-test: ok (5 classifier + 6 parse + 17 n/a-cause/record-shape assertions + LIVE read: tmd2755_p=$raw → $(classify_prox "$raw"))"; exit 0
 fi
 
 TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -134,7 +244,7 @@ fi
 
 if [ -z "$pip" ]; then
   if [ ! -f "$OFFLINEFILE" ]; then echo "phone-prox: phone unreachable — can't read proximity (not an alarm)"; touch "$OFFLINEFILE"; fi
-  printf 'UNREACHABLE %s\n' "$TS" > "$STATE"
+  na_state ssh "$TS" > "$STATE"
   mesh-state-touch "$STATE"
   exit 2
 fi
@@ -144,17 +254,19 @@ rm -f "$OFFLINEFILE"
 # mesh-light). -n 1 returns only cleanup messages, no JSON → empty read every cron → stale state. -n 2
 # self-terminates cleanly after 2 samples; the outer SSH timeout (14s) bounds it (an inner `timeout`
 # wrapping would SIGTERM termux-sensor and spew cleanup noise onto stdout, polluting the JSON stream).
-j="$(timeout 14 ssh -p "${PHONE_SSH_PORT:-8022}" -o BatchMode=yes -o ConnectTimeout=6 -o StrictHostKeyChecking=accept-new "${PHONE_USER:-u0_a380}@$pip" "termux-sensor -s $PROX_SENSOR -d 500 -n 2 2>/dev/null" </dev/null 2>/dev/null)"
+j="$(read_prox_json_retry "$pip")"
 [ -n "$j" ] || {
-  if [ ! -f "$OFFLINEFILE" ]; then echo "phone-prox: tmd2755_p read empty (driver race / sensor down)"; touch "$OFFLINEFILE"; fi
-  printf 'UNREACHABLE %s\n' "$TS" > "$STATE"; mesh-state-touch "$STATE"; exit 2
+  # The phone ACCEPTED ssh above — this is the sensor/driver dark, not the link. Saying UNREACHABLE
+  # here is the collapse this tool used to carry; SENSOR-DARK is the honest word (see header).
+  if [ ! -f "$OFFLINEFILE" ]; then echo "phone-prox: $PROX_SENSOR read empty after retry (sensor dark; phone IS reachable)"; touch "$OFFLINEFILE"; fi
+  na_state empty-read "$TS" > "$STATE"; mesh-state-touch "$STATE"; exit 2
 }
 
 raw="$(parse_prox "$j")"
-[ -n "$raw" ] || { echo "phone-prox: parse failed (not an alarm)"; printf 'UNREACHABLE %s\n' "$TS" > "$STATE"; mesh-state-touch "$STATE"; exit 2; }
+[ -n "$raw" ] || { echo "phone-prox: parse failed — stream carried no $PROX_SENSOR value (not an alarm)"; na_state parse "$TS" > "$STATE"; mesh-state-touch "$STATE"; exit 2; }
 
 verdict="$(classify_prox "$raw")"
-[ "$verdict" != UNKNOWN ] || { echo "phone-prox: non-numeric tmd2755_p '$raw' (not an alarm)"; printf 'UNREACHABLE %s\n' "$TS" > "$STATE"; mesh-state-touch "$STATE"; exit 2; }
+[ "$verdict" != UNKNOWN ] || { echo "phone-prox: non-numeric $PROX_SENSOR '$raw' (not an alarm)"; na_state nonnumeric "$TS" > "$STATE"; mesh-state-touch "$STATE"; exit 2; }
 
 emit_text(){ printf '[phone-prox] %s — distance=%s mm (tmd2755_p; 0=near)\n' "$verdict" "$raw"; }
 emit_json(){ printf '{"verdict":"%s","raw":%s,"distance_mm":%s,"sensor":"%s","ts":"%s"}\n' "$verdict" "$raw" "$raw" "$PROX_SENSOR" "$TS"; }
@@ -170,7 +282,7 @@ if [ "$MODE" = edge ]; then
   confirmed="$(cat "$STATE" 2>/dev/null || true)"; confirmed="${confirmed%%|*}"
   pending_line="$(cat "$PENDING" 2>/dev/null || true)"
   pending="${pending_line%%:*}"; pcount="${pending_line##*:}"; pcount="${pcount:-0}"
-  if [ -z "$confirmed" ] || [ "$confirmed" = UNREACHABLE ]; then
+  if [ -z "$confirmed" ] || is_na_verdict "$confirmed"; then
     printf '%s\n' "$line" > "$STATE"; rm -f "$PENDING"
   elif [ "$verdict" = "$confirmed" ]; then
     # re-confirmed: rewrite the raw count (it may have drifted within the band) but the verdict is stable.
