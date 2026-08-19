@@ -258,6 +258,62 @@ SELF="$(readlink -f "$0")"
 # exact history (pw-record stalls, capture wedges surviving restart, the post-reboot audio-group
 # deafness). Quiet stays silent by design — the dash must not carry a line per 10min tick — but a
 # broken capture is rare and must be LOUD. (2026-08-17)
+# EAR-FIRST CAPTURE (2026-08-19). This node has exactly ONE mic with signal (the USB camera; the
+# ALC897 jack is empty, rms=1) and mesh-overhear holds its ALSA PCM with a raw `arecord`, which is an
+# EXCLUSIVE open. So pw-record here cannot ever win the device while the ear runs: measured the same
+# minute, ear up -> pw-record returns 0 frames, ear stopped -> 125568 frames rms 1061. That is not a
+# busy mic the retry loop can outwait; it is a permanent lockout, and it read on the board as the
+# grind lane being SOURCE-STARVED down to one organ.
+#
+# The answer is not to add a second capture — it is to CONSUME the one the node already has (the
+# NESTING invariant's shape: a capability the path already provides is not missing). The ear writes
+# ~18s chunks continuously into $MESH/audio-buffer; the scanner reads the newest span of them instead
+# of opening the device. One capture, two consumers, no contention, and the material is identical —
+# it is the same microphone, at most one chunk-age old.
+#
+# Returns 0 having written $1, or 1 (and the caller falls through to pw-record — the right behaviour
+# on a node whose ear is absent or dead, where the device IS free). It never fabricates a capture: an
+# empty/stale buffer is a decline, and the caller's own fault path still fires.
+capture_from_ear(){  # $1 out.wav  $2 wanted-secs -> 0 ok / 1 declined
+  local out="$1" want="${2:-45}" bufdir="$MESH/audio-buffer"
+  local maxage="${SS_EAR_MAX_AGE:-180}"   # ~3 write cycles; older means the ear is dead, not quiet
+  [ -d "$bufdir" ] || return 1
+  local newest; newest="$(ls -1t "$bufdir"/*.wav 2>/dev/null | head -1)" || return 1
+  [ -n "$newest" ] || return 1
+  # FRESHNESS is the whole honesty of this path: a stale buffer replayed as "the room now" would be a
+  # fossil rendered as a live reading. Decline instead, and let the caller's fault path speak.
+  local age; age=$(( $(date +%s) - $(stat -c %Y "$newest" 2>/dev/null || echo 0) ))
+  [ "$age" -le "$maxage" ] || return 1
+  local list; list="$(mktemp)"
+  # Newest-first to reach the wanted span, then chronological so the concatenation is time-ordered
+  # (reversed audio would hand the analyzer a rhythm that never happened).
+  local acc=0 f dur
+  for f in $(ls -1t "$bufdir"/*.wav 2>/dev/null); do
+    dur="$(ffprobe -v quiet -show_entries format=duration -of csv=p=0 "$f" 2>/dev/null)" || continue
+    [ -n "$dur" ] || continue
+    printf "file '%s'\n" "$f" >> "$list"
+    acc="$(awk -v a="$acc" -v d="$dur" 'BEGIN{printf "%d", a+d}')"
+    [ "$acc" -ge "$want" ] && break
+  done
+  [ -s "$list" ] || { rm -f "$list"; return 1; }
+  tac "$list" > "$list.ord" && mv "$list.ord" "$list"
+  # TEST hook (named, opt-in, unset in production — the SS_FIXTURE_CAP convention): print the
+  # concat list and stop, so --test can assert the ORDER without decoding audio. Reversed audio
+  # would hand the analyzer a rhythm that never happened, and nothing downstream could tell.
+  if [ -n "${SS_EAR_LIST_ONLY:-}" ]; then cat "$list"; rm -f "$list"; return 0; fi
+  ffmpeg -v quiet -y -f concat -safe 0 -i "$list" -t "$want" -ar 22050 -ac 1 "$out" 2>/dev/null
+  local rc=$?; rm -f "$list"
+  [ "$rc" -eq 0 ] || return 1
+  wav_frames "$out" | awk '{exit !($1+0>0)}' || return 1
+  return 0
+}
+
+# A 44-byte WAV is a HEADER, not a capture. `[ -s "$cap" ]` is true for it, which is how the retry
+# loop below came to break on try 1 every single time the mic was held — the gate that existed to
+# outwait a busy source was satisfied by the exact artifact a failed open leaves behind. Frames, not
+# bytes. (non-empty is not correct.)
+wav_frames(){ ffprobe -v quiet -select_streams a:0 -show_entries stream=duration_ts -of csv=p=0 "$1" 2>/dev/null | tr -d '\n' | grep -E '^[0-9]+$' || echo 0; }
+
 scan_none_is_fault(){ # $1=the why line from analyze's stderr -> 0 when the CAPTURE is at fault
   case "$1" in
     load-fail*|too-short*) return 0 ;;
@@ -318,17 +374,37 @@ case "${1:---scan}" in
     # production, so the pw-record loop below is untouched. Without it the wiring between analyze()'s
     # stderr and scan_none_is_fault() is untestable, and an untestable wiring is how the discarded
     # reason survived in the first place — reverting the 2>"$_awhy" capture left every gate green.
+    CAP_SRC=""
     if [ -n "${SS_FIXTURE_CAP:-}" ] && [ -r "${SS_FIXTURE_CAP}" ]; then
-      cp -f "$SS_FIXTURE_CAP" "$cap"
+      cp -f "$SS_FIXTURE_CAP" "$cap"; CAP_SRC="fixture"
+    else
+    # Ear first — see capture_from_ear: on this node the ear holds the only live mic exclusively, so
+    # the device path below can never win it. SS_EAR=off forces the device (a node with no ear, or a
+    # deliberate second-vantage measurement).
+    if [ "${SS_EAR:-on}" != "off" ] && capture_from_ear "$cap" "$CAPTURE_SECS"; then
+      CAP_SRC="ear"
     else
     SS_TRIES="${SS_TRIES:-3}"; SS_RETRY_SLEEP="${SS_RETRY_SLEEP:-2}"
     for try in $(seq 1 "$SS_TRIES"); do
       timeout "$CAPTURE_SECS" pw-record ${SS_MIC:+--target "$SS_MIC"} --rate 22050 --channels 1 --format s16 "$cap" 2>/dev/null; true
-      [ -s "$cap" ] && break
+      # FRAMES, not bytes: a failed pw-record open leaves a 44-byte header that satisfies `-s`, which
+      # made this retry loop break on try 1 and never once retry.
+      [ "$(wav_frames "$cap")" -gt 0 ] && { CAP_SRC="mic"; break; }
       [ "$try" -lt "$SS_TRIES" ] && sleep "$SS_RETRY_SLEEP"
     done
     fi
-    if [ ! -s "$cap" ]; then echo "soundscape: no capture (mic busy/unreachable, ${SS_TRIES}x)"; exit 2; fi
+    fi
+    [ -n "$CAP_SRC" ] || CAP_SRC="none"
+    # A frameless capture is a CAPTURE FAULT and must leave the same durable line as one that reaches
+    # the analyzer — exiting quietly here is how a dead mic comes to read as a quiet room, which is
+    # the very thing the fault line downstream exists to prevent. And the scanner DID run, so the
+    # liveness touch happens on this path too (mtime = ran, content = what it found).
+    if [ "$(wav_frames "$cap")" -eq 0 ]; then
+      touch "$MESH/.soundscape-tick" 2>/dev/null
+      echo "$(date -u +%Y-%m-%dT%H:%MZ)  CAPTURE FAULT[src=$CAP_SRC]: no frames — the $CAP_SRC capture produced no audio (ear declined or mic held ${SS_TRIES:-3}x), this is NOT a quiet room (scanner heartbeat stays fresh either way)" >> "$SS_LOG"
+      [ -t 2 ] && echo "soundscape: CAPTURE FAULT[src=$CAP_SRC]: no frames"
+      exit 2
+    fi
 
     _awhy="$(mktemp)"
     read -r _tag off dur score label beats < <(analyze "$cap" "$SCALES" "$SIL" 2>"$_awhy" | grep '^WINNER')
@@ -340,7 +416,7 @@ case "${1:---scan}" in
       _why="$(head -1 "$_awhy" 2>/dev/null)"; rm -f "$_awhy"
       if scan_none_is_fault "$_why"; then
         # the CAPTURE failed — never silent, or a dead mic is indistinguishable from a quiet room
-        echo "$ts  CAPTURE FAULT: $_why — the mic/capture failed, this is NOT a quiet room (scanner heartbeat stays fresh either way)" >> "$SS_LOG"
+        echo "$ts  CAPTURE FAULT[src=$CAP_SRC]: $_why — the $CAP_SRC capture failed, this is NOT a quiet room (scanner heartbeat stays fresh either way)" >> "$SS_LOG"
         [ -t 2 ] && echo "soundscape: CAPTURE FAULT: $_why"
       else
         [ -t 2 ] && echo "soundscape: quiet, nothing scored ($_why)"   # quiet is the common case — no dash line
@@ -454,6 +530,35 @@ case "${1:---scan}" in
     sc="$(awk '{print $4}' <<<"$win")"; lbl="$(awk '{print $5}' <<<"$win")"
     awk -v s="$sc" 'BEGIN{exit !(s+0>0)}' || fail "non-numeric score ($sc)"
     [ -n "$lbl" ] || fail "empty character label"
+    # EAR-FIRST CAPTURE (2026-08-19). The scanner cannot open this node's only live mic — mesh-overhear
+    # holds its ALSA PCM exclusively — so it reads the ear's rolling buffer instead. Four legs, each
+    # seen RED against the pre-fix script (which had no capture_from_ear at all):
+    _mesh_bak="$MESH"; MESH="$(mktemp -d)"; _eb="$MESH/audio-buffer"; mkdir -p "$_eb"
+    _eo="$(mktemp --suffix=.wav)"
+    ffmpeg -v quiet -y -f lavfi -i "sine=frequency=300:duration=18:sample_rate=16000" -ac 1 "$_eb/1000.wav" || fail "ffmpeg chunk synth failed"
+    ffmpeg -v quiet -y -f lavfi -i "sine=frequency=900:duration=18:sample_rate=16000" -ac 1 "$_eb/2000.wav" || fail "ffmpeg chunk synth failed"
+    touch -d '-40 seconds' "$_eb/1000.wav"; touch -d '-5 seconds' "$_eb/2000.wav"
+    # (g) a fresh buffer yields a real capture — frames, right rate, right channel count.
+    capture_from_ear "$_eo" 30 || fail "capture_from_ear declined a FRESH ear buffer (the scanner would fall back to a device it can never open)"
+    [ "$(wav_frames "$_eo")" -gt 0 ] || fail "capture_from_ear produced a frameless wav"
+    _sr="$(ffprobe -v quiet -select_streams a:0 -show_entries stream=sample_rate,channels -of csv=p=0 "$_eo" 2>/dev/null)"
+    case "$_sr" in *22050*) : ;; *) fail "ear capture must be resampled to 22050 for the analyzer (got $_sr)";; esac
+    # (h) CHRONOLOGICAL order — newest-first selection, oldest-first concatenation.
+    _ord="$(SS_EAR_LIST_ONLY=1 capture_from_ear "$_eo" 30)"
+    [ "$(echo "$_ord" | head -1 | grep -c '1000.wav')" -eq 1 ] \
+      || fail "ear chunks concatenated newest-first — reversed audio is a rhythm that never happened (got: $_ord)"
+    # (i) a STALE buffer must DECLINE, not be replayed as the room now. Falsifiable: drop the age
+    #     check and this goes red.
+    touch -d '-2 hours' "$_eb/1000.wav" "$_eb/2000.wav"
+    if capture_from_ear "$_eo" 30; then fail "capture_from_ear accepted a 2h-old buffer — a fossil rendered as a live reading"; fi
+    # (j) FRAMES, NOT BYTES: the 44-byte header a failed pw-record open leaves must read as 0 frames.
+    #     This is the exact artifact that satisfied the old `[ -s ]` gate and made the retry loop
+    #     break on try 1, every time, for as long as the mic was held.
+    printf 'RIFF$\000\000\000WAVEfmt \020\000\000\000\001\000\001\000\104\254\000\000\210X\001\000\002\000\020\000data\000\000\000\000' > "$_eb/hdr.wav"
+    [ "$(wav_frames "$_eb/hdr.wav")" -eq 0 ] || fail "a header-only WAV must read as 0 frames (non-empty is not correct)"
+    rm -rf "$MESH" "$_eo"; MESH="$_mesh_bak"
+    echo "  ear-first capture ok (fresh buffer -> 22050 mono frames; chronological; stale declines; header-only reads 0 frames)"
+
     # REAL-READ GATE for --measure: the same synthesized signal must come back through the measure
     # mode with the RAW AXES populated — mesh-records/mesh-sound-reflex derive the whole grind recipe
     # from these, so an analyzer that silently stopped emitting them (or a `read`-shifted field) is a
