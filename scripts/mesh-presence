@@ -10,6 +10,10 @@
 #   mesh-presence <seconds>    custom scan window
 #   mesh-presence --log        also append a snapshot line to ~/.mesh/presence.log
 #   mesh-presence --loop [s]   scan + log every N sec (default 60); supervisable continuous sensor
+#   mesh-presence --fresh      never replay a coalesced scan — force this call onto the radio
+#                              (default: a scan younger than MESH_PRESENCE_COALESCE_S=45s taken by
+#                              ANY caller is replayed verbatim, marked, without touching the radio
+#                              or the scan-lock; --log never replays, it is the canonical producer)
 #   mesh-presence --json       ONE structured record (status/count/types/proximity/churn/trend/
 #                              attribution/personal_presence/familiarity/devices[]) instead of the
 #                              prose block — every sibling sense (light/body-motion/wifi-motion/
@@ -782,6 +786,7 @@ emit_presence_json() {
   PDWELL="${pres_dwell_band:-}" PDWELLS="${pres_dwell_s:-}" PCHANGES24H="${pres_changes_24h:-}" \
   POCC="${occ_macro:-}" POCCCH="${occ_changes_24h:-}" POCCDW="${occ_dwell_s:-}" \
   PDEVICES="${device_lines:-}" \
+  PCOAL="${coalesced_age_s:-}" \
   python3 - <<'PY'
 import json, os
 
@@ -802,6 +807,7 @@ status = os.environ["PSTATUS"]
 rec = {"status": status, "host": os.environ["PHOST"], "ts": os.environ["PTS"]}
 if os.environ.get("PREASON"):
     rec["reason"] = os.environ["PREASON"]
+rec["coalesced_age_s"] = i(os.environ.get("PCOAL"))   # None on a fresh scan; N on a replay
 rec["count"] = i(os.environ.get("PN"))
 rec["known"] = i(os.environ.get("PKNOWN"))
 if status == "ok":
@@ -915,6 +921,40 @@ departure_band() {
     UNKNOWN|'') echo UNKNOWN; return ;;
   esac
   awk -v p="$1" 'BEGIN{ if (p+0 < 1) print "PRESENT"; else if (p+0 < 8) print "SUSPECT"; else print "DEPARTED" }'
+}
+
+# --- scan coalescing: share ONE radio scan among the callers that pile up on the lock -----------
+# The adapter is single-writer (the flock below) but the CALLERS are many, and they collide by
+# SCHEDULE, not by accident: at minute :30 four cron reflexes want a BLE scan in the same second
+# (mesh-presence --log */10, mesh-arrivals 0-59/5, mesh-body-state */5, mesh-bt-census 11-59/19),
+# each then queueing on `flock -w WIN+25` and each spending its own WIN seconds of RADIO on the
+# combo chip that also carries this node's SOLE uplink. Measured 2026-08-19: the BLE-scanner
+# schedule asks for ~55 scan-starts per hour over 60 minutes, so the phases CANNOT be de-collided —
+# the cadence budget is saturated and the only lever that reduces demand is sharing a scan.
+# Observed cost of not sharing: mesh-body-state's `timeout 15 mesh-presence` is killed while still
+# QUEUED behind mesh-arrivals every time they collide (2113 of 5816 of its degraded renderings name
+# presence), i.e. a caller burns nothing but wall-clock and goes blind while a perfectly good scan
+# of the same room finished seconds earlier.
+# So: a caller that arrives while a scan younger than the window is on file replays THAT scan and
+# touches neither the radio nor the lock. Four rules keep the replay from becoming a lie:
+#   * it carries the PRODUCER's own ts + an explicit coalesced marker (text: a `# coalesced:` line,
+#     json: coalesced_age_s) — a consumer can always tell a replay from a fresh sample;
+#   * a replay never re-stamps the cache (a self-restamping cache never expires) and never runs the
+#     enrichment/state writes — it is a READ of someone else's observation, not a new one;
+#   * only a fully rendered, non-degraded run publishes: BUSY/SUSPECT/wedge/killed never do;
+#   * the window must stay UNDER 60s (cron's finest granularity) while every consumer's own cadence
+#     is >= 300s, so no single consumer can ever be served the same scan twice in a row — the
+#     memory a-cached-sample-reread-faster-than-its-producer-fakes-independent-confirmations.
+# --log (the canonical */10 producer, sole writer of presence.log) and --fresh never replay.
+coalesce_ok() {   # age cached_win want_win cached_rc coal_s -> YES|NO (pure, FALSIFIABLE via --test)
+  local age="$1" cwin="$2" want="$3" crc="$4" coal="$5"
+  case "${age}${cwin}${want}${crc}${coal}" in ''|*[!0-9]*) echo NO; return ;; esac
+  [ "$coal" -gt 0 ] || { echo NO; return; }        # 0 = coalescing off
+  [ "$coal" -lt 60 ] || { echo NO; return; }       # never past cron's finest granularity
+  [ "$crc" -le 1 ] || { echo NO; return; }         # only a complete reading (0/1); degraded never
+  [ "$age" -le "$coal" ] || { echo NO; return; }
+  [ "$cwin" -ge "$want" ] || { echo NO; return; }  # a shallower window is not the scan they asked for
+  echo YES
 }
 
 if [ "${1:-}" = --test ]; then
@@ -1145,6 +1185,89 @@ if [ "${1:-}" = --test ]; then
   # honest n/a: fewer than MIN samples → UNKNOWN, never a fabricated φ
   [ "$(departure_phi "600,600" 5000)" = UNKNOWN ] || { echo "  FAIL: <3 samples must be UNKNOWN (can't estimate variance)"; _f=1; }
   [ "$(departure_band UNKNOWN)" = UNKNOWN ] || { echo "  FAIL: departure_band UNKNOWN passthrough"; _f=1; }
+  # --- scan coalescing (2026-08-19, board task presence-scan-lock-contends-four-ways-on-the-sole-
+  # uplink-chip): the decision is a pure predicate, and the WIRING is driven end-to-end below —
+  # a table alone would prove only that the rule exists somewhere, not that a caller obeys it.
+  [ "$(coalesce_ok 5 10 10 0 45)" = YES ] || { echo "  FAIL: a 5s-old win-10 scan should serve a win-10 caller"; _f=1; }
+  [ "$(coalesce_ok 50 10 10 0 45)" = NO ] || { echo "  FAIL: a scan older than the window must not be replayed"; _f=1; }
+  [ "$(coalesce_ok 5 4 10 0 45)" = NO ] || { echo "  FAIL: a SHALLOWER cached window is not the scan the caller asked for"; _f=1; }
+  [ "$(coalesce_ok 5 10 10 3 45)" = NO ] || { echo "  FAIL: a degraded (rc=3 BUSY/SUSPECT) reading must never be replayed"; _f=1; }
+  [ "$(coalesce_ok 5 10 10 1 45)" = YES ] || { echo "  FAIL: a complete reading with rc=1 is still a reading"; _f=1; }
+  [ "$(coalesce_ok 5 10 10 0 0)" = NO ] || { echo "  FAIL: MESH_PRESENCE_COALESCE_S=0 must disable coalescing"; _f=1; }
+  # the load-bearing bound: a window >= 60s could serve ONE consumer the same scan on two consecutive
+  # cron ticks, which is how a cache starts faking independent confirmations. Raise it and this fails.
+  [ "$(coalesce_ok 5 10 10 0 600)" = NO ] || { echo "  FAIL: a coalesce window >= 60s (cron's finest granularity) must be refused"; _f=1; }
+  [ "$(coalesce_ok -5 10 10 0 45)" = NO ] || { echo "  FAIL: a negative age (clock skew) must refuse, never replay"; _f=1; }
+  # end-to-end: a seeded cache in a PRIVATE HOME (never the node's own ~/.mesh) must be replayed
+  # verbatim + marked, must not re-stamp itself, and must write neither the ledger nor the state file.
+  _cotd="$(mktemp -d)"; mkdir -p "$_cotd/.mesh"
+  _coep="$(( $(date +%s) - 20 ))"
+  printf '#coalesce epoch=%s win=10 rc=0 mode=text host=fixture\n' "$_coep" > "$_cotd/.mesh/.presence-scan-cache.text"
+  printf '%s\n' '=== mesh-presence fixture @ 2026-01-01T00:00:00Z — 1 device(s) in range (rssi|mac|name, closest first) ===' \
+    '-42|AA:BB:CC:DD:EE:FF|PlantedFixtureDevice' >> "$_cotd/.mesh/.presence-scan-cache.text"
+  _cost="$(date +%s)"
+  _coout="$(HOME="$_cotd" "$(command -v bash)" "$0" 2>&1)"; _corc=$?
+  _codur=$(( $(date +%s) - _cost ))
+  case "$_coout" in *PlantedFixtureDevice*) ;; *) echo "  FAIL: a fresh cached scan must be replayed (planted row absent): $_coout"; _f=1 ;; esac
+  case "$_coout" in *"# coalesced: replay of a scan"*) ;; *) echo "  FAIL: a replay must MARK itself — an unmarked replay reads as an independent sample"; _f=1 ;; esac
+  [ "$_corc" = 0 ] || { echo "  FAIL: a replay must carry the producer's exit code (got $_corc)"; _f=1; }
+  [ "$_codur" -le 4 ] || { echo "  FAIL: a replay took ${_codur}s — that is a radio scan, not a replay"; _f=1; }
+  [ "$(head -1 "$_cotd/.mesh/.presence-scan-cache.text" | sed -nE 's/.* epoch=([0-9]+).*/\1/p')" = "$_coep" ] \
+    || { echo "  FAIL: a replay RE-STAMPED the cache — a self-restamping cache never expires"; _f=1; }
+  [ ! -s "$_cotd/.mesh/presence.log" ] || { echo "  FAIL: a replay must not append to the presence ledger"; _f=1; }
+  [ ! -s "$_cotd/.mesh/.presence-state" ] || { echo "  FAIL: a replay must not rewrite the presence state (it is a read of someone else's observation)"; _f=1; }
+  # ...and the producer legs: --log never replays (it is the canonical writer of presence.log), and a
+  # real scan PUBLISHES itself for the next caller. Driven with a STUBBED bluetoothctl so the reading
+  # is deterministic (a 1-2s window against the live radio reads SUSPECT more often than not, and a
+  # gate that skips whenever the room is quiet is a gate nobody ever sees pass); only the short
+  # discovery window itself touches real hardware.
+  _costub="$(mktemp -d)"   # only bluetoothctl is shadowed; the rest of PATH stays real
+  printf '%s\n' '#!/bin/sh' \
+    'case "$1" in' \
+    '  show) printf "Powered: yes\nDiscovering: no\n" ;;' \
+    '  devices) echo "Device AA:BB:CC:DD:EE:01 StubScanDevice" ;;' \
+    '  info) printf "Name: StubScanDevice\nRSSI: 0xffb6 (-74)\nAddressType: public\n" ;;' \
+    'esac' > "$_costub/bluetoothctl"
+  chmod +x "$_costub/bluetoothctl"
+  _cologout="$(HOME="$_cotd" PATH="$_costub:$PATH" "$(command -v bash)" "$0" --log 2 2>&1)"; _cologrc=$?
+  case "$_cologout" in *PlantedFixtureDevice*) echo "  FAIL: --log REPLAYED a cached scan — the canonical producer must always use the radio"; _f=1 ;; esac
+  case "$_cologout" in *"# coalesced:"*) echo "  FAIL: --log emitted a coalesced marker — it must never replay"; _f=1 ;; esac
+  case "$_cologout" in *StubScanDevice*) ;; *) echo "  FAIL: the stubbed producer run rendered no device (rc=$_cologrc): $_cologout"; _f=1 ;; esac
+  _conew="$(head -1 "$_cotd/.mesh/.presence-scan-cache.text" 2>/dev/null | sed -nE 's/.* epoch=([0-9]+).*/\1/p')"
+  { [ -n "$_conew" ] && [ "$_conew" != "$_coep" ]; } \
+    || { echo "  FAIL: a real scan must PUBLISH itself for the next caller (cache epoch still '$_conew', seeded $_coep)"; _f=1; }
+  grep -q 'StubScanDevice' "$_cotd/.mesh/.presence-scan-cache.text" 2>/dev/null \
+    || { echo "  FAIL: the published cache does not carry the run that published it"; _f=1; }
+  grep -q 'PlantedFixtureDevice' "$_cotd/.mesh/.presence-scan-cache.text" 2>/dev/null \
+    && { echo "  FAIL: the published cache still carries the fixture body — publish did not replace it"; _f=1; }
+  rm -rf "$_costub"
+  # the DOUBLE-CHECKED leg: the pile-up is made of callers that fire in the SAME second, so every
+  # waiter read a stale cache BEFORE queueing. A caller that blocks on the scan-lock must re-test
+  # after acquiring it and replay what the holder published while it waited — otherwise coalescing
+  # helps only the stragglers and the collision it was built for still costs N radio scans.
+  _cotd2="$(mktemp -d)"; mkdir -p "$_cotd2/.mesh"
+  _codc_ep_file="$_cotd2/.mesh/.holder-epoch"
+  (
+    flock 9
+    sleep 3
+    _hep="$(date +%s)"; echo "$_hep" > "$_codc_ep_file"
+    { printf '#coalesce epoch=%s win=10 rc=0 mode=text host=fixture\n' "$_hep"
+      printf '%s\n' '=== mesh-presence fixture @ 2026-01-01T00:00:00Z — 1 device(s) in range (rssi|mac|name, closest first) ===' \
+        '-42|AA:BB:CC:DD:EE:FE|HolderPublishedDevice'
+    } > "$_cotd2/.mesh/.presence-scan-cache.text"
+  ) 9>"$_cotd2/.mesh/presence.scan.lock" &
+  _codc_holder=$!
+  sleep 0.5   # let the holder take the lock before the waiter arrives
+  _codc_t0="$(date +%s)"
+  _codc_out="$(HOME="$_cotd2" "$(command -v bash)" "$0" 2>&1)"; _codc_rc=$?
+  _codc_dur=$(( $(date +%s) - _codc_t0 ))
+  wait "$_codc_holder" 2>/dev/null
+  case "$_codc_out" in *HolderPublishedDevice*) ;; *) echo "  FAIL: a caller that WAITED on the scan-lock must replay what the holder published (rc=$_codc_rc, ${_codc_dur}s): $_codc_out"; _f=1 ;; esac
+  case "$_codc_out" in *"# coalesced: replay of a scan"*) ;; *) echo "  FAIL: the post-lock replay must MARK itself too"; _f=1 ;; esac
+  [ "$_codc_dur" -ge 2 ] || { echo "  FAIL: the waiter did not actually block on the lock (${_codc_dur}s) — the leg proves nothing"; _f=1; }
+  [ "$_codc_dur" -le 8 ] || { echo "  FAIL: the waiter took ${_codc_dur}s — it ran its own radio scan instead of replaying"; _f=1; }
+  rm -rf "$_cotd2"
+  rm -rf "$_cotd"
   [ "$_f" = 0 ] || { echo "smoke-test: FAIL"; exit 1; }
   # --- FAMILIARITY classifier + session_max_age (fidelity 2026-06-28) ---
   # FALSIFIABLE: change the 300/1800 thresholds → these flip.
@@ -1333,7 +1456,7 @@ assert d["count"] is None and d["known"] is None, d
       [ "$_pef" = 0 ] || { echo "smoke-test: FAIL ($_pe_tag)"; exit 1; }
     fi
   fi
-  echo "smoke-test: ok (BT ready + proximity:5 + median-smooth:4 + qualify-empty:3 + wedge-empty:5 + trend:5 + trend-conf:5 + rolling-history:3 + gap-aware+prune:6 + attribution:8 + classify-cli:5 + addrtype-cli:3 + addrtype:9+live + attr×addrtype-fusion:6 + personal-presence:10 + familiarity:8 + session_max_age:2 + presence-label-dwell:12 + presence-json:5 + oui-vendor:12 [resolve+degrade+vendor-cli+key+summary] + phi-accrual-departure:6 + $_pe_tag:2 assertions)"; exit 0
+  echo "smoke-test: ok (BT ready + proximity:5 + median-smooth:4 + qualify-empty:3 + wedge-empty:5 + trend:5 + trend-conf:5 + rolling-history:3 + gap-aware+prune:6 + attribution:8 + classify-cli:5 + addrtype-cli:3 + addrtype:9+live + attr×addrtype-fusion:6 + personal-presence:10 + familiarity:8 + session_max_age:2 + presence-label-dwell:12 + presence-json:5 + oui-vendor:12 [resolve+degrade+vendor-cli+key+summary] + phi-accrual-departure:6 + $_pe_tag:2 + scan-coalescing:20 [8 predicate + replay verbatim/marked/no-restamp/no-ledger/no-state + --log-never-replays + publishes + post-lock double-check:4] assertions)"; exit 0
 fi
 # --classify <name> [addrtype:public|random|unknown]: pure name→class lookup
 # (PERSONAL|APPLIANCE|AMBIGUOUS), NO BLE scan. Single source of the person-vs-appliance classifier so
@@ -1441,8 +1564,8 @@ EOF
   exit 0
 fi
 
-WIN=10; LOGIT=0; json_mode=0
-for a in "$@"; do case "$a" in --log) LOGIT=1;; --json) json_mode=1;; [0-9]*) WIN="$a";; esac; done
+WIN=10; LOGIT=0; json_mode=0; FRESH=0
+for a in "$@"; do case "$a" in --log) LOGIT=1;; --json) json_mode=1;; --fresh) FRESH=1;; [0-9]*) WIN="$a";; esac; done
 HOST="$(hostname)"; MESH="$HOME/.mesh"; LOG="$MESH/presence.log"; mkdir -p "$MESH"
 TREND_FILE="$MESH/.presence-rssi-history"
 command -v bluetoothctl >/dev/null 2>&1 || {
@@ -1453,6 +1576,73 @@ bluetoothctl show 2>/dev/null | grep -q 'Powered: yes' || {
   [ "$json_mode" = 1 ] && emit_presence_json unreachable "BT adapter not powered"
   echo "mesh-presence: BT adapter not powered — BLE sense unreachable" >&2; exit 2
 }
+
+# Coalescing gate (see coalesce_ok above). Deliberately AFTER the adapter checks — a replay asserts
+# the adapter is alive right now, it is not a way to answer while the radio is gone — and BEFORE the
+# flock, so a coalesced caller never joins the queue it was going to make worse.
+MESH_COAL_S="${MESH_PRESENCE_COALESCE_S:-45}"
+CMODE=text; [ "$json_mode" = 1 ] && CMODE=json
+CFILE="$MESH/.presence-scan-cache.$CMODE"
+try_coalesced_replay() {   # prints the replay + sets _crc, returns 0 if it replayed, 1 if it did not
+  [ "$LOGIT" = 0 ] && [ "$FRESH" = 0 ] && [ -s "$CFILE" ] || return 1
+  local _chdr _cep _cwin _cage _crepl
+  _chdr="$(head -1 "$CFILE" 2>/dev/null)"
+  case "$_chdr" in '#coalesce '*) ;; *) return 1 ;; esac
+  _cep="$(printf '%s' "$_chdr" | sed -nE 's/.* epoch=([0-9]+).*/\1/p')"
+  _cwin="$(printf '%s' "$_chdr" | sed -nE 's/.* win=([0-9]+).*/\1/p')"
+  _crc="$(printf '%s' "$_chdr" | sed -nE 's/.* rc=([0-9]+).*/\1/p')"
+  _cage=$(( $(date +%s) - ${_cep:-0} ))
+  [ "$(coalesce_ok "$_cage" "${_cwin:-0}" "$WIN" "${_crc:-9}" "$MESH_COAL_S")" = YES ] || return 1
+  if [ "$json_mode" = 1 ]; then
+    # json has no comment line to carry the marker, so inject the field. If the injection cannot run
+    # (no python3 / corrupt record) we fall THROUGH to a real scan — an unmarked replay would be
+    # indistinguishable from an independent sample, which is the one thing this must never emit.
+    _crepl="$(tail -n +2 "$CFILE" 2>/dev/null | COAL_AGE="$_cage" COAL_WIN="$_cwin" python3 -c '
+import json, os, sys
+try:
+    rec = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+if not isinstance(rec, dict):
+    sys.exit(1)
+rec["coalesced_age_s"] = int(os.environ["COAL_AGE"])
+rec["scan_win_s"] = int(os.environ["COAL_WIN"])
+print(json.dumps(rec, separators=(",", ":")))
+' 2>/dev/null)"
+    [ -n "$_crepl" ] || return 1
+    printf '%s\n' "$_crepl"
+  else
+    tail -n +2 "$CFILE"
+    echo "# coalesced: replay of a scan ${_cage}s old (win=${_cwin}s) — radio and scan-lock untouched; --fresh (or MESH_PRESENCE_COALESCE_S=0) forces a new scan"
+  fi
+  return 0
+}
+# Coalescing gate. Deliberately AFTER the adapter checks — a replay asserts the adapter is alive
+# right now, it is not a way to answer while the radio is gone — and BEFORE the flock, so a
+# coalesced caller never joins the queue it was going to make worse.
+if try_coalesced_replay; then exit "${_crc:-0}"; fi
+# A run that reaches here WILL use the radio, so it publishes what it renders for the next caller.
+# stdout is captured to a temp file and replayed at exit: the publish must be all-or-nothing (a
+# half-written cache read back as a reading is worse than no cache) and a partial capture from a
+# killed run must never be published — hence the rc/CACHEABLE guard in the trap.
+CACHEABLE=0; SCAN_EPOCH=""
+CAP="$(mktemp "$MESH/.presence-scan-cap.XXXXXX" 2>/dev/null)" || CAP=""
+if [ -n "$CAP" ]; then
+  _publish_scan() {
+    local _rc=$?
+    # publish BEFORE flushing to the caller: a consumer that closed the pipe early (`| head -4`)
+    # SIGPIPEs the flush, and a scan we actually paid the radio for must still reach the next caller.
+    if [ "$CACHEABLE" = 1 ] && { [ "$_rc" = 0 ] || [ "$_rc" = 1 ]; } && [ -n "$SCAN_EPOCH" ]; then
+      { printf '#coalesce epoch=%s win=%s rc=%s mode=%s host=%s\n' "$SCAN_EPOCH" "$WIN" "$_rc" "$CMODE" "$HOST"
+        cat "$CAP"; } > "$CFILE.$$" 2>/dev/null && mv -f "$CFILE.$$" "$CFILE" 2>/dev/null
+    fi
+    exec 1>&3 3>&-
+    cat "$CAP" 2>/dev/null
+    rm -f "$CAP" "$CFILE.$$" 2>/dev/null
+  }
+  exec 3>&1 1>"$CAP"
+  trap _publish_scan EXIT
+fi
 
 # Single-writer the adapter. BlueZ keeps ONE discovery session per adapter, ref-counted per
 # D-Bus client; when concurrent scanners overlap, one client's scan-off clears the RSSI cache
@@ -1473,6 +1663,12 @@ if command -v flock >/dev/null 2>&1; then
     exit 3
   fi
 fi
+
+# Double-checked: the caller ahead of us has just finished and PUBLISHED while we waited, so the
+# reason we queued may no longer exist. This is the case the pile-up is actually made of — four
+# reflexes that fire in the SAME second all read a stale cache before queueing — so without this
+# re-test coalescing would only ever help the stragglers, never the collision it was built for.
+if try_coalesced_replay; then exit "${_crc:-0}"; fi
 
 # Settle the adapter before we StartDiscovery. The flock serializes scans, but a prior holder's
 # StopDiscovery can still be DRAINING at the instant it releases the lock (BlueZ adapter-level
@@ -1519,6 +1715,7 @@ fi
 sleep $(( WIN > 3 ? WIN - 2 : 1 ))   # let discovery populate, query while scan still live
 
 ts="$(date -u +%FT%TZ)"; NOW="$(date +%s)"; rows=""; n=0; known=0
+SCAN_EPOCH="$NOW"   # the moment THIS reading was taken — what a replay ages against
 unid_public=0; unid_random=0; unid_unknown=0   # address-type split of UNNAMED ("?") contacts
 for mac in $(bluetoothctl devices 2>/dev/null | awk '/^Device/{print $2}'); do
   known=$((known+1))               # devices the adapter knows (cache) — used to qualify an n=0 read
@@ -1576,6 +1773,9 @@ if [ "$n" -eq 0 ] && [ "$known" -eq 0 ]; then
   fi
 fi
 
+# Past every honest-degraded gate: this run holds a complete reading, so it may be published
+# for a coalescing caller (the trap still refuses if the run dies before rendering it all).
+CACHEABLE=1
 sorted="$(printf '%s' "$rows" | sed '/^$/d' | sort -t'|' -k1 -rn)"
 if [ "$json_mode" = 0 ]; then
   echo "=== mesh-presence $HOST @ $ts — $n device(s) in range (rssi|mac|name, closest first) ==="
