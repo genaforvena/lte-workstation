@@ -1,7 +1,8 @@
 /*
 Copyright (c) 2026 lte-workstation mesh — MIT, same terms as the vendored uxn tree.
 
-net.h — network device (0xd0) for the vendored uxncli: CONNECT (step 1) + BIND (step 2).
+net.h — network device (0xd0) for the vendored uxncli: CONNECT (step 1) + stream BIND
+(step 2) + datagram BIND/RECVFROM (step 3).
 
 The port map is copied VERBATIM from uxn2 (src/uxn2.c, enum network_ports @2fbaa62)
 so a ROM written for either emulator addresses the same ports. The IMPLEMENTATION is
@@ -11,8 +12,29 @@ POSIX getaddrinfo/connect/accept, blocking and synchronous — no vector, no thr
 
 CHANNELS. The channel port (df) SELECTS which endpoint every other port addresses:
   channel 0        — the OUTBOUND lane (connect/read/write, step 1)
-  channel 1..MAX   — an INBOUND lane: a connection accepted from the bound listener
-There is one listener; bind (dd/de) puts it up, action 1 (Unbind) takes it down.
+  channel 1..MAX   — an INBOUND lane: a stream accepted from the bound listener (step 2),
+                     or, on the one channel a datagram bind was issued from, the bound
+                     datagram socket itself (step 3)
+There is one bind at a time; bind (dd/de) puts it up, action 1 (Unbind) takes it down.
+
+STREAM AND DATAGRAM LANES ARE NOT THE SAME LANE WEARING A SCHEME, and the differences are
+readable at the ports rather than hidden behind them:
+
+  · a stream bind fans ONE listener across all eight inbound lanes and each state read is
+    an accept. A datagram bind occupies the SELECTED CHANNEL ONLY — nothing is accepted, so
+    there would be nothing to put in the other seven, and seven lanes answering Bound over
+    no socket is a true-looking answer to a question the ROM did not ask.
+  · a datagram lane never reads CONNECTED. Bound = up and quiet, HasData = a packet is
+    queued. There is no peer to be connected to, and the next packet may be from anyone.
+  · the handle (db) names the family: 1 = the outbound lane, 0x01xx = an accepted stream,
+    0x02xx = a bound datagram socket. Reading db is also the only way to ask "is anything
+    attached" WITHOUT the state port's blocking accept.
+  · a datagram bind takes a NAMED address — '*', 0.0.0.0 and :: are all refused, in every
+    spelling, because the refusal is made against the resolved sockaddr and not the text.
+    A stream bind still takes a written-out '*'; it no longer takes 0.0.0.0 or :: dressed
+    as an ordinary host, which it silently did through step 2.
+  · a write on a bound datagram lane goes to whoever last wrote to it. With nothing read
+    yet there is no address, and the write is refused rather than aimed somewhere.
 
 Binding requires a channel to have been SELECTED FIRST (df != 0). A bind issued while
 channel 0 is selected is refused loudly rather than accepted, because the state port
@@ -30,7 +52,7 @@ which it is in progress. A state a ROM can never observe must not be faked.
 #define NET_WRITE    0xd8 /* d8 d9 — DEO lb: send length bytes from ram[addr] */
 #define NET_STATE    0xda /* da    — DEI: state · DEO: action (same byte, as in uxn2) */
 #define NET_HANDLE   0xdb /* db dc — DEI: handle of the SELECTED endpoint; 0 is "none" */
-#define NET_BINDADDR 0xdd /* dd de — DEO lb: bind+listen on the NUL-terminated URI at ram[addr] */
+#define NET_BINDADDR 0xdd /* dd de — DEO lb: bind on the URI at ram[addr] (+listen if stream) */
 #define NET_CHANNEL  0xdf /* df    — endpoint selector: 0 outbound, 1..MAX inbound */
 
 #define NET_MAX_CHANNELS 8
@@ -66,8 +88,9 @@ reads back its own zero.
     #d4  DEI2        ( d0xx = device present · anything else = no device here )
 
 The HIGH byte is the device, the LOW byte is the STEP, so a ROM tells a connect-only
-emulator (d001) from one that also binds (d002) and asks for what it needs rather than
-assuming: net-echo wants any d0xx, net-listen refuses below d002. The emulator is now the
+emulator (d001) from one that also binds a stream (d002) or a datagram (d003) and asks
+for what it needs: net-echo wants any d0xx, net-listen refuses below d002, a datagram ROM
+refuses below d003. The emulator is now the
 thing that drifts across the mesh, and a travelling ROM must be able to ask what it landed
 on. A ROM that pinned the WHOLE word would refuse every future step of its own device —
 which is why the step is compared as an ordering, never as equality.
@@ -76,9 +99,15 @@ INTEROP CAVEAT, stated rather than hidden: uxn2 does not know action 0xd0, so a 
 probing on uxn2 reads "no device" even though uxn2 HAS one. That is wrong-but-fail-closed
 — the ROM refuses instead of fabricating — and it costs uxn2-targeted ROMs nothing, since
 they never send the probe. It becomes interop-true only if uxn2 adopts the same action.
+
+THE STEP IS A CLAIM ABOUT THE BINARY, NOT ABOUT THE SOURCE TREE, which is why bumping it
+is half a change: mesh-uxn-drift (cadence 23, every 6h) reads this define and compares it
+against what the RUNNING emulator answers, so a bump with no rebuild reads as drift on a
+node whose source is perfectly correct. Bump and rebuild — and cross-build for the nodes
+that have no compiler (cross-build.sh, verify-note3.sh) — in the same change.
 */
 #define NET_ACTION_IDENTIFY   0xd0
-#define NET_IDENT             0xd002 /* device 0xd0, step 2 — connect AND bind */
+#define NET_IDENT             0xd003 /* device 0xd0, step 3 — connect, stream bind, datagram bind */
 
 Uint8 net_dei(Uint8 addr);
 void net_deo(Uint8 addr);

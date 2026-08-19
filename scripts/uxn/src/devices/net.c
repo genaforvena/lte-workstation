@@ -14,6 +14,7 @@
 #include <sys/time.h>
 #include <sys/socket.h>
 #include <sys/select.h>
+#include <netinet/in.h>
 #include <netdb.h>
 
 #include "../uxn.h"
@@ -22,7 +23,8 @@
 /*
 Copyright (c) 2026 lte-workstation mesh — MIT, same terms as the vendored uxn tree.
 
-net.c — network device: CONNECT (step 1) + BIND/ACCEPT (step 2). Blocking, synchronous.
+net.c — network device: CONNECT (step 1) + BIND/ACCEPT (step 2) + DATAGRAM BIND/RECVFROM
+(step 3). Blocking, synchronous.
 
 WHY THE DEVICE AT ALL, when the mesh already ships ROMs over ssh: the pipe gives
 TRANSPORT, the device gives ADDRESSING. With mesh-uxn-hop the shell wrapper picks the
@@ -57,10 +59,33 @@ CONTAINMENT, and why each guard is here rather than "obviously fine":
     loop, so it uses select() with a zero timeout (pure POSIX — MSG_DONTWAIT is not) and
     only then peeks a byte to tell HasData from a peer that closed. The ACCEPT poll is the
     one deliberate exception; its whole reasoning is at net_accept_into.
-  · a ROM can ask whether this device EXISTS (action 0xd0 Identify → d002 in the length
+  · a ROM can ask whether this device EXISTS (action 0xd0 Identify → d003 in the length
     register). Without it an emulator with no d0 page answers Disconnected — the same
     byte a refused connect gives — so "no network here" and "the far node said no" are
     indistinguishable to the program deciding. See net.h for the measured artifact.
+
+STEP 3 ADDS THE DATAGRAM LISTENER, and it is a different animal from the stream one in
+three ways that each had to be spelled out rather than inherited:
+
+  · THE ANY-ADDRESS IS REFUSED IN EVERY SPELLING on a datagram bind — '*', 0.0.0.0, ::,
+    and a missing host alike. A stream listener still accepts a written-out '*' (step 2's
+    contract, unchanged), because a stream peer must complete a handshake this node can
+    see and drop. A datagram lane has no handshake: whatever can put a packet on the wire
+    is already inside the ROM's read loop, and the ROM this exists for merges what it
+    reads into a ledger. uxn carries no crypto; the whole authentication story is the
+    tailnet ACL, and an ACL only means something if the socket is on the tailnet address.
+    So a datagram listener binds a NAMED address or it does not come up.
+  · 0.0.0.0 and :: are now refused on a STREAM bind too, and that is a bug fix, not a new
+    rule: this file already claimed any-address was "the explicit host '*' and nothing
+    else", while `tcp:0.0.0.0:port` sailed through net_resolve as an ordinary named host
+    and opened every interface. A doctrine the code does not enforce is a comment.
+  · A DATAGRAM LANE IS NEVER "CONNECTED" and never accepts. The bound socket IS the
+    endpoint, on the selected channel and no other; state reads Bound (up, nothing came)
+    or HasData (a packet is queued). Saying Connected would name a peer relationship that
+    does not exist and will not exist for the next packet either. The handle says so too:
+    0x02xx is a datagram lane, 0x01xx an accepted stream, 1 the outbound lane — three
+    families a ROM can tell apart, because "which kind of thing am I holding" is exactly
+    the question a wrong answer to is unrecoverable.
 */
 
 static int net_fd[NET_MAX_CHANNELS + 1] = { -1, -1, -1, -1, -1, -1, -1, -1, -1 };
@@ -69,8 +94,21 @@ static int net_listen_fd = -1;
 static Uint16 net_buffer_length = 0;
 static Uint16 net_success_length = 0;
 
-/* handle 0 means "none" (uxn2's convention). The outbound lane is 1, an inbound lane is
-   0x0100|channel, so the two families are never confusable in a ROM's eyes. */
+/* per-lane: is this endpoint a datagram socket? Set at connect (outbound) and at bind
+   (inbound), cleared on every drop. It is not derivable after the fact — a fd tells you
+   nothing about how it was made — and every branch below that behaves differently for
+   datagrams reads it, so a lane that lost this flag would be quietly mis-served. */
+static Uint8 net_lane_dgram[NET_MAX_CHANNELS + 1];
+
+/* the last sender on a datagram lane, which is the ONLY address a reply can go to: the
+   socket is unconnected by construction, so send(2) has nowhere to aim. Length 0 means
+   nothing has been received yet, and a write then refuses instead of guessing. */
+static struct sockaddr_storage net_peer[NET_MAX_CHANNELS + 1];
+static socklen_t net_peer_len[NET_MAX_CHANNELS + 1];
+
+/* handle 0 means "none" (uxn2's convention). The outbound lane is 1, an accepted stream is
+   0x0100|channel and a bound datagram lane is 0x0200|channel, so the three families are
+   never confusable in a ROM's eyes. */
 #define NET_OUT_HANDLE 1
 
 /*
@@ -95,6 +133,15 @@ net_timeout_secs(void)
 	v = atoi(e);
 	return v > 0 ? v : 10;
 }
+
+/*
+A REFUSAL FROM net_resolve HAS ALREADY SAID WHY, and its callers must not say it again in
+another vocabulary. Returning EAI_SERVICE/EAI_NONAME made them print gai_strerror on top —
+so a datagram bind on '*' answered with our named refusal AND "Name or service not known",
+which points at DNS, a layer that was never involved. An error message names a cause; a
+second one names the wrong cause and is where the next hour goes.
+*/
+#define NET_REFUSED (-9999)
 
 static void
 net_fail(const char *what, const char *detail)
@@ -135,14 +182,27 @@ net_deadlines(int fd)
 static void
 net_drop(int c)
 {
+	int was_dgram;
 	if(c < 0)
 		return;
 	if(net_fd[c] >= 0)
 		close(net_fd[c]);
 	net_fd[c] = -1;
-	/* an inbound lane returns to the listener's pool; only the outbound lane goes
-	   Disconnected, because only it has nothing behind it to wait on */
-	net_state[c] = (c > 0 && net_listen_fd >= 0) ? NET_STATE_BOUND : NET_STATE_DISCONNECTED;
+	was_dgram = net_lane_dgram[c];
+	net_lane_dgram[c] = 0;
+	net_peer_len[c] = 0;
+	if(c == 0) {
+		net_state[0] = NET_STATE_DISCONNECTED;
+		return;
+	}
+	/* a datagram lane has NO listener behind it — the bound socket was the endpoint, so
+	   closing it IS unbinding, and reporting Bound afterwards would name a socket that is
+	   gone. An accepted stream returns to the listener's pool, which is still up. */
+	if(was_dgram) {
+		net_state[c] = NET_STATE_UNBOUND;
+		return;
+	}
+	net_state[c] = net_listen_fd >= 0 ? NET_STATE_BOUND : NET_STATE_DISCONNECTED;
 }
 
 static void
@@ -172,6 +232,29 @@ net_clamp(Uint16 addr, Uint16 len)
 }
 
 /*
+IS THIS RESOLVED ADDRESS THE ANY-ADDRESS? Asked of the SOCKADDR, never of the string,
+because that is the only place the question has one answer: '*', 0.0.0.0, ::, 0, 0x0,
+::ffff:0.0.0.0 and an empty host all arrive at getaddrinfo as different text and leave it
+as the same in_addr. A guard that pattern-matched the spelling would refuse the two forms
+somebody thought of and wave through the rest — and every one of them opens the node.
+*/
+static int
+net_any_addr(struct addrinfo *list)
+{
+	struct addrinfo *ai;
+	for(ai = list; ai != NULL; ai = ai->ai_next) {
+		if(ai->ai_addr->sa_family == AF_INET
+			&& ((struct sockaddr_in *)ai->ai_addr)->sin_addr.s_addr == INADDR_ANY)
+			return 1;
+		if(ai->ai_addr->sa_family == AF_INET6
+			&& memcmp(&((struct sockaddr_in6 *)ai->ai_addr)->sin6_addr,
+				&in6addr_any, sizeof in6addr_any) == 0)
+			return 1;
+	}
+	return 0;
+}
+
+/*
 URI is COLON-separated, not slash-separated: scheme:host:port | host:port | scheme:host |
 host. Same shape uxn2 accepts, so the same address string works on both. Only stream/tcp
 and datagram/udp are known schemes; an unknown scheme is an error rather than a silent
@@ -181,13 +264,21 @@ failure as a plausible success.
 passive: resolve for BIND. Only there does the host '*' mean any-address, and only when it
 is written out; a MISSING host stays an error in both directions, because the convenient
 reading of "no host given" is the one that opens a port on every interface.
+
+TWO BIND-SIDE REFUSALS LIVE HERE, and they are different rules:
+  · a DATAGRAM bind refuses the any-address in every spelling. There is no handshake to
+    watch, the ROM merges what it reads, and the tailnet ACL is the entire authentication
+    story — so it binds a named address or it does not come up.
+  · a STREAM bind still takes a written-out '*' (step 2's contract), but no longer takes
+    0.0.0.0 or :: dressed as a host. Those were reaching bind(2) as ordinary named hosts
+    and opening every interface while this file claimed '*' was the only way to ask.
 */
 static int
 net_resolve(const char *uri, struct addrinfo **res, int passive)
 {
 	struct addrinfo hints;
 	char *s, *scheme, *host, *port, *service, *p;
-	int rv;
+	int rv, star;
 
 	s = strdup(uri);
 	if(s == NULL)
@@ -235,28 +326,45 @@ net_resolve(const char *uri, struct addrinfo **res, int passive)
 		else {
 			net_fail("unknown scheme", scheme);
 			free(s);
-			return EAI_SERVICE;
+			return NET_REFUSED;
 		}
 	}
 	if(port == NULL) {
 		net_fail("no port in address", uri);
 		free(s);
-		return EAI_SERVICE;
-	}
-	if(passive && hints.ai_socktype != SOCK_STREAM) {
-		/* listen() is meaningless on a datagram socket, and a bind that silently became
-		   connectionless would answer Bound while nothing could ever be accepted */
-		net_fail("bind", "only stream/tcp can be bound — no datagram listener in this build");
-		free(s);
-		return EAI_SERVICE;
+		return NET_REFUSED;
 	}
 	if(!passive && strcmp(host, "*") == 0) {
 		net_fail("connect", "'*' is a BIND address — there is nothing to dial");
 		free(s);
-		return EAI_NONAME;
+		return NET_REFUSED;
+	}
+	star = strcmp(host, "*") == 0;
+	if(passive && star && hints.ai_socktype != SOCK_STREAM) {
+		net_fail("bind", "a datagram listener takes a NAMED address, never '*' — nothing "
+			"handshakes on a datagram lane, so every host that can reach this node would "
+			"be inside the ROM's read loop, and uxn's only authentication is the tailnet ACL");
+		free(s);
+		return NET_REFUSED;
 	}
 
-	rv = getaddrinfo(passive && strcmp(host, "*") == 0 ? NULL : host, service, &hints, res);
+	rv = getaddrinfo(passive && star ? NULL : host, service, &hints, res);
+	if(rv == 0 && passive && !star && net_any_addr(*res)) {
+		/* the address resolved to 0.0.0.0/:: — the any-address under a host's name. It is
+		   refused rather than corrected, because "did you mean every interface" is a
+		   question only the ROM can answer and the wrong answer opens the node. */
+		if(hints.ai_socktype == SOCK_STREAM)
+			net_fail("bind", "that address IS the any-address (0.0.0.0/::) — write it out "
+				"as '*' if binding every interface is what you meant");
+		else
+			net_fail("bind", "that address IS the any-address (0.0.0.0/::), and a datagram "
+				"listener takes a NAMED address — there is no any-address form on this lane, "
+				"not even the written-out '*'");
+		freeaddrinfo(*res);
+		*res = NULL;
+		free(s);
+		return NET_REFUSED;
+	}
 	free(s);
 	return rv;
 }
@@ -322,7 +430,7 @@ net_connect(Uint16 addr)
 {
 	char uri[512];
 	struct addrinfo *res = NULL, *ai;
-	int rv, fd = -1;
+	int rv, fd = -1, dgram = 0;
 
 	net_drop(0);
 	if(!net_uri_from_ram(addr, uri, sizeof uri)) {
@@ -332,7 +440,8 @@ net_connect(Uint16 addr)
 	net_state[0] = NET_STATE_CONNECTING;
 	rv = net_resolve(uri, &res, 0);
 	if(rv != 0) {
-		net_fail(uri, gai_strerror(rv));
+		if(rv != NET_REFUSED) /* a refusal has already said why, in the right words */
+			net_fail(uri, gai_strerror(rv));
 		net_state[0] = NET_STATE_DISCONNECTED;
 		return;
 	}
@@ -340,8 +449,12 @@ net_connect(Uint16 addr)
 		fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
 		if(fd < 0)
 			continue;
-		if(net_connect_timed(fd, ai) == 0)
+		if(net_connect_timed(fd, ai) == 0) {
+			/* captured HERE: freeaddrinfo below takes the answer away, and every
+			   read/write branch downstream needs to know which kind of lane this is */
+			dgram = ai->ai_socktype == SOCK_DGRAM;
 			break;
+		}
 		close(fd);
 		fd = -1;
 	}
@@ -352,12 +465,25 @@ net_connect(Uint16 addr)
 		return;
 	}
 	net_fd[0] = fd;
+	net_lane_dgram[0] = (Uint8)dgram;
+	/* NOTE, stated because it is a real limit of this lane and not an oversight: a datagram
+	   connect() only records a peer — no packet leaves, so nothing on the far side has to
+	   exist for this to read Connected. What "connected" can mean for a connectionless
+	   socket is the open question the net-boundary task carries; it is NOT closed here. */
 	net_state[0] = NET_STATE_CONNECTED;
 }
 
 /*
-BIND (step 2). Synchronous: when this returns the listener is up, or it is not and every
-inbound lane says Unbound. There is no Binding window, so state 5 is never reported.
+BIND (step 2 stream, step 3 datagram). Synchronous: when this returns the listener is up,
+or it is not and every inbound lane says Unbound. No Binding window, so state 5 is never
+reported.
+
+A DATAGRAM BIND OCCUPIES EXACTLY THE SELECTED CHANNEL and no other, because there is
+nothing to accept: the bound socket IS the endpoint. The stream path fans one listener out
+across all eight lanes; the datagram path would have nothing to put in the other seven, and
+seven lanes reading Bound with no socket behind them is the plausible-wrong-answer class
+this file exists to refuse. Either kind of bind replaces whatever was bound before — two
+listeners would be one nobody is reading.
 
 A CHANNEL MUST BE SELECTED FIRST. Binding while channel 0 is selected is refused by name,
 because the state port would then answer for the outbound lane: the ROM would read
@@ -370,7 +496,7 @@ net_bind(Uint16 addr)
 {
 	char uri[512];
 	struct addrinfo *res = NULL, *ai;
-	int rv, fd = -1, on = 1, c = net_chan();
+	int rv, fd = -1, on = 1, dgram = 0, c = net_chan(), lane;
 
 	if(c < 0) {
 		net_fail("bind", "channel out of range — select 1..8 on port df first");
@@ -387,7 +513,8 @@ net_bind(Uint16 addr)
 	}
 	rv = net_resolve(uri, &res, 1);
 	if(rv != 0) {
-		net_fail(uri, gai_strerror(rv));
+		if(rv != NET_REFUSED)
+			net_fail(uri, gai_strerror(rv));
 		return;
 	}
 	for(ai = res; ai != NULL; ai = ai->ai_next) {
@@ -398,11 +525,16 @@ net_bind(Uint16 addr)
 		   TIME_WAIT. REUSEPORT is deliberately NOT set — it would let a second process
 		   silently share the port, and "someone else answered" is unattributable. */
 		setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof on);
+		/* listen(2) is meaningless on a datagram socket — the ORIGINAL reason this whole
+		   scheme was refused. It is skipped, never faked: a bind that quietly became a
+		   stream would answer Bound while nothing could ever arrive on it. */
+		dgram = ai->ai_socktype == SOCK_DGRAM;
 		if(bind(fd, ai->ai_addr, ai->ai_addrlen) == 0
-			&& listen(fd, NET_MAX_CHANNELS) == 0)
+			&& (dgram || listen(fd, NET_MAX_CHANNELS) == 0))
 			break;
 		close(fd);
 		fd = -1;
+		dgram = 0;
 	}
 	freeaddrinfo(res);
 	if(fd < 0) {
@@ -411,10 +543,19 @@ net_bind(Uint16 addr)
 		net_fail(uri, strerror(errno));
 		return;
 	}
-	net_listen_fd = fd;
-	for(c = 1; c <= NET_MAX_CHANNELS; c++)
+	if(dgram) {
+		net_deadlines(fd);
+		net_fd[c] = fd;
+		net_lane_dgram[c] = 1;
+		net_peer_len[c] = 0;
 		net_state[c] = NET_STATE_BOUND;
-	net_say("bound", uri, uxn.dev[NET_CHANNEL]);
+		net_say("bound (datagram)", uri, c);
+		return;
+	}
+	net_listen_fd = fd;
+	for(lane = 1; lane <= NET_MAX_CHANNELS; lane++)
+		net_state[lane] = NET_STATE_BOUND;
+	net_say("bound", uri, c);
 }
 
 /*
@@ -480,6 +621,11 @@ net_live_state(int c)
 	tv.tv_usec = 0;
 	if(select(net_fd[c] + 1, &rf, NULL, NULL, &tv) <= 0)
 		return NET_STATE_CONNECTED;
+	/* A DATAGRAM SOCKET HAS NO EOF, so the peek below cannot be run on one: a legal EMPTY
+	   packet peeks as 0 bytes, which on a stream means "the peer closed" — and the lane
+	   would be torn down by any host willing to send nothing. Readable IS HasData here. */
+	if(net_lane_dgram[c])
+		return NET_STATE_HASDATA;
 	n = recv(net_fd[c], &b, 1, MSG_PEEK);
 	if(n > 0)
 		return NET_STATE_HASDATA;
@@ -490,6 +636,33 @@ net_live_state(int c)
 	return NET_STATE_CONNECTED;
 }
 
+/*
+THE DATAGRAM WAIT — the accept poll's counterpart, and the same deliberate blocking read.
+
+An inbound datagram lane is never CONNECTED: there is no peer relationship to be in, and
+naming one would tell a ROM it holds something that will not be there for the next packet.
+It answers BOUND (the socket is up, nothing arrived within the deadline) or HASDATA (a
+packet is queued) — which is also why a ROM can poll it in a loop without a spin: the wait
+is the device's, with the same UXN_NET_TIMEOUT as every other op, so a silent wire surfaces
+as a readable state and never as a hang.
+*/
+static Uint8
+net_dgram_state(int c)
+{
+	fd_set rf;
+	struct timeval tv;
+
+	if(net_fd[c] < 0)
+		return NET_STATE_UNBOUND;
+	FD_ZERO(&rf);
+	FD_SET(net_fd[c], &rf);
+	tv.tv_sec = net_timeout_secs();
+	tv.tv_usec = 0;
+	if(select(net_fd[c] + 1, &rf, NULL, NULL, &tv) <= 0)
+		return NET_STATE_BOUND; /* nobody sent — the socket is fine, which is the point */
+	return NET_STATE_HASDATA;
+}
+
 static Uint8
 net_chan_state(int c)
 {
@@ -497,6 +670,8 @@ net_chan_state(int c)
 		return NET_STATE_UNBOUND; /* an out-of-range channel addresses no endpoint */
 	if(c == 0)
 		return net_live_state(0);
+	if(net_lane_dgram[c])
+		return net_dgram_state(c); /* nothing to accept: the bound socket is the endpoint */
 	if(net_listen_fd < 0)
 		return NET_STATE_UNBOUND;
 	if(net_fd[c] < 0 && !net_accept_into(c))
@@ -509,7 +684,73 @@ net_handle(int c)
 {
 	if(c < 0 || net_fd[c] < 0)
 		return 0;
-	return c == 0 ? NET_OUT_HANDLE : (Uint16)(0x0100 | c);
+	if(c == 0)
+		return NET_OUT_HANDLE;
+	/* 0x02xx says datagram, 0x01xx says accepted stream. A ROM that could not tell them
+	   apart would read a bound socket as a caller that had already arrived. */
+	return (Uint16)((net_lane_dgram[c] ? 0x0200 : 0x0100) | c);
+}
+
+/*
+RECVFROM (step 3). Three things a stream recv can assume and a datagram recv cannot:
+
+  · n == 0 IS NOT A CLOSE. It is a legal EMPTY packet. Reading it as an orderly close, the
+    way the stream path correctly does, would hand any host that can reach the port a
+    one-packet teardown of our listener — a remote unbind, spelled as a normal read.
+  · A DATAGRAM TOO BIG FOR THE BUFFER IS DISCARDED, LOUDLY, not delivered short. The
+    kernel truncates silently and the ROM cannot see the cut, so half a record would parse
+    as a whole shorter one. MSG_TRUNC makes the real size visible where it exists; where it
+    does not, a packet that exactly fills the buffer is called out as possibly cut, because
+    "cannot tell" must not print as "fine".
+  · THE SENDER IS THE ONLY REPLY ADDRESS. The socket is unconnected by construction, so it
+    is recorded here or a reply has nowhere to go. It is recorded even for a packet we then
+    refuse: who sent it is still true.
+
+An empty packet and an expired deadline both leave the ROM reading length 0 — the ports
+have no way to separate them — so both say which they were on stderr. That is the honest
+limit of a 16-bit length register, stated rather than papered over.
+*/
+static void
+net_dgram_read(int c, Uint16 addr, Uint16 len)
+{
+	struct sockaddr_storage from;
+	socklen_t flen = sizeof from;
+	ssize_t n;
+	int flags = 0;
+#ifdef MSG_TRUNC
+	flags = MSG_TRUNC; /* returns the REAL datagram size, so an oversized one is detectable */
+#endif
+	memset(&from, 0, sizeof from);
+	n = recvfrom(net_fd[c], &uxn.ram[addr], len, flags, (struct sockaddr *)&from, &flen);
+	if(n < 0) {
+		if(errno == EAGAIN || errno == EWOULDBLOCK) {
+			net_fail("read", "no datagram within the deadline — length 0, still bound");
+			return;
+		}
+		net_fail("read", strerror(errno));
+		net_drop(c);
+		return;
+	}
+	if(flen > 0 && flen <= sizeof from) {
+		memcpy(&net_peer[c], &from, sizeof from);
+		net_peer_len[c] = flen;
+	}
+	if((size_t)n > (size_t)len) {
+		fprintf(stderr, "net: read: datagram of %ld bytes does not fit %u — DISCARDED, "
+			"raise the length; a short record reads as a whole smaller one\n",
+			(long)n, (unsigned)len);
+		fflush(stderr);
+		return;
+	}
+#ifndef MSG_TRUNC
+	if((size_t)n == (size_t)len)
+		net_fail("read", "datagram exactly filled the buffer — it MAY have been truncated "
+			"and this build cannot tell (no MSG_TRUNC); raise the length to be sure");
+#endif
+	if(n == 0)
+		net_fail("read", "empty datagram received — length 0, and the lane is NOT closed "
+			"(a datagram socket has no close)");
+	net_success_length = (Uint16)n;
 }
 
 static void
@@ -521,12 +762,16 @@ net_read(void)
 
 	net_success_length = 0;
 	if(c < 0 || net_fd[c] < 0) {
-		net_fail("read", "not connected");
+		net_fail("read", "no endpoint on this channel — nothing connected or bound");
 		return;
 	}
 	len = net_clamp(addr, net_buffer_length);
 	if(len == 0)
 		return;
+	if(net_lane_dgram[c]) {
+		net_dgram_read(c, addr, len);
+		return;
+	}
 	n = recv(net_fd[c], &uxn.ram[addr], len, 0);
 	if(n < 0) {
 		if(errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -554,20 +799,36 @@ net_write(void)
 
 	net_success_length = 0;
 	if(c < 0 || net_fd[c] < 0) {
-		net_fail("write", "not connected");
+		net_fail("write", "no endpoint on this channel — nothing connected or bound");
 		return;
 	}
 	len = net_clamp(addr, net_buffer_length);
 	if(len == 0)
 		return;
-	n = send(net_fd[c], &uxn.ram[addr], len, 0);
+	if(net_lane_dgram[c] && c > 0) {
+		/* A BOUND DATAGRAM LANE REPLIES TO WHOEVER LAST WROTE TO IT and to nobody else:
+		   the socket is unconnected, so send(2) has no destination, and inventing one —
+		   the last peer of some other lane, a broadcast — is the class of guess this file
+		   refuses. With nothing received yet there is no address, and that is said. */
+		if(net_peer_len[c] == 0) {
+			net_fail("write", "no datagram sender recorded on this lane — a bound datagram "
+				"lane replies to the last packet it read, so read one first");
+			return;
+		}
+		n = sendto(net_fd[c], &uxn.ram[addr], len, 0,
+			(struct sockaddr *)&net_peer[c], net_peer_len[c]);
+	} else
+		n = send(net_fd[c], &uxn.ram[addr], len, 0);
 	if(n < 0) {
 		if(errno == EAGAIN || errno == EWOULDBLOCK) {
 			net_fail("write", "timed out — length 0, still connected");
 			return;
 		}
 		net_fail("write", strerror(errno));
-		net_drop(c);
+		/* a datagram lane survives a failed send: not reaching ONE peer says nothing about
+		   the socket, and the next packet may come from somebody else entirely */
+		if(!net_lane_dgram[c])
+			net_drop(c);
 		return;
 	}
 	net_success_length = (Uint16)n; /* a short write is REPORTED, never retried silently */

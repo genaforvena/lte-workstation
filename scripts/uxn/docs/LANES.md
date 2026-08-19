@@ -486,6 +486,97 @@ answering `uxn:ping-from-mesh-home`, 2026-07-24). Presence is not capability; a 
 carry the device and still not listen, and bind/accept is where a statically linked libc
 could plausibly differ from the host's.
 
+## Network device — step 3, the DATAGRAM listener (0xd0, 2026-08-19)
+
+Step 2's `net_resolve` parsed `datagram`/`udp` as a known scheme and would **connect** one,
+while the bind path refused it in one line: *"only stream/tcp can be bound — no datagram
+listener in this build"*. That refusal was correct — `listen()` is meaningless on a datagram
+socket, and a bind that silently became a stream would answer `Bound` while nothing could
+ever arrive. Step 3 does not weaken it; it adds the listener the refusal was standing in for,
+because the gossip lane needs a receiver that no one has to dial: a phone holding only
+`uxncli` should be a full participant, not the weak link that has to be polled by somebody
+with a shell.
+
+**A datagram lane is not a stream lane wearing a scheme**, and each difference is readable at
+the ports rather than hidden behind them:
+
+- a stream bind fans **one** listener across all eight inbound lanes and every state read on
+  one is an accept. A datagram bind occupies **the selected channel only** — there is nothing
+  to accept, so there would be nothing to put in the other seven, and seven lanes answering
+  `Bound` over no socket is a true-looking answer to a question the ROM never asked.
+- a datagram lane never reads **Connected**. `Bound` = up and quiet, `HasData` = a packet is
+  queued. Naming a peer relationship would name something that does not exist and will not
+  exist for the next packet either.
+- the handle (`db`) names the **family**: `1` outbound, `0x01xx` an accepted stream, `0x02xx`
+  a bound datagram socket. It is also the only read that touches no socket, so it is how a
+  ROM asks "did the bind take?" without spending a deadline — the trap `net-listen.tal`
+  documents and `sysfs-serve.tal` was bitten by.
+- **polling a datagram lane is safe.** On an inbound stream lane the state read *is* the
+  accept, so one extra poll eats the next caller (the whole subject of `test-sysfs-serve`).
+  On a datagram lane the state read is a `select()` and nothing else: it never consumes the
+  packet.
+- a write on a bound datagram lane goes to **whoever last wrote to it** — the socket is
+  unconnected, `send(2)` has no destination, and inventing one (another lane's peer, a
+  broadcast) is the guess this device refuses everywhere else. With nothing read yet there is
+  no address and the write is refused by name.
+
+**The any-address rule is STRICTER here, and the asymmetry is the security story.** A stream
+peer must complete a handshake this node can see; a datagram sender is already inside the
+ROM's read loop, and the ROM this lane exists for merges what it reads into a ledger. uxn
+carries no crypto — the tailnet ACL is the entire authentication, and an ACL means nothing if
+the socket is not on the tailnet address. So a datagram bind takes a **named** address: `*`,
+`0.0.0.0`, `0`, `0x0` and a missing host are all refused. The guard is made against the
+**resolved sockaddr, never the text**, because those are four spellings of one `in_addr` and
+a pattern list catches the two you thought of. The same check closed a hole in the *stream*
+lane, which had claimed since step 2 that any-address was "the explicit `*` and nothing else"
+while `tcp:0.0.0.0:port` walked through as an ordinary named host and opened every interface:
+a doctrine the code does not enforce is a comment. Written-out `tcp:*:port` still binds —
+that contract is unchanged.
+
+**Three things a stream `recv` may assume and a datagram `recvfrom` may not**, each of which
+would otherwise be a remotely triggerable fault:
+
+- `n == 0` **is not a close.** It is a legal empty packet. Reading it the way the stream path
+  correctly does hands anything that can reach the port a one-packet teardown of the
+  listener — a remote unbind, spelled as an ordinary read.
+- **an oversized datagram is discarded, loudly, not delivered short.** The kernel truncates
+  silently and the ROM cannot see the cut, so half a record arrives looking exactly like a
+  whole smaller one — the one shape a gossip receiver must never merge. `MSG_TRUNC` makes the
+  real size visible where it exists; where it does not, a packet that exactly fills the
+  buffer is called out as *possibly* cut, because "cannot tell" must not print as "fine".
+- **the sender is the only reply address**, so it is recorded on every read — including one we
+  then refuse. Who sent it is still true.
+
+An empty packet and an expired deadline both leave the ROM reading length 0; the ports cannot
+separate them, so both say which they were on stderr. That is the honest limit of a 16-bit
+length register, stated rather than papered over.
+
+**Identify moved `d002` → `d003`,** and that is half a change on its own: `mesh-uxn-drift`
+(cadence 23, every 6h) reads the `NET_IDENT` define and compares it against what the RUNNING
+binary answers, so a bump without a rebuild reads as drift on a node whose source is perfectly
+correct. Bump, rebuild, and cross-build for the compiler-less nodes in one change. ROMs still
+compare it as an **ordering**, so `net-echo` (needs 1) and `net-listen` (needs 2) are
+untouched by the bump; `net-dgram.tal` refuses below 3. The drift tool's own skew control used
+to be the literal `d001` typed beside the message "d001 vs source d002" — a hand-maintained
+constant next to the thing it describes, which on this bump would have kept passing while
+asserting nothing. It now derives the skew value **down from the source** and prints both.
+
+`net-dgram.tal` is the gate ROM: one `udp:host:port` on stdin, bind, wait, read the packet,
+reply `uxn:` + those bytes to whoever sent it. Same tag discipline as `net-listen` — an echo
+responder, a stray `socat`, or a sender reading its own buffer all produce the payload, and
+only the ROM produces `uxn:`.
+
+Gate: `test-net-device`, extended with **live datagram legs in both directions over the
+tailnet** — mesh-home's `net-echo.rom` sends `ping-uxn-dgram` to phaedra's `socat
+UDP-RECVFROM` and reads `PING-UXN-DGRAM` back, and phaedra sends a packet to **our**
+`net-dgram.rom` bound on this node's tailscale address and gets `uxn:ping-from-peer`. The
+loopback datagram leg is labelled as claiming the *mechanism only*: a round trip on 127.0.0.1
+chooses no route, consults no ACL, and cannot get the one address the entire security argument
+rests on wrong. Five new source mutants required RED — the any-address refusal removed, the
+resolved-sockaddr check removed, the datagram deadline removed (a silent wire that never
+returns), an empty datagram read as a close, and an oversized datagram delivered instead of
+discarded.
+
 ## The hop's NET LANE — a ROM that receives a ROM (2026-07-24)
 
 The hop's pipe lane ships code over ssh: `mesh-uxn-hop --pack filter.rom < text | ssh node
