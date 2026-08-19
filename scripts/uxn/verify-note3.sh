@@ -33,6 +33,7 @@ CROSS="${CROSS:-arm-linux-gnueabihf-gcc}"
 NPORT="${NOTE3_NET_PORT:-47312}"
 command -v "$CROSS" >/dev/null || { echo "need $CROSS (apt install gcc-arm-linux-gnueabihf)"; exit 2; }
 adb get-state >/dev/null 2>&1 || { echo "no adb device"; exit 2; }
+bind_ran=no; hop_ran=no   # a leg that did not run must not be claimed by the summary
 
 # 1) static armhf emulator (bionic has no glibc loader; static = pure-syscall, runs under the
 #    Android kernel). The compile line itself lives in cross-build.sh — ONE copy, shared with
@@ -48,6 +49,7 @@ adb push net-echo.rom      "$D/net-echo.rom" >/dev/null
 adb push net-listen.rom    "$D/net-listen.rom" >/dev/null
 adb push hop-serve.rom     "$D/hop-serve.rom" >/dev/null
 adb push rot13-net.rom     "$D/rot13-net.rom" >/dev/null
+adb push arith64-test.rom  "$D/arith64-test.rom" >/dev/null
 # prove byte-identity by pulling the on-device rom back and cmp'ing (Android shell has no sha1sum)
 adb pull "$D/lease-gate.rom" /tmp/rom.fromnote3 >/dev/null 2>&1
 if cmp -s lease-gate.rom /tmp/rom.fromnote3; then
@@ -108,6 +110,7 @@ esac
 PHONE_IP="${NOTE3_IP:-$(adb shell "ip -4 addr show wlan0" 2>/dev/null | grep -o 'inet [0-9.]*' | awk '{print $2}' | head -1)}"
 if [ -z "$PHONE_IP" ]; then
   echo "note3  bind round trip: n/a — no wlan0 address on the phone (it did NOT run)"
+  bind_ran=no
 else
   expect="uxn:ping-from-$(hostname)"
   adb shell "su -c 'cd $D && UXN_NET_TIMEOUT=25 ./uxncli net-listen.rom tcp:$PHONE_IP:$NPORT'" >/tmp/note3-listen.out 2>&1 &
@@ -122,6 +125,7 @@ else
   wait "$lpid" 2>/dev/null || true
   if [ "$reply" = "$expect" ]; then
     echo "note3  LIVE bind round trip: $(hostname) -> $PHONE_IP:$NPORT, the PHONE's uxncli answered '$reply'"
+    bind_ran=yes
   else
     echo "note3  LIVE bind round trip FAILED: want '$expect', got '$reply' (phone said: $(head -2 /tmp/note3-listen.out | tr '\n' ' '))"; rc=1
   fi
@@ -137,6 +141,7 @@ fi
 #    The token is generated PER RUN, so a pass cannot come from a constant baked anywhere.
 if [ -z "${PHONE_IP:-}" ]; then
   echo "note3  hop net lane: n/a — no wlan0 address (it did NOT run)"
+  hop_ran=no
 else
   HTOK="$(head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n')"
   hexp="$(printf 'Hello from mesh-home' | tr 'A-Za-z' 'N-ZA-Mn-za-m')"
@@ -148,10 +153,52 @@ else
   wait "$hpid" 2>/dev/null || true
   if [ "$hgot" = "$hexp" ]; then
     echo "note3  HOP NET LANE: shipped rot13-net.rom over TCP and the PHONE's uxncli became it — '$hgot' (no shell on the far side)"
+    hop_ran=yes
   else
     echo "note3  HOP NET LANE FAILED: want '$hexp', got '$hgot' (phone said: $(head -3 /tmp/note3-hop.out | tr '\n' ' '))"; rc=1
   fi
 fi
 
-[ "$rc" = 0 ] && echo "verify-note3: ok — identical ROM, matching verdicts on armeabi-v7a, net device live at step >= 2, the phone answered a real inbound connection, and it ran a ROM that arrived over the socket" || echo "verify-note3: FAIL"
+# 7) THE 64-BIT ARITHMETIC, ON THE PHONE. The whole point of arith64 is that a verdict
+#    computed from wide numbers means the same thing on both machines, and the place that
+#    could plausibly differ is exactly here: the carry chain is unsigned-wrap comparisons,
+#    and a 32-bit ARM libc/compiler is where a wrong-width intermediate would show up. The
+#    ROM is unmodified and its byte-identity is proven at step 2 for lease-gate; this
+#    re-proves it for arith64-test and then requires every row of the HOST's own truth
+#    table to come back identical from the phone.
+#    adb shell READS STDIN, so the row loop feeds from fd 3 and every adb call gets
+#    </dev/null — otherwise adb swallows the table and one row masquerades as all of them.
+adb pull "$D/arith64-test.rom" /tmp/rom64.fromnote3 >/dev/null 2>&1
+if cmp -s arith64-test.rom /tmp/rom64.fromnote3; then
+  a64ok=0; a64bad=0
+  while read -r op a b want <&3; do
+    [ -n "${op:-}" ] || continue
+    printf '%s\n%s\n%s\n' "$op" "$a" "$b" > /tmp/in64.txt
+    adb push /tmp/in64.txt "$D/in64.txt" >/dev/null 2>&1 </dev/null
+    got="$(adb shell "su -c 'cd $D && ./uxncli arith64-test.rom < in64.txt'" 2>/dev/null </dev/null | tr -d '\r' | tail -1)"
+    if [ "$got" = "$want" ]; then a64ok=$((a64ok+1)); else
+      a64bad=$((a64bad+1)); [ "$a64bad" -le 3 ] && echo "note3  arith64 op=$op a=$a b=$b: host $want, phone $got"
+    fi
+  done 3< <(./test-arith64 --table)
+  if [ "$a64bad" = 0 ] && [ "$a64ok" -ge 30 ]; then
+    echo "note3  ARITH64: $a64ok/$a64ok rows identical on armeabi-v7a from the same $(wc -c <arith64-test.rom)b rom"
+  else
+    echo "note3  ARITH64 FAILED: $a64bad row(s) differ, $a64ok agreed (a table of $((a64ok+a64bad)) rows)"; rc=1
+  fi
+else
+  echo "note3  arith64 rom DIFFERS host<->note3"; rc=1
+fi
+
+# The summary names only what ACTUALLY RAN. The net legs render n/a whenever the phone has no
+# wlan0 address, and a fixed sentence that credits them anyway turns an honest skip into a
+# false claim — the failure this whole file exists to make impossible.
+if [ "$rc" = 0 ]; then
+  summary="verify-note3: ok — identical ROM, matching verdicts on armeabi-v7a, net device live at step >= 2, and its 64-bit carry chain agrees with the host row for row"
+  [ "$bind_ran" = yes ] && summary="$summary; the phone answered a real inbound connection"
+  [ "$hop_ran"  = yes ] && summary="$summary; it ran a ROM that arrived over the socket"
+  [ "$bind_ran" = yes ] || [ "$hop_ran" = yes ] || summary="$summary (the two net legs did NOT run — no wlan0 address)"
+  echo "$summary"
+else
+  echo "verify-note3: FAIL"
+fi
 exit $rc

@@ -39,6 +39,7 @@ if [ "${1:-}" = --rom ]; then
   ./bin/uxnasm spearman.tal spearman.rom
   ./bin/uxnasm series-stats.tal series-stats.rom
   ./bin/uxnasm arith32-test.tal arith32-test.rom
+  ./bin/uxnasm arith64-test.tal arith64-test.rom
   ./bin/uxnasm net-echo.tal net-echo.rom
   ./bin/uxnasm fletcher16.tal fletcher16.rom
   ./bin/uxnasm permcheck.tal permcheck.rom
