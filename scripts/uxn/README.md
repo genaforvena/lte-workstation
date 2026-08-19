@@ -1,552 +1,173 @@
-# uxn-pilot-gate — a mesh reflex gate as a portable Uxn ROM
+# mesh-uxn-core
 
-**Operator eval (2026-07-20):** can a real reflex gate be a tiny, portable
-[Uxn](https://wiki.xxiivv.com/site/uxn.html) ROM instead of host shell? Port one gate,
-prove it catches a real regression the canonical *self-grep* gate is blind to, and run the
-**byte-identical ROM** on both the x86 workstation and the 32-bit ARM Note3.
+**The gates, senses and predicates of a computer mesh, compiled to tiny
+[Uxn](https://wiki.xxiivv.com/site/uxn.html) ROMs** — artifacts from 72 bytes to 25 KB that run
+byte-identically on an x86 workstation, a server, and a 2013 Android phone, instead of host
+shell that rots differently on each of them.
 
-## What was ported
-
-`mesh-reflex-health`'s **lease-vs-cadence invariant** (`eff_maxage @auto`): a watchdog's
-lease/max-age **must be ≥ 2× the producer's cron cadence**, or the reflex reads `STALE`
-every cycle while perfectly healthy (memory: `a-lease-must-exceed-its-producers-cadence`).
-Pure arithmetic — the ideal first thing to move off shell into a stack machine.
-
-- **`lease-gate.tal`** — the gate, 44 lines of uxntal. Reads `cadence` then `lease` as
-  newline-terminated argv tokens, parses decimal in-ROM, computes `lease ≥ 2·cadence`,
-  prints `OK` / `RED`, halts.
-- **`lease-gate.rom`** — assembled, **134 bytes**. This is the portable artifact.
-- **`mesh-lease-gate`** — the host shim (**~20 lines of logic**). Resolves a reflex's
-  `(cadence, lease)` from a fixtures table (or `--pair a b`) and hands the two integers to
-  the ROM. The gate *logic* is in the ROM; the shim only marshals inputs and maps the
-  verdict to exit 0 / 1.
-- **`lease-fixtures`** — `name cadence lease` rows (stand-in for the live cron + lease decls).
-- **`mesh-lease-audit`** — the **load-bearing live resolver** (the fixtures stand-in was a mock).
-  It gates the WHOLE live reflex set through the same ROM: for every reflex that self-declares a
-  `# reflex-cadence:` header it resolves two *independent* integers — **cadence** from the header
-  (what the reflex says it runs at) and **lease** from `mesh-reflex-health`'s `eff_maxage` (what
-  its liveness watchdog tolerates) — and hands them to the ROM. See "Live audit" below.
-- **`band-gate.tal` / `band-gate.rom` / `mesh-band-gate`** — a **second gate CLASS**: a compound
-  two-edged boundary `lo ≤ value ≤ hi`, RED past either edge. Proves the ROM pattern generalizes
-  beyond lease's single `≥` comparison. See "Second gate class" below.
-- **`src/`, `build.sh`** — vendored Uxn toolchain (`uxnasm` + `uxncli`, MIT, Devine Lu
-  Linvega et al.). **Modern post-2022 ISA** (JCI/JMI/JSI) — vendor-swapped 2026-07-23 from
-  `~rabbits/uxn` (uxnasm from `archive/`, uxncli+core from `src/` @ `43453d7`; provenance in
-  `build.sh`) so chibicc-compiled ROMs run (`chibicc-eval/EVAL.md`); the pre-2022-ISA
-  toolchain it replaced lives in git history. `build.sh` compiles the ~42 KB emulator **per
-  platform**; the ROM it runs is identical everywhere. Halt convention is modern: ROMs end
-  with `#80 #0f DEO` (exit code = `state & 0x7f` = 0 when a verdict was rendered) — the
-  verdict itself is TEXT (`OK`/`RED`), never the exit code.
-
-## Build & run
+Everything needed to build and run it is in this repository: a stock Uxn emulator (`src/`),
+the chibicc C→uxntal compiler (`chibicc/`), the ROMs (`*.tal`/`*.c` → `*.rom`), their host
+shims (`mesh-*`), and a test per ROM that was **seen failing before it passed** (`test-*`).
 
 ```sh
-./build.sh --rom                 # compile uxnasm+uxncli for this host, assemble the ROM
-./mesh-lease-gate ambient-clock  # resolve from fixtures -> OK/RED, exit 0/1
-./mesh-lease-gate --pair 900 900 # gate two raw integers -> RED (lease==cadence)
-./test-lease-gate                # the RED-first proof
+./build.sh --rom                 # build uxnasm + uxncli for this host, assemble every ROM
+./mesh-lease-gate --pair 900 900 # decide a real invariant  ->  RED, exit 1
+./test-lease-gate                # the proof: break the ROM's arithmetic, watch it go red
 ```
 
-## The RED-first proof (`test-lease-gate`)
+## Why a ROM instead of a shell script
 
-The doctrine's canonical vacuous gate is a **self-grep**: `grep -q '2*cadence' "$0"` — it
-asserts a *string is present in the source*, never that the *number is right*, and so can
-never fail on bad data (CLAUDE.md, the 33/52 self-matching-gate sweep 1969a5d).
+A mesh reflex is guarded by a *gate*: a small predicate that says whether a reading is
+healthy. Written in shell, the commonest form of that gate is
 
-We break the guarded fix — a reflex whose **lease drops to 1× its cadence** (the real
-regression) — and watch the two gates disagree:
+```sh
+grep -q '2*cadence' "$0"     # "the formula is in my source, so I must be correct"
+```
 
-| input `cad=900 lease=900` | self-grep gate | ROM gate |
+which asserts that **a string exists in its own text**, does no arithmetic, and therefore
+can never fail on bad data. A sweep of the parent mesh found 33 of 52 such gates matching
+nothing but themselves.
+
+A gate compiled to a stack machine has nowhere to hide: it consumes the numbers and returns
+a verdict. Corrupt the ROM's math and its test goes red. And because the ROM is a **fixed
+point** — decided once at assembly time, byte-identical afterwards — the workstation and
+the phone cannot quietly disagree about what the rule was.
+
+Three properties follow, and they are what this repository is really about:
+
+| | |
+|---|---|
+| **Portable** | the emulator is per-platform (~56 KB of C89); the ROM above it is one file, unchanged everywhere |
+| **Pinnable** | a ROM has a sha1 that can be declared, shipped, and **verified at the moment of execution** rather than claimed |
+| **Mobile** | a ROM is small enough to travel *in-band with its data* — over a pipe, over ssh, or over a socket into an emulator that becomes it |
+
+## The five rules every ROM here follows
+
+1. **The test must have been red.** Each `test-*` rebuilds its ROM from deliberately
+   corrupted source and requires the truth table to fail. A table that cannot fail is not a
+   table.
+2. **Absence answers `NA`, never a number.** No engine, no ROM, no reading → verdict text
+   `NA`, exit code 2, reason on stderr. A silent default is a failure wearing a success's
+   clothes.
+3. **The verdict is text; the exit code only mirrors it.** `OK`/`RED`/`NA` → 0/1/2.
+4. **Out of domain is not a wrapped answer.** The machine is 16-bit; overflow, underflow,
+   `/0`, bad arity and oversize input all answer `NA` rather than a plausible wrong number.
+5. **Hash, then execute.** Any ROM that arrives from somewhere else is hashed against a
+   declared sha1 *before* a byte of it runs, and the execution site stamps what it actually
+   ran.
+
+## What's in the box
+
+### Gate ROMs — one predicate, one artifact
+
+| ROM | size | decides |
+|---|---:|---|
+| `lease-gate` | 200 B | a watchdog's lease is ≥ 2× the producer's cadence (else the reflex reads STALE while healthy) |
+| `band-gate` | 165 B | a two-edged window `lo ≤ v ≤ hi` — a battery longevity band, a thermal window |
+| `hyst-gate` | 582 B | hysteresis: onset and recovery decided by **one** gate carrying prior state |
+| `sense-gate` | 305 B | a sensor read is *real* — enough axes, recent enough, and it moved (the hollow-sense signature) |
+| `permcheck` | 1013 B | a claimed-sorted stream is a genuine permutation of the original, one streaming pass — verify, don't recompute |
+| `board-check` | 24.7 KB | structural invariants over a coordination log: line shape, timestamp monotonicity, unknown node, double-claim |
+
+### Measurement ROMs — reduce a series to one calibrated number
+
+| ROM | size | answers |
+|---|---:|---|
+| `spearman` | 1307 B | rank correlation `rho×1000`, integer, no floats, up to n=2343 |
+| `series-stats` | 1365 B | `min max med2 cnt sum mean1000`; `med2` is twice the median so even-n is exact |
+| `fletcher16` | 160 B | a rolling checksum whose *function* is itself a pinned, verifiable artifact |
+
+### Arithmetic limbs — the ceiling on a 16-bit machine, lifted twice
+
+| ROM | size | provides |
+|---|---:|---|
+| `arith32` | (library) | 32-bit add/sub/cmp/mul — what took `spearman` from a 58-row demo to the real series |
+| `arith64` | (library) | 64-bit quad-word add/sub/cmp/mul/accumulate, same discipline, fully unrolled |
+
+Both ship a self-testing ROM (`arith32-test`, `arith64-test`) whose boundary table is the
+authority for carry coverage. Their lesson, learned the hard way: **the max-domain input is
+the weakest place to hunt a carry bug** — a lost high word disappears below the printed
+resolution exactly where the numbers look most impressive.
+
+### Network ROMs — the emulator gets an addressable socket (device `0xd0`)
+
+| ROM | size | does |
+|---|---:|---|
+| `net-echo` | 297 B | dial a `tcp:host:port`, write, read, print the reply — the smallest real round trip |
+| `net-listen` | 328 B | bind, wait for a caller, answer with `uxn:`+payload — the far node needs no shell |
+| `net-ident` | 72 B | probe which step of the device this emulator actually has (a net-blind build must not read as a refusal) |
+| `sysfs-serve` | 338 B | serve a phone's sysfs over TCP — a sense transport for a body whose ssh is gone |
+
+### Mobile code — a program travelling with its data
+
+| ROM | size | does |
+|---|---:|---|
+| `rot13` / `route` | 106 / 263 B | the canonical pipe-stage payloads: a filter, and a prefix router that demuxes two channels over one pipe |
+| `hop-dial` / `hop-serve` | 434 / 1380 B | the net lane: `hop-serve` reads an arriving ROM, relocates a position-independent copier, and **becomes it** — holding the live connection across the swap |
+| `lisp-eval` | 3992 B | a micro s-expression evaluator: the *predicate itself* is data, so recalibration is a text diff, not a rebuild |
+
+### Host shims — the shell that marshals, never decides
+
+`mesh-lease-gate` · `mesh-band-gate` · `mesh-sense-gate` · `mesh-board-check` ·
+`mesh-spearman` · `mesh-series-stats` · `mesh-sexpr-gate` · `mesh-uxn-hop` ·
+`mesh-body-gate` · `mesh-note3-uxn-accel` — each one resolves inputs, runs a ROM, maps the
+verdict to an exit code. The logic stays in the ROM; if a shim starts deciding things, that
+is the bug.
+
+Four are audits and watchers rather than single gates: **`mesh-lease-audit`** puts the whole
+live reflex set through `lease-gate.rom`; **`mesh-rom-calibrate`** runs the ROM *and* native
+64-bit shell arithmetic on the same inputs and logs every pair, so agreement is weak evidence
+and disagreement is loud; **`mesh-log-attest`** makes an append-only log's append-only-ness
+verifiable instead of conventional; **`mesh-uxn-drift`** watches the one thing that *can*
+drift — the emulator binary, since the ROMs cannot.
+
+## Portability — one ROM, four platforms
+
+`build.sh` builds the emulator for the host; `cross-build.sh arm64|armhf` cross-builds a
+static one to push to a phone. The ROM is never rebuilt.
+
+| target | emulator | status |
 |---|---|---|
-| verdict | **GREEN** (string still present — blind) | **RED** (900 < 1800 — caught) |
+| x86_64 host | 56,856 B dynamic | the build and test platform |
+| armhf (Note3, 2013, armeabi-v7a) | 674,652 B static | **verified on the device** — identical ROM, matching verdicts, binds and answers a dial from the workstation |
+| arm64 (Android 8+ bodies) | 1,013,392 B static | built and driven under `qemu-user`; **no physical device has run it yet** |
+| x86_64 peer, no compiler | pushed binary | serves a ROM shipped over the tailnet |
 
-Seen RED-first: the ROM truth table asserts the boundary is inclusive (`1800` OK, `1799`
-RED, `1801` OK) and that `lease==cadence` goes RED; corrupting the ROM's `#0002 MUL2` → `#0001`
-makes the bug config wrongly pass, proving the ROM does the arithmetic, not a constant.
+`--check` drives the cross-built binary instead of describing it: it must **compute** the
+truth table, **identify** the net device, and **accept** a real inbound connection. No qemu
+for that arch → exit 2, honest n/a, reported as built-but-not-run.
 
-## Live audit (`mesh-lease-audit`) — the resolver made load-bearing
+The furthest this goes: the workstation ships `rot13-net.rom` over TCP to a 2013 phone
+carrying **only a static `uxncli`** — no shell, no ssh, no scripts — and the phone's
+emulator replaces itself with the arriving code and answers `Uryyb sebz zrfu-ubzr`.
 
-The pilot's first cut resolved `(cadence, lease)` from the static `lease-fixtures` mock.
-`mesh-lease-audit` replaces that with the **live genome**: it sources `mesh-reflex-health`
-(one authority — the shared `cron_stride_from_fields` + `eff_maxage`, never a duplicated
-parse), resolves every `# reflex-cadence:` header (242 in `scripts/`), and gates each pair
-through `lease-gate.rom`.
-
-```sh
-./mesh-lease-audit          # -> "lease-audit: clean — 201 reflex(es) gated, ... (35 un-derivable skipped)"
-./mesh-lease-audit --list   # also print every resolved (name cad lease OK/RED) row
-```
-
-**Why a healthy fleet audits CLEAN, and that is honest.** `eff_maxage`'s `@auto` derives
-`lease = cadence × 2` **by design** — the maxage-from-cadence machinery
-(`mesh-reflex-health`, chat-review 2026-06-24) exists precisely to make `lease < 2·cadence`
-impossible to express by accident. So the live audit finds **zero** violations. This is not a
-dud gate — it is a **regression guard**, not a bug-finder:
-
-- the day `eff_maxage`'s `s*2` is edited to `s*1`, **every** reflex here flips RED;
-- the day a watchdog lease is hardcoded to a literal below `2·cadence` (the
-  `a-lease-must-exceed-its-producers-cadence` memory), **that** reflex flips RED.
-
-The 35 skipped reflexes carry list-crons (`17,47 …`) or `# reflex-cadence: none` — no single
-derivable cadence — and are honestly excluded, never silently passed. `test-lease-audit` is
-the RED-first proof for the **wiring** (not just the ROM): it points the audit at a
-`mesh-reflex-health` whose `eff_maxage` multiplier is broken (`s*1`) and asserts the audit
-flips from clean(0) to violation(1) on the same reflex, then that the real genome is clean.
-
-## Second gate class (`band-gate` — a compound boundary predicate)
-
-To show the ROM pattern is not a one-off, a **structurally different** gate is ported: a
-two-edged band `lo ≤ value ≤ hi` (RED past *either* edge), vs. lease's single ratio `≥`.
-Same portable-artifact story — a 165-byte ROM, byte-identical everywhere; the shim is I/O only.
-
-```sh
-./bin/uxnasm band-gate.tal band-gate.rom
-./mesh-band-gate 20 55 80                       # -> OK  (within band)
-./mesh-band-gate 20 92 80                       # -> RED (above the band)
-./mesh-band-gate --name battery 92 band-fixtures # resolve [lo,hi] for a named band, gate the value
-./test-band-gate                                # RED-first proof
-```
-
-`test-band-gate` proves both edges are real arithmetic, not a constant: it corrupts each
-`GTH2` comparison in turn (to a no-op) and demands a genuinely out-of-band value then *wrongly*
-passes — so the uncorrupted ROM's RED is the lo edge AND the hi edge, not one of them. Real mesh
-use of a two-edged window: a Li-ion longevity band (20–80%), an NVMe thermal window, a healthy
-PSI range (`band-fixtures`).
-
-## Portability (same ROM, two architectures)
-
-**`lease-gate.rom` is never rebuilt** — only the emulator is per-platform. `build.sh` needs a
-host compiler, and *mesh-home is the only node that has one* (measured 2026-07-24: the Note3
-is armeabi-v7a with no `cc` and no Termux; phaedra, x86_64, has no `cc` either). So the
-distribution model is **cross-build on mesh-home + push the binary**, not a per-node build.
-See `verify-note3.sh` for the armhf cross-build + `adb push` + on-device run that executes the
-identical 200-byte ROM on the Note3 with matching verdicts — re-verified 2026-07-24 with the
-net device compiled in, sha1 `c767efd9…` host==device, step 4 asserting the pushed emulator
-is net-capable **at step ≥ 2** (via the identify probe — a net-blind build answers a
-plausible `NA`, so presence is never inferred from a refusal), and step 5 asserting the
-capability itself: the phone BINDS and mesh-home dials it, `uxn:ping-from-mesh-home` back
-over the LAN. Static-armhf limit, measured on-device: no
-hostname resolution (glibc NSS is absent under bionic) — address Note3 ROMs by numeric IP;
-it fails loud and distinguishably, "Temporary failure in name resolution" vs "Connection
-refused".
-
-### The cross-build is now one line, and arm64 exists (2026-07-24)
-
-The compile line existed **twice** — `build.sh`'s host build and `verify-note3.sh`'s inline
-armhf build — and a third copy for arm64 is the shape this tree keeps finding: one copy gains
-a device, the others quietly do not, and the platforms disagree about what the emulator *is*.
-The translation units now live in **`emu-sources`** (`EMU_SRC`), sourced by both, and the
-cross line lives once in **`cross-build.sh`**:
+## Layout
 
 ```
-./cross-build.sh arm64 [out] [--check]     aarch64-linux-gnu-gcc    — Android 8+ bodies
-./cross-build.sh armhf [out] [--check]     arm-linux-gnueabihf-gcc  — armeabi-v7a (Note3)
+*.tal  *.c      ROM sources (uxntal, or C compiled by the vendored chibicc)
+*.rom            the assembled artifacts — the portable thing
+mesh-*           host shims: marshal inputs, run a ROM, map the verdict
+test-*           one RED-first suite per ROM
+build.sh         host build (uxnasm + uxncli + assemble ROMs)
+cross-build.sh   static arm64 / armhf emulator for a phone
+verify-note3.sh  cross-build -> adb push -> run on the device -> compare
+src/             vendored Uxn emulator + the 0xd0 net device
+chibicc/         vendored C -> uxntal compiler
+docs/LANES.md    the full engineering log: every lane, its proof, and its limits
 ```
 
-Static always (bionic has no glibc loader), which is what the sizes are about: host `uxncli`
-**56,856 b** dynamic · armhf static **674,652 b** · **arm64 static 1,013,392 b**. Still a
-single self-contained file to `adb push`, and the ROM it runs is unchanged.
+## Details
 
-**`--check` drives the binary rather than describing it.** `file` says aarch64 and `-x` says
-executable, and neither is the claim — a build that links can still be net-BLIND, and that
-one is silent (`emu_dei` → 0 → Disconnected → `NA` rc=2, byte-identical to a real refusal).
-So three claims a wrong build cannot fake: it **computes** (the four-row lease-gate table,
-same verdicts as the host), it **identifies** the net device (action `d0`, at step ≥ 2), and
-it **accepts** a real inbound connection — the cross binary binds under `qemu-user` and the
-known-good host `uxncli` dials it with `net-echo.rom`, payload tokenised per run so no
-constant can produce a pass. No qemu and not that arch → **exit 2, honest n/a**, with the
-binary explicitly reported as built-but-not-run.
+[**`docs/LANES.md`**](docs/LANES.md) is the chronological record — each lane, the regression
+it catches, the mutant that had to make it red, and what each claim deliberately does *not*
+cover. Start there for any single piece; this page is only the map.
 
-RED-first, watched 2026-07-24: against a net-blind stub (`net_dei`/`net_deo` reduced to
-exactly `emu_dei`'s fallthrough) the compute rows stay green and step 2 goes red **naming
-itself** — `net device MISSING … (got: NODEV)` — instead of impersonating a refusal.
+## License
 
-Measured on arm64 the same day, all green: truth table matched, device present at step ≥ 2
-(bind refused loudly on `203.0.113.1`), and `uxn:ping-<token>` back off the aarch64 build's
-own listener. **What that does NOT claim:** the round trip is loopback under emulation, so it
-asserts the *mechanism* (bind/accept/read/write in a static aarch64 glibc) and nothing about
-addressing, and no aarch64 **device** has run it yet — that leg needs a phone on USB, and it
-is `verify-note3.sh`'s shape (cross-build → `adb push /data/local/tmp` → run under the real
-kernel) that will carry it. Built and driven ≠ deployed and verified.
+**[CC0 1.0 Universal](LICENSE)** — our code here is public domain, no attribution required.
 
-## Measurements
+The vendored third-party trees are **not** ours to relicense and keep their own terms:
+`src/` (Uxn, Devine Lu Linvega et al.) and `chibicc/` are each upstream MIT under their own
+`LICENSE` files; provenance is recorded in `build.sh`.
 
-- **ROM:** 200 bytes (0.31% of the 64 KB Uxn address space; was 134 B before the
-  2026-07-23 domain-honesty guards — parse-overflow + cad>32767 now answer NA/#82,
-  never a wrapped verdict). Note3 byte-identity re-verified against this ROM 2026-07-24:
-  sha1 `c767efd9…`, host==device.
-- **Shim:** ~20 lines of logic.
-- **Runtime:** ~0.66 ms/run (process spawn + emulator boot + ROM eval), RSS ~1.5 MB, x86;
-  measured on the pre-swap emulator, same order of magnitude on the modern one.
-- **Emulator:** `uxncli` ~42 KB, `uxnasm` ~21 KB, C89, no deps beyond libc.
-
-## Predicate-engine lane (2026-07-23, operator-approved spec)
-
-Design: `docs/superpowers/specs/2026-07-23-uxn-predicate-engine-design.md`. **Doctrine: a new
-pure predicate defaults to a ROM gate run via `mesh-rom-gate`; self-grep gates remain banned;
-plumbing stays shell.** The lane's moving parts:
-
-- **`scripts/mesh-rom-gate`** (deployed) — the ONE runner: `mesh-rom-gate <rom> args…` prints the
-  ROM's verdict TEXT, rc `0` (not RED) / `1` (RED) / `2` (n/a LOUD — engine/ROM absent or broken;
-  never a fake verdict). Bare names resolve to `scripts/uxn/<name>.rom`. Consumers keep their
-  inline compare as the explicit rc=2 fallback and stamp `src=rom|inline-fallback`.
-- **`mesh-lease-audit`** — wired into cron via the `scripts/mesh-lease-audit` deploy shim
-  (`# reflex-cadence: 41 5 * * *`); its wired `--test` runs the full `test-lease-audit` suite.
-- **`chibicc/`** — vendored C→uxntal compiler (provenance in `build.sh`); `./build.sh --chibicc`
-  builds it, `./cc-rom.sh <src.c> <out.rom>` compiles a gate, `./test-chibicc` is the truth-table
-  vendor gate (RED-first, byte-identity informational only).
-
-## Hop lane — ROM-as-packet over ssh (2026-07-23, operator spike → tool)
-
-Transport stays ssh/tailscale; uxn is the **mobile-code layer**: the program travels
-in-band with the data. Proven live against phaedra holding ZERO ROMs — only `uxncli`
-(43 KB) + `mesh-uxn-hop` (3 KB) — with two different behaviors through the same channel.
-
-- **`mesh-uxn-hop`** — the packet runner. Format `uxp1 <rom_bytes>\n + <rom raw> + <payload…>`.
-  `--pack <rom>` builds a packet from stdin payload; bare invocation receives one, runs the
-  shipped ROM on the payload in a FRESH EMPTY tempdir (uxncli's file device is cwd-sandboxed,
-  `file_check_sandbox`), propagates the ROM's exit code, and fails LOUD (rc 65) on any
-  malformed/truncated packet — never a silent passthrough.
-  One hop: `mesh-uxn-hop --pack filter.rom < text | ssh node mesh-uxn-hop`
-- **`rot13.tal`/`rot13.rom`** (106 B) — the canonical pipe-stage payload; also documents the
-  console idiom for stream filters (stdin type 1, EOF type 4 → halt `#80`).
-- **`test-uxn-hop`** — RED-first suite (11 asserts): pack byte-accounting, shipped-code
-  execution, hop composition (double-rot13 identity), loud malformed/truncated failure with
-  empty stdout, rc propagation (`#81`→1), fresh-empty-cwd containment, sha1 declaration,
-  tamper refusal, stamp correctness (declared and legacy-undeclared).
-- **Run-time hash verification (the fixed-point doctrine, operator 2026-07-23):** a ROM is
-  the mesh's first FIXED POINT — behavior decided once at commit time, in a system where
-  everything else re-infers per tick. That only holds if the hash is VERIFIED AT RUN TIME,
-  not claimed: `--pack` declares the ROM's sha1 in the header (`uxp1 <n> <sha1>`), the
-  receiving hop hashes what it ACTUALLY got before executing a byte — declared≠actual is a
-  loud rc-65 refusal, and `UXN_HOP_STAMP=1` appends `hop: rom sha1=<actual> declared=<…>
-  rc=<n>` to stderr so the verdict is stamped by the execution site with what it really ran.
-  (Undeclared legacy headers run but stamp `declared=none` — visible, never silent. The
-  tamper test is instructive: a corrupted rot13.rom ran SILENTLY with rc=0 and empty output
-  — identical wrongness is indistinguishable from consensus, hence verify-then-execute.)
-- **`route.tal`/`route.rom`** (263 B) — the prefix router: first payload line = the prefix
-  (config travels in-band too), then each line starting with it → stdout, rest → stderr.
-  Two output channels over one ssh pipe, demuxed by shipped code; `test-uxn-route` covers
-  demux, exact-prefix, empty-prefix, mid-prefix reject replay, EOF partial, and riding the
-  hop. Proven live against phaedra with the stamp confirming the executed sha1.
-
-Next rungs (open): per-hop source routing (each leg of a multi-hop path carries its own
-program); rom-vs-agent calibration ledger (run the ROM and a mind on the same predicate,
-log both — agent divergence becomes measurable against the fixed point).
-
-## Body self-gate (stage 4c, 2026-07-24) — the first hop consumer outside this dir
-
-`mesh-body-gate` (+ deploy shim in `scripts/`, `# reflex-cadence: */30 * * * *`): the adb
-body (Note3) gates its OWN battery/thermal. Each firing reads the phone's sysfs
-(capacity, temp deci-°C), substitutes into threshold-ledger rows via
-`mesh-sexpr-gate --expr` (the packer's verb: the substituted expression WITHOUT local
-eval — pure data transform, needs no local engine), packs the pinned `lisp-eval.rom` +
-expression as ONE argv packet, and runs it on the phone under `busybox sh` + the on-device
-armhf `uxncli` — **the receiver is the byte-identical `mesh-uxn-hop` script** (strictly
-POSIX since 4c; test 15 pins that under plain `sh` — a bashism in a rarely-taken branch
-died `Bad substitution` instead of refusing loud). Recalibration = a consts diff in
-`threshold-ledger` travelling in-band on the next run; the phone is never edited.
-
-Pin chain, end to end: ledger `# evaluator-sha1:` (read via `mesh-sexpr-gate --pin`, the
-one reader) == the ROM packed == the sha1 the receiver verifies pre-exec == the stamp the
-execution site sends back. Any link broken = loud rc 2 — `test-body-gate` proves the
-pack-site link *pre-dial* (a mutant neutering that comparison survived the loose grep via
-the second pin gate, the stamp check — the sharpened leg pins refusal ORDER), the absent
-body (honest rc 2, no state), and a live round with real reads. Verdicts land in
-`~/.mesh/body-gate.state` (`src=rom-body sha1=<pin>`); `body-thermal`'s prev state feeds
-back from the state file, so both hysteresis edges run through the one ledger row on the
-body too.
-
-## Board invariant watcher (2026-07-23, operator: "the first one to actually write")
-
-`board-check.c` (chibicc-C → `board-check.rom`, 24.7 KB — the 20 KB board buffer dominates)
-— the first fixed-point WATCHER: judges the last N board lines against structural invariants
-so silent dropped directives are caught without an agent having to notice. Input staged as
-files in the cwd sandbox (`./nodes`, `./board`) — text you control; the ROM is the whole
-trust boundary. Invariants: STRUCTURE (`ts  who@host  ::  body`), MONOTONIC (bytewise
-ISO8601Z, 0 inversions in the last 2000 live lines), UNKNOWN-NODE (host ∈ nodes set),
-DOUBLE-TAKING (byte-identical claim text, `[done]`-released). Verdict text is canon: detail
-`RED <INV>: <offending line>` per hit, last line `OK n=…`/`RED v=…`/`UNKNOWN <reason>`,
-rc 0/1/2 mirrors. UNKNOWN is honest n/a (empty input, at-capacity, taking-table overflow).
-`mesh-board-check` (+ deploy shim in `scripts/`, `# reflex-cadence: */10 * * * *`) stages
-the live board (auto-halves N to fit the ROM buffer), stamps the verdict with the sha1 it
-ACTUALLY hashed pre-exec, keeps `~/.mesh/board-check.state` (liveness-touch every eval,
-content on class change), and posts BOTH edges (onset and recovery, one gate).
-`test-board-check`: 10 sections — every invariant both polarities, honest UNKNOWNs, a
-gutted-MONOTONIC mutation that the fixtures must catch, and the wrapper driven end-to-end.
-
-## Calibration ledger (2026-07-23 — the oracle use of the fixed point)
-
-`mesh-rom-calibrate` (+ deploy shim, `# reflex-cadence: 7 6 * * *`) runs BOTH
-implementations of a predicate on identical inputs — the ROM (16-bit, via
-`mesh-rom-gate`) and native shell arithmetic (64-bit, a genuinely different
-implementation) — and appends every pair to `~/.mesh/rom-calibration.log`,
-each line stamped with the sha1 of the ROM actually hashed. Doctrine: under
-the same ROM, DISAGREEMENT isolates cleanly to the implementations and posts
-`[chat-review]` loudly; AGREEMENT is weak evidence and logs silently. This
-keeps the N-version diversity signal alive that ROM uniformity destroys.
-v1 predicate: lease-vs-cadence over the same rows `mesh-lease-audit --list`
-resolves. Known divergence domain, provable live: the ROM's 16-bit parse wraps
-at 65536 — `--pair 900 67335` reads lease as 1799 → rom=RED shell=OK DIVERGE
-(the test suite drives this REAL split, not a mock). First live fleet run:
-208 pairs, 0 diverged. `test-rom-calibrate`: 6 sections; the verdict logic was
-mutated to always-AGREE and the suite seen RED (fixtures discriminate).
-
-## Lisp spike — the expression is DATA (2026-07-23, operator-requested)
-
-`lisp-eval.c` (chibicc-C → `lisp-eval.rom`, 3.9 KB) — micro s-expression evaluator:
-reader + eval over naturals 0..65535. The expression arrives as argv DATA and the fixed
-point runs it — homoiconicity on the ROM: the logic the mesh ships around is text, not a
-rebuild. Ops: `+ *` variadic, `- /` binary, `< > <= >= =` → 1/0, lazy `if` (only the
-taken branch evaluates — `(if 1 7 (/ 1 0))` → 7). NA/#82 honesty carried over from
-lease-gate: literal/`+`/`*` overflow, `-` underflow, `/0`, unknown op, bad parens/arity,
-input >512 B, nesting >24 all answer `NA` rc=2 + reason on stderr — never a wrapped value.
-Step 2 landed with it: lease-gate expressed AS an s-expr the evaluator runs —
-`(if (>= <lease> (* 2 <cad>)) 1 0)` passes the EVAL.md 5-row truth table, and the two
-calibrate-caught wrap rows (`900/67335`, `33000/60000`) answer NA instead of the false
-verdicts the 16-bit wrap once produced. `test-lisp-eval`: core + gate tables on both the
-fresh build and the committed ROM; RED-first via an inverted-`>=` mutant that must fail
-the same table. Authoring gotcha: string literals must be ASCII — chibicc emits non-ASCII
-bytes as broken labels (`uxnasm: Label unknown: ffffffe2` from an em dash).
-
-## Reduce-a-series gate class (`spearman`, `series-stats`)
-
-A gate that answers a boundary predicate is a *decision*; a gate that reduces a whole
-series to one calibrated number is a *measurement*, and it is what makes the doctrine's
-quantitative claims checkable instead of quotable. Two ROMs are in the class.
-
-**`spearman.tal`** — Spearman rank correlation, `rho*1000`, integer, no floats. The HOST
-ranks (and therefore owns tie handling); the ROM owns the formula, the reduction and its
-domain. It used to stop at `n=58` and the full series was reduced by the awk twin instead
-— which meant the ROM was not doing the reduction and "reduce a series" was a demo.
-`arith32.tal` (double-word add/sub/cmp/mul on a 16-bit machine) lifted the ceiling to
-`n=2343`, chosen so `2*D` plus the largest possible `d^2` still fits 32 bits: no single
-accumulation step can wrap, which is what turns the per-value `sum(d^2) <= 2D` check from
-a hopeful guard into a complete one.
-
-**`series-stats.tal`** — order statistics. Given a threshold, `n`, and `n` non-decreasing
-integers it answers `min max med2 cnt sum mean1000`. `med2` is *twice* the median so the
-even-`n` case is exact rather than rounded; `mean1000` is rounded to nearest, not
-truncated. Sorting is the host's job and the ROM **verifies** it, so a host that forgets
-to sort gets `NA` rc=2 rather than a plausible median of a different question.
-
-Host: `mesh-series-stats --claims` re-derives every standing quantitative claim in
-`CLAUDE.md` from the live ledger, with the doctrine's own number printed beside it. The
-twin is N-version, not a re-read: it sorts with its own selection sort over the *unsorted*
-input and accumulates in 64-bit awk floats, so an AGREE is evidence about the arithmetic
-*and* the ordering.
-
-Gates: `test-spearman`, `test-series-stats`, `test-arith32`. Each rebuilds the ROM from
-mutated source and requires its truth table to fail — a table that cannot fail is not a
-table.
-
-Two carry lessons the class produced, both counter-intuitive and both measured:
-
-- **The max-domain input is the WEAKEST place to hunt a carry bug.** A lost high-word unit
-  is an error of `65536/D` in `rho`, and `D` grows as `n^3` — so at `n=200` it is 4.9e-2
-  (screaming), at `n=650` 1.4e-3 (just visible against the printed 1e-3), and at `n=2343`
-  3.1e-5, *below* the resolution the ROM prints. `test-arith32`'s primitive boundary table
-  is the authority for carry coverage; the end-to-end tests only pin the consequence.
-- **A carry test is only a test on inputs that CAN carry.** In `series-stats` the multiply
-  is reached only through `n*place`; at `n=100` the partials do not overflow and the
-  carry-deleted mutant answers *identically*. `n=255` is pinned in the suite for exactly
-  that reason.
-
-## Network device — step 1, CONNECT-only (0xd0, 2026-07-24)
-
-`src/devices/net.{c,h}` + `0xd0` cases in `uxncli.c`'s `emu_dei`/`emu_deo` + one more `.c`
-on the build line. The **port map is copied verbatim from uxn2** (`src/uxn2.c`, `enum
-network_ports`) so a ROM written for either emulator addresses the same ports: `d0` vector
-· `d2` addr · `d4` length · `d6` read · `d8` write · `da` state(DEI)/action(DEO) · `db`
-handle · `dd` bindaddr · `df` channel. URIs are **colon**-separated, not slashed:
-`tcp:host:port`.
-
-**Why the device, when the mesh already ships ROMs over ssh:** the pipe gives *transport*,
-the device gives **addressing**. With `mesh-uxn-hop` the shell wrapper picks the next hop
-and the far node needs bash; with the device the travelling ROM picks its own next hop and
-the far node needs only `uxncli`.
-
-**Why the implementation is not ported:** uxn2's endpoint is an `SDL_Thread` posting
-`SDL_PushEvent` into an event loop, and this `uxncli` has no pump — its main loop blocks
-on `fgetc(stdin)`. Ours is plain POSIX `getaddrinfo`+`connect`, blocking and synchronous:
-no vector, no threads. Blocking read/write on DEI/DEO needs neither.
-
-Step 1's scope was **outbound only**: `bindaddr`/`channel` existed so the map stayed
-verbatim, but binding was refused loudly and read `Unbound` — an unimplemented port that
-answered a plausible state would be an organ declared before it was armed. Step 2 arms it,
-below.
-
-Guards, each because the alternative is a *believable* wrong answer rather than a crash:
-
-- **Every ram transfer is clamped to the page.** The length comes from the ROM; 0x2000
-  bytes at 0xf000 would otherwise write past the allocation. The clamp is loud.
-- **A failed connect never reads as Connected.** Every failure path closes the fd, zeroes
-  the handle, sets Disconnected and prints why.
-- **An unknown scheme is an error, not a default to tcp.** Guessing the transport renders
-  a failure as a plausible success.
-- **Every socket op is time-boxed** (`UXN_NET_TIMEOUT`, default 10s) — connect via
-  non-blocking + `select`, read/write via `SO_RCVTIMEO`/`SO_SNDTIMEO`. A wedged endpoint
-  is the stale-lease family: a hung emulator reads green to everything watching it,
-  because it never returns to say otherwise. **A timeout is not a disconnect** — length 0,
-  state stays Connected, so the ROM can retry; collapsing the two would make a slow peer
-  indistinguishable from a dead one.
-- **The state poll does not block** — `select` with a zero timeout (pure POSIX;
-  `MSG_DONTWAIT` is not), then one peeked byte to tell HasData from a closed peer.
-
-Gate: `test-net-device`, and its live leg is a **real two-node round trip** — mesh-home
-dials phaedra over tailscale, sends `ping-uxn-net`, and the far node's `tr a-z A-Z` answers
-`PING-UXN-NET`. A localhost round trip exercises the same three syscalls and proves nothing
-about addressing or the tailnet; it is the drives-only-stubs trap in its purest form. Peer
-unreachable → the suite exits 2 (honest n/a), never a fake pass. The other legs: ROM
-byte-identity across the rebuild (asserted by sha *and* by `git diff` being empty — this is
-an emulator change, no ROM was re-cut), an existing ROM answering identically under the new
-device cases, the three refusal paths, the connect deadline asserted as **wall clock**, bind
-refused, and two source-mutants required RED (unknown-scheme-silently-tcp, deadline-removed).
-
-`net-echo.tal` is the gate ROM: reads a URI and a payload from stdin, dials, writes, reads,
-prints the reply — the smallest program that can prove a round trip rather than mere
-reachability. It refuses with `NA` rc=2 on a failed connect, a short write, or an empty read.
-
-## Network device — step 2, BIND (0xd0, 2026-07-24)
-
-The other half. With connect, a travelling ROM picks its own next hop but the far node
-still needs a shell to *answer*; with bind, the far node's `uxncli` **is** the thing that
-answers, so a hop needs a shell on neither end. `net-listen.tal` is the gate ROM: it takes
-one bind address on stdin, waits for a caller, reads what it sent, and replies with
-`uxn:` + those bytes.
-
-**Channels.** The `df` port SELECTS the endpoint every other port addresses: channel 0 is
-the outbound lane from step 1, channels 1–8 are inbound lanes fed by one listener. `dd/de`
-binds, action 1 unbinds. An out-of-range channel is refused where it is **written**, and
-addresses nothing — folding it to 0 would quietly serve the outbound lane to a ROM that
-asked for something else.
-
-**The state read on an inbound lane IS the accept**, and it is the one poll in this device
-that deliberately WAITS (up to `UXN_NET_TIMEOUT`). It is the vector-less equivalent of
-uxn2's arrival callback and the only place a ROM can learn a peer has come. A zero-timeout
-poll would be honest and would force every listening ROM into a spin loop burning a core to
-sit still. On expiry it answers **Bound** — "the listener is up, nobody called" — never
-Connected (there is no peer) and never Disconnected (the listener is fine). Consequence for
-ROM authors, learned the hard way while writing `net-listen.tal`: **do not check "did it
-bind?" by reading the state.** That read consumes the first wait and answers `Connected`
-the moment a caller arrives — reading a healthy bind as a failure. The wait loop already
-carries the whole answer: `6` nobody yet, `2`/`3` a caller, `4` the bind was refused.
-
-**The threat model changed, and saying so is part of the change.** Step 1 was an outbound
-call the node itself initiates — the same shape as the ssh hop the mesh already runs. A
-listener accepts whatever can reach the port, so the bind address is always **named by the
-ROM**: there is no default, any-address is the explicit `tcp:*:port` and nothing else, and
-a missing host stays an error. The convenient reading of "no host given" is the one that
-opens a port on every interface. `SO_REUSEADDR` is set (a restarting ROM must not wait out
-`TIME_WAIT`), `SO_REUSEPORT` deliberately is not — a second process silently sharing the
-port makes "someone else answered" unattributable.
-
-**Identify (action `d0` → `d002` in the length register).** On an emulator with no `0xd0`
-page, `emu_dei` falls through to `return uxn.dev[addr]` — bare memory, reading 0, and 0 is
-`Disconnected`. So *"this build has no network"* and *"the far node refused"* arrive at the
-ROM as the same byte; measured on the Note3, both gave `NA` rc 2 byte-identically. The
-probe is a write memory cannot fake, and ROMs compare it as an **ordering** — device `d0`,
-step ≥ what the ROM needs (`net-echo` needs 1, `net-listen` needs 2) — because pinning the
-whole word makes a ROM refuse every future step of its own device. Three outcomes are now
-distinct where they were one: `NODEV` silent = no device · `NODEV` + `net: unknown action`
-= device present but **too old** · `NA` + a loud `net:` line = a real refusal. Version skew
-reads as no-usable-device: fail-closed. Interop caveat, stated rather than hidden: uxn2
-does not know action `d0`, so a probing ROM reads "no device" on uxn2 even though it has
-one — wrong but fail-closed, and free for uxn2-targeted ROMs that never send the probe.
-
-Gate: `test-net-device`, now with **live legs in both directions** — mesh-home dials
-phaedra (`ping-uxn-net` → `PING-UXN-NET`), and phaedra dials **our** `net-listen.rom` on
-this node's tailscale address and gets `uxn:ping-from-peer`. The local accept leg is
-labelled as claiming the *mechanism only*; addressing is claimed over the tailnet or by
-nothing. The reply is **tagged** on purpose: an echo server, a stray `socat`, or a client
-reading its own buffer all produce the payload, and only the ROM produces `uxn:`. Refusals
-asserted by artifact rather than by message — bind on channel 0 is refused *and* the port
-is left dead; an unassignable address reads `Unbound`; `'*'` as a connect target is refused
-by name. Both deadlines (connect, accept) are asserted as **wall clock**. Four source
-mutants required RED, the two new ones being *accept-deadline-removed* (an uncalled
-listener that never returns is indistinguishable from a wedged emulator) and
-*bind-on-channel-0-silently-allowed*. Identify is gated by the only thing that can
-discriminate it: the same ROM on two emulators, the real one and a **net-blind stub** that
-is exactly `emu_dei`'s fallthrough.
-
-`verify-note3.sh` carries the phone's half. Step 4 no longer *infers* the device from a
-refused connect — the ambiguous byte identify exists to replace — it drives `net-listen.rom`
-against an unassignable address, so one run asserts device present · step ≥ 2 · and the
-bind refusal path on armhf. Step 5 is the artifact for the capability itself: **the phone
-binds and this host dials it** (`mesh-home → 192.168.8.184:47312`, the phone's own uxncli
-answering `uxn:ping-from-mesh-home`, 2026-07-24). Presence is not capability; a build can
-carry the device and still not listen, and bind/accept is where a statically linked libc
-could plausibly differ from the host's.
-
-## The hop's NET LANE — a ROM that receives a ROM (2026-07-24)
-
-The hop's pipe lane ships code over ssh: `mesh-uxn-hop --pack filter.rom < text | ssh node
-mesh-uxn-hop`. The far node needs a shell, a key, an account, and this script. The net lane
-ships the same packet over the emulator's own `0xd0` device into a receiver that is **a ROM
-rather than a script**, and the far node needs none of those — only `uxncli`:
-
-```sh
-UXN_HOP_TOKEN=… mesh-uxn-hop --serve tcp:100.74.178.97:47311        # on the far node
-UXN_HOP_TOKEN=… mesh-uxn-hop --pack-net rot13-net.rom < text | \
-UXN_HOP_TOKEN=… mesh-uxn-hop --dial  tcp:100.74.178.97:47311        # here
-```
-
-**hop-serve becomes the packet.** It binds, accepts one caller, reads the `uxp1` header a
-**byte at a time** (a bulk read would swallow the front of the payload, and the payload
-belongs to the ROM it is about to become), reads exactly the declared ROM bytes, and then
-replaces itself: the packet is staged at `4000`, a **position-independent copier** —
-relative branches, zero-page parameters, an immediate `JMP2` — is relocated to `8000`, and
-the jump goes there; the copier copies the staged bytes down to `0100` and jumps into them.
-A copier that ran in place would overwrite itself mid-copy, and would do so **only** for
-ROMs big enough to reach it — corruption that scales with the payload and passes every
-small test.
-
-**The connection survives the swap**, and that is what makes the lane work at all: the
-socket lives in the emulator's device, not in the 64 KB being overwritten, and the selected
-channel lives in the device page. So the arriving ROM wakes up **holding a live inbound
-connection on channel 1** — it reads its payload there and writes its answer there. That is
-why `hop-serve` accepts mode `net` and nothing else: a pipe-lane ROM answers on the
-*console*, which on the serving node goes to a terminal the caller cannot see. Running it
-would look like a working hop with every answer dropped on the floor. The two lanes refuse
-each other **by name, in both directions** — the sh receiver refuses a net packet just as
-loudly.
-
-**What the lane gives up, said out loud.** The sh receiver hashes the ROM it received and
-refuses on a mismatch (hash-then-execute). A ROM cannot compute sha1 in a few hundred
-bytes, so `hop-serve` **cannot verify what it is about to run**. It demands a shared
-**token** instead — `UXN_HOP_TOKEN`, carried in the header, compared in the ROM — so
-reaching the port is not by itself permission to run code there. That is weaker than ssh's
-key auth and it is replayable by anyone who sees a packet. Hence: no default token ever
-(the wrapper refuses `--pack-net`/`--serve` without one), bind a **named tailnet address**
-rather than `*`, and the arriving ROM runs in a fresh empty dir — the file device's sandbox
-floor is the only containment left once the hash is gone. **One packet per invocation**, by
-construction rather than by policy: after the swap there is no `hop-serve` left to serve a
-second caller.
-
-**Nothing can half-close a uxn socket** (the uxn2 map has no shutdown port), so a finished
-peer is knowable only by one expired deadline. Both ROMs are therefore *patient for the
-first byte and impatient after it*: three deadlines waiting for an answer to start, one
-after it has begun. Keeping three throughout charged every hop three idle timeouts with the
-answer already in hand.
-
-Gate: `test-uxn-hop`, legs 16–24 — header shape · the token required with **nothing**
-produced when it is missing (the `$(…)` trap: an `exit` inside command substitution kills
-only the subshell, and the packet would have shipped with a blank token) · both lanes
-refusing each other by name · the round trip · a wrong token refused **pre-exec**, asserted
-by the artifact (the caller gets `NA`, not the transformation) · a valid token with the
-wrong lane · a truncated packet · an oversize ROM refused before a byte is read · two
-mutants required RED. There is deliberately **no** "mode check dropped" mutant: `match`
-advances the cursor on success, so removing the lane check also strands the token parse and
-the packet is refused for the other reason — a mutant whose damage is masked by the next
-check proves nothing, so that property is asserted directly instead.
-
-Live leg: **phaedra ships a ROM over tailscale** to this node's serve port and this node's
-`uxncli` becomes it. The dialer there is `socat`, not `uxncli` — phaedra has no compiler and
-no emulator pushed to it — so that leg honestly claims the **serve** side; the dial side is
-claimed by the local leg and by nothing else.
-
-And the payoff, on the oldest body in the mesh (`verify-note3.sh` step 6): mesh-home ships
-`rot13-net.rom` over TCP to a 2013 Note3 carrying **only a static `uxncli`** — no shell, no
-ssh, no `mesh-uxn-hop` — and the phone's emulator replaces itself with the arriving code and
-answers `Uryyb sebz zrfu-ubzr`. The token is generated per run, so the pass cannot come from
-a constant baked anywhere.
+> Extracted from the `lte-workstation` mesh genome as a standalone, shareable core.
