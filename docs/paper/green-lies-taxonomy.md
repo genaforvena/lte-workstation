@@ -49,8 +49,9 @@ precondition for the first class existing at all.
 | C6 | **Executable ≠ loadable** | `[ -x bin ]` is not "it runs"; rpath/ABI failures are a different claim | whisper.cpp `main` +x, `rc=127` for a day | `974d864` | **decidable** (`[ -x ]` gate with no invocation of the wrapped binary in `--test`) |
 | C7 | **Predicate naming a node** | a guard bound to a hostname goes permanently false when the role moves, and every pass logs green | `TG_HOST="imozerov-IdeaPad-…"`, keeper body never executed once | `09f7914` | **decidable** (hostname literal in a guard) |
 | C8 | **Never-wired reflex** | passing `--test` and being scheduled are unrelated facts; and a wired reflex can still tend a target that no longer exists | three keepalives green, none in cron | `cc617e5` | **decidable** (cadence header vs crontab vs target existence) |
+| C9 | **Absent from the candidate set** | the gate is correct and loud; the item never reaches it, because the enumerator's input set does not cover it — and *outside the set* renders identically to *nothing wrong* | `mesh-land`'s pathspec was `scripts/ docs/` + root globs, so a landed tool's five `skills/**` payload files were never candidates: the tool sat on origin **broken from a clean clone** while every pass printed "nothing settled+clean to land" | `9f4537b` | **decidable** (declared pathspec vs the repo's tracked trees) |
 
-Two cross-cutting observations that are not classes but govern all of them:
+Three cross-cutting observations that are not classes but govern all of them:
 
 * **Liveness-touch**: a reflex that writes its state only when the value *changes* leaves mtime
   frozen on a long-stable-but-live value, so an mtime watchdog reads "value held" as "reflex dead".
@@ -58,6 +59,15 @@ Two cross-cutting observations that are not classes but govern all of them:
 * **Honest n/a is free**, and therefore becomes a resting state: an organ that answers "cannot
   assess" forever is indistinguishable from a healthy quiet one on every axis a reflex-health tool
   computes. Five organs in this corpus had *never* emitted an informative line, all green.
+
+* **The empty set is spelled like success.** C9 is the sharpest instance of a shape that recurs
+  across the corpus: a verdict computed by *reducing over a collection* returns the all-clear when
+  the collection is empty, and nothing in the verdict records how the collection was built. A
+  missing **gate** rots loudly — someone eventually watches it fail. A missing **pathspec** rots
+  silently, because absence-from-the-candidate-set and cleanliness are the same output string.
+  This is why C9's detector cannot live inside the pipeline it audits: the pipeline's own view of
+  the world is exactly the set under suspicion. It must be checked against an *external*
+  enumeration (here: `git ls-files`, and a clean clone that ran the landed tool's own gate).
 
 ## 3. Detector D1 — the self-grepping gate
 
@@ -141,9 +151,41 @@ Not licensed by this data: any claim about frequency in *other* agent-written co
 and any causal claim about authorship — the sampled human projects also differ in age, review
 process and test tooling. The confound is named, not resolved. §4 is where it gets resolved.
 
+## 3bis. C9's decision procedure, run once (2026-08-20)
+
+C9 is decidable without building anything: ask *git* — not the pipeline — which tracked files the
+pipeline's declared pathspec selects, and subtract.
+
+```sh
+git ls-files | sort                                              > all
+git ls-files -- scripts/ docs/ skills/ '*.md' '*.example' \
+                '*.json' '*.conf' '*.env' '*.txt' | sort         > covered
+comm -23 all covered      # LC_ALL=C — git's sort and comm's collation differ
+```
+
+Run against `mesh-land` **after** `9f4537b` closed the `skills/` instance: **1256 tracked, 1247
+covered, 9 uncovered** — `.gitattributes`, `.gitignore`, `.sops.yaml`, `LICENSE`, `screenshot.svg`,
+`caps.example/power`, `caps.example/voice`, and — the two that carry code — **`bootstrap.sh` and
+`setup.sh`**, the scripts that plant the system onto a new node.
+
+This is the result that makes C9 worth a class rather than an anecdote: **the fix closed the
+instance, not the class.** A commit that adds `skills/` to a pathspec restores exactly one tree and
+leaves the region's shape untouched, because the defect was never in the covered set — it is in the
+*complement*, and a pathspec has no mechanism that makes its complement visible. Whether these nine
+files *ought* to be in this pipeline's scope is a scoping decision for its owner; what is not a
+decision is that the pipeline's `clean` verdict does not distinguish "these are fine" from "these
+were never looked at", and no reader of that verdict can tell which they are holding.
+
+Note also what the procedure required: a **clean clone**. The original instance was found the same
+way — cloning the repo to a throwaway directory and running the landed tool's own gate, which
+failed immediately (`missing from …/skills/…`). The tool's gate was loud and correct the entire
+time; it was simply never reached from inside the system, where the payload's absence and its
+presence produced the same output. An audit of the candidate set cannot be run from within the
+process whose candidate set is in question.
+
 ## 4. Open work
 
-1. Detectors for C3–C8 (each listed decidable above). C4 and C8 need the cadence header + crontab,
+1. Detectors for C3–C9 (each listed decidable above). C4 and C8 need the cadence header + crontab,
    which are machine-readable here.
 2. **The authorship confound.** The clean comparison is not human-repo vs agent-repo but
    *in-file self-test* vs *external test suite*, within each population. Requires a second corpus
