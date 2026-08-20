@@ -162,7 +162,9 @@
 #
 # Env: MESH_PROMISE_LEAK_H (default 24)  MESH_PROMISE_LEAK_INCIDENT_H (default 6)
 #      MESH_CLAIM_LEAK_H (default 12 — [verify] claim SLA, shorter than a task's)
-#      MESH_CHAT_LOG (default ~/.mesh/chat.log)  MESH_PROMISES_DIR (default ~/.mesh/promises)
+#      MESH_CHAT_LOG (default ~/.mesh/chat.log — the LIVE tier)  MESH_PROMISES_DIR (default ~/.mesh/promises)
+#      MESH_PROMISE_BOARD_STORE (default <board dir>/board-store.db — the DURABLE tier; empty ⇒ live-only)
+#      MESH_PROMISE_BOARD_DAYS (default 14 — horizon on the ARCHIVE tier only; the live tier is always whole)
 #      MESH_TRANS_MIN_N (default 12)  MESH_TRANS_REPS (default 2000)  MESH_TRANS_ALPHA (default 0.05)
 #      MESH_PROMISE_EPOCHS (default ~/.mesh/promise-epochs.log)  MESH_PROMISE_SEAL_AGE_H (default 48)
 #      MESH_PROMISE_MIN_OVERLAP (default 1)  MESH_PROMISE_POST (set → --feed board-posts new leaks;
@@ -174,6 +176,33 @@ export PATH="$HOME/.local/bin:$PATH"
 [ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
 MESH="$HOME/.mesh"
 CHAT_LOG="${MESH_CHAT_LOG:-$MESH/chat.log}"
+# THE DURABLE TIER. chat.log is the LIVE tier and it is a `tail -3000` sliding window — a
+# NON-MONOTONE input, and the single largest source of false verdicts this tool has ever emitted
+# (see the ERA block below: one eviction round moved this ledger 138 kept -> 6 kept, 0 -> 2 LEAKED,
+# and the memory written from it had to warn readers off the tool's own output). board-store.db is
+# the lossless, content-addressed archive mesh-chat-sync ingests the FULL union into on every
+# anti-entropy round, BEFORE the cap — so a line evicted from the window survives there. The ledger
+# now replays the UNION of the two tiers, which is monotone in the direction that matters: a
+# discharge can no longer be deleted out from under the promise it closed.
+# The store lives BESIDE the board it archives (same directory), so a fixture board — every --test
+# sets MESH_CHAT_LOG — derives a fixture store path that does not exist and replays live-only,
+# exactly as before. MESH_PROMISE_BOARD_STORE= (explicit empty) forces live-only.
+BOARD_STORE="${MESH_PROMISE_BOARD_STORE-${CHAT_LOG%/*}/board-store.db}"
+# HORIZON on the ARCHIVE tier only (days). The live tier is ALWAYS read whole — the union is a
+# superset of what the tool read before this change, never a smaller window (asserted below, as a
+# SET property, not a count). Why bounded at all: the store reaches back 69 days on this node and an
+# unbounded replay resurrects a June graveyard — measured 2026-08-20, 14d/30d/70d -> 2/4/6 leaked
+# promises and 0/0/64 leaked claims, the 64 being reflex broadcasts from mid-June that no live
+# window has held for two months. 14d is >5x the leak SLA (24h), >4x the live window's real span
+# (~3.4d) and ~7x the seal age (48h), so every verdict this tool can still change is inside it.
+# Deterministic and monotone-safe at its edge: a discharge is never OLDER than the promise it
+# closes, so a time horizon can drop a pair but can never keep the open and drop the close — which
+# is precisely the shape eviction produced.
+BOARD_DAYS="${MESH_PROMISE_BOARD_DAYS:-14}"
+BOARD="$CHAT_LOG"        # the replay input — the union, once board_resolve() has run
+BOARD_TMP=""             # materialized union (removed on exit); empty ⇒ BOARD is the live log itself
+BOARD_TIER="unresolved"  # evidence string, published beside every verdict
+BOARD_COV="na"           # oldest line the replay can actually see
 PROM_DIR="${MESH_PROMISES_DIR:-$MESH/promises}"
 JOURNAL="$PROM_DIR/promises.journal"
 STATE="$MESH/.promises-state"          # last-known leaked keys (transition posting), + liveness mtime
@@ -201,6 +230,56 @@ _self_dir="$(cd "$(dirname "$0")" && pwd)"
 
 have(){ command -v "$1" >/dev/null 2>&1; }
 
+# board_resolve — materialize the replay input: the UNION of the durable archive (bounded by
+# BOARD_DAYS) and the whole live board. Sets BOARD / BOARD_TIER / BOARD_COV. Called ONCE, from the
+# dispatcher, so every mode replays the same set and the temp file has one owner.
+#
+# HONEST-FUSION, and it is the whole reason this is not a one-liner: every failure to read the
+# archive degrades to live-only *and says which one*, on stderr and in the published tier string.
+# A silent fallback here would be the worst possible instance of the class — the tool would report
+# the same numbers it reported before the fix while claiming to be immune to eviction.
+#
+# THE GATE IS A SET PROPERTY, NOT A COUNT. `lost_in_union` is the number of live lines missing from
+# the union; it is zero by construction (a union contains its operands) and any non-zero value means
+# the merge itself is destroying board history — exactly the failure mode that let a peer's board be
+# adopted wholesale over ours while every size gate read healthy (chat-board-eviction-treadmill:
+# "the count is not the set"). On a non-zero count the union is REFUSED and the live log is replayed
+# instead: a fix for lost history must never itself lose history.
+board_resolve(){
+  local store="$BOARD_STORE" cut tmp lost live_n union_n
+  BOARD="$CHAT_LOG"; BOARD_TMP=""
+  if [ -z "$store" ]; then BOARD_TIER="live-only(durable tier disabled)"; board_cov; return 0; fi
+  if [ ! -s "$store" ]; then BOARD_TIER="live-only(no durable tier at ${store##*/})"; board_cov; return 0; fi
+  if ! have mesh-docstore; then
+    echo "mesh-promises: durable board tier present but mesh-docstore is not on PATH — replaying the EVICTING live window only" >&2
+    BOARD_TIER="live-only(mesh-docstore absent)"; board_cov; return 0
+  fi
+  cut="$(date -u -d "-${BOARD_DAYS} days" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
+  [ -n "$cut" ] || { BOARD_TIER="live-only(no date -d)"; board_cov; return 0; }
+  tmp="$(mktemp)" || { BOARD_TIER="live-only(mktemp failed)"; board_cov; return 0; }
+  if ! mesh-docstore --file "$store" all 2>/dev/null | awk -v c="$cut" '$1 >= c' > "$tmp.arc"; then
+    echo "mesh-promises: durable board tier ${store##*/} unreadable (mesh-docstore rc!=0) — replaying the EVICTING live window only" >&2
+    rm -f "$tmp" "$tmp.arc"; BOARD_TIER="live-only(store unreadable)"; board_cov; return 0
+  fi
+  { cat "$tmp.arc"; cat "$CHAT_LOG" 2>/dev/null; } | LC_ALL=C sort -u > "$tmp"   # union-merge
+  # the gate: every live line must survive into the union (set difference, not cardinality)
+  lost="$(LC_ALL=C comm -23 <(LC_ALL=C sort -u "$CHAT_LOG" 2>/dev/null) "$tmp" | grep -c . )"
+  if [ "${lost:-1}" != 0 ]; then
+    echo "mesh-promises: REFUSED the durable union — $lost live board line(s) absent from it (the merge is destroying history); replaying the live window only" >&2
+    rm -f "$tmp" "$tmp.arc"; BOARD_TIER="live-only(union refused: lost_in_union=$lost)"; board_cov; return 0
+  fi
+  live_n="$(grep -c . "$CHAT_LOG" 2>/dev/null || echo 0)"; union_n="$(grep -c . "$tmp")"
+  rm -f "$tmp.arc"
+  BOARD="$tmp"; BOARD_TMP="$tmp"
+  BOARD_TIER="union(live=$live_n + archive<=${BOARD_DAYS}d = $union_n, lost_in_union=0)"
+  board_cov
+}
+# BOARD_COV — the oldest line the replay can actually SEE. Published, because a bounded window that
+# does not say where it ends invites the reader to mistake it for all history (the clamp half of
+# a-window-longer-than-an-evicting-tape-inflates-autocorrelation).
+board_cov(){ BOARD_COV="$(head -1 "$BOARD" 2>/dev/null | awk '{print $1}')"; [ -n "$BOARD_COV" ] || BOARD_COV="na"; }
+board_tier_note(){ printf 'board tier: %s · coverage from %s\n' "$BOARD_TIER" "$BOARD_COV"; }
+
 # board_admission — ACFA Def. 3 in the mesh's terms (header block above). Echoes ONE line:
 #   <ADMITTED|LAGGING|DARK|NOEVIDENCE>|<evidence string, carried into the published verdict>
 # Reads ONLY the evidence mesh-chat-sync already writes; no SSH, no probe, no new state file.
@@ -208,8 +287,13 @@ have(){ command -v "$1" >/dev/null 2>&1; }
 # a fabricated "everyone is merged" is exactly the silent fallback this whole discipline forbids.
 board_admission(){
   local now e p rest age root adm=0 lag=0 dark=0 tot=0 lagging="" darkp=""
-  root="$(LC_ALL=C sort -u "$CHAT_LOG" 2>/dev/null | sha256sum 2>/dev/null | cut -c1-12)"
+  root="$(LC_ALL=C sort -u "$BOARD" 2>/dev/null | sha256sum 2>/dev/null | cut -c1-12)"
   [ -n "$root" ] || root="na"
+  # the root now digests the UNION, so the verdict must say WHICH tier produced it — two nodes
+  # disagreeing need to tell a different board from a differently-SOURCED one. Its OWN token: the
+  # existing `board=<12hex>` field has readers (smoke-test 42f among them) and widening a field in
+  # place breaks every one of them (a-format-fix-must-sweep-every-reader).
+  root="$root src=${BOARD_TIER%%(*}"
   if [ ! -s "$LAGF" ]; then
     printf 'NOEVIDENCE|board=%s admitted=?/? (no anti-entropy round recorded in %s — peer set unknown)\n' \
       "$root" "${LAGF##*/}"
@@ -1628,14 +1712,24 @@ if mode == 'json':
 # after which the ordering is IMMUTABLE — "the resulting finality improves on the level of consistency
 # CRDTs can provide", at no availability cost (the epoch is optional and off the write path).
 #
-# THE MESH INSTANCE, measured: this ledger is regenerated from `chat.log` on every run, and chat.log
-# is a `tail -3000` sliding window — a NON-MONOTONE input. So every verdict this tool has ever emitted
-# is provisional forever: lose the `[done]` line to an eviction round and a kept promise silently
-# re-opens and re-leaks. That is not hypothetical here. 2026-08-19T22:42Z→23:42Z, one eviction round
+# THE MESH INSTANCE, measured — and FIXED 2026-08-20, the fix is below: this ledger USED to be
+# regenerated from `chat.log` alone, and chat.log is a `tail -3000` sliding window — a NON-MONOTONE
+# input. So every verdict this tool emitted before that was provisional forever: lose the `[done]`
+# line to an eviction round and a kept promise silently re-opens and re-leaks. That is not
+# hypothetical here. 2026-08-19T22:42Z→23:42Z, one eviction round
 # on mesh-home moved this ledger `138 kept -> 6 kept` and `0 LEAKED -> 2 LEAKED`, and the memory
 # written from it had to warn readers off the tool's own output: "a LEAKED verdict after an eviction
 # round is not evidence of an unkept promise" (chat-board-eviction-treadmill). A detector whose
 # verdicts must be manually distrusted after a merge is exactly ERA's rollback, in our own corpus.
+#
+# THE INPUT IS NOW THE UNION of `board-store.db` (bounded by MESH_PROMISE_BOARD_DAYS) and the live
+# board — see board_resolve() and the BOARD_STORE block up top. Measured on mesh-home the hour it
+# landed: kept 123 -> 226 over the same live window, i.e. 103 discharges the window had already
+# destroyed, with the leak set UNCHANGED at 2 — so today's leaks are real rather than eviction
+# artifacts, which is exactly the question this tool could not answer before. The epoch/seal
+# machinery below is NOT retired by it and must not be: the union removes the ORDINARY eviction
+# rollback, while an epoch is what survives an archive that is itself lost, restored from a peer, or
+# horizon-clamped past a verdict.
 #
 # WHAT IS SEALED, AND WHAT IS DELIBERATELY NOT. Only POSITIVE, EVENT-BACKED closures are eligible: a
 # promise/claim/hold that a real board line DISCHARGED. A leak is an ABSENCE, and an absence is never
@@ -2699,7 +2793,8 @@ print("  STICKY = roles come in RUNS (the window holds one Kolb phase); MEMORYLE
 print("  order beyond its own mix; MONO = one role, never cycles. A roster can be role-diverse in")
 print("  AGGREGATE and frozen per window — composition is not cycling, and cycling is the claim.")
 print("  Caveats: roles are inferred from the MARKER, not from what the post says (a [fyi] that")
-print("  argues is scored as observation); chat.log is a sliding window so every n is today's answer;")
+print("  argues is scored as observation); the board input is bounded (live window + a horizon-capped")
+print("  archive — see `board tier:` on --report) so every n is today's answer over THAT span;")
 print("  and this measures which phase a window OCCUPIES, never whether the group learned anything.")
 sys.exit(0)
 PYEOF
@@ -2708,14 +2803,14 @@ PYEOF
 now_iso(){ date -u +%Y-%m-%dT%H:%M:%SZ; }
 
 # ============================ commands ============================
-do_empowerment(){ empower "$CHAT_LOG" "${MESH_EMP_GAMMA:-0.9}" "${MESH_EMP_SURR_K:-200}" \
+do_empowerment(){ empower "$BOARD" "${MESH_EMP_GAMMA:-0.9}" "${MESH_EMP_SURR_K:-200}" \
                           "${MESH_EMP_MIN_N:-25}" "${MESH_EMP_CAP_H:-6}" "${1:-}"; }
-do_roles(){ roles "$CHAT_LOG" "${MESH_ROLES_MIN_N:-12}" "${MESH_ROLES_REPS:-400}" \
+do_roles(){ roles "$BOARD" "${MESH_ROLES_MIN_N:-12}" "${MESH_ROLES_REPS:-400}" \
                   "${MESH_ROLES_ALPHA:-0.05}" "${1:-}"; }
 # the drift note rides the DEFAULT report (what the reflex runs) — a stale chart must be loud where
 # somebody is already looking, not only under --check. Report's exit code is the leak verdict, so it
 # is captured and re-raised around the note.
-do_report(){ local rc=0; replay report "$CHAT_LOG" "$(now_iso)" "$LEAK_H" "$LEAK_INCIDENT_H" "$MIN_OVERLAP" || rc=$?; roster_drift_note; finality_note; return $rc; }
+do_report(){ local rc=0; replay report "$BOARD" "$(now_iso)" "$LEAK_H" "$LEAK_INCIDENT_H" "$MIN_OVERLAP" || rc=$?; roster_drift_note; finality_note; board_tier_note; return $rc; }
 # FINALITY FOOTNOTE — deliberately VERDICT-PRESERVING. A resurrected promise still prints as LEAKED
 # above (its discharge left the window); this appends the sealed evidence BESIDE it without touching
 # the verdict or the exit code. Auto-suppressing a leak on sealed evidence is a steward decision, not
@@ -2727,16 +2822,16 @@ finality_note(){
   case "$eo" in *RESURRECTED*) printf '%s\n' "$eo" | sed -n '/RESURRECTED/,$p' | sed 's/^ *//; s/^/  /';; esac
   return 0
 }
-do_all(){    replay all    "$CHAT_LOG" "$(now_iso)" "$LEAK_H" "$LEAK_INCIDENT_H" "$MIN_OVERLAP"; }
-do_json(){   replay json   "$CHAT_LOG" "$(now_iso)" "$LEAK_H" "$LEAK_INCIDENT_H" "$MIN_OVERLAP"; }
-do_redundancy(){ replay redundancy "$CHAT_LOG" "$(now_iso)" "$LEAK_H" "$LEAK_INCIDENT_H" "$MIN_OVERLAP"; }
-do_teachback(){ replay teachback "$CHAT_LOG" "$(now_iso)" "$LEAK_H" "$LEAK_INCIDENT_H" "$MIN_OVERLAP"; }
-do_collisions(){ replay collisions "$CHAT_LOG" "$(now_iso)" "$LEAK_H" "$LEAK_INCIDENT_H" "$MIN_OVERLAP"; }
-do_mttr(){ replay mttr "$CHAT_LOG" "$(now_iso)" "$LEAK_H" "$LEAK_INCIDENT_H" "$MIN_OVERLAP"; }
+do_all(){    replay all    "$BOARD" "$(now_iso)" "$LEAK_H" "$LEAK_INCIDENT_H" "$MIN_OVERLAP"; }
+do_json(){   replay json   "$BOARD" "$(now_iso)" "$LEAK_H" "$LEAK_INCIDENT_H" "$MIN_OVERLAP"; }
+do_redundancy(){ replay redundancy "$BOARD" "$(now_iso)" "$LEAK_H" "$LEAK_INCIDENT_H" "$MIN_OVERLAP"; }
+do_teachback(){ replay teachback "$BOARD" "$(now_iso)" "$LEAK_H" "$LEAK_INCIDENT_H" "$MIN_OVERLAP"; }
+do_collisions(){ replay collisions "$BOARD" "$(now_iso)" "$LEAK_H" "$LEAK_INCIDENT_H" "$MIN_OVERLAP"; }
+do_mttr(){ replay mttr "$BOARD" "$(now_iso)" "$LEAK_H" "$LEAK_INCIDENT_H" "$MIN_OVERLAP"; }
 # optional $1 = an explicit "now" (ISO-Z). The diagram's window ENDS at now, so a fixture board whose
 # last event is weeks old would otherwise trail a long dead tail of high-k/zero-q bins and read
 # RETROGRADE from the silence alone. --test pins it to the fixture's last event; live use omits it.
-do_flow(){ replay flow "$CHAT_LOG" "${1:-$(now_iso)}" "$LEAK_H" "$LEAK_INCIDENT_H" "$MIN_OVERLAP"; }
+do_flow(){ replay flow "$BOARD" "${1:-$(now_iso)}" "$LEAK_H" "$LEAK_INCIDENT_H" "$MIN_OVERLAP"; }
 # The causal-delivery frontier is NOT re-derived here: mesh-chat-sync --frontier owns the predicate
 # (S = min over known peers of their last-successful-pull epoch) and a second implementation would rot
 # apart from it. rc!=0 is the tool's honest UNKNOWN (a never-converged peer) and must stay empty —
@@ -2748,17 +2843,17 @@ causal_frontier(){
   timeout 25 mesh-chat-sync --frontier 2>/dev/null \
     | sed -n 's/.*STABLE<=\([0-9TZ:-]*\).*/\1/p' | head -1
 }
-do_evidence(){ MESH_PROMISE_FRONTIER="$(causal_frontier)" replay evidence "$CHAT_LOG" "${1:-$(now_iso)}" "$LEAK_H" "$LEAK_INCIDENT_H" "$MIN_OVERLAP"; }
+do_evidence(){ MESH_PROMISE_FRONTIER="$(causal_frontier)" replay evidence "$BOARD" "${1:-$(now_iso)}" "$LEAK_H" "$LEAK_INCIDENT_H" "$MIN_OVERLAP"; }
 # ERA finality. --seal is the WRITER (append-only, idempotent per (kind,slug)); --epochs is the reader
 # and carries the RESURRECTED detector. --seal takes the frontier from the same owner --evidence does.
 do_seal(){ MESH_PROMISE_EPOCH_LOG="$EPOCH_LOG" MESH_PROMISE_SEAL_AGE_H="$SEAL_AGE_H" \
   MESH_PROMISE_FRONTIER="$(causal_frontier)" \
-  replay seal "$CHAT_LOG" "$(now_iso)" "$LEAK_H" "$LEAK_INCIDENT_H" "$MIN_OVERLAP"; }
+  replay seal "$BOARD" "$(now_iso)" "$LEAK_H" "$LEAK_INCIDENT_H" "$MIN_OVERLAP"; }
 do_epochs(){ MESH_PROMISE_EPOCH_LOG="$EPOCH_LOG" MESH_PROMISE_SEAL_AGE_H="$SEAL_AGE_H" \
-  replay epochs "$CHAT_LOG" "$(now_iso)" "$LEAK_H" "$LEAK_INCIDENT_H" "$MIN_OVERLAP"; }
-do_specificity(){ replay specificity "$CHAT_LOG" "${1:-$(now_iso)}" "$LEAK_H" "$LEAK_INCIDENT_H" "$MIN_OVERLAP"; }
-do_transversality(){ replay transversality "$CHAT_LOG" "${1:-$(now_iso)}" "$LEAK_H" "$LEAK_INCIDENT_H" "$MIN_OVERLAP"; }
-do_homefield(){ replay homefield "$CHAT_LOG" "${1:-$(now_iso)}" "$LEAK_H" "$LEAK_INCIDENT_H" "$MIN_OVERLAP"; }
+  replay epochs "$BOARD" "$(now_iso)" "$LEAK_H" "$LEAK_INCIDENT_H" "$MIN_OVERLAP"; }
+do_specificity(){ replay specificity "$BOARD" "${1:-$(now_iso)}" "$LEAK_H" "$LEAK_INCIDENT_H" "$MIN_OVERLAP"; }
+do_transversality(){ replay transversality "$BOARD" "${1:-$(now_iso)}" "$LEAK_H" "$LEAK_INCIDENT_H" "$MIN_OVERLAP"; }
+do_homefield(){ replay homefield "$BOARD" "${1:-$(now_iso)}" "$LEAK_H" "$LEAK_INCIDENT_H" "$MIN_OVERLAP"; }
 
 do_balance(){
   have hledger || { echo "mesh-promises --balance: hledger not installed (n/a)"; exit 2; }
@@ -2777,7 +2872,7 @@ do_balance(){
 do_materialize(){
   ensure_repo
   local tmp; tmp="$(mktemp)"
-  local counts; counts="$(replay journal "$CHAT_LOG" "$(now_iso)" "$LEAK_H" "$LEAK_INCIDENT_H" "$MIN_OVERLAP" "$tmp")"
+  local counts; counts="$(replay journal "$BOARD" "$(now_iso)" "$LEAK_H" "$LEAK_INCIDENT_H" "$MIN_OVERLAP" "$tmp")"
   mv -f "$tmp" "$JOURNAL"
   echo "$counts"
 }
@@ -2887,7 +2982,7 @@ PY
 
 do_feed(){
   have hledger || { echo "mesh-promises --feed: hledger not installed" >&2; exit 2; }
-  [ -f "$CHAT_LOG" ] || { echo "mesh-promises --feed: no board — n/a" >&2; exit 2; }
+  [ -f "$BOARD" ] || { echo "mesh-promises --feed: no board — n/a" >&2; exit 2; }
   ensure_repo
   # FIRST-RUN suppression: a brand-new detector must not retroactively alarm every historical leak
   # (that is the opposite of "rare and loud"). Seed state silently; alert only on leaks that appear
@@ -2962,7 +3057,8 @@ PY
 
 do_dash(){
   echo "mesh-promises · board promise leak detector · $(date -u +%H:%MZ) · $(hostname)"
-  local counts; counts="$(replay journal "$CHAT_LOG" "$(now_iso)" "$LEAK_H" "$LEAK_INCIDENT_H" "$MIN_OVERLAP" /dev/null 2>/dev/null)"
+  echo "  $(board_tier_note)"
+  local counts; counts="$(replay journal "$BOARD" "$(now_iso)" "$LEAK_H" "$LEAK_INCIDENT_H" "$MIN_OVERLAP" /dev/null 2>/dev/null)"
   write_summary "$counts"
   [ -f "$SUMMARY" ] && sed 's/^/  /' "$SUMMARY"
   echo "── leaked (made, not kept, aged) ──"
@@ -4152,8 +4248,11 @@ EOF
   FOUT="$(_feed)"                             # pass 3: set agreed ⇒ the withheld leak must surface
   grep -q 'acfa-fresh-probe' "$fh/posts" \
     || { echo "smoke-test: FAIL (admission: the WITHHELD leak never posted once the set agreed — deferral became suppression: $(echo "$FOUT" | tail -3))"; exit 1; }
-  grep 'acfa-fresh-probe' "$fh/posts" | grep -qE 'board=[0-9a-f]{12} admitted=2/2' \
-    || { echo "smoke-test: FAIL (admission: the published verdict must carry its admission evidence — $(grep 'acfa-fresh-probe' "$fh/posts" | tail -1))"; exit 1; }
+  # the evidence now carries WHICH TIER produced the root as its own `src=` token (the durable-tier
+  # change, test 47): a verdict computed over the union and one computed over the evicting window are
+  # different claims, and a reader must be able to tell them apart without re-deriving the board.
+  grep 'acfa-fresh-probe' "$fh/posts" | grep -qE 'board=[0-9a-f]{12} src=(union|live-only) admitted=2/2' \
+    || { echo "smoke-test: FAIL (admission: the published verdict must carry its admission evidence + board tier — $(grep 'acfa-fresh-probe' "$fh/posts" | tail -1))"; exit 1; }
 
   # 43) BARE-POSTER LINES MUST BE PARSED. `<who>  ::` with no `@<node>` was dropped outright by
   #     LINE (a `continue` on no-match), so such a line could neither open nor KEEP a promise. Live
@@ -4570,8 +4669,82 @@ EOF
   grep -q 'warp-coil' "$sealt" && { echo "smoke-test: FAIL (finality: sealed a closure ABOVE the watermark — W does not bind)"; exit 1; }
   echo "  ok: ERA finality (evicted closure proven to false-LEAK first; UNKNOWN frontier seals nothing; S taken from the real mesh-chat-sync wiring; RESURRECTED fires only on contradiction; append-once; watermark binds)"
 
+  # 47) THE DURABLE TIER. chat.log is a `tail -3000` sliding window, so before this the ledger's
+  #     input was NON-MONOTONE: lose a `[done]` to an eviction round and a kept promise silently
+  #     re-opened and re-leaked (measured: 138 kept -> 6 kept, 0 -> 2 LEAKED in one round on
+  #     mesh-home 2026-08-19). The replay now reads the UNION of board-store.db (the lossless
+  #     content-addressed archive) and the live board. RED-FIRST throughout: every green assertion
+  #     below is paired with the live-only run that fails it.
+  if have mesh-docstore; then
+    local ut="$t/ut"; mkdir -p "$ut"
+    local T30 T2 T20D
+    T30="$(date -u -d '30 hours ago' +%Y-%m-%dT%H:%M:%SZ)"
+    T2="$(date -u -d '2 hours ago' +%Y-%m-%dT%H:%M:%SZ)"
+    T20D="$(date -u -d '20 days ago' +%Y-%m-%dT%H:%M:%SZ)"
+    # the live board holds the OPEN promise; its discharge exists ONLY in the archive — exactly the
+    # shape an eviction round produces (the [task] is old and survives; the [done] is newer and was
+    # the casualty, because the survivors of that round were the older, shorter lines).
+    printf '%s  genome@n  ::  [task] durable tier probe. owner: genome\n' "$T30" > "$ut/chat.log"
+    printf '%s  genome@n  ::  [done] durable-tier-probe: discharged, artifact on disk.\n' "$T2" \
+      | mesh-docstore --file "$ut/board-store.db" ingest >/dev/null 2>&1
+    # a line OLDER than the horizon, unkept — 47c asserts the bound actually binds
+    printf '%s  genome@n  ::  [task] beyond horizon probe. owner: genome\n' "$T20D" \
+      | mesh-docstore --file "$ut/board-store.db" ingest >/dev/null 2>&1
+    # 47a RED: live-only (the durable tier explicitly disabled) must LEAK the probe
+    local u0 u0rc; u0="$(MESH_CHAT_LOG="$ut/chat.log" MESH_PROMISE_BOARD_STORE= MESH_PROMISE_ROSTER=genome "$0" --report 2>&1)"; u0rc=$?
+    echo "$u0" | grep -qE 'durable.tier.probe' \
+      || { echo "smoke-test: FAIL (durable tier: the RED arm did not leak — the fixture proves nothing)"; echo "$u0" | sed 's/^/    /'; exit 1; }
+    [ "$u0rc" = 1 ] || { echo "smoke-test: FAIL (durable tier: live-only arm must exit 1 with a leak, got $u0rc)"; exit 1; }
+    echo "$u0" | grep -q 'board tier: live-only' \
+      || { echo "smoke-test: FAIL (durable tier: a live-only replay must SAY it is live-only — a silent fallback here reports the pre-fix numbers while claiming immunity)"; exit 1; }
+    # 47b GREEN: the union recovers the evicted discharge — same board, promise KEPT
+    local u1 u1rc; u1="$(MESH_CHAT_LOG="$ut/chat.log" MESH_PROMISE_ROSTER=genome "$0" --report 2>&1)"; u1rc=$?
+    echo "$u1" | grep -qE 'durable.tier.probe' \
+      && { echo "smoke-test: FAIL (durable tier: the archived [done] did NOT keep the promise — the union buys nothing)"; echo "$u1" | sed 's/^/    /'; exit 1; }
+    echo "$u1" | grep -q 'board tier: union(.*lost_in_union=0' \
+      || { echo "smoke-test: FAIL (durable tier: the report must publish the tier and its zero-loss gate — $(echo "$u1" | tail -1))"; exit 1; }
+    # 47c THE HORIZON BINDS BOTH WAYS. Unbounded, this replay resurrects a 69-day graveyard; a bound
+    #     nobody can see fail is decoration.
+    echo "$u1" | grep -qE 'beyond.horizon.probe' \
+      && { echo "smoke-test: FAIL (durable tier: replayed an archive line older than MESH_PROMISE_BOARD_DAYS — the horizon does not bind)"; exit 1; }
+    local u2; u2="$(MESH_CHAT_LOG="$ut/chat.log" MESH_PROMISE_BOARD_DAYS=30 MESH_PROMISE_ROSTER=genome "$0" --report 2>&1)"
+    echo "$u2" | grep -qE 'beyond.horizon.probe' \
+      || { echo "smoke-test: FAIL (durable tier: widening the horizon to 30d did not reach a 20d-old archived line — the bound is not what is excluding it)"; echo "$u2" | sed 's/^/    /'; exit 1; }
+    # 47d THE ZERO-LOSS GATE, DRIVEN RED BY A MUTANT. lost_in_union=0 holds by construction today, so
+    #     the gate guards a FUTURE edit — the exact edit mesh-chat-sync already made once (`| tail`
+    #     to bound a union, which silently ate the local board). Run it from a scratch copy.
+    #     The mutant must be checked ON THE MERGE LINE: this test's own sed text contains the same
+    #     pattern, so a bare `grep tail -1` would match the test line and assert nothing (the
+    #     self-matching-grep shape). Anchor on `cat "$tmp.arc"`, which only the real line carries.
+    #     A first draft also mutated the marker to a bare `&`, which BACKGROUNDED the merge — the
+    #     refusal then fired on an empty $tmp, i.e. the gate went red for the wrong reason and the
+    #     result flipped with timing (green on the deployed copy, red on the genome copy).
+    local mp="$ut/mp"; sed 's/sort -u > "$tmp"   # union-merge/sort -u | tail -1 > "$tmp"/' "$0" > "$mp"; chmod +x "$mp"
+    grep -q 'cat "$tmp.arc".*tail -1 > "$tmp"' "$mp" \
+      || { echo "smoke-test: FAIL (durable tier: the mutant did not land on the merge line — the gate was never driven red)"; exit 1; }
+    local u3; u3="$(MESH_CHAT_LOG="$ut/chat.log" MESH_PROMISE_ROSTER=genome bash "$mp" --report 2>&1)"
+    echo "$u3" | grep -q 'REFUSED the durable union' \
+      || { echo "smoke-test: FAIL (durable tier: a merge that DESTROYS live board lines was accepted — the set gate is decoration)"; echo "$u3" | sed 's/^/    /'; exit 1; }
+    echo "$u3" | grep -q 'board tier: live-only(union refused' \
+      || { echo "smoke-test: FAIL (durable tier: the refusal must degrade to the live board and say so, not replay the truncated union)"; exit 1; }
+    echo "$u3" | grep -qE 'durable.tier.probe' \
+      || { echo "smoke-test: FAIL (durable tier: the refusal must still replay the LIVE board — refusing the union must not blind the ledger)"; exit 1; }
+    echo "  ok: durable tier (archived [done] proven to false-LEAK live-only, then KEPT via the union; horizon binds both ways; zero-loss set gate driven RED by a truncating mutant and degrades loudly to live-only)"
+  else
+    echo "  ok: durable tier SKIPPED (mesh-docstore not on PATH — the archive tier cannot be exercised here)"
+  fi
+
   echo "smoke-test: ok"; exit 0
 }
+
+# Resolve the replay input ONCE, before any command runs, so every mode of one invocation replays
+# the SAME set (a --report and the --feed beside it disagreeing about the board would be worse than
+# either being wrong). --test is excluded on purpose: it re-execs this script per fixture and each
+# child resolves its own (fixture-local, live-only) board; --help reads no board at all.
+case "${1:-}" in
+  --test|-h|--help) : ;;
+  *) board_resolve; trap '[ -n "${BOARD_TMP:-}" ] && rm -f "$BOARD_TMP"; :' EXIT INT HUP TERM ;;
+esac
 
 case "${1:-}" in
   --feed)        do_feed;;
