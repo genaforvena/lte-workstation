@@ -1,0 +1,407 @@
+#!/usr/bin/env python3
+"""mesh-job-answers — the job lane's ANSWER BANK: a questionnaire he fills ONCE.
+
+  mesh-job-answers --match "<вопрос>"    -> ответ на stdout (rc 0) | rc 2 = не знаем (и вопрос в очередь)
+  mesh-job-answers --list                -> банк
+  mesh-job-answers --open                -> открытые вопросы (в банке без ответа + очередь)
+  mesh-job-answers --add KEY PATTERN ANSWER [--source S]
+  mesh-job-answers --queue "<вопрос>" [--origin O]
+  mesh-job-answers --ask [--dry-run] [--force]   -> ОДНО нумерованное сообщение в TG
+  mesh-job-answers --ingest [--stdin]    -> разобрать его нумерованный ответ из voice-in.log
+  mesh-job-answers --test
+
+WHY. `needs-human` был ТУПИКОМ: тул упирался в вопрос работодателя и бросал строку в отстойник,
+где она лежала, пока человек не откроет её руками. Оператор (2026-08-20): «lets make needs-human
+more of the questionnaire that i fill once… and it would be amazing if u could be using this info.
+also if u know it about me anyhow - feel free to answer without asking me». То есть тупик становится
+ДВУМЯ ЛЕНТАМИ: известное — отвечается из банка без него; неизвестное — спрашивается ОДНИМ пакетом в
+TG и оседает в банке навсегда.
+
+ГРАНИЦА, КОТОРУЮ ТУЛ НЕ ПЕРЕХОДИТ. Отсутствие ответа НИКОГДА не становится ответом. `--match` без
+попадания = rc 2, и вызывающий обязан оставить строку в needs-human — ровно как раньше. Банк только
+СНИМАЕТ вопросы, он не выдумывает. Вопросы, где ответ стоит его времени, а не его факта (тестовое
+задание), в банк не кладутся НИКОГДА — они по определению его.
+
+РИСК, НАЗВАННЫЙ ВСЛУХ (он его принял: «ack risks and if they play out it is not anybody's fault»).
+Ответ из банка уходит работодателю ОТ ЕГО ИМЕНИ. Три ограничителя: (1) паттерн должен попасть —
+похожести недостаточно; (2) каждое применение пишется дословно в answers-used.log, так что «что мы
+за него сказали» — артефакт, а не память; (3) очередь помнит ИСХОДНЫЙ текст вопроса, поэтому его
+ответ ложится ровно на тот вопрос, который был задан, а не на наш пересказ.
+"""
+# reflex-cadence: 23 9,18 * * *
+# reflex-args: --ask
+
+import argparse, json, os, re, subprocess, sys, time
+from pathlib import Path
+
+HOME = Path.home()
+JOB = Path(os.environ.get("MESH_JOB_DIR", HOME / ".mesh/job"))
+BANK = Path(os.environ.get("MESH_JOB_ANSWERS", JOB / "answers.tsv"))
+QUEUE = Path(os.environ.get("MESH_JOB_QUESTIONS", JOB / "questions.tsv"))
+USED = Path(os.environ.get("MESH_JOB_ANSWERS_USED", JOB / "answers-used.log"))
+VOICE_IN = Path(os.environ.get("MESH_TG_IN_LOG", HOME / ".mesh/voice-in.log"))
+TG = os.environ.get("MESH_TG_BIN", "mesh-tg")
+ASK_EVERY_DAYS = float(os.environ.get("MESH_JOB_ASK_EVERY_DAYS", "3"))
+
+
+def now():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def esc(s):
+    return (s or "").replace("\\", "\\\\").replace("\t", "\\t").replace("\n", "\\n")
+
+
+def unesc(s):
+    out, i = [], 0
+    while i < len(s):
+        if s[i] == "\\" and i + 1 < len(s):
+            c = s[i + 1]
+            out.append({"n": "\n", "t": "\t", "\\": "\\"}.get(c, "\\" + c))
+            i += 2
+        else:
+            out.append(s[i])
+            i += 1
+    return "".join(out)
+
+
+def norm(q):
+    """Нормализация ВОПРОСА, не ответа: регистр, пробелы, ё, хвостовая пунктуация."""
+    q = (q or "").replace("\u00a0", " ").replace("ё", "е").lower()
+    return re.sub(r"\s+", " ", q).strip(" \t\n?:.!*—-")
+
+
+def read_rows(path, ncol):
+    if not path.exists():
+        return []
+    rows = []
+    for ln in path.read_text(encoding="utf-8").splitlines():
+        if not ln.strip() or ln.startswith("#"):
+            continue
+        f = ln.split("\t")
+        f += [""] * (ncol - len(f))
+        rows.append([unesc(x) for x in f[:ncol]])
+    return rows
+
+
+def write_rows(path, rows, header):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    body = "\n".join("\t".join(esc(x) for x in r) for r in rows)
+    tmp.write_text(header + "\n" + body + ("\n" if body else ""), encoding="utf-8")
+    tmp.replace(path)
+
+
+def bank():
+    # 6-я колонка `question` — ЧЕЛОВЕЧЕСКИЙ текст вопроса. Без неё анкета в TG печатала слаг
+    # («public work link»), то есть спрашивала его нашим внутренним именем поля, а не вопросом.
+    return read_rows(BANK, 6)          # key, pattern, answer, source, ts, question
+
+
+def queue():
+    return read_rows(QUEUE, 4)         # ts, status, origin, question
+
+
+def save_bank(rows):
+    write_rows(BANK, rows, "# key\tpattern\tanswer\tsource\tts\tquestion")
+
+
+def save_queue(rows):
+    write_rows(QUEUE, rows, "# ts\tstatus\torigin\tquestion")
+
+
+def match(q):
+    """-> (key, answer) | None. Пустой ответ в банке = вопрос ОТКРЫТ, а не отвечен."""
+    n = norm(q)
+    for key, pat, ans, _src, _ts, _q in bank():
+        if not pat or not ans.strip():
+            continue
+        try:
+            if re.search(pat, n, re.I):
+                return key, ans
+        except re.error:
+            continue
+    return None
+
+
+def enqueue(q, origin="match"):
+    n = norm(q)
+    rows = queue()
+    for r in rows:
+        if norm(r[3]) == n:
+            return False
+    rows.append([now(), "open", origin, q.strip()])
+    save_queue(rows)
+    return True
+
+
+def open_items():
+    """Открытое = ключ банка без ответа + строки очереди в статусе open/asked."""
+    out = []
+    for key, _pat, ans, _src, _ts, q in bank():
+        if not ans.strip():
+            out.append(("bank:" + key, (q.strip() or key.replace("-", " ")), key))
+    for ts, st, origin, q in queue():
+        if st.startswith("open") or st.startswith("asked"):
+            out.append(("queue:" + ts, q, origin))
+    return out
+
+
+def last_ask_ts():
+    for ts, st, _o, _q in queue():
+        pass
+    stamps = [st.split(":", 1)[1].split("#")[0] for _t, st, _o, _q in queue() if st.startswith("asked:")]
+    return max(stamps) if stamps else ""
+
+
+def do_ask(dry=False, force=False):
+    items = open_items()
+    if not items:
+        print("нечего спрашивать: открытых вопросов нет")
+        return 0
+    last = last_ask_ts()
+    if last and not force:
+        try:
+            age = time.time() - time.mktime(time.strptime(last, "%Y-%m-%dT%H:%M:%SZ"))
+            if age < ASK_EVERY_DAYS * 86400:
+                print("спрошено %s (%.1f сут назад) — молчу до %.0f сут" % (last, age / 86400, ASK_EVERY_DAYS))
+                return 0
+        except ValueError:
+            pass
+    stamp = now()
+    lines = ["Анкета job-ланы — ответьте номерами, одним сообщением, в любом порядке.",
+             "Отвечу за вас на всё, что уже знаю; ниже только то, чего в артефактах НЕТ.", ""]
+    for i, (_id, q, _origin) in enumerate(items, 1):
+        lines.append("%d. %s" % (i, q))
+    lines += ["", "Формат: «1. ... 2. ...». Пропущенный номер останется открытым, это нормально."]
+    msg = "\n".join(lines)
+    if dry:
+        print(msg)
+        return 0
+    r = subprocess.run([TG, msg], capture_output=True, text=True, timeout=90)
+    if r.returncode != 0:
+        print("mesh-tg rc=%d: %s" % (r.returncode, (r.stderr or "").strip()[:200]), file=sys.stderr)
+        return 1
+    rows = queue()
+    qidx = {norm(q): i for i, (_id, q, _o) in enumerate(items, 1)}
+    for row in rows:
+        i = qidx.get(norm(row[3]))
+        if i and (row[1].startswith("open") or row[1].startswith("asked")):
+            row[1] = "asked:%s#%d" % (stamp, i)
+    save_queue(rows)
+    bidx = [(i, key) for i, (_id, _q, key) in enumerate(items, 1) if _id.startswith("bank:")]
+    (JOB / "ask-map.json").write_text(json.dumps(
+        {"ts": stamp, "items": [{"n": i, "id": _id, "q": q} for i, (_id, q, _o) in enumerate(items, 1)]},
+        ensure_ascii=False, indent=1), encoding="utf-8")
+    print("спрошено %d вопрос(ов) в TG, карта -> %s" % (len(items), JOB / "ask-map.json"))
+    return 0
+
+
+def parse_numbered(text):
+    """'1. ... 2. ...' -> {n: answer}. Работает и в одну строку, и в столбик."""
+    out, cur, buf = {}, None, []
+    for chunk in re.split(r"(?m)(?=^\s*\d{1,2}\s*[.):])|(?<=[.\s])(?=\d{1,2}\s*[.)]\s+\S)", text):
+        m = re.match(r"^\s*(\d{1,2})\s*[.):]\s*(.*)$", chunk, re.S)
+        if not m:
+            if cur is not None:
+                buf.append(chunk)
+            continue
+        if cur is not None:
+            out[cur] = " ".join((" ".join(buf)).split()).strip()
+        cur, buf = int(m.group(1)), [m.group(2)]
+    if cur is not None:
+        out[cur] = " ".join((" ".join(buf)).split()).strip()
+    return {k: v for k, v in out.items() if v}
+
+
+def since_lines(ts):
+    if not VOICE_IN.exists():
+        return []
+    out = []
+    for ln in VOICE_IN.read_text(encoding="utf-8", errors="replace").splitlines():
+        m = re.match(r"^(\S+Z)\s+(TEXT|VOICE)\s+(.*)$", ln)
+        # >= , не > : его ответ, пришедший в ТУ ЖЕ секунду, что и вопрос, иначе теряется молча.
+        # Наше исходящее в voice-in.log не пишется, так что вернуть свой же вопрос отсюда нельзя.
+        if m and (not ts or m.group(1) >= ts):
+            out.append(m.group(3))
+    return out
+
+
+def do_ingest(from_stdin=False):
+    mp = JOB / "ask-map.json"
+    if not mp.exists():
+        print("нет ask-map.json — сначала --ask", file=sys.stderr)
+        return 1
+    m = json.loads(mp.read_text(encoding="utf-8"))
+    text = sys.stdin.read() if from_stdin else "\n".join(since_lines(m["ts"]))
+    if not text.strip():
+        print("после %s от него ничего не пришло" % m["ts"])
+        return 0
+    got = parse_numbered(text)
+    if not got:
+        print("в его сообщениях нет нумерованных ответов (искал после %s)" % m["ts"])
+        return 0
+    by_n = {it["n"]: it for it in m["items"]}
+    brows, qrows, wrote = bank(), queue(), 0
+    for n, ans in sorted(got.items()):
+        it = by_n.get(n)
+        if not it:
+            continue
+        if it["id"].startswith("bank:"):
+            key = it["id"].split(":", 1)[1]
+            for r in brows:
+                if r[0] == key:
+                    r[2], r[3], r[4] = ans, "operator-tg", now()
+                    wrote += 1
+        else:
+            q = it["q"]
+            key = "q-" + re.sub(r"[^a-z0-9]+", "-", norm(q)[:40]).strip("-") or ("q-%d" % n)
+            pat = re.escape(norm(q)[:60])
+            brows = [r for r in brows if r[0] != key]
+            brows.append([key, pat, ans, "operator-tg", now(), q])
+            for r in qrows:
+                if norm(r[3]) == norm(q):
+                    r[1] = "answered:" + key
+            wrote += 1
+        print("%d -> %s" % (n, ans[:80]))
+    save_bank(brows)
+    save_queue(qrows)
+    print("записано %d ответ(ов) в %s" % (wrote, BANK))
+    return 0
+
+
+def do_match(q, no_queue=False, origin="match"):
+    hit = match(q)
+    if hit:
+        key, ans = hit
+        USED.parent.mkdir(parents=True, exist_ok=True)
+        with USED.open("a", encoding="utf-8") as f:
+            f.write("%s\t%s\t%s\t%s\n" % (now(), key, esc(q.strip()), esc(ans)))
+        print(ans)
+        return 0
+    if not no_queue:
+        enqueue(q, origin)
+    print("не знаю ответа — вопрос в очереди (%s)" % QUEUE, file=sys.stderr)
+    return 2
+
+
+def selftest():
+    import tempfile
+    global BANK, QUEUE, USED, VOICE_IN, JOB
+    fails = []
+
+    def check(name, ok, detail=""):
+        print("%s %s%s" % ("ok  " if ok else "FAIL", name, ("  -- " + detail) if detail and not ok else ""))
+        if not ok:
+            fails.append(name)
+
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        real_bank, real_used = BANK, USED
+        JOB, BANK, QUEUE, USED = d, d / "answers.tsv", d / "questions.tsv", d / "used.log"
+        VOICE_IN = d / "voice-in.log"
+
+        save_bank([["salary", r"ожидани[яй] по зарплат|salary expectation", "500 000", "derived", now(), ""],
+                   ["relocation", r"релокац|relocat", "", "open", now(), "Готовы ли переехать?"]])
+        check("known question answers from the bank", match("Ваши ожидания по зарплате?") is not None)
+        check("an EMPTY answer is OPEN, not an answer", match("Готовы к релокации?") is None,
+              "пустой ответ прочитан как ответ")
+        check("unrelated question does not match", match("Какой у вас любимый цвет?") is None)
+
+        rc = do_match("Какой у вас любимый цвет?")
+        check("unknown -> rc 2", rc == 2, "rc=%d" % rc)
+        check("unknown lands in the queue", any("любимый цвет" in r[3] for r in queue()))
+        rc = do_match("Ваши ожидания по зарплате?")
+        check("known -> rc 0", rc == 0, "rc=%d" % rc)
+        check("a used answer is logged verbatim", USED.exists() and "500 000" in USED.read_text())
+        check("the test never touched the REAL bank", BANK != real_bank and USED != real_used)
+
+        n0 = len(queue())
+        enqueue("Какой у вас любимый цвет?")
+        check("the queue does not double a repeated question", len(queue()) == n0)
+
+        os.environ["MESH_TG_BIN"] = "true"
+        globals()["TG"] = "true"
+        rc = do_ask(force=True)
+        check("--ask sends and marks asked", rc == 0 and any(r[1].startswith("asked:") for r in queue()))
+        mp = json.loads((JOB / "ask-map.json").read_text())
+        check("ask-map numbers every asked item", len(mp["items"]) == len(open_items()) or len(mp["items"]) > 0)
+
+        g = parse_numbered("1. да, готов 2) только Европа\n3: нет")
+        check("an open bank key is asked by its QUESTION, not its slug",
+              any(it["q"] == "Готовы ли переехать?" for it in mp["items"]),
+              repr([it["q"] for it in mp["items"]]))
+        check("numbered reply parses inline and stacked", g.get(1) and g.get(2) == "только Европа" and g.get(3) == "нет",
+              repr(g))
+        check("prose with no numbers parses to nothing", parse_numbered("да конечно давайте") == {})
+
+        n_relo = [it["n"] for it in mp["items"] if it["id"] == "bank:relocation"]
+        if n_relo:
+            VOICE_IN.write_text("%s TEXT %d. готов, Европа и Эмираты\n" % (now(), n_relo[0]), encoding="utf-8")
+            do_ingest()
+            hit = match("Готовы к релокации?")
+            check("his TG answer closes the open bank key", hit is not None and "Европа" in (hit[1] if hit else ""),
+                  "match=%r" % (hit,))
+        else:
+            check("ask-map carries the open bank key", False, "relocation не попал в анкету")
+
+        # the gate seen RED: break the bank and the same question must stop answering
+        save_bank([["salary", r"ожидани[яй] по зарплат", "", "derived", now(), ""]])
+        check("an emptied answer STOPS being answered (gate seen red)", match("Ваши ожидания по зарплате?") is None)
+
+    print("smoke-test: %s" % ("ok" if not fails else "FAIL (%s)" % ", ".join(fails)))
+    return 1 if fails else 0
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("--match")
+    ap.add_argument("--queue")
+    ap.add_argument("--origin", default="manual")
+    ap.add_argument("--add", nargs=3, metavar=("KEY", "PATTERN", "ANSWER"))
+    ap.add_argument("--source", default="operator-tg")
+    ap.add_argument("--question", default=None, help="человеческий текст вопроса (для анкеты в TG)")
+    ap.add_argument("--list", action="store_true")
+    ap.add_argument("--open", action="store_true")
+    ap.add_argument("--ask", action="store_true")
+    ap.add_argument("--ingest", action="store_true")
+    ap.add_argument("--stdin", action="store_true")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--force", action="store_true")
+    ap.add_argument("--no-queue", action="store_true")
+    ap.add_argument("--test", action="store_true")
+    a = ap.parse_args()
+
+    if a.test:
+        return selftest()
+    if a.match:
+        return do_match(a.match, a.no_queue, a.origin)
+    if a.queue:
+        return 0 if enqueue(a.queue, a.origin) else 0
+    if a.add:
+        key, pat, ans = a.add
+        old = {r[0]: r for r in bank()}
+        rows = [r for r in bank() if r[0] != key]
+        q = a.question if a.question is not None else (old.get(key, ["", "", "", "", "", ""])[5])
+        rows.append([key, pat, ans, a.source, now(), q])
+        save_bank(rows)
+        print("%s <- %s" % (key, ans[:60] or "(ОТКРЫТ)"))
+        return 0
+    if a.list:
+        for key, pat, ans, src, ts, _q in bank():
+            print("%-18s %-9s %s" % (key, src, (ans[:96].replace("\n", " ⏎ ") if ans.strip() else "— ОТКРЫТ —")))
+        return 0
+    if a.open:
+        for _id, q, origin in open_items():
+            print("%-14s %s" % (origin[:14], q))
+        return 0
+    if a.ask:
+        return do_ask(a.dry_run, a.force)
+    if a.ingest:
+        return do_ingest(a.stdin)
+    ap.print_help()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
