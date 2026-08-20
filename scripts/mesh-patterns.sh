@@ -164,22 +164,87 @@ export MESH_PERSON_RE MESH_FIXED_RE MESH_NOISE_RE
 
 # ---- phone IP resolution (shared by mesh-phone-* tools) ----
 #
-# phone_reachable_ip — probe Tailscale IP then PHONE_LAN_IPS for an SSH
-# connection on PHONE_SSH_PORT. Returns the first reachable IP, sets
-# PHONE_REACHABLE_IP env var. Exit 2 if phone is unreachable on all paths.
+# phone_reachable_ip — probe the phone body's candidate addresses for an SSH connection on
+# PHONE_SSH_PORT. Returns the first reachable IP, sets PHONE_REACHABLE_IP (and PHONE_REACHABLE_VIA =
+# which rung won). Exit 2 if the phone is unreachable on every path.
 #
 # Usage:
 #   pip="$(phone_reachable_ip 2>/dev/null)" || exit 2
+#
+# A LADDER MUST BE MORE THAN ONE ADDRESS WEARING TWO LABELS (2026-08-20). Step 1 was labelled
+# "Tailscale IP" but is whatever text the operator put in the MESH_NODES ts slot — and mesh-peer-addr
+# itself falls back to a PHONE_LAN_IPS address when the ts addr does not ping, so BOTH rungs can
+# resolve to the same string. That is not a hypothetical: for ~7 weeks the slot held
+# `Redmi:u0_a380@192.168.8.146` (a workaround that outlived the tailscale outage it was written for),
+# so the "2-path" ladder was ONE dead LAN address probed twice while the phone answered on
+# 100.103.99.16 in 0.47s and every phone sense (prox/light/body-motion/tamper) rendered UNREACHABLE.
+# Two rules follow:
+#   (a) DEDUP — an address probed once is never probed again, whichever rung produced it. Duplicate
+#       rungs are not redundancy; they are a fallback that silently is not one.
+#   (b) The declared ts slot is OPERATOR TEXT and rots; tailscale's own peer table cannot. The LIVE
+#       tailnet address of the phone peer is offered as its own candidate on every call (~5ms, local
+#       API, measured), so a stale / LAN / re-issued slot costs one deduped entry instead of the whole
+#       tailnet path. Querying unconditionally (rather than only when the slot is not 100.64/10) also
+#       covers a slot that IS CGNAT-shaped but stale — same fault, same cost, since a slot that already
+#       equals the live address dedups to zero extra probes.
+# Rungs are ordered ts-slot -> ts-live -> lan and the winner is named in PHONE_REACHABLE_VIA, so a
+# consumer can SEE the slot being wrong instead of inferring it.
+
+# _mesh_is_cgnat <ip> → rc 0 if the address is in 100.64.0.0/10 (the tailnet range).
+_mesh_is_cgnat() {
+  local o2
+  case "${1:-}" in 100.*) : ;; *) return 1 ;; esac
+  o2="${1#100.}"; o2="${o2%%.*}"
+  [ "$o2" -ge 64 ] 2>/dev/null && [ "$o2" -le 127 ] 2>/dev/null
+}
+
+# phone_ts_peer_ip — the phone body's LIVE tailnet address, read from tailscale itself, never from
+# ~/.mesh/nodes. Peer matched by hostname/DNS-name regex (PHONE_TS_PEER_RE, default '^redmi' — the
+# live HostName is "Redmi 10"). Prints nothing (rc 1) when tailscale/jq is absent or no peer matches;
+# only a 100.64/10 address is ever returned, so a v6/other address cannot pose as the tailnet path.
+phone_ts_peer_ip() {
+  local re="${PHONE_TS_PEER_RE:-^redmi}" a
+  command -v tailscale >/dev/null 2>&1 || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+  while read -r a; do
+    _mesh_is_cgnat "$a" && { printf '%s\n' "$a"; return 0; }
+  done < <(timeout 3 tailscale status --json 2>/dev/null | jq -r --arg re "$re" '
+      .Peer[]? | select((((.HostName // "") | ascii_downcase) | test($re))
+                     or (((.DNSName  // "") | ascii_downcase) | test($re)))
+      | .TailscaleIPs[]?' 2>/dev/null)
+  return 1
+}
+
+# phone_reach_candidates — the DEDUPED probe ladder, one "<rung> <ip>" line per candidate. Split out
+# of the prober so the ladder's SHAPE is gateable without an SSH round trip (--test drives this off a
+# stubbed mesh-peer-addr + tailscale, i.e. the real assembly code, never an injected candidate list).
+phone_reach_candidates() {
+  local slot live ip seen=" "
+  _phone_cand_emit() {  # <rung> <ip> — dedup is here and nowhere else
+    [ -n "${2:-}" ] || return 0
+    case "$seen" in *" $2 "*) return 0 ;; esac
+    seen+="$2 "
+    printf '%s %s\n' "$1" "$2"
+  }
+  slot="$(mesh-peer-addr Redmi 2>/dev/null || mesh-peer-addr redmi 2>/dev/null || true)"
+  slot="${slot##*$'\n'}"          # mesh-peer-addr's notes go to stderr; take the address line only
+  _phone_cand_emit ts-slot "$slot"
+  live="$(phone_ts_peer_ip 2>/dev/null || true)"
+  _phone_cand_emit ts-live "$live"
+  for ip in ${PHONE_LAN_IPS:-}; do _phone_cand_emit lan "$ip"; done
+}
+
  phone_reachable_ip() {
    local port="${PHONE_SSH_PORT:-8022}"
    local puser="${PHONE_USER:-u0_a380}"
-   local ip ts_ip
+   local rung ip slot=""
    # On failure, classify WHY (chat-review/Redmi-body-degraded, 2026-07-24): a silent KEY ROTATION
    # (phone UP, sshd answered, our pubkey untrusted) read identically to a genuinely-OFFLINE phone
    # for 8 days of degrade logs — zero signal to tell 'gone' from 'key rotated'. PHONE_REACH_FAIL:
    #   offline (default)  = no route / timeout / refused (network-level: phone not answering)
    #   auth-rejected      = sshd ANSWERED + rejected our key (phone UP; the key is the problem)
    PHONE_REACH_FAIL=offline; export PHONE_REACH_FAIL
+   PHONE_REACHABLE_VIA=""; export PHONE_REACHABLE_VIA
    _probe() {  # <ip> → rc 0 reachable; on failure sets PHONE_REACH_FAIL + PHONE_REACH_LAST_IP
      PHONE_REACH_LAST_IP="$1"; export PHONE_REACH_LAST_IP
      local err rc
@@ -190,16 +255,21 @@ export MESH_PERSON_RE MESH_FIXED_RE MESH_NOISE_RE
      printf '%s' "$err" | grep -qi 'Permission denied' && PHONE_REACH_FAIL=auth-rejected
      return 1
    }
-   # 1. Tailscale IP (mesh-peer-addr)
-   ts_ip="$(mesh-peer-addr Redmi 2>/dev/null || mesh-peer-addr redmi 2>/dev/null || true)"
-   if [ -n "$ts_ip" ]; then
-     if _probe "$ts_ip"; then PHONE_REACHABLE_IP="$ts_ip"; export PHONE_REACHABLE_IP; printf '%s\n' "$ts_ip"; return 0; fi
-   fi
-   # 2. LAN IPs
-   for ip in ${PHONE_LAN_IPS:-}; do
+   while read -r rung ip; do
      [ -n "$ip" ] || continue
-     if _probe "$ip"; then PHONE_REACHABLE_IP="$ip"; export PHONE_REACHABLE_IP; printf '%s\n' "$ip"; return 0; fi
-   done
+     [ "$rung" = ts-slot ] && slot="$ip"
+     if _probe "$ip"; then
+       PHONE_REACHABLE_IP="$ip"; PHONE_REACHABLE_VIA="$rung"
+       export PHONE_REACHABLE_IP PHONE_REACHABLE_VIA
+       # LOUD, and only in the case that is a CONFIG FAULT: the live tailnet address answered while a
+       # non-tailnet slot did not. Silence here is exactly how the LAN-in-the-ts-slot workaround
+       # outlived its outage for 7 weeks. stderr, so it cannot corrupt a $(...) capture.
+       if [ "$rung" = ts-live ] && [ -n "$slot" ] && ! _mesh_is_cgnat "$slot"; then
+         printf 'phone_reachable_ip: MESH_NODES ts slot for Redmi is %s (not a 100.64/10 tailnet addr) and did not answer; live tailnet %s did — fix ~/.mesh/nodes\n' "$slot" "$ip" >&2
+       fi
+       printf '%s\n' "$ip"; return 0
+     fi
+   done < <(phone_reach_candidates)
    return 2
  }
 
@@ -472,5 +542,67 @@ if [ "${1:-}" = --test ] && [ "${BASH_SOURCE[0]}" = "${0}" ]; then
   [ "$_ps_elapsed" -lt 4 ] || { echo "  FAIL: a hanging sync_cmd must be killed by the timeout (elapsed=${_ps_elapsed}s, want <4s)"; fail=1; }
   echo "  ok: hung sync_cmd bounded by timeout (elapsed=${_ps_elapsed}s)"
   rm -rf "$_psd"
+  echo "_mesh_is_cgnat — 100.64/10 is the tailnet, and its EDGES are not off by one:"
+  ckc(){ local want="$1" label="$2" addr="$3" got; if _mesh_is_cgnat "$addr"; then got=cgnat; else got=no; fi
+         if [ "$got" = "$want" ]; then echo "  ok: $label"; else echo "  FAIL: $label ($addr → $got, want $want)"; fail=1; fi; }
+  ckc cgnat "low edge 100.64.0.0"      "100.64.0.0"
+  ckc cgnat "live phone 100.103.99.16" "100.103.99.16"
+  ckc cgnat "high edge 100.127.255.255" "100.127.255.255"
+  ckc no    "100.63.x is BELOW the range" "100.63.255.255"
+  ckc no    "100.128.x is ABOVE the range" "100.128.0.1"
+  ckc no    "a LAN addr is not a tailnet addr" "192.168.8.146"
+  ckc no    "empty is not a tailnet addr"      ""
+  echo "phone_reach_candidates — a 3-rung ladder must be 3 DISTINCT addresses, never one probed twice:"
+  # The 2026-08-20 fault verbatim: the MESH_NODES ts slot held a LAN address, so step 1 ("Tailscale
+  # IP") and step 2 (PHONE_LAN_IPS) were the same dead string. Drives the REAL assembly function off
+  # stubbed organs (mesh-peer-addr / tailscale on PATH) — no candidate list is ever injected.
+  _prd="$(mktemp -d)"
+  cat > "$_prd/peers.json" <<'PJ'
+{"Peer":{"a":{"HostName":"Redmi 10","DNSName":"redmi-10.tail3e4555.ts.net.","TailscaleIPs":["fd7a:115c:a1e0::1","100.103.99.16"]},
+         "b":{"HostName":"phaedra","DNSName":"phaedra.tail3e4555.ts.net.","TailscaleIPs":["100.94.116.17"]}}}
+PJ
+  _pr_stub(){ # <slot-addr> <with-tailscale:yes|no>
+    printf '#!/bin/sh\nprintf "%%s\\n" "%s"\n' "$1" > "$_prd/mesh-peer-addr"; chmod +x "$_prd/mesh-peer-addr"
+    if [ "$2" = yes ]; then printf '#!/bin/sh\ncat "%s"\n' "$_prd/peers.json" > "$_prd/tailscale"; chmod +x "$_prd/tailscale"
+    else rm -f "$_prd/tailscale"; fi
+  }
+  _pr_run(){ ( PATH="$_prd:$PATH"; PHONE_LAN_IPS="$1"; unset PHONE_TS_PEER_RE; phone_reach_candidates ); }
+  # 1. THE LIVE FAULT: LAN address in the ts slot, and the same address also in PHONE_LAN_IPS.
+  _pr_stub 192.168.8.146 yes
+  _pr_out="$(_pr_run "192.168.8.203 192.168.8.146")"
+  ck2 "$(printf '%s\n' "$_pr_out" | grep -c '192\.168\.8\.146')" 1 \
+      "LAN-in-ts-slot: the duplicated address is probed ONCE, not once per rung"
+  ck2 "$(printf '%s\n' "$_pr_out" | awk '{print $2}' | sort -u | wc -l)" 3 \
+      "LAN-in-ts-slot: 3 rungs → 3 distinct addresses"
+  printf '%s\n' "$_pr_out" | grep -q '^ts-live 100\.103\.99\.16$' \
+    || { echo "  FAIL: a non-tailnet ts slot must ALSO offer the live tailnet peer addr: $_pr_out"; fail=1; }
+  printf '%s\n' "$_pr_out" | grep -q '^ts-live fd7a' \
+    && { echo "  FAIL: a v6 tailnet addr must not pose as the 100.64/10 candidate"; fail=1; }
+  # 2. Healthy slot: the live lookup adds nothing — it dedups away, so the probe count is unchanged.
+  _pr_stub 100.103.99.16 yes
+  _pr_out="$(_pr_run "192.168.8.203 192.168.8.146")"
+  ck2 "$(printf '%s\n' "$_pr_out" | grep -c '100\.103\.99\.16')" 1 \
+      "correct ts slot: live lookup dedups away (no second probe of the same addr)"
+  ck2 "$(printf '%s\n' "$_pr_out" | wc -l)" 3 "correct ts slot: ladder stays 3 candidates"
+  # 3. A duplicated PHONE_LAN_IPS entry is also one probe.
+  _pr_stub 100.103.99.16 yes
+  ck2 "$(_pr_run "192.168.8.146 192.168.8.146" | grep -c '192\.168\.8\.146')" 1 \
+      "duplicate PHONE_LAN_IPS entry collapses to one candidate"
+  # 4. No tailscale binary at all → degrade to slot+LAN, never a crash or an empty ladder. PATH is
+  #    narrowed to the stub dir (+ a jq symlink) so `command -v tailscale` genuinely finds nothing —
+  #    with the node's own /usr/bin still on PATH this gate would silently test the LIVE tailnet.
+  _pr_stub 192.168.8.146 no
+  ln -sf "$(command -v jq)" "$_prd/jq"
+  _pr_out="$( ( PATH="$_prd"; PHONE_LAN_IPS="192.168.8.203"; unset PHONE_TS_PEER_RE; phone_reach_candidates ) )"
+  ck2 "$(printf '%s\n' "$_pr_out" | wc -l)" 2 "tailscale absent: ladder degrades to slot+LAN"
+  printf '%s\n' "$_pr_out" | grep -q '^ts-live' \
+    && { echo "  FAIL: no tailscale → there is no live rung to claim"; fail=1; }
+  # 5. No peer matches the phone regex → no ts-live rung invented.
+  _pr_stub 192.168.8.146 yes
+  _pr_out="$( ( PATH="$_prd:$PATH"; PHONE_LAN_IPS="192.168.8.203"; PHONE_TS_PEER_RE='^nosuchpeer'; phone_reach_candidates ) )"
+  printf '%s\n' "$_pr_out" | grep -q '^ts-live' \
+    && { echo "  FAIL: unmatched peer must yield NO ts-live candidate: $_pr_out"; fail=1; }
+  ck2 "$(printf '%s\n' "$_pr_out" | wc -l)" 2 "unmatched peer: ladder is slot+LAN only"
+  rm -rf "$_prd"
   [ "$fail" = 0 ] && { echo "smoke-test: ok"; exit 0; } || { echo "smoke-test: FAIL"; exit 1; }
 fi
