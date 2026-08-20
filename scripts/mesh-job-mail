@@ -1,0 +1,623 @@
+#!/usr/bin/env python3
+"""mesh-job-mail — read the job lane's INBOX and say only what needs a human.
+
+  mesh-job-mail [--quiet] [--tg] [--json] [--since N] [--dry-run]
+  mesh-job-mail --test
+
+# reflex-cadence: 7,37 * * * *
+# reflex-args: --tg
+
+The lane's incoming side. Everything an employer sends — hh chat messages, invitations,
+rejections, ATS follow-ups, verification codes — arrives in `imozerov@yandex.ru`, and until
+this reflex existed nothing read it: 13 applications went out 2026-08-20 and the five replies
+that came back the same afternoon sat unread. Outgoing had a reflex, incoming had none.
+
+Three things make it non-obvious, all measured:
+
+* **hh's notification mail CARRIES the chat message text.** «Вам написали по вакансии …» quotes
+  the employer's words in full, so the common case needs no browser at all — a 2s IMAP read
+  replaces a 90s chromium drive. `mesh-job-track` still owns the *status* diff (viewed/invited);
+  this owns the *words*.
+* **Most replies are robots.** Т-Банк, Гоуланг, БЮРО 1440 and Uzum all answered with a template
+  («рассмотрим ваше резюме и вернёмся»). Forwarding those to his Telegram would train him to
+  ignore the channel, so an AUTOREPLY is ledgered and never pushed. What gets pushed is a human
+  asking for something: a call, a time, an answer, a code.
+* **The mailbox is reached from the RU uplink, never the exit node.** Yandex flagged this
+  account once already for a datacenter login (`yandex-mail-walled-from-this-node`), and this
+  node's default route is phaedra's exit node. Every socket here is `SO_BINDTODEVICE`-bound to
+  the main table's default device. If that bind fails the tool EXITS — it does not quietly
+  connect over the flagged path, because the cost of the silent fallback is the account.
+
+Mail is read with BODY.PEEK and never marked \\Seen: this is his inbox, and a reflex that eats
+the unread marks destroys the human's own view of it.
+
+State: `~/.mesh/job/mail-state.json` (UIDVALIDITY + last UID). Ledger: `~/.mesh/job-mail.log`.
+`--dry-run` writes to `~/.mesh/job-mail.dryrun.log` instead — a test that appends to the durable
+ledger forges the evidence it exists to check.
+"""
+import argparse, email, html, json, os, pathlib, re, socket, subprocess, sys, time
+from email.header import decode_header, make_header
+
+os.environ["PATH"] = os.path.expanduser("~/.local/bin") + os.pathsep + os.environ.get("PATH", "/usr/bin:/bin")
+
+HOME = pathlib.Path.home()
+MAILENV = HOME / ".mesh" / "mail.env"
+STATE = HOME / ".mesh" / "job" / "mail-state.json"
+LEDGER = HOME / ".mesh" / "job-mail.log"
+DRYLEDGER = HOME / ".mesh" / "job-mail.dryrun.log"
+BOARD = HOME / ".mesh" / "job-board.tsv"
+TG = "mesh-tg"
+SO_BINDTODEVICE = 25
+
+# ---------------------------------------------------------------- vantage
+
+def uplink_dev():
+    """The device carrying the MAIN table's default route — the node's own RU uplink.
+
+    Never tailscale0: `ip route get` answers from table 52 (the exit node), which is exactly
+    the vantage Yandex flagged. Asking table main by name is the whole point."""
+    try:
+        out = subprocess.run(["ip", "route", "show", "table", "main", "default"],
+                             capture_output=True, text=True, timeout=10).stdout
+    except Exception:
+        return None
+    m = re.search(r"\bdev\s+(\S+)", out)
+    return m.group(1) if m else None
+
+
+def bind_sockets_to(dev):
+    """Bind every subsequent TCP connect to `dev`. Raises if the kernel refuses."""
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        probe.setsockopt(socket.SOL_SOCKET, SO_BINDTODEVICE, dev.encode())
+    finally:
+        probe.close()
+    orig = socket.socket.connect
+
+    def connect(self, addr):
+        self.setsockopt(socket.SOL_SOCKET, SO_BINDTODEVICE, dev.encode())
+        return orig(self, addr)
+    socket.socket.connect = connect
+
+
+def creds():
+    if not MAILENV.exists():
+        return None
+    env = {}
+    for line in MAILENV.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            k, v = line.split("=", 1)
+            env[k.strip()] = v.strip().strip('"').strip("'")
+    user = env.get("MAIL_USER", "")
+    # The app password is the ONLY credential IMAP accepts: MAIL_PASS is the account password,
+    # and Yandex answers it with AUTHENTICATIONFAILED even though the account is healthy.
+    pw = env.get("MAIL_IMAP_PASS") or ""
+    host = env.get("MAIL_IMAP_HOST", "imap.yandex.ru")
+    if not user or not pw:
+        return None
+    return user, pw, host, int(env.get("MAIL_IMAP_PORT", "993"))
+
+# ---------------------------------------------------------------- parsing
+
+def hdr(msg, name):
+    try:
+        return str(make_header(decode_header(msg.get(name, "") or "")))
+    except Exception:
+        return msg.get(name, "") or ""
+
+
+def text_of(msg):
+    parts = []
+    for p in msg.walk():
+        if p.get_content_type() == "text/plain":
+            try:
+                parts.append(p.get_payload(decode=True).decode(p.get_content_charset() or "utf-8", "replace"))
+            except Exception:
+                pass
+    if not parts:
+        for p in msg.walk():
+            if p.get_content_type() == "text/html":
+                try:
+                    h = p.get_payload(decode=True).decode(p.get_content_charset() or "utf-8", "replace")
+                except Exception:
+                    continue
+                h = re.sub(r"(?is)<(script|style|head)[^>]*>.*?</\1>", " ", h)
+                h = re.sub(r"(?i)<br[^>]*>|</p>|</tr>|</div>|</td>", "\n", h)
+                parts.append(html.unescape(re.sub(r"<[^>]+>", " ", h)))
+    txt = "\n".join(parts)
+    txt = txt.replace(" ", " ").replace("⠀", " ").replace("‌", " ")
+    txt = re.sub(r"[ \t\xa0]{2,}", " ", txt)
+    return re.sub(r"\n{3,}", "\n\n", txt).strip()
+
+
+# hh quotes the employer between guillemets; that quote is the only part worth a human's eye.
+QUOTE = re.compile(r"«(.{4,1800}?)»", re.S)
+FIELD = re.compile(r"^\s*(Вакансия|Компани[яи]):\s*(.+?)\s*$", re.M)
+
+# A template acknowledgement. Matching ANY of these makes the message a robot — the phrasings
+# are the actual sent text of Т-Банк / Гоуланг / БЮРО 1440 / Uzum, not invented patterns.
+AUTOREPLY = [
+    r"рассмотрим ваше резюме", r"рассмотрит ваше резюме", r"мы свяжемся с вами",
+    r"верн[её]мся к вам", r"сообщит вам о сво[её]м решении", r"если навыки и опыт подойд",
+    r"спасибо за отклик[!.]?\s*$", r"ваш отклик (получен|принят)",
+    r"thanks for applying", r"we (have )?received your application",
+    r"thank you for (taking the time to )?apply", r"reviewing applications",
+    r"cannot respond to all",
+    r"your application (has been|was) received",
+]
+# A DIRECT, second-person ask: he has to answer or nothing happens. These beat AUTOREPLY.
+# Kept narrow on purpose — Braintrust's template says "…you will receive an email to schedule
+# next steps", a conditional about a future robot, and pushing that to his phone is the exact
+# noise this reflex exists to avoid. An imperative or a question addressed to HIM, or nothing.
+STRONG = [
+    r"позвоните", r"наберите", r"свяжитесь с (нами|мной)", r"напишите (в чат|мне|нам)",
+    r"когда вам удобно", r"удобно ли вам", r"в какое время", r"выберите (слот|время)",
+    r"предлага[ею].{0,30}(время|созвон|встреч|интервью|собеседовани)",
+    r"приглаша[ею]м вас", r"пригласить вас на", r"готовы пригласить",
+    r"назначить (созвон|встречу|интервью|собеседовани)", r"назначим",
+    r"ждем (вашего )?ответа", r"жду (вашего )?ответа", r"ответьте",
+    r"ваши ожидания по (зарплате|доход)", r"сколько вы хотите",
+    r"тестово[ег] задани", r"выполнить задани",
+    r"are you available", r"let us know your availability", r"book a (time|slot)",
+    r"pick a time", r"schedule a (call|chat|time)", r"would you be (free|available)",
+    r"could you (share|confirm|let)", r"please (confirm|reply|share|complete)",
+]
+# Weaker job vocabulary — enough to call a message job-RELATED, never enough to wake him.
+JOBWORDS = [
+    r"ваканси", r"резюме", r"отклик", r"собеседовани", r"интервью", r"рекрут", r"HR\b",
+    r"\bposition\b", r"\brole\b", r"\bapplication\b", r"\bapplying\b", r"\brecruit",
+    r"hiring", r"candidate",
+]
+
+REJECT = [
+    r"не готов пригласить", r"вам отказано", r"к сожалению.{0,60}(не готов|отказ|не подход)",
+    r"we (will )?not be moving forward", r"unfortunately.{0,80}(not|other candidates)",
+    r"decided (not )?to (move|proceed)",
+    r"не можем пригласить", r"пока не можем", r"не сможем предложить", r"не подош",
+]
+CODE = [r"код подтверждения", r"security code", r"verification code", r"одноразовый (код|пароль)"]
+# Pure noise: hh's own recommendation digests and marketing. Ledgered at level=noise, never pushed.
+NOISE_SUBJ = [
+    r"подходящие вакансии для резюме", r"вчера ваше резюме привлекло внимание",
+    r"лучшие вакансии", r"вакансии недели", r"посмотрел[аи] ваш профиль",
+    r"рассылк", r"дайджест", r"newsletter", r"unsubscribe",
+    r"резюме прошло модерацию", r"резюме опубликовано", r"обновите резюме",
+]
+JOB_SENDERS = [
+    "hh.ru", "headhunter", "ashbyhq.com", "greenhouse", "lever.co", "workable",
+    "career.habr.com", "getmatch.ru", "talantix", "smartrecruiters", "teamtailor",
+]
+
+
+def any_of(pats, s):
+    return any(re.search(p, s, re.I) for p in pats)
+
+
+def extract_code(body):
+    """The digits, not a year. `\\d{4,8}` alone returned "2026" out of every dated footer —
+    a confident wrong answer in exactly the shape of a right one."""
+    # Greenhouse's is an 8-char MIXED token ("RaS3iV1J") sitting alone on its own line, and the
+    # only digits in that mail are its street address — a digits-only reader returned "10011".
+    m = re.search(r"(?:security )?code(?: field on your application)?:?\s*\n+\s*([A-Za-z0-9]{6,10})\s*\n", body, re.I)
+    if m:
+        return m.group(1)
+    for pat in (r"код[^0-9\n]{0,40}(\d{4,8})", r"code[^0-9\n]{0,40}(\d{4,8})",
+                r"(\d{4,8})[^0-9\n]{0,30}(?:—|-|это)?\s*(?:ваш\s+)?код"):
+        m = re.search(pat, body, re.I)
+        if m:
+            return m.group(1)
+    now = time.gmtime().tm_year
+    for m in re.finditer(r"\b(\d{4,8})\b", body):
+        v = m.group(1)
+        if not (len(v) == 4 and abs(int(v) - now) <= 2):
+            return v
+    return ""
+
+
+def classify(frm, subj, body):
+    """-> (level, kind, gist). level: act (wake him) | info (ledger) | noise (ledger, ignore).
+
+    Order matters: a code and a rejection are unambiguous whoever sent them; everything else is
+    judged by WHO sent it first, because Russian marketing mail is full of guillemets and polite
+    imperatives and would otherwise read exactly like an employer writing back."""
+    # hh puts the employer's words in guillemets — but so does the vacancy title and the
+    # company name earlier in the same mail, and taking the FIRST match gave a "message" that
+    # was just «UZUM TECHNOLOGIES». The employer's text is the longest quote in the document.
+    cands = [re.sub(r"\s+", " ", q).strip() for q in QUOTE.findall(body)]
+    quote = max(cands, key=len) if cands else ""
+    if len(quote) < 8:
+        quote = ""
+    hay = quote or body
+    both = subj + "\n" + body
+    job_sender = any(s in frm.lower() for s in JOB_SENDERS)
+    hh_shape = bool(re.search(r"сообщение от работодателя|вам написали по вакансии|новое сообщение", subj, re.I))
+
+    if any_of(CODE, subj) or any_of(CODE, body[:400]):
+        return "act", "code", extract_code(body) or quote[:120] or subj
+    if any_of(REJECT, subj) or any_of(REJECT, hay):
+        return "info", "reject", (quote or re.sub(r"\s+", " ", body))[:300]
+    if job_sender or hh_shape:
+        # A digest subject wins over a quote in the body: hh's recommendation mails carry the
+        # resume title and the company name in guillemets, which read exactly like a message.
+        if any_of(NOISE_SUBJ, subj) and not hh_shape:
+            return "noise", "digest", subj
+        if any_of(STRONG, hay):
+            return "act", "employer" if (quote or hh_shape) else "ats", (quote or re.sub(r"\s+", " ", body))[:600]
+        if any_of(AUTOREPLY, hay):
+            return "info", "autoreply", (quote or re.sub(r"\s+", " ", body))[:300]
+        if quote or hh_shape:
+            return "act", "employer", (quote or re.sub(r"\s+", " ", body))[:600]
+        return "info", "other", subj
+    # Unknown sender: employers answer from their own domains too — 2026-08-20 Т-Банк's real
+    # rejection came straight from t_career, not through hh. So judge by the WORDS, but demand
+    # actual job vocabulary before letting a stranger's imperative reach his phone.
+    if any_of(JOBWORDS, both):
+        if any_of(STRONG, hay):
+            return "act", "employer", (quote or re.sub(r"\s+", " ", body))[:600]
+        return "info", "other", subj
+    return "noise", "not-job", subj
+
+
+def fields(body):
+    out = {}
+    for k, v in FIELD.findall(body):
+        out[k.lower()] = re.sub(r"\s+", " ", v).strip()[:120]
+    return out.get("компания", "") or out.get("компании", ""), out.get("вакансия", "")
+
+# ---------------------------------------------------------------- state / ledger
+
+def load_state():
+    try:
+        return json.loads(STATE.read_text())
+    except Exception:
+        return {}
+
+
+def save_state(st):
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = STATE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(st, ensure_ascii=False, indent=1))
+    tmp.replace(STATE)
+
+
+def ledger_write(path, rows):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        for r in rows:
+            f.write("\t".join(str(x).replace("\t", " ").replace("\n", " ⏎ ") for x in r) + "\n")
+
+
+VACID = re.compile(r"hh\.ru/vacancy/(\d+)")
+
+
+def raw_html(msg):
+    for part in msg.walk():
+        if part.get_content_type() == "text/html":
+            try:
+                return part.get_payload(decode=True).decode(part.get_content_charset() or "utf-8", "replace")
+            except Exception:
+                return ""
+    return ""
+
+
+def vacancy_id(msg):
+    """hh's notification mail links the vacancy directly — `hh.ru/vacancy/135526871` — which is
+    the SAME key `mesh-job-track` writes the board by. Use it and nothing else where it exists."""
+    m = VACID.search(raw_html(msg))
+    return m.group(1) if m else ""
+
+
+def board_mark(vid, company, vacancy, state_word):
+    """Flip a board row's status. The key is the vacancy ID; a title is NOT a key.
+
+    Learned the hard way on this very file 2026-08-20: matching rows by title substring alone
+    flipped five different employers' «Senior Golang Developer» rows to `replied` off one
+    company's autoreply, and three «Руководитель группы разработки (Team Lead)» rows to
+    `rejected` off one rejection. A reply is about ONE application; a title is shared."""
+    if not BOARD.exists():
+        return None
+    if not vid and not (company and vacancy):
+        return None
+    try:
+        lines = BOARD.read_text(encoding="utf-8", errors="replace").splitlines()
+    except Exception:
+        return None
+    hit = None
+    for i, line in enumerate(lines):
+        cols = line.split("\t")
+        if len(cols) < 5:
+            continue
+        if vid:
+            if "/vacancy/%s" % vid not in line:
+                continue
+        else:
+            # No link (a direct-from-employer mail): demand BOTH names, and only ever move a row
+            # that is already an application of ours.
+            co_key = re.split(r"[.,]", company)[0].strip().lower()
+            if not co_key or co_key not in cols[1].lower():
+                continue
+            if vacancy.lower() not in cols[2].lower():
+                continue
+            if cols[4] not in ("sent", "viewed", "replied"):
+                continue
+        if cols[4] != state_word:
+            cols[4] = state_word
+            lines[i] = "\t".join(cols)
+            hit = cols[1] + " / " + cols[2]
+        break
+    if hit:
+        BOARD.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return hit
+
+
+# ---------------------------------------------------------------- main read
+
+def _connect():
+    import imaplib
+    user, pw, host, port = creds()
+    M = imaplib.IMAP4_SSL(host, port)
+    M.login(user, pw)
+    M.select("INBOX", readonly=True)
+    return M
+
+
+# Yandex DROPS the connection mid-fetch on a large message — the Foxible thread in this very
+# mailbox carries 10 MB of PDF, and one `BODY.PEEK[]` of it killed the whole run with
+# `socket error: EOF` before a single row was ledgered. So: ask the SIZE first, and take only
+# headers from anything fat. A job reply is a few KB of text; nothing worth reading here is 2 MB.
+BIG = 512 * 1024
+
+
+def fetch(since_days, limit=200):
+    c = creds()
+    if c is None:
+        raise SystemExit(2)
+    dev = uplink_dev()
+    if not dev:
+        print("mesh-job-mail: no default route in table main — refusing to guess a vantage", file=sys.stderr)
+        raise SystemExit(1)
+    bind_sockets_to(dev)
+    M = _connect()
+    validity = M.response("UIDVALIDITY")[1][0]
+    validity = validity.decode() if isinstance(validity, bytes) else str(validity)
+    st = load_state()
+    last = st.get("last_uid", 0) if st.get("uidvalidity") == validity else 0
+    since = time.strftime("%d-%b-%Y", time.gmtime(time.time() - since_days * 86400))
+    if last:
+        typ, data = M.uid("search", None, "UID", "%d:*" % (last + 1))
+    else:
+        typ, data = M.uid("search", None, "SINCE", since)
+    uids = [int(u) for u in data[0].split() if int(u) > last][-limit:]
+
+    sizes = {}
+    if uids:
+        typ, d = M.uid("fetch", ",".join(str(u) for u in uids), "(RFC822.SIZE)")
+        for item in d:
+            if isinstance(item, bytes):
+                m = re.search(rb"UID (\d+).*RFC822.SIZE (\d+)", item) or re.search(rb"RFC822.SIZE (\d+).*UID (\d+)", item)
+                if m:
+                    g = [int(x) for x in m.groups()]
+                    if b"UID" == item[item.index(b"UID"):item.index(b"UID") + 3] and item.index(b"UID") < item.index(b"RFC822.SIZE"):
+                        sizes[g[0]] = g[1]
+                    else:
+                        sizes[g[1]] = g[0]
+
+    msgs, truncated = [], 0
+    for u in uids:
+        big = sizes.get(u, 0) > BIG
+        spec = "(BODY.PEEK[HEADER])" if big else "(BODY.PEEK[])"
+        for attempt in (1, 2):
+            try:
+                typ, d = M.uid("fetch", str(u), spec)
+                break
+            except Exception:
+                # a dropped connection is not a dropped message: reconnect once, then take the
+                # headers, which are always small enough to survive.
+                try:
+                    M.logout()
+                except Exception:
+                    pass
+                M = _connect()
+                spec = "(BODY.PEEK[HEADER])"
+                big = True
+                d = None
+        if not d or not isinstance(d[0], tuple):
+            continue
+        if big:
+            truncated += 1
+        msgs.append((u, email.message_from_bytes(d[0][1]), big))
+    try:
+        M.logout()
+    except Exception:
+        pass
+    return validity, last, msgs, truncated
+
+
+# ---------------------------------------------------------------- test
+
+def selftest():
+    ok = True
+
+    def check(label, cond, detail=""):
+        nonlocal ok
+        print(("  ok   " if cond else "  FAIL ") + label + ((" — " + detail) if detail else ""))
+        ok = ok and bool(cond)
+
+    dev = uplink_dev()
+    check("uplink device from table main", bool(dev) and dev != "tailscale0", str(dev))
+    if dev:
+        try:
+            bind_sockets_to(dev)
+            check("SO_BINDTODEVICE accepted unprivileged", True, dev)
+        except Exception as e:
+            check("SO_BINDTODEVICE accepted unprivileged", False, repr(e))
+
+    # Classifier fixtures: the LITERAL text these employers sent on 2026-08-17..20.
+    tbank = "Вакансия: Руководитель группы разработки (Team Lead)\nКомпания: Т-Банк. ИТ.\n«Добрый день, Илья ! Большое спасибо за отклик на вакансию. Мы рассмотрим резюме и вернемся к вам с дальнейшей обратной связью.»"
+    lvl, kind, _ = classify("noreply@hh.ru", "Сообщение от работодателя", tbank)
+    check("template ack is INFO, not pushed", (lvl, kind) == ("info", "autoreply"), "%s/%s" % (lvl, kind))
+    co, vac = fields(tbank)
+    check("company+vacancy parsed off hh mail", co.startswith("Т-Банк") and "Team Lead" in vac, "%s | %s" % (co, vac))
+
+    ff = "Вакансия: Head of Engineering DSP\nКомпания: Future Focus\n«Илья, здравствуйте! У вас интересное резюме. Хотели бы с вами связаться и обсудить детали. Позвоните, пожалуйста, в рабочее время по телефону +7 916 212-22-79 или напишите в чат.»"
+    lvl, kind, gist = classify("noreply@hh.ru", "Сообщение от работодателя", ff)
+    check("a human asking to call is ACT", (lvl, kind) == ("act", "employer"), "%s/%s" % (lvl, kind))
+    check("gist carries the ask, not the boilerplate", "Позвоните" in gist)
+
+    rail = "Hey Ilya,\nOur team was able to have a look at your resume. Unfortunately, we will not be moving forward with the process."
+    lvl, kind, _ = classify("no-reply@ashbyhq.com", "Follow-up from Railway", rail)
+    check("ATS rejection classified", (lvl, kind) == ("info", "reject"), "%s/%s" % (lvl, kind))
+
+    lvl, kind, _ = classify("noreply@hh.ru", "Подходящие вакансии для резюме: «Руководитель группы разработки»", "подборка вакансий")
+    check("hh digest is NOISE despite guillemets in subject", lvl == "noise", "%s/%s" % (lvl, kind))
+
+    lvl, kind, gist = classify("noreply@hh.ru", "Код подтверждения", "Ваш код подтверждения: 4821")
+    check("a verification code is ACT and carries the digits", (lvl, kind, gist) == ("act", "code", "4821"), gist)
+
+    inv = "Вакансия: X\nКомпания: Y\n«Илья, приглашаем вас на техническое интервью, когда вам удобно на следующей неделе?»"
+    lvl, kind, _ = classify("noreply@hh.ru", "Вам написали по вакансии X", inv)
+    check("an interview invitation is ACT", (lvl, kind) == ("act", "employer"))
+
+    bt = "Hi Ilya,\nThank you for taking the time to apply to the Open Source Engineer role at Braintrust. Our hiring team is currently reviewing applications. While we cannot respond to all of our applicants, if there is a match, you will receive an email from one of our team members to schedule next steps!"
+    lvl, kind, _ = classify("no-reply@ashbyhq.com", "Thanks for applying to Braintrust", bt)
+    check("a template promising a FUTURE schedule mail is INFO", (lvl, kind) == ("info", "autoreply"), "%s/%s" % (lvl, kind))
+
+    tb = "Здравствуйте, Илья!\nСпасибо, что откликнулись на вакансию Руководитель группы разработки СПБ. Для нас очень ценно, но пока не можем пригласить вас на эту позицию.\nКоманда рекрутмента Т-Банка"
+    lvl, kind, _ = classify("no-reply@tbank.ru", "Обратная связь по вакансии", tb)
+    check("rejection straight from the employer domain is caught", (lvl, kind) == ("info", "reject"), "%s/%s" % (lvl, kind))
+
+    mk = "Илья, сохраните высокую ставку\n«Фиксированный доход» — откройте вклад и получите ставку. Позвоните нам, чтобы уточнить условия."
+    lvl, kind, _ = classify("partner@alfabank.ru", "Илья, сохраните высокую ставку", mk)
+    check("bank marketing with guillemets+imperative is NOISE", lvl == "noise", "%s/%s" % (lvl, kind))
+
+    rj = "Работодатель не готов\nпригласить вас\nВакансия: Руководитель команды разработки (Go)\nКомпании: Клируэй Текнолоджис"
+    co2, vac2 = fields(rj)
+    check("hh rejection mail says Компании:, not Компания:", co2 == "Клируэй Текнолоджис", "%s | %s" % (co2, vac2))
+
+    gh = "Hi Ilya,\nCopy and paste this code into the security code field on your application:\n\nRaS3iV1J \n\nAfter you enter the code, resubmit your application.\n© 2026 Greenhouse\n18 West 18th Street, New York, NY 10011, USA"
+    lvl, kind, gist = classify("no-reply@eu.greenhouse-mail.io", "Security code for your application to Kayzen", gh)
+    check("Greenhouse code is the token, not the zip code", (lvl, kind, gist) == ("act", "code", "RaS3iV1J"), gist)
+
+    dg = "Вакансия недели\nКомпания «UZUM TECHNOLOGIES» ищет\nПодборка для вас"
+    lvl, kind, _ = classify("noreply@hh.ru", "Вчера ваше резюме привлекло внимание", dg)
+    check("a digest with a quoted company stays NOISE", lvl == "noise", "%s/%s" % (lvl, kind))
+
+    short = "Проверьте чат\nНовое сообщение в чате\n«или можно в тг @AlanHRR»"
+    lvl, kind, gist = classify("noreply@hh.ru", "Новое сообщение от работодателя", short)
+    check("a SHORT real chat line survives as the gist", gist.strip() == "или можно в тг @AlanHRR", gist)
+
+    # Regression, 2026-08-20: title-only matching flipped five employers' rows off one reply.
+    global BOARD
+    real_board, BOARD = BOARD, pathlib.Path("/tmp/mesh-job-mail-test-board.tsv")
+    try:
+        BOARD.write_text(
+            "2026-08-20\tГоуланг Технологии\tSenior Golang Developer\thttps://hh.ru/vacancy/111\tsent\tx\n"
+            "2026-08-20\tVentra\tSenior Golang Developer\thttps://hh.ru/vacancy/222\tsent\tx\n"
+            "2026-08-20\tДом Лента\tSenior Golang Developer\thttps://hh.ru/vacancy/333\tsent\tx\n",
+            encoding="utf-8")
+        board_mark("222", "Ventra", "Senior Golang Developer", "replied")
+        after = BOARD.read_text(encoding="utf-8").splitlines()
+        st = [l.split("\t")[4] for l in after]
+        check("ответ помечает ТОЛЬКО свою вакансию по id", st == ["sent", "replied", "sent"], "/".join(st))
+        board_mark("", "Дом Лента", "Senior Golang Developer", "rejected")
+        st = [l.split("\t")[4] for l in BOARD.read_text(encoding="utf-8").splitlines()]
+        check("без ссылки нужны И компания И вакансия", st == ["sent", "replied", "rejected"], "/".join(st))
+        board_mark("", "Гоуланг", "Senior Golang Developer", "rejected")
+        st = [l.split("\t")[4] for l in BOARD.read_text(encoding="utf-8").splitlines()]
+        check("своя компания находится по имени, соседи не трогаются", st[1] == "replied" and st[2] == "rejected", "/".join(st))
+    finally:
+        try:
+            BOARD.unlink()
+        except Exception:
+            pass
+        BOARD = real_board
+
+    check("mesh-tg resolvable", __import__("shutil").which(TG) is not None)
+
+    # A real read is the gate the offline fixtures cannot be: reachability of the mailbox from
+    # the RU vantage, with the app-password that is the only one IMAP accepts.
+    if creds() is None:
+        print("  n/a  live IMAP read — no MAIL_IMAP_PASS in ~/.mesh/mail.env")
+        print("mesh-job-mail --test: n/a (credential absent)")
+        return 2
+    try:
+        import imaplib
+        user, pw, host, port = creds()
+        M = imaplib.IMAP4_SSL(host, port)
+        M.login(user, pw)
+        M.select("INBOX", readonly=True)
+        typ, d = M.uid("search", None, "ALL")
+        n = len(d[0].split())
+        M.logout()
+        check("live IMAP read returns a non-empty mailbox", n > 0, "%d messages" % n)
+    except Exception as e:
+        check("live IMAP read", False, repr(e))
+
+    print("mesh-job-mail --test: " + ("ok" if ok else "FAILED"))
+    return 0 if ok else 1
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--tg", action="store_true")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--quiet", action="store_true")
+    ap.add_argument("--since", type=int, default=3, help="days to scan on a cold state")
+    ap.add_argument("--dry-run", action="store_true", help="classify and print; ledger goes to the dry-run file")
+    ap.add_argument("--test", action="store_true")
+    a = ap.parse_args()
+    if a.test:
+        sys.exit(selftest())
+
+    if creds() is None:
+        print("mesh-job-mail: n/a — no MAIL_IMAP_PASS in ~/.mesh/mail.env", file=sys.stderr)
+        sys.exit(2)
+
+    validity, last, msgs, truncated = fetch(a.since)
+    rows, acts = [], []
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    for uid, msg, big in msgs:
+        frm, subj = hdr(msg, "From"), hdr(msg, "Subject")
+        body = text_of(msg) if not big else "[тело не читалось: письмо >512K, только заголовки]"
+        lvl, kind, gist = classify(frm, subj, body)
+        co, vac = fields(body)
+        vid = vacancy_id(msg)
+        rows.append((now, uid, lvl, kind, co or "-", vac or "-", subj[:120], gist[:400]))
+        if not a.dry_run:
+            # --dry-run must not move the board either: the board IS the lane's durable record,
+            # and a rehearsal that edits it is the same forgery as a test writing the live log.
+            if kind == "reject":
+                board_mark(vid, co, vac, "rejected")
+            elif kind in ("employer", "autoreply"):
+                board_mark(vid, co, vac, "replied")
+        if lvl == "act":
+            acts.append((kind, co, vac, gist, frm, subj))
+
+    ledger_write(DRYLEDGER if a.dry_run else LEDGER, rows)
+    if not a.dry_run and msgs:
+        save_state({"uidvalidity": validity, "last_uid": max(u for u, _, _ in msgs),
+                    "ran": now, "seen": len(msgs)})
+
+    if a.json:
+        print(json.dumps([{"uid": r[1], "level": r[2], "kind": r[3], "company": r[4],
+                           "vacancy": r[5], "subject": r[6], "gist": r[7]} for r in rows],
+                         ensure_ascii=False, indent=1))
+    elif not a.quiet:
+        if not rows:
+            print("job-mail: ничего нового (last uid %s)" % last)
+        for r in rows:
+            print("%-5s %-9s %-22s %s" % (r[2], r[3], (r[4] or "-")[:22], (r[7] or r[6])[:90]))
+
+    if a.tg and acts and not a.dry_run:
+        lines = []
+        for kind, co, vac, gist, frm, subj in acts[:8]:
+            head = {"code": "🔑 код", "employer": "✉️ живое письмо", "ats": "✉️ ATS"}.get(kind, kind)
+            who = co or re.sub(r".*<|>.*", "", frm)
+            lines.append("%s — %s%s\n%s" % (head, who, (" / " + vac) if vac else "", gist[:400]))
+        subprocess.run([TG, "[job] почта, требует тебя (%d):\n\n" % len(acts) + "\n\n".join(lines)], check=False)
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
