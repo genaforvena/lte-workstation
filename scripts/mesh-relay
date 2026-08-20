@@ -46,6 +46,28 @@ try:
     sys.exit(1)
 except Exception:
     sys.exit(1)'
+# `opencode run --format json` emits NDJSON (one event object per line) as of v1.18.18 — it was a
+# single JSON object in v1.16.2, and the old `json.load(sys.stdin)` raises "Extra data" on the new
+# shape, so the whole opencode/opencode-free leg silently served NOTHING (measured 2026-08-20 on
+# opencode 1.18.18). Parse line-by-line and take the first sessionID seen: a single-object body is
+# just a one-line stream, so this reads BOTH shapes and cannot regress when upstream flips again.
+OC_SESID_PY='
+import json,sys
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        d = json.loads(line)
+    except Exception:
+        continue
+    if not isinstance(d, dict):
+        continue
+    sid = d.get("sessionID") or (d.get("part") or {}).get("sessionID")
+    if sid:
+        print(sid)
+        break
+'
 OC_EXPORT_PY='
 import json,sys
 d=json.load(sys.stdin)
@@ -129,6 +151,84 @@ metabolism_variety() { # $1=groq $2=local $3=oc-free $4=opencode $5=claude (each
     "$ind" "$names" "$([ "$lo" = 1 ] && echo yes || echo no)" "$verdict" "$human"
 }
 
+# --- opencode's /tmp cdylib leak: the CALLER's sweep -----------------------------------------
+# `opencode` (a Bun binary with a Rust native addon) extracts its cdylib to
+# $TMPDIR/.<16-hex>-00000000.so (5576816 B, md5 0f8ce00433bafbb4479eb89e0ea42148) on EVERY
+# invocation and never unlinks it — one 5.5MB orphan per call, on a clean exit as well as on a
+# timeout, with zero open fds afterwards so nothing else reclaims it. opencode is upstream, not
+# ours, so the sweep lives HERE at the only mesh caller (`_oc_extract`, which invokes opencode
+# TWICE — run + export — and so mints up to two per relayed inference). Left alone this is
+# ~44MB/day on phaedra's mesh-capability-probe cadence, and tmp-guard is structurally blind to it
+# there (the files are root-owned → its other-owner skip bucket).
+# Snapshot-then-diff, never a blanket glob-and-delete: another process's in-flight `opencode` must
+# survive our reap, so we only unlink paths that appeared BETWEEN our own two snapshots.
+OC_TMPDIR="${TMPDIR:-/tmp}"
+OC_REAPED=0
+# Is this path still held by a live process? A dlopen'd cdylib is normally MAPPED with no open fd,
+# so /proc/*/maps is the load-bearing check and the fd scan is the belt-and-braces one.
+# Honesty gate: if not a single maps file is readable (hidepid, an alien namespace), "no match" is
+# a BLIND read, not an absence — report in-use and keep the file rather than delete on a scrape
+# that counted zero because it could not look.
+# NOTE both scans read their output through a VARIABLE, never a pipe: under this script's
+# `set -o pipefail`, `grep`/`ls` over /proc exit non-zero on the hundreds of other-user entries they
+# cannot read, and that meaningful non-zero becomes the whole pipeline's verdict — so a grep that
+# DID match still reads as "no match" and the held file gets unlinked. Seen red exactly that way
+# while writing (c) below.
+_oc_so_in_use() {
+  local f="$1" p hits fds
+  hits="$(grep -lF -- "$f" /proc/[0-9]*/maps 2>/dev/null)"
+  [ -n "$hits" ] && return 0
+  fds="$(ls -l /proc/[0-9]*/fd/ 2>/dev/null)"
+  case "$fds" in *"$f"*) return 0 ;; esac
+  for p in /proc/[0-9]*/maps; do [ -r "$p" ] && return 1; done
+  return 0
+}
+_oc_tmp_snapshot() {
+  local f
+  for f in "$OC_TMPDIR"/.*-00000000.so; do [ -f "$f" ] && printf '%s\n' "$f"; done
+  return 0
+}
+# reap: unlink every .so present now that was absent in the "$1" snapshot and is held by nobody.
+# Sets OC_REAPED to the count (the run path needs stdout for the inference answer, so the count is
+# a variable, not a print).
+_oc_tmp_reap() {
+  local before="$1" f
+  OC_REAPED=0
+  for f in "$OC_TMPDIR"/.*-00000000.so; do
+    [ -f "$f" ] || continue
+    case "
+$before
+" in *"
+$f
+"*) continue ;; esac
+    _oc_so_in_use "$f" && continue
+    rm -f "$f" 2>/dev/null && OC_REAPED=$((OC_REAPED+1))
+  done
+  return 0
+}
+
+# --- the opencode call itself (defined HERE, before --test, so the smoke test drives the SHIPPED
+# function and not a copy — see (6b): calling it from --test while it was still defined BELOW this
+# block made the live leg a no-op that could never fail) ---------------------------------------
+FREE_MODEL="${MESH_RELAY_FREE_MODEL:-opencode/deepseek-v4-flash-free}"
+# opencode run in v1.16.2 does not output response to stdout/stderr — extract from session export
+_oc_extract() {
+  local prompt="$1" ses_id="" out="" snap
+  # snapshot BEFORE the first opencode call and reap after the LAST one, on every exit path —
+  # a timed-out `opencode run` (rc=124) leaks exactly like a clean one, so an early `return 1`
+  # between the two would leave the orphan the sweep exists to remove.
+  snap="$(_oc_tmp_snapshot)"
+  # </dev/null on BOTH calls: opencode reads stdin, and inheriting a live-but-empty one (a pipe, an
+  # agent pane) makes it exit 0 having written nothing at all — no stdout, no stderr, no session —
+  # which reads downstream as "the pool is down" and fails the route over for no reason. Measured
+  # here 2026-08-20: identical command, 0 bytes with the inherited stdin, 2419 bytes with </dev/null.
+  ses_id="$(timeout 60 opencode run --format json "$prompt" </dev/null 2>/dev/null | python3 -c "$OC_SESID_PY" 2>/dev/null)"
+  [ -n "$ses_id" ] && out="$(timeout 10 opencode export "$ses_id" </dev/null 2>/dev/null | python3 -c "$OC_EXPORT_PY" 2>/dev/null)"
+  _oc_tmp_reap "$snap"
+  [ -n "$out" ] || return 1
+  printf '%s\n' "$out"
+}
+
 if [ "${1:-}" = --test ]; then
   command -v curl >/dev/null 2>&1 || { echo "smoke-test: FAIL (no curl)"; exit 1; }
   command -v python3 >/dev/null 2>&1 || { echo "smoke-test: FAIL (no python3)"; exit 1; }
@@ -147,6 +247,18 @@ if [ "${1:-}" = --test ]; then
   # (3) opencode session-export parse — must return the LAST assistant text part, skipping the user turn.
   oc="$(printf '%s' '{"messages":[{"info":{"role":"user"},"parts":[{"type":"text","text":"hi"}]},{"info":{"role":"assistant"},"parts":[{"type":"text","text":"there"}]}]}' | python3 -c "$OC_EXPORT_PY" 2>/dev/null)"
   [ "$oc" = "there" ] || { echo "smoke-test: FAIL (opencode export-parse drifted: got '$oc')"; exit 1; }
+  # (3b) opencode session-id extractor — must read the CURRENT NDJSON event stream AND the legacy
+  #      single-object body, and must stay empty on garbage (an empty ses_id is what makes the leg
+  #      fail over instead of exporting a session that does not exist).
+  nd='{"type":"step_start","sessionID":"ses_A","part":{"sessionID":"ses_A"}}
+{"type":"text","sessionID":"ses_A"}'
+  sid="$(printf '%s' "$nd" | python3 -c "$OC_SESID_PY" 2>/dev/null)"
+  [ "$sid" = "ses_A" ] || { echo "smoke-test: FAIL (opencode NDJSON session-id extract drifted: got '$sid' — this is the shape opencode >=1.18 emits, and json.load() on it serves nothing)"; exit 1; }
+  sid="$(printf '%s' '{"sessionID":"ses_B"}' | python3 -c "$OC_SESID_PY" 2>/dev/null)"
+  [ "$sid" = "ses_B" ] || { echo "smoke-test: FAIL (opencode legacy single-object session-id extract drifted: got '$sid')"; exit 1; }
+  sid="$(printf '%s' 'not json at all' | python3 -c "$OC_SESID_PY" 2>/dev/null)"
+  [ -z "$sid" ] || { echo "smoke-test: FAIL (opencode session-id extract invented '$sid' from a garbage body)"; exit 1; }
+
   # (4) chaos fault-injection seam — the resilience drill's gate. Pure, hermetic (no network).
   CHAOS_POOLS=""     ; chaos_kill groq 2>/dev/null && { echo "smoke-test: FAIL (chaos off but groq killed)"; exit 1; }
   CHAOS_POOLS="groq" ; chaos_kill groq 2>/dev/null || { echo "smoke-test: FAIL (chaos=groq should kill groq)"; exit 1; }
@@ -189,6 +301,57 @@ if [ "${1:-}" = --test ]; then
   [ "$(metabolism_variety 1 0 1 1 0 | grep -oE 'independent=[0-9]')" = "independent=2" ] \
     || { echo "smoke-test: FAIL (variety: opencode-free+opencode must be ONE unit → independent=2)"; exit 1; }
 
+  # (6) opencode /tmp cdylib reaper — the ONLY thing standing between the metabolism and ~44MB/day
+  #     of 5.5MB orphans (see the _oc_tmp_reap header). Hermetic: OC_TMPDIR is redirected at a
+  #     scratch dir and the decoys are real files, one of them really held open by a real live
+  #     process, so the fd/maps gate is exercised and not merely described.
+  #     RED-first, each mutation reddening a DIFFERENT half of the sweep (all four driven live):
+  #     make _oc_tmp_reap a no-op → (b) red · make _oc_so_in_use always return 1 → (c) red · drop
+  #     the snapshot diff (blanket-delete the glob) → (a) red · delete the `_oc_tmp_reap "$snap"`
+  #     call from _oc_extract → the LIVE leg (6b) red (NOT these three, which call the reaper
+  #     directly — a hermetic fixture cannot see a caller that forgot to call it).
+  ocdir="$(mktemp -d)"; _oc_test_rc=0
+  ( OC_TMPDIR="$ocdir"
+    : > "$ocdir/.aaaaaaaaaaaaaaaa-00000000.so"     # pre-existing: another caller's in-flight run
+    : > "$ocdir/keep-me.txt"                        # non-matching name in the same dir
+    snap="$(_oc_tmp_snapshot)"
+    : > "$ocdir/.bbbbbbbbbbbbbbbb-00000000.so"     # (b) appeared during our run → must be reaped
+    : > "$ocdir/.cccccccccccccccc-00000000.so"     # (c) appeared AND is held open → must survive
+    sleep 20 < "$ocdir/.cccccccccccccccc-00000000.so" & held=$!
+    sleep 0.3
+    _oc_tmp_reap "$snap"
+    kill "$held" 2>/dev/null
+    [ -f "$ocdir/.aaaaaaaaaaaaaaaa-00000000.so" ] || { echo "smoke-test: FAIL (oc-reap: unlinked a .so that PREDATED the run — a blanket glob-delete would eat another process's in-flight cdylib)"; exit 1; }
+    [ -f "$ocdir/keep-me.txt" ] || { echo "smoke-test: FAIL (oc-reap: touched a file outside the .<hex>-00000000.so pattern)"; exit 1; }
+    [ -f "$ocdir/.bbbbbbbbbbbbbbbb-00000000.so" ] && { echo "smoke-test: FAIL (oc-reap: the .so that APPEARED during the run was left behind — this is the leak, unswept)"; exit 1; }
+    [ -f "$ocdir/.cccccccccccccccc-00000000.so" ] || { echo "smoke-test: FAIL (oc-reap: unlinked a .so still HELD OPEN by a live process — the fd gate did not fire)"; exit 1; }
+    [ "$OC_REAPED" = 1 ] || { echo "smoke-test: FAIL (oc-reap: count says $OC_REAPED, expected exactly 1 reaped)"; exit 1; }
+    exit 0 ) || _oc_test_rc=1
+  rm -rf "$ocdir"
+  [ "$_oc_test_rc" = 0 ] || exit 1
+
+  # (6b) THE LIVE LEG — opt-in, because it is a real network inference (~15s) and --test is driven
+  #      hourly by mesh-doctor. This is the assertion that the reaper is aimed at the REAL writer
+  #      and not at a fixture of our own imagination: run the shipped _oc_extract and assert /tmp
+  #      gained no .so. MESH_RELAY_TEST_LIVE=1 mesh-relay --test
+  if [ "${MESH_RELAY_TEST_LIVE:-0}" = 1 ] && command -v opencode >/dev/null 2>&1; then
+    # Two vacuity guards, both learned red here: (i) _oc_extract must EXIST at this point in the
+    # file — it used to be defined *below* the --test block, so this leg called a missing function,
+    # exited 127 into /dev/null and passed forever; (ii) the call must actually have SERVED, because
+    # an opencode that dies in 0.1s extracts no cdylib either, and "no new file" would then be the
+    # inference failing, not the sweep working.
+    declare -F _oc_extract >/dev/null || { echo "smoke-test: FAIL (oc-reap live: _oc_extract is not defined here — this leg would assert nothing)"; exit 1; }
+    live_before="$(_oc_tmp_snapshot | wc -l)"
+    live_ans="$(_oc_extract "reply with the single word pong" 2>/dev/null)"
+    live_after="$(_oc_tmp_snapshot | wc -l)"
+    [ -n "$live_ans" ] || { echo "smoke-test: FAIL (oc-reap live: opencode served nothing, so the leak was never exercised — re-run when the pool is up, do not read this as a clean sweep)"; exit 1; }
+    [ "$live_after" -le "$live_before" ] || { echo "smoke-test: FAIL (oc-reap live: a real opencode run left $((live_after-live_before)) orphan .so in $OC_TMPDIR)"; exit 1; }
+    # NOTE the FILE COUNTS are the evidence here, never OC_REAPED: _oc_extract ran inside a command
+    # substitution, so its OC_REAPED assignment died with that subshell and would print 0 even on a
+    # perfect sweep. before==after while the reap-deleted arm goes before+1 IS the artifact.
+    echo "smoke-test: live oc leg ok (served; $OC_TMPDIR .so count $live_before -> $live_after)"
+  fi
+
   # Config presence (separate from the logic check above): at least one pool must be reachable to route.
   pools=""
   [ -n "${GROQ_API_KEY:-}" ] && pools="$pools groq"
@@ -196,7 +359,7 @@ if [ "${1:-}" = --test ]; then
   command -v opencode >/dev/null 2>&1 && pools="$pools opencode-free opencode"
   command -v claude >/dev/null 2>&1 && pools="$pools claude"
   [ -n "${pools# }" ] || { echo "smoke-test: FAIL (no inference pool configured)"; exit 1; }
-  echo "smoke-test: ok (parse dry-runs + chaos-seam verified; the drill's CONTROL ARM asserts a moved route reads RESILIENT while the SAME pool serving both arms reads VACUOUS not RESILIENT, a dark control is na not DEGRADED, and the answer axis refuses an empty and a served-but-wrong reply; pools:$pools)"; exit 0
+  echo "smoke-test: ok (parse dry-runs + chaos-seam verified; the drill's CONTROL ARM asserts a moved route reads RESILIENT while the SAME pool serving both arms reads VACUOUS not RESILIENT, a dark control is na not DEGRADED, and the answer axis refuses an empty and a served-but-wrong reply; opencode's /tmp cdylib reaper unlinks only what APPEARED and only when nobody holds it; pools:$pools)"; exit 0
 fi
 
 # --- Groq pool ---
@@ -218,14 +381,6 @@ local_infer() {
 }
 
 # --- opencode-free pool (free models via opencode: no subscription quota used) ---
-FREE_MODEL="${MESH_RELAY_FREE_MODEL:-opencode/deepseek-v4-flash-free}"
-# opencode run in v1.16.2 does not output response to stdout/stderr — extract from session export
-_oc_extract() {
-  local prompt="$1" ses_id
-  ses_id="$(timeout 60 opencode run --format json "$prompt" 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("sessionID",""))' 2>/dev/null)" || return 1
-  [ -z "$ses_id" ] && return 1
-  timeout 10 opencode export "$ses_id" 2>/dev/null | python3 -c "$OC_EXPORT_PY" 2>/dev/null
-}
 opencode_free_infer() {
   chaos_kill opencode-free && return 1
   command -v opencode >/dev/null 2>&1 || return 1
