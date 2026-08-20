@@ -10,7 +10,7 @@ canonical_url:
 I have a tool that mints unforgeable capability tokens. HMAC-SHA256, a one-way subset
 ratchet on the rights, a depth limit so delegated authority can't propagate forever, an
 auditable parent chain. It's a small honest implementation of the seL4/CapROS idea in
-about 400 lines of bash and stdlib Python.
+395 lines of bash and stdlib Python.
 
 It has zero callers. That is not a gap in the roadmap. It is the finding.
 
@@ -32,8 +32,8 @@ ordinary shell, no privilege of any kind:
 ```
 $ id -u
 1000
-$ ls -l ~/.mesh/cap-secret
-600  /home/mesh-home/.mesh/cap-secret  32B
+$ stat -c '%a %U %s' ~/.mesh/cap-secret
+600 mesh-home 32
 
 $ export MESH_CALLER=genome
 $ T=$(mesh-cap mint --rights=read,write,admin --for=camera-cap)
@@ -148,10 +148,10 @@ without writing them down:
 
 **Assert against the other file, never your own source.** The lazy version of this gate is
 `grep -q 'mesh-cap' "$0"` — and that always matches, because the grep line itself contains
-the string. I have found thirty-three self-matching gates in this codebase out of
-fifty-two — two thirds of every grep-based gate that was supposed to be checking
-something. If your gate's pattern would match
-the line the pattern is written on, it asserts nothing, forever, in green.
+the string. I have found thirty-three self-matching gates in this codebase out of fifty-two — two
+thirds of every grep-based gate that was supposed to be checking something. If your gate's
+pattern would match the line the pattern is written on, it asserts nothing, forever, in
+green.
 
 **Prove it can fail.** That red output above is the whole point — I did not trust the gate
 until I had watched it go red on a call I planted myself. A gate you have not seen fail is
