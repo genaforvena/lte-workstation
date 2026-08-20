@@ -20,6 +20,50 @@
 # --stream: runs forever, scanning every N seconds (default 60).
 #   With --track: detects when a tracked device switches which node it's closest to
 #   (zonal localization edge) and posts the edge to the board via mesh-chat.
+#
+# ── MAXWAIT: A CONSISTENT CUT NEEDS A TIME AXIS, NOT ONLY COMPLETENESS (LITERATURE 2026-08-20) ──
+# check_tracked_zones already carries the right sentence — "A missing peer is not a movement event.
+# Require both observations before changing zonal state, otherwise peer loss can fabricate MOVED/GONE
+# edges" — and it is a COMPLETENESS predicate with no clock in it. SCAN_COMPLETE asks *did both arms
+# produce a sample*, never *were the two samples of the same instant*. But scan_both is SEQUENTIAL:
+# the local BLE window runs, THEN the peer window runs over SSH, so the two vantages are sampled
+# ~26-45s apart on a healthy cycle and 70-160s apart whenever either arm takes its retry-once
+# (MESH_FUSE_RETRY_DELAY_S 25 + a whole failed scan_to). closest_node then compares self_rssi against
+# peer_rssi as if they were simultaneous. A person walking across the flat inside that gap is not
+# merely noisy — they are localized to whichever vantage happened to sample them nearer, so the
+# SKEW ITSELF FABRICATES the MOVED/ARRIVED edge the completeness gate above exists to prevent. Same
+# fabrication, different cause; the existing gate is structurally blind to it.
+#
+# The live literature names exactly this and gives it a knob. MAXWAIT (Lee/Lohstroh/Menard et al.,
+# "Maxwait: A Generalized Mechanism for Distributed Time-Sensitive Systems", arXiv:2601.21146, Jan
+# 2026, §III + §IV-F) makes the availability/consistency tradeoff an EXPLICIT PER-CONSUMER PARAMETER
+# with THREE outcomes where we have two. A federate may advance its tag to t when (1a) all input
+# ports are known up to and including t — a consistent cut — OR (1b) the physical clock passes
+# t + maxwait, i.e. proceed WITHOUT knowing. An input that then turns up bearing a tag earlier than
+# the tag already advanced past is "tardy", a safe-to-process violation, and it is a FIRST-CLASS
+# EVENT with its own handler (`reaction(...) {= ... =} tardy {= ... =}`). The paper's own note is
+# that a CRDT is precisely `@maxwait(0)`: process whatever arrived, whenever it arrived — which is
+# sound for a join-semilattice (order-independent) and UNSOUND the moment a consumer compares two
+# replicas' values to derive a verdict, because a comparison is not a join.
+#
+# That is our shape exactly. BLE membership IS join-shaped: "device X was in range" is monotone and
+# skew-tolerant, so the overlap/unique COLUMNS stay valid at any skew. The zone verdict is NOT: it
+# is a comparison across two vantages and it needs a cut. So this tool gains the missing axis, not a
+# new sense: scan_both stamps each arm's FINAL (post-retry) attempt with its own epoch, and
+# `skew_verdict` renders ok/skew/na against MESH_FUSE_MAXSKEW_S. The default is DERIVED, not
+# invented — scan_to (= scan_win + 35), the existing wedge-bound — because a non-retried cycle is
+# bounded by scan_to BY CONSTRUCTION while any retried arm adds >= retry_delay + a whole failed
+# scan_to, so the bound separates the healthy path from the retried one with no new constant. The
+# measured skew is written into presence-fusion.log every cycle so the knob is CALIBRATED against
+# the real corpus rather than defended in prose.
+#
+# What changes behaviourally is deliberately narrow: on skew the membership columns still print, the
+# 'Closest' column prints under a banner saying it is not a cut, person-zone renders UNKNOWN, and
+# check_tracked_zones RETAINS state and fires NO edge — the same discipline the INCOMPLETE branch
+# already applies, now for the second way a cross-vantage comparison can be invalid. A real move
+# during a skewed cycle is deferred, not lost: state is retained, so the next clean cycle fires it.
+# This is a maxwait bound WITHOUT a tardy handler: we cannot re-tag a BLE scan after the fact, so the
+# only honest option at the bound is to refuse the comparison rather than publish an unmarked guess.
 set -uo pipefail
 export PATH="$HOME/.local/bin:$PATH"
 
@@ -31,6 +75,14 @@ BEAT="$MESH/mesh-presence-fuse.beat"
 # SSH-unreachable from peer-reachable-but-mesh-presence-missing matters: they have DIFFERENT fixes
 # ("check SSH" vs "deploy mesh-presence to the peer"). Default "" = no failure / not yet scanned.
 PEER_FAIL_REASON=""
+# MAXWAIT state (see header). Epoch of the FINAL (post-retry) sampling attempt of each arm, "" when
+# that arm produced no sample at all — an unsampled arm has no time, and a fabricated one would make
+# the skew read 0 (perfectly simultaneous) on exactly the cycles that are least trustworthy.
+SCAN_LOCAL_EPOCH=""; SCAN_PEER_EPOCH=""; SCAN_SKEW_S=""; SCAN_MAXSKEW_S=""
+# The zonal narration log. Named through a variable so --test can drive the REAL functions against a
+# throwaway file: a dry-run that appends to the durable log forges the liveness evidence a reader
+# uses to believe the reflex ran (mesh-guardian, 09f7914).
+FUSELOG="${MESH_FUSE_LOG:-$HOME/.mesh/presence-fuse.log}"
 SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new"
 # Default peer: resolve the BLE-fusion peer from the registry so a NO-ARG run (the */31 cron)
 # targets the real peer instead of an empty host (DEFAULT_HOST="" → ssh user@ → permanent
@@ -187,6 +239,29 @@ dev_class() {
 # cycle (0 valid fusions since autowiring 07-14; discover→health→genome baton 2026-07-17). It also
 # sits above the --test dispatch on purpose — the dispatch `exit`s, so a real-drive gate below could
 # only call an UNDEFINED function (2026-07-16: gate read "0 scans, retry gone" against a correct retry).
+# --- skew_verdict: is the pair of vantage samples a CONSISTENT CUT? (MAXWAIT, see header) ---
+# PURE + testable: no globals read, no side effects. Args: <local_epoch> <peer_epoch> <maxskew_s>.
+#   ok   — both arms sampled and started within maxskew → the RSSI comparison spans one instant
+#   skew — both arms sampled but too far apart → membership still valid, COMPARISON is not
+#   na   — an arm has no epoch (it produced no sample) or maxskew is unset → not a skew claim; the
+#          INCOMPLETE path owns that cycle. na must NEVER read as ok: "we could not check" and
+#          "we checked and it is fine" are different facts, and collapsing them is how a blind
+#          gate wears a green.
+# rc mirrors the word (0 ok / 1 skew / 2 na) so a caller may branch on either.
+skew_verdict() {
+  local le="${1:-}" pe="${2:-}" mx="${3:-}"
+  # Validate EACH field on its own. Concatenating them first ("$le$pe$mx") hides an empty one behind
+  # its neighbours — le="" pe=1000 mx=45 reads "100045", all digits, and an UNSAMPLED arm sails
+  # through as a valid cut. Caught red by the na gate below.
+  local f
+  for f in "$le" "$pe" "$mx"; do
+    case "$f" in ""|*[!0-9]*) echo na; return 2 ;; esac
+  done
+  local d=$(( le > pe ? le - pe : pe - le ))
+  if [ "$d" -le "$mx" ]; then echo ok; return 0; fi
+  echo skew; return 1
+}
+
 # --- scan_both: collect local + peer presence, return arrays populated ---
 scan_both() {
   local local_out peer_out
@@ -209,6 +284,10 @@ scan_both() {
   # Capture the local rc — the old `|| true` DISCARDED it, so every local non-sample (contention,
   # wedge, absent stack) collapsed into one "bluetoothctl/D-Bus" message (see classify_peer_fail).
   local local_rc
+  # MAXWAIT: stamp the START of the attempt that actually samples. Re-stamped on retry below, so the
+  # skew is measured between the windows the RSSI values CAME FROM, not between the first tries.
+  local ls_epoch pe_epoch=""
+  ls_epoch="$(date +%s)"
   local_out="$(timeout "$scan_to" mesh-presence "$scan_win" 2>/dev/null)"; local_rc=$?
   # RETRY-ONCE on rc=3/124, the SAME contention the peer arm below already retries. The asymmetry was
   # the bug: a local scan-lock is if anything MORE likely than a remote one (every local BLE reflex
@@ -216,6 +295,7 @@ scan_both() {
   # straight to a permanent INCOMPLETE for the whole cron cycle while the adapter was healthy.
   if [ "$local_rc" = 3 ] || [ "$local_rc" = 124 ]; then
     sleep "${MESH_FUSE_RETRY_DELAY_S:-25}"
+    ls_epoch="$(date +%s)"
     local_out="$(timeout "$scan_to" mesh-presence "$scan_win" 2>/dev/null)"; local_rc=$?
   fi
   # Capture the peer rc so an INCOMPLETE fusion can attribute the REAL cause. ssh passes the REMOTE
@@ -234,6 +314,7 @@ scan_both() {
     ""|none)
       peer_rc=255 ;;   # no ssh attempted; STRUCTURAL n/a resolved by classify_peer_fail from PEER_HOST
     *)
+      pe_epoch="$(date +%s)"
       peer_out="$(timeout "$scan_to" ssh $SSH_OPTS "${PEER_USER}@${PEER_HOST}" "\$HOME/.local/bin/mesh-presence $scan_win" 2>/dev/null)"; peer_rc=$?
       # RETRY-ONCE on rc=3 (the retry-once standard, 5c47ea1): exit 3 is a DEGRADED read — the peer's
       # adapter was scan-locked (BUSY: another scanner's flock window, seconds long) or the read raced a
@@ -247,6 +328,7 @@ scan_both() {
       # cycle hit rc=124 with ds's own adapter healthy seconds later — a rc=3-only retry never caught it).
       if [ "$peer_rc" = 3 ] || [ "$peer_rc" = 124 ]; then
         sleep "${MESH_FUSE_RETRY_DELAY_S:-25}"
+        pe_epoch="$(date +%s)"
         peer_out="$(timeout "$scan_to" ssh $SSH_OPTS "${PEER_USER}@${PEER_HOST}" "\$HOME/.local/bin/mesh-presence $scan_win" 2>/dev/null)"; peer_rc=$?
       fi ;;
   esac
@@ -254,6 +336,17 @@ scan_both() {
   scan_sampled "$local_out" && lok=1
   scan_sampled "$peer_out" && pok=1
   SCAN_COMPLETE=0; [ "$lok" = 1 ] && [ "$pok" = 1 ] && SCAN_COMPLETE=1
+  # MAXWAIT: publish the cut. An arm that did NOT sample gets no epoch (see the global's note), so a
+  # half-failed cycle renders na and stays the INCOMPLETE path's business, never a fake 0s skew.
+  SCAN_LOCAL_EPOCH=""; [ "$lok" = 1 ] && SCAN_LOCAL_EPOCH="$ls_epoch"
+  SCAN_PEER_EPOCH="";  [ "$pok" = 1 ] && SCAN_PEER_EPOCH="$pe_epoch"
+  # Derived from scan_to, the wedge-bound already computed above — see the header on why this
+  # separates a healthy sequential cycle from a retried one without minting a new constant.
+  SCAN_MAXSKEW_S="${MESH_FUSE_MAXSKEW_S:-$scan_to}"
+  SCAN_SKEW_S=""
+  if [ -n "$SCAN_LOCAL_EPOCH" ] && [ -n "$SCAN_PEER_EPOCH" ]; then
+    SCAN_SKEW_S=$(( SCAN_LOCAL_EPOCH > SCAN_PEER_EPOCH ? SCAN_LOCAL_EPOCH - SCAN_PEER_EPOCH : SCAN_PEER_EPOCH - SCAN_LOCAL_EPOCH ))
+  fi
   # peer_online is only consulted for the rc255 reachable-vs-offline split; a sentinel PEER_HOST is
   # short-circuited to STRUCTURAL n/a in classify_peer_fail before ponline is ever read, so skip the
   # (wasted) tailscale+python probe against a host named 'none'.
@@ -289,6 +382,126 @@ scan_both() {
   esac
 }
 
+# HOISTED ABOVE THE ARG-PARSE LOOP for the same reason scan_both is (see its note): a --test that
+# cannot CALL a function can only assert its source text, and source text is never behaviour. These
+# three carry the zonal-edge decision, so the maxskew suppression gate below drives them for real.
+# --- closest_node: for a given MAC, return which node has strongest RSSI ---
+closest_node() {
+  local mac="$1" lr="${l_rssi[$mac]:-}" pr="${p_rssi[$mac]:-}"
+  if [ -z "$lr" ] && [ -z "$pr" ]; then echo ""; return; fi
+  if [ -z "$pr" ]; then echo "$SELF"; return; fi
+  if [ -z "$lr" ]; then echo "$PEER_NAME"; return; fi
+  if [ "$lr" -ge "$pr" ]; then echo "$SELF"; else echo "$PEER_NAME"; fi
+}
+
+# --- resolve_tracked: given a track key (name sub or MAC), find matching device in scan ---
+resolve_tracked() {
+  local key="$1" key_lc; key_lc="$(printf '%s' "$key" | tr '[:upper:]' '[:lower:]')"
+  local best_mac="" best_rssi=-999
+
+  for mac in "${!l_rssi[@]}" "${!p_rssi[@]}"; do
+    local mac_lc; mac_lc="$(printf '%s' "$mac" | tr '[:upper:]' '[:lower:]')"
+    local name="${l_name[$mac]:-${p_name[$mac]:-?}}"
+    local name_lc; name_lc="$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')"
+    local match=0
+    [[ "$mac_lc" == *"$key_lc"* ]] && match=1
+    [[ "$name_lc" == *"$key_lc"* ]] && match=1
+    [ "$match" -eq 1 ] && { local lr="${l_rssi[$mac]:--999}"; local pr="${p_rssi[$mac]:--999}"; local best; best=$(( lr > pr ? lr : pr )); [ "$best" -gt "$best_rssi" ] && { best_mac="$mac"; best_rssi="$best"; }; }
+  done
+  echo "$best_mac"
+}
+
+# --- check_tracked_zones: compare current closest node to stored state, feed mind on change ---
+check_tracked_zones() {
+  local ts; ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  local alerts=""
+  mesh-state-touch "$STATE"
+
+  # A missing peer is not a movement event. Require both observations before
+  # changing zonal state, otherwise peer loss can fabricate MOVED/GONE edges.
+  if [ "${SCAN_COMPLETE:-0}" -ne 1 ]; then
+    echo "$ts zonal: scan incomplete (${PEER_FAIL_REASON:-unknown cause}) — retaining previous state" >> "$FUSELOG"
+    return 0
+  fi
+
+  # MAXWAIT (see header): the guard above asks WHETHER both vantages observed, never WHEN. Two
+  # complete-but-non-simultaneous scans fabricate exactly the MOVED/ARRIVED edges that guard exists
+  # to prevent, because closest_node compares RSSI across the gap. Refuse the comparison and RETAIN
+  # state — a real move is deferred to the next clean cycle, never lost, and never invented.
+  local _skv; _skv="$(skew_verdict "${SCAN_LOCAL_EPOCH:-}" "${SCAN_PEER_EPOCH:-}" "${SCAN_MAXSKEW_S:-}")"
+  if [ "$_skv" = skew ]; then
+    echo "$ts zonal: vantages ${SCAN_SKEW_S}s apart (> maxskew ${SCAN_MAXSKEW_S}s) — cross-vantage RSSI is not a consistent cut; retaining previous state, no MOVED/ARRIVED edge" >> "$FUSELOG"
+    return 0
+  fi
+
+  for track_key in "${TRACK[@]}"; do
+    local mac; mac="$(resolve_tracked "$track_key")"
+    local name closest self_rssi peer_rssi
+
+    if [ -z "$mac" ]; then
+      # device not seen by either node this cycle → check if it was previously tracked
+      local prev; prev="$(grep "^$track_key|" "$STATE" 2>/dev/null | head -1)"
+      if [ -n "$prev" ]; then
+        closest="GONE"; name="$(echo "$prev" | cut -d'|' -f3)"
+        alerts="${alerts}${track_key}|${name}|GONE|0|0"$'\n'
+        sed -i "/^$track_key|/d" "$STATE" 2>/dev/null || true
+      fi
+      continue
+    fi
+
+    name="${l_name[$mac]:-${p_name[$mac]:-?}}"
+    closest="$(closest_node "$mac")"
+    self_rssi="${l_rssi[$mac]:--}"
+    peer_rssi="${p_rssi[$mac]:--}"
+
+    local prev_line; prev_line="$(grep "^$track_key|" "$STATE" 2>/dev/null | head -1)"
+    local prev_closest=""
+    [ -n "$prev_line" ] && prev_closest="$(echo "$prev_line" | cut -d'|' -f4)"
+
+    if [ -z "$prev_line" ]; then
+      # first time seeing this device
+      echo "$track_key|$mac|$name|$closest|$self_rssi|$peer_rssi|$ts" >> "$STATE"
+      alerts="${alerts}${track_key}|${name}|ARRIVED:${closest}|${self_rssi}|${peer_rssi}"$'\n'
+    elif [ "$prev_closest" != "$closest" ]; then
+      # zone change detected
+      sed -i "/^$track_key|/d" "$STATE" 2>/dev/null || true
+      echo "$track_key|$mac|$name|$closest|$self_rssi|$peer_rssi|$ts" >> "$STATE"
+      alerts="${alerts}${track_key}|${name}|${prev_closest}→${closest}|${self_rssi}|${peer_rssi}"$'\n'
+    else
+      # no change — update timestamp only
+      sed -i "/^$track_key|/d" "$STATE" 2>/dev/null || true
+      echo "$track_key|$mac|$name|$closest|$self_rssi|$peer_rssi|$ts" >> "$STATE"
+    fi
+  done
+
+  alerts="${alerts%%$'\n'}"
+  if [ -n "$alerts" ]; then
+    while IFS='|' read -r tk nm ev sr pr; do
+      [ -z "$tk" ] && continue
+      local msg
+      case "$ev" in
+        GONE)
+          msg="zonal: '$tk' ($nm) LEFT — no longer seen by any node" ;;
+        ARRIVED:*)
+          local cn="${ev#ARRIVED:}"
+          msg="zonal: '$tk' ($nm) ARRIVED near $cn (self=${sr:--} peer=${pr:--})" ;;
+        *→*)
+          msg="zonal: '$tk' ($nm) MOVED $ev (self=${sr:--} peer=${pr:--})" ;;
+        *) continue ;;
+      esac
+      echo "$ts $msg"
+      if command -v mesh-chat >/dev/null 2>&1; then
+        MESH_WHO="presence-fuse@$SELF" mesh-chat "[zone] $msg" >/dev/null 2>&1 || true
+      fi
+      echo "$ts $msg" >> "$FUSELOG"
+    done <<< "$alerts"
+  fi
+}
+
+# ================================================================
+# MAIN
+# ================================================================
+
 while [ $# -gt 0 ]; do
   case "$1" in
     --test)
@@ -306,6 +519,12 @@ while [ $# -gt 0 ]; do
       _wl_ln=$(grep -n '^while \[ \$# -gt 0 \]' "$0" | head -1 | cut -d: -f1)
       { [ -n "$_sb_ln" ] && [ -n "$_wl_ln" ] && [ "$_sb_ln" -lt "$_wl_ln" ]; } \
         || { echo "smoke-test: FAIL (scan_both def (line ${_sb_ln:-none}) is not ABOVE the arg-parse loop (line ${_wl_ln:-none}) — a bare zero-arg reflex run hits 'scan_both: command not found', 0 valid fusions)"; exit 1; }
+      # Same rule for the zonal trio: hoisted so the maxskew gate below can DRIVE them, not grep them.
+      for _fn in closest_node resolve_tracked check_tracked_zones; do
+        _fl=$(grep -n "^${_fn}()" "$0" | head -1 | cut -d: -f1)
+        { [ -n "$_fl" ] && [ "$_fl" -lt "$_wl_ln" ]; } \
+          || { echo "smoke-test: FAIL ($_fn def (line ${_fl:-none}) fell back BELOW the arg-parse loop — the maxskew suppression gate can no longer call it and would pass vacuously)"; exit 1; }
+      done
       # scan_sampled: content-based classify — falsifiable assertions
       scan_sampled "=== mesh-presence host @ ts — 0 device(s) in range ===" \
         || { echo "smoke-test: FAIL (empty-room scan wrongly rejected — same bug class as mesh-arrivals)"; exit 1; }
@@ -435,7 +654,88 @@ EOF
       # never be guessed personal from its bytes (this MAC's U/L bit is SET: the old rule claimed PERSONAL).
       [ "$(dev_class "?" "4A:18:79:30:A3:0F")" != PERSONAL ] || { echo "smoke-test: FAIL (MAC absent from the BlueZ map must NOT be claimed PERSONAL — the axis is lost, not guessed)"; exit 1; }
       unset MESH_ADDRTYPE_MAP
-      echo "smoke-test: ok (peer=$_resolved · scan_sampled:5 + peer-resolve/router + classify_peer_fail:10 incl. local-rc attribution + scan_both REAL-DRIVE retry/wiring + dev_class-addrtype:4 assertions)"; exit 0 ;;
+      # ── MAXWAIT / consistent-cut gates (LITERATURE 2026-08-20, see header) ──────────────────────
+      # 1. skew_verdict is PURE — assert its vocabulary in all three directions. na must be its own
+      #    word: collapsing "could not check" into ok is how a blind gate wears a green.
+      [ "$(skew_verdict 1000 1030 45)" = ok ]   || { echo "smoke-test: FAIL (30s gap under a 45s maxskew must read ok)"; exit 1; }
+      [ "$(skew_verdict 1000 1100 45)" = skew ] || { echo "smoke-test: FAIL (100s gap over a 45s maxskew must read skew — the fabricated-edge window is open)"; exit 1; }
+      [ "$(skew_verdict 1100 1000 45)" = skew ] || { echo "smoke-test: FAIL (skew must be symmetric — peer-first is the same gap as local-first)"; exit 1; }
+      [ "$(skew_verdict 1000 1045 45)" = ok ]   || { echo "smoke-test: FAIL (a gap EQUAL to maxskew must be admitted — the bound is inclusive)"; exit 1; }
+      [ "$(skew_verdict "" 1000 45)" = na ]     || { echo "smoke-test: FAIL (a missing local epoch must read na, never ok)"; exit 1; }
+      [ "$(skew_verdict 1000 "" 45)" = na ]     || { echo "smoke-test: FAIL (a missing peer epoch must read na, never ok)"; exit 1; }
+      [ "$(skew_verdict 1000 1030 "")" = na ]   || { echo "smoke-test: FAIL (an unset maxskew must read na, never ok)"; exit 1; }
+      skew_verdict 1000 1100 45 >/dev/null; [ $? = 1 ] || { echo "smoke-test: FAIL (skew must exit 1 so a caller may branch on rc)"; exit 1; }
+      # 2. REAL-DRIVE the wiring: the assertions above prove the function, never that scan_both STAMPS
+      #    the epochs or that the maxskew knob reaches it. Stub BOTH arms on PATH (the local stub
+      #    sleeps 1s, so the peer arm genuinely starts later and the skew is measured, not injected)
+      #    and drive scan_both twice — once under a wide bound, once under a zero bound. Falsify by
+      #    deleting either `date +%s` stamp: SCAN_SKEW_S goes empty and the ok arm trips.
+      _mwb="$(mktemp -d)"; mkdir -p "$_mwb/bin"
+      cat > "$_mwb/bin/mesh-presence" <<'EOF'
+#!/bin/sh
+sleep 1
+echo "=== mesh-presence stub @ now — 1 device(s) in range ==="
+echo "-40|AA:BB:CC:DD:EE:FF|Phone"
+exit 0
+EOF
+      cat > "$_mwb/bin/ssh" <<'EOF'
+#!/bin/sh
+echo "=== mesh-presence stub @ now — 1 device(s) in range ==="
+echo "-80|AA:BB:CC:DD:EE:FF|Phone"
+exit 0
+EOF
+      chmod +x "$_mwb/bin/mesh-presence" "$_mwb/bin/ssh"
+      ( PATH="$_mwb/bin:$PATH"; MESH_FUSE_SCAN_WIN=1; PEER_HOST=192.0.2.1; PEER_USER=nobody
+        MESH_FUSE_MAXSKEW_S=999 scan_both >/dev/null 2>&1
+        [ "$SCAN_COMPLETE" = 1 ] || { echo "smoke-test: FAIL (two stubbed healthy arms must read COMPLETE)"; exit 1; }
+        [ -n "$SCAN_SKEW_S" ] || { echo "smoke-test: FAIL (scan_both did not stamp the arms — SCAN_SKEW_S empty, the cut has no time axis)"; exit 1; }
+        [ "$SCAN_MAXSKEW_S" = 999 ] || { echo "smoke-test: FAIL (MESH_FUSE_MAXSKEW_S did not reach scan_both: '$SCAN_MAXSKEW_S')"; exit 1; }
+        [ "$(skew_verdict "$SCAN_LOCAL_EPOCH" "$SCAN_PEER_EPOCH" "$SCAN_MAXSKEW_S")" = ok ] \
+          || { echo "smoke-test: FAIL (a real sequential pair under a 999s bound must read ok — the gate would refuse every healthy cycle)"; exit 1; }
+        MESH_FUSE_MAXSKEW_S=0 scan_both >/dev/null 2>&1
+        [ "${SCAN_SKEW_S:-0}" -ge 1 ] || { echo "smoke-test: FAIL (the two arms measured ${SCAN_SKEW_S}s apart though the local arm sleeps 1s — the epochs are not of the real windows)"; exit 1; }
+        [ "$(skew_verdict "$SCAN_LOCAL_EPOCH" "$SCAN_PEER_EPOCH" "$SCAN_MAXSKEW_S")" = skew ] \
+          || { echo "smoke-test: FAIL (a real sequential pair under a 0s bound must read skew — the bound is not enforced on live epochs)"; exit 1; }
+        # A half-failed cycle must render na, never a fake 0s "perfectly simultaneous".
+        [ "$(skew_verdict "" "$SCAN_PEER_EPOCH" "$SCAN_MAXSKEW_S")" = na ] || { echo "smoke-test: FAIL (unsampled arm must render na)"; exit 1; }
+      ) || { rm -rf "$_mwb"; exit 1; }
+      # 3. REAL-DRIVE the BEHAVIOUR the finding is about: check_tracked_zones must fire an edge on a
+      #    consistent cut and fire NONE on a skewed one. Both arms run in one subshell against a
+      #    THROWAWAY FUSELOG/STATE (never the durable pair — a dry-run writing the liveness log forges
+      #    the evidence it exists to check) with mesh-chat/mesh-state-touch stubbed, so the control arm
+      #    proves the emission path is genuinely reached. Falsify by deleting the skew branch in
+      #    check_tracked_zones: the skew arm then fires ARRIVED and this trips.
+      cat > "$_mwb/bin/mesh-chat" <<EOF
+#!/bin/sh
+echo "\$*" >> "$_mwb/posted"
+EOF
+      cat > "$_mwb/bin/mesh-state-touch" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+      chmod +x "$_mwb/bin/mesh-chat" "$_mwb/bin/mesh-state-touch"
+      ( PATH="$_mwb/bin:$PATH"
+        STATE="$_mwb/state"; FUSELOG="$_mwb/fuse.log"; : > "$STATE"
+        TRACK=("AA:BB:CC:DD:EE:FF"); SCAN_COMPLETE=1
+        declare -gA l_rssi l_name p_rssi p_name
+        l_rssi["AA:BB:CC:DD:EE:FF"]=-40; l_name["AA:BB:CC:DD:EE:FF"]=Phone
+        p_rssi["AA:BB:CC:DD:EE:FF"]=-80; p_name["AA:BB:CC:DD:EE:FF"]=Phone
+        # skewed cut → no edge, state untouched, and the log SAYS why (a collapsed reason makes
+        # blind and quiet identical).
+        SCAN_LOCAL_EPOCH=1000; SCAN_PEER_EPOCH=1200; SCAN_MAXSKEW_S=45
+        check_tracked_zones >/dev/null 2>&1
+        [ ! -s "$_mwb/posted" ] || { echo "smoke-test: FAIL (a SKEWED cycle fabricated a zonal edge: $(cat "$_mwb/posted"))"; exit 1; }
+        [ ! -s "$STATE" ] || { echo "smoke-test: FAIL (a SKEWED cycle wrote zonal state — the next clean cycle can no longer fire the real edge)"; exit 1; }
+        grep -q 'not a consistent cut' "$_mwb/fuse.log" || { echo "smoke-test: FAIL (the skew refusal left no reason in the log — silent and blind read the same)"; exit 1; }
+        # CONTROL: same inputs, consistent cut → the edge MUST fire. Without this arm the gate above
+        # would also pass on a check_tracked_zones that never emits anything at all.
+        SCAN_PEER_EPOCH=1020
+        check_tracked_zones >/dev/null 2>&1
+        grep -q ARRIVED "$_mwb/posted" 2>/dev/null || { echo "smoke-test: FAIL (a CONSISTENT cut fired no zonal edge — the suppression gate above is vacuous)"; exit 1; }
+        [ -s "$STATE" ] || { echo "smoke-test: FAIL (a CONSISTENT cut wrote no zonal state)"; exit 1; }
+      ) || { rm -rf "$_mwb"; exit 1; }
+      rm -rf "$_mwb"
+      echo "smoke-test: ok (peer=$_resolved · scan_sampled:5 + peer-resolve/router + classify_peer_fail:10 incl. local-rc attribution + scan_both REAL-DRIVE retry/wiring + dev_class-addrtype:4 + maxskew skew_verdict:8/scan_both-stamp REAL-DRIVE/zonal-edge suppression+control assertions)"; exit 0 ;;
     --stream)
       MODE=stream; shift
       if [[ "${1:-}" =~ ^[1-9][0-9]*$ ]]; then INTERVAL="$1"; shift; fi ;;
@@ -461,32 +761,6 @@ if [[ "$PEER_HOST" == *@* ]]; then
 fi
 
 
-# --- closest_node: for a given MAC, return which node has strongest RSSI ---
-closest_node() {
-  local mac="$1" lr="${l_rssi[$mac]:-}" pr="${p_rssi[$mac]:-}"
-  if [ -z "$lr" ] && [ -z "$pr" ]; then echo ""; return; fi
-  if [ -z "$pr" ]; then echo "$SELF"; return; fi
-  if [ -z "$lr" ]; then echo "$PEER_NAME"; return; fi
-  if [ "$lr" -ge "$pr" ]; then echo "$SELF"; else echo "$PEER_NAME"; fi
-}
-
-# --- resolve_tracked: given a track key (name sub or MAC), find matching device in scan ---
-resolve_tracked() {
-  local key="$1" key_lc; key_lc="$(printf '%s' "$key" | tr '[:upper:]' '[:lower:]')"
-  local best_mac="" best_rssi=-999
-
-  for mac in "${!l_rssi[@]}" "${!p_rssi[@]}"; do
-    local mac_lc; mac_lc="$(printf '%s' "$mac" | tr '[:upper:]' '[:lower:]')"
-    local name="${l_name[$mac]:-${p_name[$mac]:-?}}"
-    local name_lc; name_lc="$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')"
-    local match=0
-    [[ "$mac_lc" == *"$key_lc"* ]] && match=1
-    [[ "$name_lc" == *"$key_lc"* ]] && match=1
-    [ "$match" -eq 1 ] && { local lr="${l_rssi[$mac]:--999}"; local pr="${p_rssi[$mac]:--999}"; local best; best=$(( lr > pr ? lr : pr )); [ "$best" -gt "$best_rssi" ] && { best_mac="$mac"; best_rssi="$best"; }; }
-  done
-  echo "$best_mac"
-}
-
 # --- print_overlap: one-shot report (original behaviour) ---
 print_overlap() {
   local TS; TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -499,6 +773,15 @@ print_overlap() {
     echo "⚠ PEER SCAN INCOMPLETE — ${PEER_FAIL_REASON:-unknown cause}. The peer column below"
     echo "  is EMPTY because the peer scan did not produce an artifact, NOT because no devices are"
     echo "  near it. Cross-node fusion is NOT valid this cycle (the local column below is still real)."
+  fi
+  # MAXWAIT (see header): both arms sampled, but not of the SAME INSTANT. Membership is join-shaped
+  # and survives skew; the cross-vantage RSSI comparison is not and does not.
+  local _skv; _skv="$(skew_verdict "${SCAN_LOCAL_EPOCH:-}" "${SCAN_PEER_EPOCH:-}" "${SCAN_MAXSKEW_S:-}")"
+  if [ "${SCAN_COMPLETE:-0}" -eq 1 ] && [ "$_skv" = skew ]; then
+    echo "⚠ VANTAGES NOT SIMULTANEOUS — the two scans sampled ${SCAN_SKEW_S}s apart (maxskew ${SCAN_MAXSKEW_S}s)."
+    echo "  The MEMBERSHIP columns below are still real: a device seen by a vantage WAS in its range."
+    echo "  The 'Closest' column is NOT — it compares RSSI across two different instants, so a device"
+    echo "  that moved inside that gap is localized to whichever vantage happened to sample it nearer."
   fi
 
   echo ""; echo "--- Overlap (seen by BOTH nodes) ---"
@@ -538,7 +821,7 @@ print_overlap() {
   # whole zonal map is unreliable → render UNKNOWN, never a confident "person near X" (appliance-vs-person
   # trap + no-faked-all-clear). This LABELS location, it does NOT conclude a human is present.
   local self_zone="" peer_zone="" person_seen=0
-  if [ "${SCAN_COMPLETE:-0}" -eq 1 ]; then
+  if [ "${SCAN_COMPLETE:-0}" -eq 1 ] && [ "$_skv" != skew ]; then
     for mac in "${!l_rssi[@]}"; do
       [ -z "${p_rssi[$mac]:-}" ] && continue   # overlap-only: needs both vantages to localize
       local nm="${l_name[$mac]:-${p_name[$mac]:-?}}"
@@ -554,17 +837,28 @@ print_overlap() {
     else
       echo "person-zone: ${self_zone:+near ${SELF}: [${self_zone}]}${self_zone:+ · }${peer_zone:+near peer: [${peer_zone}]}  (weak person-location hint; not a presence verdict)"
     fi
+  elif [ "${SCAN_COMPLETE:-0}" -eq 1 ]; then
+    echo "person-zone: UNKNOWN — vantages ${SCAN_SKEW_S}s apart (> maxskew ${SCAN_MAXSKEW_S}s); a zone is a COMPARISON and this pair is not a consistent cut"
   else
     echo "person-zone: UNKNOWN — peer scan INCOMPLETE (${PEER_FAIL_REASON:-unknown}); cross-vantage localization invalid this cycle"
   fi
 
-  echo "$TS ${SELF}+peer overlap=$overlap self_unique=$unique_self peer_unique=$unique_peer person_dualvantage=${person_seen}" >> "$MESH/presence-fusion.log"
+  # skew= is logged EVERY cycle, ok or not, so MESH_FUSE_MAXSKEW_S is calibrated against the real
+  # corpus of sequential-scan gaps instead of being defended in prose (the frozen-median trap).
+  # Compose the field ONCE: "${SCAN_SKEW_S:-na}s" renders the unmeasured cycle as "nas", a unit
+  # glued to a non-number that every future parser has to special-case.
+  local _skf="na"; [ -n "${SCAN_SKEW_S}" ] && _skf="${SCAN_SKEW_S}s"
+  echo "$TS ${SELF}+peer overlap=$overlap self_unique=$unique_self peer_unique=$unique_peer person_dualvantage=${person_seen} skew=${_skf}/${_skv}" >> "$MESH/presence-fusion.log"
   mesh-state-touch "$STATE"
 
   # Compact 1-line summary for the senses dash (mirrors wifi-crossval.state; dash just cats it, never
   # runs this expensive 2-vantage scan per frame). Honest-fusion: an INCOMPLETE peer scan is recorded
   # AS incomplete so the dash never shows a confident cross-vantage map built on a half-failed cycle.
-  if [ "${SCAN_COMPLETE:-0}" -eq 1 ]; then
+  if [ "${SCAN_COMPLETE:-0}" -eq 1 ] && [ "$_skv" = skew ]; then
+    printf '%s | %d shared · %d uniq@%s · %d uniq@peer | zone UNKNOWN — vantages %ss apart (> maxskew %ss), not a consistent cut\n' \
+      "$TS" "$overlap" "$unique_self" "$SELF" "$unique_peer" "${SCAN_SKEW_S}" "${SCAN_MAXSKEW_S}" \
+      > "$MESH/ble-spacemap.state" 2>/dev/null || true
+  elif [ "${SCAN_COMPLETE:-0}" -eq 1 ]; then
     local pz="person-zone UNKNOWN (no dual-vantage personal device)"
     [ "${person_seen:-0}" -gt 0 ] && pz="person ${self_zone:+@${SELF}:[${self_zone}]}${peer_zone:+ @peer:[${peer_zone}]}"
     printf '%s | %d shared · %d uniq@%s · %d uniq@peer | %s\n' \
@@ -575,87 +869,6 @@ print_overlap() {
       "$TS" "${PEER_FAIL_REASON:-peer unreachable}" > "$MESH/ble-spacemap.state" 2>/dev/null || true
   fi
 }
-
-# --- check_tracked_zones: compare current closest node to stored state, feed mind on change ---
-check_tracked_zones() {
-  local ts; ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  local alerts=""
-  mesh-state-touch "$STATE"
-
-  # A missing peer is not a movement event. Require both observations before
-  # changing zonal state, otherwise peer loss can fabricate MOVED/GONE edges.
-  if [ "${SCAN_COMPLETE:-0}" -ne 1 ]; then
-    echo "$ts zonal: scan incomplete (${PEER_FAIL_REASON:-unknown cause}) — retaining previous state" >> "$MESH/presence-fuse.log"
-    return 0
-  fi
-
-  for track_key in "${TRACK[@]}"; do
-    local mac; mac="$(resolve_tracked "$track_key")"
-    local name closest self_rssi peer_rssi
-
-    if [ -z "$mac" ]; then
-      # device not seen by either node this cycle → check if it was previously tracked
-      local prev; prev="$(grep "^$track_key|" "$STATE" 2>/dev/null | head -1)"
-      if [ -n "$prev" ]; then
-        closest="GONE"; name="$(echo "$prev" | cut -d'|' -f3)"
-        alerts="${alerts}${track_key}|${name}|GONE|0|0"$'\n'
-        sed -i "/^$track_key|/d" "$STATE" 2>/dev/null || true
-      fi
-      continue
-    fi
-
-    name="${l_name[$mac]:-${p_name[$mac]:-?}}"
-    closest="$(closest_node "$mac")"
-    self_rssi="${l_rssi[$mac]:--}"
-    peer_rssi="${p_rssi[$mac]:--}"
-
-    local prev_line; prev_line="$(grep "^$track_key|" "$STATE" 2>/dev/null | head -1)"
-    local prev_closest=""
-    [ -n "$prev_line" ] && prev_closest="$(echo "$prev_line" | cut -d'|' -f4)"
-
-    if [ -z "$prev_line" ]; then
-      # first time seeing this device
-      echo "$track_key|$mac|$name|$closest|$self_rssi|$peer_rssi|$ts" >> "$STATE"
-      alerts="${alerts}${track_key}|${name}|ARRIVED:${closest}|${self_rssi}|${peer_rssi}"$'\n'
-    elif [ "$prev_closest" != "$closest" ]; then
-      # zone change detected
-      sed -i "/^$track_key|/d" "$STATE" 2>/dev/null || true
-      echo "$track_key|$mac|$name|$closest|$self_rssi|$peer_rssi|$ts" >> "$STATE"
-      alerts="${alerts}${track_key}|${name}|${prev_closest}→${closest}|${self_rssi}|${peer_rssi}"$'\n'
-    else
-      # no change — update timestamp only
-      sed -i "/^$track_key|/d" "$STATE" 2>/dev/null || true
-      echo "$track_key|$mac|$name|$closest|$self_rssi|$peer_rssi|$ts" >> "$STATE"
-    fi
-  done
-
-  alerts="${alerts%%$'\n'}"
-  if [ -n "$alerts" ]; then
-    while IFS='|' read -r tk nm ev sr pr; do
-      [ -z "$tk" ] && continue
-      local msg
-      case "$ev" in
-        GONE)
-          msg="zonal: '$tk' ($nm) LEFT — no longer seen by any node" ;;
-        ARRIVED:*)
-          local cn="${ev#ARRIVED:}"
-          msg="zonal: '$tk' ($nm) ARRIVED near $cn (self=${sr:--} peer=${pr:--})" ;;
-        *→*)
-          msg="zonal: '$tk' ($nm) MOVED $ev (self=${sr:--} peer=${pr:--})" ;;
-        *) continue ;;
-      esac
-      echo "$ts $msg"
-      if command -v mesh-chat >/dev/null 2>&1; then
-        MESH_WHO="presence-fuse@$SELF" mesh-chat "[zone] $msg" >/dev/null 2>&1 || true
-      fi
-      echo "$ts $msg" >> "$MESH/presence-fuse.log"
-    done <<< "$alerts"
-  fi
-}
-
-# ================================================================
-# MAIN
-# ================================================================
 
 if [ "${#TRACK[@]}" -gt 0 ] && [ "$MODE" = oneshot ]; then MODE=once; fi
 
