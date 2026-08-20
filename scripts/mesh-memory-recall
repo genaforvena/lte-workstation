@@ -1422,7 +1422,98 @@ def spill_index(check=False, project=None):
     return rc
 
 
-def _spill_budget(head, body, files, limit):
+def _index_cycle_growth(project):
+    """(worst_gross_rise_B, cycle_s, n_cycles) — how far this corpus's index can GROW between two
+    spills, measured from this tool's own byte samples. (None, None, n_shrinks) when unmeasurable.
+
+    Two quantities, and NEITHER is read from a header or a constant:
+
+    - THE CYCLE is the median gap between samples where the index SHRANK. A shrink means a spill
+      (or a compact) ran, so the cadence comes from the tool's OWN behaviour and cannot go stale
+      when cron and a `# reflex-cadence:` header diverge — the shape senses fixed in f0f03f8.
+    - THE RISE is the sum of POSITIVE deltas inside a window, never (last - first). This series is
+      a SAWTOOTH: each spill resets it, so an endpoint difference over it is a readout of sampling
+      phase, not a rate. Measured on this node the same endpoint estimator returned -684 B/day
+      through +4916 B/day depending only on which sample happened to be last (memory
+      an-endpoint-rate-over-a-sawtooth-is-a-phase-readout, and the dash's "+1690 B/day" beside a
+      spill log clearing 300-760 B/hr is that artifact). Summing rises makes a reset contribute
+      zero instead of cancelling the growth the reserve has to cover.
+
+    The WORST window, not the mean: this sizes a reserve, and a reserve covering the average cycle
+    is breached by half of them. The rising-segment mean is not used either — it conditions on
+    rising, so it is an upper bound on nothing this needs (conditional-mean trap)."""
+    rows = [(_iso_epoch(ts), b) for ts, _p, b, _n in _index_rows(project)]
+    rows = [r for r in rows if r[0] > 0]
+    if len(rows) < 3:
+        return (None, None, 0)
+    shrinks = [rows[i][0] for i in range(1, len(rows)) if rows[i][1] < rows[i - 1][1]]
+    if len(shrinks) < 3:
+        return (None, None, len(shrinks))
+    gaps = sorted(shrinks[i] - shrinks[i - 1] for i in range(1, len(shrinks)))
+    cycle = gaps[len(gaps) // 2]
+    if cycle <= 0:
+        return (None, None, len(shrinks))
+    worst = 0
+    for i in range(len(rows)):
+        rise = 0
+        for j in range(i + 1, len(rows)):
+            if rows[j][0] - rows[i][0] > cycle:
+                break
+            d = rows[j][1] - rows[j - 1][1]
+            if d > 0:
+                rise += d
+        worst = max(worst, rise)
+    return (worst, cycle, len(gaps))
+
+
+def _spill_reserve(project, body, limit):
+    """(bytes, why) held back so ONE CYCLE of ordinary appends cannot push the index past the cut.
+
+    SPLITTING AT EXACTLY `limit` IS A SPILL WITH NO MARGIN — true at the instant it runs and false
+    minutes later. Measured on this node across 26 spills the mean post-spill headroom was 94 B
+    (min 3) against index lines of 100-240 B, so the very next memory filed landed past the read
+    limit — in NEITHER MEMORY.md's read window NOR the cold file the marker points at, which is
+    precisely the hole the spill exists to close. The verdict "index cut: none" was a SAMPLE of the
+    moment after the write, never a claim about the hour (the window-over-cadence shape).
+
+    The reserve is MEASURED and re-derived every pass. A constant here would rot against a corpus
+    whose fill rate moves — the frozen-medians failure in CLAUDE.md, one file over. Ladder, and the
+    rung that answered is NAMED in the verdict so a reader can never mistake which one spoke:
+      1. the worst gross rise over one measured cycle (_index_cycle_growth);
+      2. floored at the widest index line — a margin smaller than one line asserts nothing, since a
+         single ordinary append breaches it;
+      3. capped at limit/4: a reserve is only worth having if a hot tier survives it."""
+    widest = max((len(l.encode()) + 1 for l in body), default=0)
+    grow, cycle, n = _index_cycle_growth(project)
+    if grow is None:
+        reserve = widest
+        why = f"no measured cycle ({n} index shrink(s) sampled) — one widest index line"
+    else:
+        reserve = max(grow, widest)
+        why = f"worst rise {grow} B over {n} measured cycle(s) of ~{int(cycle // 60)} min"
+        if widest > grow:
+            why += f", floored at the widest index line {widest} B"
+    cap = max(limit // 4, 0)
+    if reserve > cap:
+        why += f" — CAPPED at limit/4 = {cap} B"
+        reserve = cap
+    return reserve, why
+
+
+def _margin_oneline(project, hot_b, limit, reserve, why):
+    """THE HEADROOM IN BYTES *AND* IN TIME. A byte count alone reads as a state; "94 B under" and
+    "94 B under = ~4 min of fill" are the same number and only one of them can be misread as a
+    claim about the hour. Fill time is n/a, never 0, where no cycle is measured."""
+    left = limit - hot_b
+    grow, cycle, _n = _index_cycle_growth(project)
+    if grow and cycle:
+        fill = f" = ~{left * cycle / grow / 60.0:.0f} min of fill at the worst measured rate"
+    else:
+        fill = " = fill time n/a (no measured cycle)"
+    return f"margin {left} B{fill} · reserve {reserve} B ({why})"
+
+
+def _spill_budget(head, body, files, limit, reserve):
     """bytes available to hot entries, or None when even the head and marker do not fit.
 
     THE RESERVE IS MEASURED, NOT GUESSED. A fixed constant here is the silent-fallback shape one
@@ -1433,18 +1524,19 @@ def _spill_budget(head, body, files, limit):
     the whole body cold. Counts only ever shrink from there, so this can never under-reserve."""
     worst = _spill_marker(len(body), len({s for l in body for s in _line_slugs(l, files)}))
     budget = (limit - sum(len(l.encode()) + 1 for l in head)
-              - (len(worst.encode()) + 1))
+              - (len(worst.encode()) + 1) - reserve)
     return budget if budget > 0 else None
 
 
-def _spill_body(head, body, files, limit):
+def _spill_body(head, body, files, limit, reserve):
     """(hot, cold) — the value-ordered body split at the harness's read limit.
 
     The cut this mirrors is the harness's own: head-kept, tail-cut, cumulative bytes. The
     difference is only that the tail lands in a FILE with a name instead of in the dark. Every line
-    is measured against what is left after the pinned head AND the marker that will announce the
-    tier, so the marker can never be the thing that pushes a memory out unannounced."""
-    budget = _spill_budget(head, body, files, limit)
+    is measured against what is left after the pinned head, the marker that will announce the tier,
+    AND the reserve, so neither the marker nor the next hour's appends can be the thing that pushes
+    a memory out unannounced."""
+    budget = _spill_budget(head, body, files, limit, reserve)
     if budget is None:
         return None
     hot, cold, cum = [], [], 0
@@ -1505,7 +1597,8 @@ def _spill_one(pdir, limit, check=False):
     last, mentioned = _use_signals(pdir.name, files, use_git=False)
     now = time.time()
     union = _order_body(body + csplit[1], files, last, mentioned, now)
-    split2 = _spill_body(head, union, files, limit)
+    reserve, why = _spill_reserve(pdir.name, union, limit)
+    split2 = _spill_body(head, union, files, limit, reserve)
     if split2 is None:
         # SPILLING EVERYTHING IS NOT A SPLIT. If the pinned head plus the marker already exceed the
         # limit, there is no hot tier to keep and emptying the index would satisfy the byte test
@@ -1535,13 +1628,17 @@ def _spill_one(pdir, limit, check=False):
     hot_b = sum(len(l.encode()) + 1 for l in new_idx)
     cold_slugs = len(ptrs(new_cold))
     if lines == new_idx and cold_text.splitlines() == new_cold:
+        # THE SETTLED BRANCH IS WHERE AN OVERRUN INDEX COMES TO REST, so it is exactly where the
+        # margin must not go quiet — same lesson the floor learned in the --compact leg.
         print(f"  [{pdir.name}] spill already settled ({hot_b} B hot / {cold_slugs} memories cold)")
+        print(f"  {_margin_oneline(pdir.name, hot_b, limit, reserve, why)}")
         return 0
     if check:
         # DRY RUN WRITES NOTHING — not the index, not the cold file, not a log (09f7914).
         print(f"  [{pdir.name}] would spill {len(cold)} line(s) / {cold_slugs} memories to "
               f"{cold_p}")
         print(f"  index {len(text.encode())} -> {hot_b} B against the {limit} B limit")
+        print(f"  {_margin_oneline(pdir.name, hot_b, limit, reserve, why)}")
         print(f"  {_floor_oneline(pdir).strip()}")
         return 0
     st1 = idx.stat()
@@ -1570,6 +1667,7 @@ def _spill_one(pdir, limit, check=False):
     print(f"  [{pdir.name}] spilled {len(cold)} line(s) / {cold_slugs} memories to {COLD_NAME} · "
           f"index {len(text.encode())} -> {hot_b} B of {limit} B · "
           f"{_cut_oneline(pdir.name).strip()}")
+    print(f"  {_margin_oneline(pdir.name, hot_b, limit, reserve, why)}")
     return 0
 
 
@@ -2625,6 +2723,81 @@ def _test_body():
                 spill_index(project="-spl")
             check("a memory that goes WARM climbs back out of the cold tier (not a one-way ratchet)",
                   coldest in (mem / "MEMORY.md").read_text())
+            # 12b2) THE RESERVE IS MEASURED, NOT A CONSTANT — and it reads RISES, not endpoints.
+            #       Feed a synthetic byte-sample log holding a known sawtooth: six cycles that each
+            #       climb 150 B and are then reset by a shrink. The endpoint estimator returns ZERO
+            #       growth over that series while the corpus really grows 150 B every cycle, which
+            #       is the whole reason _index_cycle_growth sums positive deltas.
+            _saved_ilog = globals()["INDEX_LOG"]
+            globals()["INDEX_LOG"] = td / "index.tsv"
+            try:
+                srows, t0 = [], 1755000000
+                for c in range(6):
+                    base = t0 + c * 3600
+                    srows += [(base, 1000), (base + 600, 1075), (base + 1200, 1150),
+                              (base + 3500, 1000)]
+                (td / "index.tsv").write_text("".join(
+                    "%s\t-spl\t%d\t1\n" % (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t)), b)
+                    for t, b in srows))
+                grow, cycle, ncyc = _index_cycle_growth("-spl")
+                check("the cycle is MEASURED from the tool's own shrinks, never read from a header",
+                      3000 <= cycle <= 4200 and ncyc >= 4)
+                check("the rise sums POSITIVE deltas, so the sawtooth's reset cannot cancel growth",
+                      grow == 150 and srows[-1][1] - srows[0][1] == 0)
+                bl = [l for l in (mem / "MEMORY.md").read_text().splitlines()
+                      if l.startswith("- ")]
+                widest_b = max(len(l.encode()) + 1 for l in bl)
+                res, whyt = _spill_reserve("-spl", bl, 100000)
+                check("the reserve is that measured rise, floored at one widest index line",
+                      res == max(150, widest_b) and "measured cycle(s)" in whyt)
+                res2, why2 = _spill_reserve("-spl", bl, 200)
+                check("...and a reserve that would eat the hot tier is CAPPED and says so",
+                      res2 == 50 and "CAPPED" in why2)
+                # 12b3) THE MARGIN GATE. A spill is only a spill if the cut still holds AFTER one
+                #       ordinary append — the defect is a split that is true at :12 and false at
+                #       :15. Drive the real entry point, then append one index line the way a mind
+                #       filing a memory does, and assert the harness's byte cut has not moved.
+                os.environ["MESH_MEMORY_INDEX_LIMIT"] = str(floor)
+                lim = floor
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    spill_index(project="-spl")
+                check("the spill verdict names the reserve AND the margin in time, not bytes alone",
+                      "reserve " in out.getvalue() and "min of fill" in out.getvalue())
+                pad = "- [Synth](spillslug00-memory-here.md) — " + "y" * 80
+                def _append_one():
+                    with open(mem / "MEMORY.md", "a") as _f:
+                        _f.write(pad + "\n")
+                check("after a spill the index is under the read limit",
+                      len((mem / "MEMORY.md").read_bytes()) <= lim)
+                _append_one()
+                check("...and STILL under it after one ordinary append (the margin is REAL)",
+                      len((mem / "MEMORY.md").read_bytes()) <= lim)
+                # THE CONTROL ARM — this is the code the fix replaces. With the reserve forced to
+                # zero, the split lands at exactly `limit` and the SAME append must cross it. A
+                # gate never seen fail is not a gate.
+                _real_res = _spill_reserve
+                globals()["_spill_reserve"] = lambda project, body, limit: (0, "control: no reserve")
+                try:
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        spill_index(project="-spl")
+                finally:
+                    globals()["_spill_reserve"] = _real_res
+                zero_b = len((mem / "MEMORY.md").read_bytes())
+                _append_one()
+                check("...and with the reserve removed the SAME append CROSSES it (control red)",
+                      zero_b <= lim and len((mem / "MEMORY.md").read_bytes()) > lim)
+            finally:
+                globals()["INDEX_LOG"] = _saved_ilog
+            # Leave the fixture as the legs below expect it: the synthetic appends are DUPLICATE
+            # pointers, and a duplicate hides a real loss from the pointer invariant 12d gates.
+            for _f in (mem / "MEMORY.md", mem / COLD_NAME):
+                if _f.exists():
+                    _f.write_text("\n".join(l for l in _f.read_text().splitlines()
+                                             if not l.startswith("- [Synth]")) + "\n")
+            with contextlib.redirect_stdout(io.StringIO()):
+                spill_index(project="-spl")
+
             # 12c) RAISE THE LIMIT ABOVE THE WHOLE CORPUS: the tier must DISSOLVE, marker and all,
             #      or the index keeps a line announcing a file that no longer holds anything.
             os.environ["MESH_MEMORY_INDEX_LIMIT"] = "100000"
@@ -2643,8 +2816,8 @@ def _test_body():
             good_c = (mem / COLD_NAME).read_text()
             _real_spill = _spill_body
 
-            def _lossy(head, body, files_, limit):
-                h, c = _real_spill(head, body, files_, limit)
+            def _lossy(head, body, files_, limit, reserve_):
+                h, c = _real_spill(head, body, files_, limit, reserve_)
                 return h, c[:-1]          # drop the coldest line entirely
 
             globals()["_spill_body"] = _lossy
@@ -2660,10 +2833,10 @@ def _test_body():
             # 12e) A MIND MAY WRITE MEMORY.md AT ANY MOMENT AND HOLDS NO LOCK (same race as --order).
             racer = {"n": 0}
 
-            def _racing(head, body, files_, limit):
+            def _racing(head, body, files_, limit, reserve_):
                 racer["n"] += 1
                 (mem / "MEMORY.md").write_text(good_h + "- [Raced](spillslug00-memory-here.md) — x\n")
-                return _real_spill(head, body, files_, limit)
+                return _real_spill(head, body, files_, limit, reserve_)
 
             globals()["_spill_body"] = _racing
             try:
