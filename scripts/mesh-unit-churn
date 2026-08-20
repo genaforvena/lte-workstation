@@ -27,7 +27,7 @@
 # mtime frozen while systemd-green) and the NVRM-Xid unsensed GPU fault — but a NEW AXIS: the restart
 # counter, not output freshness. This is the SOLE reader of that axis.
 #
-#   mesh-unit-churn           one delta pass: read NRestarts per auto-restart unit, emit churn, advance baseline
+#   mesh-unit-churn           one delta pass: read NRestarts per auto-restart unit, GRADE it, emit churn, advance baseline
 #   mesh-unit-churn --check   read-only report (no board post, no baseline advance)
 #   mesh-unit-churn --status  last state reading, no new read
 #   mesh-unit-churn --test    fixtures (first-sight/delta/no-replay/reset/restart-no/BLIND/distinct/debounce/
@@ -36,9 +36,26 @@
 #
 # Design constraints (each a logged mesh failure class):
 #   - Baseline = per-unit LAST-SEEN NRestarts (`~/.mesh/.unit-churn-baseline`,
-#     `<manager>/<unit><TAB>NRestarts<TAB>epoch` — the KEY carries the manager, so the two ollama.service
+#     `<manager>/<unit><TAB>NRestarts<TAB>epoch<TAB>streak` — the KEY carries the manager, so the two ollama.service
 #     units cannot share a baseline row and a churn can never be attributed to its twin).
 #     The DELTA vs baseline (not the absolute) is the churn — NRestarts is monotonic-since-unit-start.
+#   - A DELTA IS NOT A MECHANISM (this node, 2026-08-20; the fix that added grading). Until then every
+#     churn — +1 and +81 alike — reached the board wearing the same word, `crash-looping`. Live case:
+#     user/mesh-phaedra-proxy.service boarded "crash-looping: +1 restart(s) in the last ~5m" while the
+#     unit was UP, its socks5 path returning http 200 in 0.5s, and its previous session had held for an
+#     hour — one ssh reconnect after the tailscale path to phaedra stalled. Its own durable log shows the
+#     two populations plainly: 77 lines at +1 and 51 at exactly +10, and +10 is not "worse", it is the
+#     SATURATION PLATEAU (ConnectTimeout=15 + RestartUSec=15 ⇒ a 30s cycle ⇒ 10 per 300s is the fastest
+#     this unit can physically restart). One word over both means the word carries no information, and
+#     the founding ollama fixed point (16.26/min for 63.7h) could not be picked out of the stream by
+#     anything but a human reading the number. So every verdict is now GRADED by the observed mean
+#     restart PERIOD divided by that unit's OWN RestartUSec floor — a per-unit, self-calibrating ratio,
+#     not a fleet-wide count threshold (a 3s-floor unit and a 15s-floor unit are not comparable in
+#     counts). The interval is the REAL one (now − the baseline row's epoch), never the nominal cadence.
+#     The floor EXCLUDES the unit's own time-to-fail, so it is a LOWER bound on the true cycle and the
+#     ratio is an UPPER bound on distance-from-saturation: LOOP is conservative and a 2.0x LOOP may
+#     already be flat out. Missing interval or missing/zero/infinite RestartUSec ⇒ UNGRADED, printed as
+#     such and counted separately in the state line — never quietly banded as calm.
 #   - COUNTER RESET is NOT churn (never alarm on absolute): NRestarts resets to 0 on a clean
 #     stop/start, `systemctl restart`, daemon-reexec or reboot. current < baseline ⇒ reset ⇒
 #     re-baseline to current, ZERO alarm. (Rare miss: a unit that churns THROUGH a reset within one
@@ -102,25 +119,113 @@ read_leg(){ # $1=user|system → that manager's `systemctl show` grouped output 
       # Id= blocks there — the read must supply its own bus path or every scheduled tick is BLIND.
       [ -n "${XDG_RUNTIME_DIR:-}" ] || export XDG_RUNTIME_DIR="/run/user/$(id -u)"
       [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ] || export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
-      systemctl --user show '*.service' --property=Id,Restart,NRestarts 2>/dev/null ;;
+      systemctl --user show '*.service' --property=Id,Restart,NRestarts,RestartUSec 2>/dev/null ;;
     system)
       [ "$FIXTURE" = 1 ] && { cat "$SRC_SYSTEM" 2>/dev/null; return 0; }
       # the system manager is readable unprivileged (read-only dbus); needs no session bus.
-      systemctl --system show '*.service' --property=Id,Restart,NRestarts 2>/dev/null ;;
+      systemctl --system show '*.service' --property=Id,Restart,NRestarts,RestartUSec 2>/dev/null ;;
   esac
 }
 
-parse_units(){ # stdin = grouped show output → one `unit<TAB>restart<TAB>nrestarts` line per unit
+parse_units(){ # stdin = grouped show output → one `unit<TAB>restart<TAB>nrestarts<TAB>restartusec` line per unit
+  # `^Restart=` does NOT match `RestartUSec=` (the anchor includes the `=`), so order is not load-bearing
+  # here — RestartUSec is tested first only to keep the near-miss pair adjacent and obvious to the reader.
   awk -v RS='' '{
-    id=""; rs=""; nr=""
+    id=""; rs=""; nr=""; ru=""
     n=split($0, L, "\n")
     for(i=1;i<=n;i++){
-      if      (L[i] ~ /^Id=/)        { id=L[i]; sub(/^Id=/,"",id) }
-      else if (L[i] ~ /^Restart=/)   { rs=L[i]; sub(/^Restart=/,"",rs) }
-      else if (L[i] ~ /^NRestarts=/) { nr=L[i]; sub(/^NRestarts=/,"",nr) }
+      if      (L[i] ~ /^Id=/)          { id=L[i]; sub(/^Id=/,"",id) }
+      else if (L[i] ~ /^RestartUSec=/) { ru=L[i]; sub(/^RestartUSec=/,"",ru) }
+      else if (L[i] ~ /^Restart=/)     { rs=L[i]; sub(/^Restart=/,"",rs) }
+      else if (L[i] ~ /^NRestarts=/)   { nr=L[i]; sub(/^NRestarts=/,"",nr) }
     }
-    if (id != "") print id"\t"rs"\t"nr
+    if (id != "") print id"\t"rs"\t"nr"\t"ru
   }'
+}
+
+usec_to_ms(){ # $1 = a systemd time span as `systemctl show` renders it (15s · 100ms · 2min 30s · 0 ·
+  # infinity) → integer MILLISECONDS on stdout, or NOTHING when it is absent/zero/unbounded/unparseable.
+  # Empty output is the honest "no floor" — the caller must render `na`, never substitute a number.
+  local v="$1" ms=0 hit=0 sub=0 n u tok
+  [ -n "$v" ] || return 1
+  # redundant with the digit-scrape below (neither word yields a leading digit, so both would return 1
+  # anyway) — kept because `infinity` is systemd's documented sentinel and a future edit to the scrape
+  # must not silently start accepting it. The `infinity` test arm asserts the OUTCOME, not this line.
+  case "$v" in infinity|infinite) return 1 ;; esac
+  for tok in $v; do   # `2min 30s`, `1h 5min`, `100ms`, `15s`, `500us`, `0`
+    n="$(printf '%s' "$tok" | sed -n 's/^\([0-9][0-9]*\).*$/\1/p')"
+    u="$(printf '%s' "$tok" | sed -n 's/^[0-9][0-9]*//p')"
+    [ -n "$n" ] || continue
+    case "$u" in
+      us|usec) ms=$(( ms + n / 1000 )); [ "$n" -gt 0 ] && sub=1 ;;
+      ms|msec) ms=$(( ms + n )) ;;
+      ''|s|sec) ms=$(( ms + n * 1000 )) ;;
+      m|min)   ms=$(( ms + n * 60000 )) ;;
+      h|hr)    ms=$(( ms + n * 3600000 )) ;;
+      d|day)   ms=$(( ms + n * 86400000 )) ;;
+      *) continue ;;
+    esac
+    hit=1
+  done
+  [ "$hit" = 1 ] || return 1
+  # a SUB-MILLISECOND floor (RestartUSec=500us) is a real floor of ~0, not an absent one — round it up
+  # to 1ms so the unit still grades instead of going blind. A literal `0` is systemd for "no delay",
+  # which is not a measurable floor at all: reject it.
+  [ "$ms" -gt 0 ] || { [ "$sub" = 1 ] && ms=1 || return 1; }
+  printf '%s' "$ms"
+}
+
+# BAND_RULE is printed WITH every verdict — a band whose criterion is not on the line beside it is a
+# word the reader has to trust. It is deliberately NOT the floor-ratio alone: RestartUSec's DEFAULT is
+# 100ms, so on a default-floor unit a genuine 3.7s-period loop divides out to a 37x ratio and would band
+# calm. Nor the raw period alone: with delta=1 the "period" IS the window (period = elapsed ÷ delta is
+# floor-censored at the window length), so a unit whose floor is near the 5m cadence can never show a
+# short period no matter how hard it loops. Three inputs, each covering the others' blind spot:
+#   ABSOLUTE period  — restarting at least once a minute is a loop whatever the floor says.
+#   FLOOR ratio      — a unit sitting at its own RestartUSec is a loop even at a slow absolute rate.
+#   STREAK           — consecutive churning passes; disambiguates the delta=1 window, where intensity
+#                      is unmeasurable, and keeps the floor-ratio arm from firing on a single sample.
+# Calibrated against this node's REAL corpus (~/.mesh/unit-churn.log, 202 lines / 2 units at the time of
+# writing), not invented edges: the plateau at +10/5m on a 15s floor (period 30s, 51 lines) is
+# mesh-phaedra-proxy restarting as fast as ConnectTimeout+RestartUSec allow, and the founding system
+# ollama.service case (+81/5m on a 3s floor, period 3.7s) sits deep inside the absolute arm — both LOOP.
+# The opposite mode, +1/5m on the same 15s floor (77 lines, period 300s, streak 1), is one reconnect
+# after an hour of healthy uptime and must NOT wear the same word. Any figure here is this corpus's
+# CURRENT answer and rots as the corpus turns over; the CLAIM is the gate — re-derive from the log's
+# period/floor/ratio/streak columns, which is why those columns are written.
+BAND_RULE="LOOP: period<=60s or (ratio<=3.0x and streak>=2) · BLIP: delta<=2 and period>=120s and streak=1 · else CHURN"
+
+band_says(){ # $1=band $2=delta → the plain-language clause the board carries. ONLY LOOP may say
+  # crash-loop; a +1 blip wearing that word is why this grading exists.
+  case "$1" in
+    LOOP)     printf 'crash-looping' ;;
+    CHURN)    printf 'restart-churning (elevated, NOT at the timer floor)' ;;
+    BLIP)     printf 'restarted %s time(s) — NOT a crash-loop, far above the timer floor' "$2" ;;
+    *)        printf 'restart counter rose; no usable interval and/or no RestartUSec floor — the intensity is UNKNOWN, not low' ;;
+  esac
+}
+
+grade(){ # $1=delta $2=elapsed_seconds(or empty) $3=floor_ms(or empty) $4=streak(consecutive churning passes)
+  # → `<TOKEN>\t<period>\t<floor>\t<ratio>\t<streak>`. NOT a raw count: +1 and +81 in one window are the
+  # SAME word without this, which is the defect it exists to end. See BAND_RULE above for why all three
+  # inputs are needed. UNGRADED whenever the interval is missing — never a fabricated band; a missing
+  # FLOOR alone still grades on the absolute arm (and says ratio=na), because losing RestartUSec must
+  # not take the sense blind to a 3-second loop.
+  local delta="$1" el="$2" fl="$3" st="$4" per_ms rx10 ratio band
+  printf '%s' "$st" | grep -qE '^[0-9]+$' || st=1
+  printf '%s' "$el" | grep -qE '^[0-9]+$' || { printf 'UNGRADED\tna\tna\tna\t%s' "$st"; return; }
+  [ "$el" -ge 1 ] && [ "$delta" -ge 1 ] || { printf 'UNGRADED\tna\tna\tna\t%s' "$st"; return; }
+  per_ms=$(( el * 1000 / delta ))
+  rx10=""; ratio=na
+  if printf '%s' "$fl" | grep -qE '^[0-9]+$' && [ "$fl" -gt 0 ]; then
+    rx10=$(( per_ms * 10 / fl )); ratio="$(( rx10 / 10 )).$(( rx10 % 10 ))x"
+  fi
+  if   [ "$per_ms" -le 60000 ];                                         then band=LOOP
+  elif [ -n "$rx10" ] && [ "$rx10" -le 30 ] && [ "$st" -ge 2 ];         then band=LOOP
+  elif [ "$delta" -le 2 ] && [ "$per_ms" -ge 120000 ] && [ "$st" = 1 ]; then band=BLIP
+  else                                                                       band=CHURN
+  fi
+  printf '%s\t%sms\t%s\t%s\t%s' "$band" "$per_ms" "$(if [ -n "$rx10" ]; then printf '%sms' "$fl"; else printf na; fi)" "$ratio" "$st"
 }
 
 board_debounced(){ # $1=unit → exit 0 (true) if the SAME unit hit the board within DEBOUNCE_MIN (suppress
@@ -140,7 +245,7 @@ board_debounced(){ # $1=unit → exit 0 (true) if the SAME unit hit the board wi
 }
 
 pass(){ # one delta pass; echoes churn summary lines; sets PASS_TOKEN/PASS_NEW/PASS_BLIND. $1=--check → no writes.
-  local checkonly="${1:-}" raw units now unit rs nr base churned nunit over mgr key seen
+  local checkonly="${1:-}" raw units now unit rs nr ru base bepoch pstreak nstreak churned nunit over mgr key seen gr
   now="$(date +%s)"
   mkdir -p "$STATE_DIR"
   churned=""; PASS_BLIND=""; seen=0
@@ -157,21 +262,36 @@ pass(){ # one delta pass; echoes churn summary lines; sets PASS_TOKEN/PASS_NEW/P
       continue
     fi
     seen=$(( seen + 1 ))
-    while IFS=$'\t' read -r unit rs nr; do
+    while IFS=$'\t' read -r unit rs nr ru; do
       [ -n "$unit" ] || continue
       # only self-healing units hide a crash-loop behind `active`; Restart=no dies visibly (--failed).
       [ -n "$rs" ] && [ "$rs" != no ] || continue
       printf '%s' "$nr" | grep -qE '^[0-9]+$' || nr=0
       key="$mgr/$unit"                       # manager-qualified: the two ollama.service units are DISTINCT keys
       base="$(awk -F'\t' -v u="$key" '$1==u{print $2}' "$BASELINE" 2>/dev/null | tail -1)"
+      # the baseline row's EPOCH is the previous pass's clock — the delta's REAL interval. Never the
+      # nominal cadence: a missed/late tick makes the two differ, and a rate over an assumed 300s that
+      # actually spanned 900s reports a burst three times sharper than the one that happened.
+      bepoch="$(awk -F'\t' -v u="$key" '$1==u{print $3}' "$BASELINE" 2>/dev/null | tail -1)"
+      # STREAK = consecutive passes this key has churned, carried in the baseline row's 4th field (no
+      # second state file to fall out of sync). A pass in which the unit does NOT churn resets it to 0,
+      # so `streak` counts an unbroken run, never a lifetime total. An old 3-field row reads as 0 ⇒ the
+      # first pass after an upgrade is streak=1, i.e. treated as a fresh churn — conservative, never a
+      # LOOP claimed on a history this file does not actually have.
+      pstreak="$(awk -F'\t' -v u="$key" '$1==u{print $4}' "$BASELINE" 2>/dev/null | tail -1)"
+      printf '%s' "$pstreak" | grep -qE '^[0-9]+$' || pstreak=0
+      nstreak=0
       if printf '%s' "$base" | grep -qE '^[0-9]+$'; then
         if [ "$nr" -lt "$base" ]; then
           :                                  # counter RESET → re-baseline (below), never alarm
         elif [ "$nr" -gt "$base" ]; then
-          churned="$churned$key"$'\t'"$(( nr - base ))"$'\t'"$base"$'\t'"$nr"$'\t'"$mgr"$'\n'
+          gr=""
+          printf '%s' "$bepoch" | grep -qE '^[0-9]+$' && [ "$now" -ge "$bepoch" ] && gr="$(( now - bepoch ))"
+          nstreak=$(( pstreak + 1 ))
+          churned="$churned$key"$'\t'"$(( nr - base ))"$'\t'"$base"$'\t'"$nr"$'\t'"$mgr"$'\t'"$(grade "$(( nr - base ))" "$gr" "$(usec_to_ms "$ru" || true)" "$nstreak")"$'\n'
         fi
       fi                                     # else first sight → baseline only (below), no event
-      printf '%s\t%s\t%s\n' "$key" "$nr" "$now" >> "$BASELINE.tmp"
+      printf '%s\t%s\t%s\t%s\n' "$key" "$nr" "$now" "$nstreak" >> "$BASELINE.tmp"
     done <<EOF
 $units
 EOF
@@ -185,24 +305,32 @@ EOF
   # `churned` is built by appending `<line>\n` per churning unit → it ends in a newline (or is empty).
   # Do NOT round-trip it through $(...) — that strips the trailing newline and `while read` then drops
   # the last (often only) line. Keep it verbatim.
-  if [ -z "$churned" ]; then PASS_TOKEN=QUIET; PASS_NEW=0; return 0; fi
+  if [ -z "$churned" ]; then PASS_TOKEN=QUIET; PASS_NEW=0; PASS_WORST=na; PASS_UNGRADED=0; return 0; fi
   nunit="$(printf '%s' "$churned" | grep -c .)"
   PASS_NEW="$nunit"; PASS_TOKEN=CHURN
+  # worst = the most severe GRADED band this pass; UNGRADED is counted SEPARATELY, never folded in as a
+  # low band — "we could not measure the intensity" is not "the intensity was low" (missing evidence
+  # renders na, never calm). A pass with only ungraded churn reports worst=na ungraded=N.
+  PASS_WORST="$(printf '%s' "$churned" | awk -F'\t' '
+    $6=="LOOP"{l=1} $6=="CHURN"{c=1} $6=="BLIP"{b=1}
+    END{ print l?"LOOP":(c?"CHURN":(b?"BLIP":"na")) }')"
+  PASS_UNGRADED="$(printf '%s' "$churned" | awk -F'\t' '$6=="UNGRADED"{n++} END{print n+0}')"
   # LOG the complete record FIRST (unit-churn.log never loses a churn line).
-  printf '%s' "$churned" | while IFS=$'\t' read -r key delta base cur mgr; do
+  printf '%s' "$churned" | while IFS=$'\t' read -r key delta base cur mgr band period floor ratio streak; do
     [ -n "$key" ] || continue
-    printf '%s unit-churn %s +%s (NRestarts %s->%s, %s manager)\n' "$(date -u +%FT%TZ)" "$key" "$delta" "$base" "$cur" "$mgr" >> "$LOG" 2>/dev/null || true
+    printf '%s unit-churn %s +%s (NRestarts %s->%s, %s manager) %s period=%s floor=%s ratio=%s streak=%s\n' \
+      "$(date -u +%FT%TZ)" "$key" "$delta" "$base" "$cur" "$mgr" "$band" "$period" "$floor" "$ratio" "$streak" >> "$LOG" 2>/dev/null || true
   done
   # ≤3 board lines per pass; same-unit flood debounced across passes; distinct unit boards fresh.
-  printf '%s' "$churned" | head -3 | while IFS=$'\t' read -r key delta base cur mgr; do
+  printf '%s' "$churned" | head -3 | while IFS=$'\t' read -r key delta base cur mgr band period floor ratio streak; do
     [ -n "$key" ] || continue
-    msg="[unit-churn] $key: +$delta restart(s)/$WINDOW (NRestarts $base->$cur — $mgr manager; Restart=always crash-loop reads 'active' between crashes, invisible to systemctl --failed)"
+    msg="[unit-churn] $key: $band ($(band_says "$band" "$delta")) +$delta restart(s)/$WINDOW period=$period floor=$floor ratio=$ratio streak=$streak [$BAND_RULE] (NRestarts $base->$cur — $mgr manager; a Restart!=no unit reads 'active' between restarts, invisible to systemctl --failed)"
     if board_debounced "$key"; then
       echo "$msg (board-debounced <${DEBOUNCE_MIN}m)"
     else
       echo "$msg"
       if [ "$CHAT" = 1 ] && command -v mesh-chat >/dev/null 2>&1; then
-        MESH_WHO="unit-churn@$(hostname)" mesh-chat "[unit-churn] $key crash-looping: +$delta restart(s) in the last $WINDOW (NRestarts $base->$cur) on $(hostname) — name is MANAGER-QUALIFIED ($mgr): a unit Id is unique only within its manager, so a healthy twin of the same name can exist in the other scope. Read it back with 'systemctl --$mgr status $(printf '%s' "$key" | cut -d/ -f2-)'; full record ~/.mesh/unit-churn.log" >/dev/null 2>&1 || true
+        MESH_WHO="unit-churn@$(hostname)" mesh-chat "[unit-churn] $key $band $(band_says "$band" "$delta"): +$delta restart(s) in the last $WINDOW (NRestarts $base->$cur) on $(hostname) — GRADE is period÷floor, not the count: mean restart period=$period over the MEASURED interval, this unit's own RestartUSec floor=$floor ⇒ ratio=$ratio, consecutive churning passes streak=$streak ($BAND_RULE). The floor is a LOWER bound on the real cycle (it excludes the unit's own time-to-fail), so ratio is an UPPER bound on distance-from-saturation: LOOP is conservative, and a LOOP at ratio 2x may already be as fast as this unit can physically restart. Name is MANAGER-QUALIFIED ($mgr): a unit Id is unique only within its manager, so a healthy twin of the same name can exist in the other scope. Read it back with 'systemctl --$mgr status $(printf '%s' "$key" | cut -d/ -f2-)'; full record ~/.mesh/unit-churn.log" >/dev/null 2>&1 || true
       fi
     fi
   done
@@ -220,10 +348,12 @@ EOF
   return 0
 }
 
-# line 1 grammar for consumers: `<CHURN|QUIET|BLIND> <utc> new=<n> blind=<none|user|system|user,system>`
-# — field 1 token unchanged; `blind=` NAMES which manager could not be read, so a half-blind pass is
-# never read as full coverage.
-write_state(){ printf '%s %s new=%s blind=%s\n' "$1" "$(date -u +%FT%TZ)" "${2:-0}" "${3:-none}" > "$STATE"; }
+# line 1 grammar for consumers: `<CHURN|QUIET|BLIND> <utc> new=<n> blind=<none|user|system|user,system>
+# worst=<LOOP|CHURN|BLIP|na> ungraded=<n>` — field 1 token unchanged and the two new keys are APPENDED,
+# so an older reader keeps parsing. `blind=` NAMES which manager could not be read, so a half-blind pass
+# is never read as full coverage; `worst=` is the most severe GRADED band and `ungraded=` counts the
+# churns whose intensity could not be measured (they are NOT silently graded low).
+write_state(){ printf '%s %s new=%s blind=%s worst=%s ungraded=%s\n' "$1" "$(date -u +%FT%TZ)" "${2:-0}" "${3:-none}" "${4:-na}" "${5:-0}" > "$STATE"; }
 
 if [ "${1:-}" = --test ]; then
   command -v awk >/dev/null 2>&1 || { echo "smoke-test: FAIL (no awk)"; exit 1; }
@@ -242,9 +372,17 @@ if [ "${1:-}" = --test ]; then
   done
 
   _mk(){ # write a one-unit `systemctl show` fixture block: _mk FILE ID RESTART NRESTARTS [ID2 R2 N2 ...]
+    # NO RestartUSec — these blocks deliberately model a floor-less read, so every band assertion below
+    # has to come from _mkf; if grading ever started inventing a floor, tests 1-12 would start banding.
     local f="$1"; shift; : > "$f"
     while [ $# -ge 3 ]; do
       printf 'Id=%s\nRestart=%s\nNRestarts=%s\n\n' "$1" "$2" "$3" >> "$f"; shift 3
+    done
+  }
+  _mkf(){ # same, WITH a RestartUSec floor: _mkf FILE ID RESTART NRESTARTS RESTARTUSEC [...]
+    local f="$1"; shift; : > "$f"
+    while [ $# -ge 4 ]; do
+      printf 'Id=%s\nRestart=%s\nNRestarts=%s\nRestartUSec=%s\n\n' "$1" "$2" "$3" "$4" >> "$f"; shift 4
     done
   }
   _td="$(mktemp -d)"; _fx="$_td/fx"
@@ -260,7 +398,7 @@ if [ "${1:-}" = --test ]; then
   _mk "$_fx" mesh-organ.service always 43
   out="$(env $_env "$0" 2>&1)"; rc=$?
   { [ "$rc" = 0 ] && [ "$(printf '%s\n' "$out" | grep -cF '[unit-churn]')" = 1 ] \
-      && printf '%s' "$out" | grep -qF 'user/mesh-organ.service: +3'; } \
+      && printf '%s' "$out" | grep -qE 'user/mesh-organ\.service: [A-Z]+ .*\+3 '; } \
     || { rm -rf "$_td"; echo "smoke-test: FAIL (delta +3 must board once naming the unit: rc=$rc out='$out')"; exit 1; }
 
   # 3) NO-REPLAY: unchanged rerun (still 43) → delta 0 → silent.
@@ -277,7 +415,7 @@ if [ "${1:-}" = --test ]; then
     || { rm -rf "$_td"; echo "smoke-test: FAIL (counter reset must NOT alarm: rc=$rc out='$out')"; exit 1; }
   _mk "$_fx" mesh-organ.service always 7
   out="$(env $_env "$0" 2>&1)"; rc=$?
-  { [ "$rc" = 0 ] && printf '%s' "$out" | grep -qF 'mesh-organ.service: +5'; } \
+  { [ "$rc" = 0 ] && printf '%s' "$out" | grep -qE 'mesh-organ\.service: [A-Z]+ .*\+5 '; } \
     || { rm -rf "$_td"; echo "smoke-test: FAIL (rise after reset must board +5 from the reset floor, not miss it: rc=$rc out='$out')"; exit 1; }
 
   # 5) RESTART=no is NOT watched: a Restart=no unit whose NRestarts jumps must NEVER board (it dies
@@ -338,7 +476,7 @@ if [ "${1:-}" = --test ]; then
   env $_senv "$0" >/dev/null 2>&1                     # baseline (first sight, never replayed)
   _mk "$_sfx" ollama.service always 62216
   out="$(env $_senv "$0" 2>&1)"; rc=$?
-  { [ "$rc" = 0 ] && printf '%s' "$out" | grep -qF 'system/ollama.service: +19'; } \
+  { [ "$rc" = 0 ] && printf '%s' "$out" | grep -qE 'system/ollama\.service: [A-Z]+ .*\+19 '; } \
     || { rm -rf "$_td" "$_sd"; echo "smoke-test: FAIL (system-manager churn must board as system/<unit>: rc=$rc out='$out')"; exit 1; }
   rm -rf "$_sd"
 
@@ -355,7 +493,7 @@ if [ "${1:-}" = --test ]; then
   _mk "$_cs" ollama.service always 107                # crash-loop twin: +7
   out="$(env $_cenv "$0" 2>&1)"; rc=$?
   { [ "$rc" = 0 ] && [ "$(printf '%s\n' "$out" | grep -cF '[unit-churn]')" = 1 ] \
-      && printf '%s' "$out" | grep -qF 'system/ollama.service: +7' \
+      && printf '%s' "$out" | grep -qE 'system/ollama\.service: [A-Z]+ .*\+7 ' \
       && ! printf '%s' "$out" | grep -qF 'user/ollama.service'; } \
     || { rm -rf "$_td" "$_cd"; echo "smoke-test: FAIL (collision: only the system twin may board, named: rc=$rc out='$out')"; exit 1; }
   rm -rf "$_cd"
@@ -376,7 +514,7 @@ if [ "${1:-}" = --test ]; then
     || { rm -rf "$_td" "$_pd"; echo "smoke-test: FAIL (partial blind must proceed, name the leg, hold its baseline: rc=$rc out='$out' state='$(cat "$_pd/.unit-churn-state" 2>/dev/null)' base='$(cat "$_pd/.unit-churn-baseline" 2>/dev/null)')"; exit 1; }
   _mk "$_ps" b.service always 50                      # leg returns: the rise is measured from the HELD baseline
   out="$(env $_penv "$0" 2>&1)"; rc=$?
-  { [ "$rc" = 0 ] && printf '%s' "$out" | grep -qF 'system/b.service: +40'; } \
+  { [ "$rc" = 0 ] && printf '%s' "$out" | grep -qE 'system/b\.service: [A-Z]+ .*\+40 '; } \
     || { rm -rf "$_td" "$_pd"; echo "smoke-test: FAIL (churn across a blind window must be caught from the held baseline: rc=$rc out='$out')"; exit 1; }
   rm -rf "$_pd"
 
@@ -392,8 +530,132 @@ if [ "${1:-}" = --test ]; then
     || { rm -rf "$_td" "$_ld"; echo "smoke-test: FAIL (a live pass must baseline BOTH managers: rc=$rc user=$(grep -c '^user/' "$_ld/.unit-churn-baseline" 2>/dev/null) system=$(grep -c '^system/' "$_ld/.unit-churn-baseline" 2>/dev/null))"; exit 1; }
   rm -rf "$_ld"
 
+  # 13) GRADING — the SAME delta must land in DIFFERENT bands purely by the interval it spanned, and a
+  # +1 must never wear the crash-loop word. The interval is synthesized by writing the baseline row's
+  # epoch directly (the tool reads `now - that epoch`), so this asserts the real code path, not a stub.
+  # RED-first, both directions, both driven: band the verdict on `delta` instead of the ratio and the
+  # BLIP arm reds; drop the `case` in band_says so every band says crash-looping and the no-crash-loop
+  # assert reds.
+  _gd="$(mktemp -d)"; _gfx="$_gd/fx"
+  _genv="MESH_STATE_DIR=$_gd MESH_UNIT_CHURN_SRC=$_gfx MESH_UNIT_CHURN_CHAT=0 MESH_UNIT_CHURN_DEBOUNCE_MIN=0"
+  _seed(){ # $1=NRestarts baseline, $2=seconds ago → one baseline row for user/px.service
+    printf 'user/px.service\t%s\t%s\n' "$1" "$(( $(date +%s) - $2 ))" > "$_gd/.unit-churn-baseline"; }
+  mkdir -p "$_gd"
+  # a) +1 over 300s on a 15s floor ⇒ period 300s, ratio 20.0x ⇒ BLIP, and the words `crash-loop` must
+  #    NOT appear. This is the exact live line that motivated the fix.
+  _seed 100 300; _mkf "$_gfx" px.service always 101 15s
+  out="$(env $_genv "$0" 2>&1)"; rc=$?
+  # the negative asserts the CLAIM form `(crash-looping)`, never the bare substring — the BLIP clause
+  # itself contains the words "NOT a crash-loop", so a substring scan here would turn a correct denial
+  # into a failure (and, mutated the other way, read a denial as the claim).
+  { [ "$rc" = 0 ] && printf '%s' "$out" | grep -qF 'BLIP (' && printf '%s' "$out" | grep -qF ' +1 restart(s)' \
+      && printf '%s' "$out" | grep -qF 'ratio=20.0x' && printf '%s' "$out" | grep -qF 'NOT a crash-loop' \
+      && ! printf '%s' "$out" | grep -qF '(crash-looping)'; } \
+    || { rm -rf "$_td" "$_gd"; echo "smoke-test: FAIL (+1/300s on a 15s floor must be BLIP at 20.0x and must not claim crash-looping: rc=$rc out='$out')"; exit 1; }
+  # b) +10 over the SAME 300s on the SAME floor ⇒ period 30s, ratio 2.0x ⇒ LOOP (the saturation plateau).
+  _seed 100 300; _mkf "$_gfx" px.service always 110 15s
+  out="$(env $_genv "$0" 2>&1)"; rc=$?
+  { [ "$rc" = 0 ] && printf '%s' "$out" | grep -qF 'LOOP (crash-looping)' && printf '%s' "$out" | grep -qF ' +10 restart(s)' \
+      && printf '%s' "$out" | grep -qF 'ratio=2.0x'; } \
+    || { rm -rf "$_td" "$_gd"; echo "smoke-test: FAIL (+10/300s on a 15s floor must be LOOP at 2.0x and SAY crash-looping: rc=$rc out='$out')"; exit 1; }
+  # c) SAME delta, DIFFERENT interval: +10 over 10800s ⇒ period 1080s ⇒ CHURN, not LOOP. Proves the
+  #    band comes from the MEASURED interval, not the count — a nominal-cadence denominator says LOOP.
+  _seed 100 10800; _mkf "$_gfx" px.service always 110 15s
+  out="$(env $_genv "$0" 2>&1)"; rc=$?
+  { [ "$rc" = 0 ] && printf '%s' "$out" | grep -qE 'CHURN \(.*\+10 restart' && ! printf '%s' "$out" | grep -qF '(crash-looping)'; } \
+    || { rm -rf "$_td" "$_gd"; echo "smoke-test: FAIL (+10 spread over 3h must be CHURN, not LOOP — the interval must be measured, not assumed: rc=$rc out='$out')"; exit 1; }
+  # d) NO floor readable ⇒ ratio=na floor=na, but STILL GRADED on the absolute arm. RED-first: gate the
+  #    whole grade on a present floor (the first draft did) and this reds — losing RestartUSec must not
+  #    take the sense blind to a 3-second loop, which is precisely the founding ollama case.
+  _seed 100 300; _mk "$_gfx" px.service always 110
+  out="$(env $_genv "$0" 2>&1)"; rc=$?
+  { [ "$rc" = 0 ] && printf '%s' "$out" | grep -qE 'LOOP \(.*\+10 restart' && printf '%s' "$out" | grep -qF 'floor=na' \
+      && printf '%s' "$out" | grep -qF 'ratio=na'; } \
+    || { rm -rf "$_td" "$_gd"; echo "smoke-test: FAIL (a missing RestartUSec must still grade on the absolute arm, floor=na ratio=na: rc=$rc out='$out')"; exit 1; }
+  # d2) NO usable INTERVAL (a legacy 2-field baseline row: key + counter, no epoch) ⇒ UNGRADED, counted
+  #     separately in the state, and NEVER banded — "the intensity is unmeasured" is not "it was low".
+  printf 'user/px.service\t100\n' > "$_gd/.unit-churn-baseline"
+  _mkf "$_gfx" px.service always 110 15s
+  out="$(env $_genv "$0" 2>&1)"; rc=$?
+  { [ "$rc" = 0 ] && printf '%s' "$out" | grep -qE 'UNGRADED \(.*\+10 restart' && printf '%s' "$out" | grep -qF 'period=na' \
+      && grep -qF 'ungraded=1' "$_gd/.unit-churn-state" && grep -qF 'worst=na' "$_gd/.unit-churn-state"; } \
+    || { rm -rf "$_td" "$_gd"; echo "smoke-test: FAIL (no interval must render UNGRADED + ungraded=1/worst=na, never a band: rc=$rc out='$out' state='$(cat "$_gd/.unit-churn-state" 2>/dev/null)')"; exit 1; }
+  # e) `infinity` and a literal `0` are NOT floors (unbounded / no-delay) ⇒ floor=na ratio=na, absolute
+  #    arm still grades. A sub-ms `500us` IS a floor and must NOT read as absent.
+  for _bad in infinity 0; do
+    _seed 100 300; _mkf "$_gfx" px.service always 110 "$_bad"
+    out="$(env $_genv "$0" 2>&1)"; rc=$?
+    { [ "$rc" = 0 ] && printf '%s' "$out" | grep -qF 'floor=na' && printf '%s' "$out" | grep -qF 'ratio=na'; } \
+      || { rm -rf "$_td" "$_gd"; echo "smoke-test: FAIL (RestartUSec=$_bad must render floor=na: rc=$rc out='$out')"; exit 1; }
+  done
+  # f) the span parser reaches the LINE, not just the band: the rendered floor must be the parsed value.
+  _seed 100 300; _mkf "$_gfx" px.service always 110 100ms
+  out="$(env $_genv "$0" 2>&1)"; rc=$?
+  { [ "$rc" = 0 ] && printf '%s' "$out" | grep -qF 'floor=100ms'; } \
+    || { rm -rf "$_td" "$_gd"; echo "smoke-test: FAIL (a 100ms floor must render floor=100ms: rc=$rc out='$out')"; exit 1; }
+  _seed 100 300; _mkf "$_gfx" px.service always 110 "2min 30s"
+  out="$(env $_genv "$0" 2>&1)"; rc=$?
+  { [ "$rc" = 0 ] && printf '%s' "$out" | grep -qF 'floor=150000ms'; } \
+    || { rm -rf "$_td" "$_gd"; echo "smoke-test: FAIL (multi-token span '2min 30s' must render floor=150000ms: rc=$rc out='$out')"; exit 1; }
+  # f2) STREAK — the arm that covers the period criterion's blind spot. A unit whose RestartUSec (5min)
+  #     is near the cadence can NEVER show a short period: delta is 0 or 1 per window by construction,
+  #     so period is floor-censored at the window length however hard it loops. +1 over 330s on a 300s
+  #     floor is ratio 1.1x — at the timer floor — and must read BLIP on ONE sample (a single window
+  #     cannot tell it from a lone reconnect) and LOOP once it REPEATS. RED-first, both ends: drop the
+  #     `streak>=2` requirement and pass 1 reds; drop the streak carry-forward and pass 2 reds.
+  _sk="$(mktemp -d)"; _skfx="$_sk/fx"
+  _skenv="MESH_STATE_DIR=$_sk MESH_UNIT_CHURN_SRC=$_skfx MESH_UNIT_CHURN_CHAT=0 MESH_UNIT_CHURN_DEBOUNCE_MIN=0"
+  printf 'user/slow.service\t100\t%s\t0\n' "$(( $(date +%s) - 330 ))" > "$_sk/.unit-churn-baseline"
+  _mkf "$_skfx" slow.service always 101 5min
+  out="$(env $_skenv "$0" 2>&1)"; rc=$?
+  { [ "$rc" = 0 ] && printf '%s' "$out" | grep -qE 'BLIP \(.*\+1 restart' && printf '%s' "$out" | grep -qF 'streak=1'; } \
+    || { rm -rf "$_td" "$_gd" "$_sk"; echo "smoke-test: FAIL (at-the-floor churn on ONE sample must be BLIP streak=1, not LOOP: rc=$rc out='$out')"; exit 1; }
+  # rewind the epoch the pass just wrote (keeping the streak it earned) and churn again: streak 2 ⇒ LOOP
+  awk -F'\t' -v OFS='\t' -v e="$(( $(date +%s) - 330 ))" '{$3=e; print}' "$_sk/.unit-churn-baseline" > "$_sk/b.tmp" && mv "$_sk/b.tmp" "$_sk/.unit-churn-baseline"
+  _mkf "$_skfx" slow.service always 102 5min
+  out="$(env $_skenv "$0" 2>&1)"; rc=$?
+  { [ "$rc" = 0 ] && printf '%s' "$out" | grep -qF 'LOOP (crash-looping)' && printf '%s' "$out" | grep -qF 'streak=2' \
+      && grep -qF 'worst=LOOP' "$_sk/.unit-churn-state"; } \
+    || { rm -rf "$_td" "$_gd" "$_sk"; echo "smoke-test: FAIL (a REPEATED at-the-floor churn must reach LOOP at streak=2: rc=$rc out='$out' state='$(cat "$_sk/.unit-churn-state" 2>/dev/null)')"; exit 1; }
+  # and a NON-churning pass must RESET the streak — otherwise it is a lifetime total wearing the word
+  # "consecutive", and one old flap would band every later blip as a loop.
+  out="$(env $_skenv "$0" 2>&1)"                       # same counter ⇒ no churn
+  awk -F'\t' -v OFS='\t' -v e="$(( $(date +%s) - 330 ))" '{$3=e; print}' "$_sk/.unit-churn-baseline" > "$_sk/b.tmp" && mv "$_sk/b.tmp" "$_sk/.unit-churn-baseline"
+  _mkf "$_skfx" slow.service always 103 5min
+  out="$(env $_skenv "$0" 2>&1)"; rc=$?
+  { [ "$rc" = 0 ] && printf '%s' "$out" | grep -qF 'streak=1' && ! printf '%s' "$out" | grep -qF '(crash-looping)'; } \
+    || { rm -rf "$_td" "$_gd" "$_sk"; echo "smoke-test: FAIL (a quiet pass must reset the streak to 0 so the next churn is streak=1: rc=$rc out='$out')"; exit 1; }
+  rm -rf "$_sk"
+
+  # h) usec_to_ms CONTRACT, asserted directly — the band fixtures above only reach it through grade(),
+  #     which re-guards `floor > 0` itself, so a broken accept inside the parser is masked by the second
+  #     guard and mutating it survives the suite. A parser gets its own table.
+  while IFS='|' read -r _span _want; do
+    _got="$(usec_to_ms "$_span" || true)"
+    [ "$_got" = "$_want" ] || { rm -rf "$_td" "$_gd"; echo "smoke-test: FAIL (usec_to_ms '$_span' → '$_got', want '$_want')"; exit 1; }
+  done <<'SPANS'
+15s|15000
+100ms|100
+2s|2000
+1min 30s|90000
+1h 5min|3900000
+500us|1
+0|
+infinity|
+|
+banana|
+SPANS
+
+  # g) the LIVE read must actually carry the floor — a fixture-only proof would survive dropping
+  #    RestartUSec from the real `systemctl show` property list, which is the whole new read.
+  for _lg in user system; do
+    read_leg "$_lg" 2>/dev/null | parse_units | awk -F'\t' '$2!="no" && $2!="" && $4!=""{f=1} END{exit f?0:1}' \
+      || { rm -rf "$_td" "$_gd"; echo "smoke-test: FAIL (live $_lg read yields no RestartUSec on any watched unit — grading would be permanently UNGRADED here)"; exit 1; }
+  done
+  rm -rf "$_gd"
+
   rm -rf "$_td"
-  echo "smoke-test: ok (real user+system reads + Restart!=no live · first-sight/delta/no-replay/reset-rebaseline/restart-no/BLIND/distinct-overflow/debounce/system-leg/name-collision/partial-blind fixtures + live both-manager coverage)"; exit 0
+  echo "smoke-test: ok (real user+system reads + Restart!=no + live RestartUSec · first-sight/delta/no-replay/reset-rebaseline/restart-no/BLIND/distinct-overflow/debounce/system-leg/name-collision/partial-blind/grading-bands fixtures + live both-manager coverage)"; exit 0
 fi
 
 if [ "${1:-}" = --status ]; then
@@ -416,7 +678,7 @@ if [ "$prc" = 2 ]; then
   exit 2
 fi
 [ -n "${PASS_BLIND:-}" ] && echo "unit-churn: PARTIAL — ${PASS_BLIND} manager leg BLIND this pass (baseline held)" >&2
-write_state "$PASS_TOKEN" "$PASS_NEW" "${PASS_BLIND:-none}"
+write_state "$PASS_TOKEN" "$PASS_NEW" "${PASS_BLIND:-none}" "${PASS_WORST:-na}" "${PASS_UNGRADED:-0}"
 command -v mesh-state-touch >/dev/null 2>&1 && mesh-state-touch "$STATE" >/dev/null 2>&1 || true
 [ "$PASS_TOKEN" = QUIET ] && echo "unit-churn: QUIET (no restart-counter delta this pass)"
 exit 0
