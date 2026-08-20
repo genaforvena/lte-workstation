@@ -155,6 +155,67 @@ wedge_empty() {
   { [ "${1:-0}" -eq 0 ] && [ "${2:-0}" -eq 0 ] && [ "${3:-no}" = yes ]; } 2>/dev/null && echo WEDGE || echo EMPTY
 }
 
+# --- unlocked-collision detector (2026-08-20, board task
+#     mesh-presence-has-no-defense-against-a-scanner-that-skips-its-lock) ---
+# presence.scan.lock only serializes scanners that TAKE it. A scanner that never does (bt-census did
+# exactly this for weeks, 6b31aa7) collides anyway: BlueZ ref-counts one discovery session per
+# adapter, so the other client's scan-off blanks the RSSI cache mid-query and we render the
+# documented "clean-but-empty result that masquerades as 0 devices in range" — with NO marker, as a
+# normal low count. No lock defends against a process that skips it, so the defense must be a
+# DETECTOR, and there is one that needs no cooperation: a lock-abiding scanner CANNOT be discovering
+# while we hold the lock and have not started our own session yet, so Adapter1.Discovering=yes at
+# that instant is a foreign session BY CONSTRUCTION.
+# It is sampled REPEATEDLY because a prior holder's StopDiscovery drains asynchronously (what the
+# 0.4s settle exists for): a drain stops within the settle, a live foreign scan does not. One 'no'
+# is enough to acquit — the alarm has to be rare and loud, not a second name for the handoff race.
+adapter_discovering() {   # → yes | no | unknown (unknown = the adapter could not be read at all)
+  local v
+  v="$(bluetoothctl show 2>/dev/null | sed -nE 's/.*Discovering:[[:space:]]*(yes|no).*/\1/p' | head -1)"
+  printf '%s\n' "${v:-unknown}"
+}
+
+# foreign_scan_detected [samples] [gap] → yes|no. yes ONLY when every sample says discovering; the
+# first 'no' returns immediately, so a clean run pays exactly one adapter read and a detected
+# collision costs (samples-1)*gap. 'unknown' is not 'yes' — an unreadable adapter accuses nobody.
+foreign_scan_detected() {
+  local samples="${1:-3}" gap="${2:-0.5}" i=0
+  while [ "$i" -lt "$samples" ]; do
+    [ "$(adapter_discovering)" = yes ] || { echo no; return; }
+    i=$((i+1))
+    [ "$i" -lt "$samples" ] && sleep "$gap"
+  done
+  echo yes
+}
+
+# collision_verdict <collided:yes|no> <n> <last_n> → CLEAN | MARKED | SUSPECT
+# A collision does not make every reading worthless — it makes an UNDERCOUNT indistinguishable from a
+# real drop, and it is the DROP that poisons presence-fuse/perimeter/situation with a false all-clear:
+#   collided + n=0                → SUSPECT (never an authoritative empty)
+#   collided + n at most half the last good reading → SUSPECT (a collapse within one tick)
+#   collided + a plausible count  → MARKED  (published, carrying collided=yes — a possible undercount
+#                                  is still evidence, and darkening the sense on EVERY foreign scan
+#                                  trades a false calm for blindness, which is not an improvement)
+#   not collided                  → CLEAN
+# last_n<=0 (no prior good reading) cannot support a drop claim: with n>0 that is MARKED, never
+# SUSPECT — an absent baseline must not manufacture the alarm.
+collision_verdict() {
+  local collided="${1:-no}" n="${2:-0}" last="${3:-0}"
+  [ "$collided" = yes ] || { echo CLEAN; return; }
+  [ "${n:-0}" -eq 0 ] 2>/dev/null && { echo SUSPECT; return; }
+  { [ "${last:-0}" -gt 0 ] && [ $(( n * 2 )) -le "$last" ]; } 2>/dev/null && { echo SUSPECT; return; }
+  echo MARKED
+}
+
+# last_logged_n [logfile] → n= of the most recent NON-degraded snapshot line, else 0. Degraded and
+# already-collided lines are skipped: comparing against an undercount would let one poisoned scan
+# license the next, and the drop would vanish exactly when the collision persists.
+last_logged_n() {
+  local f="${1:-${LOG:-}}" v
+  [ -n "$f" ] || { echo 0; return; }
+  v="$(grep -v 'SUSPECT\|BUSY\|collided=yes' "$f" 2>/dev/null | grep -oE ' n=[0-9]+' | tail -1 | tr -d ' n=')"
+  printf '%s\n' "${v:-0}"
+}
+
 # --- RSSI trend tracking ---
 # Rolling window of RSSI readings per MAC, stored in .presence-rssi-history.
 # Format: one line per MAC, "MAC|rss1,rss2,...,rssN|last_seen_epoch" (csv up to TREND_WINDOW entries;
@@ -797,7 +858,7 @@ emit_presence_json() {
   PDWELL="${pres_dwell_band:-}" PDWELLS="${pres_dwell_s:-}" PCHANGES24H="${pres_changes_24h:-}" \
   POCC="${occ_macro:-}" POCCCH="${occ_changes_24h:-}" POCCDW="${occ_dwell_s:-}" \
   PDEVICES="${device_lines:-}" \
-  PCOAL="${coalesced_age_s:-}" \
+  PCOAL="${coalesced_age_s:-}" PCOLLIDED="${COLLIDED:-no}" \
   python3 - <<'PY'
 import json, os
 
@@ -819,6 +880,7 @@ rec = {"status": status, "host": os.environ["PHOST"], "ts": os.environ["PTS"]}
 if os.environ.get("PREASON"):
     rec["reason"] = os.environ["PREASON"]
 rec["coalesced_age_s"] = i(os.environ.get("PCOAL"))   # None on a fresh scan; N on a replay
+rec["collided"] = os.environ.get("PCOLLIDED") == "yes"   # a lock-skipping foreign scanner was live
 rec["count"] = i(os.environ.get("PN"))
 rec["known"] = i(os.environ.get("PKNOWN"))
 if status == "ok":
@@ -1023,6 +1085,48 @@ if [ "${1:-}" = --test ]; then
   [ "$(wedge_empty 0 0 '')" = EMPTY ] || { echo "  FAIL: missing discovery flag should default EMPTY (don't cry wedge on a read glitch)"; _f=1; }
   [ "$(wedge_empty 0 3 yes)" = EMPTY ] || { echo "  FAIL: known>0 is the cache-race SUSPECT path, not WEDGE"; _f=1; }
   [ "$(wedge_empty 2 0 yes)" = EMPTY ] || { echo "  FAIL: n>0 means devices seen, never WEDGE"; _f=1; }
+  # --- unlocked-collision detector (a scanner that never takes presence.scan.lock) ---
+  # collision_verdict truth table. FALSIFIABLE both ways: delete the n=0 arm and the false all-clear
+  # comes back; delete the MARKED arm and every foreign scan darkens the sense instead of marking it.
+  [ "$(collision_verdict no  0 9)" = CLEAN ]   || { echo "  FAIL: no collision → CLEAN even at n=0 (the other gates own that case)"; _f=1; }
+  [ "$(collision_verdict yes 0 9)" = SUSPECT ] || { echo "  FAIL: collided + n=0 must never be an authoritative empty"; _f=1; }
+  [ "$(collision_verdict yes 0 0)" = SUSPECT ] || { echo "  FAIL: collided + n=0 is SUSPECT with or without a baseline"; _f=1; }
+  [ "$(collision_verdict yes 2 9)" = SUSPECT ] || { echo "  FAIL: collided + count collapsed vs last good (2 vs 9) must be SUSPECT"; _f=1; }
+  [ "$(collision_verdict yes 4 8)" = SUSPECT ] || { echo "  FAIL: exactly-halved (4 vs 8) is inside the drop band"; _f=1; }
+  [ "$(collision_verdict yes 5 9)" = MARKED ]  || { echo "  FAIL: collided + plausible count publishes MARKED, not degraded"; _f=1; }
+  [ "$(collision_verdict yes 3 0)" = MARKED ]  || { echo "  FAIL: no baseline cannot support a DROP claim — must be MARKED, never SUSPECT"; _f=1; }
+  # last_logged_n: the baseline must be a GOOD reading. A degraded/collided line as baseline would let
+  # one poisoned scan license the next, and the drop would vanish exactly while the collision persists.
+  _cvd="$(mktemp -d)"
+  printf '%s\n' \
+    '2026-08-20T10:00:00Z h n=9 devices=[a] attribution=personal:1,appliance:0,ambiguous:0' \
+    '2026-08-20T10:10:00Z h n=2 devices=[a] attribution=personal:1,appliance:0,ambiguous:0 collided=yes' \
+    '2026-08-20T10:20:00Z h n=0 SUSPECT known=5' > "$_cvd/log"
+  [ "$(last_logged_n "$_cvd/log")" = 9 ] || { echo "  FAIL: baseline must skip SUSPECT and collided= lines (got $(last_logged_n "$_cvd/log"))"; _f=1; }
+  [ "$(last_logged_n "$_cvd/nosuchfile")" = 0 ] || { echo "  FAIL: absent log must yield baseline 0 (no baseline), not an error"; _f=1; }
+  # foreign_scan_detected: EVERY sample must say discovering. A prior holder's async StopDiscovery
+  # drain shows one 'yes' then stops — that is the handoff race, not a foreign scanner, and calling it
+  # one would fire the alarm on our own predecessor at every */10 tick.
+  _fsd="$(mktemp -d)"; _fsdc="$_fsd/calls"
+  _fsd_stub() {  # <verdict-per-call...>  → a bluetoothctl whose Nth `show` answers the Nth word
+    { printf '#!/bin/sh\n'
+      printf 'n=$(cat "%s" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "%s"\n' "$_fsdc" "$_fsdc"
+      printf 'set -- %s\n' "$*"
+      printf 'eval v=\\$$n; [ -n "$v" ] || v=no\n'
+      printf 'printf "Powered: yes\\nDiscovering: %%s\\n" "$v"\n'; } > "$_fsd/bluetoothctl"
+    chmod +x "$_fsd/bluetoothctl"; rm -f "$_fsdc"
+  }
+  _fsd_stub yes yes yes
+  [ "$(PATH="$_fsd:$PATH" foreign_scan_detected 3 0)" = yes ] || { echo "  FAIL: adapter discovering across every sample is a foreign scan"; _f=1; }
+  _fsd_stub yes no yes
+  [ "$(PATH="$_fsd:$PATH" foreign_scan_detected 3 0)" = no ] || { echo "  FAIL: a DRAIN (yes then no) must acquit — it is the handoff race, not a lock-skipper"; _f=1; }
+  _fsd_stub no
+  [ "$(PATH="$_fsd:$PATH" foreign_scan_detected 3 0)" = no ] || { echo "  FAIL: a quiesced adapter is not a collision"; _f=1; }
+  [ "$(cat "$_fsdc" 2>/dev/null)" = 1 ] || { echo "  FAIL: the clean path must cost ONE adapter read, not $(cat "$_fsdc" 2>/dev/null)"; _f=1; }
+  printf '#!/bin/sh\nexit 1\n' > "$_fsd/bluetoothctl"; chmod +x "$_fsd/bluetoothctl"
+  [ "$(PATH="$_fsd:$PATH" adapter_discovering)" = unknown ] || { echo "  FAIL: an unreadable adapter is 'unknown'"; _f=1; }
+  [ "$(PATH="$_fsd:$PATH" foreign_scan_detected 3 0)" = no ] || { echo "  FAIL: an unreadable adapter must accuse NOBODY (unknown is not yes)"; _f=1; }
+  rm -rf "$_cvd" "$_fsd"
   # trend classifier assertions (FALSIFIABLE: change threshold → assertion fails)
   [ "$(classify_trend "-60,-55,-50,-45,-40")" = APPROACHING ] || { echo "  FAIL: improving RSSI should be APPROACHING"; _f=1; }
   [ "$(classify_trend "-40,-45,-50,-55,-60")" = RECEDING ] || { echo "  FAIL: degrading RSSI should be RECEDING"; _f=1; }
@@ -1699,6 +1803,11 @@ if try_coalesced_replay; then exit "${_crc:-0}"; fi
 # read 0 while raw bluetoothctl saw 6 devices; retry read 7). A short settle lets the handoff finish.
 sleep 0.4
 
+# Sample the adapter BEFORE our own StartDiscovery: anything discovering here skipped the lock we
+# are holding (see the unlocked-collision detector above). One read on the clean path.
+COLLIDED="$(foreign_scan_detected)"
+[ "$COLLIDED" = yes ] && echo "mesh-presence: FOREIGN SCAN — adapter already discovering while we hold presence.scan.lock; this reading may be a collision undercount" >&2
+
 # hold an active scan for WIN seconds via BlueZ's D-Bus API (StartDiscovery/StopDiscovery on
 # org.bluez.Adapter1) instead of an interactive `bluetoothctl` pipe. An interactive bluetoothctl
 # session (stdin held open for the scan window) auto-registers a default pairing agent, which flips
@@ -1764,6 +1873,19 @@ wait "$scanpid" 2>/dev/null || true
 # Qualify by the cache: if the adapter knew devices but NONE yielded a fresh RSSI, the signal was
 # cleared/out-of-range → SUSPECT, not authoritative-empty → emit a degraded reading and exit 3 (the
 # same "no reliable read" code as adapter-busy), never a faked empty. known==0 stays a confident EMPTY.
+CVERDICT="$(collision_verdict "${COLLIDED:-no}" "$n" "$(last_logged_n)")"
+_collided_field=""; [ "$CVERDICT" = MARKED ] && _collided_field=" collided=yes"
+if [ "$CVERDICT" = SUSPECT ]; then
+  _last_n="$(last_logged_n)"
+  if [ "$json_mode" = 1 ]; then
+    emit_presence_json suspect_collision "a scanner that skipped presence.scan.lock was discovering when this scan started; n=$n vs last good $_last_n — collision undercount, NOT an authoritative reading"
+  else
+    echo "=== mesh-presence $HOST @ $ts — SUSPECT(collision): a scanner that skipped presence.scan.lock was discovering when this scan started; n=$n vs last good $_last_n — collision undercount, NOT an authoritative reading ==="
+  fi
+  [ "$LOGIT" = 1 ] && echo "$ts $HOST n=$n SUSPECT-collision last_good_n=$_last_n" >> "$LOG"
+  exit 3
+fi
+
 if [ "$n" -eq 0 ] && [ "$(qualify_empty "$known")" = SUSPECT ]; then
   if [ "$json_mode" = 1 ]; then
     emit_presence_json suspect "0 of $known known device(s) gave a fresh RSSI (cache cleared by a concurrent scan OR all out-of-range)"
@@ -1800,7 +1922,11 @@ fi
 CACHEABLE=1
 sorted="$(printf '%s' "$rows" | sed '/^$/d' | sort -t'|' -k1 -rn)"
 if [ "$json_mode" = 0 ]; then
-  echo "=== mesh-presence $HOST @ $ts — $n device(s) in range (rssi|mac|name, closest first) ==="
+  if [ "$CVERDICT" = MARKED ]; then
+    echo "=== mesh-presence $HOST @ $ts — $n device(s) in range, COLLIDED (a scanner that skipped presence.scan.lock was discovering; possible undercount) (rssi|mac|name, closest first) ==="
+  else
+    echo "=== mesh-presence $HOST @ $ts — $n device(s) in range (rssi|mac|name, closest first) ==="
+  fi
   printf '%s\n' "$sorted" | sed '/^$/d'
 fi
 # NOTE: the --log append to presence.log is deferred to AFTER the attribution loop below,
@@ -1886,7 +2012,10 @@ prune_rssi_history "$TREND_FILE" "$NOW"
 # as a trailing additive field. n=/devices=[...] anchors are byte-identical to the old format.
 if [ "$LOGIT" = 1 ]; then
   devlist="$(printf '%s' "$sorted" | sed '/^$/d' | tr '\n' ' ' | sed 's/ $//')"
-  echo "$ts $HOST n=$n devices=[$devlist] attribution=personal:$attr_personal,appliance:$attr_appliance,ambiguous:$attr_ambiguous unidentified=public:$unid_public,random:$unid_random,unknown:$unid_unknown" >> "$LOG"
+  # MARKED (collided but plausible) rides as a trailing additive field — the same shape as
+  # attribution=: it never moves the n=/devices=[...] anchors every consumer parses, and it keeps this
+  # line OUT of last_logged_n's baseline so a possible undercount cannot become the reference.
+  echo "$ts $HOST n=$n devices=[$devlist] attribution=personal:$attr_personal,appliance:$attr_appliance,ambiguous:$attr_ambiguous unidentified=public:$unid_public,random:$unid_random,unknown:$unid_unknown${_collided_field:-}" >> "$LOG"
 fi
 
 summary_types=""
