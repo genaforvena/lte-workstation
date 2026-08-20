@@ -41,6 +41,7 @@ MESH_DIR="${MESH_DIR:-$HOME/.mesh}"
 BG_DIR="${MESH_BG_DIR:-$MESH_DIR/bg}"
 LOG="${MESH_BG_RETRY_LOG:-$MESH_DIR/bg-retry.log}"
 MAX_ATTEMPTS="${MESH_BG_RETRY_MAX_ATTEMPTS:-5}"
+FRESH_SECS="${MESH_BG_RETRY_FRESH_SECS:-3600}"   # a stranding this new is a LIVE failure, not backlog
 # Resolve mesh-bg-done ABSOLUTELY. cron's PATH is not a login shell's: the first wired run died
 # rc=127 on all three batches — "command not found", not a delivery failure — and, worse, charged
 # each one an attempt for it. A bare name here is a dependency on an environment this tool does not
@@ -75,11 +76,22 @@ _attempts() { # $1=batch
   printf '%s\n' "${n:-0}"
 }
 
-# every done-undelivered manifest with a DEAD pid, oldest-updated first (fairest drain order).
+# every done-undelivered manifest with a DEAD pid, in TWO TIERS.
+#
+# Plain oldest-first was wrong, and wrong in the direction that matters. It is the fair order for a
+# BACKLOG — nothing starves behind newer work — but it buries a LIVE failure. Measured: drop ee7f3fca
+# stranded at 11:10 on a DNS blip (curl rc=6) while 66 manifests from the previous 24 days sat ahead
+# of it; at 3 per 30min the operator would have waited ~11h for the render he made minutes ago, while
+# the lane shipped him grinds he had long forgotten. Age is not urgency: a fresh stranding is a live
+# delivery failure someone is waiting on, an old one is history.
+#
+# So: FRESH tier (stranded within BG_RETRY_FRESH_SECS) drains first, then the backlog. Oldest-first
+# INSIDE each tier, so the anti-starvation property still holds where it was actually doing work.
 _candidates() { # $1=window-filter(optional)
-  local win="${1:-}" root="$BG_DIR" f pid upd
+  local win="${1:-}" root="$BG_DIR" f pid upd now tier
   [ -n "$win" ] && root="$BG_DIR/$win"
   [ -d "$root" ] || return 0
+  now="$(date +%s)"
   while IFS= read -r f; do
     [ -r "$f" ] || continue
     [ "$(_mf_get "$f" status)" = done-undelivered ] || continue
@@ -87,8 +99,10 @@ _candidates() { # $1=window-filter(optional)
     # a live pid = delivery may still be in flight; re-firing on-done would DUPLICATE it.
     [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && continue
     upd="$(_mf_get "$f" updated)"
-    printf '%s\t%s\n' "${upd:-0}" "$f"
-  done < <(find "$root" -name '*.manifest' -type f 2>/dev/null) | sort -n | cut -f2-
+    # tier 0 = fresh (sorts first), tier 1 = backlog. Both then ordered by updated ascending.
+    tier=1; [ $(( now - ${upd:-0} )) -le "$FRESH_SECS" ] && tier=0
+    printf '%s\t%s\t%s\n' "$tier" "${upd:-0}" "$f"
+  done < <(find "$root" -name '*.manifest' -type f 2>/dev/null) | sort -k1,1n -k2,2n | cut -f3-
 }
 
 _report_line() { # $1=manifest
@@ -214,12 +228,18 @@ EOF
   #    has waited longest ships next, so a busy lane cannot starve the backlog behind it forever).
   #    updated= is pinned, not `date`: with ties the sort order is arbitrary and this leg passes or
   #    fails on which manifest find(1) happened to emit first — a flake wearing a verdict's clothes.
-  _mk cap1 done-undelivered "$deadpid" "true" 10
-  _mk cap2 done-undelivered "$deadpid" "true" 20
-  _run 1 w 1 >/dev/null 2>&1
-  local capped; capped=$(grep -lx 'status=delivered' "$BG_DIR/w/cap1.manifest" "$BG_DIR/w/cap2.manifest" 2>/dev/null | wc -l)
+  # Own window dir: earlier legs leave `failing` behind with updated=now, which lands in the FRESH
+  # tier and preempts whatever an ORDERING leg is trying to measure. An ordering assertion has to own
+  # its candidate set or it is measuring the leftovers.
+  mkdir -p "$BG_DIR/ord"
+  _mkw() { printf 'window=ord\nbatch=%s\ntarget=T\non-done=%s\nstatus=%s\npid=%s\nregistered=1\nupdated=%s\n' \
+             "$1" "$4" "$2" "$3" "$5" > "$BG_DIR/ord/$1.manifest"; }
+  _mkw cap1 done-undelivered "$deadpid" "true" 10
+  _mkw cap2 done-undelivered "$deadpid" "true" 20
+  _run 1 ord 1 >/dev/null 2>&1
+  local capped; capped=$(grep -lx 'status=delivered' "$BG_DIR/ord/cap1.manifest" "$BG_DIR/ord/cap2.manifest" 2>/dev/null | wc -l)
   [ "$capped" = 1 ] || { echo "bg-retry-test: FAIL (--max 1 settled $capped batches — the pace cap does not cap)"; rc=1; }
-  grep -qx 'status=delivered' "$BG_DIR/w/cap1.manifest" \
+  grep -qx 'status=delivered' "$BG_DIR/ord/cap1.manifest" \
     || { echo "bg-retry-test: FAIL (the capped run did not take the OLDEST stranded batch — the backlog can starve behind newer work)"; rc=1; }
 
   # 6. ATTEMPTS EXHAUST. The failing batch has burnt 1 attempt; drive it past MAX_ATTEMPTS=2 and it
@@ -231,6 +251,26 @@ EOF
     || { echo "bg-retry-test: FAIL (an exhausted batch was resolved rather than left blocking)"; rc=1; }
   [ "$(_attempts failing)" -le 3 ] \
     || { echo "bg-retry-test: FAIL (exhausted batch kept burning attempts: $(_attempts failing))"; rc=1; }
+
+  # 6b. A FRESH STRANDING BEATS THE BACKLOG. Oldest-first alone buried a live failure: drop ee7f3fca
+  #     stranded on a DNS blip with 66 manifests from the previous 24 days ahead of it, i.e. ~11h at
+  #     the wired pace before the operator got the render he had just made. Age is not urgency. One
+  #     ancient backlog entry + one stranded seconds ago, --max 1: the FRESH one must ship.
+  rm -f "$BG_DIR/ord/"*.manifest
+  _mkw ancient done-undelivered "$deadpid" "true" 10
+  _mkw justnow done-undelivered "$deadpid" "true" "$(date +%s)"
+  _run 1 ord 1 >/dev/null 2>&1
+  grep -qx 'status=delivered' "$BG_DIR/ord/justnow.manifest" \
+    || { echo "bg-retry-test: FAIL (a seconds-old stranding lost its slot to a backlog entry — a live delivery failure waits behind history)"; rc=1; }
+  grep -qx 'status=done-undelivered' "$BG_DIR/ord/ancient.manifest" \
+    || { echo "bg-retry-test: FAIL (the capped run shipped the backlog entry too — --max is not capping across tiers)"; rc=1; }
+  # ...and within the backlog tier the old fairness still holds: two old ones, oldest goes first.
+  rm -f "$BG_DIR/ord/"*.manifest
+  _mkw old1 done-undelivered "$deadpid" "true" 100
+  _mkw old2 done-undelivered "$deadpid" "true" 200
+  _run 1 ord 1 >/dev/null 2>&1
+  grep -qx 'status=delivered' "$BG_DIR/ord/old1.manifest" \
+    || { echo "bg-retry-test: FAIL (inside the backlog tier the drain no longer takes the oldest — the anti-starvation property was lost with the tiering)"; rc=1; }
 
   # 7. A RUNNER FAULT IS NOT A DELIVERY FAULT. cron's PATH is not a login shell's, and the first
   #    wired run died rc=127 on every batch — "command not found" — while charging each one an
@@ -268,7 +308,7 @@ EOF
   [ "$(_attempts cfg1)" = "$before" ] \
     || { echo "bg-retry-test: FAIL (rc=127 did not refund the attempt: $before -> $(_attempts cfg1))"; rc=1; }
 
-  [ "$rc" = 0 ] && echo "smoke-test: ok (dry run is the default and mutates nothing; a live pid and a terminal manifest are never candidates; --apply delivers through the REAL bg-done state flip; a FAILED delivery stays done-undelivered and blocking, never silently resolved; --max caps the drain pace and takes the OLDEST stranded first; attempts exhaust into a loud skip that leaves the gate blocking for a human; and a RUNNER fault — bg-done missing or rc=126/127 — aborts charging nothing and refunds the attempt it wrote, so cron's PATH cannot exhaust the whole backlog; and an on-done that is a BARE NAME resolves under a cron-like PATH, which is the fault that actually killed the first wired run)"
+  [ "$rc" = 0 ] && echo "smoke-test: ok (dry run is the default and mutates nothing; a live pid and a terminal manifest are never candidates; --apply delivers through the REAL bg-done state flip; a FAILED delivery stays done-undelivered and blocking, never silently resolved; --max caps the drain pace; a FRESH stranding (a live delivery failure) preempts the backlog while the backlog itself still drains oldest-first; attempts exhaust into a loud skip that leaves the gate blocking for a human; and a RUNNER fault — bg-done missing or rc=126/127 — aborts charging nothing and refunds the attempt it wrote, so cron's PATH cannot exhaust the whole backlog; and an on-done that is a BARE NAME resolves under a cron-like PATH, which is the fault that actually killed the first wired run)"
   return "$rc"
 }
 
