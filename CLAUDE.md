@@ -117,6 +117,37 @@ a fast-path PREFERENCE and the write result is checked (`printf … && return 0`
 degrades to the sudo path instead of reporting a false success. (`mesh-chat:450` met the same instinct in
 the test-vacuity direction — `[ -f LOG ] && [ -w LOG ]` standing in for a real dry-run.)
 
+Extend it to **the flag whose NAME is wider than its VOCABULARY**: a kernel API that lets you *state*
+a restriction does not thereby cover the thing its noun names. Landlock's `handled_access_net` reads,
+in review, as "network" — and on this node (ABI **4**, kernel 6.8, uid 1000) it defines **exactly two
+rights**: `BIND_TCP` and `CONNECT_TCP`. Bits 2..5 return `EINVAL`, so handling both and adding zero
+rules IS the strictest network statement the ABI has. Measured 2026-08-20 against a control arm that
+ALLOWED every row (so each DENIED is the sandbox, not a missing path): inside that maximal ruleset,
+TCP connect *and* bind DENIED `EACCES`, while a **non-53 UDP/123 NTP round-trip returned a real
+epoch**, `UDP bind 0.0.0.0:0` succeeded, and AF_UNIX to the session bus succeeded. So it is neither
+DNS-specific nor outbound-only: a sandbox commented `# no network` can **exfiltrate, be reached, and
+talk to the bus**. Compounding it, an **unhandled right is an UNRESTRICTED right** — a write-only
+ruleset leaves `~/.mesh/nodes` (beside `~/.mesh/secrets/`, `groq.env`) fully readable inside the
+sandbox. So: never write the noun, write the **enumerated rights** (`# no TCP; UDP and AF_UNIX are
+open`), and if the network must actually close, pair it with **seccomp-BPF** — which installs
+unprivileged here (`NO_NEW_PRIVS` + `PR_SET_SECCOMP` both rc=0) and *bites* (`socket()` → `EPERM`),
+expressing precisely what Landlock cannot say. Filter on `args[0] == AF_INET`, not on `socket`
+wholesale: a blunt filter takes AF_UNIX with it and kills the session bus (seen — all three families
+denied). Nothing in `scripts/` uses either today, so this is a trap for the next hand, not a live
+hole. (Landlock+seccomp, never Landlock alone.)
+
+And extend it to **the probe that answers a DIFFERENT question in the same type**: the ABI version
+above was nearly filed as **5**. `landlock_create_ruleset(NULL, 0, flags)` returns a small positive
+integer for *two* different flags — `flags=1` (`…_VERSION`) → `4`, `flags=2` (`…_ERRATA`) → `5`, an
+errata *bitmask* — and **nothing in the return value distinguishes them**: same syscall, same type,
+same plausible magnitude, no error. Passing the wrong flag yields a confident wrong number that
+survives review because it looks exactly like the right one, and here it would have rewritten a
+correct find ("ABI 4") into a false correction of it. Sibling of the `EINVAL`-on-a-0666-pseudo-file
+trap above, where the errno itself misdirects: **when a probe returns a bare integer, assert what
+QUESTION was asked, not just that an answer came back** — pin the flag/constant by name against the
+uapi header, and prefer a probe whose wrong-question path *errors* (`flags=4` → `EINVAL`) over one
+whose wrong-question path *answers*.
+
 Extend it to **the reflex that was never wired**: passing `--test` and running are unrelated facts.
 `mesh-channel-keepalive`/`mesh-mind-keepalive`/`mesh-supervise` all passed green with none in cron or
 carrying a `# reflex-cadence:` header. And a wired reflex can still be vacuous — `mesh-mind-keepalive`
