@@ -100,7 +100,16 @@ def run():
         # the variable, and the page's own advice ("turn off your VPN or proxy") points at the wrong
         # thing. What differs is the fingerprint: headless-shell is the most detectable chromium
         # build there is, and these forms carry an empty g-recaptcha-response.
-        b = p.chromium.launch(headless=os.environ.get("HH_HEADLESS", "1") != "0")
+        # HH_PROXY routes this browser out a vantage the node's default route does not have.
+        # Needed since 2026-08-20: hh.ru blackholed the tailscale exit node's IP (TCP 443 to
+        # 94.124.200.0 never answers from 38.49.216.141, measured from this node AND from the
+        # exit node itself), while the node's own uplink gets 302 -> nn.hh.ru, 200. chromium
+        # cannot bind an interface, so the vantage arrives as a socks proxy
+        # (`mesh-vantage-socks`, whose sockets are SO_BINDTODEVICE-bound to that uplink).
+        launch = {"headless": os.environ.get("HH_HEADLESS", "1") != "0"}
+        if os.environ.get("HH_PROXY"):
+            launch["proxy"] = {"server": os.environ["HH_PROXY"]}
+        b = p.chromium.launch(**launch)
         ctx = b.new_context(storage_state=str(STATE), locale="ru-RU",
                             timezone_id="Europe/Moscow",
                             user_agent=("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
