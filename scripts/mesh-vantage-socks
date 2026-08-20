@@ -1,0 +1,157 @@
+#!/usr/bin/env python3
+"""mesh-vantage-socks — a SOCKS5 front end for ONE egress device, so a browser can be given a
+vantage the node's own routing table would never hand it.
+
+  mesh-vantage-socks [--dev <iface>] [--port 1081] [--test]
+
+Why this exists: this node's default route goes through a tailscale exit node, and hh.ru
+blackholed that exit's IP (measured 2026-08-20: TCP 443 to 94.124.200.0 never answers from
+38.49.216.141, from this node AND from phaedra itself; the same request out the node's own
+uplink returns 302 -> nn.hh.ru, 200, 1.5 MB). curl can pick the vantage per-request with
+`--interface <dev>` (SO_BINDTODEVICE, unprivileged), but chromium cannot — it only speaks
+`--proxy-server`. This is that adapter: every outbound socket it opens is bound to <dev>, so
+the far end sees the device's own public IP and nothing else on the node is touched.
+
+NOT a substrate change and deliberately so: no ip rule, no route, no fwmark, no tailscale
+setting. It is one process holding one listening socket on loopback; kill it and the node is
+exactly as it was. That is the whole point — the exit-node egress every other lane depends on
+keeps working while one browser looks out a different window.
+
+`--test` asserts the REAL path: it starts the proxy, fetches ipify THROUGH it, and fails unless
+the IP differs from the node's default-route IP. A proxy that silently fell back to the default
+route would answer 200 all day and teach the opposite of what it exists to prove.
+"""
+import argparse, os, select, socket, struct, subprocess, sys, threading, time
+
+SO_BINDTODEVICE = 25
+DEFAULT_DEV = os.environ.get("MESH_VANTAGE_DEV", "")
+
+
+def default_dev():
+    """The device the node's own DEFAULT route (table main) uses — never the tailscale one."""
+    try:
+        out = subprocess.run(["ip", "-o", "route", "show", "table", "main", "default"],
+                             capture_output=True, text=True, timeout=10).stdout
+        for tok in out.split():
+            if tok == "dev":
+                return out.split()[out.split().index("dev") + 1]
+    except Exception:
+        pass
+    return ""
+
+
+def connect_via(dev, host, port, timeout=20):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, SO_BINDTODEVICE, dev.encode() + b"\0")
+    s.settimeout(timeout)
+    s.connect((host, port))
+    return s
+
+
+def pump(a, b):
+    try:
+        while True:
+            r, _, _ = select.select([a, b], [], [], 300)
+            if not r:
+                return
+            for src in r:
+                dst = b if src is a else a
+                data = src.recv(65536)
+                if not data:
+                    return
+                dst.sendall(data)
+    except Exception:
+        return
+    finally:
+        for s in (a, b):
+            try:
+                s.close()
+            except Exception:
+                pass
+
+
+def handle(cli, dev):
+    try:
+        cli.settimeout(30)
+        head = cli.recv(2)
+        if len(head) < 2 or head[0] != 5:
+            cli.close(); return
+        cli.recv(head[1])                      # methods, all ignored
+        cli.sendall(b"\x05\x00")               # no auth
+        req = cli.recv(4)
+        if len(req) < 4 or req[1] != 1:        # CONNECT only
+            cli.sendall(b"\x05\x07\x00\x01" + b"\x00" * 6); cli.close(); return
+        atyp = req[3]
+        if atyp == 1:
+            host = socket.inet_ntoa(cli.recv(4))
+        elif atyp == 3:
+            host = cli.recv(cli.recv(1)[0]).decode()
+        else:                                   # IPv6: this vantage is v4-only, say so
+            cli.sendall(b"\x05\x08\x00\x01" + b"\x00" * 6); cli.close(); return
+        port = struct.unpack("!H", cli.recv(2))[0]
+        try:
+            up = connect_via(dev, host, port)
+        except Exception:
+            cli.sendall(b"\x05\x05\x00\x01" + b"\x00" * 6); cli.close(); return
+        cli.sendall(b"\x05\x00\x00\x01" + socket.inet_aton("0.0.0.0") + struct.pack("!H", 0))
+        cli.settimeout(None); up.settimeout(None)
+        pump(cli, up)
+    except Exception:
+        try:
+            cli.close()
+        except Exception:
+            pass
+
+
+def serve(dev, port, ready=None):
+    srv = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", port))
+    srv.listen(64)
+    if ready:
+        ready.set()
+    while True:
+        cli, _ = srv.accept()
+        threading.Thread(target=handle, args=(cli, dev), daemon=True).start()
+
+
+def probe(port, dev):
+    """ipify through the proxy vs. ipify on the node's default route — must differ."""
+    via = subprocess.run(["curl", "-sS", "--max-time", "25", "-x", f"socks5h://127.0.0.1:{port}",
+                          "https://api.ipify.org"], capture_output=True, text=True).stdout.strip()
+    direct = subprocess.run(["curl", "-sS", "--max-time", "25", "https://api.ipify.org"],
+                            capture_output=True, text=True).stdout.strip()
+    return via, direct
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dev", default=DEFAULT_DEV)
+    ap.add_argument("--port", type=int, default=int(os.environ.get("MESH_VANTAGE_PORT", "1081")))
+    ap.add_argument("--test", action="store_true")
+    a = ap.parse_args()
+    dev = a.dev or default_dev()
+    if not dev:
+        print("n/a: no default-route device found", file=sys.stderr); return 2
+
+    if a.test:
+        port = a.port + 1000
+        ready = threading.Event()
+        threading.Thread(target=serve, args=(dev, port, ready), daemon=True).start()
+        if not ready.wait(10):
+            print("FAIL: listener never came up"); return 1
+        via, direct = probe(port, dev)
+        print(f"dev={dev} via-proxy={via or '(none)'} default-route={direct or '(none)'}")
+        if not via:
+            print("FAIL: no answer through the proxy"); return 1
+        if via == direct:
+            print("FAIL: proxy exit == default-route exit — the device bind did not take"); return 1
+        print("ok: the proxy exits somewhere the default route does not")
+        return 0
+
+    print(f"mesh-vantage-socks: socks5://127.0.0.1:{a.port} -> dev {dev}", flush=True)
+    serve(dev, a.port)
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)
