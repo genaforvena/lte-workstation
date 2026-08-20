@@ -1,0 +1,459 @@
+#!/usr/bin/env python3
+"""mesh-gmail-note3 — read the operator's Gmail off the PHYSICAL Note 3, with no password.
+
+  mesh-gmail-note3 [--list N] [--search REGEX] [--since DAYS] [--from ADDR]
+                   [--body ID] [--json] [--refresh] [--coverage]
+  mesh-gmail-note3 --test
+
+Operator, 2026-08-20 (Telegram): *"вместо того, чтобы я выдавал вам какие-то пароли, у вас есть
+просто физический девайс"*. He is right, and this is that lane. The Note 3 is signed in as
+`ilyailiilia@gmail.com`, it is rooted, and the Gmail app keeps its synced mail in a SQLite DB
+under `/data/data/com.google.android.gm/databases/bigTopDataDB.<id>`. Reading it needs adb +
+root on a device that lives in his flat — take the phone away and the access is gone. No app
+password, no OAuth token, nothing in `~/.mesh/` that a leaked node could replay.
+
+Why it exists: four job applications went out from `ilyailiilia@gmail.com` (Kayzen, RTB House,
+adtelligent, DOU) while the mail organ polls `imap.yandex.ru` ONLY. RTB House's recruiter
+answered on 2026-08-18 and nothing in the mesh saw it for two days.
+
+Four measured things this tool exists to not get wrong:
+
+* **`adb shell` MANGLES BINARY on this device.** `adb shell "su -c 'cat db'"` returned 10821971
+  bytes for a 10780672-byte file — the pre-Android-7 adbd translates LF to CRLF, and the result
+  is a corrupt SQLite file that still *opens* (the header survives) and reports a plausible page
+  count. `file` called it "SQLite 3.x database" either way. Use `adb exec-out`, and ASSERT the
+  pulled size equals the size the device reports — a mangled DB is not a slow lane, it is a
+  fabricated one.
+* **It is a CACHE, not IMAP.** The app syncs a sliding window; anything older simply is not
+  there. So every listing publishes its own coverage (`--coverage`, and the `span=` line on
+  every human-readable run): a consumer must never read "not found" as "did not arrive". Today
+  the window holds 998 messages over 35 days.
+* **Read-only, and it must stay that way.** Nothing here writes to the device or marks anything
+  read — this is the operator's own inbox and his unread marks are his view of it.
+* **A missing phone is n/a, an empty parse is a FAULT.** No device / no root exits 2 (honest
+  "organ unreachable"). A reachable phone whose DB parses to zero messages exits 1 — the normal
+  state is ~1000, so a silent zero is the hollow-sense shape, never a quiet empty inbox.
+
+`--test` drives the REAL path: pulls from the real phone, asserts byte-exactness against the
+device's own size, parses, and requires a message carrying both a sender and a timestamp. It
+exits 2 where the phone is absent so `mesh-land` treats it as an honest n/a. It writes only to
+its own cache dir, never to a durable ledger.
+"""
+import argparse, datetime, html, json, os, pathlib, re, shutil, sqlite3, subprocess, sys, time, zlib
+
+os.environ["PATH"] = os.path.expanduser("~/.local/bin") + os.pathsep + os.environ.get("PATH", "/usr/bin:/bin")
+
+HOME = pathlib.Path.home()
+CACHE = HOME / ".mesh" / "gmail-note3"
+GMDIR = "/data/data/com.google.android.gm/databases"
+MAXAGE = 600          # seconds a cached pull stays usable without --refresh
+SQLITE_MAGIC = b"SQLite format 3\x00"
+
+
+class Absent(Exception):
+    """Organ unreachable — renders n/a (exit 2), never a fabricated empty inbox."""
+
+
+# ---------------------------------------------------------------- device
+
+def adb(*args, timeout=90, binary=False):
+    cmd = ["adb"] + list(args)
+    try:
+        p = subprocess.run(cmd, capture_output=True, timeout=timeout)
+    except FileNotFoundError:
+        raise Absent("adb not installed")
+    except subprocess.TimeoutExpired:
+        raise Absent("adb timed out: " + " ".join(args))
+    if binary:
+        return p.returncode, p.stdout, p.stderr.decode("utf-8", "replace")
+    return p.returncode, p.stdout.decode("utf-8", "replace"), p.stderr.decode("utf-8", "replace")
+
+
+def device():
+    rc, out, _ = adb("devices", timeout=20)
+    if rc != 0:
+        raise Absent("adb devices failed")
+    devs = [l.split()[0] for l in out.splitlines()[1:] if l.strip().endswith("device")]
+    if not devs:
+        raise Absent("no adb device attached (Note 3 off or unplugged)")
+    return devs[0]
+
+
+def su(cmd, timeout=90, binary=False):
+    """Run cmd as root on the phone. exec-out, NEVER shell: see the module docstring."""
+    return adb("exec-out", "su -c '%s'" % cmd, timeout=timeout, binary=binary)
+
+
+def accounts():
+    rc, out, _ = adb("shell", "dumpsys account", timeout=30)
+    return sorted(set(re.findall(r"Account \{name=([^,]+), type=com\.google\}", out)))
+
+
+def db_names():
+    """The Gmail sync DBs on the device, newest-written first. Discovered, never hardcoded —
+    the numeric suffix is per-account and changes when an account is re-added."""
+    # `ls -1` is rejected by this device's toolbox ("Unknown option '-1'"); plain ls
+    # already prints one name per line here.
+    rc, out, err = su("ls %s" % GMDIR, timeout=30)
+    if rc != 0 or not out.strip():
+        raise Absent("no root read of %s (%s)" % (GMDIR, (err or out).strip()[:120] or "empty"))
+    names = [n.strip() for n in out.splitlines()
+             if re.fullmatch(r"bigTopDataDB\.\d+", n.strip())]
+    if not names:
+        raise Absent("no bigTopDataDB in %s — Gmail app not signed in?" % GMDIR)
+    return names
+
+
+def dev_size(path):
+    """The device's own idea of the file size — the byte-exactness oracle for the pull.
+
+    `ls -l` is the ONLY way to ask on this phone: its toolbox ships no `wc`, no `stat` and no
+    `busybox` (all three probed, all "not found"). The columns are
+    `perm owner group SIZE YYYY-MM-DD HH:MM name` with no link-count column, so anchor on the
+    date and take the field before it rather than counting from the left."""
+    rc, out, _ = su("ls -l %s" % path, timeout=30)
+    if rc != 0 or not out.strip():
+        return None
+    for line in out.splitlines():
+        t = line.split()
+        for i, tok in enumerate(t):
+            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", tok) and i and t[i - 1].isdigit():
+                return int(t[i - 1])
+    return None
+
+
+def pull(name, dest):
+    """Pull `name` (+ its -wal) byte-exactly. Raises on any size mismatch."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    for suffix, target in ((("", dest)), ("-wal", dest.with_name(dest.name + "-wal"))):
+        src = "%s/%s%s" % (GMDIR, name, suffix)
+        want = dev_size(src)
+        if want is None:
+            if suffix:                       # no -wal is normal (checkpointed db)
+                target.unlink(missing_ok=True)
+                continue
+            raise Absent("cannot stat %s on device" % src)
+        rc, data, err = su("cat %s" % src, timeout=240, binary=True)
+        if rc != 0:
+            raise Absent("root cat %s failed: %s" % (src, err.strip()[:120]))
+        if len(data) != want:
+            raise SystemExit(
+                "mesh-gmail-note3: pulled %d bytes, device says %d for %s — the transport "
+                "mangled it (adb shell does this; exec-out should not). Refusing to parse."
+                % (len(data), want, src))
+        if not suffix and not data.startswith(SQLITE_MAGIC):
+            raise SystemExit("mesh-gmail-note3: %s is not a SQLite file" % src)
+        target.write_bytes(data)
+    con = sqlite3.connect("file:%s?mode=ro" % dest, uri=True)
+    try:
+        if con.execute("pragma integrity_check").fetchone()[0] != "ok":
+            raise SystemExit("mesh-gmail-note3: pulled DB fails integrity_check "
+                             "(torn db/-wal pair) — rerun with --refresh")
+    finally:
+        con.close()
+
+
+def local_db(refresh=False):
+    """Path to a fresh-enough local copy, pulling from the phone when stale."""
+    CACHE.mkdir(parents=True, exist_ok=True)
+    dest = CACHE / "gmail.db"
+    if not refresh and dest.exists() and time.time() - dest.stat().st_mtime < MAXAGE:
+        return dest, False
+    device()
+    name = db_names()[0]
+    pull(name, dest)
+    return dest, True
+
+
+# ---------------------------------------------------------------- protobuf
+
+def _varint(b, i):
+    r = s = 0
+    while True:
+        c = b[i]; i += 1
+        r |= (c & 0x7F) << s; s += 7
+        if not c & 0x80:
+            return r, i
+
+
+def pfields(b):
+    """Yield (field_number, wire_type, value) — enough of protobuf to walk an unknown schema."""
+    i, n = 0, len(b)
+    while i < n:
+        try:
+            k, i = _varint(b, i)
+        except IndexError:
+            return
+        f, w = k >> 3, k & 7
+        if w == 0:
+            v, i = _varint(b, i); yield f, w, v
+        elif w == 2:
+            l, i = _varint(b, i); yield f, w, b[i:i + l]; i += l
+        elif w == 5:
+            yield f, w, b[i:i + 4]; i += 4
+        elif w == 1:
+            yield f, w, b[i:i + 8]; i += 8
+        else:
+            return
+
+
+def _sub(blob, path):
+    """Follow a field-number path through nested submessages; None if any hop is missing."""
+    cur = blob
+    for want in path:
+        nxt = None
+        for f, w, v in pfields(cur):
+            if f == want and w == 2:
+                nxt = v
+        if nxt is None:
+            return None
+        cur = nxt
+    return cur
+
+
+# Field numbers, read off the real protos on this device (2026-08-20). They are Gmail's private
+# schema and could move under an app update — `--test` is what notices.
+F_SUBJECT, F_ENVELOPE, F_SNIPPET, F_MSGID = 5, 6, 7, 8
+F_SENDER, F_TO, F_DATE_MS, F_SERVER_ID = 11, 12, 17, 29
+S_NAME, S_ADDR = 15, 17
+# The HTML sits one hop deeper than it looks: 6.2.3 is a WRAPPER submessage whose field 2 holds
+# the markup. Stopping at 6.2.3 still yields a blob that starts with readable HTML — the two
+# framing bytes decode to a stray U+FFFD and everything after them is the real body — so it
+# passes every "is there a body" check while heading each gist with a replacement character.
+# A schema mis-read that renders 99% correct output is the shape you fix, not lstrip.
+BODY_PATH = (F_ENVELOPE, 2, 3, 2)
+
+
+def strip_html(s):
+    s = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", s)
+    s = re.sub(r"(?i)<br\s*/?>", "\n", s)
+    s = re.sub(r"(?i)</(p|div|tr|li|h[1-6])>", "\n", s)
+    s = re.sub(r"<[^>]+>", " ", s)
+    s = html.unescape(s)
+    s = s.replace(" ", " ")
+    s = re.sub(r"[ \t‌​]{2,}", " ", s)
+    return re.sub(r"\n\s*\n\s*\n+", "\n\n", s).strip()
+
+
+def parse_message(rid, blob):
+    top = {}
+    for f, w, v in pfields(blob):
+        top.setdefault(f, []).append(v)
+
+    def txt(f):
+        v = top.get(f)
+        return v[0].decode("utf-8", "replace") if v and isinstance(v[0], bytes) else ""
+
+    frm = name = ""
+    if F_SENDER in top:
+        for f, w, v in pfields(top[F_SENDER][0]):
+            if f == S_ADDR and isinstance(v, bytes):
+                frm = v.decode("utf-8", "replace")
+            elif f == S_NAME and isinstance(v, bytes):
+                name = v.decode("utf-8", "replace")
+    to = []
+    for rec in top.get(F_TO, []):
+        for f, w, v in pfields(rec):
+            if f == 2 and isinstance(v, bytes):
+                to.append(v.decode("utf-8", "replace"))
+    body = _sub(blob, BODY_PATH)
+    html_body = body.decode("utf-8", "replace") if body else ""
+    ts = top.get(F_DATE_MS, [0])[0]
+    ts = ts if isinstance(ts, int) else 0
+    return {
+        "id": rid,
+        "ts": ts // 1000,
+        "date": datetime.datetime.fromtimestamp(ts / 1000).strftime("%Y-%m-%dT%H:%M") if ts else "",
+        "from": frm, "from_name": name, "to": to,
+        "subject": txt(F_SUBJECT), "snippet": txt(F_SNIPPET),
+        "message_id": txt(F_MSGID),
+        "html": html_body, "text": strip_html(html_body),
+    }
+
+
+def read_messages(dbpath):
+    con = sqlite3.connect("file:%s?mode=ro" % dbpath, uri=True)
+    try:
+        rows = con.execute(
+            "select row_id, zipped_message_proto, message_proto from item_messages "
+            "where zipped_message_proto is not null or message_proto is not null").fetchall()
+    finally:
+        con.close()
+    out = []
+    for rid, zipped, plain in rows:
+        try:
+            blob = zlib.decompress(zipped[1:]) if zipped else plain
+        except Exception:
+            continue
+        if not blob:
+            continue
+        try:
+            out.append(parse_message(rid, blob))
+        except Exception:
+            continue
+    out.sort(key=lambda m: m["ts"])
+    return out
+
+
+def coverage(msgs):
+    if not msgs:
+        return {"n": 0, "oldest": None, "newest": None, "days": 0}
+    lo, hi = msgs[0]["ts"], msgs[-1]["ts"]
+    return {"n": len(msgs),
+            "oldest": datetime.datetime.fromtimestamp(lo).strftime("%Y-%m-%dT%H:%M"),
+            "newest": datetime.datetime.fromtimestamp(hi).strftime("%Y-%m-%dT%H:%M"),
+            "days": round((hi - lo) / 86400.0, 1)}
+
+
+def span_line(cov, fresh):
+    return ("span=%s..%s (%s msgs / %s days, sync cache — older mail is NOT absent, it is "
+            "outside the window) pull=%s" % (cov["oldest"], cov["newest"], cov["n"],
+                                             cov["days"], "fresh" if fresh else "cached"))
+
+
+# ---------------------------------------------------------------- test
+
+def selftest():
+    ok = True
+
+    def chk(name, cond, detail=""):
+        nonlocal ok
+        print("  %s %s%s" % ("ok  " if cond else "FAIL", name, (" — " + detail) if detail else ""))
+        ok = ok and cond
+
+    print("mesh-gmail-note3 --test")
+    try:
+        dev = device()
+        names = db_names()
+    except Absent as e:
+        print("  n/a — %s" % e)
+        print("mesh-gmail-note3: organ absent (exit 2)")
+        return 2
+    print("  device: %s   dbs: %s" % (dev, ",".join(names)))
+    accs = accounts()
+    chk("a google account is signed in", bool(accs), ",".join(accs) or "none")
+
+    # The byte-exactness gate, driven for real: exec-out must match the device's own size, and
+    # the mangling `adb shell` would do must still be VISIBLE here — a gate nobody has seen fail
+    # is not a gate. Compare the two transports on the same small file.
+    probe = "%s/%s" % (GMDIR, names[0])
+    want = dev_size(probe)
+    chk("device reports a size for the db", bool(want), str(want))
+    rc, exact, _ = su("cat %s" % probe, timeout=240, binary=True)
+    chk("exec-out pull is byte-exact", rc == 0 and want is not None and len(exact) == want,
+        "%d vs %d" % (len(exact), want or -1))
+    rcs, mangled, _ = adb("shell", "su -c 'cat %s'" % probe, timeout=240, binary=True)
+    chk("adb shell would have mangled it (the trap is live)",
+        rcs == 0 and len(mangled) != len(exact),
+        "shell=%d exec-out=%d" % (len(mangled), len(exact)))
+
+    tmp = CACHE / "selftest.db"
+    try:
+        pull(names[0], tmp)
+    except Absent as e:
+        print("  n/a — %s" % e)
+        return 2
+    chk("pulled db opens and passes integrity_check", tmp.exists() and tmp.stat().st_size > 0,
+        "%d bytes" % (tmp.stat().st_size if tmp.exists() else 0))
+
+    msgs = read_messages(tmp)
+    chk("parsed a non-empty mailbox", len(msgs) > 0, "%d messages" % len(msgs))
+    if msgs:
+        withaddr = [m for m in msgs if "@" in m["from"] and m["ts"] > 0]
+        chk("messages carry a sender AND a timestamp", len(withaddr) >= max(1, len(msgs) // 2),
+            "%d/%d" % (len(withaddr), len(msgs)))
+        withsub = [m for m in msgs if m["subject"]]
+        chk("messages carry a subject", len(withsub) >= max(1, len(msgs) // 2),
+            "%d/%d" % (len(withsub), len(msgs)))
+        withbody = [m for m in msgs if len(m["text"]) > 20]
+        chk("messages carry a readable body", len(withbody) >= max(1, len(msgs) // 2),
+            "%d/%d" % (len(withbody), len(msgs)))
+        newest = msgs[-1]["ts"]
+        age_h = (time.time() - newest) / 3600.0
+        chk("the sync window reaches the present (<48h)", age_h < 48, "newest %.1fh old" % age_h)
+        print("  " + span_line(coverage(msgs), True))
+    for p in (tmp, tmp.with_name(tmp.name + "-wal")):
+        p.unlink(missing_ok=True)
+    print("mesh-gmail-note3: %s" % ("PASS" if ok else "FAIL"))
+    return 0 if ok else 1
+
+
+# ---------------------------------------------------------------- main
+
+def main():
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("--list", type=int, nargs="?", const=20, default=None, metavar="N")
+    ap.add_argument("--search", metavar="REGEX")
+    ap.add_argument("--from", dest="frm", metavar="ADDR")
+    ap.add_argument("--since", type=float, metavar="DAYS")
+    ap.add_argument("--body", metavar="ID", help="print one message in full (row id)")
+    ap.add_argument("--coverage", action="store_true")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--refresh", action="store_true", help="force a fresh pull from the phone")
+    ap.add_argument("--test", action="store_true")
+    a = ap.parse_args()
+
+    if a.test:
+        return selftest()
+
+    try:
+        dbpath, fresh = local_db(a.refresh)
+    except Absent as e:
+        print("mesh-gmail-note3: n/a — %s" % e, file=sys.stderr)
+        return 2
+    msgs = read_messages(dbpath)
+    if not msgs:
+        print("mesh-gmail-note3: phone reachable but the DB parsed to ZERO messages — that is a "
+              "fault (Gmail schema moved?), not an empty inbox", file=sys.stderr)
+        return 1
+    cov = coverage(msgs)
+
+    if a.coverage:
+        print(json.dumps(cov, ensure_ascii=False) if a.json else span_line(cov, fresh))
+        return 0
+
+    sel = msgs
+    if a.since is not None:
+        cut = time.time() - a.since * 86400
+        sel = [m for m in sel if m["ts"] >= cut]
+    if a.frm:
+        sel = [m for m in sel if a.frm.lower() in (m["from"] + " " + m["from_name"]).lower()]
+    if a.search:
+        rx = re.compile(a.search, re.I)
+        sel = [m for m in sel if rx.search("\n".join(
+            (m["from"], m["from_name"], m["subject"], m["snippet"], m["text"])))]
+
+    if a.body:
+        hit = [m for m in msgs if str(m["id"]) == str(a.body)] or sel[-1:]
+        if not hit:
+            print("mesh-gmail-note3: no such message", file=sys.stderr)
+            return 1
+        m = hit[-1]
+        if a.json:
+            print(json.dumps(m, ensure_ascii=False))
+        else:
+            print("date:    %s\nfrom:    %s <%s>\nto:      %s\nsubject: %s\n" %
+                  (m["date"], m["from_name"], m["from"], ", ".join(m["to"]), m["subject"]))
+            print(m["text"])
+        return 0
+
+    n = a.list if a.list is not None else 20
+    show = sel[-n:] if n else sel
+    if a.json:
+        print(json.dumps({"coverage": cov, "fresh": fresh,
+                          "messages": [{k: v for k, v in m.items() if k != "html"} for m in show]},
+                         ensure_ascii=False))
+        return 0
+    print(span_line(cov, fresh))
+    print("matched %d, showing %d" % (len(sel), len(show)))
+    for m in show:
+        print("%-6s %s  %-34s %s" % (m["id"], m["date"], (m["from"] or "?")[:34],
+                                     (m["subject"] or m["snippet"])[:78]))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)

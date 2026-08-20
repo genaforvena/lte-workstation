@@ -550,6 +550,9 @@ dead-on-arrival orphan stays visible.
   sense — reads fail2ban's sshd jail; self-wires via `# reflex-cadence:` ONLY where `fail2ban-client`
   exists, i.e. phaedra, and `--test` exits 2 → autowire SKIPs it on every other node)
 - **On-demand senses / fusion / queries (pulled when asked or consumed by a caller — not scheduled):**
+  `mesh-gmail-note3` (the PHYSICAL-DEVICE credential lane — reads the operator's Gmail off his
+  rooted Note 3 over adb, no password anywhere in the mesh; consumed by `mesh-job-mail`'s second
+  lane, invoked by hand otherwise) ·
   `mesh-overview` · `mesh-operator-context` · `mesh-operator-engagement` (these two overlap — operator-activity
   fusion) · `mesh-social-fusion` · `mesh-net-io` · `mesh-socket-state` · `mesh-power-source` ·
   `mesh-travels`
