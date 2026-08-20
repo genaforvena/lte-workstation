@@ -1,0 +1,203 @@
+#!/usr/bin/env bash
+# mesh-bg-retry — the missing half of the bg-manifest contract: RETRY a stranded delivery.
+#
+# mesh-bg-register's contract calls `done-undelivered` "retryable, must be resolved (BLOCKS)".
+# Nothing in the mesh retried it. The state is written by mesh-bg-done BEFORE it runs the on-done
+# (deliberately: a crash in between must not read as delivered), so any batch whose process dies
+# mid-delivery — OOM, pane death, reboot, a mind /cleared out from under it — sits done-undelivered
+# forever. The crash-reap only covers `running` -> `crashed`; a dead pid at done-undelivered is
+# unreapable AND unretried, so it blocks that window's every future /clear permanently.
+#
+# Measured on this node 2026-08-20: 74 stranded sound manifests, oldest 2026-07-27, ALL with dead
+# pids and ALL with their render still on disk — and `mesh-clear --gate sound` blocking on every one
+# of them, which is exactly why that window had not /cleared in 26 days. A hand-retry of the freshest
+# (mesh-bg-done <manifest>) delivered first try, TG ok:true: the renders were never bad, the delivery
+# path just had nobody to restart it.
+#
+#   mesh-bg-retry [--window <w>]                 DRY RUN (default): list what would be retried
+#   mesh-bg-retry --apply [--window <w>] [--max N]   actually retry, at most N per run (default 3)
+#   mesh-bg-retry --test
+#
+# DRY RUN IS THE DEFAULT ON PURPOSE. Every retry fires the manifest's on-done, which for the sound
+# lane means an audio file into the operator's Telegram. A deep backlog drained in one run is a
+# notification flood, so --apply is explicit and --max caps the pace; run it on a cadence to drain
+# gradually rather than raising the cap.
+#
+# ONLY a DEAD pid is retried. A live pid means the original delivery may still be in flight, and
+# re-firing the on-done alongside it sends the target a DUPLICATE.
+#
+# Attempts are counted from THIS TOOL'S OWN LOG, not from a manifest field — the manifest schema is
+# shared by three tools and closed; widening it here would make every reader's parse a guess. After
+# MAX_ATTEMPTS the batch is left ALONE and reported LOUDLY, still blocking: a delivery that fails
+# forever is a thing a human must see, never something this tool may quietly mark resolved.
+# orphan-ok: outward-facing sends — deliberately NOT cron-wired until an operator sets the drain pace.
+set -uo pipefail
+
+MESH_DIR="${MESH_DIR:-$HOME/.mesh}"
+BG_DIR="${MESH_BG_DIR:-$MESH_DIR/bg}"
+LOG="${MESH_BG_RETRY_LOG:-$MESH_DIR/bg-retry.log}"
+MAX_ATTEMPTS="${MESH_BG_RETRY_MAX_ATTEMPTS:-5}"
+BG_DONE="${MESH_BG_DONE_CMD:-mesh-bg-done}"
+
+_mf_get() { grep -m1 "^$2=" "$1" 2>/dev/null | cut -d= -f2-; }
+_now()    { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+# attempts already spent on this batch, counted from our own log (batch ids are unique per run).
+_attempts() { # $1=batch
+  [ -r "$LOG" ] || { echo 0; return; }
+  # grep -c PRINTS 0 and EXITS 1 on no match, so a `|| echo 0` fallback prints a SECOND zero and the
+  # caller reads "0\n0" — two lines where a count was expected. Swallow the exit code, not the output.
+  local n; n="$(grep -cF " attempt batch=$1 " "$LOG" 2>/dev/null)" || true
+  printf '%s\n' "${n:-0}"
+}
+
+# every done-undelivered manifest with a DEAD pid, oldest-updated first (fairest drain order).
+_candidates() { # $1=window-filter(optional)
+  local win="${1:-}" root="$BG_DIR" f pid upd
+  [ -n "$win" ] && root="$BG_DIR/$win"
+  [ -d "$root" ] || return 0
+  while IFS= read -r f; do
+    [ -r "$f" ] || continue
+    [ "$(_mf_get "$f" status)" = done-undelivered ] || continue
+    pid="$(_mf_get "$f" pid)"
+    # a live pid = delivery may still be in flight; re-firing on-done would DUPLICATE it.
+    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && continue
+    upd="$(_mf_get "$f" updated)"
+    printf '%s\t%s\n' "${upd:-0}" "$f"
+  done < <(find "$root" -name '*.manifest' -type f 2>/dev/null) | sort -n | cut -f2-
+}
+
+_report_line() { # $1=manifest
+  local f="$1" b w t u a
+  b="$(_mf_get "$f" batch)"; w="$(_mf_get "$f" window)"; t="$(_mf_get "$f" target)"
+  u="$(_mf_get "$f" updated)"; a="$(_attempts "$b")"
+  printf '  %-8s %-34s -> %-14s stranded %s  attempts=%s/%s\n' \
+    "$w" "$b" "$t" "$(date -u -d "@${u:-0}" +%Y-%m-%dT%H:%MZ 2>/dev/null || echo '?')" "$a" "$MAX_ATTEMPTS"
+}
+
+_run() { # $1=apply(0/1) $2=window $3=max
+  local apply="$1" win="$2" max="$3" f n=0 done_n=0 fail_n=0 exh_n=0 b a rc
+  local -a cands=()
+  while IFS= read -r f; do [ -n "$f" ] && cands+=("$f"); done < <(_candidates "$win")
+  n="${#cands[@]}"
+  if [ "$n" = 0 ]; then
+    echo "mesh-bg-retry: nothing stranded${win:+ in $win} (no done-undelivered manifest with a dead pid)"
+    return 0
+  fi
+  if [ "$apply" = 0 ]; then
+    echo "mesh-bg-retry: DRY RUN — $n stranded batch(es)${win:+ in $win}, would retry up to $max per --apply run:"
+    local i=0
+    for f in "${cands[@]}"; do
+      i=$((i+1)); [ "$i" -gt "$max" ] && { echo "  … and $((n-max)) more (raise --max, or run --apply repeatedly / on a cadence)"; break; }
+      _report_line "$f"
+    done
+    echo "mesh-bg-retry: nothing sent. Re-run with --apply to actually deliver."
+    return 0
+  fi
+  mkdir -p "$(dirname "$LOG")"
+  for f in "${cands[@]}"; do
+    [ "$((done_n+fail_n))" -ge "$max" ] && break
+    b="$(_mf_get "$f" batch)"; a="$(_attempts "$b")"
+    if [ "$a" -ge "$MAX_ATTEMPTS" ]; then
+      exh_n=$((exh_n+1))
+      printf '%s exhausted batch=%s attempts=%s manifest=%s\n' "$(_now)" "$b" "$a" "$f" >> "$LOG"
+      echo "mesh-bg-retry: EXHAUSTED after $a attempts, left BLOCKING for a human: $f" >&2
+      continue
+    fi
+    printf '%s attempt batch=%s n=%s manifest=%s\n' "$(_now)" "$b" "$((a+1))" "$f" >> "$LOG"
+    "$BG_DONE" "$f" >>"$LOG" 2>&1; rc=$?
+    if [ "$rc" = 0 ] && [ "$(_mf_get "$f" status)" = delivered ]; then
+      done_n=$((done_n+1)); echo "mesh-bg-retry: delivered $b"
+      printf '%s delivered batch=%s manifest=%s\n' "$(_now)" "$b" "$f" >> "$LOG"
+    else
+      fail_n=$((fail_n+1)); echo "mesh-bg-retry: FAILED rc=$rc (stays done-undelivered, retryable) $b" >&2
+      printf '%s failed batch=%s rc=%s manifest=%s\n' "$(_now)" "$b" "$rc" "$f" >> "$LOG"
+    fi
+  done
+  echo "mesh-bg-retry: delivered=$done_n failed=$fail_n exhausted=$exh_n · $((n-done_n)) still stranded${win:+ in $win}"
+  [ "$fail_n" = 0 ]
+}
+
+_test() {
+  # NOT local: the EXIT trap fires after _test returns, and under `set -u` a local is already out of
+  # scope by then — the cleanup dies on "td: unbound variable" and leaks the dir.
+  local rc=0; _RT_TD="$(mktemp -d)"; trap 'rm -rf "$_RT_TD"' EXIT
+  local td="$_RT_TD"
+  export MESH_DIR="$td/m"; BG_DIR="$td/m/bg"; export MESH_BG_DIR="$BG_DIR"
+  LOG="$td/m/bg-retry.log"; MAX_ATTEMPTS=2
+  mkdir -p "$BG_DIR/w"
+  _mk() { # $1=batch $2=status $3=pid $4=ondone
+    printf 'window=w\nbatch=%s\ntarget=T\non-done=%s\nstatus=%s\npid=%s\nregistered=1\nupdated=%s\n' \
+      "$1" "$4" "$2" "$3" "$(date +%s)" > "$BG_DIR/w/$1.manifest"
+  }
+  # a real stub bg-done: flips status per the on-done's exit, exactly like the shipped tool.
+  cat > "$td/bgdone" <<'EOF'
+#!/usr/bin/env bash
+f="$1"; oc="$(grep -m1 '^on-done=' "$f" | cut -d= -f2-)"
+bash -c "$oc" || exit 4
+sed -i 's/^status=.*/status=delivered/' "$f"
+EOF
+  chmod +x "$td/bgdone"; BG_DONE="$td/bgdone"
+
+  # dead pid 2 (init's child reaper is never ours; use a pid we KNOW is dead)
+  local deadpid; deadpid="$( (exec sh -c 'echo $$') )"   # a pid that has already exited
+  _mk ok        done-undelivered "$deadpid" "true"
+  _mk failing   done-undelivered "$deadpid" "false"
+  _mk live      done-undelivered "$$"       "true"
+  _mk terminal  delivered        "$deadpid" "true"
+
+  # 1. DRY RUN sends nothing and settles nothing — the default must never act.
+  local out; out="$(_run 0 w 10)"
+  grep -q 'DRY RUN' <<<"$out"        || { echo "bg-retry-test: FAIL (default is not a dry run)"; rc=1; }
+  grep -q 'nothing sent' <<<"$out"   || { echo "bg-retry-test: FAIL (dry run did not say it sent nothing)"; rc=1; }
+  grep -qx 'status=done-undelivered' "$BG_DIR/w/ok.manifest" \
+    || { echo "bg-retry-test: FAIL (dry run MUTATED a manifest — the default acted)"; rc=1; }
+  [ ! -s "$LOG" ] || { echo "bg-retry-test: FAIL (dry run wrote the attempt log)"; rc=1; }
+
+  # 2. a LIVE pid is never retried — re-firing on-done beside an in-flight delivery duplicates it.
+  grep -q ' live ' <<<"$out" && { echo "bg-retry-test: FAIL (a live-pid manifest was listed as retryable)"; rc=1; }
+  # 3. a terminal manifest is never a candidate.
+  grep -q ' terminal ' <<<"$out" && { echo "bg-retry-test: FAIL (a delivered manifest was listed as retryable)"; rc=1; }
+
+  # 4. --apply delivers the good one and leaves the failing one BLOCKING (never a silent resolve).
+  _run 1 w 10 >/dev/null 2>&1
+  grep -qx 'status=delivered' "$BG_DIR/w/ok.manifest" \
+    || { echo "bg-retry-test: FAIL (--apply did not deliver a retryable batch)"; rc=1; }
+  grep -qx 'status=done-undelivered' "$BG_DIR/w/failing.manifest" \
+    || { echo "bg-retry-test: FAIL (a FAILED retry did not stay done-undelivered — a failing delivery was silently resolved)"; rc=1; }
+  grep -qx 'status=done-undelivered' "$BG_DIR/w/live.manifest" \
+    || { echo "bg-retry-test: FAIL (--apply touched a live-pid manifest)"; rc=1; }
+
+  # 5. --max CAPS the run. Two fresh stranded batches, --max 1 => exactly one delivered.
+  _mk cap1 done-undelivered "$deadpid" "true"; _mk cap2 done-undelivered "$deadpid" "true"
+  _run 1 w 1 >/dev/null 2>&1
+  local capped; capped=$(grep -lx 'status=delivered' "$BG_DIR/w/cap1.manifest" "$BG_DIR/w/cap2.manifest" 2>/dev/null | wc -l)
+  [ "$capped" = 1 ] || { echo "bg-retry-test: FAIL (--max 1 settled $capped batches — the pace cap does not cap)"; rc=1; }
+
+  # 6. ATTEMPTS EXHAUST. The failing batch has burnt 1 attempt; drive it past MAX_ATTEMPTS=2 and it
+  #    must be SKIPPED and reported, still blocking — never marked resolved to unwedge the gate.
+  _run 1 w 10 >/dev/null 2>&1            # attempt 2 -> now at MAX
+  local eout; eout="$(_run 1 w 10 2>&1)" # attempt 3 -> refused
+  grep -q 'EXHAUSTED' <<<"$eout" || { echo "bg-retry-test: FAIL (an over-limit batch was retried again instead of reported exhausted)"; rc=1; }
+  grep -qx 'status=done-undelivered' "$BG_DIR/w/failing.manifest" \
+    || { echo "bg-retry-test: FAIL (an exhausted batch was resolved rather than left blocking)"; rc=1; }
+  [ "$(_attempts failing)" -le 3 ] \
+    || { echo "bg-retry-test: FAIL (exhausted batch kept burning attempts: $(_attempts failing))"; rc=1; }
+
+  [ "$rc" = 0 ] && echo "smoke-test: ok (dry run is the default and mutates nothing; a live pid and a terminal manifest are never candidates; --apply delivers through the REAL bg-done state flip; a FAILED delivery stays done-undelivered and blocking, never silently resolved; --max caps the drain pace; attempts exhaust into a loud skip that leaves the gate blocking for a human)"
+  return "$rc"
+}
+
+APPLY=0; WIN=""; MAX=3
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --test)    _test; exit $? ;;
+    --apply)   APPLY=1 ;;
+    --window)  WIN="${2:-}"; shift ;;
+    --max)     MAX="${2:-3}"; shift ;;
+    -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
+    *) echo "mesh-bg-retry: unknown arg '$1'" >&2; exit 2 ;;
+  esac
+  shift
+done
+_run "$APPLY" "$WIN" "$MAX"
