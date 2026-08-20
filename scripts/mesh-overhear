@@ -1246,10 +1246,37 @@ def read_exact(f,n,stall=None):
             left=deadline-time.time()
             if left<=0: break
             if not select.select([f],[],[],left)[0]: break
-        c=f.read(n-len(b))
+        # read1(), NEVER read(): select() proves >=1 byte is READABLE, but BufferedReader.read(k)
+        # blocks until it has k bytes or EOF — so a recorder that emits a PARTIAL frame and then
+        # goes quiet while STILL ALIVE blocks INSIDE this call, past the deadline, forever. The
+        # guard above then bounds nothing: measured 2026-08-20, stall=2s, a stub emitting 100 of
+        # 6400 bytes then holding the pipe open was still blocked at 8s with read(), and returned
+        # in 2.0s with read1(). read1() issues ONE underlying read and hands back whatever arrived,
+        # so the while-loop re-enters select() and the deadline is what actually decides. This is
+        # also what makes the "partial progress rearms the clock" contract above TRUE rather than
+        # aspirational — a partial read cannot rearm a clock it never returns from.
+        c=f.read1(n-len(b))
         if not c: break
         b+=c
         if deadline is not None: deadline=time.time()+stall
+    return b
+
+def read_avail(f,budget=2.0,cap=4096):
+    # Bounded drain of whatever is ALREADY readable — for stderr, which must never block the path
+    # that REPORTS a fault. f.read() on stderr blocks until EOF, and on the exact failure this code
+    # exists to describe there is no EOF: p.kill() reaps the `sh` we spawned, but an orphaned
+    # grandchild (`sh -c 'head ...; sleep 60'` leaves `sleep` behind) still holds the inherited pipe
+    # write end open. Measured 2026-08-20: with the frame read fixed, capture_utterance STILL hung
+    # 12s+ here — the oracle wedged on the very fault it was reading out. Deadline + read1, same
+    # discipline as read_exact.
+    b=b""; deadline=time.time()+budget
+    while len(b)<cap:
+        left=deadline-time.time()
+        if left<=0: break
+        if not select.select([f],[],[],left)[0]: break
+        c=f.read1(cap-len(b))
+        if not c: break
+        b+=c
     return b
 
 def capture_utterance():
@@ -1292,7 +1319,7 @@ def capture_utterance():
         # recorder never delivered a single full frame → it failed to start/produce, NOT a short
         # utterance. Read WHY off stderr and surface it so the caller backs off + can log the cause.
         err=""
-        try: err=(p.stderr.read() or b"").decode("utf-8","ignore").strip().replace("\n"," ")[:200]
+        try: err=read_avail(p.stderr,min(2.0,STALL_SECS)).decode("utf-8","ignore").strip().replace("\n"," ")[:200]
         except Exception: pass
         try: p.stderr.close()
         except Exception: pass
@@ -1630,6 +1657,11 @@ PYEOF
 
 case "${1:-}" in
   --daemon)  runpy daemon ;;
+  # TEST-ONLY entry point for the capture_probe mode (see the partial-frame stall gate in --test).
+  # The gate must drive the probe as a SUBPROCESS under `timeout`, because the failure it asserts is
+  # an UNBOUNDED BLOCK — an in-process `runpy capture_probe` would hang the whole --test with no
+  # verdict instead of going red. Undocumented on purpose: it is a hook, not a user verb.
+  --test-capture-probe) runpy capture_probe ;;
   --ingest)  shift; runpy ingest "$@" ;;
   --show)    runpy show ;;
   --hear)    # LIVE read: re-transcribe the recent window, then print with the freshness header. Single-
@@ -1957,6 +1989,34 @@ case "${1:-}" in
       echo "smoke-test: FAIL (no-backoff respawn: $_spawns recorder spawns in ~2s — daemon backoff not firing)"; exit 1
     fi
     echo "  recorder no-backoff gate ok (fault reason surfaced; $_spawns spawns in ~2s, backoff bounds the storm)"
+    # PARTIAL-FRAME STALL gate (2026-08-20). The no-backoff gate above drives a recorder that dies
+    # with ZERO bytes — the ONE failure the old unbounded f.read() still happened to survive, because
+    # EOF unblocks it. The wedge that actually took the ear down for 72 minutes is the other one: a
+    # recorder ALIVE but no longer delivering, with a PARTIAL frame already in the pipe. select() then
+    # says "readable" and BufferedReader.read(FBYTES) blocks INSIDE the call waiting for the rest, past
+    # the deadline, forever — the stall guard bounds the wait and not the read, so the daemon never
+    # returns to its loop, never prunes, never backs off, while systemctl says active and the unit's
+    # liveness reads green. Drive exactly that shape: 100 of 6400 bytes, then hold the pipe open.
+    # The whole probe must come back INSIDE the stall budget with a NON-None err. RED on f.read():
+    # the timeout below kills it and $_ps is empty; GREEN on f.read1(), which returns what arrived and
+    # lets the deadline decide. To see it fail, put read( back at read_exact's single call site.
+    _pd="$(mktemp -d)"
+    _pstub="sh -c 'head -c 100 /dev/zero; sleep 60'"
+    _pt0="$(date +%s)"
+    _ps="$( export OH_RECORDER_CMD="$_pstub" OH_STALL_SECS=2 OH_LOG="$_pd/o.log"; timeout 12 "$0" --test-capture-probe 2>/dev/null )"
+    _pel=$(( $(date +%s) - _pt0 ))
+    rm -rf "$_pd"
+    case "$_ps" in
+      *"wav=no|err="*) : ;;
+      *) echo "smoke-test: FAIL (partial-frame stall: a recorder that emitted 100/6400 bytes then held the pipe did not surface an err within the ${_pel}s the probe took — the stall guard bounds the select() wait but not the read() inside it; got: '${_ps:-<no output: still blocked when timeout killed it>}')"; exit 1;;
+    esac
+    # Ceiling is 8s, not 2s, and the two are different budgets: the frame read is bounded by
+    # OH_STALL_SECS (2s here) and the stderr drain by its own min(2.0,STALL_SECS) — a healthy pass
+    # spends BOTH (~4s), because the orphaned grandchild holds stderr open to the end. Asserting 2s
+    # would fail a correct fix; asserting nothing would pass the 12s block. 8s bounds the sum with
+    # headroom and still separates fixed from wedged by a wide margin.
+    [ "$_pel" -le 8 ] || { echo "smoke-test: FAIL (partial-frame stall: probe returned but took ${_pel}s — over the 8s ceiling on the two stall budgets (frame read + stderr drain), so a read is not deadline-bounded)"; exit 1; }
+    echo "  partial-frame stall gate ok (100/6400-byte dribble then a live-but-quiet pipe -> err in ${_pel}s = frame-stall + stderr-drain budgets, under the 8s ceiling; unbounded at either site blocks past 12s)"
     # wake-word tiering (chat-review/wake-confirm-mint-too-loose): a strict-stem hit must pass BOTH
     # wake_hit (poke) and wake_confirm_hit (marker+ack); a loose-only garble-family word must pass
     # wake_hit but NOT wake_confirm_hit, so it can never mint the marker or fire --ack.
