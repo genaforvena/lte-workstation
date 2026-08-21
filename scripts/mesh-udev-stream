@@ -81,7 +81,8 @@
 #
 #   mesh-udev-stream            ensure the listener, then one read pass: emit, board, advance baseline
 #   mesh-udev-stream --check    read-only: same reading, no ensure, no write, no board post
-#   mesh-udev-stream --status   last reading, no new read
+#   mesh-udev-stream --status   last reading + a LIVE orphan-listener census, no new read
+#   mesh-udev-stream --reap-orphans  kill every listener family holding a lock that is not ours
 #   mesh-udev-stream --tail [N] the last N named events (default 20)
 #   mesh-udev-stream --daemon   the listener itself (foreground; refuses to double-start)
 #   mesh-udev-stream --ensure   start the listener if none holds the lock; print what it did
@@ -135,6 +136,38 @@ listener_alive(){
   if flock -n 8 2>/dev/null; then flock -u 8 2>/dev/null; exec 8>&-; return 1; fi
   exec 8>&-; return 0
 }
+
+# --- the LEAK CENSUS ------------------------------------------------------------------------------
+# "liveness is the lock, not a pid" above is a STRONGER claim than a name match precisely because it
+# is blind to a listener holding a DIFFERENT lock file — and that blindness is total: an orphan armed
+# by a sandboxed --test under a tmp lock is invisible to every check this tool has, forever, while
+# every reading still says a clean `listener=up`. Measured 2026-08-21 on mesh-home: 5 orphan families
+# (20 procs, 5 udevadm monitors) holding deleted /tmp/.../e.lock paths, 3 of them from mesh-doctor's
+# hourly --test sweep, none visible to anything. So the census is the ONLY instrument that can see
+# this class, and it has to be a NUMBER on the reading, not a log line nobody reads.
+# Counted by fd 9 (the daemon's own lock fd), never by cmdline alone — the node's REAL reflex wears
+# the identical cmdline, so a name match would count the healthy listener as a leak.
+# No `ps`: /proc is read directly (a pgid via ps is also filtered to death inside a mind pane), and a
+# proc we cannot read (another uid, or one that exited mid-walk) is SKIPPED, never counted.
+leak_census(){   # prints "<families> <procs>" — families = distinct foreign lock paths
+  local canon="$LOCKF" p c fd n=0 fam=0 seen=" "
+  for p in /proc/[0-9]*; do
+    # a proc that exits mid-walk makes the REDIRECTION fail, and that error is printed by the
+    # shell, not by tr — so tr's own 2>/dev/null does not silence it. Brace-group and redirect.
+    { c="$(tr '\0' ' ' < "$p/cmdline")"; } 2>/dev/null || continue
+    case "$c" in *mesh-udev-stream*--daemon*) : ;; *) continue;; esac
+    fd="$(readlink "$p/fd/9" 2>/dev/null)" || continue
+    [ -n "$fd" ] || continue
+    fd="${fd% (deleted)}"
+    [ "$fd" = "$canon" ] && continue
+    n=$((n+1))
+    case "$seen" in *" $fd "*) : ;; *) seen="$seen$fd "; fam=$((fam+1));; esac
+  done
+  printf '%s %s\n' "$fam" "$n"
+}
+
+# The pgid of a pid, read from /proc (field 3 after the comm parenthesis) rather than `ps -o pgid=`.
+pgid_of(){ sed -n 's/.*) //p' "/proc/$1/stat" 2>/dev/null | awk '{print $3}'; }
 
 # --- the listener ---------------------------------------------------------------------------------
 # One udevadm, one gawk folding each property block into one line, one appending shell that rotates.
@@ -320,7 +353,12 @@ pass(){   # $1 = 1 write / 0 read-only
   else sdelta=$(( seq - bseq )); fi
   v="$(decide "$live" "$start" "$nowe" "$win" "$events" "$sdelta" "$bootchg")"
   rc="${v#*|}"; rc="${rc%%|*}"; cov="${v#*|*|}"; cov="${cov%%|*}"; msg="${v#*|*|*|}"; v="${v%%|*}"
-  line="$(stamp) $v events=$events window=${win}s coverage=${cov}% seqdelta=$sdelta seq-total=$seq stream-sgap=$sgap listener=$( [ "$live" = 1 ] && echo up || echo down )$( [ "$live" = 1 ] && printf " since=%s" "$start" )${names:+ named=$names} :: $msg"
+  local cens cfam cprocs
+  cens="$(leak_census)"; cfam="${cens%% *}"; cprocs="${cens##* }"
+  line="$(stamp) $v events=$events window=${win}s coverage=${cov}% seqdelta=$sdelta seq-total=$seq stream-sgap=$sgap listener=$( [ "$live" = 1 ] && echo up || echo down )$( [ "$live" = 1 ] && printf " since=%s" "$start" ) leaked=$cfam${names:+ named=$names} :: $msg"
+  # A leak does not change the VERDICT (the stream is being read either way) — it gets its own loud
+  # clause, so `leaked=0` on every healthy line is what makes a non-zero one legible.
+  [ "${cfam:-0}" -gt 0 ] 2>/dev/null && line="$line || LEAK: $cfam orphan listener famil(y/ies), $cprocs proc(s), holding a lock that is not $LOCKF — a --test that redirects the lock and dies before its reap leaves exactly this, and the lock-based liveness above is blind to it BY CONSTRUCTION; reap with mesh-udev-stream --reap-orphans"
   [ -n "$names" ] && line="$line || the names come from udev's own post-rule properties, the only naming instrument here that sees removals and non-USB subsystems"
   printf '%s\n' "$line"
   [ "$write" = 1 ] || return "$rc"
@@ -348,6 +386,60 @@ pass(){   # $1 = 1 write / 0 read-only
 run_test(){
   local fails=0 out
   F(){ echo "smoke-test: FAIL ($1)" >&2; fails=$((fails+1)); }
+
+  # --- THE TEST REAPS WHAT IT SPAWNS, ON EVERY EXIT PATH -----------------------------------------
+  # This test arms REAL listeners under tmp lock files, and `ensure` starts them with `setsid nohup`
+  # — so they do not die with this shell, and `rm -rf $sb` only deletes the path out from under an
+  # fd that stays open forever. The happy path already called --stop on each; that is not the leak.
+  # The leak is every OTHER exit: a timeout (mesh-doctor drives this hourly under one), a SIGTERM, a
+  # `set -u` blowup, an `exit 2` from the n/a branch. Measured 2026-08-21: killing --test mid-run
+  # leaves a full family (daemon + 2 subshells + udevadm monitor) holding a DELETED lock, and 5 such
+  # families were live on mesh-home when this was written. A test that leaks is not green.
+  REAP_DIRS=""
+  reap_sandbox(){   # kill the family armed under a sandbox dir, scoped by ITS OWN pidfile
+    local dir="$1" pid pgid i
+    { pid="$(tr -dc '0-9' < "$dir/e.pid")"; } 2>/dev/null || return 0
+    [ -n "$pid" ] || return 0
+    # the pid is only trusted while it still names a listener (pids are reused) — same rule as --stop
+    case "$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)" in *mesh-udev-stream*--daemon*) : ;; *) return 0;; esac
+    pgid="$(pgid_of "$pid")"; [ -n "$pgid" ] || pgid="$pid"
+    kill -TERM -- -"$pgid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
+    for i in 1 2 3 4 5 6 7 8 9 10; do [ -d "/proc/$pid" ] || return 0; sleep 0.2; done
+    kill -KILL -- -"$pgid" 2>/dev/null
+    return 0
+  }
+  test_reap_all(){ local d; for d in $REAP_DIRS; do reap_sandbox "$d"; done; }
+  # ...and the sandbox DIRECTORY too: `rm -rf $sb` also only ran on the happy path, so an
+  # interrupted run left its tmpdir behind as well (766 /tmp/tmp.* on this node when this was
+  # written). Reap first, remove second — never the other way round, or the pidfile that scopes
+  # the kill is gone before it is read.
+  # A pidfile-scoped reap is not enough on the interrupt path: the reaped run's own `--ensure`
+  # CHILD can still be mid-flight, and `listener_alive`/`daemon` both `mkdir -p` — so the child
+  # re-creates the sandbox dir and can arm a daemon AFTER the trap already reaped and removed it.
+  # Seen live (an e.lock-only tmpdir reappearing at 13:46:24Z). So the trap sweeps a SECOND time,
+  # by fd 9 against the registered dirs — the same instrument as the census, which needs no pidfile
+  # and no cooperation from a process that was never registered anywhere.
+  reap_under_dirs(){
+    local p c fd d pid pgid hit
+    for p in /proc/[0-9]*; do
+      { c="$(tr '\0' ' ' < "$p/cmdline")"; } 2>/dev/null || continue
+      case "$c" in *mesh-udev-stream*--daemon*) : ;; *) continue;; esac
+      fd="$(readlink "$p/fd/9" 2>/dev/null)" || continue
+      fd="${fd% (deleted)}"; hit=0
+      for d in $REAP_DIRS; do case "$fd" in "$d"/*) hit=1;; esac; done
+      [ "$hit" = 1 ] || continue
+      pid="${p#/proc/}"; pgid="$(pgid_of "$pid")"; [ -n "$pgid" ] || pgid="$pid"
+      kill -TERM -- -"$pgid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
+    done
+  }
+  test_clean_all(){ local d
+    test_reap_all; reap_under_dirs; sleep 0.5; reap_under_dirs
+    for d in $REAP_DIRS; do case "$d" in /tmp/tmp.*) rm -rf "$d";; esac; done; }
+  trap 'test_clean_all' EXIT
+  # measured BEFORE anything is armed, because the census counts the whole node: another mind's
+  # --test running right now is a real orphan-shaped reading that is not OURS. Every assertion
+  # below is therefore a DELTA against this, never an absolute 0.
+  local CENS0 FAM0; CENS0="$(leak_census)"; FAM0="${CENS0%% *}"
   local NOW=1000000
 
   # (1) the reading this tool exists for: named events in a fully covered window.
@@ -472,6 +564,7 @@ run_test(){
   # (10) LIVE, and END TO END: a real listener, a real event through the real udevadm, a real read.
   #      A wrapper's test that drives only stubs has never once touched the thing it wraps.
   local sb; sb="$(mktemp -d)"
+  REAP_DIRS="$REAP_DIRS $sb"   # registered BEFORE anything is armed under it
   local E=( "MESH_UDEV_STREAM_LOG=$sb/e.log" "MESH_UDEV_STREAM_STATE=$sb/e.state" "MESH_UDEV_STREAM_BASE=$sb/e.base"
             "MESH_UDEV_STREAM_LOCK=$sb/e.lock" "MESH_UDEV_STREAM_STARTF=$sb/e.start" "MESH_UDEV_STREAM_DLOG=$sb/e.dlog"
             "MESH_UDEV_STREAM_MARK=$sb/e.mark" "MESH_UDEV_STREAM_PIDF=$sb/e.pid" "MESH_UDEV_STREAM_CHAT=0" )
@@ -514,6 +607,7 @@ run_test(){
   #      the first's whole process group must be gone — killing the parent alone orphans the udevadm
   #      that actually holds the udev socket, which then lives forever with nothing draining it.
   local sb2; sb2="$(mktemp -d)"
+  REAP_DIRS="$REAP_DIRS $sb2"   # registered BEFORE anything is armed under it
   local E2=( "MESH_UDEV_STREAM_LOG=$sb2/e.log" "MESH_UDEV_STREAM_STATE=$sb2/e.state" "MESH_UDEV_STREAM_BASE=$sb2/e.base"
              "MESH_UDEV_STREAM_LOCK=$sb2/e.lock" "MESH_UDEV_STREAM_STARTF=$sb2/e.start" "MESH_UDEV_STREAM_DLOG=$sb2/e.dlog"
              "MESH_UDEV_STREAM_MARK=$sb2/e.mark" "MESH_UDEV_STREAM_PIDF=$sb2/e.pid" "MESH_UDEV_STREAM_CHAT=0" )
@@ -546,6 +640,37 @@ run_test(){
   kill -0 "$stranger" 2>/dev/null || F "--stop KILLED a stranger whose pid the pidfile happened to name"
   kill -TERM "$stranger" "$holder" 2>/dev/null; wait "$stranger" "$holder" 2>/dev/null
   rm -rf "$sb3"
+
+  # (11c) THE LEAK DETECTOR, driven by a REAL leak. Everything above proves the SINGLETON; nothing
+  #       above can prove there is no SECOND listener, because `listener_alive` asks "is my lock
+  #       held" and an orphan holds a different lock — the very property that makes the lock check
+  #       stronger than a name match makes it blind here, BY CONSTRUCTION. So arm a genuine orphan,
+  #       watch the census count it and the reading RENDER it, reap it, watch the number go back.
+  #       A detector nobody has seen COUNT is the same as one that always prints 0.
+  local sb4; sb4="$(mktemp -d)"
+  REAP_DIRS="$REAP_DIRS $sb4"
+  local pre_f; pre_f="$(leak_census)"; pre_f="${pre_f%% *}"
+  local E4=( "MESH_UDEV_STREAM_LOG=$sb4/e.log" "MESH_UDEV_STREAM_STATE=$sb4/e.state" "MESH_UDEV_STREAM_BASE=$sb4/e.base"
+             "MESH_UDEV_STREAM_LOCK=$sb4/e.lock" "MESH_UDEV_STREAM_STARTF=$sb4/e.start" "MESH_UDEV_STREAM_DLOG=$sb4/e.dlog"
+             "MESH_UDEV_STREAM_MARK=$sb4/e.mark" "MESH_UDEV_STREAM_PIDF=$sb4/e.pid" "MESH_UDEV_STREAM_CHAT=0" )
+  env "${E4[@]}" bash "${BASH_SOURCE[0]}" --ensure >/dev/null 2>&1
+  local leak_f leak_p leak_c; leak_c="$(leak_census)"; leak_f="${leak_c%% *}"; leak_p="${leak_c##* }"
+  [ "$leak_f" = "$(( pre_f + 1 ))" ] || F "the census did not count a listener armed under a FOREIGN lock (expected $(( pre_f + 1 )) famil(y/ies), got $leak_f; procs=$leak_p) — the leak class stays invisible"
+  # ...and it must be ON the reading a human/watchdog reads, not only inside a helper.
+  out="$(bash "${BASH_SOURCE[0]}" --status 2>&1)"
+  case "$out" in *"leak-census: leaked=$leak_f"*) : ;; *) F "--status did not render the live census beside the reading (got: $(printf '%s' "$out" | tail -2 | tr '\n' ' '))";; esac
+  out="$(MESH_UDEV_STREAM_LOG=$sb4/r.log MESH_UDEV_STREAM_STATE=$sb4/r.state MESH_UDEV_STREAM_BASE=$sb4/r.base \
+         MESH_UDEV_STREAM_CHAT=0 bash "${BASH_SOURCE[0]}" --check 2>&1)"
+  case "$out" in *" leaked=$leak_f"*) : ;; *) F "the reading line does not carry leaked= beside listener= (got: $out)";; esac
+  case "$out" in *"|| LEAK:"*) : ;; *) F "a non-zero census produced no loud clause on the reading — a number in a field nobody looks at is not a detector (got: $out)";; esac
+  # THE REAP, asserted. The trap would also do this on any other exit path; here we watch it work.
+  reap_sandbox "$sb4"
+  local post_f; post_f="$(leak_census)"; post_f="${post_f%% *}"
+  [ "$post_f" = "$pre_f" ] || F "the test's own reaper did not reap the listener it spawned (census $pre_f -> $leak_f -> $post_f) — a test that leaks is not green"
+  out="$(bash "${BASH_SOURCE[0]}" --status 2>&1)"
+  case "$out" in *"leak-census: leaked=$pre_f"*) : ;; *) F "--status still reports the reaped orphan (got: $(printf '%s' "$out" | tail -2 | tr '\n' ' '))";; esac
+  rm -rf "$sb4"
+
   # a DOWN pass (lock free) is rc 2 and says blind.
   local d2; d2="$(mktemp -d)"
   out="$(MESH_UDEV_STREAM_LOG=$d2/n.log MESH_UDEV_STREAM_STATE=$d2/n.state MESH_UDEV_STREAM_BASE=$d2/n.base \
@@ -555,8 +680,15 @@ run_test(){
   case "$out" in *"listener=down"*) : ;; *) F "the DOWN line does not say the listener is down";; esac
   rm -rf "$sb" "$d2"
 
+  # The whole test, judged by what it left running: every sandbox it armed is registered in
+  # REAP_DIRS and reaped here (the EXIT trap catches every path this line is not reached on), and
+  # the census must be back where it started. This assertion is the one that would have caught the
+  # 5 orphan families that were live on this node when it was written.
+  test_reap_all
+  local FAM1; FAM1="$(leak_census)"; FAM1="${FAM1%% *}"
+  [ "$FAM1" = "$FAM0" ] || F "this --test LEAKED listener famil(y/ies): census $FAM0 -> $FAM1 — it armed real setsid'd daemons and did not reap them"
   [ "$fails" = 0 ] || { echo "smoke-test: FAILED ($fails)" >&2; exit 1; }
-  echo "smoke-test: ok (EVENTS/QUIET/DOWN/PARTIAL/GAP/REBOOT/BASELINE each driven; a dead listener never reads quiet; coverage rendered and a partial count labelled a floor; the counter cross-check overrides silence; the fold driven on REAL udevadm output incl. its header and a seqnum gap; scanners span a rotation and name a REMOVAL; a real listener armed, singleton by lock, capturing a real triggered uevent and named by the read; --check writes nothing; --stop is scoped by its own pidfile, reaps its whole process group and leaves a second listener untouched)"
+  echo "smoke-test: ok (EVENTS/QUIET/DOWN/PARTIAL/GAP/REBOOT/BASELINE each driven; a dead listener never reads quiet; coverage rendered and a partial count labelled a floor; the counter cross-check overrides silence; the fold driven on REAL udevadm output incl. its header and a seqnum gap; scanners span a rotation and name a REMOVAL; a real listener armed, singleton by lock, capturing a real triggered uevent and named by the read; --check writes nothing; --stop is scoped by its own pidfile, reaps its whole process group and leaves a second listener untouched; a REAL orphan under a foreign lock driven, counted by the census, rendered on --status and on the reading, reaped and counted back to zero; and this run leaked nothing)"
   exit 0
 }
 
@@ -566,8 +698,50 @@ case "${1:-}" in
   --ensure)  ensure; exit $? ;;
   --stop)    stop_listener; exit $? ;;
   --check)   pass 0; exit $? ;;
-  --status)  [ -s "$STATE" ] && { cat "$STATE"; exit 0; }; echo "no reading yet ($STATE)"; exit 2 ;;
+  --status)  # The census is measured NOW, never read back off the stored line: an orphan can be armed
+             # after the last pass, and a stale number is not a leak detector. It prints on EVERY
+             # status, including 0 — a field that only appears when it is non-zero is a field whose
+             # absence cannot be distinguished from a reader that never rendered it.
+             st_cens="$(leak_census)"; st_fam="${st_cens%% *}"; st_procs="${st_cens##* }"
+             if [ -s "$STATE" ]; then cat "$STATE"; st_rc=0; else echo "no reading yet ($STATE)"; st_rc=2; fi
+             printf 'leak-census: leaked=%s orphan listener famil(y/ies) / %s proc(s) holding a lock that is not %s\n' \
+               "$st_fam" "$st_procs" "$LOCKF"
+             [ "${st_fam:-0}" -gt 0 ] 2>/dev/null && printf '%s\n' \
+               "  ^ the lock-based liveness check cannot see these BY CONSTRUCTION (they hold a different lock); reap with: $0 --reap-orphans"
+             exit "$st_rc" ;;
+  --reap-orphans)
+             # On-demand ONLY, never wired: it kills every listener family holding a lock that is not
+             # $LOCKF — which is the right scope for orphans and also, deliberately, would take out a
+             # --test's live sandbox listener. The node's real reflex is excluded by the same fd-9
+             # comparison the census uses, not by a name match.
+             rp_n=0
+             for rp_p in /proc/[0-9]*; do
+               { rp_c="$(tr '\0' ' ' < "$rp_p/cmdline")"; } 2>/dev/null || continue
+               case "$rp_c" in *mesh-udev-stream*--daemon*) : ;; *) continue;; esac
+               rp_fd="$(readlink "$rp_p/fd/9" 2>/dev/null)" || continue
+               rp_fd="${rp_fd% (deleted)}"
+               [ -n "$rp_fd" ] && [ "$rp_fd" != "$LOCKF" ] || continue
+               rp_pid="${rp_p#/proc/}"; rp_g="$(pgid_of "$rp_pid")"; [ -n "$rp_g" ] || rp_g="$rp_pid"
+               # the whole process group: the udevadm holding the udev socket is a CHILD, and killing
+               # the parent alone orphans it with nothing draining it (same reason --stop does this).
+               kill -TERM -- -"$rp_g" 2>/dev/null || kill -TERM "$rp_pid" 2>/dev/null
+               rp_n=$((rp_n+1))
+             done
+             sleep 1
+             for rp_p in /proc/[0-9]*; do
+               { rp_c="$(tr '\0' ' ' < "$rp_p/cmdline")"; } 2>/dev/null || continue
+               case "$rp_c" in *mesh-udev-stream*--daemon*) : ;; *) continue;; esac
+               rp_fd="$(readlink "$rp_p/fd/9" 2>/dev/null)" || continue
+               rp_fd="${rp_fd% (deleted)}"
+               [ -n "$rp_fd" ] && [ "$rp_fd" != "$LOCKF" ] || continue
+               rp_pid="${rp_p#/proc/}"; rp_g="$(pgid_of "$rp_pid")"; [ -n "$rp_g" ] || rp_g="$rp_pid"
+               kill -KILL -- -"$rp_g" 2>/dev/null
+             done
+             sleep 0.5
+             rp_left="$(leak_census)"
+             echo "reap-orphans: signalled $rp_n orphan listener famil(y/ies) (whole process group each); census now ${rp_left%% *} famil(y/ies) / ${rp_left##* } proc(s)"
+             [ "${rp_left%% *}" = 0 ] && exit 0 || exit 1 ;;
   --tail)    n="${2:-20}"; for f in "$LOG.1" "$LOG"; do [ -f "$f" ] && cat "$f"; done 2>/dev/null | tail -n "$n"; exit 0 ;;
   ""|--run)  ensure >/dev/null 2>&1; pass 1; exit $? ;;
-  *) echo "usage: mesh-udev-stream [--check|--status|--tail N|--ensure|--daemon|--stop|--test]" >&2; exit 64 ;;
+  *) echo "usage: mesh-udev-stream [--check|--status|--tail N|--ensure|--daemon|--stop|--reap-orphans|--test]" >&2; exit 64 ;;
 esac
