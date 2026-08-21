@@ -1,0 +1,543 @@
+#!/usr/bin/env bash
+# mesh-devcd-catch — CATCH the kernel's devcoredump before it deletes itself.
+#
+# WHY (discover find 2026-08-21T08:07Z, health verify 08:24:27Z + report
+# ~/.mesh/knowledge/verify-devcoredump-fault-evidence-channel-mesh-home-20260821.md, probe
+# ~/.mesh/knowledge/probe-devcoredump-fault-evidence-mesh-home-20260821.sh → rc 0
+# "armed, empty, produced-for, unwatched"):
+#
+# When a driver's firmware crashes, the kernel takes a forensic dump and publishes it at
+# /sys/class/devcoredump/devcdN/data. **It then DELETES it — and the retention on THIS kernel is
+# exactly 300 s.** That number is not an upstream #define quoted from memory; health extracted it
+# from this running kernel's own binary: KASLR slide 0x28e00000 off _stext, dev_coredumpm+0x216
+# reads `mov $0x493e0,%ecx; call queue_delayed_work_on` = 300000 jiffies, and
+# /boot/config-6.8.0-138-generic has CONFIG_HZ=1000 → 300 s. There is NO knob to extend it: the
+# devcoredump class carries exactly one attribute, `disabled`.
+#
+# **THIS IS WHY THE TOOL IS A LISTENER AND NOT A CADENCE.** A */5 cron races a 300 s self-deleting
+# artifact and will silently miss dumps — and the miss looks exactly like "no crash happened". The
+# channel needs something that copies the dump out THE MOMENT IT APPEARS. So the primary mode is
+# --listen: an unprivileged `udevadm monitor --kernel --subsystem-match=devcoredump` reader that
+# extracts on the `add` uevent, milliseconds in, not minutes.
+#
+# WHY THIS NODE SPECIFICALLY: the sole uplink is an RTL8822BU USB dongle that wedges (moved through
+# five USB paths, faulting at every one — CLAUDE.local.md). `rtw88_core` IS a registered devcoredump
+# producer (imports dev_coredumpv, carries the fw-crash dump path; probe leg D). So today every
+# firmware crash on the node's ONLY path destroys its own evidence unwatched — and health measured
+# that the fault VIEW was inverted relative to that evidence: mesh-hw-fault-watch's radio alphabet
+# was (fail|error|timed out), so `firmware crash, start reset and recover`, `Firmware Coredump Nth`
+# and `fw crash dump's length is 0` all NO-MATCHED while `dump fw fifo fail` matched — it paged
+# exactly when the dump could NOT be taken and was silent for the 300 s a real dump was readable.
+# That half is FIXED and landed (ffd48e6, 'crash' added to the alphabet). This tool is the other
+# half: the alphabet now tells us a dump EXISTS; this takes the dump.
+#
+#   mesh-devcd-catch                one SWEEP pass: capture any live dump now (the cron BACKSTOP)
+#   mesh-devcd-catch --sweep        same, explicit
+#   mesh-devcd-catch --listen       THE PRIMARY: block on uevents, capture the instant one appears
+#   mesh-devcd-catch --status       channel arm state + listener state + last capture (no capture)
+#   mesh-devcd-catch --list         the dumps captured on disk (size, failing device, sha256)
+#   mesh-devcd-catch --test         smoke test (exit 2 where the class is absent)
+#
+# TWO LAYERS, DELIBERATELY, AND THEY ARE NOT REDUNDANT:
+#   · --listen is the catch. Registered in ~/.mesh/supervise.list, so mesh-supervise (every 120 s
+#     from the always-on, systemd Restart=always mesh-liveness-loop) restarts it if it dies.
+#   · --sweep is the BACKSTOP for the listener's own death window. Coverage is window/cadence
+#     (a-senses-coverage-is-window-over-cadence): the artifact lives 300 s, the sweep runs every
+#     60 s, so a dump born while the listener is down still gets ~5 chances. The sweep also REPORTS
+#     the listener being down — a backstop that silently carries the load is a backstop nobody fixes.
+#
+# Design constraints:
+#   - ARMING NEEDS NO PRIVILEGE, READING THE DUMP DOES. `udevadm monitor` receives as uid 1000
+#     (asserted for real, off the tmux path, in health's probe leg F). But devcdN/data is 0600 root,
+#     so extraction is one `sudo -n cat` (NOPASSWD here). --test asserts that privilege path for
+#     REAL against a live root-owned sysfs file, never by assuming it.
+#   - THE MODE BIT IS NOT THE READ (a-mode-bit-is-not-the-write, one ring out): we never gate on
+#     `[ -r data ]`. We ATTEMPT the read and check the bytes that came back. A 0-byte result is a
+#     FAILURE, never a capture — an empty .bin filed as evidence is the plausible-constant trap.
+#   - A FAILED CAPTURE IS NOT MARKED SEEN, so the sweep retries inside the remaining window; but a
+#     key that has failed $FAILCAP times is retired LOUDLY, so a permanently unreadable dump cannot
+#     hot-loop the listener.
+#   - ABSOLUTE PATHS FOR EVERY HELPER. cron's PATH is /usr/bin:/bin and health lost a probe leg to
+#     exactly this (modinfo is /usr/sbin) while the summary still printed a verdict. Any n/a leg
+#     here makes the summary say UNASSERTED — never a pass.
+#   - LOUD: every capture writes the durable ledger ~/.mesh/devcd-catch.log, calls mesh-trace, and
+#     posts one board [fyi]. The ledger is DELIBERATELY NOT the cron stdout log — sharing them
+#     double-counts the rate (the lesson from mesh-exit-node-lan-heal).
+#   - DEPLOYING THIS TOOL KILLS ITS OWN LISTENER (measured while building it, 2026-08-21): bash
+#     reads a script incrementally, so `cp` over ~/.local/bin/mesh-devcd-catch truncates the file
+#     under the running --listen and it dies mid-read. That is survivable BY DESIGN, not by luck —
+#     mesh-supervise restarts it within 120s and the */1 sweep covers the gap — but if you deploy
+#     during a live 300s window, sweep once by hand afterwards.
+#   - **READ THE CAPTURE RATE AS THE DONGLE FAULT RATE.** A rising count is the RTL8822BU degrading;
+#     it is not a node quietly healing itself.
+#   - WE NEVER WRITE TO devcdN/data. Writing frees the dump immediately — it would destroy the
+#     artifact for any other reader inside the window. We only read.
+#   - WE NEVER FIRE A DUMP. /sys/kernel/debug/ieee80211/phy4/rtw88/fw_crash exists on this node and
+#     is FORBIDDEN: it crashes the firmware of the SOLE UPLINK, i.e. it severs the channel the
+#     result would be reported over — self-defeating, not reversible from outside itself.
+#
+# reflex-cadence: * * * * *
+# reflex-args: --sweep
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+[ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
+
+CLASS="${DEVCD_CLASS:-/sys/class/devcoredump}"     # override exists for --test's synthetic arm ONLY
+STATE_DIR="${MESH_STATE_DIR:-$HOME/.mesh}"
+DUMP_DIR="${MESH_DEVCD_DIR:-$STATE_DIR/devcd}"
+LEDGER="${MESH_DEVCD_LEDGER:-$STATE_DIR/devcd-catch.log}"
+SEEN="${MESH_DEVCD_SEEN:-$STATE_DIR/.devcd-catch-seen}"
+LOCK="${MESH_DEVCD_LOCK:-$STATE_DIR/.devcd-catch.lock}"
+CHAT="${MESH_DEVCD_CHAT:-1}"
+KEEP="${MESH_DEVCD_KEEP:-20}"          # newest N .bin kept
+MAXMB="${MESH_DEVCD_MAXMB:-512}"       # and total bytes capped
+FAILCAP="${MESH_DEVCD_FAILCAP:-5}"     # retire a key after this many failed reads
+CHATCAP="${MESH_DEVCD_CHATCAP:-6}"     # board posts per rolling hour; a burst collapses to one line
+
+SUDO=/usr/bin/sudo; UDEVADM=/usr/bin/udevadm; SHA=/usr/bin/sha256sum
+STAT=/usr/bin/stat; FLOCK=/usr/bin/flock; TIMEOUT=/usr/bin/timeout
+STDBUF=/usr/bin/stdbuf; JOURNALCTL=/usr/bin/journalctl
+
+mkdir -p "$STATE_DIR" "$DUMP_DIR"
+now(){ date -u +%Y-%m-%dT%H:%M:%SZ; }
+say(){ printf '%s\n' "$*"; }
+
+# ── loudness ────────────────────────────────────────────────────────────────────────────────────
+# NB: args are joined with REAL tabs here. `ledger "a\tb"` in a double-quoted bash string writes a
+# literal backslash-t, not a separator — awk -F'\t' would then see one field and every rate query
+# (the board cap, --status) would silently read zero. Pass fields as separate ARGS.
+ledger(){ local IFS=$'\t'; printf '%s\t%s\n' "$(now)" "$*" >>"$LEDGER"; }
+trace(){ command -v mesh-trace >/dev/null 2>&1 && mesh-trace "devcd-catch: $*" >/dev/null 2>&1; }
+board(){ # one [fyi] per capture, capped per rolling hour so a crash-loop cannot storm the board
+  [ "$CHAT" = 1 ] || return 0
+  command -v mesh-chat >/dev/null 2>&1 || return 0
+  local cutoff n; cutoff=$(date -u -d '-1 hour' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)
+  n=$(awk -v c="$cutoff" -F'\t' '$1>=c && $2 ~ /^captured/' "$LEDGER" 2>/dev/null | wc -l)
+  if [ "${n:-0}" -gt "$CHATCAP" ]; then
+    [ "$n" -eq $((CHATCAP+1)) ] && mesh-chat "[fyi] devcd-catch: BURST — >$CHATCAP dumps captured in the last hour; board posts suppressed, read the ledger $LEDGER and mesh-devcd-catch --list. A rising capture rate IS the RTL8822BU fault rate." >/dev/null 2>&1
+    return 0
+  fi
+  mesh-chat "$*" >/dev/null 2>&1
+}
+
+# ── the seen-set ────────────────────────────────────────────────────────────────────────────────
+seen_status(){ [ -f "$SEEN" ] && awk -F'\t' -v k="$1" '$1==k{print $2}' "$SEEN" | tail -1; }
+seen_fails(){  [ -f "$SEEN" ] && awk -F'\t' -v k="$1" '$1==k && $2=="fail"' "$SEEN" | wc -l || echo 0; }
+seen_mark(){   printf '%s\t%s\t%s\n' "$1" "$2" "$(now)" >>"$SEEN"; }
+
+# ONE guard, taken by BOTH entrypoints. The listener and the */1 cron sweep share the seen-set and
+# the dump dir; without this they interleave and one dump gets filed twice (which would make the
+# capture rate stop meaning the fault rate). Never nest a with_lock inside a with_lock.
+with_lock(){ exec 9>"$LOCK" || return 1; "$FLOCK" -w 30 9 || { say "busy: another mesh-devcd-catch holds $LOCK"; return 1; }; "$@"; local r=$?; exec 9>&-; return $r; }
+
+# ── capture ONE dump directory. The only code path; --listen and --sweep both come here ─────────
+capture_one(){
+  local d="$1" dev key mt fdev drv out part size sha ctx fails
+  dev=$(basename "$d")
+  # sysfs class-device dir mtime is instantiation, i.e. when the kernel created this dump. Reading
+  # an ATTRIBUTE restamps the attribute, not the directory (a-sysfs-attribute-mtime-is-dentry-...),
+  # so the pair (devname, dir-mtime) is a stable identity for one dump across devcdN reuse.
+  mt=$("$STAT" -c %Y "$d" 2>/dev/null || echo 0)
+  key="$dev@$mt"
+
+  case "$(seen_status "$key")" in
+    captured) return 3 ;;                    # already ours
+    retired)  return 3 ;;
+  esac
+  fails=$(seen_fails "$key")
+  if [ "${fails:-0}" -ge "$FAILCAP" ]; then
+    seen_mark "$key" retired
+    ledger retired "$key" "unreadable after $fails attempts"
+    trace "RETIRED $key — unreadable after $fails attempts"
+    board "[fyi] devcd-catch: a live devcoredump ($key) was UNREADABLE after $fails attempts and is now retired — the 300s window will close on uncaptured evidence. Check sudo -n and $CLASS/$dev/data."
+    return 2
+  fi
+
+  fdev=$(readlink -f "$d/failing_device" 2>/dev/null)
+  drv=$(basename "$(readlink -f "$d/failing_device/driver" 2>/dev/null)" 2>/dev/null)
+  [ -n "$drv" ] && [ "$drv" != "." ] || drv=unknown
+
+  # The dump's OWN identity goes in the filename, not just the capture clock: a name keyed only on
+  # the moment collides for two captures in the same second and the later one overwrites the earlier
+  # (a-name-keyed-on-the-moment-cannot-converge-on-re-processing). Found by a mutant drill, 2026-08-21.
+  out="$DUMP_DIR/$(date -u +%Y%m%dT%H%M%SZ)-$dev-$drv-$mt.bin"
+  local _i=0; while [ -e "$out" ]; do _i=$((_i+1)); out="${out%.bin}.$_i.bin"; [ "$_i" -gt 50 ] && break; done
+  part="$out.part"
+  # THE MODE BIT IS NOT THE READ: attempt it, then judge the BYTES. Direct read first (a synthetic
+  # fixture and a future non-root-owned attr both work without privilege); sudo -n only if needed.
+  if ! cat "$d/data" >"$part" 2>/dev/null || [ ! -s "$part" ]; then
+    "$SUDO" -n cat "$d/data" >"$part" 2>/dev/null
+  fi
+  size=$("$STAT" -c %s "$part" 2>/dev/null || echo 0)
+  if [ "${size:-0}" -le 0 ]; then
+    rm -f "$part"
+    seen_mark "$key" fail
+    ledger FAILED "$key" "dev=$dev drv=$drv read returned 0 bytes (attempt $((fails+1))/$FAILCAP)"
+    trace "FAILED read of $CLASS/$dev/data (0 bytes, attempt $((fails+1))/$FAILCAP)"
+    return 2
+  fi
+  mv -f "$part" "$out"
+  sha=$("$SHA" "$out" 2>/dev/null | cut -d' ' -f1)
+
+  # journal context: the driver lines that bracket this dump. Bounded, and it is CONTEXT, not proof.
+  ctx=$("$JOURNALCTL" -k --since '-3 min' --no-pager 2>/dev/null \
+        | grep -iE 'rtw_?[0-9a-z]+|devcoredump|firmware coredump|fw crash|Bluetooth' | tail -12)
+
+  { echo "captured:      $(now)"
+    echo "key:           $key"
+    echo "class-device:  $CLASS/$dev"
+    echo "failing-device:${fdev:-unknown}"
+    echo "driver:        $drv"
+    echo "bytes:         $size"
+    echo "sha256:        $sha"
+    echo "retention:     300s on this kernel (dev_coredumpm 300000 jiffies @ CONFIG_HZ=1000) —"
+    echo "               the kernel copy is gone; THIS file is the only remaining evidence."
+    echo "--- kernel journal, -3min ---"
+    printf '%s\n' "$ctx"
+  } >"${out%.bin}.meta"
+
+  seen_mark "$key" captured
+  ledger captured "$key" "drv=$drv bytes=$size sha=$sha file=$out"
+  trace "CAPTURED $key drv=$drv ${size}B -> $out"
+  board "[fyi] devcd-catch: CAUGHT a devcoredump before the kernel's 300s deleted it — $dev, driver=$drv, ${size} bytes, sha ${sha:0:12}. Evidence: $out (+ .meta). ${drv} is the sole-uplink combo chip if it reads rtw_8822bu — a rising capture rate IS the dongle fault rate, not a self-heal."
+  say "captured $key drv=$drv ${size}B -> $out"
+  return 0
+}
+
+prune(){ ( _prune ); }
+_prune(){
+  local n bytes f
+  cd "$DUMP_DIR" 2>/dev/null || return 0
+  n=$(ls -1t *.bin 2>/dev/null | wc -l)
+  if [ "${n:-0}" -gt "$KEEP" ]; then
+    ls -1t *.bin 2>/dev/null | tail -n +$((KEEP+1)) | while read -r f; do
+      rm -f "$f" "${f%.bin}.meta"; ledger pruned "$f" "over keep=$KEEP"
+    done
+  fi
+  bytes=$(du -sb "$DUMP_DIR" 2>/dev/null | cut -f1)
+  while [ "${bytes:-0}" -gt $((MAXMB*1024*1024)) ]; do
+    f=$(ls -1t *.bin 2>/dev/null | tail -1); [ -n "$f" ] || break
+    rm -f "$f" "${f%.bin}.meta"; ledger pruned "$f" "over maxmb=$MAXMB"
+    bytes=$(du -sb "$DUMP_DIR" 2>/dev/null | cut -f1)
+  done
+}
+
+listener_pid(){ pgrep -u "$(id -u)" -f -- '(mesh-devcd-catch|devcd-catch).*--listen' 2>/dev/null | head -1; }
+
+# ── SWEEP: one pass. The backstop, and the cron entrypoint ───────────────────────────────────────
+do_sweep(){
+  local rc=0 d found=0 lp
+  [ -d "$CLASS" ] || { say "n/a: $CLASS absent — kernel has no CONFIG_DEV_COREDUMP"; exit 2; }
+  for d in "$CLASS"/devcd*; do
+    [ -d "$d" ] || continue
+    found=$((found+1))
+    capture_one "$d"; case $? in 2) rc=1 ;; esac
+  done
+  prune
+  # a backstop that silently carries the load is a backstop nobody fixes
+  lp=$(listener_pid)
+  if [ -z "$lp" ] && [ "${MESH_DEVCD_EXPECT_LISTENER:-1}" = 1 ]; then
+    ledger listener-down sweep "no --listen process; only the 60s backstop covers the 300s window"
+    if [ ! -f "$STATE_DIR/.devcd-catch-downnote" ] \
+       || [ $(( $(date +%s) - $("$STAT" -c %Y "$STATE_DIR/.devcd-catch-downnote" 2>/dev/null || echo 0) )) -gt 3600 ]; then
+      : >"$STATE_DIR/.devcd-catch-downnote"
+      board "[fyi] devcd-catch: the --listen daemon is DOWN; the 60s sweep is the only cover for a 300s artifact. Restart: mesh-supervise (registry ~/.mesh/supervise.list)."
+    fi
+    say "listener: DOWN (sweep-only cover)"
+  fi
+  command -v mesh-state-touch >/dev/null 2>&1 && mesh-state-touch "$LEDGER" >/dev/null 2>&1
+  [ "$found" -eq 0 ] && say "sweep: no live dump in $CLASS"
+  return $rc
+}
+
+# ── LISTEN: the primary. Unprivileged uevent receive, capture on `add` ──────────────────────────
+do_listen(){
+  [ -d "$CLASS" ] || { say "n/a: $CLASS absent — kernel has no CONFIG_DEV_COREDUMP"; exit 2; }
+  ledger listener-up "pid=$$" "class=$CLASS"
+  trace "listener up (pid $$)"
+  # Catch anything already sitting in the window at start-up (a restart mid-window must not lose a
+  # dump), THEN block. The verdict is printed, not swallowed: --test's arm I needs it to prove the
+  # start-up sweep found nothing, otherwise a capture would not implicate the event loop at all.
+  say "startup-sweep: $(with_lock do_sweep 2>&1 | tr '\n' '; ')"
+  local line act path d i mon_pid
+  # THE LOOP RUNS IN THE MAIN SHELL, VIA PROCESS SUBSTITUTION — NOT `monitor | while read`.
+  # Measured 2026-08-21 while building this: with a pipeline, `while read` runs in a SUBSHELL, so the
+  # listener is TWO bash pids. Kill the parent and the subshell is reparented to init and keeps
+  # running; pgrep still finds a `mesh-devcd-catch --listen`, so mesh-supervise reads UP and never
+  # restarts — a leaked half greening the liveness check over a listener whose parent is dead
+  # (a-lock-based-singleton-is-blind-to-a-leaked-twin). One pid, and the monitor child is reaped.
+  #
+  # The receive itself is asserted REAL by --test arm D (a live udevadm takes real kernel uevents off
+  # the netlink socket). The MESH_DEVCD_MONITOR_CMD seam exists so arm I can drive THIS loop with
+  # real-format lines: no safe trigger can produce a devcoredump `add` on this node, and an
+  # unexercised loop body is the half of a listener that quietly does nothing.
+  if [ -n "${MESH_DEVCD_MONITOR_CMD:-}" ]; then
+    exec 8< <( $MESH_DEVCD_MONITOR_CMD 2>&1 )
+  else
+    exec 8< <( "$STDBUF" -oL "$UDEVADM" monitor --kernel --subsystem-match=devcoredump 2>&1 )
+  fi
+  mon_pid=$!
+  # EXIT alone leaks under SIGTERM (exit-only-traps-leak-under-sigterm): name every signal that
+  # actually reaches this process, or a supervisor's TERM orphans the udevadm child.
+  trap 'kill "$mon_pid" 2>/dev/null; ledger listener-down "pid=$$" "signalled"; exit 0' INT TERM HUP
+  trap 'kill "$mon_pid" 2>/dev/null' EXIT
+  while read -r line <&8; do
+    case "$line" in
+      KERNEL\[*)
+        act=$(printf '%s\n' "$line" | awk '{print $2}')
+        path=$(printf '%s\n' "$line" | awk '{print $3}')
+        [ "$act" = add ] || continue
+        case "$path" in */devcd*) ;; *) continue ;; esac
+        d="$CLASS/$(basename "$path")"
+        # the attrs are created before the uevent is emitted, but never assume a race away
+        for i in 1 2 3 4 5; do
+          [ -d "$d" ] && break
+          sleep 0.2
+        done
+        with_lock capture_one "$d"
+        with_lock prune
+        ;;
+    esac
+  done
+  ledger listener-down "pid=$$" "udevadm monitor stream ended"
+  return 1
+}
+
+do_status(){
+  local dis lp last
+  if [ -d "$CLASS" ]; then
+    dis=$(cat "$CLASS/disabled" 2>/dev/null)
+    case "$dis" in
+      0) say "channel:  ARMED (disabled=0) — dumps are taken, and deleted 300s later" ;;
+      1) say "channel:  MUTED (disabled=1) — every driver dump is discarded at birth, nothing to catch" ;;
+      *) say "channel:  UNREADABLE (disabled='${dis:-<empty>}')" ;;
+    esac
+    say "live now: $(ls -1d "$CLASS"/devcd* 2>/dev/null | wc -l) dump(s) in $CLASS"
+  else
+    say "channel:  ABSENT ($CLASS) — no CONFIG_DEV_COREDUMP"
+  fi
+  lp=$(listener_pid)
+  if [ -n "$lp" ]; then say "listener: UP (pid $lp)"
+  else say "listener: DOWN — only the 60s sweep covers the 300s window"; fi
+  say "captured: $(ls -1 "$DUMP_DIR"/*.bin 2>/dev/null | wc -l) dump(s) in $DUMP_DIR"
+  last=$(awk -F'\t' '$2=="captured"' "$LEDGER" 2>/dev/null | tail -1)
+  say "last:     ${last:-<none ever captured>}"
+}
+
+do_list(){
+  local f
+  shopt -s nullglob
+  for f in "$DUMP_DIR"/*.bin; do
+    printf '%s  %10s B  %s\n' "$(basename "$f")" "$("$STAT" -c %s "$f")" \
+      "$(grep -a '^failing-device:' "${f%.bin}.meta" 2>/dev/null | sed 's/^failing-device: *//')"
+  done
+  [ -z "$(ls -A "$DUMP_DIR" 2>/dev/null)" ] && say "no dumps captured yet ($DUMP_DIR empty)"
+  return 0
+}
+
+# ── TEST ────────────────────────────────────────────────────────────────────────────────────────
+# HONESTY OF THIS TEST, stated up front because it is the whole point:
+# there is NO safe real trigger on this node. Both registered producers — rtw88_core and bluetooth —
+# are the SAME combo chip that carries the sole uplink, so firing a dump severs the channel the
+# result would be reported over. Therefore the EXTRACTION path is driven against a SYNTHETIC class
+# directory and the summary SAYS SO; everything else — the class, the arm bit, the privilege path,
+# and the uevent receive — is asserted for REAL against live kernel state. Any leg that cannot run
+# renders UNASSERTED and the summary refuses to pass on it.
+do_test(){
+  local fail=0 unasserted="" rc out want got n n2
+  local td="" td2=""
+  [ -d "$CLASS" ] || { say "n/a: $CLASS absent — kernel has no CONFIG_DEV_COREDUMP"; exit 2; }
+  say "A  REAL class present: $CLASS"
+
+  # B — armed? (real read of live kernel state)
+  local dis; dis=$(cat "$CLASS/disabled" 2>/dev/null)
+  case "$dis" in
+    0) say "B  REAL armed: disabled=0" ;;
+    1) say "B  REAL MUTED: disabled=1 — nothing will ever be catchable until this is 0"; fail=1 ;;
+    *) say "B  FAIL: $CLASS/disabled unreadable (got '${dis:-<empty>}')"; fail=1 ;;
+  esac
+
+  # C — THE PRIVILEGE PATH, FOR REAL. Extraction is a `sudo -n cat` of a 0600 root sysfs file.
+  # Assert it against a live root-owned file under this very class, not by assuming NOPASSWD.
+  if "$SUDO" -n cat "$CLASS/disabled" >/dev/null 2>&1; then
+    say "C  REAL privilege path live: sudo -n read of a root sysfs file under $CLASS succeeded"
+  else
+    say "C  n/a UNASSERTED: sudo -n unavailable — a real devcdN/data (0600 root) could NOT be read"
+    unasserted="$unasserted C"
+  fi
+
+  # D — THE RECEIVE LEG, FOR REAL. A parser that never receives is not a listener.
+  local mon flt seen trig
+  mon=$(mktemp); flt=$(mktemp)
+  "$TIMEOUT" 6 "$UDEVADM" monitor --kernel --subsystem-match=devcoredump >"$flt" 2>&1 &
+  "$TIMEOUT" 6 "$UDEVADM" monitor --kernel >"$mon" 2>&1 &
+  sleep 1
+  if "$SUDO" -n "$UDEVADM" trigger --action=change --subsystem-match=mem 2>/dev/null; then trig=1; else trig=0; fi
+  wait 2>/dev/null
+  seen=$(grep -c 'KERNEL\[' "$mon" 2>/dev/null)
+  if [ "$trig" -eq 0 ]; then
+    say "D  n/a UNASSERTED: could not raise a control uevent (no sudo -n) — receive leg NOT asserted"
+    unasserted="$unasserted D"
+  elif [ "${seen:-0}" -ge 1 ]; then
+    say "D  REAL receive live: uid $(id -u) udevadm monitor took $seen kernel uevents off the netlink socket"
+    grep -q 'devcoredump' "$flt" || grep -q 'monitor will print' "$flt" \
+      || { say "D  FAIL: --subsystem-match=devcoredump was rejected by udevadm $("$UDEVADM" --version)"; fail=1; }
+  else
+    say "D  FAIL: 0 uevents after a real trigger — the receive leg is DEAD"; fail=1
+  fi
+  rm -f "$mon" "$flt"
+
+  # E/F/G — EXTRACTION, on a SYNTHETIC class dir (declared; no safe real trigger exists here)
+  td=$(mktemp -d); mkdir -p "$td/class/devcd7" "$td/out" "$td/faildev/driver"
+  head -c 4096 /dev/urandom >"$td/class/devcd7/data"
+  ln -s "$td/faildev" "$td/class/devcd7/failing_device"
+  want=$("$SHA" "$td/class/devcd7/data" | cut -d' ' -f1)
+  run_fixture(){ DEVCD_CLASS="$td/class" MESH_DEVCD_DIR="$td/out" MESH_DEVCD_LEDGER="$td/ledger" \
+                 MESH_DEVCD_SEEN="$td/seen" MESH_DEVCD_LOCK="$td/lock" MESH_DEVCD_CHAT=0 \
+                 MESH_DEVCD_EXPECT_LISTENER=0 MESH_STATE_DIR="$td" bash "$0" --sweep 2>&1; }
+
+  out=$(run_fixture); rc=$?
+  got=$("$SHA" "$td"/out/*.bin 2>/dev/null | cut -d' ' -f1)
+  if [ "$rc" -eq 0 ] && [ -n "$got" ] && [ "$got" = "$want" ]; then
+    say "E  SYNTHETIC extraction: 4096 known bytes captured, sha256 matches the source exactly"
+  else
+    say "E  FAIL: synthetic extraction did not reproduce the source bytes (rc=$rc want=${want:0:12} got=${got:0:12})"; fail=1
+  fi
+  grep -q '^bytes:         4096$' "$td"/out/*.meta 2>/dev/null \
+    || { say "E  FAIL: .meta sidecar missing or wrong size field"; fail=1; }
+
+  # F — the DEDUP arm: a second sweep over the same dump must capture NOTHING (else the cron
+  #     backstop re-files one dump every 60s and the capture rate stops meaning the fault rate)
+  run_fixture >/dev/null 2>&1
+  # Count the ledger's CAPTURED ROWS, not files: a file count is insensitive because two captures in
+  # the same second used to collide on one name (that overwrite bug was found by mutating the dedup
+  # early-return away and watching this arm stay green — a-count-guard-cannot-see-a-content-replacement).
+  n=$(awk -F'\t' '$2=="captured"' "$td/ledger" 2>/dev/null | wc -l)
+  n2=$(ls -1 "$td"/out/*.bin 2>/dev/null | wc -l)
+  if [ "$n" -eq 1 ] && [ "$n2" -eq 1 ]; then
+    say "F  SYNTHETIC dedup: a re-sweep of the same dump produced 0 further captures (1 ledger row, 1 file)"
+  else
+    say "F  FAIL: dedup broken — $n captured ledger row(s), $n2 file(s) after two sweeps of ONE dump"; fail=1
+  fi
+
+  # G — THE RED ARM, SEEN RED: an UNREADABLE dump must FAIL, must NOT file a 0-byte artifact, and
+  #     must NOT mark itself seen (so the remaining window is still retried). A gate never seen
+  #     fail is not a gate.
+  rm -rf "$td/class2" "$td/out2" "$td/seen2"; mkdir -p "$td/class2/devcd8" "$td/out2"
+  : >"$td/class2/devcd8/data"        # zero bytes = the read produced nothing
+  out=$(DEVCD_CLASS="$td/class2" MESH_DEVCD_DIR="$td/out2" MESH_DEVCD_LEDGER="$td/ledger2" \
+        MESH_DEVCD_SEEN="$td/seen2" MESH_DEVCD_LOCK="$td/lock2" MESH_DEVCD_CHAT=0 \
+        MESH_DEVCD_EXPECT_LISTENER=0 MESH_STATE_DIR="$td" bash "$0" --sweep 2>&1); rc=$?
+  n2=$(ls -1 "$td"/out2/*.bin 2>/dev/null | wc -l)
+  if [ "$rc" -ne 0 ] && [ "${n2:-0}" -eq 0 ] && grep -q 'FAILED' "$td/ledger2" 2>/dev/null \
+     && ! grep -q 'captured' "$td/seen2" 2>/dev/null; then
+    say "G  RED ARM seen red: a 0-byte dump exits non-zero, files NO artifact, and is not marked seen"
+  else
+    say "G  FAIL: the empty-read guard did not go red (rc=$rc files=$n2)"; fail=1
+  fi
+
+  # H — the FAILCAP retirement, seen fire
+  local i; for i in 1 2 3 4 5 6; do
+    DEVCD_CLASS="$td/class2" MESH_DEVCD_DIR="$td/out2" MESH_DEVCD_LEDGER="$td/ledger2" \
+      MESH_DEVCD_SEEN="$td/seen2" MESH_DEVCD_LOCK="$td/lock2" MESH_DEVCD_CHAT=0 \
+      MESH_DEVCD_EXPECT_LISTENER=0 MESH_STATE_DIR="$td" bash "$0" --sweep >/dev/null 2>&1
+  done
+  if grep -q 'retired' "$td/ledger2" 2>/dev/null; then
+    say "H  SYNTHETIC failcap: a permanently unreadable dump retires after $FAILCAP attempts (no hot loop)"
+  else
+    say "H  FAIL: failcap never retired an unreadable key — the listener could hot-loop"; fail=1
+  fi
+  # I — THE LISTENER'S OWN LOOP, driven end-to-end. Arms E-H exercise the SWEEP; this exercises the
+  #     EVENT path, which is the PRIMARY and is the entire reason this tool is not a cron.
+  #     TWO traps are designed out of this arm:
+  #      · VACUITY. --listen sweeps once at start-up by design, so a fixture dump that already
+  #        exists would be captured whether or not the event loop works at all. So the fixture
+  #        script creates the dump only AFTER the start-up sweep has run — exactly the kernel's own
+  #        order (device_add, then the uevent) — and the arm asserts the start-up sweep found NOTHING.
+  #      · A HAND-WRITTEN LAYOUT. The column layout is the thing a parser gets wrong, so the add row
+  #        is spliced into REAL udevadm-255 output captured from this node, never typed out here.
+  td2=$(mktemp -d); mkdir -p "$td2/class" "$td2/out" "$td2/src"
+  head -c 2048 /dev/urandom >"$td2/src/data"
+  want=$("$SHA" "$td2/src/data" | cut -d' ' -f1)
+  { "$TIMEOUT" 4 "$UDEVADM" monitor --kernel 2>&1 &
+    sleep 1; "$SUDO" -n "$UDEVADM" trigger --action=change --subsystem-match=mem 2>/dev/null
+    wait 2>/dev/null; } >"$td2/stream" 2>&1
+  if ! grep -q 'KERNEL\[' "$td2/stream"; then
+    say "I  n/a UNASSERTED: could not capture a real udevadm line layout — listener loop NOT driven"
+    unasserted="$unasserted I"
+  else
+    sed -n 's#^\(KERNEL\[[0-9.]*\] \)change\( *\)/devices/.*#\1add\2/devices/virtual/devcoredump/devcd3 (devcoredump)#p' \
+        "$td2/stream" | head -1 >"$td2/addrow"
+    if ! grep -q 'devcd3 (devcoredump)' "$td2/addrow"; then
+      say "I  FAIL: could not splice a real-format add row out of live udevadm output"; fail=1
+    else
+      _mk_fixture(){ # $1=action-row file, $2=fixture script path
+        { echo '#!/usr/bin/env bash'
+          echo "sleep 2"                                   # let the start-up sweep run on an EMPTY class
+          echo "mkdir -p '$td2/class/devcd3'"
+          echo "cp '$td2/src/data' '$td2/class/devcd3/data'"
+          echo "cat '$1'"
+          echo "sleep 3"
+        } >"$2"; chmod +x "$2"; }
+      _drive(){ # $1=fixture script  $2=outdir  $3=tag
+        rm -rf "$2"; mkdir -p "$2"
+        MESH_DEVCD_MONITOR_CMD="$1" DEVCD_CLASS="$td2/class" MESH_DEVCD_DIR="$2" \
+          MESH_DEVCD_LEDGER="$td2/ledger-$3" MESH_DEVCD_SEEN="$td2/seen-$3" \
+          MESH_DEVCD_LOCK="$td2/lock-$3" MESH_DEVCD_CHAT=0 MESH_DEVCD_EXPECT_LISTENER=0 \
+          MESH_STATE_DIR="$td2" "$TIMEOUT" 25 bash "$0" --listen >"$td2/listen-$3.out" 2>&1
+        rm -rf "$td2/class/devcd3"; }
+      _mk_fixture "$td2/addrow" "$td2/fix-add"
+      _drive "$td2/fix-add" "$td2/out" add
+      got=$("$SHA" "$td2"/out/*.bin 2>/dev/null | cut -d' ' -f1)
+      n=$(ls -1 "$td2"/out/*.bin 2>/dev/null | wc -l)
+      # VACUITY GUARD: the start-up sweep must have found nothing, or this arm proves nothing
+      if ! grep -q 'no live dump' "$td2/listen-add.out" 2>/dev/null; then
+        say "I  FAIL: VACUOUS — the start-up sweep saw a dump, so a capture does not implicate the loop"; fail=1
+      elif [ "$n" -eq 1 ] && [ "$got" = "$want" ]; then
+        say "I  LISTENER LOOP driven: start-up sweep found nothing, then a real-format devcoredump"
+        say "   add row produced exactly 1 capture with byte-exact contents — the EVENT path works"
+      else
+        say "I  FAIL: the listener loop did not capture on an add row (files=$n want=${want:0:12} got=${got:0:12})"; fail=1
+      fi
+      # RED ARM: same fixture, same timing, action flipped to `remove` -> the loop must capture NOTHING
+      sed 's#\] add \( *\)#] remove \1#' "$td2/addrow" >"$td2/rmrow"
+      _mk_fixture "$td2/rmrow" "$td2/fix-rm"
+      _drive "$td2/fix-rm" "$td2/out2" rm
+      n2=$(ls -1 "$td2"/out2/*.bin 2>/dev/null | wc -l)
+      if [ "${n2:-0}" -eq 0 ]; then
+        say "I  RED ARM seen red: the identical stream with action=remove captured 0 — the action"
+        say "   gate is real, not an artefact of the dump merely existing"
+      else
+        say "I  FAIL: a non-add action still captured $n2 file(s) — the action gate does nothing"; fail=1
+      fi
+    fi
+  fi
+  rm -rf "$td2"
+  rm -rf "$td"
+
+  # summary — a leg that did not run is never asserted by this line
+  [ "$fail" -eq 1 ] && { say "RESULT: mesh-devcd-catch --test FAILED"; return 1; }
+  if [ -n "$unasserted" ]; then
+    say "RESULT: PASS for the legs that RAN — UNASSERTED:$unasserted (their claims are NOT made)."
+    say "        Extraction legs E-I are SYNTHETIC by necessity: both devcoredump producers on"
+    say "        this node (rtw88_core, bluetooth) are the sole uplink's combo chip, so no dump can"
+    say "        be fired without severing the channel the result reports over."
+    return 0
+  fi
+  say "RESULT: PASS — A/B/C/D (class, arm bit, sudo -n read path, live uevent receive) asserted REAL"
+  say "        against this kernel. E-I (extraction, dedup, empty-read red arm, failcap, and the"
+  say "        listener's own event loop with its action gate) asserted SYNTHETIC: both devcoredump"
+  say "        producers here (rtw88_core, bluetooth) are the sole uplink's combo chip, so firing a"
+  say "        real dump would sever the channel the result reports over."
+  return 0
+}
+
+case "${1:---sweep}" in
+  --sweep|"")  with_lock do_sweep ;;
+  --listen)    do_listen ;;
+  --status)    do_status ;;
+  --list)      do_list ;;
+  --test)      do_test ;;
+  -h|--help)   sed -n '/^#   mesh-devcd-catch /,/^#   mesh-devcd-catch --test/p' "$0" | sed 's/^# \{0,3\}//' ;;
+  *)           say "unknown mode: $1 (see --help)"; exit 64 ;;
+esac
