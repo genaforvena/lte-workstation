@@ -255,6 +255,37 @@ GRIND_TIMEOUT="${SR_GRIND_TIMEOUT:-300}"
 # 2026-07-16, untimed rerun) — the flat cap killed it 17s short of a real 34M render. 5s per
 # source-second is 2x the measured 2.53 s/s, with SR_GRIND_TIMEOUT as the floor for short records.
 grind_cap(){ awk -v d="${1:-0}" -v g="$GRIND_TIMEOUT" 'BEGIN{ t=int(d*5+0.999); print (t>g)? t : g }'; }
+# ── THE CAP IS A RENDER BUDGET, BUT `timeout` CHARGES IT FOR THE QUEUE TOO ────────────────────────
+# grind_cap answers "how long should RENDERING this source take". The wrapper below spends it on the
+# WHOLE call, and mesh-room-music's first act is to queue: mesh-heavy-run serializes heavy jobs on a
+# flock and waits MESH_HEAVY_LOCK_WAIT (default 300s) for the slot, having already polled up to
+# MESH_HEAVY_ADMIT_WAIT (default 120s) for memory headroom. So a grind can burn its entire cap
+# without rendering one frame.
+#
+# And the two numbers COLLIDED: SR_GRIND_TIMEOUT=300 is the render-cap FLOOR, MESH_HEAVY_LOCK_WAIT=300
+# is the queue patience — same integer, two files, two different quantities, neither aware of the
+# other. For any source short enough that the cap IS the floor (dur <= 60s, i.e. every ear record),
+# contention makes the kill land at or before the instant rendering begins.
+#
+# Measured live 2026-08-21 on ear 911738ac (dur=7.00s, cap=max(300, 35)=300): the grind was killed at
+# 300s having rendered nothing — pid 1819871 observed at +117s with its SOLE descendant `flock -w 300
+# 9` and no python child, while another mind's 1160s-feed grind held the lane. The untimed rerun
+# shipped a real 84465-byte / 28.08s render (l200_w8_ss1.5_s0.25_..._1726.mp3) — the material was
+# never the problem, and the verdict said "was still rendering" about a render that had not started.
+#
+# Note the queue cannot announce itself: heavy-run's `flock -w "$LOCK_WAIT" 9 || true` DEGRADES to
+# unserialized rather than refusing, so lock starvation never returns rc=75. The reflex's rc=75
+# "deferred" branch — built to say "the node could not seat this" — is structurally blind to it, and
+# every lock-starved grind lands as a statement about the material instead.
+#
+# Fix: budget the queue SEPARATELY and derive it from the shim's own variables, so the two can never
+# drift apart again. 0 when the shim is not deployed (nothing queues, nothing to budget).
+queue_budget(){
+  command -v mesh-heavy-run >/dev/null 2>&1 || { echo 0; return; }
+  echo $(( ${MESH_HEAVY_LOCK_WAIT:-300} + ${MESH_HEAVY_ADMIT_WAIT:-120} ))
+}
+# call_cap <render-cap> -> what `timeout` may spend on the WHOLE call
+call_cap(){ echo $(( ${1:-0} + $(queue_budget) )); }
 # Retired: SR_OUTLIER (a multiplier on the WRONG population — see outlier_hw). Kept read-only so a
 # node with it exported in ~/.mesh/nodes does not silently change meaning.
 OUTLIER_N="${SR_OUTLIER_N:-20}"
@@ -2412,10 +2443,17 @@ tick(){
 # RETRY: a second timeout then verdicts skip:grind-timeout(...,retry-exhausted), which the
 # retry scan's $-anchored match on the un-suffixed verdict can never pick again.
 launch_grind(){
+  # The RENDER budget ($5) is what the caller sized against the source. The child is bounded by the
+  # CALL cap, which adds the queue budget — see queue_budget() above for why they are different
+  # quantities and what it cost to conflate them.
+  local _cc; _cc="$(call_cap "$5")"
   setsid bash -c '
-    src="$1"; args="$2"; meta="$3"; h="$4"; GT="$5"; self="$6"; organ="$7"; dur="$8"; MF="${9:-}"; DELIVER="${10:-}"; RF="${11:-}"; BL="${12:-/dev/null}"
+    src="$1"; args="$2"; meta="$3"; h="$4"; GT="$5"; self="$6"; organ="$7"; dur="$8"; MF="${9:-}"; DELIVER="${10:-}"; RF="${11:-}"; BL="${12:-/dev/null}"; CC="${13:-$5}"
+    # CC (call cap) = GT (the RENDER budget) + the queue budget. `timeout` bounds the whole call, and
+    # the call begins with mesh-heavy-run queueing on a flock, so spending GT alone kills grinds that
+    # never started rendering. See queue_budget() in the parent for the measured case.
     raw="$(MESH_RMC_AUTOMIX="$args" MESH_RMC_META="src=$organ/$h $meta" \
-           timeout "$GT" mesh-room-music --remix "$src" 2>/dev/null)"; rmc_rc=$?
+           timeout "$CC" mesh-room-music --remix "$src" 2>/dev/null)"; rmc_rc=$?
     out="$(grep -E "\.mp3$" <<<"$raw" | tail -1)"
     if [ -n "$out" ] && [ -f "$out" ]; then
       "$self" --verdict "$h" "ground:$(basename "$out")"
@@ -2424,8 +2462,14 @@ launch_grind(){
       # for two causes: it buried the first drop the lane ever received (fdfdd3fb, 125.57s, killed
       # 17s short of a real 34M render, 2026-07-16). grind_cap scales with duration so this should
       # be rare; when it still fires, say what actually happened.
-      "$self" --verdict "$h" "skip:grind-timeout(${GT}s${RF:+,retry-exhausted})"
-      "$self" --poke grind-timeout "Record $h [$organ] (dur=${dur}s) was still rendering when the ${GT}s grind cap killed it — the material is NOT judged degenerate. Either the cap is too tight for this source or the render genuinely hung; an untimed rerun distinguishes them."
+      #
+      # And say only what we KNOW. This branch used to assert the record "was still rendering", which
+      # is a claim about a leg it cannot see: the call is queue-then-render, the queue can consume the
+      # whole budget on its own (the heavy-run flock degrades rather than refusing, so starvation never
+      # surfaces as rc=75), and on ear 911738ac the render had not started at all. The verdict names
+      # the CALL cap it actually spent and the two legs inside it; it does not pick one.
+      "$self" --verdict "$h" "skip:grind-timeout(${CC}s${RF:+,retry-exhausted})"
+      "$self" --poke grind-timeout "Record $h [$organ] (dur=${dur}s) hit the ${CC}s call cap (render budget ${GT}s + queue budget $((CC-GT))s) — the material is NOT judged degenerate, and this does NOT say the render was running: the call is queue-then-render and a busy heavy lane can spend the whole budget before a frame is produced (heavy-run degrades its flock instead of refusing, so starvation never arrives as a defer). Distinguish before concluding: a mesh-heavy-run pid whose only descendant is flock, with no python child, is a QUEUE; an untimed rerun that renders fast is not the material."
     elif [ "$rmc_rc" -eq 75 ]; then
       # rc=75 (EX_TEMPFAIL) is mesh-heavy-run REFUSING admission — the node could not seat the grind
       # RAM budget under memory/CPU pressure. The render NEVER RAN; the material is untouched, NOT
@@ -2592,7 +2636,7 @@ launch_grind(){
         mesh-bg-done "$MF" --no-deliver >>"$BL" 2>&1
       fi
     fi
-  ' _ "$1" "$2" "$3" "$4" "$5" "$0" "$6" "$7" "${8:-}" "${9:-}" "${10:-}" "$BGLOG" </dev/null >/dev/null 2>&1 9>&- &
+  ' _ "$1" "$2" "$3" "$4" "$5" "$0" "$6" "$7" "${8:-}" "${9:-}" "${10:-}" "$BGLOG" "$_cc" </dev/null >/dev/null 2>&1 9>&- &
   # 9>&- closes the inherited flock fd in the detached child BEFORE it runs. Without this the child
   # (and its own children: timeout, mesh-room-music) keep fd 9 open for the whole grind, so the flock
   # stays held long after this tick returns — every cron tick that lands mid-grind hits `flock -n 9 ||
@@ -3807,16 +3851,49 @@ if [ "${1:-}" = --test ]; then
     || { echo "  FAIL: grind_cap(18s) = $(grind_cap 18), want 300 — the floor must hold for short records, not shrink below the old default"; f=1; }
   [ "$(grind_cap '')" = 300 ] \
     || { echo "  FAIL: grind_cap with no dur = $(grind_cap ''), want the 300 floor — a missing field must not zero the cap"; f=1; }
+  # ── THE CALL CAP MUST OUTLAST THE QUEUE ──────────────────────────────────────────────────────────
+  # grind_cap is a RENDER budget; `timeout` spends it on the whole call, which begins by queueing on
+  # mesh-heavy-run's flock. SR_GRIND_TIMEOUT=300 and MESH_HEAVY_LOCK_WAIT=300 were the SAME NUMBER in
+  # two files, so on any source at the floor (every ear record) a busy heavy lane killed the grind at
+  # or before the instant rendering began — measured on ear 911738ac (dur=7.00s), whose untimed rerun
+  # then shipped a real 28.08s render. The invariant is a STRICT inequality against the shim's own
+  # variables, never a second copy of the numbers.
+  _qb="$(queue_budget)"
+  if command -v mesh-heavy-run >/dev/null 2>&1; then
+    [ "$_qb" -gt 0 ] \
+      || { echo "  FAIL: queue_budget=0 while mesh-heavy-run IS deployed — the queue leg is unbudgeted and the render cap pays for it"; f=1; }
+    for _d in 7 18 125.57; do
+      _rc="$(grind_cap "$_d")"; _cc="$(call_cap "$_rc")"
+      [ "$_cc" -gt "$(( ${MESH_HEAVY_LOCK_WAIT:-300} + ${MESH_HEAVY_ADMIT_WAIT:-120} ))" ] \
+        || { echo "  FAIL: dur=${_d}s call cap ${_cc}s does not EXCEED the queue budget $(( ${MESH_HEAVY_LOCK_WAIT:-300} + ${MESH_HEAVY_ADMIT_WAIT:-120} ))s — a fully-queued grind is killed with zero render time and the verdict blames the material"; f=1; }
+      [ "$_cc" -gt "$_rc" ] \
+        || { echo "  FAIL: dur=${_d}s call cap ${_cc}s is not greater than the render cap ${_rc}s — the queue leg vanished from the budget"; f=1; }
+    done
+  else
+    [ "$_qb" = 0 ] \
+      || { echo "  FAIL: queue_budget=$_qb with no mesh-heavy-run on PATH — nothing queues, so nothing may be budgeted for it"; f=1; }
+  fi
+  # The budget must TRACK the shim, not restate it: move the shim variable and the call cap must move.
+  _cc_a="$(MESH_HEAVY_LOCK_WAIT=300 MESH_HEAVY_ADMIT_WAIT=120 call_cap 300)"
+  _cc_b="$(MESH_HEAVY_LOCK_WAIT=900 MESH_HEAVY_ADMIT_WAIT=120 call_cap 300)"
+  if command -v mesh-heavy-run >/dev/null 2>&1; then
+    [ "$_cc_b" -gt "$_cc_a" ] \
+      || { echo "  FAIL: raising MESH_HEAVY_LOCK_WAIT 300->900 left the call cap at $_cc_a/$_cc_b — the budget is a hardcoded copy, so the two constants can drift apart again"; f=1; }
+  fi
   : > "$PARAMS_LOG"; : > "$LEDGER"; mkdir -p "$tmp/rec"
   printf 'x' > "$tmp/rec/t-hT.mp3"; printf 'x' > "$tmp/rec/t-hU.mp3"
   # stub renderer that OUTLIVES the cap: rc=124 is the cap speaking, not the material
+  # MESH_HEAVY_LOCK_WAIT/ADMIT_WAIT=0 on every tick below is NOT a weakened gate: these arms drive a
+  # STUB room-music that never calls mesh-heavy-run, so there is no queue and budgeting 420s for one
+  # would swamp the 1s cap the arm exists to fire. The queue budget is asserted on its own terms
+  # above (strict inequality vs the shim variables, and that it TRACKS them when they move).
   printf '#!/bin/sh\nsleep 3\necho fake.mp3\n' > "$tmp/bin/mesh-room-music"; chmod +x "$tmp/bin/mesh-room-music"
   opath2="$PATH"; PATH="$tmp/bin:$PATH"
   rm -f "$ANCHOR"
   printf '2026-07-16T00:00Z ear h0 dur=1 win=3 score=40 beats=6 [x] dyn=0.2 act=0.3 rich=0.6 move=0.1 cent=1100 -> ground:x.mp3\n' >> "$LEDGER"
   fresh_lines >/dev/null                              # anchor to h0; hT is the fresh block
   printf '2026-07-16T00:01Z ear hT dur=0.2 win=3 score=40 beats=6 [x] dyn=0.2 act=0.3 rich=0.6 move=0.1 cent=1100 -> pending\n' >> "$LEDGER"
-  MESH_REC_LOG="$LEDGER" MESH_REC_DIR="$tmp/rec" REC_DIR="$tmp/rec" GRIND_TIMEOUT=1 MESH_TEST_SANDBOX=1 tick 2>/dev/null
+  MESH_REC_LOG="$LEDGER" MESH_REC_DIR="$tmp/rec" REC_DIR="$tmp/rec" GRIND_TIMEOUT=1 MESH_HEAVY_LOCK_WAIT=0 MESH_HEAVY_ADMIT_WAIT=0 MESH_TEST_SANDBOX=1 tick 2>/dev/null
   await_grep ' hT .*-> skip:' "$LEDGER" 20 || true
   lrow="$(grep ' hT ' "$LEDGER" 2>/dev/null || true)"   # ONE read — condition and message below both use it
   printf '%s\n' "$lrow" | grep -q ' hT .*-> skip:grind-timeout' \
@@ -3825,7 +3902,7 @@ if [ "${1:-}" = --test ]; then
   printf '#!/bin/sh\nexit 0\n' > "$tmp/bin/mesh-room-music"
   printf '2026-07-16T00:02Z ear hU dur=0.2 win=3 score=40 beats=6 [x] dyn=0.2 act=0.3 rich=0.6 move=0.1 cent=1100 -> pending\n' >> "$LEDGER"
   : > "$FAILED_LOG"
-  MESH_REC_LOG="$LEDGER" MESH_REC_DIR="$tmp/rec" REC_DIR="$tmp/rec" SR_FAILED_LOG="$FAILED_LOG" GRIND_TIMEOUT=1 MESH_TEST_SANDBOX=1 tick 2>/dev/null
+  MESH_REC_LOG="$LEDGER" MESH_REC_DIR="$tmp/rec" REC_DIR="$tmp/rec" SR_FAILED_LOG="$FAILED_LOG" GRIND_TIMEOUT=1 MESH_HEAVY_LOCK_WAIT=0 MESH_HEAVY_ADMIT_WAIT=0 MESH_TEST_SANDBOX=1 tick 2>/dev/null
   await_grep ' hU .*-> skip:' "$LEDGER" 20 || true
   lrow="$(grep ' hU ' "$LEDGER" 2>/dev/null || true)"   # ONE read — condition and message below both use it
   printf '%s\n' "$lrow" | grep -q ' hU .*-> skip:degenerate' \
@@ -3841,7 +3918,7 @@ if [ "${1:-}" = --test ]; then
   printf 'x' > "$tmp/rec/t-hD.mp3"
   printf '#!/bin/sh\nexit 75\n' > "$tmp/bin/mesh-room-music"
   printf '2026-07-16T00:03Z ear hD dur=0.2 win=3 score=40 beats=6 [x] dyn=0.2 act=0.3 rich=0.6 move=0.1 cent=1100 -> pending\n' >> "$LEDGER"
-  MESH_REC_LOG="$LEDGER" MESH_REC_DIR="$tmp/rec" REC_DIR="$tmp/rec" GRIND_TIMEOUT=1 MESH_TEST_SANDBOX=1 tick 2>/dev/null
+  MESH_REC_LOG="$LEDGER" MESH_REC_DIR="$tmp/rec" REC_DIR="$tmp/rec" GRIND_TIMEOUT=1 MESH_HEAVY_LOCK_WAIT=0 MESH_HEAVY_ADMIT_WAIT=0 MESH_TEST_SANDBOX=1 tick 2>/dev/null
   await_grep ' hD .*-> skip:' "$LEDGER" 20 || true
   lrow="$(grep ' hD ' "$LEDGER" 2>/dev/null || true)"   # ONE read — condition and message below both use it
   printf '%s\n' "$lrow" | grep -q ' hD .*-> skip:deferred' \
@@ -3855,7 +3932,7 @@ if [ "${1:-}" = --test ]; then
   printf 'x' > "$tmp/rec/t-hO.mp3"
   printf '#!/bin/sh\nexit 137\n' > "$tmp/bin/mesh-room-music"
   printf '2026-07-16T00:04Z ear hO dur=0.2 win=3 score=40 beats=6 [x] dyn=0.2 act=0.3 rich=0.6 move=0.1 cent=1100 -> pending\n' >> "$LEDGER"
-  MESH_REC_LOG="$LEDGER" MESH_REC_DIR="$tmp/rec" REC_DIR="$tmp/rec" GRIND_TIMEOUT=1 MESH_TEST_SANDBOX=1 tick 2>/dev/null
+  MESH_REC_LOG="$LEDGER" MESH_REC_DIR="$tmp/rec" REC_DIR="$tmp/rec" GRIND_TIMEOUT=1 MESH_HEAVY_LOCK_WAIT=0 MESH_HEAVY_ADMIT_WAIT=0 MESH_TEST_SANDBOX=1 tick 2>/dev/null
   await_grep ' hO .*-> skip:' "$LEDGER" 20 || true
   lrow="$(grep ' hO ' "$LEDGER" 2>/dev/null || true)"   # ONE read — condition and message below both use it
   printf '%s\n' "$lrow" | grep -q ' hO .*-> skip:oom' \
@@ -3870,7 +3947,7 @@ if [ "${1:-}" = --test ]; then
   printf '#!/bin/sh\necho "remix: automix produced a hollow/undecodable track (x.mp3) — refusing to log/ship a broken grind"\nexit 1\n' > "$tmp/bin/mesh-room-music"
   printf '2026-07-16T00:05Z ear hH dur=0.2 win=3 score=40 beats=6 [x] dyn=0.2 act=0.3 rich=0.6 move=0.1 cent=1100 -> pending\n' >> "$LEDGER"
   : > "$FAILED_LOG"
-  MESH_REC_LOG="$LEDGER" MESH_REC_DIR="$tmp/rec" REC_DIR="$tmp/rec" SR_FAILED_LOG="$FAILED_LOG" GRIND_TIMEOUT=1 MESH_TEST_SANDBOX=1 tick 2>/dev/null
+  MESH_REC_LOG="$LEDGER" MESH_REC_DIR="$tmp/rec" REC_DIR="$tmp/rec" SR_FAILED_LOG="$FAILED_LOG" GRIND_TIMEOUT=1 MESH_HEAVY_LOCK_WAIT=0 MESH_HEAVY_ADMIT_WAIT=0 MESH_TEST_SANDBOX=1 tick 2>/dev/null
   await_grep ' hH .*-> skip:' "$LEDGER" 20 || true
   lrow="$(grep ' hH ' "$LEDGER" 2>/dev/null || true)"   # ONE read — condition and message below both use it
   printf '%s\n' "$lrow" | grep -q ' hH .*-> skip:hollow' \
@@ -3892,7 +3969,7 @@ if [ "${1:-}" = --test ]; then
   printf '#!/bin/sh\necho "remix: automix produced no FRESH output (grind failed — refusing to resend stale x.mp3)"\nexit 1\n' > "$tmp/bin/mesh-room-music"
   printf '2026-07-16T00:06Z ear hN dur=0.2 win=3 score=40 beats=6 [x] dyn=0.2 act=0.3 rich=0.6 move=0.1 cent=1100 -> pending\n' >> "$LEDGER"
   : > "$FAILED_LOG"
-  MESH_REC_LOG="$LEDGER" MESH_REC_DIR="$tmp/rec" REC_DIR="$tmp/rec" SR_FAILED_LOG="$FAILED_LOG" GRIND_TIMEOUT=1 MESH_TEST_SANDBOX=1 tick 2>/dev/null
+  MESH_REC_LOG="$LEDGER" MESH_REC_DIR="$tmp/rec" REC_DIR="$tmp/rec" SR_FAILED_LOG="$FAILED_LOG" GRIND_TIMEOUT=1 MESH_HEAVY_LOCK_WAIT=0 MESH_HEAVY_ADMIT_WAIT=0 MESH_TEST_SANDBOX=1 tick 2>/dev/null
   await_grep ' hN .*-> skip:' "$LEDGER" 20 || true
   lrow="$(grep ' hN ' "$LEDGER" 2>/dev/null || true)"   # ONE read — condition and message below both use it
   printf '%s\n' "$lrow" | grep -q ' hN .*-> skip:no-render' \
@@ -3907,7 +3984,7 @@ if [ "${1:-}" = --test ]; then
   printf 'x' > "$tmp/rec/t-hR.mp3"
   printf '2026-07-16T00:07Z ear hR dur=0.2 win=3 score=40 beats=6 [x] dyn=0.2 act=0.3 rich=0.6 move=0.1 cent=1100 -> skip:grind-timeout(1s)\n' >> "$LEDGER"
   rm -f "$ANCHOR"; fresh_lines >/dev/null      # anchor at hR → the next tick is IDLE (no fresh block)
-  MESH_REC_LOG="$LEDGER" MESH_REC_DIR="$tmp/rec" REC_DIR="$tmp/rec" GRIND_TIMEOUT=1 MESH_TEST_SANDBOX=1 tick 2>/dev/null
+  MESH_REC_LOG="$LEDGER" MESH_REC_DIR="$tmp/rec" REC_DIR="$tmp/rec" GRIND_TIMEOUT=1 MESH_HEAVY_LOCK_WAIT=0 MESH_HEAVY_ADMIT_WAIT=0 MESH_TEST_SANDBOX=1 tick 2>/dev/null
   await_grep ' hR .*-> ground:' "$LEDGER" 20 || true
   lrow="$(grep ' hR ' "$LEDGER" 2>/dev/null || true)"   # ONE read — condition and message below both use it
   printf '%s\n' "$lrow" | grep -q ' hR .*-> ground:' \
@@ -3917,7 +3994,7 @@ if [ "${1:-}" = --test ]; then
   printf 'x' > "$tmp/rec/t-hX.mp3"
   printf '2026-07-16T00:08Z ear hX dur=0.2 win=3 score=40 beats=6 [x] dyn=0.2 act=0.3 rich=0.6 move=0.1 cent=1100 -> skip:grind-timeout(1s)\n' >> "$LEDGER"
   rm -f "$ANCHOR"; fresh_lines >/dev/null
-  MESH_REC_LOG="$LEDGER" MESH_REC_DIR="$tmp/rec" REC_DIR="$tmp/rec" GRIND_TIMEOUT=1 MESH_TEST_SANDBOX=1 tick 2>/dev/null
+  MESH_REC_LOG="$LEDGER" MESH_REC_DIR="$tmp/rec" REC_DIR="$tmp/rec" GRIND_TIMEOUT=1 MESH_HEAVY_LOCK_WAIT=0 MESH_HEAVY_ADMIT_WAIT=0 MESH_TEST_SANDBOX=1 tick 2>/dev/null
   await_grep ' hX .*retry-exhausted' "$LEDGER" 20 || true
   lrow="$(grep ' hX ' "$LEDGER" 2>/dev/null || true)"   # ONE read — condition and message below both use it
   printf '%s\n' "$lrow" | grep -q ' hX .*-> skip:grind-timeout(2s,retry-exhausted)' \
@@ -4001,7 +4078,7 @@ if [ "${1:-}" = --test ]; then
     && { echo "  FAIL: a no-render RETRY wrote its recipe into the FAILED store — the retry path must keep the engine/recipe split the first attempt already makes (f27604f)"; f=1; }
 
   # (c) an exhausted record must NEVER be re-picked — the scan is $-anchored on the un-suffixed verdict
-  MESH_REC_LOG="$LEDGER" MESH_REC_DIR="$tmp/rec" REC_DIR="$tmp/rec" GRIND_TIMEOUT=1 MESH_TEST_SANDBOX=1 tick 2>/dev/null
+  MESH_REC_LOG="$LEDGER" MESH_REC_DIR="$tmp/rec" REC_DIR="$tmp/rec" GRIND_TIMEOUT=1 MESH_HEAVY_LOCK_WAIT=0 MESH_HEAVY_ADMIT_WAIT=0 MESH_TEST_SANDBOX=1 tick 2>/dev/null
   sleep 1
   lrow="$(grep ' hX ' "$LEDGER" 2>/dev/null || true)"   # ONE read — condition and message below both use it
   printf '%s\n' "$lrow" | grep -q ' hX .*retry-exhausted' \
