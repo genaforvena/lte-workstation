@@ -153,6 +153,11 @@ the case is the evidence, and mixing them is what made this section a wall nobod
 - **A step everything depends on must have its own unconditional cadence**, never ride inside a
   conditional path that only fires when something else did.
   [[a-step-everything-depends-on-needs-its-own-unconditional-cadence]]
+- **A sense whose device is permanently HELD by a higher-value consumer must DERIVE its reading from
+  that consumer's stream** — naming which device was busy is a diagnosis, not a cure, and a second
+  grab on a contended organ can only ever be EBUSY; publish coverage + freshness with the derived
+  value so a dead holder ages into UNKNOWN, never into a plausible constant.
+  [[a-contended-organ-is-cured-by-sharing-not-by-probing-harder]]
 - **A detector is not a closed loop** — a recurring fault with a one-line idempotent remedy needs a
   RE-APPLIER, and its re-apply RATE must stay loud, or the healer erases the fault signal it rides on.
   [[a-detector-without-a-re-applier-leaves-the-operators-hands-as-the-loop]]
