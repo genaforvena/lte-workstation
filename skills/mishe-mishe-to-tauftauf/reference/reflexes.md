@@ -81,3 +81,9 @@ holding its last value**, and every reader keeps treating that value as current.
 artifact too, or replace it with a line that says explicitly that this is retired and when.
 
 An absence and a stale plausible value look identical from downstream. Only one of them is honest.
+
+And whatever you schedule, `mishe burn` has to be able to find it. It strips crontab lines and macOS
+launch agents that mention mishe; anything you wire by another route — a systemd user unit, a
+launchd label that does not carry the name, a hook — is invisible to the teardown and turns "nothing
+remains" into "nothing remains except". If you add a scheduling route, add it to `burn_scan` in the
+core in the same change.

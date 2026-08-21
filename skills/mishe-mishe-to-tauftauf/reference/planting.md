@@ -1,38 +1,83 @@
-# Planting, step by step
+# Planting a baby mesh — the branches
+
+This is the detail behind SKILL.md. It is not a script to read out. Each section is a **branch
+point**: you ask, they answer, and their answer picks the next section. If you find yourself
+delivering these in fixed order regardless of what they said, you have stopped having the
+conversation and started performing it.
 
 ## Before anything: who is asking
 
-The question in step 1 has to be asked by someone the human will actually answer. If you are the
-agent on their machine, you ask it directly, in the first turn, before you touch a file. If you are
-an agent somewhere else preparing this, **you do not get to answer it on their behalf** — record
-that it is unanswered and hand it to whoever has the channel.
+If you are the agent on their machine, you ask the questions directly, in your own turns, before
+touching a file. If you are an agent somewhere else preparing this, **you do not get to answer them
+on their behalf** — record that they are unanswered and hand it to whoever has the channel.
 
-An organ chosen from what we know how to build, rather than from what they do, is a guess wearing a
-capability's clothes.
+## Branch 0 — how much of this world are they already in
 
-## Step 1 — the question
+The first question is about *them*, not about their work and not about the mesh:
 
-Ask what they do and what part of it is annoying. In their words, not from a menu.
+> Before I show you anything — how much of this world are you already in? Have you used a terminal
+> much, or tmux, or is Claude Code the first thing of this kind you've run?
 
-Bad (offers a menu, gets you a pick from *your* abilities):
+Nothing downstream is right until this is answered. Installing Claude Code tells you almost nothing
+about it: people arrive here from an IDE, from a colleague's screen share, from a video.
 
-> I can help with file organisation, writing, research, or automation — which would you like?
+### "I live in a terminal / I use tmux"
 
-Good (gets you their work):
-
-> Before I set anything up — what do you actually do day to day? And what part of it is annoying
-> enough that you'd want help with it this week?
-
-Then **write the answer to the board verbatim**, before you interpret it:
+Say almost nothing. Raise it and hand them the handle:
 
 ```sh
-mishe board "[fyi] what she does: <their words>"
+~/.mishe/bin/mishe view          # they are now inside it
 ```
 
-Verbatim matters. Your paraphrase is a number with no source: two weeks later nobody can tell
-whether "handles a lot of spreadsheets" was said or inferred.
+Let them drive. Point at exactly one thing they will not guess — `mishe tell` — and stop talking.
+They will find the rest and they will tell you what is wrong with it, which is the useful part.
 
-## Step 2 — the core on disk
+### "I can use a terminal, but tmux is new"
+
+Raise it, then narrate **once**, in terms of what moves on screen rather than in terms of what tmux
+is:
+
+> Two windows in one session. The bottom one is where we talk. The top one is showing what this
+> machine is holding right now, and it refreshes itself — so I stop asking it the same question
+> every few minutes and you can see the same thing I see.
+
+Do the first `mishe tell` yourself so they watch the other window act. Then invite exactly one:
+
+> Try one: `mishe tell mind "mishe board '[fyi] hi'"` — then watch the top window notice it.
+
+`Ctrl-b n` to move between windows, `Ctrl-b d` to detach, `tmux attach -t mishe` to come back. Three
+keys, not a tour.
+
+### "Claude Code is my first thing like this"
+
+**Do not put them inside tmux.** Raise the session detached and drive it yourself:
+
+```sh
+MISHE_VIEW_ATTACH=0 ~/.mishe/bin/mishe view
+```
+
+Show them a window changing on its own before you explain what a window is. Something that visibly
+moves teaches faster than any paragraph, and a person who has just been dropped into a terminal
+multiplexer is not learning, they are coping. Attaching is something to offer later, if they ask
+what else is in there.
+
+Everything the culture is actually made of still works with no layout at all: `mishe board`,
+`mishe open`, `mishe handoff`. If tmux never becomes interesting to them, they have lost nothing
+important.
+
+### "I don't want a terminal thing"
+
+Stop. Say plainly that the board and the handoff are the whole culture and need no layout, offer
+those two, and **do not raise a session**. Then write it down:
+
+```sh
+mishe board "[fyi] no layout: they don't want a terminal thing. Board + handoff only."
+```
+
+A degrade that is recorded is a fact. A degrade that is not is an assumption someone will later
+mistake for a capability.
+
+## Branch 1 — the baby, planted live
 
 ```sh
 mkdir -p ~/.mishe/bin
@@ -40,102 +85,150 @@ cp core/mishe ~/.mishe/bin/mishe && chmod +x ~/.mishe/bin/mishe
 ~/.mishe/bin/mishe --test
 ```
 
-`--test` must print `mishe --test: ok`. If it does not, stop and read the failures — they name
-which behaviour is broken, and each one has been seen to go red on purpose.
+`--test` must print `mishe --test: ok`. If it does not, stop and read the failures — each names one
+behaviour, and each has been watched going red on purpose.
 
-Optionally put it on PATH (`export PATH="$HOME/.mishe/bin:$PATH"` in `~/.zshrc` — macOS default
-shell is zsh). This is a convenience, not part of the plant; `~/.mishe/bin/mishe` works either way.
+Optional, and not part of the plant: `export PATH="$HOME/.mishe/bin:$PATH"` in `~/.zshrc` (macOS
+default shell is zsh). `mishe burn` knows about that line and removes it; nothing else you add by
+hand is guaranteed to be found, so if you add something, add it to the burn scan too.
 
-No repo. No clone. No package manager. The core installs nothing and neither does the plant —
-`mishe --test` asserts it by shimming the package managers and failing if any of them is *run*.
-`tmux` in step 3 is the one thing a human may choose to install, by answering a question that
-`mishe view` puts to them; printing the command is not running it, and the gate knows the
-difference.
+No repo, no clone, no package manager. The core installs nothing and neither does the plant —
+`mishe --test` asserts this by shimming the package managers and failing if any of them is *run*.
+`tmux` is the one thing a human may choose to install, by answering a question `mishe view` puts to
+them; printing the command is not running it, and the gate knows the difference.
 
-## Step 3 — the layout, in one verb
+### The four things to show, in this order
 
-```sh
-~/.mishe/bin/mishe view
-```
-
-That is the whole step. It raises a `tmux` session named `mishe` with **two windows**: `mind` (where
-the thinking happens) and `data` (running `mishe watch` — what is held, what is unsettled, what the
-organs say, the tail of the board). Run it again later and it attaches to the same session instead
-of rebuilding it.
-
-This is the one habit that is easiest to skip and most expensive to skip: without the second window,
-every turn re-derives state a file already knows, and the conversation's room goes on re-fetching.
+1. **One window puts work into another** — `mishe tell mind "mishe board '[fyi] hello'"`, and then
+   the self-refreshing `data` window shows the line arrive with nobody touching it. This is the
+   primitive; everything else is habit built on it.
+   It refuses two things rather than pretending: a window that does not exist (tmux would resolve
+   the name loosely, and a command typed into the wrong window is not undone by re-sending), and a
+   window running a **program** rather than sitting at a prompt — `data` is running `mishe watch`,
+   so send-keys there is bytes into a loop's stdin and nothing happens. Aim at `mind`, or at a
+   window you added.
+2. **The board outlives the talking** — `mishe board "[task] <slug> …"`, then `mishe open`. The
+   claim is standing there unsettled, and it will still be standing tomorrow.
+3. **The handoff survives a clear** — write one, then actually `/clear` your own context, then
+   `mishe handoff --restore`. **Do it for real.** A described handoff convinces nobody; a context
+   you visibly wiped and walked back into does.
+4. **A broken organ says it is broken** — `mishe organ x "exit 3"`, `mishe dash` → `FAILED rc=3`,
+   not a blank line. Then remove it. What is being shown is that this thing does not go quiet when
+   it fails.
 
 ### If the machine has no tmux
 
-`mishe view` **does not install it.** It prints one question for you to ask the human, in their
-terms, and the exact command. Ask it — do not decide for them, and do not quietly fall back:
+`mishe view` **does not install it.** It prints one question and the exact command. Ask it; do not
+decide for them and do not quietly fall back to one tab:
 
 > I can keep the data view in a second terminal tab — that works, but only you can see it and it
 > dies with the window. Or I can install tmux (one command) and the view lives in a session that
 > survives the window and that anyone on this machine can attach to. Want me to install it?
 
-- **Yes** → they (or you, with their word) run `brew install tmux` / `sudo apt-get install -y tmux`,
-  then `mishe view` again.
-- **No** → a second terminal tab running `~/.mishe/bin/mishe watch`, and **write the degrade to the
-  board** so the missing property is a recorded fact rather than an assumption:
-  `mishe board "[fyi] view: no tmux, second tab only — private to one screen, dies with it"`.
+- **Yes** → `brew install tmux` / `sudo apt-get install -y tmux`, then `mishe view` again.
+- **No** → a second terminal tab running `~/.mishe/bin/mishe watch`, and write the degrade to the
+  board so the missing property is recorded rather than assumed.
 
-Most machines answer this question by already having tmux: on Linux it is nearly always there, so
-the question never gets asked and nothing gets installed. macOS is where it is a real question, and
-one direct question is cheaper than a dependency taken on someone's behalf.
+Most Linux machines answer this by already having tmux, so the question never gets asked. macOS is
+where it is a real question, and one direct question is cheaper than a dependency taken on
+somebody's behalf.
 
-### Why a session and not a tab — the two properties
+### Why a session and not a tab
 
-A tab gives you the layout. It does not give the two things that make the view *shared memory*, and
-those are properties, not habits:
+A tab gives you the layout and neither of the two properties that make the view *shared memory*:
 
-- **A tab is private.** Only the person sitting at it sees it. No second human, no second agent,
-  nobody over ssh later can look at the same state.
+- **A tab is private.** Only the person at it sees it — no second human, no second agent, nobody
+  over ssh later.
 - **A tab dies with its window.** Close the terminal, drop the connection, shut the lid: gone.
 
-A session has the opposite two. It outlives the window it was started from, and anyone on that
-machine can attach and see **the same** state — the scrollback becomes the machine's recent memory
-instead of one person's screen.
-
-It does not make this machine part of anything. The shared perception is **inside one machine**,
-between whoever is at it — not between machines. One mishe is still one. Nothing is scheduled and
+A session has the opposite two: it outlives the window it was started from, and anyone on that
+machine can attach and see **the same** state. It does not make this machine part of anything —
+the shared perception is *inside one machine*, between whoever is at it. Nothing is scheduled and
 nothing phones home; `mishe view` only ever talks to `tmux` on this host.
 
-## Step 4 — one real task
+## Branch 2 — does it live
 
-Take what they named in step 1 and do a real piece of it. End to end. Their data, not a sample.
+> That is the whole thing. Do you want to keep it, or should I remove it?
 
-Then write what happened:
+You must mean both. If your next sentence after "remove it" is an argument for keeping it, the
+question was theatre and they will hear that.
+
+### "Remove it"
+
+```sh
+~/.mishe/bin/mishe burn
+```
+
+In front of them. It prints what it killed, then re-scans every place a mishe can leave a trace and
+prints that nothing is left. Do not offer a reduced version. Do not leave "just the board, in
+case" — a leftover is the one thing that turns a cheap experiment into an installation they did not
+agree to. Then thank them and stop.
+
+The thing to say afterwards, if anything: it cost nothing to lose, and it grows again anywhere in
+one phrase. That is the property, and burning it is the only way to actually show it.
+
+**Killing a tmux session is the one sanctioned exception to the mesh's append-only rule.** A
+session is a workspace and its scrollback is memory. The exception holds only for a session this
+mishe raised and wrote to its own receipt (`~/.mishe/.raised`, written on the create branch of
+`view` and never on the adopt branch). Never kill a session by name match, not even during a burn.
+
+### "Keep it"
+
+It is theirs, and it is exactly as mortal as it was a minute ago. Say that once, plainly, and move
+on to their work.
+
+## Branch 3 — their work
+
+```
+What do you actually do day to day? And what part of it is annoying enough that you'd want help
+with it this week?
+```
+
+Bad, because it gets you a pick from *your* abilities instead of a description of their work:
+
+> I can help with file organisation, writing, research, or automation — which would you like?
+
+Write the answer to the board **verbatim**, before you interpret it:
+
+```sh
+mishe board "[fyi] what they do: <their words>"
+```
+
+Verbatim matters. Your paraphrase is a number with no source: two weeks later nobody can tell
+whether "handles a lot of spreadsheets" was said or inferred.
+
+## Branch 4 — one real task
+
+Take what they named and do a real piece of it, end to end, on their data. Then write what happened:
 
 ```sh
 mishe board "[done] <slug>: <what came out, and whether it was right>"
 ```
 
-## Step 5 — the landing artifact
+## Branch 5 — the landing artifact
 
 The planting is verified when **they have read an answer about their own work and told you whether
 it was useful or wrong.** Not before.
 
 ```sh
-mishe board "[fyi] landed: <what she asked> -> <what she got> -> <what she said about it>"
+mishe board "[fyi] landed: <what they asked> -> <what they got> -> <what they said about it>"
 ```
 
-Things that are NOT the landing artifact, and each has been mistaken for it:
+Things that are NOT the landing artifact, each of which has been mistaken for it:
 
 | Not an artifact | Why |
 |---|---|
 | `~/.claude/skills/mishe-mishe-to-tauftauf/` exists | A file on disk is a mode bit, not a write |
 | `mishe --test: ok` | The core works; nothing has been done with it |
-| A demo on invented data | Their real data is where the interesting failure lives |
-| "She said thanks" | Politeness is not a read |
+| A run on invented data | Their real data is where the interesting failure lives |
+| "They said thanks" | Politeness is not a read |
+| The baby is still up | Surviving is not being useful |
 
-Until that line is on the board, the honest report is *"skill installed, culture not yet planted"*
-— and saying that costs nothing, while reporting success you cannot show costs the next person who
-believes it.
+Until that line is on the board, the honest report is *"planted, not yet load-bearing"*.
 
-## Step 6 — what happens after
+## Branch 6 — after
 
-Nothing scheduled. The node is now a board, a handoff, a view, and a habit. It grows only when a
-real piece of work repeats often enough to be worth tending — and only then do you read
-`reflexes.md`.
+Nothing scheduled. It is a board, a handoff, a view, a `tell`, and a habit. It grows only when a
+real piece of work repeats often enough to be worth tending — and only then read `reflexes.md`.
+
+And it stays mortal. If it stops earning its place, `mishe burn` is still one phrase.

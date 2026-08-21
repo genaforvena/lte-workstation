@@ -32,7 +32,7 @@ The recipient runs `sh mishe-seed.sh`. It writes `~/.claude/skills/mishe-mishe-t
 `~/.mishe/bin/mishe`, runs the core's self-test, and stops. No network. No package manager. No
 clone. Nothing outside their home directory. Nothing scheduled, and nothing installed.
 
-`mishe view` (step 3 of `planting.md`) does not change that. Where tmux already exists it only
+`mishe view` (branch 1 of `planting.md`) does not change that. Where tmux already exists it only
 raises a session; where it does not, it **prints** the install command and one question for the
 human, and returns non-zero. Printing a command is not running it, and `mishe --test` asserts the
 difference directly: the package managers are shimmed to record every call, the degraded path is
@@ -51,8 +51,19 @@ the new node is visible, that nothing got scheduled, and that nothing got instal
 package managers are shimmed too, so a `brew install` anywhere in the plant is a recorded call). It does not assert that the file exists;
 that assertion is worth nothing.
 
-On the receiving side, the test that matters is not the seed's own output. It is step 5 of
+On the receiving side, the test that matters is not the seed's own output. It is branch 5 of
 `planting.md`: a real answer, about their real work, that they actually read.
+
+## The seed's other half is the burn
+
+A seed is only cheap to accept if it is equally cheap to undo, so the two things the seed writes are
+exactly the two things `mishe burn` removes: `~/.claude/skills/mishe-mishe-to-tauftauf/` and
+`~/.mishe/`. Whatever you add to the seed, add to `burn_scan` in the core in the same change —
+otherwise the seed grows a footprint the teardown cannot see, and "nothing remains" quietly becomes
+"nothing remains except". That is not left to care: `mesh-mishe --test` plants into a throwaway
+home, burns it, and then sweeps that home **itself** for anything named mishe — burn's own verdict
+is checked, and then checked again by something that is not burn. Seen red against a mutant whose
+burn skipped the skill directory.
 
 ## What is deliberately not here
 
