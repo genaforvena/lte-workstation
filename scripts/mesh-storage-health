@@ -9,6 +9,7 @@
 #   mesh-disk-space     .disk-space.state    NORMAL|WARNING|CRITICAL|OFFLINE   (capacity: use%/inode%)
 #   mesh-disk-latency   .disk-latency-state  FAST|NORMAL|SLOW|STALLED|UNKNOWN|OFFLINE  (perf: await ms)
 #   mesh-nvme-temp      .nvme-temp.state     COOL|WARM|HOT|CRITICAL|OFFLINE    (controller heat)
+#   mesh-nvme-health    .nvme-health.state   HEALTHY|DEGRADED|CRITICAL (AGG line)  (MEDIA self-report)
 #
 # Why this is NEW (not a dup of mesh-system-vitality):
 #   mesh-system-vitality folds disk-latency in as ONE of 4 hardware axes (CPU/battery/thermal/disk)
@@ -37,9 +38,40 @@
 #   mechanism the OTHER axis's fault cannot disturb. Tell in the artifact: that CRITICAL carried
 #   no `@<mount>`, because the capacity verdict was not about a full filesystem at all.
 #
+# LATENCY IS NOT A MEDIA SENSE, AND THIS TOOL SAID "IMMINENT STORAGE FAILURE" OFF IT ALONE
+# (2026-08-21, mesh-home, board task {#0af5ca57} — the SECOND false CRITICAL here, and unlike the
+# 2026-08-16 one it is NOT a shared-input artifact: capacity carried its @/ mount, was NORMAL@18%,
+# thermal COOL. latency=STALLED was the sole trigger and it fired the incident by itself):
+#   /proc/diskstats write_await = write_ticks/writes_completed, and a request's ticks accrue from
+#   QUEUE INSERT to completion. It is therefore a QUEUE-INCLUSIVE number that measures OFFERED LOAD
+#   at least as much as the device, and its denominator varies, so a few large queued writes give a
+#   huge mean while a heavy steady stream dilutes it. MEASURED on this node the same morning,
+#   against `smartctl -A` taken in the same run (critical_warning 0x00, available_spare 99%,
+#   media_and_data_integrity_errors 0, error_information_log_entries 0 — both NVMe, PASSED):
+#     idle 10s          dm-0 write_await   0.09ms   device service time 0.17ms/write
+#     one 2GB dd+fsync  dm-0 write_await 254.49ms   device service time 0.33ms/write
+#     64x256MB writers  dm-0 write_await 187.77ms   device service time 4.34ms/write
+#   — a 2800x swing on the axis this tool alarms on, while the device's own service time moved 2x.
+#   And STALLED itself REPRODUCES ON DEMAND on that clean drive: `mesh-disk-latency` run right
+#   after an rm+sync of a few GB of scratch read "STALLED write=1175.37ms", while the SAME tool run
+#   DURING a real 6GB write read only SLOW (152ms) — so the band does not even track load
+#   monotonically, it tracks the interval's IO mix. Nothing about the media was wrong in any of it.
+# THE FIX, and note its ASYMMETRY: latency=STALLED as the SOLE trigger is downgraded to DEGRADED
+#   only when a FRESH MEDIA READ POSITIVELY CONTRADICTS it (mesh-nvme-health AGG=HEALTHY — the
+#   controller's own wear/error self-report, an axis no amount of queueing can disturb). Missing or
+#   stale media evidence NEVER downgrades: no reading -> CRITICAL stands, and the reason says
+#   "media=unread" so the absence is visible instead of being spent as an all-clear.
+# AND PERSISTENCE STILL ESCALATES: a load burst does not survive its interval (both wild CRITICALs
+#   here were HEALTHY again on the very next fire), a dying drive does. STALLED held for
+#   STALL_ESCALATE consecutive evals re-raises CRITICAL even against a HEALTHY media report, so the
+#   downgrade costs the incident tag on a transient and nothing on a real hang.
+#
 # Bands (FALSIFIABLE: change a band rule -> test flips):
-#   CRITICAL   capacity=CRITICAL (exhausted/read-only) OR latency=STALLED OR thermal=CRITICAL
+#   CRITICAL   capacity=CRITICAL (exhausted/read-only) OR thermal=CRITICAL OR media=CRITICAL
 #              — imminent storage failure regardless of attribution
+#              latency=STALLED also raises CRITICAL, UNLESS it is the sole trigger AND media reads
+#              a fresh HEALTHY (then DEGRADED — see the falsification note above), UNLESS it has
+#              persisted STALL_ESCALATE consecutive evals (then CRITICAL again, persistence-attributed)
 #   DEGRADED   capacity=WARNING OR latency=SLOW OR thermal=HOT
 #              — reason names the ATTRIBUTION: thermal-attributed / capacity-attributed / BOTH /
 #                UNATTRIBUTED (latency degraded, neither capacity nor thermal corroborates —
@@ -61,6 +93,12 @@ export PATH="$HOME/.local/bin:$PATH"
 MESH="${MESH_DIR:-$HOME/.mesh}"
 STATE="$MESH/.storage-health-state"
 STALE_S=1800  # 30min — generous vs the slowest input cadence (disk-space/nvme-temp */15)
+# the MEDIA axis has its own bound: mesh-nvme-health is a `0 */6` reflex (a SMART read is expensive
+# and wear moves in days, not minutes). Judging it by STALE_S would render it stale on every single
+# eval — an axis permanently n/a is an axis that is not in the fusion at all.
+MEDIA_STALE_S=28800   # 8h — 6h cadence + 2h slack
+STALL_ESCALATE=3      # consecutive evals of latency=STALLED that re-raise CRITICAL despite healthy
+                      # media (at the 4-59/15 cadence: 45min — longer than any burst seen here)
 
 # --- read helpers (required axes return OFFLINE on missing/stale/unreadable) ---
 read_capacity() {
@@ -109,10 +147,31 @@ read_thermal() {
   esac
 }
 
+# MEDIA is the axis that answers the question the CRITICAL band's words actually make ("imminent
+# storage FAILURE"): the controller's own wear/error self-report, which queueing cannot disturb.
+# OPTIONAL like thermal — a node with no NVMe / no sudo / no smartctl legitimately has none, so a
+# missing read is "n/a", never "OFFLINE". n/a must never be spent as an all-clear (see classify).
+read_media() {
+  local f="$1" v now m
+  [ -f "$f" ] || { echo "n/a"; return; }
+  now=$(date +%s); m=$(stat -c %Y "$f" 2>/dev/null || echo "$now")
+  if [ $((now - m)) -gt "$MEDIA_STALE_S" ]; then echo "n/a"; return; fi
+  # mesh-nvme-health writes an AGG roll-up line plus one line per device; the AGG line is the
+  # fleet-of-one verdict. Grep it by name rather than by position — a per-device line first would
+  # otherwise silently become the whole node's media verdict.
+  v="$(grep -m1 '^AGG:' "$f" 2>/dev/null | sed -n 's/^AGG:\([A-Z]*\)|.*/\1/p')"
+  case "$v" in
+    HEALTHY|DEGRADED|CRITICAL) printf '%s' "$v" ;;
+    *) echo "n/a" ;;
+  esac
+}
+
 # --- classifier (pure, offline-testable) ---
-# classify_storage <capacity> <latency> <thermal> -> "LABEL|reason"
+# classify_storage <capacity> <latency> <thermal> [capwhere] [media] [stallrun] -> "LABEL|reason"
+#   media    HEALTHY|DEGRADED|CRITICAL|n/a  — optional, defaults n/a (behaves as before when absent)
+#   stallrun integer — how many consecutive evals latency has now read STALLED, this one included
 classify_storage() {
-  local cap="$1" lat="$2" therm="$3" capwhere="${4:-}"
+  local cap="$1" lat="$2" therm="$3" capwhere="${4:-}" media="${5:-n/a}" stallrun="${6:-0}"
   # every 'capacity=<label>' in a reason carries its MOUNT when the capacity sense named one
   local cap_d="$cap${capwhere:+@$capwhere}"
   # 1. Missing-required tally (thermal excluded — optional axis)
@@ -125,40 +184,79 @@ classify_storage() {
     return
   fi
   if [ "$degen" -eq 1 ]; then
-    echo "DEGRADED|missing: $missing (1 required input offline, can't fully assert) | capacity=$cap_d latency=$lat thermal=$therm"
+    echo "DEGRADED|missing: $missing (1 required input offline, can't fully assert) | capacity=$cap_d latency=$lat thermal=$therm media=$media"
     return
   fi
-  # 2. CRITICAL: capacity exhausted, latency stalled, or thermal at/past crit — regardless of attribution
-  if [ "$cap" = "CRITICAL" ] || [ "$lat" = "STALLED" ] || [ "$therm" = "CRITICAL" ]; then
+  # 1b. MEDIA=CRITICAL is its own trigger — the controller predicting its own failure needs no
+  #     corroboration from a performance number.
+  # 2. CRITICAL: capacity exhausted, thermal at/past crit, or media critical — regardless of attribution
+  if [ "$cap" = "CRITICAL" ] || [ "$therm" = "CRITICAL" ] || [ "$media" = "CRITICAL" ]; then
     local why=""
     [ "$cap" = "CRITICAL" ] && why="${why}capacity=CRITICAL,"
     [ "$lat" = "STALLED" ] && why="${why}latency=STALLED,"
     [ "$therm" = "CRITICAL" ] && why="${why}thermal=CRITICAL,"
-    echo "CRITICAL|${why%,} (imminent storage failure) | capacity=$cap_d latency=$lat thermal=$therm"
+    [ "$media" = "CRITICAL" ] && why="${why}media=CRITICAL,"
+    echo "CRITICAL|${why%,} (imminent storage failure) | capacity=$cap_d latency=$lat thermal=$therm media=$media"
+    return
+  fi
+  # 2b. latency=STALLED. Queue-inclusive await is not a media sense (see the header measurement),
+  #     so what this branch decides is WHETHER ANYTHING ELSE AGREES the storage is failing.
+  if [ "$lat" = "STALLED" ]; then
+    local corrob=""
+    [ "$cap" = "WARNING" ] && corrob="${corrob}capacity,"
+    [ "$therm" = "HOT" ] && corrob="${corrob}thermal,"
+    [ "$media" = "DEGRADED" ] && corrob="${corrob}media,"
+    if [ -n "$corrob" ]; then
+      echo "CRITICAL|latency=STALLED corroborated=${corrob%,} (imminent storage failure) | capacity=$cap_d latency=$lat thermal=$therm media=$media"
+      return
+    fi
+    # persistence beats a healthy self-report: a load burst does not survive its own interval.
+    if [ "$stallrun" -ge "$STALL_ESCALATE" ]; then
+      echo "CRITICAL|latency=STALLED persisted ${stallrun} consecutive evals (past a load burst — escalated despite media=$media) | capacity=$cap_d latency=$lat thermal=$therm media=$media"
+      return
+    fi
+    # the ONLY downgrade, and it needs POSITIVE contradicting evidence, never mere absence
+    if [ "$media" = "HEALTHY" ]; then
+      echo "DEGRADED|latency=STALLED UNATTRIBUTED but media=HEALTHY CONTRADICTS it (SMART self-report clean; diskstats await is queue-inclusive — reads as load, not failure). Escalates to CRITICAL if held ${STALL_ESCALATE} evals | capacity=$cap_d latency=$lat thermal=$therm media=$media"
+      return
+    fi
+    # media unread/stale/absent: absence of evidence is NOT evidence of health — CRITICAL stands,
+    # and the reason SAYS the axis was unread so nobody mistakes it for a checked all-clear.
+    echo "CRITICAL|latency=STALLED, media=unread (no SMART corroborate — media health not ruled out) | capacity=$cap_d latency=$lat thermal=$therm media=$media"
     return
   fi
   # 3. DEGRADED: capacity warning, latency slow, or thermal hot — ATTRIBUTE if latency is the trigger
-  if [ "$cap" = "WARNING" ] || [ "$lat" = "SLOW" ] || [ "$therm" = "HOT" ]; then
+  if [ "$cap" = "WARNING" ] || [ "$lat" = "SLOW" ] || [ "$therm" = "HOT" ] || [ "$media" = "DEGRADED" ]; then
     local attrib=""
     if [ "$lat" = "SLOW" ]; then
       local cause=""
       [ "$therm" = "HOT" ] && cause="${cause}thermal,"
       [ "$cap" = "WARNING" ] && cause="${cause}capacity,"
+      [ "$media" = "DEGRADED" ] && cause="${cause}media,"
       if [ -z "$cause" ]; then
-        attrib="latency=SLOW UNATTRIBUTED (no thermal/capacity correlate — investigate media health directly)"
+        # the media axis exists now, so "investigate media health directly" must not be printed
+        # when it ALREADY WAS: an instruction to check something already checked is a reader
+        # spending their turn re-deriving a fact the line is holding.
+        if [ "$media" = "HEALTHY" ]; then
+          attrib="latency=SLOW UNATTRIBUTED, media=HEALTHY already checked (SMART clean — queue-inclusive await reads as load, not media)"
+        else
+          attrib="latency=SLOW UNATTRIBUTED (no thermal/capacity correlate, media=$media — investigate media health directly)"
+        fi
       else
         attrib="latency=SLOW attributed=${cause%,} (corroborated cause found)"
       fi
+    elif [ "$media" = "DEGRADED" ]; then
+      attrib="media=DEGRADED (drive self-report — the axis queueing cannot fake)"
     elif [ "$therm" = "HOT" ]; then
       attrib="thermal=HOT (leading indicator — latency not yet degraded)"
     else
       attrib="capacity=WARNING${capwhere:+ on $capwhere} (latency not yet degraded)"
     fi
-    echo "DEGRADED|$attrib | capacity=$cap_d latency=$lat thermal=$therm"
+    echo "DEGRADED|$attrib | capacity=$cap_d latency=$lat thermal=$therm media=$media"
     return
   fi
-  # 4. HEALTHY: capacity NORMAL, latency FAST/NORMAL, thermal COOL/WARM/n/a
-  echo "HEALTHY|capacity=$cap_d latency=$lat thermal=$therm (storage nominal)"
+  # 4. HEALTHY: capacity NORMAL, latency FAST/NORMAL, thermal COOL/WARM/n/a, media HEALTHY/n/a
+  echo "HEALTHY|capacity=$cap_d latency=$lat thermal=$therm media=$media (storage nominal)"
 }
 
 # --- Test mode (pure classifier, no state-file reads) ---
@@ -208,6 +306,90 @@ if [ "${1:-}" = --test ]; then
   # a capacity sense that named no mount must NOT invent one (no stray '@')
   r="$(classify_storage NORMAL FAST COOL)"; echo "$r" | grep -q 'capacity=NORMAL@' && { echo "  FAIL attribution-absent: invented a mount: got=$r"; fail=1; }
 
+  # --- MEDIA AXIS (2026-08-21, board {#0af5ca57}) — the asymmetry is the whole fix, so each arm
+  # is asserted separately. A gate you have not seen FAIL is not a gate: flipping the DEGRADED in
+  # the media branch to CRITICAL, or dropping the stallrun escalation, must turn these red.
+  # (a) STALLED alone + a FRESH HEALTHY media self-report -> DEGRADED, not an incident
+  r="$(classify_storage NORMAL STALLED COOL / HEALTHY 1)"
+  echo "$r" | grep -q '^DEGRADED' || { echo "  FAIL media-contradicts-stall label: got=$r"; fail=1; }
+  echo "$r" | grep -q 'imminent storage failure' && { echo "  FAIL media-contradicts-stall: still claims imminent failure: got=$r"; fail=1; }
+  echo "$r" | grep -q 'media=HEALTHY CONTRADICTS' || { echo "  FAIL media-contradicts-stall reason: got=$r"; fail=1; }
+  # (b) ABSENCE OF EVIDENCE NEVER DOWNGRADES: media unread -> CRITICAL stands and SAYS it is unread
+  r="$(classify_storage NORMAL STALLED COOL / n/a 1)"
+  echo "$r" | grep -q '^CRITICAL' || { echo "  FAIL media-unread-must-not-downgrade: got=$r"; fail=1; }
+  echo "$r" | grep -q 'media=unread' || { echo "  FAIL media-unread must name the missing axis: got=$r"; fail=1; }
+  # (c) PERSISTENCE BEATS A CLEAN SMART: a burst does not survive its interval, a dying drive does
+  r="$(classify_storage NORMAL STALLED COOL / HEALTHY "$STALL_ESCALATE")"
+  echo "$r" | grep -q '^CRITICAL' || { echo "  FAIL stall-persistence-escalation: got=$r"; fail=1; }
+  echo "$r" | grep -q 'persisted' || { echo "  FAIL stall-persistence reason: got=$r"; fail=1; }
+  r="$(classify_storage NORMAL STALLED COOL / HEALTHY "$((STALL_ESCALATE - 1))")"
+  echo "$r" | grep -q '^DEGRADED' || { echo "  FAIL stall-escalation boundary (one below must NOT escalate): got=$r"; fail=1; }
+  # (d) a corroborating axis restores the incident immediately, no persistence needed
+  r="$(classify_storage NORMAL STALLED COOL / DEGRADED 1)"; echo "$r" | grep -q '^CRITICAL' || { echo "  FAIL stall+media-degraded: got=$r"; fail=1; }
+  r="$(classify_storage WARNING STALLED COOL / HEALTHY 1)"; echo "$r" | grep -q '^CRITICAL' || { echo "  FAIL stall+capacity-warning: got=$r"; fail=1; }
+  r="$(classify_storage NORMAL STALLED HOT / HEALTHY 1)"; echo "$r" | grep -q '^CRITICAL' || { echo "  FAIL stall+thermal-hot: got=$r"; fail=1; }
+  # (e) media is a trigger in its own right — the controller predicting its own death needs no second opinion
+  r="$(classify_storage NORMAL FAST COOL / CRITICAL 0)"; echo "$r" | grep -q '^CRITICAL' || { echo "  FAIL media-critical-alone: got=$r"; fail=1; }
+  r="$(classify_storage NORMAL FAST COOL / DEGRADED 0)"; echo "$r" | grep -q '^DEGRADED' || { echo "  FAIL media-degraded-alone: got=$r"; fail=1; }
+  echo "$r" | grep -q 'media=DEGRADED (drive self-report' || { echo "  FAIL media-degraded-alone attribution: got=$r"; fail=1; }
+  # (f) BACKWARD COMPAT: called with the old 3/4-arg signature (media defaults n/a) the CRITICAL
+  #     band must still fire on STALLED — no caller silently loses its alarm.
+  r="$(classify_storage NORMAL STALLED COOL)"; echo "$r" | grep -q '^CRITICAL' || { echo "  FAIL legacy-signature-stall: got=$r"; fail=1; }
+  # (g) the verdict must PUBLISH the media axis so a reader can never mistake n/a for checked-clean
+  r="$(classify_storage NORMAL FAST COOL / n/a 0)"; echo "$r" | grep -q 'media=n/a' || { echo "  FAIL media not published in HEALTHY reason: got=$r"; fail=1; }
+
+  # (h) SLOW UNATTRIBUTED must not order a check the fusion already performed
+  r="$(classify_storage NORMAL SLOW COOL / HEALTHY 0)"
+  echo "$r" | grep -q 'investigate media health directly' && { echo "  FAIL slow-unattributed: orders a media check it already has the answer to: got=$r"; fail=1; }
+  echo "$r" | grep -q 'media=HEALTHY already checked' || { echo "  FAIL slow-unattributed reason: got=$r"; fail=1; }
+  # ...but with NO media reading it must still send the reader to the media, and name the absence
+  r="$(classify_storage NORMAL SLOW COOL / n/a 0)"
+  echo "$r" | grep -q 'investigate media health directly' || { echo "  FAIL slow-unattributed-no-media: got=$r"; fail=1; }
+
+  # --- MEDIA STALENESS BOUND: judging a `0 */6` reflex by STALE_S (30min) renders it n/a on every
+  # eval — an axis permanently absent is an axis not in the fusion, and here that silently restores
+  # the exact false CRITICAL this change removes. Assert the bound covers the producer's cadence.
+  _nh="$(dirname "$0")/mesh-nvme-health"; [ -f "$_nh" ] || _nh="$(command -v mesh-nvme-health 2>/dev/null)"
+  if [ -n "$_nh" ] && [ -f "$_nh" ]; then
+    _cad="$(grep -m1 '^# reflex-cadence:' "$_nh" | sed -n 's/.*reflex-cadence: *[0-9*]* \*\/\([0-9]\+\) .*/\1/p')"
+    if [ -n "$_cad" ]; then
+      [ "$MEDIA_STALE_S" -gt $(( _cad * 3600 )) ] || { echo "  FAIL media-stale-bound: MEDIA_STALE_S=$MEDIA_STALE_S <= mesh-nvme-health cadence ${_cad}h — the axis would read n/a on every eval"; fail=1; }
+    else
+      echo "  (media-stale-bound gate skipped: could not parse mesh-nvme-health's cadence)"
+    fi
+  else
+    echo "  (media-stale-bound gate skipped: mesh-nvme-health not present)"
+  fi
+
+  # --- CROSS-TOOL FORMAT GATE for the media axis: read_media must parse the bytes mesh-nvme-health
+  # ACTUALLY writes, not a fixture agreeing with itself. Copy the LIVE state into a sandbox and
+  # re-stamp its mtime — never read the live path through the staleness branch (a genuinely old
+  # file would fail this gate for a reason that is not a format drift), and never WRITE the live
+  # artifact from a --test.
+  if [ -f "$MESH/.nvme-health.state" ]; then
+    _mb="$(mktemp -d -t mesh-storage-health-media.XXXXXXXX)"
+    cp "$MESH/.nvme-health.state" "$_mb/live.state" && touch "$_mb/live.state"
+    _mv="$(read_media "$_mb/live.state")"
+    case "$_mv" in
+      HEALTHY|DEGRADED|CRITICAL) : ;;
+      *) echo "  FAIL cross-tool media: mesh-nvme-health's live state parses to '$_mv' — format drift, the axis is silently absent: $(head -1 "$_mb/live.state")"; fail=1 ;;
+    esac
+    # a state file carrying ONLY per-device lines must NOT have one device promoted to the node verdict
+    grep -v '^AGG:' "$_mb/live.state" > "$_mb/nodeagg.state" 2>/dev/null || true
+    if [ -s "$_mb/nodeagg.state" ]; then
+      touch "$_mb/nodeagg.state"
+      _mv2="$(read_media "$_mb/nodeagg.state")"
+      [ "$_mv2" = "n/a" ] || { echo "  FAIL cross-tool media: a per-device line was read as the node verdict ('$_mv2')"; fail=1; }
+    fi
+    # stale beyond the bound -> n/a (and n/a must never downgrade — asserted in (b))
+    touch -d '-9 hours' "$_mb/live.state" 2>/dev/null && {
+      [ "$(read_media "$_mb/live.state")" = "n/a" ] || { echo "  FAIL media staleness not enforced at 9h"; fail=1; }
+    }
+    rm -rf "$_mb"
+  else
+    echo "  (cross-tool media format gate skipped: no .nvme-health.state on this node)"
+  fi
+
   # --- CROSS-TOOL FORMAT GATE: read_capacity_where parses the reason string that mesh-disk-space
   # ACTUALLY writes. Parsing a hand-written fixture would assert only that this file agrees with
   # itself, and the two could drift the day the producer's wording changes. Drive the real producer
@@ -229,8 +411,37 @@ if [ "${1:-}" = --test ]; then
     echo "  (cross-tool format gate skipped: mesh-disk-space not present)"
   fi
 
+  # --- LIVE-PATH ROUND TRIP for the persistence counter. The classifier above proves the RULE;
+  # it proves nothing about the counter being CARRIED across runs — exactly the gap that makes an
+  # escalation rule a decoration. Drive the real read/write path in a sandbox HOME (never the live
+  # state — a --test must not write the artifact a human or watchdog reads for liveness).
+  _pb="$(mktemp -d -t mesh-storage-health-run.XXXXXXXX)"; mkdir -p "$_pb/.mesh"
+  printf 'NORMAL|use_pct=18|inode_pct=2|writeable=yes|space OK (use=18%% on / inode=2%% on /)\n' > "$_pb/.mesh/.disk-space.state"
+  printf 'STALLED|verdict=STALLED|dev=dm-0|side=write|write_ms=1400\n' > "$_pb/.mesh/.disk-latency-state"
+  printf 'COOL|40850|40.9|89850|94850|x|x\n' > "$_pb/.mesh/.nvme-temp.state"
+  printf 'AGG:HEALTHY|devices=2|x\n' > "$_pb/.mesh/.nvme-health.state"
+  # run 1: no prior state -> stall run 1 -> DEGRADED (media contradicts)
+  _r1="$(HOME="$_pb" MESH_DIR="$_pb/.mesh" "$0" 2>/dev/null)"
+  case "$_r1" in *DEGRADED*) : ;; *) echo "  FAIL live-path run1: expected DEGRADED on a first STALLED against healthy media, got: $_r1"; fail=1;; esac
+  grep -q '|stall=1$' "$_pb/.mesh/.storage-health-state" || { echo "  FAIL live-path: stall counter not persisted after run 1: $(cat "$_pb/.mesh/.storage-health-state")"; fail=1; }
+  # runs 2..STALL_ESCALATE: the counter must CARRY and escalate exactly at the bound
+  _i=2
+  while [ "$_i" -le "$STALL_ESCALATE" ]; do
+    _rn="$(HOME="$_pb" MESH_DIR="$_pb/.mesh" "$0" 2>/dev/null)"; _i=$((_i + 1))
+  done
+  case "$_rn" in *CRITICAL*persisted*) : ;; *) echo "  FAIL live-path escalation: $STALL_ESCALATE consecutive STALLED did not re-raise CRITICAL, got: $_rn"; fail=1;; esac
+  # a single recovered eval must RESET the run — otherwise the counter ratchets and every later
+  # stall escalates instantly, which is the same false incident wearing a new mechanism.
+  printf 'NORMAL|verdict=NORMAL|dev=dm-0|side=write|write_ms=52\n' > "$_pb/.mesh/.disk-latency-state"
+  HOME="$_pb" MESH_DIR="$_pb/.mesh" "$0" >/dev/null 2>&1
+  grep -q '|stall=0$' "$_pb/.mesh/.storage-health-state" || { echo "  FAIL live-path: a recovered eval did not reset the stall run: $(cat "$_pb/.mesh/.storage-health-state")"; fail=1; }
+  printf 'STALLED|verdict=STALLED|dev=dm-0|side=write|write_ms=1400\n' > "$_pb/.mesh/.disk-latency-state"
+  _rr="$(HOME="$_pb" MESH_DIR="$_pb/.mesh" "$0" 2>/dev/null)"
+  case "$_rr" in *DEGRADED*) : ;; *) echo "  FAIL live-path: after a reset the next STALLED escalated immediately, got: $_rr"; fail=1;; esac
+  rm -rf "$_pb"
+
   [ "$fail" = 1 ] && { echo "smoke-test: FAIL"; exit 1; }
-  echo "smoke-test: ok (22 fusion assertions: CRITICAL x3+priority, DEGRADED attribution x5+alone x2, HEALTHY x3, OFFLINE x3, mount-attribution x4 + live cross-tool format gate)"
+  echo "smoke-test: ok (40 fusion assertions: CRITICAL x3+priority, DEGRADED attribution x6+alone x3, HEALTHY x3, OFFLINE x3, mount-attribution x4, media-axis x16 incl. the stall/media asymmetry + persistence boundary, + live cross-tool format gates for disk-space AND nvme-health + the media staleness bound)"
   exit 0
 fi
 
@@ -239,25 +450,37 @@ cap="$(read_capacity "$MESH/.disk-space.state")"
 capw="$(read_capacity_where "$MESH/.disk-space.state")"
 lat="$(read_latency "$MESH/.disk-latency-state")"
 therm="$(read_thermal "$MESH/.nvme-temp.state")"
-
-result="$(classify_storage "$cap" "$lat" "$therm" "$capw")"
-label="${result%%|*}"
-reason="${result#*|}"
+media="$(read_media "$MESH/.nvme-health.state")"
 
 # capture prev BEFORE overwriting STATE — reading it after the write would always see the label
 # we just wrote (a real latent bug in the sibling mesh-system-vitality, which does exactly that
 # and so its --edge is a permanent no-op); do the read/write in the right order here.
-prev=""; [ -f "$STATE" ] && prev="$(head -1 "$STATE" 2>/dev/null | cut -d'|' -f1)" || true
+prev=""; prev_stall=0
+if [ -f "$STATE" ]; then
+  _prev_line="$(head -1 "$STATE" 2>/dev/null || true)"
+  prev="$(printf '%s' "$_prev_line" | cut -d'|' -f1)"
+  # stall= is a trailing field appended by this tool; an OLD state file written before it existed
+  # has none, which correctly reads 0 (a fresh run cannot claim a history it never observed).
+  prev_stall="$(printf '%s' "$_prev_line" | sed -n 's/.*|stall=\([0-9]\+\).*/\1/p')"
+  [ -n "$prev_stall" ] || prev_stall=0
+fi
+# consecutive STALLED run, this eval included. Any non-STALLED reading resets it — the escalation
+# is about a stall that HELD, so one recovered eval genuinely ends the run.
+if [ "$lat" = "STALLED" ]; then stallrun=$((prev_stall + 1)); else stallrun=0; fi
+
+result="$(classify_storage "$cap" "$lat" "$therm" "$capw" "$media" "$stallrun")"
+label="${result%%|*}"
+reason="${result#*|}"
 
 TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 mkdir -p "$MESH" 2>/dev/null || true
-printf '%s|capacity=%s|latency=%s|thermal=%s|%s\n' "$label" "$cap" "$lat" "$therm" "$reason" > "$STATE"
+printf '%s|capacity=%s|latency=%s|thermal=%s|media=%s|%s|stall=%s\n' "$label" "$cap" "$lat" "$therm" "$media" "$reason" "$stallrun" > "$STATE"
 [ -x "$HOME/.local/bin/mesh-state-touch" ] && mesh-state-touch "$STATE" >/dev/null 2>&1 || touch "$STATE" 2>/dev/null || true
 
 # --- Output ---
 if [ "${1:-}" = --json ]; then
-  printf '{"label":"%s","reason":"%s","inputs":{"capacity":"%s","latency":"%s","thermal":"%s"},"ts":"%s"}\n' \
-    "$label" "$reason" "$cap" "$lat" "$therm" "$TS"
+  printf '{"label":"%s","reason":"%s","inputs":{"capacity":"%s","latency":"%s","thermal":"%s","media":"%s"},"stall_run":%s,"ts":"%s"}\n' \
+    "$label" "$reason" "$cap" "$lat" "$therm" "$media" "$stallrun" "$TS"
   exit 0
 fi
 if [ "${1:-}" = --edge ]; then
