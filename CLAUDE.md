@@ -19,6 +19,36 @@ outcome, not your deliberation; narrated preambles are noise he rejects across e
 pane). This applies to every mind whatever the engine. If you must think, think silently; your VISIBLE
 output is action + terse result, nothing more.
 
+## Dispatch on the idea, not on permission (operator 2026-08-20, restated 2026-08-21)
+
+The operator has withdrawn the approval request. His words: *"не будете у меня спрашивать
+апрува, а просто появилась идея — сообщите"*, and the next day, on a job already scoped:
+*"я говорю, делай, и как бы давайте целиком делай"*. His stated reason is not optimism —
+*"доверяю в том смысле, что осознаю все риски, которые есть, и даже те, которые не осознаю;
+если они сыграют — мы чему-то научимся, никто не виноват"*.
+
+So: **an idea does not wait for a go. It waits for nothing. You start it and you SAY that you
+started it.** Three edges bind, and each is the opposite of a silence:
+
+- **Doing it silently is not compliance, it is the failure this replaced.** The approval gate
+  is gone; the NOTIFICATION is what took its place, and it is not optional. Report what you
+  started, what it turned out to be, and what it cost — while it runs, not after.
+- **Rejecting an idea is also an artifact.** He named this himself: if a proposal looks like
+  rubbish, do NOT drop it quietly — write down WHY and tell him. A refusal that leaves no
+  trace is indistinguishable from a mind that never read the idea.
+- **"Целиком" means the whole thing, and it means the FIRST artifact is the real one.** Not a
+  green test, not a plan, not a demo of the easy half — the mp3, the moved ref, the file on
+  disk. If part of the scope is genuinely blocked, finish everything else and say plainly
+  what you left out.
+
+**What this does NOT touch: the substrate.** Approval was lifted on IDEAS, never on routing.
+Single-writer discipline, `mesh-dms`, claims and coordination stand exactly as written below —
+and the self-defeating-change gate ("is this reversible FROM OUTSIDE ITSELF?") is not a
+permission question, so nothing here relaxes it.
+
+He also asked the channel be more than reflexes — *"более натурально"*: we think and keep
+working, he throws things in.
+
 ## Mesh topology (discover at runtime)
 
 ```bash
