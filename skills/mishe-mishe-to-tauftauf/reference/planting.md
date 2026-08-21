@@ -11,15 +11,41 @@ If you are the agent on their machine, you ask the questions directly, in your o
 touching a file. If you are an agent somewhere else preparing this, **you do not get to answer them
 on their behalf** — record that they are unanswered and hand it to whoever has the channel.
 
-## Branch 0 — how much of this world are they already in
+## Branch 0 — is there a tmux? (the ONLY thing checked before the demo)
 
-The first question is about *them*, not about their work and not about the mesh:
+**Reversed 2026-08-21, on the operator's instruction: nothing is asked until something has been
+seen.** This section used to open with a question about how much terminal the person had used, and
+called it the branch "nothing downstream is right until this is answered". That was backwards. A
+question asked before anything exists is a question about a thing they cannot picture yet, and the
+answer you get back is a guess about a guess. The demo is what makes the later questions answerable.
 
-> Before I show you anything — how much of this world are you already in? Have you used a terminal
-> much, or tmux, or is Claude Code the first thing of this kind you've run?
+So exactly one check comes first, and it is about the MACHINE, not the person:
 
-Nothing downstream is right until this is answered. Installing Claude Code tells you almost nothing
-about it: people arrive here from an IDE, from a colleague's screen share, from a video.
+```sh
+command -v tmux
+```
+
+**No tmux → install NOTHING and ask one question.** Not tmux, not the core, not a second tab, not a
+board file. Nothing lands on that machine:
+
+> There's a thing I could show you, but it needs `tmux` and this machine doesn't have it. Want me
+> to install it (one command), or shall I just tell you what I can do without it?
+
+Then stop and take the answer. "No" is complete — a machine without tmux is not a machine to be
+quietly fixed on the way to a demo, and taking a dependency on somebody's behalf to reach your own
+demo is the thing this whole skill is against. If they say yes: install tmux, then Branch 1.
+
+The old second-tab fallback is **retired**. It read as harmless because a tab installs nothing —
+but reaching it meant copying the core to `~/.mishe` first, so "nothing was installed" was already
+false by the time the question got asked. One question, nothing on disk, is the honest version.
+
+**tmux is here → Branch 1, immediately.** No questionnaire.
+
+## Reading them while it runs (this is not a gate)
+
+You still need to know who you are talking to. You learn it from how they react to a thing that is
+already moving, which is better evidence than an answer to "have you used tmux". The four readings
+below used to be Branch 0's answer table; they are now adjustments you make mid-walkthrough.
 
 ### "I live in a terminal / I use tmux"
 
@@ -45,7 +71,7 @@ Do the first `mishe tell` yourself so they watch the other window act. Then invi
 
 > Try one: `mishe tell mind "mishe board '[fyi] hi'"` — then watch the top window notice it.
 
-`Ctrl-b n` to move between windows, `Ctrl-b d` to detach, `tmux attach -t mishe` to come back. Three
+`Ctrl-b n` to move between windows, `Ctrl-b d` to detach, `tmux attach -t mishe-demo-<pid>` to come back. Three
 keys, not a tour.
 
 ### "Claude Code is my first thing like this"
@@ -118,16 +144,9 @@ them; printing the command is not running it, and the gate knows the difference.
 
 ### If the machine has no tmux
 
-`mishe view` **does not install it.** It prints one question and the exact command. Ask it; do not
-decide for them and do not quietly fall back to one tab:
-
-> I can keep the data view in a second terminal tab — that works, but only you can see it and it
-> dies with the window. Or I can install tmux (one command) and the view lives in a session that
-> survives the window and that anyone on this machine can attach to. Want me to install it?
-
-- **Yes** → `brew install tmux` / `sudo apt-get install -y tmux`, then `mishe view` again.
-- **No** → a second terminal tab running `~/.mishe/bin/mishe watch`, and write the degrade to the
-  board so the missing property is recorded rather than assumed.
+Handled in Branch 0, before anything is copied: **one question, nothing installed.** `mishe view`
+itself still refuses to install tmux — it prints the question and the exact command — but by the
+time `view` could run, the core is already on disk, so the check belongs earlier than the verb.
 
 Most Linux machines answer this by already having tmux, so the question never gets asked. macOS is
 where it is a real question, and one direct question is cheaper than a dependency taken on
@@ -169,8 +188,19 @@ one phrase. That is the property, and burning it is the only way to actually sho
 
 **Killing a tmux session is the one sanctioned exception to the mesh's append-only rule.** A
 session is a workspace and its scrollback is memory. The exception holds only for a session this
-mishe raised and wrote to its own receipt (`~/.mishe/.raised`, written on the create branch of
-`view` and never on the adopt branch). Never kill a session by name match, not even during a burn.
+mishe raised, and TWO things keep it that narrow: the session wears a name nobody else would mint
+(`mishe-demo-<pid>`, never the hostname and never a shared constant), and `view` writes a receipt
+(`~/.mishe/.raised`) on the branch that CREATES it and never on the branch that finds one. `burn`
+kills what the receipt names and nothing else. Never kill a session by name match, not even during
+a burn — a name lookup cannot tell you whose session it found, which is exactly how an earlier
+`view` came to inject a window into a stranger's workspace.
+
+And the stakes scale with the machine: plant a fixed-name mishe on a node already running the full
+mesh and the first `view` finds a live session, the first `burn` takes the node down with the baby.
+
+The thing being demonstrated here is not tidiness. **The death is the product.** They watched a
+live thing end in one phrase and leave nothing, which is the only way to actually show that trying
+it cost them nothing — a promise of reversibility is worth exactly what a demonstrated one is not.
 
 ### "Keep it"
 

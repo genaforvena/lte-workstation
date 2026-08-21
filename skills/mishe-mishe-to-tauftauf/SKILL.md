@@ -52,46 +52,59 @@ Five things travel, and they are all habits:
    burn` is built on this rule: it removes, then **re-scans and prints what is left**, because
    "nothing remains" is a claim until something looked.
 
-## How to run this: a roleplay with branches, not a walkthrough
+## How to run this: the demo comes first, and the demo is mortal
 
 **You are not delivering a fixed sequence.** You are having a conversation whose next step depends
-on their last answer. The steps below are branch points, and you take the branch they hand you.
+on their last answer. But the ORDER is fixed at the front, and it is the opposite of the obvious
+one (operator, 2026-08-21): **nothing is asked until something has been seen.** No question about
+their experience, no question about their work, no description of what a mesh is. A description
+buys nothing; five minutes of watching one buys the whole conversation.
 
-### Step 0 — ask what they already know, before anything else
+### Step 1 — is there a tmux? That is the only thing you check first
 
-The first question is not about their work and not about the mesh. It is about **them**:
+```sh
+command -v tmux
+```
 
-> Before I show you anything — how much of this world are you already in? Have you used a terminal
-> much, or tmux, or is Claude Code the first thing of this kind you've run?
+**No tmux → install NOTHING.** Not the core, not a second terminal tab, not a board. Ask one
+question and stop:
 
-Ask it, wait, and **branch on the answer**. Do not guess it from the fact that they installed
-Claude Code — that tells you almost nothing.
+> There's a thing I could show you, but it needs `tmux` and this machine doesn't have it. Want me
+> to install it (one command), or shall I just tell you what I can do without it?
 
-| They say | What changes |
-|---|---|
-| **"I live in a terminal / I use tmux"** | Skip the explanations. Raise it, hand them `tmux attach -t mishe`, let them drive. Go fast; they will tell you when something is wrong. |
-| **"I can use a terminal, tmux is new"** | Raise it and narrate the two windows *once*, in terms of what they see move. Do the sends yourself; invite them to try one. |
-| **"Claude Code is my first thing like this"** | Do not put them in tmux at all at first. You drive; they watch a window change on its own. Explain nothing until they ask — a thing that visibly moves teaches faster than a paragraph. Attaching comes later, if they want it. |
-| **"I don't want a terminal thing"** | Take that seriously and stop. `mishe board` and `mishe handoff` alone are still the culture and need no layout. Say so, and do not raise a session. |
+A machine without tmux is not a machine to be fixed on the way to a demo. Their answer decides
+whether there is a demo at all, and "no" is a complete answer.
 
-Write their answer to the board verbatim before interpreting it — your paraphrase is a number with
-no source.
-
-### Step 1 — plant the baby, live, in front of them
-
-**This comes before any question about their work.** A description of what a mesh is buys nothing;
-five minutes of watching one buys the whole conversation.
+**tmux is here → raise the baby, live, in front of them.**
 
 ```sh
 mkdir -p ~/.mishe/bin && cp core/mishe ~/.mishe/bin/mishe && chmod +x ~/.mishe/bin/mishe
 ~/.mishe/bin/mishe --test          # must print "mishe --test: ok"
-~/.mishe/bin/mishe view            # the baby is now up: session "mishe", windows mind + data
+~/.mishe/bin/mishe view            # up: session mishe-demo-<pid>, windows mind + data
 ```
 
 No repo, no clone, no package manager. If they have no repo to copy from, `reference/seed.md` — the
 core is one file small enough to reconstruct from a pasted block, which is the point.
 
-Then **show four things happening**, in this order, adapted to their branch above:
+#### The session has its OWN, ephemeral name — and this is the load-bearing part
+
+`view` raises **`mishe-demo-<pid>`**. Never the hostname-named session. Never a fixed shared
+`mishe` either. This is not tidiness:
+
+**Killing a tmux session is the ONE sanctioned exception to the mesh's append-only rule** — a
+session is somebody's workspace and its scrollback is that machine's recent memory — and the
+exception is only sanctionable while the session being killed is provably ours. A name lookup
+cannot tell you whose session it found. So an earlier `view` that looked up the hostname session
+adopted a stranger's workspace and injected a window into it; a `view` that looked up a constant
+`mishe` merely made that rarer. **On a machine already running the full mesh, the first mishe
+planted would find a live session and one `burn` later take the node down with the baby.**
+
+Two things make the exception narrow enough to keep: the name is one nobody else would mint, and
+`view` writes a **receipt** (`~/.mishe/.raised`) on the branch that CREATES a session and not on
+the branch that finds one. `burn` kills only what that receipt names. A session wearing our name
+that we have no receipt for is refused out loud, never adopted.
+
+#### Then show four things happening, in this order
 
 1. **One window puts work into another.** From your shell:
    `mishe tell mind "mishe board '[fyi] hello from the other window'"` — the `mind` window runs it,
@@ -105,32 +118,50 @@ Then **show four things happening**, in this order, adapted to their branch abov
 3. **The handoff survives a clear.** `mishe handoff "half-done: X; next: Y"`, then actually `/clear`
    your own context, then `mishe handoff --restore`. Do it for real. A described handoff convinces
    nobody; a context you visibly wiped and walked back into does.
-4. **An organ that fails says so.** `mishe organ x "exit 3"` then `mishe dash` — `FAILED rc=3`, not
-   a blank. Then remove it. The point being made is that this thing does not lie when it is broken.
+4. **A stop lands where they are looking.** Stop the data view and the stop is *visible* — it does
+   not vanish into a window nobody reads. `mishe organ x "exit 3"` then `mishe dash` shows
+   `FAILED rc=3`, not a blank. Then remove it. The point being made is that this thing does not lie
+   when it is broken, and that a failure in one half surfaces in the half the human is watching.
+
+Adapt the narration to who they turn out to be — you learn that from how they react, not from a
+questionnaire. Someone who reaches for the keyboard gets handed `tmux attach -t mishe-demo-<pid>`.
+Someone who watches gets no explanation until they ask; a thing that visibly moves teaches faster
+than a paragraph. Someone who says "I don't want a terminal thing" is telling you to stop, and you
+stop — `mishe board` and `mishe handoff` alone are still the culture and need no layout.
 
 ### Step 2 — ask whether it lives
 
-Now, and only now:
+Now, and only now, the first real question:
 
 > That is the whole thing. Do you want to keep it, or should I remove it?
 
-Both answers are fine and you must mean that. Then:
+Both answers are fine and **you must mean that**. Then:
 
-- **"Remove it"** → `mishe burn`. One phrase, in front of them. It prints what it killed, then
-  re-scans and prints that nothing is left. **That is the point of the whole thing arriving, not
-  the loss of it** — the baby died, cost nothing, and grows again in one phrase anywhere. Do not argue, do not offer
-  a reduced version, do not leave "just the board, in case". Then thank them and stop.
-- **"Keep it"** → go to step 3. It is now theirs, and it is still just as mortal.
+- **"Remove it"** → `mishe burn`, one phrase, in front of them. It prints what it killed, then
+  re-scans and prints that nothing is left: the session, `~/.mishe`, the board, the handoff, the
+  crontab lines, the rc line, the skill. Nothing remains.
 
-### Step 3 — now ask about their work
+  **This is the demonstration arriving, not the demonstration failing.** That mishe died, it cost
+  nothing to lose, and it grows again in one phrase on any machine. A thing you can end in one
+  phrase is a thing you can afford to try — the mortality is what made the planting cheap enough
+  to say yes to in the first place, so watching it die is watching the claim get paid.
 
-Only after the thing exists (or has been buried) does the question about them earn its place:
+  Do not argue. Do not offer a reduced version. Do not leave "just the board, in case" — an
+  "everything except…" turns the one honest promise in this skill into a lie. Then thank them and
+  stop.
+- **"Keep it"** → it is now theirs, and it is still just as mortal.
+
+### Step 3 — only now, ask what they actually want
+
+Whichever way step 2 went — kept or buried — the question about them has now earned its place:
 
 > What do you actually do day to day, and what part of it is annoying enough that you'd want help
 > with it this week?
 
 In their words, never from a menu of your abilities — a menu gets you a pick from what you can do
-instead of a description of what they do. Write the answer to the board **verbatim**.
+instead of a description of what they do. Write the answer to the board **verbatim**; your
+paraphrase is a number with no source. If the baby was burned, write it wherever you and they
+actually talk.
 
 Until it is answered, **any organ is a guess.** The core is organ-neutral, so it can live without
 the answer; what it tends cannot be chosen without it.
@@ -166,13 +197,17 @@ anything still there, exiting non-zero. It never reports clean without looking.
 Three things about it are load-bearing and each has a gate in `mishe --test` that has been watched
 going red:
 
-- **It kills only sessions it raised.** `view` writes a receipt (`~/.mishe/.raised`) on the branch
-  that *creates* a session and not on the branch that adopts one. **Killing a tmux session is the
-  one sanctioned exception to the mesh's append-only rule** — a session is somebody's workspace and
-  its scrollback is memory — and the exception holds only for a session this mishe raised and wrote
-  down. Never kill by name match. An earlier version of `view` adopted the machine's
-  hostname-named session and injected a window into a stranger's workspace; that is the mistake
-  this receipt exists to make impossible in the other direction.
+- **It kills only sessions it raised.** Two mechanisms, and it needs both. `view` raises a name
+  nobody else would mint (`mishe-demo-<pid>`), and writes a receipt (`~/.mishe/.raised`) on the
+  branch that *creates* a session and never on the branch that finds one. `burn` kills only what
+  that receipt names. **Killing a tmux session is the one sanctioned exception to the mesh's
+  append-only rule** — a session is somebody's workspace and its scrollback is that machine's
+  memory — and the exception holds only for a session this mishe raised and wrote down. Never kill
+  by name match. An earlier `view` adopted the machine's hostname-named session and injected a
+  window into a stranger's workspace; renaming it to a constant `mishe` made that rarer without
+  making it impossible, which is the frequency at which a silent adoption does its damage — nobody
+  is watching when it finally happens. A session wearing our name with no receipt behind it is now
+  **refused out loud**, and the refusal names what it is leaving alone.
 - **It steps out of its own body first.** The file being run lives inside the directory being
   deleted, and a POSIX shell reads a script incrementally — so `burn` re-execs from a copy in
   `$TMPDIR` before the `rm`, or it can come back truncated mid-teardown.
@@ -190,7 +225,7 @@ mishe board -n 40          # read it
 mishe open                 # claims opened and never settled
 mishe handoff "<state>"    # BEFORE /clear
 mishe handoff --restore    # AFTER /clear
-mishe view                 # raise the layout: tmux session, two windows (asks before any install)
+mishe view                 # raise the layout: session mishe-demo-<pid>, two windows (installs nothing silently)
 mishe tell <win> "<text>"  # one window puts work into another
 mishe dash                 # the data view, once
 mishe watch                # the data view, looping (what the `data` window runs)
@@ -230,8 +265,20 @@ is the whole detector.
 - The machine already runs the full mesh (`~/.local/bin/mesh-*`). This is the seed of that culture,
   not a second copy — planting it there gives you two boards.
 - Someone wants a specific tool built. Build the tool.
-- They said they do not want a terminal thing. Step 0 exists so you hear that before you raise
-  anything.
+- They said they do not want a terminal thing. Hear it and stop — the board and the handoff are
+  still the culture and need no layout. (There is no longer a question standing between them and
+  the demo, so this one has to be heard whenever they say it, including mid-walkthrough.)
+
+## Where this gets proved
+
+**The acceptance polygon is `opencode` + `deepseek`, not Claude** (operator, 2026-08-21). This
+skill is written to be run by *bare* coding agents on someone else's machine, so a walkthrough that
+only ever succeeds under the model it was authored with has been tested against its author, not
+against its job. A cheaper, blunter engine is where the implicit steps show up: an instruction that
+reads as obvious here and gets skipped there was never an instruction, it was an assumption.
+
+Run it end to end there before believing any of the above — and when it breaks, the fix goes in
+this file, not in a note about which model to use.
 
 ## Reference
 
