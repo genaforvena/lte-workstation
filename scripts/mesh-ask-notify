@@ -1,0 +1,250 @@
+#!/usr/bin/env python3
+# mesh-ask-notify — when a claim closes, tell WHOEVER ASKED, and hand them the artifact.
+#
+# reflex-cadence: */7 * * * *
+#
+# Operator, 2026-08-21 (TG, after first proposing a two-state claim and then cutting it back himself):
+# «в клейме должен быть кто? Кому придёт нотификация, когда он закончится… давайте пусть он не будет
+# с этим [не двигается по состояниям]. То есть добавляем просто нотификацию, возможность как-то это
+# что-то поменять. И проверить.»
+#
+# So this is deliberately NOT a state machine. The claim lifecycle is untouched: [task] opens, [done]
+# closes, exactly as before. The ONLY addition is a field — `asker: <who>` — and a delivery when the
+# claim closes. Nothing blocks, nothing reverts, nothing waits for an ack. If the asker looks at the
+# artifact and says "доделай вот это", that is an ordinary message, not a protocol transition.
+#
+# WHY IT IS A SEPARATE TOOL AND NOT A HOOK IN mesh-promises: mesh-promises is the ledger, it REPLAYS
+# the board to compute standing balances, and it has an open unclaimed [task] against it right now
+# (ask-ledger-redeems-from-the-wrong-tape). A notifier needs to fire ONCE per close and remember it;
+# a replayer must be free to re-read history any number of times without side effects. Those are
+# opposite contracts, and putting a send inside a replay is how a ledger rebuild spams a human.
+#
+#   mesh-ask-notify            scan for newly-closed claims, notify their askers   (the reflex)
+#   mesh-ask-notify --status   what is armed, what closed unaddressed, no sends
+#   mesh-ask-notify --dry-run  print what WOULD be sent, send nothing
+#   mesh-ask-notify --test
+#
+# BOARD FORMAT (the whole of the change):
+#   [task] <slug> — owner: <tool>/<window> — asker: operator — <what>
+#   [done] <slug>: <result> artifact: <path>   task:<slug>
+# `asker: operator` -> the operator's Telegram (mesh-tg).  `asker: <window>` -> that window
+# (mesh-tell).  `artifact: <path>` is optional; when the path exists the FILE is delivered, because
+# a prose summary of a result is the "the camera works" failure this mesh already has a chapter on.
+import os, re, subprocess, sys, time
+from pathlib import Path
+
+MESH = Path(os.environ.get("MESH_DIR", str(Path.home() / ".mesh")))
+BOARD = Path(os.environ.get("MESH_CHAT_LOG", str(MESH / "chat.log")))
+SENT = Path(os.environ.get("MESH_ASK_NOTIFY_SENT", str(MESH / ".ask-notify-sent")))
+LOG = Path(os.environ.get("MESH_ASK_NOTIFY_LOG", str(MESH / "ask-notify.log")))
+BIN = Path.home() / ".local" / "bin"
+# Only look back a bounded window: the board is months deep and a first run must not fire a hundred
+# notifications for claims closed long before this tool existed. A close older than the window is
+# recorded as already-sent rather than delivered — silently arming, never retroactively shouting.
+LOOKBACK_H = float(os.environ.get("MESH_ASK_NOTIFY_LOOKBACK_H", "48"))
+
+ASKER_RE = re.compile(r"\basker:\s*([A-Za-z0-9][A-Za-z0-9._@/-]*)")
+ARTIFACT_RE = re.compile(r"\bartifact:\s*(\S+)")
+CLOSE_RE = re.compile(r"\btask:([A-Za-z0-9][A-Za-z0-9/._-]*)")
+TASK_SLUG_RE = re.compile(r"^\[task\]\s+([A-Za-z0-9][A-Za-z0-9/._-]*)")
+TS_RE = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ)\s+(\S+)\s+::\s+(.*)$")
+
+
+def parse_board(text):
+    """[(epoch, who, body), ...] — rows the board actually has, malformed lines dropped once, here."""
+    out = []
+    for line in text.splitlines():
+        m = TS_RE.match(line)
+        if not m:
+            continue
+        try:
+            ep = time.mktime(time.strptime(m.group(1), "%Y-%m-%dT%H:%M:%SZ")) - time.timezone
+        except ValueError:
+            continue
+        out.append((ep, m.group(2), m.group(3)))
+    return out
+
+
+def collect(rows, now=None):
+    """-> (opens, closes) where opens maps slug -> {asker, who, ts} and closes slug -> row.
+
+    The asker is read from the OPENING line, never from the [done]: the doer writes the [done], and
+    letting the doer name its own audience is how a claim gets closed to an empty room.
+    """
+    opens, closes = {}, {}
+    for ep, who, body in rows:
+        tm = TASK_SLUG_RE.match(body)
+        if tm:
+            am = ASKER_RE.search(body)
+            opens[tm.group(1)] = {"asker": am.group(1) if am else None, "who": who, "ts": ep,
+                                  "body": body}
+            continue
+        if body.startswith("[done]"):
+            for slug in CLOSE_RE.findall(body):
+                closes[slug] = (ep, who, body)
+    return opens, closes
+
+
+def _read_sent():
+    try:
+        return set(SENT.read_text().split())
+    except OSError:
+        return set()
+
+
+def _mark(slug):
+    try:
+        with open(SENT, "a") as f:
+            f.write(slug + "\n")
+    except OSError:
+        pass
+
+
+def _log(msg):
+    try:
+        with open(LOG, "a") as f:
+            f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}  {msg}\n")
+    except OSError:
+        pass
+
+
+def send(asker, text, artifact=None):
+    """True on delivery. The two addresses are genuinely different channels, not one with a flag."""
+    if asker == "operator":
+        if artifact:
+            r = subprocess.run([str(BIN / "mesh-tg"), "--file", artifact, text[:1000]],
+                               capture_output=True, text=True, timeout=180)
+            if r.returncode == 0:
+                return True
+            _log(f"file send failed ({r.stderr.strip()[:80]}) — falling back to text")
+        r = subprocess.run([str(BIN / "mesh-tg"), text], capture_output=True, text=True, timeout=120)
+        return r.returncode == 0
+    # a window on this node
+    body = text if not artifact else f"{text}\n(артефакт: {artifact})"
+    r = subprocess.run([str(BIN / "mesh-tell"), asker, body], capture_output=True, text=True,
+                       timeout=120)
+    return r.returncode == 0
+
+
+def scan(dry=False, status=False):
+    if not BOARD.exists():
+        print("no board", file=sys.stderr); return 1
+    rows = parse_board(BOARD.read_text(errors="replace"))
+    opens, closes = collect(rows)
+    sent = _read_sent()
+    cutoff = time.time() - LOOKBACK_H * 3600
+    armed = [s for s, o in opens.items() if o["asker"]]
+    delivered = failed = 0
+    # A closed claim whose opening line named NO asker. He was explicit that an empty field must not
+    # quietly mean "nobody", and the honest way to honour that without inventing an audience is to
+    # COUNT them and say so — a number a human can see beats a guess a tool cannot defend.
+    unaddressed = []
+    for slug, (ep, who, body) in sorted(closes.items(), key=lambda kv: kv[1][0]):
+        o = opens.get(slug)
+        if not o or not o.get("asker"):
+            if ep >= cutoff and slug not in sent:
+                unaddressed.append(slug)
+            continue
+        if slug in sent:
+            continue
+        if ep < cutoff:
+            # Pre-existing history: arm, never retro-shout.
+            if not dry and not status:
+                _mark(slug)
+            continue
+        am = ARTIFACT_RE.search(body)
+        art = am.group(1) if am and Path(am.group(1)).exists() else None
+        gist = re.sub(r"\s+", " ", body)[:700]
+        msg = (f"Клейм закрыт: {slug}\nЗакрыл: {who}\n\n{gist}"
+               + ("" if art else "\n\n(артефакт файлом не приложен)"))
+        if status:
+            continue
+        if dry:
+            print(f"WOULD notify {o['asker']} about {slug}"
+                  + (f" with file {art}" if art else " (text only)"))
+            continue
+        if send(o["asker"], msg, art):
+            delivered += 1; _mark(slug); _log(f"notified {o['asker']} about {slug} artifact={art}")
+        else:
+            failed += 1; _log(f"NOTIFY FAILED {o['asker']} about {slug}")
+    if status or dry:
+        print(f"armed: {len(armed)} open claim(s) carry asker:  ·  closes seen: {len(closes)}")
+        print(f"closed in the last {LOOKBACK_H:.0f}h with NO asker: (nobody was told): "
+              f"{len(unaddressed)}" + (" — " + ", ".join(unaddressed[:8]) if unaddressed else ""))
+        return 0
+    print(f"notified {delivered}, failed {failed}, "
+          f"{len(unaddressed)} recent close(s) had no asker: and told nobody")
+    if unaddressed:
+        _log(f"{len(unaddressed)} close(s) with no asker: {' '.join(unaddressed[:12])}")
+    return 0 if failed == 0 else 1
+
+
+def selftest():
+    fails = []
+    def T(ok, msg):
+        if not ok: fails.append(msg)
+
+    rows = parse_board(
+        "2026-08-21T10:00:00Z  discover@h  ::  [task] alpha-slug — owner: x/genome — asker: operator — do a thing\n"
+        "2026-08-21T10:01:00Z  discover@h  ::  [task] beta-slug — owner: x/genome — do another thing\n"
+        "2026-08-21T11:00:00Z  genome@h  ::  [done] alpha-slug: did it artifact: /nonexistent/x.mp3 task:alpha-slug\n"
+        "2026-08-21T11:01:00Z  genome@h  ::  [done] beta-slug: did it too task:beta-slug\n"
+        "garbage line with no timestamp\n")
+    T(len(rows) == 4, f"malformed rows were not dropped (got {len(rows)})")
+    opens, closes = collect(rows)
+    T(opens["alpha-slug"]["asker"] == "operator", "asker: was not read off the opening line")
+    T(opens["beta-slug"]["asker"] is None, "an absent asker: was invented")
+    T(set(closes) == {"alpha-slug", "beta-slug"}, "close-key parsing missed a [done]")
+
+    # The asker must come from the OPEN, never the CLOSE — a doer naming its own audience can close a
+    # claim to an empty room, or to itself. Assert it explicitly: a [done] carrying its own asker:
+    # must not become the address.
+    rows2 = parse_board(
+        "2026-08-21T10:00:00Z  a@h  ::  [task] gamma — asker: operator — thing\n"
+        "2026-08-21T11:00:00Z  b@h  ::  [done] gamma: done asker: b task:gamma\n")
+    o2, _ = collect(rows2)
+    T(o2["gamma"]["asker"] == "operator",
+      "the DOER's asker: on the [done] line overrode the opener's — a claim can be closed to itself")
+
+    # A non-existent artifact path must NOT be presented as an attached file: claiming an artifact
+    # that is not there is worse than admitting none, because it reads as evidence.
+    T(ARTIFACT_RE.search("did it artifact: /nonexistent/x.mp3 task:a").group(1) == "/nonexistent/x.mp3",
+      "artifact: not parsed")
+    T(not Path("/nonexistent/x.mp3").exists(), "fixture path unexpectedly exists")
+
+    # The lookback must ARM on old history rather than retro-shout. Drive it: an ancient close with a
+    # live asker, dry-run, and assert nothing would be sent.
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        b = Path(td) / "chat.log"
+        b.write_text("2020-01-01T10:00:00Z  a@h  ::  [task] ancient — asker: operator — thing\n"
+                     "2020-01-01T11:00:00Z  b@h  ::  [done] ancient: done task:ancient\n")
+        old_board, old_sent = globals()["BOARD"], globals()["SENT"]
+        globals()["BOARD"] = b; globals()["SENT"] = Path(td) / "sent"
+        import io, contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            scan(dry=True)
+        globals()["BOARD"], globals()["SENT"] = old_board, old_sent
+        T("WOULD notify" not in buf.getvalue(),
+          "a years-old close would have fired a notification on first run")
+
+    for t in ("mesh-tg", "mesh-tell"):
+        T((BIN / t).exists(), f"delivery channel {t} is absent")
+
+    if fails:
+        print("smoke-test: FAIL (" + "; ".join(fails) + ")"); return 1
+    print("smoke-test: ok (asker read from the OPEN not the CLOSE; absent asker not invented; "
+          "old history arms instead of retro-shouting; malformed board rows dropped; both channels present)")
+    return 0
+
+
+if __name__ == "__main__":
+    a = sys.argv[1] if len(sys.argv) > 1 else ""
+    if a == "--test":
+        sys.exit(selftest())
+    if a == "--status":
+        sys.exit(scan(status=True))
+    if a == "--dry-run":
+        sys.exit(scan(dry=True))
+    sys.exit(scan())
