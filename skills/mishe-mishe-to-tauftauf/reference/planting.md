@@ -67,6 +67,36 @@ already knows.
 If they will not keep a second tab open, that is a real answer — degrade honestly to running
 `mishe dash` at the top of each session, and do not pretend the view exists.
 
+### When someone else has to be able to look
+
+A tab gives you the layout. It does not give you the other two things a terminal multiplexer gives,
+and those two are properties, not habits:
+
+- **A tab is private.** Only the person sitting at it sees it. Nobody else — no second human, no
+  second agent, not you over ssh later — can look at the same state.
+- **A tab dies with its window.** Close the terminal, drop the ssh connection, shut the laptop lid
+  on a connection: the tab and everything on it is gone.
+
+A `tmux` session has the opposite two properties. It outlives the window it was started from, and
+anyone on that machine can attach to it and see **the same** state — the scrollback becomes the
+machine's recent memory instead of one person's screen.
+
+```sh
+tmux new-session -A -s "$(hostname)"     # attach if it exists, create if it does not
+```
+
+**This is a paid step and it is not day one.** macOS does not ship `tmux` (`brew install tmux`),
+it has its own keys to learn, and the planting installs nothing — so on the first day the second
+tab is the right answer and this section is only here so the step is *reachable*. A capability
+nothing names is a capability nobody can grow into.
+
+Take it when the answer to "who else needs to see this?" stops being "nobody": a second person on
+the machine, an agent you want to leave running, work you reach over ssh, or anything you want to
+still be there tomorrow.
+
+It does not make this machine part of anything. The shared perception is **inside one machine**,
+between whoever is at it — not between machines. One mishe is still one.
+
 ## Step 4 — one real task
 
 Take what they named in step 1 and do a real piece of it. End to end. Their data, not a sample.
