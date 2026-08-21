@@ -50,8 +50,9 @@ precondition for the first class existing at all.
 | C7 | **Predicate naming a node** | a guard bound to a hostname goes permanently false when the role moves, and every pass logs green | `TG_HOST="imozerov-IdeaPad-…"`, keeper body never executed once | `09f7914` | **decidable** (hostname literal in a guard) |
 | C8 | **Never-wired reflex** | passing `--test` and being scheduled are unrelated facts; and a wired reflex can still tend a target that no longer exists | three keepalives green, none in cron | `cc617e5` | **decidable** (cadence header vs crontab vs target existence) |
 | C9 | **Absent from the candidate set** | the gate is correct and loud; the item never reaches it, because the enumerator's input set does not cover it — and *outside the set* renders identically to *nothing wrong* | `mesh-land`'s pathspec was `scripts/ docs/` + root globs, so a landed tool's five `skills/**` payload files were never candidates: the tool sat on origin **broken from a clean clone** while every pass printed "nothing settled+clean to land" | `9f4537b` | **decidable** (declared pathspec vs the repo's tracked trees) |
+| C10 | **Echo port** | the probe reads back *its own last write*: an absent device's read falls through to the register array that backs the write, so the capability check returns a plausible, varying, non-zero value carrying zero information about the world | probing Varvara for audio **input**: on a build with no audio device all 16 ports return the sentinel; on the real device exactly 3 of 16 are computed and **none is a microphone** | `9ed9d26` | **decidable at runtime** (write a sentinel, read it back — a match means you are talking to yourself) |
 
-Three cross-cutting observations that are not classes but govern all of them:
+Four cross-cutting observations that are not classes but govern all of them:
 
 * **Liveness-touch**: a reflex that writes its state only when the value *changes* leaves mtime
   frozen on a long-stable-but-live value, so an mtime watchdog reads "value held" as "reflex dead".
@@ -68,6 +69,15 @@ Three cross-cutting observations that are not classes but govern all of them:
   This is why C9's detector cannot live inside the pipeline it audits: the pipeline's own view of
   the world is exactly the set under suspicion. It must be checked against an *external*
   enumeration (here: `git ls-files`, and a clean clone that ran the landed tool's own gate).
+
+* **A vacuity guard is not trustworthy until it has been wrong once.** C10's own guard first
+  asserted `position* != 0` to prove a note was really playing — and that call is *false at the
+  wrap*: a 16-byte looping sample returns the playhead to exactly `i % 16 == 0` after 1024 frames,
+  so the guard declares a live note dead on a schedule. The general form: **a liveness check
+  reading a wrapping counter has a periodic false negative, and the period is a property of the
+  data, not of the check.** It was replaced with a read of the VU. Note what actually caught it —
+  not review, but *running the guard against a case it should pass* and watching it fail. A guard
+  only ever seen green is indistinguishable from C1.
 
 ## 3. Detector D1 — the self-grepping gate
 
@@ -183,9 +193,49 @@ time; it was simply never reached from inside the system, where the payload's ab
 presence produced the same output. An audit of the candidate set cannot be run from within the
 process whose candidate set is in question.
 
+## 3ter. C10's decision procedure, run once (2026-08-21)
+
+C10 is the class that defeats C2's detector. C2 (silent fallback) is found by asking *is this
+value a constant that a total failure would also produce?* — an echo port fails that test in the
+attacker's favour: the value **varies**, it is **non-zero**, and it **changes when you change your
+inputs**, which is exactly the evidence one would accept as proof of a live sensor. There is also
+nothing to grep: no `|| echo <default>` appears in the source, because the fallthrough is a
+`default:` case returning the device register array that the *write* path already populated.
+
+The procedure is therefore runtime, not static, and it is one line: **write a sentinel, read it
+back.** Any byte you get back that equals what you just wrote is your own echo.
+
+Probing Varvara (the uxn virtual machine's device layer) for an audio **input** capability,
+sentinel `a5` to all 16 ports of the audio page:
+
+```
+$ ./bin/uxncli audio-in-probe.rom
+ports 30..3f readback: a5 a5 a5 a5 a5 a5 a5 a5 a5 a5 a5 a5 a5 a5 a5 a5
+device: ABSENT -- every port echoed our own write
+verdict: NO AUDIO INPUT DEVICE IN VARVARA
+```
+
+16 of 16. On a build linking the reference audio device, exactly ports `32,33,34` are computed
+(`position*`, `output`) and the other **13 of 16 still echo** — and all three computed bytes
+describe *the note the ROM itself started playing*. The capability was never there to find; a
+naive read of any single port would have returned a plausible non-zero byte and been believed.
+
+Two structural points this case contributes:
+
+* **An absence needs two arms.** A probe that only ever runs where the device is missing has not
+  demonstrated it can tell missing from present. The suite here builds *both* — the stock binary
+  (device absent, `rc=2`, honest n/a) and a binary linking the real device (`rc=0`) — and a guard
+  goes red if the real device is ever added to the default build, because that would silently
+  delete the absent arm and leave the suite testing one thing twice. **A branch nothing has been
+  seen to take is not a branch.**
+* **Absence must be rendered, not inferred.** The probe prints the full 16-byte readback rather
+  than a verdict alone, so a reader sees the echo pattern itself. Compare C9: in both, the system's
+  own answer about its coverage is the thing under suspicion, so the evidence has to be shown at a
+  level below the verdict.
+
 ## 4. Open work
 
-1. Detectors for C3–C9 (each listed decidable above). C4 and C8 need the cadence header + crontab,
+1. Detectors for C3–C10 (each listed decidable above). C4 and C8 need the cadence header + crontab,
    which are machine-readable here.
 2. **The authorship confound.** The clean comparison is not human-repo vs agent-repo but
    *in-file self-test* vs *external test suite*, within each population. Requires a second corpus
