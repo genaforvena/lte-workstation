@@ -1,19 +1,34 @@
 #!/usr/bin/env bash
-# mesh-sms — send an SMS via the phone body (termux-sms-send).
+# mesh-sms — send an SMS via a phone body. TWO LANES, tried in order:
+#   1. SSH/Termux  (Redmi)  — termux-sms-send over the mesh-act/mesh-light path.
+#   2. ADB/UI      (Note3)  — the operator's ONLY working SIM (MTS RU) hangs off USB, no Termux.
 # TG-independent alert channel: works when Telegram is geo-blocked or down.
-# Reaches the phone via SSH the same path as mesh-act/mesh-light/mesh-body-*.
 #
 # Config (in priority order):
+#   --to <number>            — explicit recipient, beats everything below
 #   MESH_SMS_NUMBER env var  — recipient number (e.g. +79001234567)
 #   ~/.mesh/sms.conf         — one line: the number (no quotes, no comments)
 #
-#   mesh-sms "message text"     send SMS to the configured number
-#   mesh-sms --test             smoke test (checks phone reachable + termux-sms-send present)
+#   mesh-sms "message text"          send SMS to the configured number
+#   mesh-sms --to +7900… "text"      send to an explicit recipient
+#   mesh-sms --test                  smoke test (lane reachable + the send-button lookup)
 #
 # Exit codes (honest-exit contract, matches mesh-act/mesh-light):
-#   0 = sent OK
+#   0 = sent OK — and on the adb lane that means a row was READ BACK from the phone's own
+#       content://sms/sent, never merely "the command returned"
 #   1 = config error (no number configured / no message)
 #   2 = phone unreachable / send failed (NOT "SMS sent" — a failed delivery is never exit 0)
+#
+# WHY THE ADB LANE DRIVES THE UI AND NOT `service call isms` (measured 2026-08-21, SM-N900,
+# Android 5.0, root):  the canonical rooted one-liner
+#     service call isms 9 s16 com.android.mms s16 <dest> i32 -1 s16 <text> i32 0 i32 0
+# returns `Result: Parcel(00000000 '....')` — a clean void return, no exception — and sends
+# NOTHING: no row in content://sms/sent, no row in the recipient's inbox 60s later, no
+# SmsDispatcher line in logcat. Txn 9 IS sendText in AOSP 5.0.0_r1's ISms.aidl, so the code is
+# right and Samsung's framework simply does not honour it. That is the exact shape the doctrine
+# warns about — rc=0 indistinguishable from silence — so this lane refuses to trust its own
+# return value and reads the artifact instead. The composer intent leaves that artifact behind;
+# the isms call leaves none, which is why the ugly path is the honest one.
 set -uo pipefail
 # ── --help guard (pub/argv-is-payload-tools-fire-on-help, 2026-07-15) ──────────────────────────────
 # argv IS this tool's payload, so the universal discovery gesture WAS the action: `--help` sent the
@@ -23,6 +38,15 @@ set -uo pipefail
 # read. usage() renders this file's own header block, so it can never drift from the docs above.
 usage(){ sed -n '2,/^[^#]/p' "$0" | sed -n 's/^# \?//p'; }
 case "${1:-}" in -h|--help) usage; exit 0 ;; esac
+
+# --to <number>: an explicit recipient. Parsed BEFORE the sandbox gate so that a suppressed
+# send still reports who it would have gone to.
+TO_NUMBER=""
+if [ "${1:-}" = "--to" ]; then
+  TO_NUMBER="${2:-}"
+  [ -n "$TO_NUMBER" ] || { echo "mesh-sms: --to needs a number" >&2; exit 1; }
+  shift 2
+fi
 
 export PATH="$HOME/.local/bin:$PATH"
 [ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
@@ -45,11 +69,66 @@ SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=6 -o StrictHostKeyChecking=accept-n
 # Resolve phone IP: probe-based (TS → LAN candidates, first that connects)
 PHONE_IP="$(mesh-phone-ip 2>/dev/null)" || PHONE_IP=""
 
-# Resolve SMS number: env var > config file
-SMS_NUMBER="${MESH_SMS_NUMBER:-}"
+# Resolve SMS number: --to > env var > config file
+SMS_NUMBER="${TO_NUMBER:-${MESH_SMS_NUMBER:-}}"
 if [ -z "$SMS_NUMBER" ] && [ -f "$HOME/.mesh/sms.conf" ]; then
   SMS_NUMBER="$(head -1 "$HOME/.mesh/sms.conf" 2>/dev/null | tr -d '[:space:]')"
 fi
+
+# ── lane 2: ADB/UI (the Note3 body) ───────────────────────────────────────────────────────────
+# The send button's BOUNDS move (the soft keyboard reflows the composer: y=893 with it open,
+# y=1779 without), so nothing here may hardcode a coordinate. Its resource-id does not move —
+# and it is ASCII, unlike its content-desc, which this body's uiautomator writes as literal '?'
+# (see mesh-note3-ui's non-ASCII note). So: look the button up by id, tap its centre.
+ADB_SEND_BUTTON_ID='com.android.mms:id/send_button'
+ADB_UI_XML='/sdcard/mesh-sms-ui.xml'
+
+# centre of a uiautomator bounds="[x1,y1][x2,y2]" attribute -> "cx cy" (empty if unparseable)
+adb_bounds_centre() {
+  printf '%s' "$1" | sed -n 's/.*bounds="\[\([0-9]*\),\([0-9]*\)\]\[\([0-9]*\),\([0-9]*\)\].*/\1 \2 \3 \4/p' \
+  | awk 'NF==4 { print int(($1+$3)/2), int(($2+$4)/2) }'
+}
+
+adb_serial() { adb devices 2>/dev/null | awk '$2=="device"{print $1; exit}'; }
+
+# adb_send <number> <text> -> 0 sent (READ BACK from the phone's sent box), 2 otherwise
+adb_send() {
+  local num="$1" msg="$2" serial esc node centre cx cy needle seen i
+  command -v adb >/dev/null 2>&1 || { echo "mesh-sms: no adb on PATH" >&2; return 2; }
+  serial="$(adb_serial)"; [ -n "$serial" ] || { echo "mesh-sms: no adb device attached" >&2; return 2; }
+
+  esc="$(printf '%s' "$msg" | sed "s/'/'\\\\''/g")"
+  timeout 30 adb -s "$serial" shell \
+    "am start -a android.intent.action.SENDTO -d 'sms:${num}' --es sms_body '${esc}' --ez exit_on_sent true" \
+    >/dev/null 2>&1 || { echo "mesh-sms: composer intent failed" >&2; return 2; }
+  sleep 4
+
+  timeout 40 adb -s "$serial" shell "uiautomator dump $ADB_UI_XML" >/dev/null 2>&1 \
+    || { echo "mesh-sms: uiautomator dump failed (screen locked?)" >&2; return 2; }
+  node="$(timeout 30 adb -s "$serial" shell "cat $ADB_UI_XML" 2>/dev/null \
+          | tr -d '\r' | tr '<' '\n' | grep -F "$ADB_SEND_BUTTON_ID" | head -1)"
+  timeout 20 adb -s "$serial" shell "rm -f $ADB_UI_XML" >/dev/null 2>&1
+  [ -n "$node" ] || { echo "mesh-sms: send button ($ADB_SEND_BUTTON_ID) not in the UI tree" >&2; return 2; }
+  centre="$(adb_bounds_centre "$node")"
+  cx="${centre%% *}"; cy="${centre##* }"
+  { [ -n "$cx" ] && [ -n "$cy" ]; } || { echo "mesh-sms: could not parse send-button bounds" >&2; return 2; }
+  timeout 20 adb -s "$serial" shell "input tap $cx $cy" >/dev/null 2>&1 \
+    || { echo "mesh-sms: tap failed" >&2; return 2; }
+
+  # THE ARTIFACT. A tap is not a delivery: poll the phone's OWN sent box for this body. Compare
+  # whitespace-stripped, because the composer reflows what it stores. No row -> exit 2; the whole
+  # point of this lane is that its command layer returns success while sending nothing.
+  needle="$(printf '%s' "$msg" | tr -d '[:space:]' | cut -c1-24)"
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    seen="$(timeout 30 adb -s "$serial" shell \
+      'su -c "content query --uri content://sms/sent --projection body --sort \"date DESC LIMIT 5\""' \
+      2>/dev/null | tr -d '\r' | tr -d '[:space:]')"
+    case "$seen" in *"$needle"*) return 0 ;; esac
+    sleep 3
+  done
+  echo "mesh-sms: tapped send but NO row appeared in content://sms/sent within 30s — not claiming sent" >&2
+  return 2
+}
 
 if [ "${1:-}" = --test ]; then
   # TEST-SANDBOX gate: a send attempted under MESH_TEST_SANDBOX=1 must be SUPPRESSED (exit 0, no SSH,
@@ -57,12 +136,41 @@ if [ "${1:-}" = --test ]; then
   _sup="$(MESH_TEST_SANDBOX=1 "$0" "sandbox probe — must never become a real SMS" 2>&1)"; _rc=$?
   { [ "$_rc" = 0 ] && printf '%s' "$_sup" | grep -q 'SUPPRESSED'; } \
     || { echo "smoke-test: FAIL (MESH_TEST_SANDBOX gate broken: rc=$_rc out='$_sup')"; exit 1; }
-  [ -n "$PHONE_IP" ] || { echo "smoke-test: n/a (no PHONE_IP / Redmi not in registry + MESH_TEST_SANDBOX gate ok)"; exit 2; }
+  # ADB-lane gate: assert the LOAD-BEARING bounds parse, the one thing between "tapped something"
+  # and "tapped the send button". Falsifiable both ways — a real node line must yield the centre,
+  # and a node WITHOUT bounds must yield nothing (a regex that fell back to matching anything
+  # would tap a coordinate derived from noise). Fixture, not a live read: this leg must stay
+  # green with the phone unplugged, and it must never open a composer.
+  _fx='node resource-id="com.android.mms:id/send_button" bounds="[936,1716][1062,1842]" /'
+  _got="$(adb_bounds_centre "$_fx")"
+  [ "$_got" = "999 1779" ] || { echo "smoke-test: FAIL (bounds->centre drifted: got '$_got', want '999 1779')"; exit 1; }
+  _bad="$(adb_bounds_centre 'node resource-id="com.android.mms:id/send_button" clickable="true" /')"
+  [ -z "$_bad" ] || { echo "smoke-test: FAIL (bounds regex matched a node with NO bounds: '$_bad')"; exit 1; }
+
+  if [ -z "$PHONE_IP" ]; then
+    _ser="$(adb_serial 2>/dev/null)"
+    [ -n "$_ser" ] || { echo "smoke-test: n/a (no body: no PHONE_IP and no adb device + sandbox & bounds gates ok)"; exit 2; }
+    # the adb body IS present: assert the composer package this lane drives actually exists on it.
+    # Reachability is not producing — a phone with no com.android.mms can never send by this lane.
+    _pkg="$(timeout 20 adb -s "$_ser" shell 'pm list packages com.android.mms' 2>/dev/null | tr -d '\r')"
+    case "$_pkg" in *com.android.mms*) : ;;
+      *) echo "smoke-test: FAIL (adb body $_ser has no com.android.mms — the adb lane cannot send)"; exit 1 ;;
+    esac
+    echo "smoke-test: ok (lane=adb device=${_ser}, com.android.mms present, bounds parse + sandbox gate ok)"; exit 0
+  fi
   result="$(timeout 10 ssh $SSH_OPTS -p "$PHONE_PORT" "${PHONE_USER}@${PHONE_IP}" \
-    "command -v termux-sms-send >/dev/null 2>&1 && echo ok || echo missing" 2>/dev/null)" || {
-    echo "smoke-test: n/a (phone unreachable at ${PHONE_USER}@${PHONE_IP}:${PHONE_PORT})"; exit 2
-  }
-  [ "$result" = ok ] || { echo "smoke-test: FAIL (termux-sms-send not found on phone)"; exit 1; }
+    "command -v termux-sms-send >/dev/null 2>&1 && echo ok || echo missing" 2>/dev/null)" || result=""
+  if [ "$result" != ok ]; then
+    # ssh body has an IP but is not answering (or has no termux-sms-send) — that is exactly when
+    # the adb lane matters, so report on IT rather than ending the test here.
+    _ser="$(adb_serial 2>/dev/null)"
+    [ -n "$_ser" ] || { echo "smoke-test: n/a (ssh body ${PHONE_IP} not answering and no adb device + sandbox & bounds gates ok)"; exit 2; }
+    _pkg="$(timeout 20 adb -s "$_ser" shell 'pm list packages com.android.mms' 2>/dev/null | tr -d '\r')"
+    case "$_pkg" in *com.android.mms*) : ;;
+      *) echo "smoke-test: FAIL (adb body $_ser has no com.android.mms — the adb lane cannot send)"; exit 1 ;;
+    esac
+    echo "smoke-test: ok (lane=adb device=${_ser}; ssh body ${PHONE_IP} not answering, fell back; bounds parse + sandbox gate ok)"; exit 0
+  fi
   [ -n "$SMS_NUMBER" ] || { echo "smoke-test: WARN (no number configured — set MESH_SMS_NUMBER or ~/.mesh/sms.conf)"; exit 0; }
   echo "smoke-test: ok (number=${SMS_NUMBER}, phone=${PHONE_IP} + MESH_TEST_SANDBOX send-suppression gate)"; exit 0
 fi
@@ -72,28 +180,46 @@ fi
   exit 1
 }
 
-[ -n "$PHONE_IP" ] || {
-  echo "mesh-sms: phone IP unresolved (Redmi not in registry and unreachable via LAN)" >&2
-  exit 2
-}
-
 MSG="${*:-}"
 [ -n "$MSG" ] || { echo "mesh-sms: no message text" >&2; exit 1; }
 
-# Send: pipe message via stdin to avoid shell-quoting issues with special chars
-esc_num="$(printf '%s' "$SMS_NUMBER" | sed "s/'/'\\\\''/g")"
-rc=0
-printf '%s' "$MSG" | timeout 20 ssh $SSH_OPTS -p "$PHONE_PORT" "${PHONE_USER}@${PHONE_IP}" \
-  "termux-sms-send -n '${esc_num}'" 2>&1 || rc=$?
-
-if [ $rc -eq 124 ] || [ $rc -eq 255 ]; then
-  echo "mesh-sms: phone unreachable during send" >&2; exit 2
+# LANE CHOICE. The ssh/Termux body is preferred (it sends without touching a UI); the adb body is
+# the fallback and is NOT a lesser claim — on 2026-08-21 it was the only lane at all, the Redmi
+# having gone ssh-dead while the operator's single working SIM sat in the USB-attached Note3.
+# An IP is not a body. mesh-phone-ip kept answering 100.103.99.16 for the Redmi on 2026-08-21
+# while its sshd refused every connection, so a lane picked on "PHONE_IP is set" would have
+# exited 2 with a working adb body sitting one USB cable away. Probe before choosing.
+ssh_body_ok() {
+  [ -n "$PHONE_IP" ] || return 1
+  timeout 8 ssh $SSH_OPTS -p "$PHONE_PORT" "${PHONE_USER}@${PHONE_IP}" \
+    'command -v termux-sms-send >/dev/null 2>&1' >/dev/null 2>&1
+}
+LANE=""
+if ssh_body_ok; then LANE=ssh
+elif [ -n "$(adb_serial 2>/dev/null)" ]; then LANE=adb
+else
+  echo "mesh-sms: no body — Redmi unreachable (no PHONE_IP) and no adb device attached" >&2
+  exit 2
 fi
-[ $rc -eq 0 ] || { echo "mesh-sms: send failed (rc=$rc)" >&2; exit 2; }
+
+if [ "$LANE" = adb ]; then
+  adb_send "$SMS_NUMBER" "$MSG" || exit 2
+else
+  # Send: pipe message via stdin to avoid shell-quoting issues with special chars
+  esc_num="$(printf '%s' "$SMS_NUMBER" | sed "s/'/'\\\\''/g")"
+  rc=0
+  printf '%s' "$MSG" | timeout 20 ssh $SSH_OPTS -p "$PHONE_PORT" "${PHONE_USER}@${PHONE_IP}" \
+    "termux-sms-send -n '${esc_num}'" 2>&1 || rc=$?
+
+  if [ $rc -eq 124 ] || [ $rc -eq 255 ]; then
+    echo "mesh-sms: phone unreachable during send" >&2; exit 2
+  fi
+  [ $rc -eq 0 ] || { echo "mesh-sms: send failed (rc=$rc)" >&2; exit 2; }
+fi
 
 msglen="${#MSG}"
 [ -x "$HOME/.local/bin/mesh-trace" ] && \
   MESH_WHO="mesh-sms@$(hostname)" "$HOME/.local/bin/mesh-trace" \
-  "[sms-sent] to=${SMS_NUMBER} len=${msglen}" >/dev/null 2>&1 || true
+  "[sms-sent] to=${SMS_NUMBER} len=${msglen} lane=${LANE}" >/dev/null 2>&1 || true
 
-echo "mesh-sms: sent to ${SMS_NUMBER} (${msglen} chars)"
+echo "mesh-sms: sent to ${SMS_NUMBER} (${msglen} chars, lane=${LANE})"
