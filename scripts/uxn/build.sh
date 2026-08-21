@@ -49,6 +49,7 @@ if [ "${1:-}" = --rom ]; then
   ./bin/uxnasm rot13-net.tal rot13-net.rom
   ./bin/uxnasm net-dgram.tal net-dgram.rom
   ./bin/uxnasm gossip.tal gossip.rom
+  ./bin/uxnasm audio-in-probe.tal audio-in-probe.rom
 fi
 if [ "${1:-}" = --chibicc ]; then
   $CC -std=c11 -O2 -fno-common -o bin/chibicc chibicc/src/*.c
