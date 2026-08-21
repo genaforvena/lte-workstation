@@ -147,6 +147,33 @@ a fast-path PREFERENCE and the write result is checked (`printf … && return 0`
 degrades to the sudo path instead of reporting a false success. (`mesh-chat:450` met the same instinct in
 the test-vacuity direction — `[ -f LOG ] && [ -w LOG ]` standing in for a real dry-run.)
 
+Extend it to **the DECLARED PREF that is not the FIB** — the mode-bit trap one ring out, and the
+one where the lie is *green in the only direction anyone watches*. A subsystem that lets you
+*declare* an exclusion does not thereby *install* it, and nothing in the declaration says which.
+Measured 2026-08-21T10:50Z on mesh-home: with an exit node set, `tailscale debug prefs` read
+`ExitNodeAllowLANAccess: true` and the node's own LAN was swallowed anyway — `ip route get
+192.168.8.1` answered `dev tailscale0 table 52`, and table 52 held a default plus nine overlay
+peers with ZERO LAN entries and ZERO throw routes. tailscaled had `NRestarts=0`, so no re-`up` had
+reset it: the pref and its implementation had simply diverged. Five organs alarmed at once (router
+LAN-ping OFF, router-thermal unreachable, sim UNREACHABLE, mesh path-down-egress) and each named
+its own far end as the fault, while EGRESS WAS PERFECT — so every outward probe stayed green and
+the node was blind inward. L2 was healthy throughout (`ip neigh` REACHABLE, wifi -46 dBm): ARP
+replies prove the frames reach the LAN and the LAN answers; only IPv4 forwarding died. Note what
+this does to a remedy: the node's own operator context prescribed *setting that very pref* for
+this exact failure, so following the documented fix would have "applied" a setting already true
+and confirmed itself. **Rule: for a declared network exclusion, the artifact is the FIB LOOKUP,
+never the pref — `ip route get <a real address in the excluded range>` and read the DEVICE that
+comes back.** Two traps inside the probe itself: never look up your OWN address (`ip rule` 0,
+`from all lookup local`, precedes every later rule, so it answers locally no matter how thoroughly
+the range is swallowed — it greens exactly during the fault), and never assert the table's
+*contents* as text when you can ask the kernel to *resolve* — a rule set can shadow a route that
+is plainly present. Wired: `mesh-card --refresh` renders `exit-node-lan:` from that lookup and
+folds it into `invariant-check`, so the existing `mesh-card-watchdog` alarm carries it (a new
+violation class must never need a new alarm nobody wired). And when you fold a NEW leg into an
+OLD rollup, re-check every line rendered off that rollup: `default-egress:` printed "⚠ via
+WireGuard" keyed on the summary, so the LAN leg tripping libelled a perfectly clean egress — a
+summary must never assert a leg that did not fire.
+
 Extend it to **the flag whose NAME is wider than its VOCABULARY**: a kernel API that lets you *state*
 a restriction does not thereby cover the thing its noun names. Landlock's `handled_access_net` reads,
 in review, as "network" — and on this node (ABI **4**, kernel 6.8, uid 1000) it defines **exactly two

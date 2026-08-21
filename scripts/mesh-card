@@ -536,14 +536,82 @@ probe_services() {
     printf '%s\n' "${out:-none}"
 }
 
+# --- exit-node LAN exclusion: ask the FIB, NEVER the pref ---------------------
+# A DECLARED PREF IS NOT THE FIB. Measured live on mesh-home 2026-08-21T10:50Z (health@, board
+# [fyi]): with phaedra set as exit node, `tailscale debug prefs` read `ExitNodeAllowLANAccess:
+# true` and the LAN was swallowed anyway — `ip route get 192.168.8.1` answered
+# `dev tailscale0 table 52`, and table 52 held a default plus nine 100.x peers with ZERO
+# 192.168 entries and ZERO throw routes. The exclusion the pref promises was never installed,
+# and tailscaled had NRestarts=0 (up 25h), so no `tailscale up` had reset it: the pref and its
+# implementation simply diverged.
+#
+# WHY IT BELONGS ON THE CARD. It is the documented substrate invariant ("the forwarding mark
+# must exclude LAN/private ranges") being violated by the exit-node path, and it is SILENT in
+# the one direction anybody watches: egress stayed perfect throughout (public IP correct,
+# tailscale peers=7), so every OUTWARD probe was green while the node was blind INWARD. Five
+# organs alarmed at once — router LAN-ping OFF, router-thermal unreachable, sim UNREACHABLE,
+# mesh path-down-egress — and each named its own far end as the fault. L2 was healthy the whole
+# time (`ip neigh` REACHABLE, wifi -46 dBm): ARP answers prove our frames reach the LAN and the
+# LAN replies; only IPv4 forwarding died.
+#
+# WHY IT DOES NOT READ THE PREF. CLAUDE.local.md's remedy for this exact failure ("set
+# --exit-node-allow-lan-access=true; re-check it after ANY tailscale up; verify by pinging a
+# LAN peer") is refuted by that measurement — it was already true. This is the mode-bit trap
+# one ring out: `[ -w ]` is not what the kernel will DO with your write, and a pref is not what
+# the kernel will DO with your packet. So the probe asks the FIB the same question the LAN
+# asks, and the verdict is the DEVICE that comes back.
+#
+# lan_probe_target <cidr> -> "<addr> <network/prefix>", or empty.
+# The address must NOT be our own: `ip rule` 0 (`from all lookup local`) precedes the tailscale
+# rule, so our own address answers `local` and proves nothing about the LAN.
+lan_probe_target() {
+    [ -n "${1:-}" ] || return 0
+    python3 - "$1" <<'PY' 2>/dev/null
+import ipaddress, sys
+try:
+    iface = ipaddress.ip_interface(sys.argv[1])
+except Exception:
+    sys.exit()
+net = iface.network
+if net.prefixlen >= 31:      # /31,/32 hold no third address to probe with
+    sys.exit()
+for cand in (net.network_address + 1, net.network_address + 2):
+    if cand != iface.ip and cand in net:
+        print(cand, net); break
+PY
+}
+
+# lan_fib_verdict <exit-node> <target> <network> <route-get-output> -> rendered verdict.
+# PURE — every input is passed in, so --test drives it with fixtures instead of the live node.
+# rc0 = ok or an honest n/a; rc2 = the LAN is swallowed.
+lan_fib_verdict() {
+    local xnode="$1" target="$2" net="$3" route="$4" dev table
+    case "${xnode:-}" in
+        '' | none) echo "n/a (no exit node — nothing can swallow the LAN)"; return 0 ;;
+        '?')       echo "n/a (could not ask tailscale for the exit node)"; return 0 ;;
+    esac
+    [ -n "$target" ] || { echo "n/a (no usable LAN prefix on this node)"; return 0; }
+    [ -n "$route" ]  || { echo "n/a (FIB lookup for $target returned nothing)"; return 0; }
+    dev=$(printf '%s\n' "$route" | grep -oP '\bdev \K\S+' | head -1)
+    [ -n "$dev" ] || { echo "n/a (FIB answer for $target names no device: $route)"; return 0; }
+    case "$dev" in
+        tailscale*)
+            table=$(printf '%s\n' "$route" | grep -oP '\btable \K\S+' | head -1)
+            echo "⚠ SWALLOWED — $target routes via dev $dev${table:+ table $table}, not the LAN link, while exit-node '$xnode' carries egress. Inward LAN sight is dead and every outward probe stays green. The pref is NOT the fix (measured true during the fault, mesh-home 2026-08-21T10:50Z) — install the exclusion in the FIB: ip route add throw $net table ${table:-<t>}"
+            return 2 ;;
+        *)  echo "ok ($target -> dev $dev, exit-node '$xnode')"; return 0 ;;
+    esac
+}
+
 refresh() {
-    local host tsip lanip egress_dev wg_ifaces fwd pubip exitnode svc inv_check
+    local host tsip lanip lancidr egress_dev wg_ifaces fwd pubip exitnode svc inv_check wg_check
+    local lan_target lan_net lan_route lan_check lan_rc
     host=$(hostname)
     tsip=$(tailscale ip -4 2>/dev/null | head -1 || echo '?')
     # real LAN IP = a global v4 addr that isn't tailscale/docker/bridge/loopback
-    lanip=$(ip -o -4 addr show scope global 2>/dev/null \
-            | awk '$2!~/^(lo|tailscale|docker|br-|veth|wg|Gtcld)/ {print $4}' \
-            | cut -d/ -f1 | head -1)
+    lancidr=$(ip -o -4 addr show scope global 2>/dev/null \
+            | awk '$2!~/^(lo|tailscale|docker|br-|veth|wg|Gtcld)/ {print $4}' | head -1)
+    lanip=${lancidr%%/*}
     egress_dev=$(ip route get 1.1.1.1 2>/dev/null | grep -oP 'dev \K\S+' | head -1)
     # wireguard interfaces present (no sudo needed)
     wg_ifaces=$(ip -o link show type wireguard 2>/dev/null | awk -F': ' '{print $2}' | cut -d@ -f1 | paste -sd' ' -)
@@ -570,10 +638,29 @@ print(xid)
 
     svc=$(probe_services)
 
+    # exit-node LAN exclusion, measured in the FIB (see lan_fib_verdict above — never the pref)
+    read -r lan_target lan_net <<<"$(lan_probe_target "${lancidr:-}")"
+    lan_route=""
+    [ -n "${lan_target:-}" ] && lan_route=$(ip route get "$lan_target" 2>/dev/null | head -1)
+    lan_check=$(lan_fib_verdict "$exitnode" "${lan_target:-}" "${lan_net:-}" "$lan_route"); lan_rc=$?
+
     # --- INVARIANT CHECK: is this node's OWN control plane riding a local VPN? ---
-    inv_check="OK"
+    # TWO legs, and the rollup must never speak for a leg that did not fire (a summary line that
+    # asserts legs it never ran is its own failure shape). `wg_check` stays the WireGuard leg
+    # alone, because the `default-egress:` line below renders "⚠ via WireGuard" off it — keyed on
+    # the rollup, that suffix would libel a perfectly clean egress the moment the LAN leg tripped.
+    wg_check="OK"
     if [ -n "$egress_dev" ] && printf ' %s ' "$wg_ifaces" | grep -q " $egress_dev "; then
-        inv_check="⚠ VIOLATED — host's own default egress is dev $egress_dev (a local WireGuard tunnel). The control plane is betting on an offered route. One endpoint flap = lockout. Set Table=off + scope to forwarded traffic only."
+        wg_check="⚠ VIOLATED — host's own default egress is dev $egress_dev (a local WireGuard tunnel). The control plane is betting on an offered route. One endpoint flap = lockout. Set Table=off + scope to forwarded traffic only."
+    fi
+    inv_check="$wg_check"
+    # Same invariant, the CONSUMING side: a route this node rides must not carry its own LAN.
+    # Folded into the rollup so the existing watchdog/alert path carries it — a new violation
+    # class must not need a new alarm nobody wired. Appended, never substituted: both legs can
+    # be violated at once and the second must not erase the first.
+    if [ "$lan_rc" = 2 ]; then
+        if [ "$inv_check" = OK ]; then inv_check="$lan_check"
+        else inv_check="$inv_check  ALSO: $lan_check"; fi
     fi
 
     local invariant notes
@@ -590,9 +677,10 @@ print(xid)
         printf '%s\n' "$invariant"
         echo
         echo "live (auto — regenerated by \`mesh-card --refresh\`; do not hand-edit):"
-        echo "  default-egress: dev ${egress_dev:-?}$([ "$inv_check" = OK ] && echo '  (clean)' || echo '  ⚠ via WireGuard')"
+        echo "  default-egress: dev ${egress_dev:-?}$([ "$wg_check" = OK ] && echo '  (clean)' || echo '  ⚠ via WireGuard')"
         echo "  public-ip: $pubip"
         echo "  exit-node: $exitnode"
+        echo "  exit-node-lan: $lan_check"
         echo "  ip-forwarding: $([ "$fwd" = 1 ] && echo on || echo off)"
         echo "  wireguard-ifaces: ${wg_ifaces:-none}"
         # bare $svc, not ${svc:-none}: the none/?/list decision is made ONCE at the probe above, where
@@ -788,6 +876,98 @@ exit 0'
                _got="$(sed -n 's/^  services-active: //p' "$_std/card")"
                [ "$_got" = '?' ] || { echo "smoke-test: FAIL (bus-less REFRESH rendered 'services-active: $_got' — the probe is right but the card does not use it)"; failures=1; }
                rm -rf "$_std"
+               # --- exit-node LAN exclusion: the FIB, never the pref -------------------------
+               # Every arm drives the REAL lan_probe_target/lan_fib_verdict on fixtures, and arm
+               # (L6) drives the REAL writer, because (L1)-(L5) only prove the functions decide
+               # right. The live fault this was built from (health@, mesh-home 2026-08-21T10:50Z)
+               # is a NODE condition, so it can never be an assertion here: arm (L1) carries it as
+               # a fixture instead, and stays red-able on a node where the LAN is fine.
+               _lfail(){ echo "smoke-test: FAIL (exit-node-lan: $1)"; failures=1; }
+               _TS_ROUTE='192.168.8.1 dev tailscale0 table 52 src 100.81.222.19 uid 1000'
+               _LAN_ROUTE='192.168.8.1 dev wlxbcec43434a22 src 192.168.8.224 uid 1000'
+               # (L1) the swallowed LAN — an exit node is set and the FIB sends the LAN into it.
+               _lout="$(lan_fib_verdict phaedra 192.168.8.1 192.168.8.0/24 "$_TS_ROUTE")"; _lrc=$?
+               [ "$_lrc" = 2 ] || _lfail "a LAN routed via dev tailscale0 returned rc=$_lrc, must be 2"
+               case "$_lout" in *SWALLOWED*) ;; *) _lfail "swallowed LAN rendered '$_lout'" ;; esac
+               # and the remedy must name the REAL table it read, not a placeholder — a remedy that
+               # cannot be pasted is a remedy nobody applies
+               case "$_lout" in *"throw 192.168.8.0/24 table 52"*) ;; *) _lfail "remedy did not carry the measured net+table: '$_lout'" ;; esac
+               # (L2) same exit node, LAN on its own link — the healthy case must NOT warn, or the
+               # verdict is stuck accusing and stops carrying information
+               _lout="$(lan_fib_verdict phaedra 192.168.8.1 192.168.8.0/24 "$_LAN_ROUTE")"; _lrc=$?
+               [ "$_lrc" = 0 ] || _lfail "a LAN on its own link returned rc=$_lrc, must be 0"
+               case "$_lout" in ok*) ;; *) _lfail "healthy LAN rendered '$_lout'" ;; esac
+               # (L3) no exit node = nothing can swallow the LAN. n/a, never ok — the difference
+               # between "I checked and it is fine" and "there was nothing to check".
+               case "$(lan_fib_verdict none 192.168.8.1 192.168.8.0/24 "$_TS_ROUTE")" in
+                 n/a*) ;; *) _lfail "no exit node must render n/a, got '$(lan_fib_verdict none 192.168.8.1 192.168.8.0/24 "$_TS_ROUTE")'" ;;
+               esac
+               lan_fib_verdict none 192.168.8.1 192.168.8.0/24 "$_TS_ROUTE" >/dev/null \
+                 || _lfail "no exit node must not raise a violation rc"
+               # (L4) missing evidence renders n/a, never a fabricated ok: an unaskable tailscale,
+               # no LAN prefix, and an empty FIB answer are three different silences.
+               for _lf in "'?' 192.168.8.1 192.168.8.0/24 $_TS_ROUTE" "phaedra '' '' $_TS_ROUTE" "phaedra 192.168.8.1 192.168.8.0/24 ''"; do
+                 eval "set -- $_lf"
+                 case "$(lan_fib_verdict "$1" "${2:-}" "${3:-}" "${4:-}")" in
+                   n/a*) ;; *) _lfail "missing evidence [$_lf] did not render n/a" ;;
+                 esac
+               done
+               # (L5) the probe target must be a LAN address that is NOT ours — `ip rule` 0
+               # (`from all lookup local`) precedes the tailscale rule, so our own address answers
+               # `local` no matter how thoroughly the LAN is swallowed, and would green the check
+               # exactly during the fault.
+               [ "$(lan_probe_target 192.168.8.224/24)" = "192.168.8.1 192.168.8.0/24" ] \
+                 || _lfail "probe target for 192.168.8.224/24 was '$(lan_probe_target 192.168.8.224/24)'"
+               [ "$(lan_probe_target 192.168.8.1/24)" = "192.168.8.2 192.168.8.0/24" ] \
+                 || _lfail "probe target collided with our own address: '$(lan_probe_target 192.168.8.1/24)'"
+               [ -z "$(lan_probe_target 10.0.0.1/32)" ] \
+                 || _lfail "a /32 has no third address to probe with, yet one was offered"
+               [ -z "$(lan_probe_target '')" ] || _lfail "an empty CIDR yielded a probe target"
+               # (L6) and it must be WIRED INTO THE CARD. One REAL refresh over a scratch HOME
+               # whose shimmed `ip`/`tailscale` present the swallowed-LAN fixture, asserting the
+               # RENDERED line AND that it reaches invariant-check (which is what mesh-card-watchdog
+               # alerts on — an unfolded verdict would be a warning nobody is wired to hear).
+               # Same shimming rationale as arm (d): an unshimmed refresh SSHes to phones.
+               _ltd="$(mktemp -d)"; mkdir -p "$_ltd/.local/bin" "$_ltd/.mesh"
+               cat > "$_ltd/.local/bin/ip" <<'IPSH'
+#!/bin/sh
+case "$*" in
+  *"addr show scope global"*) echo "3: wlan0    inet 192.168.8.224/24 brd 192.168.8.255 scope global wlan0"; exit 0;;
+  *"link show type wireguard"*) exit 0;;
+  *"route get 192.168.8.1"*) echo "192.168.8.1 dev tailscale0 table 52 src 100.81.222.19 uid 1000"; exit 0;;
+  *"route get "*) echo "1.1.1.1 dev tailscale0 table 52 src 100.81.222.19 uid 1000"; exit 0;;
+esac
+exit 0
+IPSH
+               cat > "$_ltd/.local/bin/tailscale" <<'TSSH'
+#!/bin/sh
+case "$1" in
+  status) echo '{"Self":{"HostName":"t"},"Peer":{"p":{"ID":"XID","HostName":"phaedra","TailscaleIPs":["100.1.1.1"],"Tags":[],"Online":true}}}';;
+  debug)  echo '{"ExitNodeID":"XID","ExitNodeAllowLANAccess":true}';;
+  ip)     echo "100.81.222.19";;
+esac
+exit 0
+TSSH
+               printf '#!/bin/sh\nexit 0\n' > "$_ltd/.local/bin/curl"
+               printf '#!/bin/sh\nexit 1\n' > "$_ltd/.local/bin/systemctl"
+               for _p in mesh-camera mesh-body-motion mesh-light mesh-link-flap mesh-volume; do
+                   printf '#!/bin/sh\nexit 1\n' > "$_ltd/.local/bin/$_p"
+               done
+               chmod +x "$_ltd/.local/bin"/*
+               HOME="$_ltd" MESH_CARD="$_ltd/card" "$SELF" --refresh >/dev/null 2>&1
+               _lrc=$?
+               grep -q '^  exit-node-lan: ⚠ SWALLOWED' "$_ltd/card" \
+                 || _lfail "a swallowed-LAN REFRESH rendered '$(sed -n 's/^  exit-node-lan: //p' "$_ltd/card")' — the probe is right but the card does not use it"
+               grep -q '^  invariant-check: ⚠ SWALLOWED' "$_ltd/card" \
+                 || _lfail "the swallowed LAN did not reach invariant-check, so the watchdog would never alert on it"
+               [ "$_lrc" = 2 ] || _lfail "a swallowed-LAN refresh exited $_lrc — mesh-card-watchdog alerts on non-zero only"
+               # ...and the OTHER leg must stay silent. The fixture has no WireGuard interface at
+               # all, so `default-egress:` must read (clean). Keyed on the rollup instead of its
+               # own leg it would read "⚠ via WireGuard" — a summary asserting a leg that never
+               # fired, and a second, false accusation riding in on the true one.
+               grep -q '^  default-egress: .*(clean)' "$_ltd/card" \
+                 || _lfail "the LAN leg libelled a clean egress: '$(sed -n 's/^  default-egress: //p' "$_ltd/card")'"
+               rm -rf "$_ltd"
                # --- S5 identity coherence (VSM PII2) -------------------------------------------
                # Every arm drives the REAL identity_conflicts/identity_verdict against fixture
                # surfaces. Mutants seen RED before landing (run from a scratch copy, 2026-08-04):
@@ -915,7 +1095,7 @@ exit 0'
                esac
                rm -rf "$_rtd"
                ((failures)) && exit 1
-               echo "smoke-test: ok (+ services-active: bus-less → '?', bus-says-zero → 'none', mesh unit survives the filter, + a real bus-less refresh renders '?' so the probe is provably wired into the card; + identity/PII2: identical re-export ≠ conflict, differing one IS with both line numbers, commented-out ignored, quoted '#' kept, planted+retired, card-vs-policy, missing restore.env → n/a not COHERENT, and a real refresh renders the line; + organ roster: body sense declared on CONFIGURATION through a dead probe, light survives a dead body, sticky floor holds TOTAL when detection goes false, --retire-organ is the one exit)"; exit 0 ;;
+               echo "smoke-test: ok (+ services-active: bus-less → '?', bus-says-zero → 'none', mesh unit survives the filter, + a real bus-less refresh renders '?' so the probe is provably wired into the card; + identity/PII2: identical re-export ≠ conflict, differing one IS with both line numbers, commented-out ignored, quoted '#' kept, planted+retired, card-vs-policy, missing restore.env → n/a not COHERENT, and a real refresh renders the line; + organ roster: body sense declared on CONFIGURATION through a dead probe, light survives a dead body, sticky floor holds TOTAL when detection goes false, --retire-organ is the one exit; + exit-node-lan: the FIB and never the pref — a LAN routed via tailscale0 is SWALLOWED with a pasteable net+table remedy, a LAN on its own link is not, no-exit-node/unaskable/no-prefix/empty-answer all render n/a, the probe target is never our own address (rule 0 would answer it locally and green the live fault), and a real refresh renders the line, folds it into invariant-check so the watchdog alerts, and leaves default-egress clean)"; exit 0 ;;
     "")        [ -r "$CARD" ] && cat "$CARD" || echo "no card at $CARD — run: mesh-card --refresh" ;;
     *)         echo "usage: mesh-card [--refresh]" >&2; exit 1 ;;
 esac

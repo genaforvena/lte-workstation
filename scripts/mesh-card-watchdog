@@ -34,6 +34,11 @@
 # slows past 30s would see autowire SKIP this tool silently. Check autowire.log, not the header,
 # if it ever stops appearing in reflexes.cron.
 set -uo pipefail
+# SELF — an ABSOLUTE path to THIS file, resolved BEFORE any test arm rewrites HOME. The debounce
+# arms below run the real alert path over a scratch HOME, and a relative "$0" would either miss
+# the file or (worse) resolve to a DIFFERENT mesh-card-watchdog on PATH and green off code that
+# is not in this file.
+SELF="$(cd "$(dirname "$0")" 2>/dev/null && pwd)/$(basename "$0")"
 if [ "${1:-}" = --test ]; then
   # tmp fence — task:doctor-test-tmpdir-cleanup-traps. Re-exec the smoke test ONCE under a private
   # TMPDIR and remove it from the PARENT, so the cleanup cannot be lost to the test's own `exit 1`
@@ -51,9 +56,18 @@ if [ "${1:-}" = --test ]; then
   tmp="$(mktemp -d)" || { echo "smoke-test: FAIL (mktemp failed)"; exit 1; }
   trap 'rm -rf "$tmp"' EXIT
   touch "$tmp/traces.log" || { echo "smoke-test: FAIL (cannot create temp log)"; exit 1; }
-  out="$(MESH_CARD="$tmp/card" HOME="$HOME" mesh-card --refresh 2>&1)" || {
-    echo "smoke-test: FAIL (mesh-card --refresh failed: $out)"; exit 1;
-  }
+  # rc=2 is `mesh-card --refresh` reporting an INVARIANT VIOLATION — i.e. this watchdog's
+  # working case, the whole reason it exists. Treating it as a smoke-test failure renders a NODE
+  # condition as a CODE verdict: the moment a node actually violates the invariant, mesh-doctor
+  # and mesh-autowire would read this reflex as broken and could SKIP wiring it, silencing the
+  # alarm exactly when it has something to say. Seen live: mesh-home 2026-08-21, where the
+  # exit-node LAN-exclusion check (mesh-card `exit-node-lan:`) put --refresh at rc=2 on a node
+  # whose watchdog is perfectly healthy. Only rc other than 0/2 is a real fault here.
+  out="$(MESH_CARD="$tmp/card" HOME="$HOME" mesh-card --refresh 2>&1)"; _rrc=$?
+  case "$_rrc" in
+    0|2) ;;
+    *) echo "smoke-test: FAIL (mesh-card --refresh exited $_rrc: $out)"; exit 1 ;;
+  esac
   printf '%s\n' "$out" | grep -q '^hostname:' || {
     echo "smoke-test: FAIL (mesh-card refresh did not emit card content)"; exit 1;
   }
@@ -61,7 +75,57 @@ if [ "${1:-}" = --test ]; then
     echo "smoke-test: FAIL (mesh-card refresh missing invariant-check)"; exit 1;
   }
   [ -s "$tmp/card" ] || { echo "smoke-test: FAIL (temp card file not written)"; exit 1; }
-  echo "smoke-test: ok"; exit 0
+
+  # --- the ALERT path: edge + cooldown, driven for real -------------------------------------
+  # Every arm runs THIS FILE end-to-end over a scratch HOME, so LOG/STATE/mesh-card/mesh-tg all
+  # land inside the fixture and nothing here can touch the live ~/.mesh/traces.log — a dry-run
+  # that writes the durable liveness record forges the evidence it exists to check.
+  wfail=0; _wf(){ echo "smoke-test: FAIL (alert-debounce: $1)"; wfail=1; }
+  _wh="$tmp/home"; mkdir -p "$_wh/.local/bin" "$_wh/.mesh"
+  # fake card: rc + invariant-check text come from files, so an arm can change either
+  cat > "$_wh/.local/bin/mesh-card" <<'FCARD'
+#!/bin/sh
+echo "hostname: fixture"
+echo "  invariant-check: $(cat "$HOME/.mesh/fixture-viol" 2>/dev/null)"
+exit "$(cat "$HOME/.mesh/fixture-rc" 2>/dev/null || echo 0)"
+FCARD
+  printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "$HOME/.mesh/tg-sent"\n' > "$_wh/.local/bin/mesh-tg"
+  chmod +x "$_wh/.local/bin/mesh-card" "$_wh/.local/bin/mesh-tg"
+  _wtg(){ [ -f "$_wh/.mesh/tg-sent" ] && grep -c . "$_wh/.mesh/tg-sent" || echo 0; }
+  _wlog(){ [ -f "$_wh/.mesh/traces.log" ] && grep -c 'INVARIANT VIOLATION' "$_wh/.mesh/traces.log" || echo 0; }
+  _wrun(){ HOME="$_wh" MESH_CARD_ALERT_REPEAT_S="${1:-21600}" bash "$SELF" >/dev/null 2>&1; echo $?; }
+
+  # (A) first violation ALERTS, and the rc is the node's verdict
+  echo 2 > "$_wh/.mesh/fixture-rc"; echo "VIOLATED lan swallowed" > "$_wh/.mesh/fixture-viol"
+  [ "$(_wrun)" = 2 ] || _wf "a violating card did not propagate rc=2"
+  [ "$(_wtg)" = 1 ] || _wf "the first violation sent $(_wtg) telegram(s), expected 1"
+  [ "$(_wlog)" = 1 ] || _wf "the first violation wrote $(_wlog) trace line(s), expected 1"
+  # (B) the SAME standing violation, next tick: silent on both channels, rc UNCHANGED.
+  # A violation persists until a human edits a routing table while this reflex fires every
+  # 15min — undebounced that is 96 identical alerts a day, which is how a channel gets ignored.
+  [ "$(_wrun)" = 2 ] || _wf "a debounced tick stopped reporting rc=2 — the exit code must never be debounced"
+  [ "$(_wtg)" = 1 ] || _wf "a repeat of the SAME standing violation alerted again ($(_wtg) total)"
+  [ "$(_wlog)" = 1 ] || _wf "a repeat of the SAME standing violation wrote another trace line"
+  # (C) a violation that MUTATES is a new fact — a boolean latch would swallow it (e.g. the
+  # WireGuard leg joining the LAN leg on an already-violating node)
+  echo "VIOLATED lan swallowed ALSO wireguard egress" > "$_wh/.mesh/fixture-viol"
+  _wrun >/dev/null
+  [ "$(_wtg)" = 2 ] || _wf "a CHANGED violation text did not alert ($(_wtg) total) — the debounce is a latch"
+  # (D) the cooldown expires and a still-open violation re-alerts, so it cannot fade out
+  [ "$(_wrun 0)" = 2 ] || _wf "cooldown-expiry tick lost the rc"
+  [ "$(_wtg)" = 3 ] || _wf "a still-open violation past its cooldown stayed silent ($(_wtg) total)"
+  grep -q 'still-open' "$_wh/.mesh/traces.log" || _wf "the cooldown re-alert did not name itself still-open"
+  # (E) recovery clears the memory, so a RECURRENCE alerts immediately instead of inheriting the
+  # old cooldown — otherwise the debounce eats the very transition it exists to report
+  echo 0 > "$_wh/.mesh/fixture-rc"
+  [ "$(_wrun)" = 0 ] || _wf "a clean card did not exit 0"
+  [ -e "$_wh/.mesh/.card-watchdog.alert" ] && _wf "recovery left the alert memory behind"
+  echo 2 > "$_wh/.mesh/fixture-rc"
+  _wrun >/dev/null
+  [ "$(_wtg)" = 4 ] || _wf "a violation RECURRING after a recovery was silent ($(_wtg) total)"
+  [ "$wfail" = 0 ] || exit 1
+
+  echo "smoke-test: ok (+ alert path: first violation alerts, a standing repeat is silent on TG and trace but keeps rc=2, changed text alerts, cooldown expiry re-alerts as still-open, recovery clears the memory so a recurrence alerts at once; all over a scratch HOME so the live traces.log is never written)"; exit 0
 fi
 
 CARD="${MESH_CARD:-$HOME/.mesh-card}"
@@ -79,19 +143,58 @@ output="$("$MESH_CARD_BIN" --refresh 2>&1)"
 rc=$?
 
 if [ $rc -eq 0 ]; then
-    # Invariant holds — nothing to do
+    # Invariant holds. Drop the alert memory so a RECURRENCE alerts immediately as `new`
+    # instead of inheriting the old violation's cooldown — otherwise a flapping invariant is
+    # silent for up to ALERT_REPEAT_S after every recovery, which is the debounce eating the
+    # very transition it exists to report.
+    rm -f "${MESH_DIR}/.card-watchdog.alert" 2>/dev/null || true
     exit 0
 fi
 
-# Violation detected — alert
+# Violation detected — alert, on the EDGE and on a cooldown, never once per tick.
+#
+# WHY THIS IS DEBOUNCED (2026-08-21). Until the exit-node LAN-exclusion leg was added to
+# mesh-card, this node had never once violated the invariant, so the alert path had never run
+# at cadence and its lack of a debounce was invisible. A violation is a STANDING condition —
+# it persists until a human holds a substrate claim and edits a routing table — while this
+# reflex fires every 15 min, so an undebounced alert is 96 identical Telegrams a day. That is
+# not vigilance, it is the operator learning to ignore the channel. The opposite trap is
+# equally documented (a first-time-only notice latches itself mute), so this is an EDGE plus a
+# REPEAT, not a latch: a violation whose text CHANGED always alerts, and an unchanged one
+# re-alerts every ALERT_REPEAT_S so a standing violation cannot fade out of the record.
+# The state file carries the text, not a boolean — a violation that MUTATES into a different
+# one (wireguard leg joining the LAN leg) is a new fact and must not be swallowed as "same".
+STATE="${MESH_DIR}/.card-watchdog.alert"
+ALERT_REPEAT_S="${MESH_CARD_ALERT_REPEAT_S:-21600}"   # 6h
+
+viol="$(echo "$output" | grep -i 'invariant-check\|VIOLATION' | head -3 | tr '\n' ' ')"
+now=$(date -u +%s)
+prev_when=0; prev_viol=""
+if [ -r "$STATE" ]; then
+    prev_when=$(sed -n 1p "$STATE" 2>/dev/null)
+    prev_viol=$(sed -n 2p "$STATE" 2>/dev/null)
+    case "$prev_when" in ''|*[!0-9]*) prev_when=0 ;; esac
+fi
+
+if [ "$viol" != "$prev_viol" ]; then
+    reason="new"
+elif [ $(( now - prev_when )) -ge "$ALERT_REPEAT_S" ]; then
+    reason="still-open $(( (now - prev_when) / 3600 ))h"
+else
+    # Standing, already-reported violation. Silent on the channels, but STILL rc!=0 — the exit
+    # code is this tool's honest verdict about the node and must never be debounced.
+    exit $rc
+fi
+
 echo "$output" >&2
-echo "$(ts)  mesh-card-watchdog@$HOST  ::  [ALERT] mesh-card INVARIANT VIOLATION (exit $rc)" >> "$LOG"
+echo "$(ts)  mesh-card-watchdog@$HOST  ::  [ALERT] mesh-card INVARIANT VIOLATION ($reason, exit $rc)" >> "$LOG"
+
+mkdir -p "$MESH_DIR" 2>/dev/null || true
+printf '%s\n%s\n' "$now" "$viol" > "$STATE" 2>/dev/null || true
 
 # Notify via Telegram
 if [ -x "$MESH_TG_BIN" ]; then
-    # Extract the violation line from the card output
-    viol="$(echo "$output" | grep -i 'invariant-check\|VIOLATION' | head -3 | tr '\n' ' ')"
-    "$MESH_TG_BIN" "[ALERT] mesh-card invariant violation on $HOST: $viol" 2>/dev/null || true
+    "$MESH_TG_BIN" "[ALERT] mesh-card invariant violation on $HOST ($reason): $viol" 2>/dev/null || true
 fi
 
 exit $rc
