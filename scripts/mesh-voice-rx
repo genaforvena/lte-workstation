@@ -149,6 +149,42 @@ def _instrumental(chent, voiced):
         return False
     return voiced < INSTR_VOICED_MAX and chent < INSTR_CHENT_MAX
 
+# THE TIMEOUT IS A DURATION ASSUMPTION (2026-08-21). The local whisper run was capped at a FLAT 240s
+# regardless of how long the operator spoke, so the cap silently encoded "his notes are short". A
+# 410s note (15:46:01Z) could not fit it on any loaded node — the cloud fallback was down on DNS that
+# minute, and the note surfaced as "[voice: transcription timed out (node under load)]", which named
+# LOAD as the cause when the real cause was that the budget never looked at the audio. Recovered by
+# hand afterwards; it was a grind test, so nothing was lost, but the shape is the one to keep: a
+# constant wall-clock cap over a variable-length input is a claim about the input.
+#
+# Size it to the audio instead. The wav is always 16 kHz mono s16 here (ffmpeg above writes it), so
+# its duration is bytes/32000 — read from the file we are about to transcribe, never from Telegram's
+# `duration` field, which is absent for a spooled note and is the sender's claim either way.
+# FACTOR: turbo-q5_0 on this node measured 60s of speech in 27.9s (~0.47x realtime) quiet; 3x
+# realtime plus a fixed 60s of model load is generous headroom for a loaded node without being
+# unbounded. FLOOR keeps the old 240s for short notes (never a regression). CEILING is NOT a taste
+# call — mesh-voice-rx.service sets WatchdogSec=900 and the loop's only ping site is per-update
+# (line ~1303), so a single whisper run that outlives the watchdog gets the poller KILLED mid-note.
+# 600s leaves the download and the ffmpeg pass inside the same 900s window. Raising it means moving
+# WatchdogSec first, or pinging from inside the run.
+WHISPER_BUDGET_FLOOR = 240
+WHISPER_BUDGET_CEILING = 600
+
+def _wav_seconds(wav):
+    """Duration of a 16 kHz mono s16 wav from its size, or None if it cannot be read."""
+    try:
+        n = Path(wav).stat().st_size - 44          # RIFF header; a few ms of error, irrelevant here
+        return max(0.0, n / 32000.0) if n > 0 else 0.0
+    except OSError:
+        return None
+
+def _whisper_budget(wav, floor=WHISPER_BUDGET_FLOOR, ceiling=WHISPER_BUDGET_CEILING):
+    """Seconds to allow the local whisper run, sized to the AUDIO. Unmeasurable -> the old floor."""
+    secs = _wav_seconds(wav)
+    if secs is None:
+        return floor
+    return int(max(floor, min(ceiling, 60.0 + 3.0 * secs)))
+
 def _instrumental_intro(chent, voiced, dest, heard):
     """The routed line for a note whose TEXT says speech but whose AUDIO says instrument. Pure, so
     the contract that matters is assertable offline: it CARRIES the transcript verbatim (a note the
@@ -208,6 +244,21 @@ if len(sys.argv) > 1 and sys.argv[1] == '--test':
     _t(not _instrumental(None, None), "an unmeasured note reads as an instrument")
     _t(not _instrumental(0.9953, 0.800), "him TALKING reads as an instrument (thresholds inverted)")
     _t(_instrumental(0.9882, 0.449), "his guitar take reads as speech (thresholds inverted)")
+    # 7) THE BUDGET IS SIZED TO THE AUDIO, not a constant (2026-08-21). Goes RED if anyone restores
+    # a flat cap, if the floor stops protecting short notes, or if the ceiling drifts past the
+    # 900s WatchdogSec that bounds it.
+    import tempfile as _tf_b
+    with _tf_b.TemporaryDirectory() as _bd:
+        def _mkwav(secs):
+            p = Path(_bd) / f"w{secs}.wav"; p.write_bytes(b"\0" * (44 + int(secs * 32000))); return p
+        _t(_whisper_budget(_mkwav(10)) == 240, "a short note lost the 240s floor")
+        _t(_whisper_budget(_mkwav(410)) > 240, "a 410s note still gets the flat 240s cap (the fault)")
+        _t(_whisper_budget(_mkwav(410)) == 600, "the 410s budget is not the ceiling it should clamp to")
+        _t(_whisper_budget(_mkwav(120)) == 420, "the 120s budget is not 60+3x realtime")
+        _t(_whisper_budget(Path(_bd) / "absent.wav") == 240, "an unmeasurable wav must fall to the floor")
+        _t(WHISPER_BUDGET_CEILING <= 600, "ceiling raised past what WatchdogSec=900 can carry")
+        _t(abs(_wav_seconds(_mkwav(60)) - 60) < 0.1, "wav duration from size is wrong")
+
     _line = _instrumental_intro(0.9882, 0.449, "/tmp/x.oga", "то что он сказал")
     _t("то что он сказал" in _line, "the hedged routing line DROPS the transcript")
     _t("/tmp/x.oga" in _line and "not act on it" in _line.lower(), "routing line loses the audio path or the warning")
@@ -875,9 +926,10 @@ def transcribe(file_id, doc=None, spooled=None):
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if not wav.exists(): return "[voice: ffmpeg failed]"
     local_admit_refused = False; local_timed_out = False
+    budget = _whisper_budget(wav); wav_secs = _wav_seconds(wav)
     try:
         out = subprocess.run([str(WHISPER), "-m", str(MODEL), "-f", str(wav), "-nt", "-l", "auto"],
-                             capture_output=True, text=True, timeout=240)
+                             capture_output=True, text=True, timeout=budget)
         # rc 75 = the whisper-run admission gate REFUSED (node too memory-pressured to run the ~2GB
         # job) → stdout is empty but the audio was NEVER transcribed. Do NOT surface that as an
         # "empty transcript" (a FAKE — the operator DID speak). Fall through to the cloud fallback.
@@ -1003,8 +1055,12 @@ def transcribe(file_id, doc=None, spooled=None):
         return ("[voice: node too memory-pressured to transcribe and cloud STT unavailable — "
                 "your note was NOT empty; please resend as text if urgent]")
     if local_timed_out:
-        return ("[voice: transcription timed out (node under load) and cloud STT unavailable — "
-                "your note was NOT empty; please resend as text if urgent]")
+        # Name the BUDGET and the DURATION, not just "load": a note longer than the ceiling allows
+        # is a different fault from a node too busy to keep up, and the old message could not tell
+        # the operator which one he hit (nor the next hand where to look).
+        _d = f"{wav_secs:.0f}s note" if wav_secs is not None else "note of unknown length"
+        return (f"[voice: local transcription exceeded its {budget}s budget for a {_d} and cloud STT "
+                "was unavailable — your note was NOT empty; please resend as text if urgent]")
     return "[voice: empty transcript]"
 
 def handle(update):
