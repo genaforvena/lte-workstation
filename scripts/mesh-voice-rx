@@ -230,7 +230,7 @@ def acquire_instance_lock():
 
 # Reject a competing poller before opening logs or spawning the scrubber. Focused unit-style tests do
 # not poll Telegram, so they may run beside the live receiver.
-_NO_POLL_TEST = len(sys.argv) > 1 and sys.argv[1] in ('--test-operator-fyi-routing', '--test-image-routing', '--test-document-board-claim', '--test-voice-hold', '--test-instrumental')
+_NO_POLL_TEST = len(sys.argv) > 1 and sys.argv[1] in ('--test-operator-fyi-routing', '--test-image-routing', '--test-document-board-claim', '--test-voice-hold', '--test-instrumental', '--test-spool')
 if not _NO_POLL_TEST and not acquire_instance_lock():
     sys.exit(0)
 
@@ -857,12 +857,20 @@ def groq_stt(wav):
         print(f"[voice-rx] groq_stt failed: {str(e)[:80]}", file=sys.stderr)
         return None
 
-def transcribe(file_id, doc=None):
-    info = get("getFile", file_id=file_id)
-    path = info.get("result", {}).get("file_path")
-    if not path: return "[voice: getFile failed]"
+def transcribe(file_id, doc=None, spooled=None):
     oga = MESH / "voice-in.oga"; wav = MESH / "voice-in.wav"
-    urllib.request.urlretrieve(f"{FILEAPI}/{path}", oga)
+    if spooled and Path(spooled).exists():
+        # SPOOL-FIRST consumer. The bytes are already on disk; re-downloading them would re-run the
+        # exact network step that lost update 879098783 on an SSL timeout, for no new information.
+        # COPY, never move — the spool is the durable catch and this function ends by unlinking its
+        # working copy, so a move would make the interpreter destroy the material again.
+        import shutil as _sh_tr
+        _sh_tr.copyfile(str(spooled), str(oga))
+    else:
+        info = get("getFile", file_id=file_id)
+        path = info.get("result", {}).get("file_path")
+        if not path: return "[voice: getFile failed]"
+        urllib.request.urlretrieve(f"{FILEAPI}/{path}", oga)
     subprocess.run([FFMPEG, "-y", "-i", str(oga), "-ar", "16000", "-ac", "1", str(wav)],
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if not wav.exists(): return "[voice: ffmpeg failed]"
@@ -979,7 +987,7 @@ def handle(update):
         # transcribed to "(upbeat music)…" garbage and the file DELETED (2026-07-06: operator's 3
         # jam tracks lost — 1 garbled, 2 silently dropped). Audio routes to the inbox branch below.
         fid = msg["voice"]["file_id"]
-        txt = transcribe(fid, msg["voice"])
+        txt = transcribe(fid, msg["voice"], spooled=spool_audio_path(update))
         write("VOICE", txt)
         typing_start(); kick_feed(); post_to_board(txt)
     elif msg.get("text"):
@@ -1073,6 +1081,144 @@ if len(sys.argv) > 1 and sys.argv[1] == '--test-document-board-claim':
     print("smoke-test: ok (operator document -> durable board [task] claim despite pane-inject failure)", flush=True)
     sys.exit(0)
 
+# --- SPOOL-FIRST: the raw update is durable BEFORE anything interprets it --------------------
+# 2026-08-21, operator: "где бы полер ни был, должно доставляться". Two independent losses in one
+# night, and neither needed the other:
+#   (1) a SECOND poller (phaedra, pid 3307678) won the getUpdates race, had no whisper stack, and
+#       wrote every note it stole into its OWN /root/.mesh/voice-in.log as "[voice: empty
+#       transcript]" — destruction on a machine nobody reads;
+#   (2) update 879098783 died on an SSL timeout INSIDE handle() at 02:36:46Z and was lost for
+#       good, because poll_once advances the offset unconditionally. That one needed no second
+#       poller at all — a lone receiver loses it identically.
+# Both are one shape: the only copy of the operator's words was produced by INTERPRETING them, so
+# every interpretation failure was a destruction. The fix separates CATCHING from READING. The
+# spool is the catch — the update's JSON, and for a voice note the raw opus bytes, fsynced under
+# the update_id BEFORE handle() is called. Interpretation then reads the spool; an interpreter
+# that dies leaves the material on disk, and a poller on a node that cannot transcribe still holds
+# an update_id-keyed artifact another node can merge, instead of a ruined transcript.
+# BOUNDARY, stated rather than implied: bytes are spooled for VOICE ONLY. Photos/documents/audio
+# already land in ~/.mesh/inbox and carry a durable board [task] row (its own gate at
+# --test-document-board-claim), and re-fetching a 20MB document buys nothing. Widen this
+# deliberately, never by reflex.
+SPOOL_DIR = Path(os.environ.get("MESH_TG_SPOOL", str(MESH / "tg-spool")))
+SPOOL_LOG = Path(os.environ.get("MESH_TG_SPOOL_LOG", str(MESH / "tg-spool.log")))
+SPOOL_KEEP_DAYS = float(os.environ.get("MESH_TG_SPOOL_DAYS", "7"))
+# A spool failure must NOT advance the offset — that is the entire point. But it must not wedge the
+# queue forever either (the hazard the old unconditional advance was written against), so the hold
+# is BOUNDED and giving up is LOUD: after this many consecutive failures on one update_id the
+# offset advances, handle() still gets its best-effort try (never WORSE than the old path), and a
+# SPOOL-FAILED line reaches the log the operator's mind actually reads. Silence is not available in
+# either direction.
+SPOOL_MAX_ATTEMPTS = int(os.environ.get("MESH_TG_SPOOL_ATTEMPTS", "3"))
+_SPOOL_FAILS = {}
+
+def _fsync_write(path, data):
+    """Write atomically and fsync BOTH the file and its directory.
+
+    Without the DIRECTORY fsync the rename itself can be lost on power failure, leaving exactly the
+    state this mechanism exists to prevent: an advanced offset and no artifact. A tmp name in the
+    same directory (not with_suffix, which chokes on a two-dot suffix) keeps the replace atomic.
+    """
+    path = Path(path)
+    if isinstance(data, str):
+        data = data.encode()
+    tmp = path.parent / (path.name + ".part")
+    with open(tmp, "wb") as f:
+        f.write(data); f.flush(); os.fsync(f.fileno())
+    tmp.replace(path)
+    dfd = os.open(str(path.parent), os.O_RDONLY)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+    return path
+
+def spool_voice_doc(update):
+    """The voice payload of an update, or None. Separate so the routing is assertable offline.
+
+    OWNER-gated on purpose: a stranger's update is logged and never fetched, so spooling can never
+    be used to make this node download a file on an unauthenticated party's command.
+    """
+    msg = update.get("message") or update.get("edited_message") or {}
+    if (msg.get("from") or {}).get("id") != OWNER:
+        return None
+    return msg.get("voice")
+
+def spool_audio_path(update):
+    """Where spool_update put this update's opus, or None. The consumer's half of the contract."""
+    uid = (update or {}).get("update_id")
+    if uid is None:
+        return None
+    p = SPOOL_DIR / f"{uid}.oga"
+    return p if p.exists() else None
+
+def _spool_note(uid, update, apath):
+    """One manifest row per caught update — update_id keyed, so two nodes' spools MERGE and DEDUPE.
+
+    The ledger outlives the bytes (the prune below is bounded): after the audio is gone the row is
+    still the handle by which a note is known to have arrived, and by whom it was caught.
+    """
+    msg = (update.get("message") or update.get("edited_message") or {})
+    kind = ("voice" if msg.get("voice") else "text" if msg.get("text") else
+            "photo" if msg.get("photo") else "document" if msg.get("document") else
+            "audio" if msg.get("audio") else "other")
+    try:
+        with open(SPOOL_LOG, "a") as f:
+            f.write("%s  node=%s  update_id=%s  kind=%s  audio=%s  bytes=%s\n"
+                    % (ts(), os.uname().nodename, uid, kind,
+                       apath.name if apath else "na",
+                       apath.stat().st_size if apath and apath.exists() else "na"))
+    except OSError as e:
+        print(f"[rx] spool ledger write failed: {str(e)[:80]}", file=sys.stderr)
+
+def _spool_prune():
+    """Bounded retention, same stance as voice-hold: long enough to recover, not an archive."""
+    cutoff = time.time() - SPOOL_KEEP_DAYS * 86400
+    try:
+        for old in SPOOL_DIR.iterdir():
+            try:
+                if old.is_file() and old.stat().st_mtime < cutoff:
+                    old.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+def spool_update(update):
+    """Make the update durable BEFORE it is interpreted. True = caught.
+
+    False means the CATCH failed (getFile / download / disk), NOT that the update was bad — the
+    caller must then hold the offset so Telegram re-offers the same update on the next poll.
+    """
+    uid = update.get("update_id")
+    if uid is None:
+        return True                      # nothing to key on; no worse than the old path
+    try:
+        SPOOL_DIR.mkdir(parents=True, exist_ok=True)
+        _fsync_write(SPOOL_DIR / f"{uid}.json", json.dumps(update, ensure_ascii=False))
+        doc = spool_voice_doc(update)
+        apath = None
+        if doc and doc.get("file_id"):
+            apath = SPOOL_DIR / f"{uid}.oga"
+            if not apath.exists():       # idempotent: a retry after a partial batch re-fetches nothing
+                info = get("getFile", file_id=doc["file_id"])
+                fp = ((info or {}).get("result") or {}).get("file_path")
+                if not fp:
+                    raise RuntimeError(f"getFile: {(info or {}).get('description') or 'no file_path'}")
+                with urllib.request.urlopen(f"{FILEAPI}/{fp}", timeout=120) as r:
+                    blob = r.read()
+                if not blob:
+                    # A zero-byte catch is a FAILED catch, not a caught silence. Distinguishing
+                    # these two is the whole lesson of "[voice: empty transcript]".
+                    raise RuntimeError("downloaded 0 bytes")
+                _fsync_write(apath, blob)
+        _spool_note(uid, update, apath)
+        _spool_prune()
+        return True
+    except Exception as e:
+        print(f"[rx] spool FAILED for update {uid}: {str(e)[:120]}", file=sys.stderr)
+        return False
+
 def poll_once(offset):
     data = get("getUpdates", timeout=25, offset=offset)
     if not data.get("ok"):
@@ -1082,18 +1228,186 @@ def poll_once(offset):
         print(f"[rx] getUpdates not ok: {data.get('description')}", file=sys.stderr); return offset
     write_rx_state("OK")   # reached Telegram → operator channel is UP (the axis mesh-stress consumes)
     for up in data.get("result", []):
-        # ALWAYS advance the offset, even if handle() throws — a single un-handleable update
-        # (bad voice note, download error, anything) must NOT wedge the entire inbound queue.
+        uid = up.get("update_id")
+        # SPOOL-FIRST. The offset is the mesh's only claim that an update was RECEIVED, and it used
+        # to advance on nothing but "Telegram handed us JSON" — so any failure downstream of that
+        # (download, ffmpeg, whisper, a poller with no whisper at all) converted the operator's words
+        # into a permanent absence. Now the offset moves only once the raw material is on disk.
+        if not spool_update(up):
+            n = _SPOOL_FAILS.get(uid, 0) + 1
+            _SPOOL_FAILS[uid] = n
+            write_rx_state("ERR:spool")
+            if n < SPOOL_MAX_ATTEMPTS:
+                # HOLD the offset — Telegram re-offers this update (and everything behind it) on the
+                # next poll. This is a deliberate, bounded wedge: ~SPOOL_MAX_ATTEMPTS poll cycles.
+                print(f"[rx] spool attempt {n}/{SPOOL_MAX_ATTEMPTS} failed for {uid}; holding offset",
+                      file=sys.stderr)
+                return offset
+            # Bounded hold expired. Fall through to handle() — best-effort interpretation is exactly
+            # the OLD behaviour, so giving up is never worse than before it existed — but say so in
+            # the log the mind reads, because a loss the operator learns about can be resent and a
+            # loss recorded only on stderr cannot.
+            print(f"[rx] spool giving up on {uid} after {n} attempts; interpreting unspooled",
+                  file=sys.stderr)
+            try:
+                write("FYI", f"[spool-failed] the raw material for update {uid} could not be saved "
+                             f"after {n} attempts — if this was a voice note and it comes back empty, "
+                             f"ask the operator to resend")
+            except Exception:
+                pass
+        else:
+            _SPOOL_FAILS.pop(uid, None)
         try:
             if not already_processed(up):
                 handle(up)
                 _mark_processed(update_key(up), message_key(up))
         except Exception as e:
+            # Still non-fatal, and now genuinely non-destructive: the spool holds the raw update, so
+            # an un-handleable one costs an interpretation, not the material.
             print(f"[rx] handle failed for update {up.get('update_id')}: {e}", file=sys.stderr)
         offset = up["update_id"] + 1
         OFFSET_F.write_text(str(offset))
         _watchdog_ping()   # handle() can run minutes (download + whisper); still alive, still working
     return offset
+
+if len(sys.argv) > 1 and sys.argv[1] == '--test-spool':
+    # GATE for SPOOL-FIRST (2026-08-21). The claim under test is NOT "a spool directory exists" —
+    # that is a mode bit. It is the OFFSET CONTRACT: the receipt marker may move only after the raw
+    # material is on disk, and when it cannot be, the hold is bounded and the giving-up is audible.
+    # Every arm below was seen RED against a mutant before this was trusted (see the commit body).
+    import tempfile, shutil as _sh, types
+    fails = []
+    def _t(ok, msg):
+        if not ok: fails.append(msg)
+    td = Path(tempfile.mkdtemp(prefix="spool-gate-"))
+    g = globals()
+    g["SPOOL_DIR"] = td / "spool"
+    g["SPOOL_LOG"] = td / "spool.log"
+    g["OFFSET_F"] = td / "offset"
+    g["RX_STATE"] = td / "rx-state"
+    g["OWNER"] = 4242
+    g["SPOOL_MAX_ATTEMPTS"] = 3
+    g["_SPOOL_FAILS"] = {}
+
+    wrote = []
+    g["write"] = lambda kind, text: wrote.append((kind, text))
+    handled = []
+    g["handle"] = lambda up: handled.append(up.get("update_id"))
+    g["already_processed"] = lambda up: False
+    g["_mark_processed"] = lambda *a: None
+    g["_watchdog_ping"] = lambda: None
+    g["kick_feed"] = lambda: None
+
+    def _voice_update(uid, from_id=4242):
+        return {"update_id": uid,
+                "message": {"message_id": uid, "chat": {"id": from_id}, "from": {"id": from_id},
+                            "voice": {"file_id": f"fid{uid}", "file_unique_id": f"u{uid}",
+                                      "duration": 3}}}
+
+    calls = {"getFile": 0, "download": 0}
+    dl_ok = {"v": True}
+    def _fake_get(method, **params):
+        if method == "getFile":
+            calls["getFile"] += 1
+            return {"ok": True, "result": {"file_path": "voice/x.oga"}}
+        return {"ok": True, "result": []}
+    class _Resp:
+        def __init__(self, blob): self.blob = blob
+        def read(self): return self.blob
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+    def _fake_urlopen(url, timeout=None):
+        calls["download"] += 1
+        if not dl_ok["v"]:
+            raise urllib.error.URLError("simulated SSL timeout (the 879098783 failure)")
+        return _Resp(b"OPUSOPUSOPUS")
+    g["get"] = _fake_get
+    _real_urlopen = urllib.request.urlopen
+    urllib.request.urlopen = _fake_urlopen
+
+    def _poll(updates):
+        g["get"] = lambda method, **p: ({"ok": True, "result": updates} if method == "getUpdates"
+                                        else _fake_get(method, **p))
+        try:
+            return poll_once(int(OFFSET_F.read_text()) if OFFSET_F.exists() else 0)
+        finally:
+            g["get"] = _fake_get
+
+    # ---- A) HAPPY PATH: caught, then interpreted, then the receipt moves ----------------------
+    off = _poll([_voice_update(100)])
+    _t((SPOOL_DIR / "100.json").exists(), "spool did not write the update JSON")
+    _t((SPOOL_DIR / "100.oga").read_bytes() == b"OPUSOPUSOPUS" if (SPOOL_DIR / "100.oga").exists()
+       else False, "spool did not write the raw opus bytes")
+    _t(SPOOL_LOG.exists() and "update_id=100" in SPOOL_LOG.read_text(),
+       "spool ledger has no row for the caught update (two nodes cannot merge/dedupe without it)")
+    _t("kind=voice" in (SPOOL_LOG.read_text() if SPOOL_LOG.exists() else ""),
+       "spool ledger row does not name the kind")
+    _t(off == 101 and OFFSET_F.read_text() == "101", f"offset did not advance after a good catch ({off})")
+    _t(handled == [100], f"handle() was not reached on the happy path ({handled})")
+
+    # ---- B) CATCH FAILS: the receipt must NOT move -------------------------------------------
+    dl_ok["v"] = False
+    handled.clear()
+    before = OFFSET_F.read_text()
+    off = _poll([_voice_update(200)])
+    _t(off == 101, f"offset ADVANCED past an update whose raw material was never saved ({off})")
+    _t(OFFSET_F.read_text() == before, "offset file moved past an uncaught update")
+    _t(not (SPOOL_DIR / "200.oga").exists(), "a failed download left an artifact behind")
+    _t(handled == [], f"an uncaught update was interpreted anyway on attempt 1 ({handled})")
+    _t(RX_STATE.exists() and RX_STATE.read_text().startswith("ERR:spool"),
+       "a spool failure is invisible in the rx state a watchdog reads")
+
+    # ---- B2) A ZERO-BYTE CATCH IS A FAILED CATCH, NOT A CAUGHT SILENCE ----------------------
+    # This is the "[voice: empty transcript]" lesson at the catch layer: an empty artifact that is
+    # accepted is indistinguishable from a note the operator never sent.
+    dl_ok["v"] = True
+    _empty = {"v": True}
+    _prev_urlopen = urllib.request.urlopen
+    urllib.request.urlopen = lambda url, timeout=None: _Resp(b"")
+    _t(spool_update(_voice_update(250)) is False, "a 0-byte download was accepted as a caught note")
+    _t(not (SPOOL_DIR / "250.oga").exists(), "a 0-byte download left an empty artifact on disk")
+    urllib.request.urlopen = _prev_urlopen
+    dl_ok["v"] = False
+
+    # ---- C) THE HOLD IS BOUNDED, AND GIVING UP IS AUDIBLE ------------------------------------
+    off = _poll([_voice_update(200)])                       # attempt 2 — still holding
+    _t(off == 101, f"the hold released early, at attempt 2 ({off})")
+    off = _poll([_voice_update(200)])                       # attempt 3 — bounded hold expires
+    _t(off == 201, f"the bounded hold never released — one bad note wedges the whole queue ({off})")
+    _t(handled == [200], f"giving up did not fall through to best-effort handle() ({handled})")
+    _t(any("spool-failed" in t for _, t in wrote),
+       "the mesh gave up on the operator's material and said so NOWHERE the mind reads")
+
+    # ---- D) THE CONSUMER READS THE SPOOL, IT DOES NOT RE-FETCH -------------------------------
+    dl_ok["v"] = True
+    _poll([_voice_update(300)])
+    n_get, n_dl = calls["getFile"], calls["download"]
+    spooled = spool_audio_path(_voice_update(300))
+    _t(spooled is not None and spooled.exists(), "spool_audio_path cannot find what spool_update wrote")
+    # Guarded, so a mutant that never spools bytes at all FAILS BY NAME instead of raising an
+    # AttributeError — an assertion that dies before it speaks tells the next reader nothing.
+    if spooled is not None and spooled.exists():
+        try:
+            transcribe("fid300", {"file_id": "fid300"}, spooled=spooled)
+        except Exception as e:
+            _t(False, f"transcribe on a spooled note raised: {str(e)[:80]}")
+        _t(calls["getFile"] == n_get and calls["download"] == n_dl,
+           "transcribe RE-FETCHED a note whose bytes were already spooled (the lost-update step, re-run)")
+        _t(spooled.exists(), "transcribe DESTROYED the spooled original (moved instead of copied)")
+
+    # ---- E) A STRANGER'S UPDATE IS NEVER FETCHED ---------------------------------------------
+    _t(spool_voice_doc(_voice_update(400, from_id=9999)) is None,
+       "a stranger's voice note is spooled — an unauthenticated party can make this node download")
+    _t(spool_voice_doc(_voice_update(401)) is not None, "the OWNER's voice note is not spooled")
+
+    urllib.request.urlopen = _real_urlopen
+    try: _sh.rmtree(td)
+    except Exception: pass
+    if fails:
+        print("smoke-test: FAIL (" + "; ".join(fails) + ")", flush=True); sys.exit(1)
+    print("smoke-test: ok (spool-first: the offset moves only after the raw material is on disk; "
+          "the hold is bounded and audible; the consumer reads the spool)", flush=True)
+    sys.exit(0)
 
 def main():
     if not TOKEN or not OWNER: sys.exit("BOT_TOKEN/CHAT_ID not set")
