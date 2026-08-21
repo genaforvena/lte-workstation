@@ -30,7 +30,14 @@ mesh-mishe --seed            # writes ~/.mesh/mishe-seed.sh
 
 The recipient runs `sh mishe-seed.sh`. It writes `~/.claude/skills/mishe-mishe-to-tauftauf/` and
 `~/.mishe/bin/mishe`, runs the core's self-test, and stops. No network. No package manager. No
-clone. Nothing outside their home directory. Nothing scheduled.
+clone. Nothing outside their home directory. Nothing scheduled, and nothing installed.
+
+`mishe view` (step 3 of `planting.md`) does not change that. Where tmux already exists it only
+raises a session; where it does not, it **prints** the install command and one question for the
+human, and returns non-zero. Printing a command is not running it, and `mishe --test` asserts the
+difference directly: the package managers are shimmed to record every call, the degraded path is
+driven, and the gate fails if the log is non-empty. It has been seen red against a mutant that
+ran `apt-get`/`brew` from that branch.
 
 It is deliberately **plain text, not base64**: someone who is about to run a script from a friend
 should be able to read what it does, and an opaque blob teaches them a habit we do not want them
@@ -40,7 +47,8 @@ to have.
 
 On the sending side, `mesh-mishe --test` plants the seed into a throwaway home directory and
 asserts the planted core actually works — that files arrive byte-identical, that a claim written on
-the new node is visible, and that nothing got scheduled. It does not assert that the file exists;
+the new node is visible, that nothing got scheduled, and that nothing got installed (the
+package managers are shimmed too, so a `brew install` anywhere in the plant is a recorded call). It does not assert that the file exists;
 that assertion is worth nothing.
 
 On the receiving side, the test that matters is not the seed's own output. It is step 5 of

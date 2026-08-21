@@ -22,9 +22,14 @@ Five things travel, and they are all habits:
 1. **One main channel to the human.** Pick exactly one place where you and they talk. Everything
    goes through it. A second channel does not add reach, it adds a place for a message to be
    missed in.
-2. **Data beside the thinking.** A second terminal running `mishe watch` holds what you would
-   otherwise re-fetch every turn. The test is mechanical: if you keep running the same probe turn
-   after turn, that probe belongs in the view, not in your context.
+2. **Data beside the thinking.** `mishe view` raises a `tmux` session with two windows — `mind`
+   and `data` (the latter running `mishe watch`) — so what you would otherwise re-fetch every turn
+   is on screen instead of in your context. The test is mechanical: if you keep running the same
+   probe turn after turn, that probe belongs in the view. Two windows, not one, because a lone tab
+   is private to one screen and dies with its window; a session outlives the window and anyone on
+   the machine can attach to the same state. **`mishe view` never installs anything** — with no
+   tmux it prints one question for the human and the exact command, and degrades to a second tab
+   only after they say no, on the record.
 3. **Handoff before clear.** `/clear` drops your uncommitted work-state — what was half-done, what
    is next, which files. Write it down first (`mishe handoff "…"`), read it back after
    (`mishe handoff --restore`). A clear that drops work-state is a fault, not a fresh start.
@@ -60,16 +65,21 @@ If the human is not standing there with a repo to copy from, see `reference/seed
 small enough to be reconstructed from a single pasted block, which is the point. Cloning a
 repository is deploying a system; that is a different thing and they will not do it.
 
-**Step 3 — one real task, end to end.** Take the thing they named in step 1 and do a real piece of
+**Step 3 — the layout.** `mishe view`. Two windows, raised by the verb rather than described in
+prose — a layout that exists only as a paragraph is one nobody grows into. It installs nothing; if
+tmux is missing it hands you the one question to ask, and the answer goes on the board either way.
+Details in `reference/planting.md`.
+
+**Step 4 — one real task, end to end.** Take the thing they named in step 1 and do a real piece of
 it. Small is fine. It must be their work, not a demo.
 
-**Step 4 — the landing artifact.** The planting is not verified by `~/.claude/skills/` containing a
+**Step 5 — the landing artifact.** The planting is not verified by `~/.claude/skills/` containing a
 file. It is verified by **an answer about their real work that they actually read** and can say was
 useful or wrong. Write that moment to the board with what it was. Until such a line exists, the
 skill is installed and the culture is not planted, and you should say exactly that rather than
 report success.
 
-**Step 5 — reflexes, later, one at a time, and only if.** Read `reference/reflexes.md` before
+**Step 6 — reflexes, later, one at a time, and only if.** Read `reference/reflexes.md` before
 scheduling anything at all. The short version: on day one there is nothing to tend, and a
 scheduled thing with nothing to tend reports green forever.
 
@@ -81,8 +91,9 @@ mishe board -n 40         # read it
 mishe open                # claims opened and never settled
 mishe handoff "<state>"   # BEFORE /clear
 mishe handoff --restore   # AFTER /clear
+mishe view                # raise the layout: tmux session, two windows (asks before any install)
 mishe dash                # the data view, once
-mishe watch               # the data view, in a second terminal tab
+mishe watch               # the data view, looping (what the `data` window runs)
 mishe idea "<text>"       # an idea, reported
 mishe drop "<text> — why" # an idea rejected, with the reason
 mishe organ <name> "<cmd>" # register something worth tending

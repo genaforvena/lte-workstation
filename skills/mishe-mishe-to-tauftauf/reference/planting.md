@@ -46,56 +46,61 @@ which behaviour is broken, and each one has been seen to go red on purpose.
 Optionally put it on PATH (`export PATH="$HOME/.mishe/bin:$PATH"` in `~/.zshrc` — macOS default
 shell is zsh). This is a convenience, not part of the plant; `~/.mishe/bin/mishe` works either way.
 
-No repo. No clone. No package manager. If a step needs `brew install`, it is not part of planting —
-it is part of some later organ, and it waits for that organ to be justified.
+No repo. No clone. No package manager. The core installs nothing and neither does the plant —
+`mishe --test` asserts it by shimming the package managers and failing if any of them is *run*.
+`tmux` in step 3 is the one thing a human may choose to install, by answering a question that
+`mishe view` puts to them; printing the command is not running it, and the gate knows the
+difference.
 
-## Step 3 — the second terminal
-
-Open a second Terminal tab and leave it running:
-
-```sh
-~/.mishe/bin/mishe watch
-```
-
-That tab is the data view. It shows what is being held, what is unsettled, what the organs say,
-and the tail of the board. The thinking happens in the first tab.
-
-This is the one habit that is easiest to skip and most expensive to skip: without it, every turn
-you re-derive the state you already had, and you spend the conversation's room on things a file
-already knows.
-
-If they will not keep a second tab open, that is a real answer — degrade honestly to running
-`mishe dash` at the top of each session, and do not pretend the view exists.
-
-### When someone else has to be able to look
-
-A tab gives you the layout. It does not give you the other two things a terminal multiplexer gives,
-and those two are properties, not habits:
-
-- **A tab is private.** Only the person sitting at it sees it. Nobody else — no second human, no
-  second agent, not you over ssh later — can look at the same state.
-- **A tab dies with its window.** Close the terminal, drop the ssh connection, shut the laptop lid
-  on a connection: the tab and everything on it is gone.
-
-A `tmux` session has the opposite two properties. It outlives the window it was started from, and
-anyone on that machine can attach to it and see **the same** state — the scrollback becomes the
-machine's recent memory instead of one person's screen.
+## Step 3 — the layout, in one verb
 
 ```sh
-tmux new-session -A -s "$(hostname)"     # attach if it exists, create if it does not
+~/.mishe/bin/mishe view
 ```
 
-**This is a paid step and it is not day one.** macOS does not ship `tmux` (`brew install tmux`),
-it has its own keys to learn, and the planting installs nothing — so on the first day the second
-tab is the right answer and this section is only here so the step is *reachable*. A capability
-nothing names is a capability nobody can grow into.
+That is the whole step. It raises a `tmux` session named `mishe` with **two windows**: `mind` (where
+the thinking happens) and `data` (running `mishe watch` — what is held, what is unsettled, what the
+organs say, the tail of the board). Run it again later and it attaches to the same session instead
+of rebuilding it.
 
-Take it when the answer to "who else needs to see this?" stops being "nobody": a second person on
-the machine, an agent you want to leave running, work you reach over ssh, or anything you want to
-still be there tomorrow.
+This is the one habit that is easiest to skip and most expensive to skip: without the second window,
+every turn re-derives state a file already knows, and the conversation's room goes on re-fetching.
+
+### If the machine has no tmux
+
+`mishe view` **does not install it.** It prints one question for you to ask the human, in their
+terms, and the exact command. Ask it — do not decide for them, and do not quietly fall back:
+
+> I can keep the data view in a second terminal tab — that works, but only you can see it and it
+> dies with the window. Or I can install tmux (one command) and the view lives in a session that
+> survives the window and that anyone on this machine can attach to. Want me to install it?
+
+- **Yes** → they (or you, with their word) run `brew install tmux` / `sudo apt-get install -y tmux`,
+  then `mishe view` again.
+- **No** → a second terminal tab running `~/.mishe/bin/mishe watch`, and **write the degrade to the
+  board** so the missing property is a recorded fact rather than an assumption:
+  `mishe board "[fyi] view: no tmux, second tab only — private to one screen, dies with it"`.
+
+Most machines answer this question by already having tmux: on Linux it is nearly always there, so
+the question never gets asked and nothing gets installed. macOS is where it is a real question, and
+one direct question is cheaper than a dependency taken on someone's behalf.
+
+### Why a session and not a tab — the two properties
+
+A tab gives you the layout. It does not give the two things that make the view *shared memory*, and
+those are properties, not habits:
+
+- **A tab is private.** Only the person sitting at it sees it. No second human, no second agent,
+  nobody over ssh later can look at the same state.
+- **A tab dies with its window.** Close the terminal, drop the connection, shut the lid: gone.
+
+A session has the opposite two. It outlives the window it was started from, and anyone on that
+machine can attach and see **the same** state — the scrollback becomes the machine's recent memory
+instead of one person's screen.
 
 It does not make this machine part of anything. The shared perception is **inside one machine**,
-between whoever is at it — not between machines. One mishe is still one.
+between whoever is at it — not between machines. One mishe is still one. Nothing is scheduled and
+nothing phones home; `mishe view` only ever talks to `tmux` on this host.
 
 ## Step 4 — one real task
 
