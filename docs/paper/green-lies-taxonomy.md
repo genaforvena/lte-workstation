@@ -1,6 +1,6 @@
 # Green Lies: a taxonomy of self-observation failures in an autonomous agent system
 
-**Status: DRAFT, increment 1 of N. Not submitted. Not complete.**
+**Status: DRAFT, increment 4 of N. Not submitted. Not complete.**
 Target: arXiv preprint → one workshop (agents / reliability). One paper, not a pipeline.
 Board task `paper-green-lies-taxonomy` `{#cfde8f2c}`, owner pub, tempo: unhurried (operator).
 
@@ -22,7 +22,15 @@ continuously-running multi-node agent system, provides a detector where the clas
 and measures how often the class appears in third-party human-written code — establishing whether
 these are general software defects or specific to code that carries its own self-observation.
 
-The first measured answer suggests the latter, sharply. (§3.1.)
+The measured answer so far is **class-dependent, and the classes disagree** — which is itself the
+finding that keeps this from being a one-mechanism story. C1 (the self-grepping gate) does not
+occur *at all* in 1296 files of mature public shell: it is an affordance of in-file self-testing,
+which is what agent-authored tooling does (§3.2). C2 (the silent fallback) occurs in both, and
+public shell lies at **three times** this system's per-site rate — what distinguishes the agent
+system there is not worse judgement but **321x the exposure**, plus one asymmetry density does not
+explain: 13 fallbacks that lexically assert the all-clear here, zero there (§3quater.2).
+So "agentic self-observation lies green" resolves into at least two different mechanisms —
+structural affordance and sheer volume — and a remedy aimed at the wrong one would miss.
 
 ## 1. System under study
 
@@ -42,7 +50,7 @@ precondition for the first class existing at all.
 | # | Class | One-line decision procedure | Live case | Commit | Detector |
 |---|-------|------------------------------|-----------|--------|----------|
 | C1 | **Self-grepping gate** | the assertion's evidence is its own source text | mesh-land's push self-heal | `1969a5d` | **D1, built** (§3) |
-| C2 | **Silent fallback** | `cmd 2>/dev/null \|\| echo <default>` makes total failure indistinguishable from a constant | beat detector pinned at 500 for weeks | `f51e36d` | planned |
+| C2 | **Silent fallback** | `cmd 2>/dev/null \|\| echo <default>` makes total failure indistinguishable from a constant | beat detector pinned at 500 for weeks | `f51e36d` | **D2, built** (§3quater) |
 | C3 | **Window < cadence** | sampling window ÷ cadence = coverage; a 10s window on a 600s tick reports a sample, not a state | `mesh-psi` read CALM for 14.2 days on a stalled node | `fe35dd9` | **decidable** (header cadence vs the kernel field read) |
 | C4 | **Dry-run writes the liveness log** | a `--test` writing the durable artifact a watchdog reads forges the evidence it exists to check | guardian's mock peer in the real log, reflex not in cron | `09f7914` | **decidable** (a `--test` path writing a `doctor-artifact`) |
 | C5 | **Mode bit ≠ write accepted** | `[ -w f ]` describes the inode; for a pseudo-file the kernel may refuse anyway, with a *misleading errno* | `/proc/pressure/cpu` 0666, every uid-1000 write `EINVAL` | — (node measurement) | **decidable** (`[ -w ]` on a `/proc`/`/sys` path) |
@@ -233,10 +241,131 @@ Two structural points this case contributes:
   own answer about its coverage is the thing under suspicion, so the evidence has to be shown at a
   level below the verdict.
 
+## 3quater. Detector D2 — the silent fallback, and the result that inverts §3.2
+
+Detector: `docs/paper/detectors/d2_silent_fallback.py` (self-test + **5 mutants seen red**, one of
+which was found only because a mutant came back GREEN — see below).
+
+### 3quater.0 Decision procedure
+
+A fallback is a *correct* construct; its existence is not the defect. The graded question is
+whether the substituted value is **distinguishable from a reading**:
+
+| verdict | condition |
+|---|---|
+| **loud** | the literal is a marker (`na`, `unknown`, `error`, empty), or control escapes the branch (`exit`/`return`/`die`), or the branch writes to stderr — the failure is still announced |
+| **silent** | the literal is a plausible datum in the success domain |
+| **critical** | the literal is a word that *lexically asserts wellness* (`ok`/`up`/`true`/`pass`/…) — the failure does not merely hide, it reports the all-clear |
+| **+colliding** | the same literal is also emitted on a **success path in the same file** — the only statically available *proof*, rather than inference from spelling, that the fallback lands inside the success domain |
+| **undecidable** | the value carries a substitution (runtime text is not the text on the page), or the branch could not be parsed cleanly out of its enclosing context |
+| **not-a-fallback** | `cond && echo Y \|\| echo n` (a two-way ternary: the `\|\|` arm is the deliberate *false* value) or `[ test ] \|\| printf …` (a conditional — nothing was being read, so nothing was substituted for a reading) |
+
+`${VAR:-default}` is deliberately out of scope: it defaults an *unset variable*, not a failure
+branch, and including it would measure how common the idiom is rather than how often it lies.
+
+**Four discriminations, each earned by watching the detector be wrong**, in the order they were
+forced:
+
+1. **The cut landed mid-token.** `$(cmd 2>/dev/null || echo NA)"` hands a naive parse the fragment
+   `NA)"`, which is in no vocabulary and therefore grades as *a plausible datum*. The first honest
+   run reported **872 SILENT** that way (`NA)"`, `absent)`, `null )" \`). A parse that cannot
+   close its own quotes must return **undecidable**, never a grade — a false positive manufactured
+   by the parser is not an observation about the code.
+2. **`>&2` is a redirect, not a branch separator.** Breaking the fragment at its `&` truncates
+   `echo "cannot read x" >&2; exit 1` to `"msg" >`, and the parse-failure guard from (1) then files
+   a plainly *loud* diagnostic as undecidable.
+3. **The ternary.** `probe && echo Y || echo n` matches every naive `|| echo` rule; five of the
+   first run's hits were one file's `Y/n` ternaries. 2852 sites in the system under study are
+   ternaries or conditionals — **75% of what survives the undecidable filter** — so omitting this
+   discrimination would have inflated the denominator by 4x.
+4. **A number is not a wellness word.** `|| echo 0` was initially graded *critical* on the
+   authority of this system's own doctrine that all-zero is the healthy reading for a fault
+   counter. That is true for a counter and false for a count of matches, and **nothing on the page
+   separates them**: whether `0` is the all-clear or the right answer depends on the success
+   *domain* of the left-hand command. Grading numbers critical inflated CRITICAL from 34 to 549.
+   They are now reported as their own bucket, asserted to be silent and **not** asserted to be the
+   all-clear. This is the honest boundary of what a static detector can claim about this class.
+
+**A mutant that came back green is a finding about the test, not about the code.** Of five mutants,
+four went red immediately; removing the parse-failure guard of (1) left the self-test **passing**,
+because a second, redundant guard downstream caught the same fixtures. The guard's *unique*
+contribution — a fragment carrying an escape — had no test at all. A fixture was added and the
+mutant now goes red. Note the shape: the surviving mutant did not reveal a weak guard, it revealed
+that the guard responsible for removing 872 false positives was **untested**, and would have been
+free to rot.
+
+### 3quater.1 Results
+
+**System under study** (`scripts/`, 733 scanned files):
+
+| `\|\| echo` sites | undecidable | ternary/conditional | decidable fallbacks | **SILENT** | critical | numeric | colliding |
+|---|---|---|---|---|---|---|---|
+| 12351 | 5693 | 2852 | 3806 | **645 (16.9%)** | 13 | 533 | 391 |
+
+Plus **7613** bare `2>/dev/null` with no substitute (counted apart: those yield empty, which most
+consumers can still tell from a reading).
+
+**Base rate, the same 10 public projects as §3.1** (1296 scanned files):
+
+| `\|\| echo` sites | undecidable | ternary/conditional | decidable fallbacks | **SILENT** | critical | numeric | colliding |
+|---|---|---|---|---|---|---|---|
+| 68 | 38 | 9 | 21 | **12 (57.1%)** | 0 | 1 | 2 |
+
+Per project: fzf 2/2 · ohmyzsh 4/4 · nvm 5/12 · rbenv 1/1 · powerlevel10k 0/2 · bats-core, neofetch,
+pyenv, shellcheck, tpm: no decidable site. Two spot-checked hits, both textbook:
+`rbenv-version-file-read "$FILE" || echo system` (a read *failure* renders as a real version
+selection) and ohmyzsh's `git rev-parse --show-toplevel 2>/dev/null || echo "."` (not-in-a-repo
+renders as the cwd).
+
+### 3quater.2 Interpretation — this class does **not** replicate §3.2, and that matters
+
+Wilson 95% CIs: public **57.1% [36.5, 75.5]** (n=21), system **16.9% [15.8, 18.2]** (n=3806).
+The intervals do not overlap.
+
+**Per site, the agent-authored system is the more disciplined of the two.** That is the opposite of
+the story C1 tells, and it is reported here because a taxonomy paper whose every class points the
+same way should be suspected of measuring its authors' expectations. C1 found the construct
+*structurally absent* from human shell; C2 finds it present, and lying at three times our rate.
+
+What differs is **exposure, not per-decision quality**:
+
+| | sites per scanned file |
+|---|---|
+| system under study | **16.85** |
+| 10 public projects | 0.052 |
+
+**321x the density.** A monitoring system is a machine for reading things that can fail, so it
+writes this construct constantly; a plugin manager reads almost nothing it does not control. The
+system under study therefore carries ~54x more *silently-lying* fallbacks per file than the public
+corpus (645/733 vs 12/1296) while making the individual mistake three times *less* often.
+
+Two consequences for the thesis, one narrowing and one sharpening it:
+
+* **Narrowing.** "Agentic self-observation lies green" is not a single mechanism. For C1 it is a
+  *structural* affordance (in-file self-testing makes the vacuous construct expressible at all).
+  For C2 it is *volume*: the same defect rate applied across two orders of magnitude more
+  opportunities. Any remedy aimed at decision quality would have addressed the wrong term.
+* **Sharpening.** The classes are not interchangeable evidence for one claim, and the small-n
+  caveat cuts both ways: 21 decidable sites is a thin base rate, and the honest reading is that
+  *human shell is not measurably better at this class*, not that it is worse.
+
+Also asymmetric, and probably the most consequential single number here: **13 CRITICAL against 0.**
+A fallback whose literal lexically asserts the all-clear (`|| echo ok`, `|| echo up`) does not
+occur once in 1296 files of public shell, and occurs 13 times here. That is a small count on which
+no rate can be built, but it is the exact sub-shape the thesis predicts, and it is the one the
+density argument does *not* explain away.
+
 ## 4. Open work
 
-1. Detectors for C3–C10 (each listed decidable above). C4 and C8 need the cadence header + crontab,
-   which are machine-readable here.
+1. Detectors for C3–C10 (each listed decidable above; C2 is now built). C4 and C8 need the cadence
+   header + crontab, which are machine-readable here.
+1b. **The numeric bucket.** 533 of 645 silent fallbacks in this system substitute a *number*, and
+   static analysis cannot say whether that is the all-clear or a correct empty count — it depends
+   on the left-hand command's success domain. A dynamic probe (force the left side to fail, compare
+   the emitted value against a real reading) would decide it, and is the natural D2b.
+1c. **Density is a confound the base rate cannot remove.** The right comparison for C2 is against
+   other *monitoring* code — human-written Nagios/Icinga/collectd check scripts — not against
+   plugin managers. That corpus exists and is public.
 2. **The authorship confound.** The clean comparison is not human-repo vs agent-repo but
    *in-file self-test* vs *external test suite*, within each population. Requires a second corpus
    of agent-written tooling, and a sample of human projects that do carry in-file self-tests.
@@ -254,4 +383,11 @@ Two structural points this case contributes:
 docs/paper/detectors/d1_self_grepping_gate.py --selftest   # the detector's own gates
 docs/paper/detectors/d1_self_grepping_gate.py scripts      # system under study
 docs/paper/detectors/d1_self_grepping_gate.py --json <dir> # any tree
+
+docs/paper/detectors/d2_silent_fallback.py --selftest      # 8 fixtures, 5 mutants seen red
+docs/paper/detectors/d2_silent_fallback.py scripts         # system under study
+docs/paper/detectors/d2_silent_fallback.py --json <dir>    # any tree
 ```
+
+Comparison corpus for both detectors (shallow clones): ohmyzsh, nvm, tpm, fzf, pyenv, rbenv,
+bats-core, shellcheck, neofetch, powerlevel10k.
