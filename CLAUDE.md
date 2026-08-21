@@ -1,9 +1,22 @@
 # lte-workstation — Node Operator Context
 
 This file is the **generic skeleton** (committed) — doctrine, conventions, and mesh-* tool contracts,
-plantable on any node. Node-specific topology, services, and credentials live in `CLAUDE.local.md`
-(gitignored, per-node). There is **no fixed mind** — a mind is any node running an agent
+plantable on any node. There is **no fixed mind** — a mind is any node running an agent
 (`docs/mesh-skeleton.md`); run `hostname` to know which body you're in.
+
+**The instruction/memory boundary (operator 2026-08-21).** Four tiers, and a line belongs to exactly one:
+
+| tier | holds | read by |
+|---|---|---|
+| **`CLAUDE.md`** (this file) | ONLY what is true for **any window on any node** — and each rule is **one line plus a `[[link]]` to its case** | every mind, always |
+| **`charter/<window>.md`** (→ `~/.mesh/charter/<window>.md`) | what is true for **one window** — its duties, its routing, what it owes | that window, laid under the handoff by the SessionStart hook (`mesh-handoff --charter`) |
+| **`CLAUDE.local.md`** (gitignored) | what is true for **one node** — topology, services, credentials, hardware | minds on that node |
+| **`memory/`** | the **cases**: the measurement, the date, the commit, the failure as it actually happened | on recall, and via the `[[link]]` in a rule |
+
+A rule that carries its own case inside it stops being read — the wall that used to be the verification
+principle was 189 lines nobody re-read. **A case never lands here; it lands in `memory/` and this file
+links to it.** If a line is only true for your window, it belongs in your charter; if only on this node,
+in `CLAUDE.local.md`.
 
 ## Your role
 
@@ -88,188 +101,58 @@ Every claimed capability must produce a real artifact. Not "the camera works." A
 JPEG on disk. Not "audio recorded." A playable `.m4a`. Not "node online." A `tailscale status`
 entry with `Online: true`.
 
-Extend it to **regressions, not just new powers**: the artifact for a network change is
-*every node still reaches the internet and the LAN* — captured **before and after** — not
-"the interface came up." `mesh-health` and `mesh-card --refresh` are those artifacts.
+**Each rule below is one line and stands on its own; the case that earned it lives whole in
+`memory/`.** Follow a `[[link]]` only when you need the measurement — the rule is the instruction,
+the case is the evidence, and mixing them is what made this section a wall nobody re-read.
 
-The eight failures below are one shape each; the commit carries the full story.
-
-Extend it to **the SILENT FALLBACK**: `cmd 2>/dev/null || echo <default>` turns a total failure into a
-plausible constant. `mesh-room-music`'s beat detector raised under a numpy-less python3, `|| echo 500`
-swallowed it, and the "beat-driven" grinder ran flat for weeks — the mp3s looked fine; only the params
-log (`beat 500`, every line) showed the axis was dead. A fallback must be **rare and loud**, and its
-`--test` must assert the REAL path (a 400ms click track reads 400/800, never the default). If a default
-is indistinguishable from a success, it will be one. (f51e36d.)
-
-Extend it to **test suites, not just live runs**: a sensor's `--test` MUST assert a real hardware read
-produces data (≥N axes / a parseable value), not just the offline classifier. **A gate you have not seen
-FAIL is not a gate** — break the fix, watch it go red, restore it. Reachability ≠ producing: a reachable
-phone whose driver returns empty is a *hollow* sense, cron-green while its artifact goes stale for days
-(`mesh-mag`/`mesh-gyro` raced the driver with `-n 1`, 5 days stale, `--test` green; d657375). `mesh-land`
-treats exit 2 (honest n/a — organ unreachable) as a pass, so a real-read gate may require hardware
-without blocking landing.
-
-Extend it to **the test that writes the artifact**: a `--test` must NEVER write to the log a human or
-watchdog reads for liveness — it forges the evidence it exists to check. `mesh-guardian`'s dry-run wrote
-its mock peer to the real `guardian.log` (and `mesh-doctor` runs every `--test` hourly), so the log read
-as a live pass while the reflex was **not in cron at all**. Give the dry-run its own log. Same trap in
-the *gate*: the first fix's gate passed by reading the PREVIOUS run's line — an assertion that can read
-another run's artifact asserts nothing. Fresh artifact per direction. (09f7914.)
-
-Extend it to **the predicate that names a node**: `TG_HOST="imozerov-IdeaPad-…"` gated the keeper that
-restarts the telegram organ. The minds migrated; the predicate went permanently false; the keeper body
-**never executed once** while every pass logged green. Bind a guard to the thing itself (the organ runs
-where `BOT_TOKEN` is), never to a name that ages out — and make the else-branch **say why it skipped**.
-
-Extend it to **the proxy that is not the claim**: `[ -x "$BIN" ]` is not "it runs". whisper.cpp's `main`
-was executable and died rc=127 for a day (rpath patched on the binary, not on `lib*.so.*`) — **executable
-and loadable are different claims**. `mesh-whisper-run --test` drove only stubs: nice, ionice, flock,
-admission all genuinely asserted, all green, and it never once invoked whisper. A wrapper's test MUST
-exercise the thing it wraps (transcribe a known wav, assert the known words), exit 2 where the organ is
-absent. (974d864.)
-
-Extend it to **the mode bit that is not the write**: `[ -w "$f" ]` is not "the write will be accepted".
-A permission bit describes the INODE; it does not tell you what the kernel will DO with your write, and
-for a kernel pseudo-file (procfs/sysfs/cgroupfs) the two come apart. Measured this node (kernel
-6.8.0-136): `/proc/pressure/cpu` is mode 0666, `[ -w ]` and `os.access(W_OK)` both TRUE, yet as uid 1000
-EVERY write is refused (80 spanning combinations, zero accepted) while root's first identical string is
-accepted. The errno compounds the lie — the refusal is `EINVAL`(22) "Invalid argument", not
-`EPERM`/`EACCES`, so it reads as "your format is wrong" and sends you to tune numbers (18 format attempts
-lost to exactly that before testing the privilege axis). Contrast, same node same moment: the 0644
-root-owned cgroup `cpu.pressure` refuses with `EACCES`(13) — mode honest, errno honest; the 0666 file
-lies twice. Sibling of "executable and loadable are different claims" above, and it compounds with
-"an error message names a cause, not the cause" — here the errno ITSELF is the misdirection, so a tool
-that logs `EINVAL` faithfully still teaches the wrong lesson. Practical rule: for a pseudo-file, probe by
-ATTEMPTING the write and checking the result; never gate on the mode. No live instance in the genome
-(checked) — the ~14 `[ -w ]` uses in `scripts/` are all ordinary regular files, where the bit is
-accurate; the one pseudo-file writer, `mesh-act:104` `ledh_write()`, is the pattern to copy — `[ -w ]` is
-a fast-path PREFERENCE and the write result is checked (`printf … && return 0`), so a mode-lying file
-degrades to the sudo path instead of reporting a false success. (`mesh-chat:450` met the same instinct in
-the test-vacuity direction — `[ -f LOG ] && [ -w LOG ]` standing in for a real dry-run.)
-
-Extend it to **the DECLARED PREF that is not the FIB** — the mode-bit trap one ring out, and the
-one where the lie is *green in the only direction anyone watches*. A subsystem that lets you
-*declare* an exclusion does not thereby *install* it, and nothing in the declaration says which.
-Measured 2026-08-21T10:50Z on mesh-home: with an exit node set, `tailscale debug prefs` read
-`ExitNodeAllowLANAccess: true` and the node's own LAN was swallowed anyway — `ip route get
-192.168.8.1` answered `dev tailscale0 table 52`, and table 52 held a default plus nine overlay
-peers with ZERO LAN entries and ZERO throw routes. tailscaled had `NRestarts=0`, so no re-`up` had
-reset it: the pref and its implementation had simply diverged. Five organs alarmed at once (router
-LAN-ping OFF, router-thermal unreachable, sim UNREACHABLE, mesh path-down-egress) and each named
-its own far end as the fault, while EGRESS WAS PERFECT — so every outward probe stayed green and
-the node was blind inward. L2 was healthy throughout (`ip neigh` REACHABLE, wifi -46 dBm): ARP
-replies prove the frames reach the LAN and the LAN answers; only IPv4 forwarding died. Note what
-this does to a remedy: the node's own operator context prescribed *setting that very pref* for
-this exact failure, so following the documented fix would have "applied" a setting already true
-and confirmed itself. **Rule: for a declared network exclusion, the artifact is the FIB LOOKUP,
-never the pref — `ip route get <a real address in the excluded range>` and read the DEVICE that
-comes back.** Two traps inside the probe itself: never look up your OWN address (`ip rule` 0,
-`from all lookup local`, precedes every later rule, so it answers locally no matter how thoroughly
-the range is swallowed — it greens exactly during the fault), and never assert the table's
-*contents* as text when you can ask the kernel to *resolve* — a rule set can shadow a route that
-is plainly present. Wired: `mesh-card --refresh` renders `exit-node-lan:` from that lookup and
-folds it into `invariant-check`, so the existing `mesh-card-watchdog` alarm carries it (a new
-violation class must never need a new alarm nobody wired). And when you fold a NEW leg into an
-OLD rollup, re-check every line rendered off that rollup: `default-egress:` printed "⚠ via
-WireGuard" keyed on the summary, so the LAN leg tripping libelled a perfectly clean egress — a
-summary must never assert a leg that did not fire.
-
-Extend it to **the flag whose NAME is wider than its VOCABULARY**: a kernel API that lets you *state*
-a restriction does not thereby cover the thing its noun names. Landlock's `handled_access_net` reads,
-in review, as "network" — and on this node (ABI **4**, kernel 6.8, uid 1000) it defines **exactly two
-rights**: `BIND_TCP` and `CONNECT_TCP`. Bits 2..5 return `EINVAL`, so handling both and adding zero
-rules IS the strictest network statement the ABI has. Measured 2026-08-20 against a control arm that
-ALLOWED every row (so each DENIED is the sandbox, not a missing path): inside that maximal ruleset,
-TCP connect *and* bind DENIED `EACCES`, while a **non-53 UDP/123 NTP round-trip returned a real
-epoch**, `UDP bind 0.0.0.0:0` succeeded, and AF_UNIX to the session bus succeeded. So it is neither
-DNS-specific nor outbound-only: a sandbox commented `# no network` can **exfiltrate, be reached, and
-talk to the bus**. Compounding it, an **unhandled right is an UNRESTRICTED right** — a write-only
-ruleset leaves `~/.mesh/nodes` (beside `~/.mesh/secrets/`, `groq.env`) fully readable inside the
-sandbox. So: never write the noun, write the **enumerated rights** (`# no TCP; UDP and AF_UNIX are
-open`), and if the network must actually close, pair it with **seccomp-BPF** — which installs
-unprivileged here (`NO_NEW_PRIVS` + `PR_SET_SECCOMP` both rc=0) and *bites* (`socket()` → `EPERM`),
-expressing precisely what Landlock cannot say. Filter on `args[0] == AF_INET`, not on `socket`
-wholesale: a blunt filter takes AF_UNIX with it and kills the session bus (seen — all three families
-denied). Nothing in `scripts/` uses either today, so this is a trap for the next hand, not a live
-hole. (Landlock+seccomp, never Landlock alone.)
-
-And extend it to **the probe that answers a DIFFERENT question in the same type**: the ABI version
-above was nearly filed as **5**. `landlock_create_ruleset(NULL, 0, flags)` returns a small positive
-integer for *two* different flags — `flags=1` (`…_VERSION`) → `4`, `flags=2` (`…_ERRATA`) → `5`, an
-errata *bitmask* — and **nothing in the return value distinguishes them**: same syscall, same type,
-same plausible magnitude, no error. Passing the wrong flag yields a confident wrong number that
-survives review because it looks exactly like the right one, and here it would have rewritten a
-correct find ("ABI 4") into a false correction of it. Sibling of the `EINVAL`-on-a-0666-pseudo-file
-trap above, where the errno itself misdirects: **when a probe returns a bare integer, assert what
-QUESTION was asked, not just that an answer came back** — pin the flag/constant by name against the
-uapi header, and prefer a probe whose wrong-question path *errors* (`flags=4` → `EINVAL`) over one
-whose wrong-question path *answers*.
-
-Extend it to **ATTRIBUTION, which is not a health verdict** (operator, 2026-08-21). Naming *who* a load
-belongs to answers a different question from *whether it is healthy*, and a verdict that is a pure
-function of identity carries no duration and no steadiness term at all — so a 30-second compile and a
-20-hour 72% spin render the SAME line, and it is the quiet one. `mesh-load-audit`'s `cpu_verdict` was
-exactly this: `ORGAN-LOAD … (known workload — build/inference)` for both. The trap is that it was
-*created by a correct fix*: pid 2354950 read `chrome-headless[?]` → JUNK-LOAD and ALERTED only because
-its identity was being **laundered**; the ancestry fix (a9f96bb0) correctly renamed it
-`organ(via mesh-hh-drive.py)` — and ended the only signal on a **16.7-CPU-hour burn**. Attribution had
-been doing the alerting work, and improving it removed the alarm. **Rule: when a fix improves
-attribution, check what was silently RIDING on the old misattribution — the alarm you did not intend
-to delete is the one nobody will notice is gone.** The remedy is a second axis orthogonal to identity,
-rendered BESIDE it (`burn=17.0CPUh/71%` next to the `(via X)`) so a *known* organ can still read as
-burning. Three traps in building that axis, each answered by a NAMED term: **node load cannot see it**
-— this burn is 0.7 of ONE core on a 16-core box, so `load1` never moves and a busy-gate short-circuits
-to QUIET before it looks at anything; the axis must be a **per-process integral** (`utime+stime`, the
-accumulator already on disk), never node load. **CPU-seconds alone fires on any old idler** — a 30-day
-process at 1% has burned 7 CPU-hours; the steadiness term (lifetime avg % of one core) is what makes
-it a burn rather than an age. And **a lifetime integral is MONOTONE**, an ever-happened indicator whose
-floor is reached simply by waiting, so without a *currentness* term (still burning in the current
-window) the alert latches for the life of the process and every later reading is a memory, not a
-measurement. Scan the WHOLE corpus, not the top-N table: measured live, the burner was **not** the top
-row on most passes. (f39c0a1.)
-
-Extend it to **the reflex that was never wired**: passing `--test` and running are unrelated facts.
-`mesh-channel-keepalive`/`mesh-mind-keepalive`/`mesh-supervise` all passed green with none in cron or
-carrying a `# reflex-cadence:` header. And a wired reflex can still be vacuous — `mesh-mind-keepalive`
-tends a window the re-org deleted, so cronning it yields a permanently green reflex tending a phantom.
-Check the reflex has a TARGET THAT EXISTS, not just a cadence. (cc617e5.)
-
-Extend it to **the SAMPLE THAT IS NOT THE INTERVAL — a live sense can be blind without ever being
-wrong.** A reflex's coverage is its sampling WINDOW divided by its CADENCE, and nothing in a green
-`--test`, a fresh mtime, or an honest reading exposes the ratio. `mesh-psi` read `avg10` — a
-10-second kernel average — once per 600s cron tick: **1.7% of wallclock**, and the `--edge`
-2-consecutive debounce compounded it, requiring a burst to be caught by two independent 1.7% samples
-600s apart, so anything shorter than ~20 minutes could essentially never raise the level. Result:
-`.psi.state` read CALM for **14.2 days** on a node whose real workload (three llama-servers, whisper,
-the grinder) put it at `cpu some=78%, STALLED` the moment a human ran the tool by hand. Every
-liveness frame was honest — the band was live and re-fired on demand, the mtime was 2 minutes old,
-the value-frozen report correctly said "not an alarm" — and the sense was still asleep 98.3% of the
-time while its CALM was read as a claim about the node. Note the shape: `reflex-health`'s
-`value-frozen` flag was the ONLY thing pointing at it, and it points at both real constancy and this,
-so it is a lead, never a verdict. **Rule: a sense whose window is narrower than its cadence reports a
-sample, not a state — prefer the kernel's own monotonic ACCUMULATOR (`total=` in `/proc/pressure`,
-counters in `/proc/diskstats`) delta'd across the interval, which covers 100% of it at zero extra
-cost.** Keep both windows: the interval mean dilutes a sharp spike, the instantaneous one misses
-everything between ticks — they answer different questions, so fold with a max that NAMES its winner
-and publish the coverage IN the reading (`window=inst+iv`), so a consumer can never mistake the
-narrow claim for the wide one. Missing evidence renders `na`, never 0 (a reboot-reset counter read as
-`0` is a fabricated calm). Checked the sibling: `mesh-psi-memory` already reads avg10/60/300 and is
-not this shape. (fe35dd9.)
-
-Extend it to **the gate that greps its own source**: `grep -q '<literal>' "$0"` ALWAYS matches the grep
-line itself, so the gate asserts its own text and can never fail. `mesh-land` carried two guarding the
-mesh's only unattended push; deleting that push entirely still yielded `smoke-test: ok` (**33 of 52**
-such gates were self-matching mesh-wide). Detector: run the pattern against the grep LINE alone; a match
-means vacuous. Deeper rule — **source text is never behaviour**; even a non-self-matching grep proves a
-string is present, not that the code RUNS. Assert the ARTIFACT (drive a real push at a real bare origin,
-assert the ref MOVES). (1969a5d.)
-
-Extend it to **the push that only happens when something else does**: every path that got the genome onto
-origin was conditional on THAT run having work to land — `--autoland` exits at "nothing settled" before
-reaching its self-heal; `--apply` pushes only what it just committed. Minds commit in their own panes,
-satisfying neither, so **55 commits sat local for 11h** and the OPERATOR noticed before any reflex did —
-none was looking. A step everything depends on must have its own unconditional cadence, not ride inside a
-conditional path. (1969a5d.)
+- **Regressions, not just new powers.** The artifact for a network change is every node still
+  reaching the internet and the LAN, captured BEFORE and AFTER — never "the interface came up";
+  `mesh-health` + `mesh-card --refresh` are those artifacts.
+  [[the-artifact-for-a-network-change-is-before-and-after-on-every-node]]
+- **A fallback must be RARE and LOUD.** `cmd 2>/dev/null || echo <default>` turns a total failure
+  into a plausible constant, and a default indistinguishable from a success will be one; a `--test`
+  must assert the REAL path. [[a-silent-fallback-turns-a-failure-into-a-plausible-constant]]
+- **A sensor's `--test` must assert a real hardware read**, not just the offline classifier —
+  reachability is not producing, and a hollow organ runs cron-green while its artifact goes stale.
+  [[a-sensor-test-must-assert-a-real-hardware-read]]
+- **A gate you have not seen FAIL is not a gate** — break the fix, watch it go red, restore it.
+- **A `--test` must never write the log a human or watchdog reads for liveness** — it forges the
+  evidence it exists to check; give the dry-run its own log, and assert a FRESH artifact per
+  direction. [[a-dry-run-that-writes-the-liveness-log-forges-its-own-evidence]]
+- **Bind a guard to the thing itself, never to a name that ages out** (`BOT_TOKEN` exists, not
+  `HOST == "<some-node>"`), and make the else-branch SAY why it skipped.
+  [[a-guard-bound-to-a-node-name-goes-permanently-false]]
+- **Executable and loadable are different claims**, and a wrapper's `--test` must exercise the
+  thing it wraps (transcribe a known wav, assert the known words), exiting 2 where the organ is
+  absent. [[executable-is-not-loadable-and-a-wrappers-test-must-drive-what-it-wraps]]
+- **For a pseudo-file, probe by ATTEMPTING the write and checking the result — never gate on the
+  mode bit**; a 0666 procfs/sysfs file can refuse every unprivileged write, and its errno lies too.
+  [[a-mode-bit-is-not-the-write]]
+- **For a declared network exclusion the artifact is the FIB LOOKUP, never the pref** —
+  `ip route get <a real address in the excluded range>`, never your own address, and read the
+  DEVICE that comes back. [[a-declared-pref-is-not-the-fib]]
+- **Write the enumerated RIGHTS, never the noun.** A kernel API's restriction covers only what its
+  ABI can say — Landlock's "no network" is TCP bind/connect ONLY, and an unhandled right is an
+  UNRESTRICTED right; pair it with seccomp-BPF if the network must actually close.
+  [[landlock-no-network-is-tcp-only]]
+- **When a probe returns a bare integer, assert what QUESTION was asked** — pin the flag by name
+  against the header, and prefer a probe whose wrong-question path ERRORS over one that answers.
+  [[a-version-probe-can-answer-a-different-question-in-the-same-type]]
+- **Attribution is not a health verdict.** A verdict that is a pure function of identity carries no
+  duration and no steadiness term — and when a fix improves attribution, check what was silently
+  RIDING on the old misattribution. [[an-attribution-is-not-a-health-verdict]]
+- **Passing `--test` and being wired are unrelated facts**, and a wired reflex can still tend a
+  target that no longer exists. [[passing-a-test-and-being-wired-are-unrelated-facts]]
+- **A sense whose window is narrower than its cadence reports a SAMPLE, not a state.** Coverage =
+  window ÷ cadence; prefer the kernel's monotonic ACCUMULATOR delta'd across the interval, keep
+  both windows, publish the coverage IN the reading, and render `na` for missing evidence — never 0.
+  [[a-senses-coverage-is-window-over-cadence]]
+- **`grep -q '<literal>' "$0"` always matches its own line, so the gate can never fail** — and even
+  a non-self-matching grep proves a string is present, not that the code RUNS. Assert the ARTIFACT.
+  [[a-self-source-grep-is-vacuous-by-polarity]]
+- **A step everything depends on must have its own unconditional cadence**, never ride inside a
+  conditional path that only fires when something else did.
+  [[a-step-everything-depends-on-needs-its-own-unconditional-cadence]]
 
 ## Substrate changes & multi-agent coordination
 
@@ -294,9 +177,8 @@ rides the offered route, and the forwarding mark must **exclude** LAN/private ra
 **The NESTING invariant — never add a path the UPSTREAM already carries (operator 2026-08-11).** A
 tunnel is not additive. If the node's router/gateway already egresses through the same VPN, a second
 tunnel raised *on the host* does not "also" reach the world — it nests inside the first, and the
-node's own traffic loops out through a path it is already inside. mesh-home carried exactly this:
-the router held the LAN VPN, `wg-quick@wg-mesh` held a consumer tunnel to phaedra, and the operator
-had to `wg-quick down` **by hand** to get mesh connectivity back. So, before raising ANY tunnel,
+node's own traffic loops out through a path it is already inside
+([[a-tunnel-nests-inside-the-one-the-upstream-already-carries]]). So, before raising ANY tunnel,
 route, exit-node or proxy on a node: **establish what the upstream already provides, and if it
 provides it, the answer is not to add — it is to consume.** A capability the path already has is not
 missing.
@@ -310,10 +192,10 @@ are the rollback path, the change does not go in. Two consequences, both binding
 a path change is reachability measured from a vantage the change cannot sever** (a peer's
 `mesh-tell --peek`, another node's `mesh-health`), never a local "the interface came up"; and **the
 operator having to fix connectivity by hand IS the incident** — log it, name the self-defeating edge,
-and make the node's role explicit so nothing re-raises it (mesh-home: `MESH_EGRESS_TUNNEL=off` in
-`~/.mesh/nodes` → `mesh-egress-tunnel` renders n/a and `--test` exits 2, so `mesh-autowire` cannot
-resurrect the reflex, and the `VPN_EGRESS_*` block is commented out so `mesh-fix-egress` no-ops).
-A role declared only in a mind's memory is re-raised by the next reflex that reads the config.
+and make the node's role explicit **in the config a reflex reads** so nothing re-raises it — a role
+declared only in a mind's memory is re-raised by the next reflex that reads the config, and the
+removal must run in the order a re-raise would come (stop AND disable, move the config, remove the
+`--heal` cron line, then set the off-switch the tool itself gates on).
 
 Full protocol + the 2026-06-07 worked example: `docs/coordination.md`.
 
@@ -461,10 +343,11 @@ set)" summary was wrong in BOTH directions at once — still listing a merged ch
 retired ones, claiming 15 on a node running 11. It now counts the `ensure_uniform_channel` calls that
 actually planted, and prints retired names so a decommission reads as deliberate absence, not a gap.
 
-**`witness` carries TWO DUTY CLASSES and they are not interchangeable** — on the TAPE (top half) it is
-read-only and never writes a measurement; on the BOARD (bottom half) it ACTS: files `[task]` from
-chat-review, drives stuck strands to owners, and is `mesh-mind-control`'s `AGENTIC_FALLBACK`. A merge
-leaving only the passive charter ends the active lane green and silent — the dead-lane shape.
+**What a window IS lives in its CHARTER, not here.** `charter/<window>.md` in the genome (overridable
+per node at `~/.mesh/charter/<window>.md`) carries everything true for ONE window only — its duty
+classes, what routes to it, what it owes the board — and `mesh-handoff --restore` lays it under the
+handoff at every `startup|clear`, so a freshly-cleared mind wakes holding its own charter without
+this file having to carry six windows' worth of it. Read yours with `mesh-handoff --charter`.
 
 ## Chat room & idle coordination (`mesh-chat`)
 
@@ -584,8 +467,17 @@ load-bearing tools — run `mesh-tools <category>` for the rest and the full con
 - **Perceive (sensorium):** `mesh-location` · `mesh-body-motion` · `mesh-light` · `mesh-tamper` · `mesh-body-context` · `mesh-presence`(+`-fuse`/`-trends`/`-delta`) · `mesh-arrivals` · `mesh-lan-newdevice`/`mesh-lan-health` · `mesh-wifi-link`/`mesh-wifi-motion` · `mesh-room-sense` · `mesh-say`/`mesh-act` · `mesh-voice-say` (THE clone-synth primitive — every speech organ synthesizes through it via the warm `mesh-voice-clone-daemon`/xtts_v2; piper/ruslan is the LOUD fallback) · `mesh-voice-rx`/`mesh-voice-tx` · `mesh-tg-roz` · `mesh-watchtower`/`mesh-cam-watch`/`mesh-face-recognize` · `mesh-overhear`/`mesh-room`/`mesh-room-trace` (the room "third party": ambient rolling transcript + the room mind's read/say verbs). Perception is re-observed live, never stored (decays on reboot).
 - **Fusion / derived state:** `mesh-situation` · `mesh-perimeter` · `mesh-sensorium` · `mesh-stress` · `mesh-operator-home`/`mesh-operator-state` · `mesh-home-state`/`mesh-household-state` · `mesh-ambient-clock` · `mesh-sense-monitor`. Honest-fusion rule: an unreachable input renders UNKNOWN/partial, never a faked all-clear.
 - **Sound studio (records → grind):** `mesh-records` (the ARCHIVIST — keeps + measures every record before its organ prunes it; the ledger `~/.mesh/records.log` outlives the audio) · `mesh-sound-reflex` (the GRINDER — derives each recipe from the record's MEASURED character, repelled from recent renders, bg-grinds via `mesh-room-music`, pokes the mind only on drop/walked-out/outlier/degenerate) · `mesh-soundscape --measure <wav>` (the one measure tract — never add a second librosa analyzer) · `mesh-room-music` (owns the grind invocation + `room-music-params.log`).
-  - **Check what your ranker SELECTS FOR, not just that it ranks.** A measure's TOP END can invert what you want. `mesh-soundscape`'s score weights `dyn` heaviest, so one transient pins it and tops the corpus — while every consumer of that score is beat-DRIVEN. State the effect where it lives: the GLOBAL rank correlation is weakly POSITIVE; only the upper TAIL inverts ("anti-correlated" as a global property did not survive being computed). Ranking grind candidates by score therefore aimed the lane at the least grindable material and poked a paid turn per cough. A beat floor doesn't catch it — the detector *hallucinates* beats and cannot report "no rhythm". Fix: a **rhythm-density floor** (beats/s; impulses ≈0.0–0.4, real material ≈1.3–1.6).
-  - **Calibrate a derived axis against the REAL corpus, never an assumed 0..1.** `tone`'s median IS its max, so any rule keyed on it is a CONSTANT; dyn/act/move medians sit well below 0.5, so a naive 0.5 split calls nearly everything "even" and "sparse". Two corrections earned the hard way: **a median pinned as a constant ROTS** (this bullet's own n=29 figures died when the corpus grew), and **a "can never fire" is one counterexample from false** (`act > 0.55` was declared unreachable; it fires). **And no `n=` here is reproducible, ever — `records.log` is a per-organ SLIDING WINDOW**, pruned every sweep, so the population turns over and n moves DOWN as well as up. The CLAIM is the gate; any figure is only its current answer, RE-DERIVED by `mesh-series-stats --claims` (`docs/uxn-doctrine-claims.md`), never quoted. Rank against the live corpus: self-calibrating, cannot saturate. **The rule binds a constant in the CODE, not only a figure in prose** — `mesh-sound-reflex`'s thin-corpus fallback carried these very medians frozen at n=29 into the source, and by 2026-08-19 they had rotted +37/+14/+3/+103/+51% (dyn/act/rich/move/cent) against a live n=1306: a record was being told it was high-motion while sitting below the corpus median. It now re-measures the centre from the live ledger and persists it beside that ledger, and `mesh-sound-reflex --prior` prints cached-vs-live per axis so the drift is a measured column, not an argument. **A fallback that cannot read the live corpus still must not carry a constant — but it must not go blind either:** dropping to a flat 0.5 where nothing is cached turned character-driven params into one constant recipe until the 8th record landed (seen red). The ladder is measured-cache -> this corpus's own median -> a MARKED no-rank, each named in the source column, and nothing invented at any rung.
+  - **Check what your ranker SELECTS FOR, not just that it ranks** — a measure's TOP END can invert what
+    every consumer of it wants, and a beat floor cannot catch it (the detector hallucinates beats and
+    cannot report "no rhythm"); the gate is a rhythm-DENSITY floor.
+    [[check-what-your-ranker-selects-for-not-just-that-it-ranks]]
+  - **Calibrate a derived axis against the LIVE corpus, never an assumed 0..1** — a median pinned as a
+    constant ROTS, a "can never fire" is one counterexample from false, and no `n=` off a sliding-window
+    ledger is reproducible: the CLAIM is the gate, re-derived by `mesh-series-stats --claims`, never
+    quoted. The rule binds a constant in the CODE, not only a figure in prose; a fallback that cannot
+    read the corpus must not carry a constant and must not go blind either (measured-cache → this
+    corpus's own median → a MARKED no-rank, each named in the source column).
+    [[calibrate-a-derived-axis-against-the-live-corpus]]
 - **Liveness / self-tend:** `mesh-card [--refresh]` · `mesh-health`/`mesh-hw-health`/`mesh-egress-health` · `mesh-mca` (the CPU-fault axis: AMD SMCA per-functional-unit corrected-error counters, 0444/no-root; publishes COVERAGE beside the value because all-zero is the healthy reading, so a half-broken read's 0 must not wear it) · `mesh-supervise` · `mesh-verify` · `mesh-tick`/`mesh-heartbeat`/`mesh-selfcare` · `mesh-reflex-health` · `mesh-mind-state` · `mesh-resource-guard` · `mesh-state-touch`.
   - **Liveness-touch convention (conditional-write reflexes):** a reflex that rewrites its STATE artifact ONLY when the VALUE changes leaves mtime frozen on a long-stable-but-LIVE value, so the mtime-aging watchdogs (`mesh-reflex-health`/`mesh-pulse`) misread "value held" as "reflex dead" → false-STALE. **Decouple ran-live from value-changed: call `mesh-state-touch "$STATE"` on EVERY successful eval** — mtime = liveness, content = the reflex's own change-gated write. A dead cron never runs → never touches → still honest-STALE. (For the change-gated/debounce subset only; e.g. `mesh-activity-tempo`, f3f84c1.)
 - **Metabolism (inference):** `mesh-relay` (text→cheapest-available-pool→text; Groq primary + local-mind fallback; key in gitignored `~/.mesh/groq.env`, never the genome).
