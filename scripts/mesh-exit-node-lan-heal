@@ -1,0 +1,466 @@
+#!/usr/bin/env bash
+# reflex-cadence: * * * * *
+# mesh-exit-node-lan-heal — re-install the ONE FIB line an exit node keeps eating.
+#
+# WHY THIS EXISTS. When this node consumes a tailscale exit node, tailscaled's own routing table
+# (52 here) carries a default plus the peer /32s and NOTHING for the local LAN — so
+# `ip route get 192.168.8.1` answers `dev tailscale0 table 52` and every inward LAN path dies while
+# every OUTWARD probe stays perfect. `ExitNodeAllowLANAccess: true` does not prevent it: measured
+# true on mesh-home 2026-08-21T10:50Z DURING the fault, with tailscaled NRestarts=0. The pref and
+# its implementation simply diverged, which is why `mesh-card`'s probe reads the FIB and never the
+# pref, and why this tool installs a real route rather than re-asserting a preference.
+#
+# WHAT WAS MISSING. Detection already exists end to end: `mesh-card --refresh` measures the FIB,
+# folds a SWALLOWED verdict into `invariant-check`, and `mesh-card-watchdog` alarms on it. Nothing
+# RE-APPLIED. On 2026-08-21 the same one-line fix was installed by a mind's hand three times —
+# 13:01:47Z, wiped by the 16:25-16:34Z link flap, 17:52Z — and CLAUDE.local.md already records that
+# the operator's hands being the rollback path IS the incident. Detection closes the loop only if a
+# hand is watching the board.
+#
+# WHY THE TRIGGER IS NOT RARE. tailscaled OWNS table 52 and rebuilds it on a netmap reconverge; a
+# reconverge follows any link flap, with NO daemon restart, no re-`up` and no exit-node change
+# (measured 2026-08-21T16:41Z: the throw was gone while NRestarts=0 and uptime 31h). This node's
+# sole uplink is the wedging RTL8822BU dongle, so the wipe rate IS the dongle fault rate. That is
+# why every application is LOUD in the trace: a rising re-apply count must stay legible as the
+# hardware fault it actually is, never be smoothed away into a quietly self-healing node.
+#
+# WHY IT CANNOT SEVER THE PATH IT WOULD BE UNDONE OVER (the self-defeating-change gate). The one
+# route it installs is a `throw` for this node's OWN LAN prefix in the exit-node's table. Measured
+# twice on 2026-08-21 (13:01:47Z, 17:52Z): egress public IP and the whole tailscale peer list were
+# byte-identical before and after. It removes nothing, it touches no default route, and it is
+# scoped by construction to a private prefix that CONTAINS this node's own address — the guards
+# below refuse anything else rather than trusting the probe's output.
+#
+# TWO GUARD RAILS FROM THE SAME NODE, both deliberate absences:
+#   - NO `MESH_DMS_FENCE_KEY`, and no `mesh-dms`. A root-run fence calls `mesh-claim --check`, and
+#     claim ownership is the board WHO field — so root reads the applying mind's OWN live claim as
+#     "theirs" and REVERTS a change its own verify already blessed (measured 2026-08-21T13:01:28Z:
+#     a green application rolled back 5 minutes later). A fence that cannot pass a privilege
+#     boundary is not a race detector, it is an unconditional undo.
+#   - The verify is NEVER `mesh-lan-presence`. Its ARP fallback reads L2, and the swallow does not
+#     touch L2 (`ip neigh` stays REACHABLE, the wifi stays associated at -46 dBm) — so it renders
+#     peers PRESENT straight through a dead L3. The gate is the FIB, re-asked after the write.
+#
+# SINGLE-WRITER: it CHECKS the routing claim and stands down if another mind holds it; it does not
+# TAKE one. A claim is a board post with a TTL, and a per-minute reflex minting one for a
+# millisecond-long idempotent add would bury the board and lock the key against the humans it is
+# meant to coordinate with. Standing down is the safe half of the protocol, and the alarm
+# (mesh-card-watchdog) keeps firing meanwhile, so a held key delays the heal, never hides it.
+#
+#   mesh-exit-node-lan-heal            one cycle: probe, and re-install the line if it is missing
+#   mesh-exit-node-lan-heal --check    dry-run — probe and say what WOULD be done, never write
+#   mesh-exit-node-lan-heal --log [N]  the durable application tape (last N lines, default 20)
+#   mesh-exit-node-lan-heal --test     smoke test (stubbed FIB — touches no real route)
+set -uo pipefail
+
+usage(){ sed -n '2,/^[^#]/p' "$0" | sed -n 's/^# \?//p'; }
+case "${1:-}" in -h|--help) usage; exit 0 ;; esac
+
+# CRON'S PATH IS NOT YOURS. This is wired `* * * * *` and cron hands a reflex `/usr/bin:/bin` —
+# `~/.local/bin` is absent, so a bare `mesh-card` is rc=127 and this tool is BLIND every minute.
+# Measured live 2026-08-21T18:54Z, five minutes after wiring: the BLIND gate below caught it and
+# refused to run green (which is exactly why that gate exists), but the fix is here. Same line
+# mesh-card itself carries, for the same reason.
+export PATH="$HOME/.local/bin:$PATH"
+
+MESH_DIR="${MESH_DIR:-$HOME/.mesh}"
+# THE TAPE IS NOT THE CRON STDOUT LOG, and the name is deliberate. `mesh-autowire` wires a reflex
+# as `... >> $HOME/.mesh/<toolname>.log 2>&1`, so the obvious name for this file is precisely the
+# one cron already owns. Sharing it would append every minute's stdout to the ledger `applied_since`
+# counts — and since that stdout says "APPLIED throw ..." on a real heal, the re-apply RATE would
+# count each application twice and the dongle-fault signal would be fiction. Separate file, and the
+# counter below additionally refuses any line that does not START with a real timestamp.
+LOG="${MESH_XNL_LOG:-$MESH_DIR/exit-node-lan-heal-applications.log}"
+STATE="${MESH_XNL_STATE:-$MESH_DIR/.exit-node-lan-heal.state}"
+BOARD_MIN_GAP="${MESH_XNL_BOARD_MIN_GAP:-900}"   # seconds between board posts (trace is unthrottled)
+CLAIM_KEY="${MESH_XNL_CLAIM_KEY:-routing}"
+mkdir -p "$MESH_DIR" 2>/dev/null || true
+
+ts(){ date -u +%Y-%m-%dT%H:%M:%SZ; }
+say(){ printf '%s\n' "$*"; }
+# quiet(): the NO-OP path only. This fires every minute from cron, whose stdout is appended to a
+# durable log — a per-minute "nothing to do" would bury the events it exists to make visible. A
+# human running it by hand (tty) or asking --check still gets the answer — an explicit dry-run
+# ask that answers nothing is unreadable. Nothing that WROTE, or
+# refused, or failed, is ever routed through here.
+quiet(){ if [ -t 1 ] || [ "${DRY:-0}" = 1 ] || [ "${MESH_XNL_VERBOSE:-0}" = 1 ]; then printf '%s\n' "$*"; fi; }
+tape(){ printf '%s  %s\n' "$(ts)" "$*" >> "$LOG" 2>/dev/null || true; }
+trace(){ command -v mesh-trace >/dev/null 2>&1 && mesh-trace "$*" >/dev/null 2>&1 || true; }
+
+# ── the durable tape ───────────────────────────────────────────────────────────────────────────
+case "${1:-}" in
+  --log) n="${2:-20}"; [ -s "$LOG" ] && tail -n "$n" "$LOG" || echo "(no applications recorded yet: $LOG)"; exit 0 ;;
+esac
+
+# ── smoke test ─────────────────────────────────────────────────────────────────────────────────
+# EVERY arm runs the REAL tool against a stubbed FIB: a scratch PATH whose `mesh-card` answers a
+# fixture, whose `sudo`/`ip` RECORD the command instead of running it, and whose `mesh-trace`/
+# `mesh-chat` write to files. No real route is created, deleted or read. The mutants each arm was
+# seen RED against are named beside it (run from a scratch copy, never this tree).
+if [ "${1:-}" = --test ]; then
+  SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+  fails=0; F(){ echo "smoke-test: FAIL ($1)"; fails=1; }
+  td="$(mktemp -d)" || { echo "smoke-test: FAIL (mktemp)"; exit 1; }
+  trap 'rm -rf "$td"' EXIT
+  mkdir -p "$td/bin" "$td/mesh"
+  # `mesh-card --exit-node-lan` stub: the fixture is whatever $td/kv holds, rc from $td/kvrc.
+  cat > "$td/bin/mesh-card" <<'MC'
+#!/bin/sh
+[ "$1" = --exit-node-lan ] || exit 1
+cat "$XNL_TD/kv"; exit "$(cat "$XNL_TD/kvrc" 2>/dev/null || echo 0)"
+MC
+  # sudo/ip: record argv, and fail with whatever $td/iperr says (empty = success).
+  cat > "$td/bin/sudo" <<'SU'
+#!/bin/sh
+[ "$1" = -n ] && shift
+[ -f "$XNL_TD/sudoblock" ] && { echo "sudo: a password is required" >&2; exit 1; }
+exec "$@"
+SU
+  cat > "$td/bin/ip" <<'IPS'
+#!/bin/sh
+echo "$*" >> "$XNL_TD/ip.cmds"
+if [ -s "$XNL_TD/iperr" ]; then cat "$XNL_TD/iperr" >&2; exit 2; fi
+exit 0
+IPS
+  printf '#!/bin/sh\necho "$*" >> "$XNL_TD/trace.log"\n'  > "$td/bin/mesh-trace"
+  printf '#!/bin/sh\necho "$*" >> "$XNL_TD/chat.log"\n'   > "$td/bin/mesh-chat"
+  printf '#!/bin/sh\nexit 0\n'                            > "$td/bin/ping"
+  printf '#!/bin/sh\ncat "$XNL_TD/claim" 2>/dev/null\nexit 0\n' > "$td/bin/mesh-claim"
+  chmod +x "$td/bin"/*
+  SWALLOWED='state: swallowed
+exit-node: phaedra
+own-cidr: 192.168.8.224/24
+target: 192.168.8.1
+net: 192.168.8.0/24
+dev: tailscale0
+table: 52
+verdict: ⚠ SWALLOWED — 192.168.8.1 routes via dev tailscale0 table 52'
+  HEALED='state: ok
+exit-node: phaedra
+own-cidr: 192.168.8.224/24
+target: 192.168.8.1
+net: 192.168.8.0/24
+dev: wlxbcec43434a22
+table:
+verdict: ok (192.168.8.1 -> dev wlxbcec43434a22)'
+  # run <fixture-before> <fixture-after> [args...] -> tool stdout in $OUT, rc in $RC
+  run(){
+    local before="$1" after="$2"; shift 2
+    rm -f "$td/ip.cmds" "$td/trace.log" "$td/chat.log"
+    # the tool asks twice: probe, then post-verify. A tiny wrapper flips the fixture after the
+    # first read, which is what makes the "wrote it and the fault remains" arm expressible at all.
+    cat > "$td/bin/mesh-card" <<MC2
+#!/bin/sh
+[ "\$1" = --exit-node-lan ] || exit 1
+if [ -f "\$XNL_TD/asked" ]; then printf '%s\n' "\$(cat "\$XNL_TD/kv2")"; exit "\$(cat "\$XNL_TD/kv2rc")"; fi
+: > "\$XNL_TD/asked"; printf '%s\n' "\$(cat "\$XNL_TD/kv")"; exit "\$(cat "\$XNL_TD/kvrc")"
+MC2
+    chmod +x "$td/bin/mesh-card"; rm -f "$td/asked"
+    printf '%s\n' "$before" > "$td/kv"; printf '%s\n' "$after" > "$td/kv2"
+    case "$before" in *'state: swallowed'*) echo 2 > "$td/kvrc" ;; *) echo 0 > "$td/kvrc" ;; esac
+    case "$after"  in *'state: swallowed'*) echo 2 > "$td/kv2rc" ;; *) echo 0 > "$td/kv2rc" ;; esac
+    OUT="$(XNL_TD="$td" PATH="$td/bin:$PATH" HOME="$td" MESH_DIR="$td/mesh" \
+           MESH_XNL_LOG="$td/mesh/heal.log" MESH_XNL_STATE="$td/mesh/state" \
+           "$SELF" "$@" 2>&1)"; RC=$?
+  }
+  applied(){ grep -q 'route add throw' "$td/ip.cmds" 2>/dev/null; }
+
+  # (T1) the whole point: a swallowed LAN gets EXACTLY the one line, and it is LOUD in the trace.
+  #      mutant: drop the `sudo -n ip route add` call → red (nothing applied).
+  run "$SWALLOWED" "$HEALED"
+  [ "$RC" = 0 ] || F "a healable swallow exited $RC: $OUT"
+  grep -qx 'route add throw 192.168.8.0/24 table 52' "$td/ip.cmds" 2>/dev/null \
+    || F "did not install exactly 'ip route add throw 192.168.8.0/24 table 52' (got: $(cat "$td/ip.cmds" 2>/dev/null))"
+  [ "$(grep -c . "$td/ip.cmds")" = 1 ] || F "installed more than the one line: $(cat "$td/ip.cmds")"
+  grep -q 'APPLIED' "$td/trace.log" 2>/dev/null \
+    || F "an application left NO trace — the re-apply rate is the whole signal and it must be loud"
+  grep -q 'in 24h' "$td/trace.log" 2>/dev/null \
+    || F "the trace carried no rate: '$(cat "$td/trace.log" 2>/dev/null)'"
+  grep -q 'APPLIED throw 192.168.8.0/24 table 52' "$td/mesh/heal.log" 2>/dev/null \
+    || F "the durable tape recorded no application"
+
+  # (T2) healthy LAN: touch NOTHING. A healer that writes when there is nothing wrong is a writer
+  #      nobody asked for, and it would fake the rate signal every minute.
+  #      mutant: branch on rc instead of state, or drop the `!= swallowed` early return → red.
+  run "$HEALED" "$HEALED"
+  [ "$RC" = 0 ] || F "a healthy FIB exited $RC: $OUT"
+  applied && F "wrote a route while the LAN was FINE: $(cat "$td/ip.cmds")"
+
+  # (T3) the prefix must be OUR OWN LAN. A probe answer naming someone else's network, a public
+  #      network, or a /0 must be REFUSED — the healer is not a general-purpose route installer.
+  #      mutant: delete the net_allowed call → red on all three.
+  for bad in '10.0.0.0/8' '8.8.8.0/24' '0.0.0.0/0'; do
+    run "$(printf '%s\n' "$SWALLOWED" | sed "s|^net: .*|net: $bad|")" "$HEALED"
+    applied && F "installed a throw for $bad, which does not contain this node's own 192.168.8.224"
+    [ "$RC" = 0 ] && F "refusing $bad exited 0 — a refusal that reads as success is a silent skip"
+  done
+
+  # (T4) no table, or the placeholder the verdict renders when it could not read one: REFUSE.
+  #      Guessing 52 would install a throw in a table this node may not even own.
+  for badt in '' '<t>'; do
+    run "$(printf '%s\n' "$SWALLOWED" | sed "s|^table: .*|table: $badt|")" "$HEALED"
+    applied && F "guessed a table when the probe gave '$badt'"
+  done
+  # (T5) ...and NEVER main/local/default — a throw there blackholes the LAN it is meant to free.
+  for badt in main local default 254; do
+    run "$(printf '%s\n' "$SWALLOWED" | sed "s|^table: .*|table: $badt|")" "$HEALED"
+    applied && F "wrote a throw into table '$badt', which carries this node's real routing"
+  done
+
+  # (T6) EEXIST is idempotent success, and must NOT be counted as an application — a rate padded
+  #      with no-ops stops measuring the dongle.  mutant: treat EEXIST as APPLIED → red.
+  printf 'RTNETLINK answers: File exists\n' > "$td/iperr"
+  run "$SWALLOWED" "$HEALED"
+  rm -f "$td/iperr"
+  [ "$RC" = 0 ] || F "an already-present route exited $RC: $OUT"
+  grep -q 'APPLIED' "$td/mesh/heal.log.eexist" 2>/dev/null && F "unreachable"
+  grep -q 'PRESENT' "$td/mesh/heal.log" 2>/dev/null || F "EEXIST was not recorded as PRESENT: $OUT"
+  case "$OUT" in *'already present'*) ;; *) F "EEXIST did not report as already-present: $OUT" ;; esac
+
+  # (T7) the write succeeded and the FIB STILL says swallowed → LOUD failure, non-zero. Reporting
+  #      green off `ip route add` returning 0 would be exactly the "the interface came up" claim
+  #      the doctrine forbids: the artifact is the re-asked FIB, not the writer's own rc.
+  #      mutant: drop the post-verify → red (exits 0 while the fault stands).
+  run "$SWALLOWED" "$SWALLOWED"
+  [ "$RC" = 0 ] && F "the fault survived the write and the tool still exited 0: $OUT"
+  grep -q 'UNHEALED' "$td/trace.log" 2>/dev/null || F "a failed heal left no UNHEALED trace: $OUT"
+
+  # (T8) no passwordless sudo: a real, loud failure. Never a silent skip — a healer that cannot
+  #      write must not run green forever (that is the reflex-that-was-never-wired shape).
+  : > "$td/sudoblock"
+  run "$SWALLOWED" "$HEALED"
+  rm -f "$td/sudoblock"
+  [ "$RC" = 0 ] && F "a blocked sudo exited 0: $OUT"
+  grep -q 'FAILED' "$td/mesh/heal.log" 2>/dev/null || F "a blocked sudo left nothing on the tape"
+
+  # (T9) single-writer: another mind holding the routing key means STAND DOWN, not fight.
+  #      mutant: drop the claim check → red (it applies over a live writer).
+  printf 'theirs: routing held by health@mesh-home (held 120s)\n' > "$td/claim"
+  run "$SWALLOWED" "$HEALED"
+  rm -f "$td/claim"
+  applied && F "wrote a route while ANOTHER mind held the routing claim"
+  [ "$RC" = 0 ] || F "standing down for a live claim exited $RC — that is a normal outcome"
+  # ...and OUR OWN claim ('yours:') must not stop us: the mind that claimed routing is who wired
+  # this reflex, and treating its own claim as a blocker is the privilege-fence bug one ring out.
+  printf 'yours: routing (held 341s)\n' > "$td/claim"
+  run "$SWALLOWED" "$HEALED"
+  rm -f "$td/claim"
+  applied || F "stood down for OUR OWN claim — 'yours:' is not a second writer"
+
+  # (T10) --check is a DRY RUN and must never write, even with the fault live in front of it.
+  run "$SWALLOWED" "$HEALED" --check
+  applied && F "--check wrote a route: $(cat "$td/ip.cmds")"
+  case "$OUT" in *'WOULD APPLY'*) ;; *) F "--check did not name what it would do: $OUT" ;; esac
+
+  # (T14) IT MUST WORK UNDER CRON'S PATH. Wired `* * * * *`, this gets `/usr/bin:/bin` and nothing
+  #       else — a bare `mesh-card` is rc=127 there. Caught in production 5 minutes after wiring by
+  #       the BLIND gate (T11), which is the right failure but the wrong outcome: the reflex was
+  #       alive, loud and useless. So the tool prepends ~/.local/bin itself, and this arm drives it
+  #       with the stub reachable ONLY through $HOME/.local/bin.
+  #       mutant: drop the `export PATH="$HOME/.local/bin:$PATH"` line -> red.
+  mkdir -p "$td/.local/bin"; cp "$td/bin/mesh-card" "$td/bin/ip" "$td/bin/sudo" "$td/bin/ping" "$td/.local/bin/"
+  rm -f "$td/asked"; printf '%s\n' "$HEALED" > "$td/kv"; printf '%s\n' "$HEALED" > "$td/kv2"
+  echo 0 > "$td/kvrc"; echo 0 > "$td/kv2rc"
+  OUT="$(XNL_TD="$td" PATH="/usr/bin:/bin" HOME="$td" MESH_DIR="$td/mesh" \
+         MESH_XNL_LOG="$td/mesh/heal.log" MESH_XNL_STATE="$td/mesh/state" \
+         MESH_XNL_VERBOSE=1 "$SELF" 2>&1)"; RC=$?
+  case "$OUT" in *BLIND*) F "under cron's PATH (/usr/bin:/bin) the tool could not find mesh-card — it would run BLIND every minute: $OUT" ;; esac
+  [ "$RC" = 0 ] || F "under cron's PATH the tool exited $RC: $OUT"
+
+  # (T12) THE CRON-LOG COLLISION. `mesh-autowire` wires this as `>> ~/.mesh/<toolname>.log`, so the
+  #       default tape name must NOT be that file, and the counter must not be fooled if some other
+  #       writer ever lands stdout in it: a line saying "APPLIED" that does not START with a
+  #       timestamp is not a ledger entry, and counting it would double the very rate this tool
+  #       publishes as the dongle-fault signal. Caught before landing, when autowire chose the name.
+  #       mutants: default LOG back to $MESH_DIR/exit-node-lan-heal.log → red; drop the timestamp
+  #       anchor from the awk counter → red.
+  case "$(XNL_TD="$td" HOME="$td" MESH_DIR="$td/mesh" MESH_XNL_LOG='' "$SELF" --log 1 2>&1)" in
+    *"/exit-node-lan-heal.log"*) F "the default tape IS the cron stdout log mesh-autowire redirects into — every application would be counted twice" ;;
+  esac
+  rm -f "$td/mesh/heal.log"
+  printf 'exit-node-lan-heal: APPLIED throw 192.168.8.0/24 table 52 (a cron stdout line, not a ledger entry)\n' > "$td/mesh/heal.log"
+  run "$SWALLOWED" "$HEALED"
+  case "$(grep -o 'in 24h' -B0 "$td/trace.log" >/dev/null; sed -n 's/.*re-applications: \([0-9]*\) in 1h, \([0-9]*\) in 24h.*/\1 \2/p' "$td/trace.log")" in
+    "1 1") ;;
+    *) F "an unstamped stdout line saying APPLIED inflated the rate: $(sed -n 's/.*re-applications:/re-applications:/p' "$td/trace.log")" ;;
+  esac
+
+  # (T13) it runs EVERY MINUTE into an appended log: the no-op path must print NOTHING, or the
+  #       events drown in 1440 daily "nothing to do" lines. --check and a tty still answer.
+  #       mutant: route the no-op through say() → red.
+  rm -f "$td/mesh/heal.log"
+  run "$HEALED" "$HEALED"
+  [ -z "$OUT" ] || F "the no-op path printed to a non-tty stdout — this runs 1440x/day: '$OUT'"
+  run "$HEALED" "$HEALED" --check
+  [ -n "$OUT" ] || F "--check printed nothing — a dry run that says nothing cannot be read"
+
+  # (T11) a mesh-card WITHOUT the --exit-node-lan leg (an un-deployed node) must read BLIND and
+  #       non-zero, never "nothing to do". A probe that cannot answer is not an all-clear.
+  # both locations: T14 planted a working stub in $HOME/.local/bin, which the tool now prepends —
+  # leaving it there would let this arm find a HEALTHY probe and pass for the wrong reason.
+  rm -f "$td/asked"
+  for _b in "$td/bin/mesh-card" "$td/.local/bin/mesh-card"; do
+    printf '#!/bin/sh\nexit 1\n' > "$_b"; chmod +x "$_b"
+  done
+  OUT="$(XNL_TD="$td" PATH="$td/bin:$PATH" HOME="$td" MESH_DIR="$td/mesh" \
+         MESH_XNL_LOG="$td/mesh/heal.log" MESH_XNL_STATE="$td/mesh/state" "$SELF" 2>&1)"; RC=$?
+  [ "$RC" = 0 ] && F "a mesh-card with no --exit-node-lan leg exited 0 — the reflex would run green while blind"
+  case "$OUT" in *BLIND*) ;; *) F "an unanswerable probe did not render BLIND: $OUT" ;; esac
+
+  [ "$fails" = 0 ] && echo "smoke-test: ok (applies EXACTLY one throw for our own LAN prefix and is loud about the rate; writes nothing when the FIB is healthy; refuses a foreign/public/zero prefix, a missing or placeholder table, and main/local/default; EEXIST is PRESENT not an application, so the re-apply rate stays a real dongle-fault measurement; a write whose re-asked FIB is still swallowed exits non-zero; a blocked sudo fails loudly instead of skipping; stands down for ANOTHER mind's routing claim but not its own; --check never writes; and a mesh-card without the leg reads BLIND, never all-clear; + the tape is NOT the log mesh-autowire redirects cron stdout into and an unstamped 'APPLIED' line cannot inflate the rate; + the no-op path is silent on a non-tty, because this fires 1440x/day into an appended log; + it finds mesh-card under CRON's own /usr/bin:/bin PATH, the defect its own BLIND gate caught in production 5 minutes after wiring)"
+  exit "$fails"
+fi
+
+# applications recorded in the last <secs>. The RATE is the point of this tool's tape: a heal that
+# fires more often is reporting a dongle that faults more often, and that must not be smoothed.
+applied_since(){
+  local secs="$1" cutoff
+  cutoff=$(date -u -d "@$(( $(date -u +%s) - secs ))" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null) || return 0
+  [ -s "$LOG" ] || { echo 0; return 0; }
+  awk -v c="$cutoff" '$1 ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T/ && $1 >= c && /APPLIED/ {n++} END{print n+0}' "$LOG"
+}
+
+# ── gate: is <net> a prefix this tool is allowed to install a throw for? ────────────────────────
+# PURE (net + our own cidr in, verdict out) so --test drives it with fixtures. Refuses rather than
+# trusts: the probe is a reader of a table tailscaled owns, and a healer that installs whatever
+# prefix it is handed is one bad answer away from throwing away a route it needs.
+#   - must be RFC1918 (this is a LAN exclusion; nothing else belongs in it)
+#   - must CONTAIN this node's own live address (that is what "our own LAN" means, and it is read
+#     from the link, never from a config that can age out)
+#   - prefix must be /8../30 (a /31,/32 is not a LAN; a /0../7 is a route to the world)
+net_allowed(){
+  python3 - "${1:-}" "${2:-}" <<'PY'
+import ipaddress, sys
+net, own = (sys.argv[1] or ''), (sys.argv[2] or '')
+def die(m): print(m); sys.exit(1)
+if not net: die("no net in the probe answer")
+try: n = ipaddress.ip_network(net, strict=True)
+except Exception: die("net %r is not a network" % net)
+if n.version != 4: die("net %s is not IPv4" % net)
+if not (8 <= n.prefixlen <= 30): die("net %s has prefixlen /%d — outside /8../30" % (net, n.prefixlen))
+if not n.is_private: die("net %s is not RFC1918 — this installs LAN exclusions only" % net)
+if not own: die("this node has no readable LAN address to check %s against" % net)
+try: a = ipaddress.ip_interface(own).ip
+except Exception: die("own address %r unparseable" % own)
+if a not in n: die("net %s does not contain this node's own address %s" % (net, a))
+print("ok")
+PY
+}
+
+# ── gate: is <table> a table this tool is allowed to write? ────────────────────────────────────
+# The throw belongs in the exit-node's OWN table. main/local/default (254/255/253) carry this
+# node's real routing, and a throw installed there would blackhole the LAN instead of freeing it.
+table_allowed(){
+  case "${1:-}" in
+    '')                    echo "no table in the probe answer"; return 1 ;;
+    '<t>')                 echo "the probe could not read a table (rendered the placeholder)"; return 1 ;;
+    main|local|default|254|255|253|0)
+                           echo "table '$1' carries this node's real routing — refusing"; return 1 ;;
+    *[!a-zA-Z0-9_-]*)      echo "table '$1' is not a plausible table name"; return 1 ;;
+    *)                     echo ok ;;
+  esac
+}
+
+DRY=0; [ "${1:-}" = --check ] && DRY=1
+
+# ── probe: ONE definition of the fact, mesh-card's own FIB leg ─────────────────────────────────
+kv="$(mesh-card --exit-node-lan 2>/dev/null)"; prc=$?
+state="$(printf '%s\n' "$kv" | sed -n 's/^state: //p')"
+if [ -z "$state" ]; then
+  # BLIND, and it must never look like health. A deployed mesh-card without the --exit-node-lan
+  # leg answers nothing here, and a silent skip would render this reflex green forever.
+  say "exit-node-lan-heal: BLIND — 'mesh-card --exit-node-lan' returned no state (rc=$prc). Deploy the mesh-card that carries the leg."
+  tape "BLIND mesh-card --exit-node-lan rc=$prc no-state"
+  trace "[exit-node-lan-heal] BLIND on $(hostname): mesh-card --exit-node-lan gave no state (rc=$prc) — the re-application leg cannot see the FIB"
+  exit 1
+fi
+net="$(printf '%s\n' "$kv"   | sed -n 's/^net: //p')"
+table="$(printf '%s\n' "$kv" | sed -n 's/^table: //p')"
+own="$(printf '%s\n' "$kv"   | sed -n 's/^own-cidr: //p')"
+xnode="$(printf '%s\n' "$kv" | sed -n 's/^exit-node: //p')"
+target="$(printf '%s\n' "$kv"| sed -n 's/^target: //p')"
+
+# liveness is ran-live, not value-changed (the conditional-write convention): touch on EVERY
+# successful eval, and let the content below be written only when there is something to say.
+touch_state(){ command -v mesh-state-touch >/dev/null 2>&1 && mesh-state-touch --create "$STATE" >/dev/null 2>&1 || touch "$STATE" 2>/dev/null || true; }
+
+if [ "$state" != swallowed ]; then
+  quiet "exit-node-lan-heal: nothing to do — $state ($(printf '%s\n' "$kv" | sed -n 's/^verdict: //p'))"
+  touch_state
+  exit 0
+fi
+
+# ── SWALLOWED. Gate everything before touching the FIB. ────────────────────────────────────────
+g="$(net_allowed "$net" "$own")" || { say "exit-node-lan-heal: REFUSING — $g"; tape "REFUSED net=$net own=$own: $g"; trace "[exit-node-lan-heal] REFUSED on $(hostname): $g"; exit 1; }
+g="$(table_allowed "$table")"    || { say "exit-node-lan-heal: REFUSING — $g"; tape "REFUSED table=$table: $g"; trace "[exit-node-lan-heal] REFUSED on $(hostname): $g"; exit 1; }
+
+if [ "$DRY" = 1 ]; then
+  say "exit-node-lan-heal: WOULD APPLY  ip route add throw $net table $table   (LAN $target swallowed by exit-node '$xnode')"
+  touch_state
+  exit 0
+fi
+
+# single-writer: stand down for a live claim held by SOMEONE ELSE (never take one — see the header)
+if command -v mesh-claim >/dev/null 2>&1; then
+  cl="$(mesh-claim --check "$CLAIM_KEY" 2>/dev/null)"
+  case "$cl" in
+    theirs:*) say "exit-node-lan-heal: standing down — $cl"; tape "STOOD-DOWN $cl"; touch_state; exit 0 ;;
+  esac
+fi
+
+out="$(sudo -n ip route add throw "$net" table "$table" 2>&1)"; arc=$?
+case "$arc:$out" in
+  0:*)  verb=APPLIED ;;
+  *"File exists"*) verb=PRESENT ;;   # idempotent: EEXIST is not an application, and must not be
+                                     # counted as one or the re-apply RATE becomes fiction
+  *)    say "exit-node-lan-heal: APPLY FAILED (rc=$arc) — $out"
+        tape "FAILED rc=$arc net=$net table=$table: $out"
+        trace "[exit-node-lan-heal] APPLY FAILED on $(hostname): ip route add throw $net table $table -> rc=$arc $out"
+        exit 1 ;;
+esac
+
+# ── VERIFY by re-asking the FIB (never the pref, never mesh-lan-presence) ──────────────────────
+vkv="$(mesh-card --exit-node-lan 2>/dev/null)"; vrc=$?
+vstate="$(printf '%s\n' "$vkv" | sed -n 's/^state: //p')"
+# corroboration only, and rendered `na` when it cannot be asked — a ping that cannot run must never
+# read as a ping that failed, nor as one that passed.
+if command -v ping >/dev/null 2>&1 && [ -n "$target" ]; then
+  ping -c1 -W2 "$target" >/dev/null 2>&1 && png="ping $target ok" || png="ping $target FAILED"
+else png="ping na"; fi
+
+if [ "$vstate" != ok ]; then
+  say "exit-node-lan-heal: WROTE THE ROUTE AND THE FAULT REMAINS — post-verify state=$vstate rc=$vrc ($png)"
+  tape "UNHEALED $verb net=$net table=$table post-state=$vstate $png"
+  trace "[exit-node-lan-heal] UNHEALED on $(hostname): installed throw $net table $table, FIB still says $vstate — $png"
+  exit 1
+fi
+
+[ "$verb" = PRESENT ] && { say "exit-node-lan-heal: route already present, FIB now ok (nothing applied)"; tape "PRESENT net=$net table=$table $png"; touch_state; exit 0; }
+
+# tape FIRST, then count — so every rate below includes this application and no reader has to
+# remember an off-by-one. The tape is the ledger; the counts are derived from it, never beside it.
+tape "APPLIED throw $net table $table exit-node=$xnode $png"
+n1h=$(applied_since 3600); n24=$(applied_since 86400)
+# every application, unthrottled — the trace is where the RATE lives
+trace "[exit-node-lan-heal] APPLIED on $(hostname): ip route add throw $net table $table (exit-node '$xnode' had swallowed $target) — $png; re-applications: $n1h in 1h, $n24 in 24h. Each one is a tailscaled netmap reconverge, i.e. a link flap on the sole uplink."
+say "exit-node-lan-heal: APPLIED throw $net table $table — LAN sight restored ($png); $n24 re-application(s) in 24h"
+printf 'last-applied: %s\nnet: %s\ntable: %s\nexit-node: %s\n' "$(ts)" "$net" "$table" "$xnode" > "$STATE" 2>/dev/null || true
+touch_state
+
+# the board gets the RATE, not every event: throttled, and the post carries how many it suppressed,
+# so a flood of re-applications is still legible as a flood without becoming one on the board.
+BSTAMP="$MESH_DIR/.exit-node-lan-heal.board"
+now=$(date -u +%s); last=0; [ -s "$BSTAMP" ] && last=$(cat "$BSTAMP" 2>/dev/null || echo 0)
+case "$last" in ''|*[!0-9]*) last=0 ;; esac
+if [ $(( now - last )) -ge "$BOARD_MIN_GAP" ] && command -v mesh-chat >/dev/null 2>&1; then
+  sup_txt=""
+  if [ "$last" -gt 0 ]; then
+    since=$(date -u -d "@$last" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)
+    sup_n=$(awk -v c="$since" '$1 ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T/ && $1 > c && /APPLIED/ {n++} END{print n+0}' "$LOG" 2>/dev/null || echo 0)
+    sup_n=$(( sup_n > 0 ? sup_n - 1 : 0 ))   # minus this one — the rest are what the throttle ate
+    [ "$sup_n" -gt 0 ] && sup_txt=", plus $sup_n further application(s) the board throttle suppressed since the last post"
+  fi
+  mesh-chat "[fyi] exit-node-lan-heal@$(hostname): re-installed 'throw $net table $table' — exit-node '$xnode' had swallowed the LAN again ($png). $n1h in 1h, $n24 in 24h$sup_txt. The wipe is a tailscaled netmap reconverge after a link flap, so this rate IS the uplink fault rate — not a node that heals itself for free." >/dev/null 2>&1 || true
+  echo "$now" > "$BSTAMP" 2>/dev/null || true
+fi
+exit 0

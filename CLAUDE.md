@@ -153,6 +153,9 @@ the case is the evidence, and mixing them is what made this section a wall nobod
 - **A step everything depends on must have its own unconditional cadence**, never ride inside a
   conditional path that only fires when something else did.
   [[a-step-everything-depends-on-needs-its-own-unconditional-cadence]]
+- **A detector is not a closed loop** — a recurring fault with a one-line idempotent remedy needs a
+  RE-APPLIER, and its re-apply RATE must stay loud, or the healer erases the fault signal it rides on.
+  [[a-detector-without-a-re-applier-leaves-the-operators-hands-as-the-loop]]
 
 ## Substrate changes & multi-agent coordination
 
