@@ -10,6 +10,9 @@
 #   mesh-test-forgery --json              machine-readable verdicts
 #   mesh-test-forgery --test              smoke test (hermetic scratch HOME; red AND green fixtures)
 #
+# EXIT: 0 clean · 1 forgeries found · 3 another sweep already running (skipped) · 4 truncated at the
+# wall-clock bound (a PARTIAL pass — never read it as a clean one; the summary carries swept=n/N).
+#
 # WHY THE STATIC SCAN IS NOT ENOUGH (health@, board 2026-08-15T07:41Z): grepping for `>> $LOG` inside
 # the `--test` arm misses every INDIRECT writer — gpu-lid's forgery went through do_off → log_event,
 # a function defined far above the arm. Only running the test and watching the logs sees it. That is
@@ -92,11 +95,35 @@ BIN="${MESH_BIN_DIR:-$HOME/.local/bin}"
 LOG="$MESH/forgery-sweep.log"
 STATE="$MESH/.forgery-sweep.state"          # pairs already reported to the board (edge-only posting)
 ATTRIB_LOG="$MESH/.forgery-attrib.log"      # DOTFILE: snapshot()'s *.log glob must never see it
+PROGRESS="$MESH/.forgery-sweep.progress"    # DOTFILE, same reason — and it is written MID-sweep, so
+                                            # a *.log name here would grow between a tool's before/
+                                            # after snapshots and be attributed to that tool.
+LOCKFILE="$MESH/.forgery-sweep.lock"
 TEST_TIMEOUT="${MESH_TEST_FORGERY_TIMEOUT:-30}"
+# `timeout` sends TERM and then WAITS for the child: a child that DEFERS TERM (a non-interactive
+# bash runs no trap until its foreground command returns) leaves the wrapper hanging past its own
+# bound — measured 2026-08-21, a `timeout 30` alive 3h21m. Nothing can defer KILL, so -k is the
+# bound that does not need the root cause. 0/empty disables it (the --test RED arm, nothing else).
+KILL_AFTER="${MESH_TEST_FORGERY_KILL_AFTER:-10}"
+# Overall wall-clock bound, checked BETWEEN tools (a single wedged tool is bounded by -k above, not
+# by this). Sized against the real thing, not a guess: the last completed pass took 9h35m over 654
+# tools (04:41Z→14:16:05Z, 2026-08-18), and the per-tool worst case is now 40s × 2 runs × 654 ≈
+# 14.5h — so 20h can only fire when something outside those bounds goes wrong, and never truncates
+# a healthy sweep. 0 truncates before the first tool (used by --test).
+MAX_SECONDS="${MESH_TEST_FORGERY_MAX_SECONDS:-72000}"
 CTRL_MIN="${MESH_TEST_FORGERY_CTRL_MIN:-2}"   # control window floor, seconds
 ATTRIB="${MESH_TEST_FORGERY_ATTRIB:-1}"       # 0 disables the fanotify leg (verdicts read `na`)
 
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+# an absolute path to THIS script, whatever form it was invoked in (used for the flock re-exec)
+_self_path() {
+  case "$0" in
+    /*)   printf '%s\n' "$0" ;;
+    */*)  printf '%s\n' "$PWD/$0" ;;
+    *)    command -v -- "$0" 2>/dev/null || printf '%s\n' "$0" ;;
+  esac
+}
 
 # ---- log snapshot -----------------------------------------------------------------------------
 # "<path> <size>" per line. A file that does not exist yet is absent here, so its first appearance
@@ -129,9 +156,29 @@ is_exempt_log() {
 
 # run one tool's --test the way mesh-doctor does (same env + timeout), output discarded, rc ignored:
 # a FAILING test that writes the production log is still a forgery, so the verdict never reads rc.
+
+# the timeout prefix both call sites share — built per call so a test can flip KILL_AFTER in-process
+_timeout_cmd() {
+  if [ -n "${KILL_AFTER:-}" ] && [ "${KILL_AFTER:-0}" != 0 ]; then
+    TIMEOUT_CMD=(timeout -k "$KILL_AFTER" "$TEST_TIMEOUT")
+  else
+    TIMEOUT_CMD=(timeout "$TEST_TIMEOUT")     # unbounded once the child defers TERM — see KILL_AFTER
+  fi
+}
+
 run_test() {
   # </dev/null: the sweep loop reads tool_list on stdin — a swept tool must never eat it
-  MESH_TEST_SANDBOX=1 timeout "$TEST_TIMEOUT" nice -n 10 "$1" --test </dev/null >/dev/null 2>&1
+  local -a TIMEOUT_CMD; _timeout_cmd
+  # The subshell is not decoration. -k signals the whole GROUP, so the wrapper dies by KILL too, and
+  # the shell that waited on it — not the command — prints a bare "Killed" to ITS stderr, which cron
+  # appends to the sweep log with no tool name on it. Swallow that and say it properly instead.
+  # (`exit $?` also stops bash exec-optimising the subshell away, which is what makes the redirect
+  # land on the right process.)
+  local rc=0
+  ( MESH_TEST_SANDBOX=1 "${TIMEOUT_CMD[@]}" nice -n 10 "$1" --test </dev/null >/dev/null 2>&1; exit $? ) 2>/dev/null
+  rc=$?
+  [ "$rc" -ge 124 ] && printf '%s bounded %s rc=%d (timeout %ss, kill-after %ss)\n' \
+    "$(ts)" "$(basename "$1")" "$rc" "$TEST_TIMEOUT" "${KILL_AFTER:-0}" >&2
   return 0
 }
 
@@ -150,8 +197,13 @@ attrib_available() {
 # the same run as run_test, in a FRESH SESSION whose id (== the leader's pid) lands in $2. Every
 # process the test spawns inherits it, so the session is the membership test for "our run wrote it".
 run_test_sid() {
-  setsid --wait bash -c 'echo $$ >"$2"; exec env MESH_TEST_SANDBOX=1 timeout "$3" nice -n 10 "$1" --test' \
-    _ "$1" "$2" "$TEST_TIMEOUT" </dev/null >/dev/null 2>&1
+  local -a TIMEOUT_CMD; _timeout_cmd
+  local rc=0
+  ( setsid --wait bash -c 'echo $$ >"$1"; shift; exec env MESH_TEST_SANDBOX=1 "$@"' \
+    _ "$2" "${TIMEOUT_CMD[@]}" nice -n 10 "$1" --test </dev/null >/dev/null 2>&1; exit $? ) 2>/dev/null
+  rc=$?
+  [ "$rc" -ge 124 ] && printf '%s bounded %s rc=%d (setsid path, timeout %ss, kill-after %ss)\n' \
+    "$(ts)" "$(basename "$1")" "$rc" "$TEST_TIMEOUT" "${KILL_AFTER:-0}" >&2
   return 0
 }
 
@@ -282,12 +334,32 @@ tool_list() {
 
 do_sweep() {
   local out t n_forge=0 n_un=0 n_noise=0 n_ex=0 line verdict tool lg new_pairs=""
+  local -a tools; local i=0 total swept=0 truncated=0 t0=$SECONDS
+  # read the list into an array first: the loop then holds no stdin of its own, so a swept tool
+  # cannot eat the worklist even if the </dev/null in run_test is ever lost.
+  mapfile -t tools < <(tool_list)
+  total=${#tools[@]}
   out=""
-  while read -r t; do
+  for t in "${tools[@]}"; do
     [ -n "$t" ] || continue
+    i=$((i+1))
+    # THE WALL-CLOCK BOUND, checked between tools. A single wedged tool is bounded by -k, not here;
+    # this is the backstop for the whole pass, so a run can never still be alive when the next
+    # cadence fires. A truncated pass is a PARTIAL one and says so — swept=n/N below, exit 4.
+    if [ "$((SECONDS - t0))" -ge "$MAX_SECONDS" ]; then truncated=1; break; fi
+    # PROGRESS, on stderr and to a dotfile, BEFORE the tool runs. The cron line appends stderr to
+    # the same log, so a wedged sweep now reads as partial-and-stuck-on-<tool> within a minute of
+    # the fire instead of as 18h of silence (2026-08-21). Never a *.log under $MESH — see PROGRESS.
+    printf '%s progress %d/%d %s elapsed=%ds\n' "$(ts)" "$i" "$total" "$(basename "$t")" \
+      "$((SECONDS - t0))" >&2
+    # the FILE is the scheduled pass's own liveness marker (the loser of the lock reads it), so an
+    # interactive --tool run must never overwrite or clear a live sweep's line.
+    [ -z "${ONE_TOOL:-}" ] && printf '%s progress %d/%d %s elapsed=%ds pid=%d\n' \
+      "$(ts)" "$i" "$total" "$(basename "$t")" "$((SECONDS - t0))" "$$" > "$PROGRESS" 2>/dev/null
     line="$(sweep_tool "$t")"
+    swept=$((swept+1))
     [ -n "$line" ] && out="${out}${line}"$'\n'
-  done < <(tool_list)
+  done
 
   while read -r verdict tool lg w; do
     [ -n "${verdict:-}" ] || continue
@@ -301,8 +373,8 @@ do_sweep() {
   done <<<"$out"
 
   if [ "${JSON:-0}" = 1 ]; then
-    printf '{"ts":"%s","forgery":%d,"unattributable":%d,"noise_discarded":%d,"exempt":%d,"rows":[' \
-      "$(ts)" "$n_forge" "$n_un" "$n_noise" "$n_ex"
+    printf '{"ts":"%s","forgery":%d,"unattributable":%d,"noise_discarded":%d,"exempt":%d,"swept":%d,"tools":%d,"truncated":%d,"rows":[' \
+      "$(ts)" "$n_forge" "$n_un" "$n_noise" "$n_ex" "$swept" "$total" "$truncated"
     local first=1
     while read -r verdict tool lg w; do
       [ -n "${verdict:-}" ] || continue
@@ -312,14 +384,18 @@ do_sweep() {
     printf ']}\n'
   else
     printf '%s' "$out" | sort | sed 's/^/  /'
-    printf 'test-forgery: %d forged, %d unattributable (cron noise), %d single-pass discarded, %d exempt dry-run sinks\n' \
-      "$n_forge" "$n_un" "$n_noise" "$n_ex"
+    # coverage is printed ALWAYS, not only when short: a pass that swept 12/654 must not read like a
+    # pass that swept everything (`a-senses-coverage-is-window-over-cadence`).
+    printf 'test-forgery: %d forged, %d unattributable (cron noise), %d single-pass discarded, %d exempt dry-run sinks — swept=%d/%d in %ds%s\n' \
+      "$n_forge" "$n_un" "$n_noise" "$n_ex" "$swept" "$total" "$((SECONDS - t0))" \
+      "$([ "$truncated" = 1 ] && printf ' TRUNCATED at the %ss wall-clock bound (PARTIAL pass)' "$MAX_SECONDS")"
   fi
 
   # durable record + edge-only board post (a pair already reported never re-posts)
   {
-    printf '%s sweep forged=%d unattributable=%d noise=%d exempt=%d attrib=%s\n' \
-      "$(ts)" "$n_forge" "$n_un" "$n_noise" "$n_ex" "$(attrib_available && echo fanotify || echo na)"
+    printf '%s sweep forged=%d unattributable=%d noise=%d exempt=%d attrib=%s swept=%d/%d dur=%ds truncated=%d\n' \
+      "$(ts)" "$n_forge" "$n_un" "$n_noise" "$n_ex" "$(attrib_available && echo fanotify || echo na)" \
+      "$swept" "$total" "$((SECONDS - t0))" "$truncated"
     while read -r verdict tool lg w; do
       [ "${verdict:-}" = forgery ] && printf '%s FORGERY %s -> %s writer=%s\n' "$(ts)" "$tool" "$lg" "${w:-na}"
     done <<<"$out"
@@ -332,6 +408,8 @@ do_sweep() {
     done <<<"$out"
   fi
 
+  [ -z "${ONE_TOOL:-}" ] && rm -f "$PROGRESS"
+  [ "$truncated" = 1 ] && return 4
   [ "$n_forge" -eq 0 ]
 }
 
@@ -427,8 +505,13 @@ EOF
 
   # the sink is a DOTFILE so the sweep cannot detect its own attribution writes as everyone's
   # forgery. Assert the glob, not the intention. Falsify: rename it to forgery-attrib.log → listed.
-  : > "$d/.mesh/.forgery-attrib.log"
-  ( MESH="$d/.mesh"; snapshot ) | grep -q 'forgery-attrib' \
+  # NEVER `snapshot | grep -q` here: `grep -q` exits on the first match and SIGPIPEs snapshot, and
+  # under `set -o pipefail` the pipeline then reports 141 — so the `&& _f` could not fire and this
+  # gate was VACUOUS by polarity until 2026-08-21 (`pipefail-turns-sigpipe-into-a-false-verdict`).
+  local snap
+  : > "$d/.mesh/$(basename "$ATTRIB_LOG")"
+  snap="$( MESH="$d/.mesh"; snapshot )"
+  grep -qF "$(basename "$ATTRIB_LOG")" <<<"$snap" \
     && _f "attribution sink: the dotfile sink is visible to snapshot() — the detector would report \
 itself as the writer of every candidate"
 
@@ -459,6 +542,113 @@ unattributable — an absent attribution may never read like a present one; got:
   [ "$(grown <(printf '%s\n' "$b") "$(printf '%s\n' "/x/a.log 10"$'\n'"/x/new.log 5")")" = "/x/new.log" ] \
     || _f "grown(): a newly created log must read as growth from 0"
 
+  # ---- the wedge bounds (2026-08-21: a `timeout 30` from this sweep was alive 3h21m) -------------
+  # A TERM-DEFERRING fixture. `trap '' TERM` is an IGNORE disposition, and ignore IS inherited across
+  # exec — so the sleep ignores it too, and `timeout` waits on it forever. $$ survives the exec, so
+  # the recorded pid IS the sleep: cleanup by pid, never by `pkill -f` on a name half the node shares.
+  cat > "$d/bin/mesh-deaf" <<'EOF'
+#!/usr/bin/env bash
+trap '' TERM
+case "${1:-}" in --test) echo $$ > "$MESH_DEAF_PID"; exec sleep 20 ;; esac
+EOF
+  chmod +x "$d/bin/mesh-deaf"
+
+  local pf="$d/deaf.pid" w0 wdur cpid rp shape
+  # RED ARM: with the escalation off, the wrapper must OUTLIVE its own `timeout 1`. If this ever goes
+  # green the fixture has stopped reproducing the wedge and the -k gate below would be vacuous.
+  rm -f "$pf"
+  ( export MESH_DEAF_PID="$pf"; TEST_TIMEOUT=1 KILL_AFTER=0 run_test "$d/bin/mesh-deaf" ) &
+  rp=$!
+  sleep 3
+  kill -0 "$rp" 2>/dev/null \
+    || _f "RED arm: a TERM-deferring child must outlive a plain \`timeout 1\` — the fixture no longer \
+reproduces the wedge, so the kill-after gate proves nothing"
+  cpid="$(cat "$pf" 2>/dev/null)"
+  kill -9 "$rp" 2>/dev/null; [ -n "$cpid" ] && kill -9 "$cpid" 2>/dev/null
+  wait "$rp" 2>/dev/null
+
+  # GREEN: -k puts a KILL behind the deferred TERM, at BOTH call sites — the plain one and the
+  # setsid one (the wedged run was the setsid path, and an asymmetry there is exactly what hid).
+  for shape in run_test run_test_sid; do
+    rm -f "$pf"
+    w0=$SECONDS
+    if [ "$shape" = run_test ]; then
+      ( export MESH_DEAF_PID="$pf"; TEST_TIMEOUT=1 KILL_AFTER=1 run_test "$d/bin/mesh-deaf" )
+    else
+      ( export MESH_DEAF_PID="$pf"; TEST_TIMEOUT=1 KILL_AFTER=1 run_test_sid "$d/bin/mesh-deaf" "$d/sid" )
+    fi
+    wdur=$(( SECONDS - w0 ))
+    [ "$wdur" -le 6 ] \
+      || _f "$shape: kill-after must bound a TERM-deferring child (timeout 1 + kill 1 took ${wdur}s)"
+    cpid="$(cat "$pf" 2>/dev/null)"
+    if [ -n "$cpid" ] && kill -0 "$cpid" 2>/dev/null; then
+      _f "$shape: the child SURVIVED the bound (pid $cpid still alive) — the wrapper returned but the \
+work did not stop"
+      kill -9 "$cpid" 2>/dev/null
+    fi
+  done
+
+  # WIRING, not just mechanism. Both arms above set KILL_AFTER by hand, so they stay green with the
+  # DEFAULT at 0 — measured (`passing-a-test-and-being-wired-are-unrelated-facts`). Take the
+  # effective bound from a REAL run's own report, and assert the PROPERTY (non-zero), never the
+  # constant — a gate that restates the default is one edit away from agreeing with anything.
+  cat > "$d/bin/mesh-slow" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in --test) sleep 5 ;; esac
+EOF
+  chmod +x "$d/bin/mesh-slow"
+  local sw
+  sw="$(HOME="$d" MESH_HOME="$d/.mesh" MESH_BIN_DIR="$d/bin" MESH_TEST_FORGERY_ATTRIB=0 \
+      MESH_TEST_FORGERY_TIMEOUT=1 PATH="$d/bin:$PATH" bash "$0" --tool mesh-slow 2>&1 >/dev/null)"
+  grep -qE 'bounded mesh-slow rc=[0-9]+ \(timeout 1s, kill-after [1-9][0-9]*s\)' <<<"$sw" \
+    || _f "kill-after WIRING: the default bound must escalate, and a bounded run must name the tool \
+it bounded — got: $(tr '\n' '|' <<<"$sw")"
+
+  # ---- the sweep-level bounds -------------------------------------------------------------------
+  local sout srct serr
+  # the progress dotfile must be invisible to snapshot(), like the attribution sink: it is written
+  # BETWEEN a tool's before/after snapshots, so a *.log name would name every tool as its writer.
+  # …asserted through the script's OWN $PROGRESS name, never a literal: a gate that restates the
+  # constant it guards goes green the moment the constant changes (measured — a literal here stayed
+  # green against a mutant that renamed the sink to *.log).
+  : > "$d/.mesh/$(basename "$PROGRESS")"
+  snap="$( MESH="$d/.mesh"; snapshot )"      # captured, not piped — see the attribution sink above
+  grep -qF "$(basename "$PROGRESS")" <<<"$snap" \
+    && _f "progress sink: $(basename "$PROGRESS") is visible to snapshot() — the sweep would report \
+itself as the writer of every candidate"
+
+  # per-tool progress on stderr, BEFORE the tool runs (the cron line appends stderr to the same log)
+  serr="$(HOME="$d" MESH_HOME="$d/.mesh" MESH_BIN_DIR="$d/bin" MESH_TEST_FORGERY_ATTRIB=0 \
+      PATH="$d/bin:$PATH" bash "$0" --tool mesh-quiet 2>&1 >/dev/null)"
+  grep -qE 'progress 1/1 mesh-quiet' <<<"$serr" \
+    || _f "progress: a sweep must emit a per-tool line while it runs, not only a report when it \
+exits — 18h of work produced zero output on 2026-08-21; got: $(tr '\n' '|' <<<"$serr")"
+
+  # wall-clock bound: a bound of 0 truncates before the first tool → PARTIAL pass, exit 4, coverage
+  sout="$(HOME="$d" MESH_HOME="$d/.mesh" MESH_BIN_DIR="$d/bin" MESH_TEST_FORGERY_ATTRIB=0 \
+      MESH_TEST_FORGERY_MAX_SECONDS=0 PATH="$d/bin:$PATH" bash "$0" --sweep 2>/dev/null)"
+  srct=$?
+  [ "$srct" = 4 ] || _f "wall-clock bound: a truncated pass must exit 4 (got $srct) — a partial pass \
+that exits 0 reads exactly like a clean one"
+  grep -q 'swept=0/' <<<"$sout" \
+    || _f "wall-clock bound: a pass must publish its COVERAGE (swept=n/N) — got: $sout"
+  grep -q 'TRUNCATED' <<<"$sout" || _f "wall-clock bound: a partial pass must say it is partial"
+
+  # no-overlap: hold the lock and assert the next cadence SKIPS instead of stacking a second pass
+  if command -v flock >/dev/null 2>&1; then
+    flock -n -o "$d/.mesh/.forgery-sweep.lock" sleep 5 &
+    local hp=$!
+    sleep 0.4
+    sout="$(HOME="$d" MESH_HOME="$d/.mesh" MESH_BIN_DIR="$d/bin" MESH_TEST_FORGERY_ATTRIB=0 \
+        MESH_TEST_FORGERY_MAX_SECONDS=0 PATH="$d/bin:$PATH" bash "$0" --sweep 2>&1)"
+    srct=$?
+    kill "$hp" 2>/dev/null; wait "$hp" 2>/dev/null
+    [ "$srct" = 3 ] \
+      || _f "no-overlap: a sweep must SKIP (exit 3) while another holds the lock (got $srct) — the \
+04:41Z run was still alive when the next 04:41Z fire would have landed on it"
+    grep -q 'SKIPPED' <<<"$sout" || _f "no-overlap: the skip must be LOUD, not a silent early return"
+  fi
+
   rm -rf "$d"
   [ "$(size_of "$REALLOG")" = "$REALLOG_SZ" ] \
     || _f "sandbox: --test APPENDED to the production log $REALLOG — the detector forged its own record"
@@ -471,6 +661,7 @@ unattributable — an absent attribution may never read like a present one; got:
 
 # ---- entry ------------------------------------------------------------------------------------
 JSON=0; ONE_TOOL=""
+ORIG_ARGS=("$@")
 while [ $# -gt 0 ]; do
   case "$1" in
     --test)  smoke_test; exit $? ;;
@@ -484,4 +675,25 @@ while [ $# -gt 0 ]; do
 done
 
 mkdir -p "$MESH"
+
+# NO OVERLAP. A full pass takes hours (9h35m on 2026-08-18) and a wedged one took 18h+, so the next
+# cadence CAN land on top of a live run. Re-exec under flock rather than locking an fd here: an fd
+# opened in this shell is inherited by every tool we hand `--test` to, and a single leaked daemon
+# would hold the lock forever after we exit. `-o` closes it before exec, so only this process holds
+# it. `--tool` is the interactive single-shot form and is deliberately NOT gated.
+if [ -z "$ONE_TOOL" ] && [ -z "${MESH_TEST_FORGERY_LOCKED:-}" ] && command -v flock >/dev/null 2>&1; then
+  export MESH_TEST_FORGERY_LOCKED=1
+  # `bash "$self"`, never a bare "$0": flock execs with execvp, so a $0 with no slash would be
+  # PATH-searched (not found in the cwd) and a $0 that is merely readable would need the exec bit.
+  flock -n -o -E 3 "$LOCKFILE" bash "$(_self_path)" "${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}"
+  rc=$?
+  if [ "$rc" = 3 ]; then
+    printf '%s test-forgery: SKIPPED — a sweep is already running (%s); this cadence is not adding a second one\n' \
+      "$(ts)" "$(cat "$PROGRESS" 2>/dev/null || echo 'no progress line yet')" >&2
+  fi
+  exit "$rc"
+fi
+# holder's identity, for the loser's message above; the lock lives on the inode, so truncating is safe
+[ -z "$ONE_TOOL" ] && printf '%s holder pid=%d started\n' "$(ts)" "$$" > "$PROGRESS" 2>/dev/null
+
 do_sweep
