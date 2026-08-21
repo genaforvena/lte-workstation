@@ -205,6 +205,29 @@ QUESTION was asked, not just that an answer came back** — pin the flag/constan
 uapi header, and prefer a probe whose wrong-question path *errors* (`flags=4` → `EINVAL`) over one
 whose wrong-question path *answers*.
 
+Extend it to **ATTRIBUTION, which is not a health verdict** (operator, 2026-08-21). Naming *who* a load
+belongs to answers a different question from *whether it is healthy*, and a verdict that is a pure
+function of identity carries no duration and no steadiness term at all — so a 30-second compile and a
+20-hour 72% spin render the SAME line, and it is the quiet one. `mesh-load-audit`'s `cpu_verdict` was
+exactly this: `ORGAN-LOAD … (known workload — build/inference)` for both. The trap is that it was
+*created by a correct fix*: pid 2354950 read `chrome-headless[?]` → JUNK-LOAD and ALERTED only because
+its identity was being **laundered**; the ancestry fix (a9f96bb0) correctly renamed it
+`organ(via mesh-hh-drive.py)` — and ended the only signal on a **16.7-CPU-hour burn**. Attribution had
+been doing the alerting work, and improving it removed the alarm. **Rule: when a fix improves
+attribution, check what was silently RIDING on the old misattribution — the alarm you did not intend
+to delete is the one nobody will notice is gone.** The remedy is a second axis orthogonal to identity,
+rendered BESIDE it (`burn=17.0CPUh/71%` next to the `(via X)`) so a *known* organ can still read as
+burning. Three traps in building that axis, each answered by a NAMED term: **node load cannot see it**
+— this burn is 0.7 of ONE core on a 16-core box, so `load1` never moves and a busy-gate short-circuits
+to QUIET before it looks at anything; the axis must be a **per-process integral** (`utime+stime`, the
+accumulator already on disk), never node load. **CPU-seconds alone fires on any old idler** — a 30-day
+process at 1% has burned 7 CPU-hours; the steadiness term (lifetime avg % of one core) is what makes
+it a burn rather than an age. And **a lifetime integral is MONOTONE**, an ever-happened indicator whose
+floor is reached simply by waiting, so without a *currentness* term (still burning in the current
+window) the alert latches for the life of the process and every later reading is a memory, not a
+measurement. Scan the WHOLE corpus, not the top-N table: measured live, the burner was **not** the top
+row on most passes. (f39c0a1.)
+
 Extend it to **the reflex that was never wired**: passing `--test` and running are unrelated facts.
 `mesh-channel-keepalive`/`mesh-mind-keepalive`/`mesh-supervise` all passed green with none in cron or
 carrying a `# reflex-cadence:` header. And a wired reflex can still be vacuous — `mesh-mind-keepalive`
@@ -568,7 +591,7 @@ load-bearing tools — run `mesh-tools <category>` for the rest and the full con
 - **Metabolism (inference):** `mesh-relay` (text→cheapest-available-pool→text; Groq primary + local-mind fallback; key in gitignored `~/.mesh/groq.env`, never the genome).
 - **Autopoiesis (self-production):** CODEBASE lane (`mesh-generate`→`mesh-feed`→genome) + PERCEPTION lane (`mesh-sense-evolve`); meta-layer `mesh-vitality`/`mesh-needs`/`mesh-fitness`/`mesh-autowire`. (reflex-health=lanes fire · vitality=they produce · fitness=sound · needs=goals self-derived · autowire=products integrate.)
 - **`# reflex-cadence:` self-wiring:** a scheduled tool declares `# reflex-cadence: <5-field cron>` (+ optional `# reflex-args:`) in its header; `mesh-autowire` wires it into `~/.mesh/reflexes.cron` (→ `mesh-reflexes --apply`, add-only) after a passing `--test`.
-- **Genome / substrate:** `mesh-sync-tools` · `mesh-genome-sync` · `mesh-restore` · `mesh-dms` · `mesh-land` (`--check`) · `mesh-fix-egress` · `mesh-revert-catch` · `mesh-harden-ssh`.
+- **Genome / substrate:** `mesh-sync-tools` · `mesh-genome-sync` · `mesh-knowledge-publish` (the knowledge tier's DURABILITY lane — commit → local bare anchor → best-effort git remote, and it publishes the remote's own AGE so a dead lane cannot wear "has a remote" as liveness; distinct from `mesh-knowledge-sync`, which is rsync anti-entropy ACROSS peers — converged and burnt down together is still gone) · `mesh-restore`
 - **Minds control:** `mesh-mind-control` (`--allocate`/`--dispatch`/`--classify`/`--watch`) · `mesh-mind-compact` · `mesh-spend` · `mesh-usage`/`mesh-load` · `mesh-mode` · `mesh-gate-watch`.
 - **Channels / streams:** `mesh-stream` · `mesh-channels` · `mesh-nodestate` · `mesh-fleet-feed` · `mesh-channel-tg`.
 - **Organs / actuators:** `mesh-organ` (capability router) · `mesh-tv-dlna` · `mesh-sms` · `mesh-phone-*` (`-ip`/`-watch`/`-ear`/`-sensors`/`-convo`) · `mesh-sensor-log`.
