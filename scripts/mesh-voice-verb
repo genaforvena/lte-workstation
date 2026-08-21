@@ -1,0 +1,326 @@
+#!/usr/bin/env python3
+"""mesh-voice-verb — a VOICE REFLEX: the first word of a voice note is a verb, the rest is its argument.
+
+Operator, 2026-08-21: *«хочется просто говорить „грайнд“, и тогда запускался бы, и всё, что потом
+идёт, просто бы отрезалось и отдавалось бы как источник в саунд»*. No button, no pult, no second
+audio stack — the phone he already talks into becomes the control surface.
+
+Two pieces made this buildable the same night and neither existed the day before:
+
+* ``mesh-voice-rx`` now SPOOLS the raw opus under the update_id BEFORE anything interprets it
+  (09e6eb3), so the material is intact and has not been through a second encode.
+* whisper.cpp with ``-ml 1`` emits WORD-level timestamps, verified on a real note::
+
+      [00:00:00.140 --> 00:00:00.650]   Так
+      [00:00:00.650 --> 00:00:01.190]   вот
+
+  So "cut off everything after the word" is an exact operation on a measured boundary, not a guess.
+
+THE ASYMMETRY THAT SHAPES EVERY THRESHOLD HERE. A MISS costs the operator one repetition. A FALSE
+FIRE cuts a real message in half and ships the remainder to the grinder — his words, destroyed by
+our confidence. The two errors are not comparable, so the tuning is not "be accurate", it is **be
+reluctant**: the trigger must be the FIRST spoken word, must start inside :data:`HEAD_WINDOW_S`,
+and must match a listed variant within an edit distance of :data:`MAX_EDITS`. Everything else falls
+through as an ordinary message.
+
+And the reflex ADDS, never REPLACES: the full transcript is delivered exactly as it would have been
+with no verb at all. A voice command that swallows the sentence it rode in on is a worse failure
+than one that never fires — see the confirmation line in :func:`describe`.
+"""
+import os, re, sys, json, shutil, subprocess, tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+
+HOME = Path.home(); MESH = HOME / ".mesh"
+INBOX = Path(os.environ.get("MESH_VOICE_VERB_INBOX", str(MESH / "inbox")))
+LOG = Path(os.environ.get("MESH_VOICE_VERB_LOG", str(MESH / "voice-verb.log")))
+_WSHIM = Path(os.environ.get("MESH_WHISPER_RUN", str(HOME / ".local/bin/mesh-whisper-run")))
+WHISPER = _WSHIM if _WSHIM.exists() else MESH / "whispercpp" / "main"
+MODEL = Path(os.environ.get("MESH_VOICE_VERB_MODEL",
+                            str(MESH / "whispercpp/models/ggml-large-v3-turbo-q5_0.bin")))
+
+# The trigger may only be the note's FIRST word and may only START this early. Without the window a
+# passing mention of the word mid-sentence ("надо бы это в грайнд отдать") would slice the message
+# the operator was in the middle of speaking.
+HEAD_WINDOW_S = float(os.environ.get("MESH_VOICE_VERB_HEAD_S", "2.5"))
+# Levenshtein slack. whisper renders the same spoken word as гринд / грайн / грант depending on the
+# room; one edit buys those back. TWO would start matching ordinary Russian words, and the asymmetry
+# above says the cost of that is not symmetric with the cost of missing.
+MAX_EDITS = int(os.environ.get("MESH_VOICE_VERB_MAX_EDITS", "1"))
+# A margin AFTER the word's measured end, because a word boundary is where the model stopped hearing
+# the word, not where the operator stopped saying it: cutting exactly there leaves a consonant tail.
+CUT_PAD_S = float(os.environ.get("MESH_VOICE_VERB_PAD_S", "0.12"))
+# Below this the "argument" is not material, it is the operator clearing his throat. Refused LOUDLY
+# rather than shipped, so a 0.4s scrap never reaches the grinder wearing the name of a take.
+MIN_ARG_S = float(os.environ.get("MESH_VOICE_VERB_MIN_ARG_S", "1.5"))
+
+# One verb, deliberately. A frame for six is a claim about five reflexes nobody has driven; one that
+# works is worth more than a scaffold. The shape is here for the next one (владелец лана + куда
+# кладём), so adding "задача"/"идея" later is a row, not a redesign.
+VERBS = {
+    "грайнд": {"variants": ("грайнд", "гринд", "грайд", "граинд", "grind"),
+               "lane": "sound", "prefix": "voice-grind"},
+}
+
+
+def _norm(w):
+    return re.sub(r"[^0-9a-zа-яё]+", "", (w or "").lower().replace("ё", "е"))
+
+
+def _edits(a, b):
+    """Plain Levenshtein. Small strings, no dependency — a trigger table is not worth an import."""
+    if a == b:
+        return 0
+    if not a or not b:
+        return max(len(a), len(b))
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
+
+def match_verb(word):
+    """The verb this word is, or None. Exact first, then one edit — never a prefix or substring.
+
+    Substring matching was rejected on purpose: "гриндер", "грайндом", any inflection would fire,
+    and so would a longer word that merely contains the trigger.
+    """
+    w = _norm(word)
+    if not w:
+        return None
+    for name, spec in VERBS.items():
+        vs = tuple(_norm(v) for v in spec["variants"])
+        if w in vs:
+            return name
+        if min(_edits(w, v) for v in vs) <= MAX_EDITS and abs(len(w) - min(len(v) for v in vs)) <= MAX_EDITS:
+            return name
+    return None
+
+
+_TS = re.compile(r"^\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\s*-->\s*(\d\d):(\d\d):(\d\d)\.(\d\d\d)\]\s*(.*)$")
+
+
+def parse_words(text):
+    """whisper ``-ml 1`` output -> ``[(start_s, end_s, word), ...]``, punctuation-only tokens dropped.
+
+    Blank and punctuation rows are NOT skipped silently at the caller: they are dropped here, once,
+    so "the first word" means the same thing to every reader of this module.
+    """
+    out = []
+    for line in (text or "").splitlines():
+        m = _TS.match(line.strip())
+        if not m:
+            continue
+        g = m.groups()
+        start = int(g[0]) * 3600 + int(g[1]) * 60 + int(g[2]) + int(g[3]) / 1000.0
+        end = int(g[4]) * 3600 + int(g[5]) * 60 + int(g[6]) + int(g[7]) / 1000.0
+        word = g[8].strip()
+        if not _norm(word):
+            continue
+        out.append((start, end, word))
+    return out
+
+
+def find_trigger(words):
+    """``(verb, cut_at_seconds, word_as_heard)`` or None. The FIRST spoken word, inside the window.
+
+    Note it looks at exactly one word. Scanning "the first few" was the tempting version and it is
+    the one that fires on «так вот, грайнд этого не берёт» — a sentence about grinding, not a
+    command to grind.
+    """
+    if not words:
+        return None
+    start, end, word = words[0]
+    if start > HEAD_WINDOW_S:
+        return None
+    verb = match_verb(word)
+    if verb is None:
+        return None
+    return verb, end + CUT_PAD_S, word
+
+
+def transcribe_words(wav, timeout=300):
+    """Word-timestamped pass. Returns raw whisper stdout, or None if it could not run.
+
+    None is "we could not look" and never "no trigger": a failed pass must leave the note behaving
+    exactly as an ordinary message, not silently unarm the reflex while reporting nothing.
+    """
+    if not Path(WHISPER).exists() or not MODEL.exists():
+        return None
+    try:
+        p = subprocess.run([str(WHISPER), "-m", str(MODEL), "-f", str(wav), "-l", "ru", "-ml", "1"],
+                           capture_output=True, text=True, timeout=timeout)
+    except Exception as e:
+        print(f"[voice-verb] word pass failed: {str(e)[:100]}", file=sys.stderr)
+        return None
+    return p.stdout if p.stdout.strip() else None
+
+
+# The recogniser only ever needs the HEAD. The trigger must start inside HEAD_WINDOW_S, so a
+# word-level pass over a 90-second note transcribes 87 seconds nobody will look at — and `-ml 1` is
+# far slower than an ordinary pass, so that waste is what makes the reflex too expensive to run on
+# every note. Measured: driving twelve real notes end-to-end this way blew a 10-minute budget without
+# finishing. Slicing the head first makes the cost a constant, independent of how long he talked.
+# The margin over the window exists so a word that STARTS inside it is not cut off mid-word at the
+# slice boundary and rendered as a different word.
+HEAD_SLICE_S = float(os.environ.get("MESH_VOICE_VERB_HEAD_SLICE_S", "5.0"))
+
+
+def to_wav(src, dest, head_s=None):
+    ff = shutil.which("ffmpeg") or "ffmpeg"
+    argv = [ff, "-y", "-v", "error", "-i", str(src)]
+    if head_s:
+        argv += ["-t", f"{head_s:.2f}"]
+    argv += ["-ar", "16000", "-ac", "1", str(dest)]
+    r = subprocess.run(argv, capture_output=True, text=True)
+    return Path(dest).exists() and Path(dest).stat().st_size > 44 and r.returncode == 0
+
+
+def cut_tail(src, cut_at, dest):
+    """Everything AFTER the verb, re-encoded from the SPOOLED original, not from the 16k mono copy.
+
+    The wav is a working file for the recogniser; the material the operator recorded is the opus.
+    Grinding the recogniser's downsample would hand the sound lane a worse take than the one that
+    arrived, for no reason other than it being the file already open.
+    """
+    ff = shutil.which("ffmpeg") or "ffmpeg"
+    r = subprocess.run([ff, "-y", "-v", "error", "-ss", f"{cut_at:.3f}", "-i", str(src),
+                        "-c", "copy", str(dest)], capture_output=True, text=True)
+    if not (Path(dest).exists() and Path(dest).stat().st_size > 0):
+        # -c copy cuts on a packet boundary and can fail on some containers; re-encode rather than
+        # report a failure the operator would read as "the reflex is broken".
+        r = subprocess.run([ff, "-y", "-v", "error", "-ss", f"{cut_at:.3f}", "-i", str(src),
+                            "-c:a", "libopus", str(dest)], capture_output=True, text=True)
+    return Path(dest).exists() and Path(dest).stat().st_size > 0
+
+
+def duration(path):
+    pr = shutil.which("ffprobe") or "ffprobe"
+    try:
+        r = subprocess.run([pr, "-v", "error", "-show_entries", "format=duration",
+                            "-of", "csv=p=0", str(path)], capture_output=True, text=True, timeout=30)
+        return float((r.stdout or "0").strip() or 0)
+    except Exception:
+        return 0.0
+
+
+def describe(res):
+    """The confirmation line. It names WHAT WAS HEARD, not merely that something fired.
+
+    A reflex the operator cannot audit is one he has to trust; printing the heard word and the cut
+    point lets him see a near-miss ("гринд") as a near-miss instead of wondering why nothing
+    happened — and lets him catch a wrong cut immediately rather than after the grind.
+    """
+    return (f"услышал «{res['heard']}» → {res['verb']}, отрезал с {res['cut_at']:.2f}с, "
+            f"{res['arg_s']:.1f}с материала → {res['dest']}")
+
+
+def run(oga, transcript_hint=None):
+    """Detect + cut + place. Returns a result dict, or None when no verb fired (the common case)."""
+    oga = Path(oga)
+    if not oga.exists():
+        return None
+    td = Path(tempfile.mkdtemp(prefix="voice-verb-"))
+    try:
+        wav = td / "in.wav"
+        if not to_wav(oga, wav, head_s=HEAD_SLICE_S):
+            return None
+        out = transcribe_words(wav)
+        if out is None:
+            return None
+        hit = find_trigger(parse_words(out))
+        if hit is None:
+            return None
+        verb, cut_at, heard = hit
+        total = duration(oga)
+        arg_s = max(0.0, total - cut_at)
+        if arg_s < MIN_ARG_S:
+            # Refused, and SAID so. A sub-second scrap shipped as a take is exactly the "empty
+            # artifact accepted" shape this mesh keeps paying for.
+            return {"verb": verb, "heard": heard, "cut_at": cut_at, "arg_s": arg_s,
+                    "dest": None, "refused": f"после «{heard}» только {arg_s:.1f}с — это не материал"}
+        INBOX.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        dest = INBOX / f"{VERBS[verb]['prefix']}-{stamp}{oga.suffix or '.oga'}"
+        if not cut_tail(oga, cut_at, dest):
+            return {"verb": verb, "heard": heard, "cut_at": cut_at, "arg_s": arg_s,
+                    "dest": None, "refused": "не смог отрезать хвост (ffmpeg)"}
+        res = {"verb": verb, "heard": heard, "cut_at": cut_at, "arg_s": duration(dest),
+               "dest": str(dest), "lane": VERBS[verb]["lane"], "refused": None}
+        try:
+            with open(LOG, "a") as f:
+                f.write(f"{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}  "
+                        f"{json.dumps(res, ensure_ascii=False)}\n")
+        except OSError:
+            pass
+        return res
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--test":
+        fails = []
+        def T(ok, msg):
+            if not ok: fails.append(msg)
+
+        # ── the reluctance, which is the whole design ───────────────────────────────────────────
+        T(match_verb("грайнд") == "грайнд", "the exact trigger does not match")
+        T(match_verb("гринд") == "грайнд", "a one-edit mishearing does not match (whisper will produce these)")
+        T(match_verb("Грайнд,") == "грайнд", "punctuation/case defeat the match")
+        T(match_verb("гриндер") is None, "a LONGER word containing the trigger fired — substring matching is back")
+        T(match_verb("грайнда") is None, "an inflection fired; one edit must not become a stem match")
+        T(match_verb("привет") is None, "an unrelated word fired")
+        T(match_verb("") is None and match_verb(None) is None, "empty input fired")
+
+        # ── the trigger is the FIRST word, inside the head window ──────────────────────────────
+        w_cmd = [(0.14, 0.65, "Грайнд"), (0.80, 1.20, "вот"), (1.3, 1.9, "это")]
+        hit = find_trigger(w_cmd)
+        T(hit is not None and hit[0] == "грайнд", "a real command did not fire")
+        T(hit is not None and abs(hit[1] - (0.65 + CUT_PAD_S)) < 1e-6,
+          "the cut point is not the word's measured end plus the pad")
+        # The sentence ABOUT grinding. This is the false-fire that costs the operator his message,
+        # and it is the assertion that must never be relaxed to "scan the first few words".
+        w_talk = [(0.10, 0.50, "Так"), (0.50, 0.90, "вот"), (1.0, 1.6, "грайнд"), (1.7, 2.2, "этого")]
+        T(find_trigger(w_talk) is None,
+          "a mid-sentence mention of the trigger fired — a message about grinding was cut in half")
+        # Late start: the note begins with silence/noise and the first WORD lands past the window.
+        T(find_trigger([(9.0, 9.4, "грайнд")]) is None, "a trigger past the head window fired")
+        T(find_trigger([]) is None, "an empty word list fired")
+
+        # ── the whisper parse, on REAL output shape (measured on a live note 2026-08-21) ────────
+        real = ("[00:00:00.000 --> 00:00:00.140]  \n"
+                "[00:00:00.140 --> 00:00:00.650]   Так\n"
+                "[00:00:00.650 --> 00:00:01.190]   вот\n"
+                "[00:00:01.190 --> 00:00:01.380]  ,\n"
+                "[00:00:01.380 --> 00:00:01.550]   я\n")
+        ws = parse_words(real)
+        T(len(ws) == 3, f"blank and punctuation-only rows were not dropped (got {len(ws)} words)")
+        T(ws[0][2] == "Так" and abs(ws[0][1] - 0.650) < 1e-6, "word/timestamp parse is wrong")
+        T(parse_words("not whisper output at all") == [], "garbage parsed as words")
+
+        # ── the three-state rule: could-not-look is not no-trigger ─────────────────────────────
+        _real_w = globals()["WHISPER"]
+        globals()["WHISPER"] = Path("/nonexistent/whisper")
+        T(transcribe_words("/tmp/whatever.wav") is None,
+          "an absent whisper did not render None — a blind pass must not read as 'no verb'")
+        globals()["WHISPER"] = _real_w
+
+        if fails:
+            print("smoke-test: FAIL (" + "; ".join(fails) + ")", flush=True); sys.exit(1)
+        print("smoke-test: ok (trigger is reluctant: exact+1 edit, first word only, inside the head "
+              "window; a sentence ABOUT grinding does not fire; word timestamps parsed from real "
+              "whisper output; a blind pass is not a no-trigger)", flush=True)
+        sys.exit(0)
+
+    if len(sys.argv) < 2:
+        print("usage: mesh-voice-verb <audio.oga> | --test", file=sys.stderr); sys.exit(64)
+    r = run(sys.argv[1])
+    if r is None:
+        print("no verb"); sys.exit(2)
+    if r.get("refused"):
+        print(f"refused: {r['refused']}"); sys.exit(1)
+    print(describe(r)); sys.exit(0)
