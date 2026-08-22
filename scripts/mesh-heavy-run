@@ -107,18 +107,76 @@ nice_prefix() {
 # ulimit + a LOUD why, rather than running a job it only BELIEVES is capped. Prefer python3 (one
 # process = one unambiguous OOM victim); absent it, require the memory controller delegated to our
 # user slice AND the scope to launch (structural bind evidence, still stronger than a bare launch).
+# ---- the probe SIGNS its own kills, and runs at most once per boot --------------------------
+# A binding-ceiling probe is a DESTRUCTIVE measurement: proving the cap binds means getting killed
+# by it, so every capcheck mints a real kernel OOM line. mem_cap_available is called on EVERY heavy
+# run (line ~313) by seven tools, which measured out at 115 `Memory cgroup out of memory: Killed
+# process N (python3)` lines in one boot, ~50/hour (health 2026-08-22). That poisons the channel its
+# own readers use: a health probe MINTING the exact kernel line a real OOM emits.
+#
+# Two independent narrowings, because either alone leaves the fault:
+#
+#  (1) IDENTITY, not shape. Downstream had been guessing which OOM lines were ours by the VICTIM'S
+#      RSS BAND (mesh-hw-fault-watch's BENIGN_RE — three bands, widened three times: 32M, 64M,
+#      2.5G), which is a proxy: a real python OOM landing in a band renders silent, and a real
+#      python cgroup OOM was being dropped outright by mesh-journal-watch's `(python*` clause. The
+#      kernel already prints an identity we CONTROL — comm, in `Killed process N (<comm>)`, and
+#      task=/oom_memcg= on the companion `oom-kill:` line. So the allocator runs through a symlink
+#      named `mesh-capcheck` and the scope is named after it too. comm truncates at 15 bytes
+#      (journal-comm-field-is-truncated-to-15-bytes); this is 13. Now the minter signs its own
+#      kills and no reader has to guess. If the symlink cannot be made, the probe still runs
+#      (unsigned, python3) — a probe that refuses to answer is worse than a noisy one.
+#
+#  (2) RATE. The property probed — is the memory controller delegated to this user manager and does
+#      MemoryMax actually bind — is structural, not per-call: it changes at boot or when delegation
+#      changes, never between two heavy jobs a minute apart. So a POSITIVE verdict is cached against
+#      a fingerprint of exactly those two things (boot_id + the user slice's cgroup.controllers) and
+#      re-probed when either moves. 115 kills/boot -> 1.
+#      ONLY the positive is cached, and that is not a convenience: the survived / launch-failure
+#      paths mint NO kernel line at all (nothing was killed), so caching them would buy no quiet
+#      while risking a transient bus failure freezing every later heavy job onto the ulimit
+#      fallback for a whole boot. Cache what is expensive to observe, never what is cheap.
+CAPCACHE="${MESH_HEAVY_CAPCACHE:-$MESH/.heavy-run-capcheck}"
+CAPPROBE_COMM=mesh-capcheck   # <=15 bytes — the kernel's comm field truncates there
+
+# what the cached verdict is ABOUT. Not a clock: a TTL would serve a refuted verdict for its window
+# and re-probe for nothing when nothing moved.
+cap_fingerprint() {
+  local _bid _ctl
+  _bid="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)"; _bid="${_bid:-unknown}"
+  _ctl="$(cat "/sys/fs/cgroup/user.slice/user-$(id -u 2>/dev/null).slice/cgroup.controllers" 2>/dev/null)"
+  printf '%s|%s' "$_bid" "${_ctl:-none}"
+}
+
 mem_cap_available() {
   command -v systemd-run >/dev/null 2>&1 || return 1
+  local _fp; _fp="$(cap_fingerprint)"
+  if [ "${MESH_HEAVY_CAPCACHE_OFF:-0}" != 1 ] && [ -r "$CAPCACHE" ]; then
+    # a hit is only ever "binds": see (2) above
+    [ "$(cat "$CAPCACHE" 2>/dev/null)" = "binds $_fp" ] && return 0
+  fi
   if command -v python3 >/dev/null 2>&1; then
-    local _o _rc
-    _o="$(systemd-run --user --scope -q --collect -p MemoryMax=32M -p MemorySwapMax=0M -- \
-          python3 -c 'a=bytearray(128*1024*1024); print("ALIVE",len(a))' 2>/dev/null)"; _rc=$?
+    local _o _rc _pd _bin
+    _bin="$(command -v python3)"
+    # sign the kill: a symlink whose NAME becomes the victim's comm in the kernel's own line
+    _pd="$(mktemp -d 2>/dev/null)" &&
+      ln -s "$_bin" "$_pd/$CAPPROBE_COMM" 2>/dev/null &&
+      _bin="$_pd/$CAPPROBE_COMM"
+    _o="$(systemd-run --user --scope -q --collect --unit="$CAPPROBE_COMM-$$" \
+          -p MemoryMax=32M -p MemorySwapMax=0M -- \
+          "$_bin" -c 'a=bytearray(128*1024*1024); print("ALIVE",len(a))' 2>/dev/null)"; _rc=$?
+    [ -n "${_pd:-}" ] && rm -rf "$_pd"
     # Three outcomes, and empty stdout is AMBIGUOUS between two of them: (a) the alloc printed ALIVE →
     # survived → ceiling did NOT bind; (b) the alloc was OOM-killed → scope exits 128+SIGKILL(9)=137 →
     # ceiling BINDS; (c) systemd-run failed to LAUNCH (no user bus / broken) → empty stdout too, but a
     # non-signal rc (<128) → NOT a working ceiling. So require a real signal-kill rc, never bare-empty.
-    case "$_o" in *ALIVE*) return 1 ;; esac      # survived → not capping
-    [ "${_rc:-0}" -ge 128 ] && return 0          # killed by a signal (cgroup-OOM = 137) → ceiling binds
+    case "$_o" in *ALIVE*) return 1 ;; esac      # survived → not capping (mints no kernel line)
+    if [ "${_rc:-0}" -ge 128 ]; then             # killed by a signal (cgroup-OOM = 137) → ceiling binds
+      mkdir -p "$(dirname "$CAPCACHE")" 2>/dev/null
+      printf 'binds %s\n' "$_fp" > "$CAPCACHE.tmp$$" 2>/dev/null &&
+        mv -f "$CAPCACHE.tmp$$" "$CAPCACHE" 2>/dev/null
+      return 0
+    fi
     return 1                                      # launch failure / non-kill exit → no binding ceiling
   fi
   local _cg="/sys/fs/cgroup/user.slice/user-$(id -u 2>/dev/null).slice/cgroup.controllers"
@@ -260,6 +318,51 @@ if [ "${1:-}" = --test ]; then
     _capmode="ulimit-fallback"
   fi
 
+  # 7b) THE CAP-PROBE MUST SIGN ITS KILLS AND RUN ONCE PER FINGERPRINT ------------------------
+  # Real kernel reads, never a fixture: the claim is about a line the KERNEL writes. Uses a private
+  # cache file, so nothing here touches the durable one. Skipped honestly where the ceiling does not
+  # bind (there is no kill to sign) — reachability is not producing.
+  _cc="$_td/capcache"; _ccenv="$_base MESH_HEAVY_CAPCACHE=$_cc"
+  _klines() { journalctl -k -o cat --since "-5min" --no-pager 2>/dev/null |
+                grep -c "Killed process [0-9]* ($CAPPROBE_COMM)" ; }
+  # The BEFORE count is taken first and the assertion is on the INCREASE: a bare ">=1" would be
+  # satisfied by any signed kill still inside the journal window, including one this run did not mint
+  # (measured — mutant "strip the signing symlink" passed on a >=1 gate).
+  _npre=0; command -v journalctl >/dev/null 2>&1 && _npre="$(_klines)"
+  if command -v systemd-run >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1 &&
+     command -v journalctl >/dev/null 2>&1 &&
+     env $_ccenv MESH_HEAVY_CAPCACHE_OFF=1 "$0" --capcheck >/dev/null 2>&1; then
+    # (a) the COLD probe recorded a positive against the LIVE fingerprint — not a clock, not a bare flag
+    grep -q "^binds .*|" "$_cc" 2>/dev/null \
+      || { echo "smoke-test: FAIL (a binding cap-probe did not cache its verdict: '$(cat "$_cc" 2>/dev/null)')"; exit 1; }
+    # (b) the kill THIS run just minted names the PROBE. This is the whole identity claim: downstream
+    #     had been guessing by the victim's rss band, and a band is a proxy for "a cap was enforced".
+    _seen=0; _w=0
+    while [ "$_w" -lt 8 ]; do [ "$(_klines)" -gt "$_npre" ] && { _seen=1; break; }; sleep 1; _w=$((_w+1)); done
+    [ "$_seen" = 1 ] \
+      || { echo "smoke-test: FAIL (the cap-probe's OOM does not name itself — no NEW 'Killed process N ($CAPPROBE_COMM)' line was minted by this probe)"; exit 1; }
+    # (c) RATE: a WARM cache answers without minting another kill. Three calls, zero new lines.
+    _n0="$(_klines)"
+    env $_ccenv "$0" --capcheck >/dev/null 2>&1 || { echo "smoke-test: FAIL (warm cache did not answer 'binds')"; exit 1; }
+    env $_ccenv "$0" --capcheck >/dev/null 2>&1
+    env $_ccenv "$0" --capcheck >/dev/null 2>&1
+    _n1="$(_klines)"
+    [ "$_n1" = "$_n0" ] \
+      || { echo "smoke-test: FAIL (3 cached capchecks minted $((_n1-_n0)) new OOM kill(s) — the cache is not suppressing the probe)"; exit 1; }
+    # (d) a cache whose fingerprint does NOT match is not a hit — it re-probes and re-stamps. A cache
+    #     keyed on nothing (or on a clock) would serve this forever.
+    printf 'binds not-this-boot|not-these-controllers\n' > "$_cc"
+    env $_ccenv "$0" --capcheck >/dev/null 2>&1
+    grep -q 'not-this-boot' "$_cc" 2>/dev/null \
+      && { echo "smoke-test: FAIL (a STALE fingerprint was served as a cache hit)"; exit 1; }
+    grep -q "^binds .*|" "$_cc" 2>/dev/null \
+      || { echo "smoke-test: FAIL (a stale cache was not replaced by a fresh live-fingerprint verdict)"; exit 1; }
+    _capsign="signed+cached"
+  else
+    _capsign="skip(no binding ceiling / no journalctl here — nothing to sign)"
+  fi
+  unset -f _klines
+
   # 8) CRON-ENV PARITY: wherever the ceiling binds in THIS env, it must also bind in a cron-shaped
   #    env (XDG_RUNTIME_DIR / DBUS_SESSION_BUS_ADDRESS stripped) — the self-supplied defaults at the
   #    top are what close the gap. RED-first: without them, env-stripped capcheck fails wherever
@@ -273,7 +376,7 @@ if [ "${1:-}" = --test ]; then
     _cronpar="skip(no binding ceiling in any env)"
   fi
 
-  echo "smoke-test: ok (arg-validate + passthrough/exit + stderr + budget-gate both ways + node-pressure-gate + accel-precursor-gate + FORCE-bypass + admit-preflight + mem-ceiling[$_capmode] + cron-env[$_cronpar] + 2×1s-serialize=${_el}s)"
+  echo "smoke-test: ok (arg-validate + passthrough/exit + stderr + budget-gate both ways + node-pressure-gate + accel-precursor-gate + FORCE-bypass + admit-preflight + mem-ceiling[$_capmode] + cap-probe[$_capsign] + cron-env[$_cronpar] + 2×1s-serialize=${_el}s)"
   exit 0
 fi
 
