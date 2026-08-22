@@ -165,6 +165,10 @@ the case is the evidence, and mixing them is what made this section a wall nobod
   — and never let a sanitizer's CONSTANT placeholder reach a key: many identities collapse onto one
   row, so one close discharges them all and the netting erases the evidence.
   [[a-redaction-placeholder-used-as-a-key-is-a-self-erasing-collision]]
+- **A sidecar cannot narrow a bit its readers never open** — annotating a shared binary observable
+  fixes it only for the readers you rewrote (1 of ~10 here); shrink the BIT's own claim to what every
+  reader already supports, and keep ONE reader watching the narrowed-away case.
+  [[a-sidecar-cannot-narrow-a-bit-its-readers-never-open]]
 
 ## Substrate changes & multi-agent coordination
 
