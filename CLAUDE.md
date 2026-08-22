@@ -190,6 +190,13 @@ the case is the evidence, and mixing them is what made this section a wall nobod
   fixes it only for the readers you rewrote (1 of ~10 here); shrink the BIT's own claim to what every
   reader already supports, and keep ONE reader watching the narrowed-away case.
   [[a-sidecar-cannot-narrow-a-bit-its-readers-never-open]]
+- **An exemption that cannot place its SUBJECT inside the excusing window must HOLD the verdict, never
+  clear it** — measure the window per-subject, and REWIND the cursor to the earliest unresolved one so
+  "re-assessed next pass" is true instead of a full rotation away.
+  [[a-blanket-exemption-that-cannot-place-its-subject-in-the-window]]
+- **Never quote the asserted literal in the prose beside a source-text gate** — the comment satisfies
+  the gate and the real call site can be deleted green; paraphrase, and prove it by MUTATION.
+  [[a-source-text-gate-is-satisfied-by-its-own-explanatory-prose]]
 
 ## Substrate changes & multi-agent coordination
 
