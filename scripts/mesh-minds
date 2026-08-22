@@ -18,7 +18,7 @@ skeleton senses; it does not coordinate.
 Usage:  mesh-minds            # human table
         mesh-minds --json     # machine-readable (for other minds to consume)
 """
-import json, os, subprocess, sys, getpass, concurrent.futures
+import json, os, subprocess, sys, getpass, time, concurrent.futures
 
 # --test is handled by smoke_test() at the bottom (after the node/probe functions it exercises
 # are defined) so the gate can assert the real attached-node path, not just the tailscale base.
@@ -285,6 +285,12 @@ def _resolve_phone_lan(nodes, resolver=None):
     return nodes
 
 
+# How hard a LAN-presence probe tries before it is allowed to say "not there". Env-overridable so
+# a node on a steadier uplink can spend less, and so the --test can drive the loop without sleeping.
+PRESENCE_TRIES  = max(1, int(os.environ.get("MESH_PRESENCE_TRIES", "3")))
+PRESENCE_GAP_S  = float(os.environ.get("MESH_PRESENCE_GAP_S", "1.5"))
+
+
 def _resolve_lan_present(nodes, resolver=None, pinger=None):
     """Mark a NON-phone node that left Tailscale but is still ANSWERING on the LAN.
 
@@ -317,8 +323,10 @@ def _resolve_lan_present(nodes, resolver=None, pinger=None):
         return (r.stdout.strip().splitlines() or [""])[0].strip() if r.returncode == 0 else ""
 
     def _ping(ip):
-        return subprocess.run(["ping", "-c", "1", "-W", "2", ip],
-                              capture_output=True, timeout=8).returncode == 0
+        # TWO packets, not one. `-c 1` makes a single lost datagram the whole evidence base for a
+        # verdict word that means "the device is NOT THERE"; `-c 2` returns 0 on either reply.
+        return subprocess.run(["ping", "-c", "2", "-W", "2", ip],
+                              capture_output=True, timeout=12).returncode == 0
 
     resolver = resolver or _peer_addr
     pinger = pinger or _ping
@@ -334,10 +342,35 @@ def _resolve_lan_present(nodes, resolver=None, pinger=None):
         # says so out loud ("returning ts addr as a guess") and a guess must not become a verdict.
         if not cand or cand == rec.get("ip"):
             continue
-        try:
-            up = pinger(cand)
-        except Exception:
-            up = False
+        # RETRY — a presence probe is not a one-packet question on a flapping uplink (2026-08-22).
+        # `mesh-minds --json` was measured rendering GL-MT3000 `online:false` with NO lan_ip at
+        # 18:52Z and `online:true, lan_present:true` at 19:01Z, nine minutes apart, while the router
+        # answered ICMP 0% loss / tcp22 / tcp80 throughout and `ping -c1 -W2 192.168.8.1` scored
+        # 30/30 by hand. Nothing about the router changed; OUR sole uplink (the RTL8822BU dongle)
+        # went dark 53 times on that day alone, 50-170s a time per `mesh-link-heal`'s RECOVERED
+        # tape. A probe issued into one of those windows collapses the row from `unreach` (there,
+        # not enumerable over our transport) straight back to `offline` (not there) — the exact
+        # verdict this whole function exists to prevent, restored by a transient in OUR OWN radio.
+        # probe() one screen down already learned this for the SSH leg (`attempts = 2 if android`,
+        # 2026-07-07: a dozing phone drops the FIRST connection and a single-attempt probe reads
+        # that as offline). The lesson was applied to the SSH transport and never to the ICMP one.
+        # The retry lives HERE, not inside _ping, so the injected test `pinger` is what gets called
+        # repeatedly: a retry buried in the default helper is bypassed by every stub, so the fixture
+        # could assert nothing about the real path.
+        # HONEST BOUND, not a cure: this widens the evidence from one datagram to ~PRESENCE_TRIES
+        # spaced attempts, so it clears packet loss and sub-10s micro-flaps. A 60s dark window still
+        # renders `offline`, because from inside one we genuinely cannot tell absence from our own
+        # blindness — that separation needs a verdict word the renderer does not yet have.
+        up = False
+        for _attempt in range(PRESENCE_TRIES):
+            try:
+                up = pinger(cand)
+            except Exception:
+                up = False
+            if up:
+                break
+            if _attempt + 1 < PRESENCE_TRIES:
+                time.sleep(PRESENCE_GAP_S)
         if up:
             rec["lan_ip"] = cand
             rec["lan_present"] = True
@@ -570,6 +603,49 @@ def smoke_test():
         _resolve_lan_present([rtr2], resolver=lambda h: "192.168.8.1", pinger=lambda ip: False)
         if rtr2.get("online") or rtr2.get("lan_present"):
             print(f"smoke-test: FAIL (unpingable LAN addr claimed presence: {rtr2})"); sys.exit(1)
+        # (e2) A FLAKY probe is not an absent device (2026-08-22). Every pinger stub in this
+        #      fixture is a CONSTANT — `lambda ip: True` / `lambda ip: False` — so the alphabet
+        #      could not express the one case that actually bit: a device that is there, on a link
+        #      that drops the first packet. Measured live: `mesh-minds --json` rendered GL-MT3000
+        #      `online:false` at 18:52Z and `online:true, lan_present:true` at 19:01Z with the
+        #      router answering ICMP/tcp22/tcp80 the whole time, because our own uplink went dark
+        #      53 times that day. A constant stub can never fail on that, which is why the leg is
+        #      written as a CALL COUNTER, not another lambda: it asserts BOTH that the retry
+        #      happens and that it is BOUNDED, so "retry until it answers" cannot pass here either.
+        calls = {"n": 0}
+        def _flaky(ip):
+            calls["n"] += 1
+            return calls["n"] >= 2          # drops the first packet, answers the second
+        rtr_f = {"host": "GL-MT3000", "ip": "100.105.241.84", "online": False, "os": "linux",
+                 "self": False}
+        _saved_gap = globals()["PRESENCE_GAP_S"]; globals()["PRESENCE_GAP_S"] = 0.0
+        try:
+            _resolve_lan_present([rtr_f], resolver=lambda h: "192.168.8.1", pinger=_flaky)
+            if not (rtr_f.get("online") and rtr_f.get("lan_present")):
+                print(f"smoke-test: FAIL (a device that answered the SECOND packet read as absent: "
+                      f"{rtr_f} after {calls['n']} attempt(s) — the presence probe is not retrying)")
+                sys.exit(1)
+            if calls["n"] != 2:
+                print(f"smoke-test: FAIL (retry did not stop on the first success: {calls['n']} calls)")
+                sys.exit(1)
+            # and the retry must stay BOUNDED — a never-answering address may not be probed forever,
+            # nor may the retry manufacture presence out of one.
+            dead = {"n": 0}
+            def _never(ip):
+                dead["n"] += 1
+                return False
+            rtr_d = {"host": "GL-MT3000", "ip": "100.105.241.84", "online": False, "os": "linux",
+                     "self": False}
+            _resolve_lan_present([rtr_d], resolver=lambda h: "192.168.8.1", pinger=_never)
+            if rtr_d.get("online") or rtr_d.get("lan_present"):
+                print(f"smoke-test: FAIL (retry manufactured presence from a dead address: {rtr_d})")
+                sys.exit(1)
+            if dead["n"] != PRESENCE_TRIES:
+                print(f"smoke-test: FAIL (presence retry unbounded/miscounted: {dead['n']} calls, "
+                      f"PRESENCE_TRIES={PRESENCE_TRIES})")
+                sys.exit(1)
+        finally:
+            globals()["PRESENCE_GAP_S"] = _saved_gap
         # (f) a resolver echoing the dead TS address has told us nothing — never a verdict.
         rtr3 = {"host": "GL-MT3000", "ip": "100.105.241.84", "online": False, "os": "linux",
                 "self": False}
