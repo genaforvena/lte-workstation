@@ -36,6 +36,18 @@ LOG = pathlib.Path(os.environ.get("HH_LOG", MESH / f"job/{PROFILE}-drive.log"))
 SHOTS = MESH / "job/shots"
 HOME_URL = os.environ.get("HH_HOME", "https://hh.ru/")
 IDLE_LIMIT = int(os.environ.get("HH_IDLE_LIMIT", 45 * 60))
+# THE IDLE PAGE IS NOT A FREE PAGE. This daemon exists so the login page stays warm, but the page
+# it stays warm ON is whatever the last command left it on — and hh's SPAs (negotiations, the chat
+# list) keep animating forever. Measured 2026-08-21 (health@): the renderer held ~0.7 of a core
+# CONTINUOUSLY between commands, 14.6 CPU-hours over 20h16m, uncorrelated with the drive's output.
+# So park on about:blank once the command file has been quiet, and re-goto the parked URL when the
+# next command arrives: the cold-load cost this daemon avoids is the BROWSER LAUNCH, not a goto.
+# HH_PARK_AFTER=0 disables parking. Note what parking COSTS — a re-goto restores the URL, never the
+# page's in-memory state — so it must be long enough that no flow can straddle it (steps in
+# mesh-job-apply land seconds apart), and both edges are logged so a lost half-filled form is
+# readable in the log rather than a mystery.
+PARK_AFTER = int(os.environ.get("HH_PARK_AFTER", 180))
+PARK_URL = "about:blank"
 
 # Verbs whose argument is free text, not a shell-ish selector list. `js`/`text` take the whole
 # remainder; `type`/`fill` take "<selector> <text…>" and must not lose the text's punctuation.
@@ -121,9 +133,21 @@ def run():
         dump(pg)
 
         seen, last = 0, time.time()
+        parked = None
         while time.time() - last < IDLE_LIMIT:
             lines = CMD.read_text(encoding="utf-8").splitlines()
             if len(lines) <= seen:
+                if (PARK_AFTER and parked is None and time.time() - last > PARK_AFTER
+                        and pg.url != PARK_URL):
+                    want = pg.url
+                    try:
+                        pg.goto(PARK_URL, wait_until="domcontentloaded", timeout=15000)
+                        parked = want
+                        out("[park]", want)
+                    except Exception as e:
+                        # A park that fails must not be remembered as done: the page is still on
+                        # the live URL, so the next command must NOT re-goto anything.
+                        out("[park-FAIL]", type(e).__name__, str(e)[:200])
                 time.sleep(2)
                 continue
             for step in lines[seen:]:
@@ -145,6 +169,14 @@ def run():
                     else:
                         parts = shlex.split(step)
                         verb, rest = parts[0], parts[1:]
+                    if parked is not None:
+                        # goto replaces the destination anyway and quit is leaving; everything else
+                        # assumes the page it was left on, so restore it first.
+                        if verb not in ("goto", "quit"):
+                            pg.goto(parked, wait_until="domcontentloaded", timeout=60000)
+                            pg.wait_for_timeout(3500)
+                            out("[unpark]", parked)
+                        parked = None
                     if verb == "quit":
                         ctx.storage_state(path=str(STATE))
                         b.close()
