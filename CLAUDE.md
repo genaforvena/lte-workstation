@@ -161,10 +161,19 @@ the case is the evidence, and mixing them is what made this section a wall nobod
 - **A detector is not a closed loop** — a recurring fault with a one-line idempotent remedy needs a
   RE-APPLIER, and its re-apply RATE must stay loud, or the healer erases the fault signal it rides on.
   [[a-detector-without-a-re-applier-leaves-the-operators-hands-as-the-loop]]
+- **Once a detector has an actuator, move the ALERT behind it** — fire on the actuator's OUTCOME,
+  never on the fault, or every episode the loop repairs itself still wakes a human (twice: the edge
+  and the recovery); hold the edge unspent, bound the hold by the gate's own arithmetic, and log
+  every hold in its own ledger. [[an-alert-wired-to-the-fault-not-to-its-actuators-outcome]]
 - **When a SHAPE guess has been widened three times, exempt the POSITION the grammar already fixes**
   — and never let a sanitizer's CONSTANT placeholder reach a key: many identities collapse onto one
   row, so one close discharges them all and the netting erases the evidence.
   [[a-redaction-placeholder-used-as-a-key-is-a-self-erasing-collision]]
+- **A probe that proves a limit BINDS mints the very signal its detectors read — sign it at the
+  SOURCE**, in a field the kernel prints (comm via a symlink, a named scope), never separate probe
+  from real event by the victim's SIZE: a band is a proxy whose failure direction is SILENCE, and an
+  unsigned probe must BOARD, not fall into a whitelist it no longer qualifies for.
+  [[a-size-band-is-a-proxy-for-identity-and-it-fails-toward-silence]]
 - **A sidecar cannot narrow a bit its readers never open** — annotating a shared binary observable
   fixes it only for the readers you rewrote (1 of ~10 here); shrink the BIT's own claim to what every
   reader already supports, and keep ONE reader watching the narrowed-away case.
