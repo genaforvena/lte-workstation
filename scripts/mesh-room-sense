@@ -81,6 +81,13 @@ EVENTS="$MESH_DIR/.room-sense-events"  # one epoch per verdict change, self-prun
 ROOM_TAPE="${ROOM_TAPE:-$MESH_DIR/room-sense-tape.log}"
 ROOM_TAPE_KEEP="${ROOM_TAPE_KEEP:-4032}"   # 14 days at the 2-59/5 cadence (288/day)
 
+# BLIND_GAP_S — the width above which a hole in the tape means "this sense was not observing",
+# not "cron jittered". Measured on this node's own tape, 1196 consecutive gaps: median 300.0s,
+# p90 301s, p99 312s, and exactly FOUR gaps over 900s (1562, 4199, 21901, 32998) — every one a
+# real outage, the largest being the 2026-08-22T00:32:04Z→09:42:02Z power-off. 3x the tool's own
+# cadence separates them with two orders of magnitude of room on either side.
+BLIND_GAP_S="${BLIND_GAP_S:-900}"
+
 # --status: READ-ONLY cached read of the last CONFIRMED (edge-debounced) verdict — $STATE + its
 # mtime, nothing else. MUST run before any of the live-probe setup below (mesh-phone-ip alone can
 # block for 7s+ on a dozing/offline phone, on top of the full fusion's own BLE scan/mic/cam/SSH
@@ -464,6 +471,74 @@ count_recent_events() {
     [ "$_ts" -ge "$cutoff" ] 2>/dev/null && c=$((c+1))
   done < "$f"
   echo "$c"
+}
+# --- OBSERVED dwell: a continuity claim cannot cross an interval nobody watched ---
+# `dwell_s` was `now - last_change_ts`, read off EVENTS — a log that records only CHANGES. So a
+# sense that stopped running entirely kept accruing dwell at wall-clock rate, and the number it
+# published was indistinguishable from one earned by continuous observation. Caught live
+# 2026-08-22: the node was OFF 00:32:04Z→09:42:02Z (9h09m58s, `journalctl --list-boots`) and
+# `.room-sense.state` read `PRESENT|dwell_s=86366` — a 24h continuous-occupancy claim of which
+# 38% was a powered-down machine. The room could have emptied and refilled twice.
+#
+# The evidence was already on disk and the arithmetic simply never opened it: ROOM_TAPE takes one
+# line per EVALUATION, unconditionally, precisely so the observation history is separable from the
+# verdict history.
+#
+# WHICH BIT TO NARROW. 22 tools read $STATE and 21 of them would never open a new 4th field
+# (a-sidecar-cannot-narrow-a-bit-its-readers-never-open), so the fix shrinks the bit they ALL
+# already open: `dwell_s` now counts from the LATER of (last verdict change, end of the last blind
+# gap) — i.e. it finally means the thing its name always claimed, "observed continuously for N
+# seconds". Every existing reader gets a number that no longer over-claims, and the direction of
+# the change is conservative: dwell only ever shrinks, so no consumer's threshold is crossed by
+# this that was not crossed before. `dwell_cov=` then carries the narrowed-away case for the one
+# reader that should watch it.
+#
+# dwell_observed <tape> <last_change_ts> <now> → "<dwell_s>|<cov>"
+#   cov is the integer percent of (now - last_change_ts) that was actually observed, or `na` when
+#   the tape cannot answer — absent, unreadable, or not reaching back as far as the last change
+#   (14-day retention vs an older change). MISSING EVIDENCE RENDERS na, NEVER 100: a tape that has
+#   been pruned past the window is exactly the case where the old wall-clock number is unvouched,
+#   so it is reported AS the old number with cov=na rather than silently blessed as full coverage.
+dwell_observed() {
+  local tape="$1" start="$2" now="$3" out
+  if [ -z "$start" ] || ! [ "$start" -gt 0 ] 2>/dev/null; then printf '0|na\n'; return; fi
+  if [ ! -r "$tape" ]; then printf '%s|na\n' "$(( now - start ))"; return; fi
+  out="$(awk -v start="$start" -v now="$now" -v thr="$BLIND_GAP_S" '
+    # days_from_civil (Howard Hinnant) — exact, and portable in a way mktime() is not: this must
+    # not quietly degrade to a wrong number under mawk. All tape stamps are UTC by construction.
+    function dfc(y,m,d,  era,yoe,doy,doe) {
+      if (m <= 2) y--
+      era = int((y >= 0 ? y : y-399) / 400)
+      yoe = y - era*400
+      doy = int((153*(m + (m > 2 ? -3 : 9)) + 2)/5) + d - 1
+      doe = yoe*365 + int(yoe/4) - int(yoe/100) + doy
+      return era*146097 + doe - 719468
+    }
+    {
+      if ($1 !~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z$/) next
+      y=substr($1,1,4)+0; mo=substr($1,6,2)+0; d=substr($1,9,2)+0
+      h=substr($1,12,2)+0; mi=substr($1,15,2)+0; se=substr($1,18,2)+0
+      t = dfc(y,mo,d)*86400 + h*3600 + mi*60 + se
+      if (first == 0) first = t
+      if (prev > 0 && t > start) {
+        gap = t - prev
+        if (gap > thr) { blind += gap; if (t > eff) eff = t }
+      }
+      prev = t
+    }
+    END {
+      if (first == 0) { print "na|na"; exit }              # no parseable row at all
+      if (first > start) { print "na|na"; exit }           # tape does not reach back to the change
+      if (eff < start) eff = start
+      printf "%d|%d\n", eff, blind
+    }' "$tape" 2>/dev/null)"
+  local eff="${out%%|*}" blind="${out##*|}" wall=$(( now - start ))
+  if [ "$eff" = "na" ] || [ -z "$eff" ]; then printf '%s|na\n' "$wall"; return; fi
+  local dw=$(( now - eff )); [ "$dw" -lt 0 ] && dw=0
+  local cov=100
+  [ "$wall" -gt 0 ] && cov=$(( (wall - blind) * 100 / wall ))
+  [ "$cov" -lt 0 ] && cov=0
+  printf '%s|%s\n' "$dw" "$cov"
 }
 # log_room_event <log> <epoch> <verdict> <now> — append a verdict-change event and prune to 24h from
 # NOW. Format: epoch|verdict. Stale events older than 24h relative to NOW are pruned, so the log
@@ -1227,6 +1302,55 @@ PY
   _fuse_verdict STILL PRESENT_WEAK "" UNCERTAIN UNKNOWN 0 0 UNKNOWN UNKNOWN UNKNOWN UNKNOWN INITIAL -1 UNKNOWN RECENT UNKNOWN >/dev/null 2>&1
   [ "$verdict" = "PRESENT" ] || { echo "  FAIL tamper-gate live RECENT should drive PRESENT (control): got verdict=$verdict"; _df=1; }
   [ "$_df" = 0 ] || { echo "smoke-test: FAIL (occupancy_dwell assertions)"; exit 1; }
+
+  # --- dwell_observed: the blind-gap truncation (regression for the 2026-08-22 9h10m power-off,
+  # where .room-sense.state published dwell_s=86366 across an interval nobody was watching) ---
+  _dw=0
+  _dwt="$(mktemp)"; _sav_bg="$BLIND_GAP_S"; BLIND_GAP_S=900
+  # A 5-minute-cadence tape covering 01:00:00Z..02:00:00Z with NO hole. start = 01:00:00Z.
+  : > "$_dwt"; _t=$(date -u -d '2026-08-22T01:00:00Z' +%s)
+  for _i in $(seq 0 12); do date -u -d "@$(( _t + _i*300 ))" +%FT%TZ >> "$_dwt"; done
+  _r="$(dwell_observed "$_dwt" "$_t" "$(( _t + 3600 ))")"
+  [ "$_r" = "3600|100" ] || { echo "  FAIL dwell_observed: unbroken tape should be 3600|100, got '$_r'"; _dw=1; }
+  # Same window, but 01:10:00Z..01:50:00Z is missing (a 2400s hole > 900s). The claim must restart
+  # at the far side of the hole, not span it: dwell = 02:00 - 01:50 = 600s, coverage = (3600-2400)/3600.
+  : > "$_dwt"
+  for _i in 0 1 2; do date -u -d "@$(( _t + _i*300 ))" +%FT%TZ >> "$_dwt"; done
+  for _i in 10 11 12; do date -u -d "@$(( _t + _i*300 ))" +%FT%TZ >> "$_dwt"; done
+  _r="$(dwell_observed "$_dwt" "$_t" "$(( _t + 3600 ))")"
+  [ "$_r" = "600|33" ] || { echo "  FAIL dwell_observed: 2400s blind gap should truncate to 600|33, got '$_r'"; _dw=1; }
+  # Cron jitter is NOT blindness: a 600s hole (2x cadence, under the 900s threshold) changes nothing.
+  : > "$_dwt"
+  for _i in 0 1 2 4 5 6 7 8 9 10 11 12; do date -u -d "@$(( _t + _i*300 ))" +%FT%TZ >> "$_dwt"; done
+  _r="$(dwell_observed "$_dwt" "$_t" "$(( _t + 3600 ))")"
+  [ "$_r" = "3600|100" ] || { echo "  FAIL dwell_observed: a 600s sub-threshold hole must not truncate, got '$_r'"; _dw=1; }
+  # MISSING EVIDENCE RENDERS na, NEVER 100 — the whole point of the field. Three shapes:
+  _r="$(dwell_observed "$_dwt/no-such-dir/tape" "$_t" "$(( _t + 3600 ))")"
+  [ "$_r" = "3600|na" ] || { echo "  FAIL dwell_observed: unreadable tape must be <wall>|na, got '$_r'"; _dw=1; }
+  : > "$_dwt"
+  _r="$(dwell_observed "$_dwt" "$_t" "$(( _t + 3600 ))")"
+  [ "$_r" = "3600|na" ] || { echo "  FAIL dwell_observed: empty tape must be <wall>|na, got '$_r'"; _dw=1; }
+  # Tape pruned past the window (retention shorter than the dwell): first row is AFTER the change,
+  # so nothing can be said about the interval before it — na, not a flattering 100.
+  : > "$_dwt"
+  for _i in 6 7 8 9 10 11 12; do date -u -d "@$(( _t + _i*300 ))" +%FT%TZ >> "$_dwt"; done
+  _r="$(dwell_observed "$_dwt" "$_t" "$(( _t + 3600 ))")"
+  [ "$_r" = "3600|na" ] || { echo "  FAIL dwell_observed: tape not reaching the change must be <wall>|na, got '$_r'"; _dw=1; }
+  # A junk-only tape parses nothing — a parse that consumes nothing is never a measurement.
+  printf 'garbage\nnot a timestamp\n' > "$_dwt"
+  _r="$(dwell_observed "$_dwt" "$_t" "$(( _t + 3600 ))")"
+  [ "$_r" = "3600|na" ] || { echo "  FAIL dwell_observed: unparseable tape must be <wall>|na, got '$_r'"; _dw=1; }
+  # No last-change timestamp at all → 0|na, never a wall-clock number off an empty start.
+  _r="$(dwell_observed "$_dwt" "" "$(( _t + 3600 ))")"
+  [ "$_r" = "0|na" ] || { echo "  FAIL dwell_observed: empty start must be 0|na, got '$_r'"; _dw=1; }
+  # Cross-year civil-date arithmetic (the hand-rolled dfc() replaces gawk's mktime, so its
+  # leap/era handling is asserted rather than assumed): 2028-02-29 is a real day.
+  _t2=$(date -u -d '2028-02-29T23:00:00Z' +%s); : > "$_dwt"
+  for _i in $(seq 0 12); do date -u -d "@$(( _t2 + _i*300 ))" +%FT%TZ >> "$_dwt"; done
+  _r="$(dwell_observed "$_dwt" "$_t2" "$(( _t2 + 3600 ))")"
+  [ "$_r" = "3600|100" ] || { echo "  FAIL dwell_observed: leap-day boundary should be 3600|100, got '$_r'"; _dw=1; }
+  rm -f "$_dwt"; BLIND_GAP_S="$_sav_bg"
+  [ "$_dw" = 0 ] || { echo "smoke-test: FAIL (dwell_observed assertions)"; exit 1; }
   # --- --status fixtures (offline, file-bound — no scan, no phone, no writes) ---
   # STATE is derived from MESH_DIR ("$MESH_DIR/.room-sense.state", hardcoded concat, not itself
   # env-overridable) — so fixtures point a sandboxed MESH_DIR at the re-exec'd "$0" --status rather
@@ -1398,7 +1522,7 @@ PY
   rm -rf "$_rd"
   [ "$_rf" = 0 ] || { echo "smoke-test: FAIL (channel-redundancy probe)"; exit 1; }
 
-  echo "smoke-test: ok (16 fusion + 9 derived + 3 unsampled-presence + 3 cam-motion + 3 cam-liveness + 5 cam-dark-reclass + 8 light-map (phone/webcam/n-a-honesty) + 4 mixed-not-offline/cam-dark-token + 4 appliance-vs-person + 7 self-playback + 2 flat-field/blind-lens + 6 addr-type-fusion + live-bluez-addrtype + 2 presence-session fusion + 2 nameless-ble confidence-cap + 9 occupancy_dwell assertions + 10 tamper-freshness-gate + 2 tamper-gate fusion + 5 status-read-only + 4 wake-edge-gate + 7 observation-tape + 17 channel-redundancy)"; exit 0
+  echo "smoke-test: ok (16 fusion + 9 derived + 3 unsampled-presence + 3 cam-motion + 3 cam-liveness + 5 cam-dark-reclass + 8 light-map (phone/webcam/n-a-honesty) + 4 mixed-not-offline/cam-dark-token + 4 appliance-vs-person + 7 self-playback + 2 flat-field/blind-lens + 6 addr-type-fusion + live-bluez-addrtype + 2 presence-session fusion + 2 nameless-ble confidence-cap + 9 occupancy_dwell + 9 dwell_observed blind-gap assertions + 10 tamper-freshness-gate + 2 tamper-gate fusion + 5 status-read-only + 4 wake-edge-gate + 7 observation-tape + 17 channel-redundancy)"; exit 0
 }
 
 MODE=oneshot
@@ -1805,13 +1929,16 @@ case "$MODE" in
     # for parity with the consumer-facing output).
     _now="$(date +%s)"
     _last_change_ts=""; [ -f "$EVENTS" ] && _last_change_ts="$(tail -n 1 "$EVENTS" 2>/dev/null | cut -d'|' -f1)"
-    _dwell_s=0
-    if [ -n "$_last_change_ts" ] && [ "$_last_change_ts" -gt 0 ] 2>/dev/null; then _dwell_s=$(( _now - _last_change_ts )); fi
+    _dwell_s=0; _dwell_cov=na
+    if [ -n "$_last_change_ts" ] && [ "$_last_change_ts" -gt 0 ] 2>/dev/null; then
+      _do="$(dwell_observed "$ROOM_TAPE" "$_last_change_ts" "$_now")"
+      _dwell_s="${_do%%|*}"; _dwell_cov="${_do##*|}"
+    fi
     _changes_24h="$(count_recent_events "$EVENTS" "$_now" 86400)"
-    printf '{"verdict":"%s","status":"%s","occupancy":"%s","confidence":"%s","room_mode":"%s","degraded":"%s","signals":%s,"reason":%s,"ts":"%s","phone_ok":%s,"ble_ok":%s,"body":"%s","ambient":"%s","kbd":"%s","presence_familiarity":"%s","presence_session_max_s":%s,"tamper_recency":"%s","dwell_s":%d,"dwell_band":"%s","changes_24h":%d}\n' \
+    printf '{"verdict":"%s","status":"%s","occupancy":"%s","confidence":"%s","room_mode":"%s","degraded":"%s","signals":%s,"reason":%s,"ts":"%s","phone_ok":%s,"ble_ok":%s,"body":"%s","ambient":"%s","kbd":"%s","presence_familiarity":"%s","presence_session_max_s":%s,"tamper_recency":"%s","dwell_s":%d,"dwell_band":"%s","dwell_cov":"%s","changes_24h":%d}\n' \
       "$verdict" "$status" "$occupancy" "$confidence" "$room_mode" "$degraded" "$(printf '%s' "$signals" | json_escape)" "$(printf '%s' "$reason" | json_escape)" "$TS" "$phone_ok" "$ble_ok" "$body_verdict" "$ambient_level" "$kbd_verdict" \
       "$presence_familiarity" "$presence_session_max_s" "$tamper_recency" \
-      "$_dwell_s" "${_dwell_s:+$(classify_dwell "$_dwell_s" | cut -d'|' -f1)}" \
+      "$_dwell_s" "${_dwell_s:+$(classify_dwell "$_dwell_s" | cut -d'|' -f1)}" "$_dwell_cov" \
       "$_changes_24h"
     ;;
   edge)
@@ -1822,7 +1949,9 @@ case "$MODE" in
     tape_room_eval "$TS" "$verdict" "$confidence" "$status" "$occupancy" "$degraded" "$signals"
     # 2-consecutive-scan debounce: a threshold-straddling sensor can flip PRESENT↔UNCERTAIN
     # every scan. Only fire after 2 consecutive same verdicts.
-    # STATE = confirmed verdict (additive 3-field: VERDICT|dwell_s=N|changes_24h=N); PENDING = "verdict:count" for the in-progress candidate.
+    # STATE = confirmed verdict (additive 4-field: VERDICT|dwell_s=N|changes_24h=N|dwell_cov=N|na);
+    # PENDING = "verdict:count" for the in-progress candidate. dwell_s is the OBSERVED dwell (see
+    # dwell_observed) and dwell_cov the percent of the wall-clock window this sense actually watched.
     PENDING="${STATE%.state}.pending"
     confirmed_raw="$(cat "$STATE" 2>/dev/null || true)"
     # Extract just the bare label (1st field) for back-compat with the legacy 1-field STATE
@@ -1867,15 +1996,16 @@ case "$MODE" in
     # as real) — so we ONLY touch an existing STATE.
     _now="$(date +%s)"
     _last_change_ts=""; [ -f "$EVENTS" ] && _last_change_ts="$(tail -n 1 "$EVENTS" 2>/dev/null | cut -d'|' -f1)"
-    _dwell_s=0
+    _dwell_s=0; _dwell_cov=na
     if [ -n "$_last_change_ts" ] && [ "$_last_change_ts" -gt 0 ] 2>/dev/null; then
-      _dwell_s=$(( _now - _last_change_ts ))
+      _do="$(dwell_observed "$ROOM_TAPE" "$_last_change_ts" "$_now")"
+      _dwell_s="${_do%%|*}"; _dwell_cov="${_do##*|}"
     fi
     _changes_24h="$(count_recent_events "$EVENTS" "$_now" 86400)"
     if [ -e "$STATE" ]; then
       # Re-read the just-written 1st field (might be new) and append the dwell fields
       _cur_label="$(head -1 "$STATE" 2>/dev/null | cut -d'|' -f1)"
-      [ -n "$_cur_label" ] && printf '%s|dwell_s=%s|changes_24h=%s\n' "$_cur_label" "$_dwell_s" "$_changes_24h" > "$STATE"
+      [ -n "$_cur_label" ] && printf '%s|dwell_s=%s|changes_24h=%s|dwell_cov=%s\n' "$_cur_label" "$_dwell_s" "$_changes_24h" "$_dwell_cov" > "$STATE"
       # touch every run so the state-file mtime tracks last-RUN (liveness), not last-CHANGE —
       # else a stable verdict reads as a dead reflex to the sensorium roll-call's age/STALE check.
       # Use the shared liveness primitive (chat-review/state-touch-adoption 2026-06-25) — bare
@@ -1884,7 +2014,7 @@ case "$MODE" in
       # / mesh-vpn-health hollow-sense fixes).
       [ -x "$HOME/.local/bin/mesh-state-touch" ] && "$HOME/.local/bin/mesh-state-touch" --create "$STATE" >/dev/null 2>&1 || touch "$STATE" 2>/dev/null
     else
-      printf '%s|dwell_s=%s|changes_24h=%s\n' "$verdict" "$_dwell_s" "$_changes_24h" > "$STATE"
+      printf '%s|dwell_s=%s|changes_24h=%s|dwell_cov=%s\n' "$verdict" "$_dwell_s" "$_changes_24h" "$_dwell_cov" > "$STATE"
     fi
     ;;
   *)
