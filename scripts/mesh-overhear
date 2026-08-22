@@ -244,7 +244,7 @@ _room_wake_should_tell() {
 runpy() {  # <mode> [args...]
   local PY; PY="$(mktemp "${TMPDIR:-/tmp}"/overhear-XXXXXX.py)"; trap 'rm -f "$PY"' RETURN
   cat > "$PY" <<'PYEOF'
-import os, sys, time, wave, audioop, subprocess, re, select
+import os, sys, time, wave, audioop, subprocess, re, select, math
 
 KEEP=int(os.environ.get("OH_KEEP_MIN","15"))*60
 LOGF=os.environ["OH_LOG"]; LANG=os.environ.get("OH_LANG","ru")  # ru-first (operator 2026-07-04)
@@ -264,6 +264,70 @@ HEAR_SECS=int(os.environ.get("OH_HEAR_SECS","300"))   # 5-min live window — Gr
 TRANSCRIPT_FILE=os.path.join(os.path.dirname(LOGF),"room-transcript.txt")
 MUTE_FLAG=os.path.join(os.path.dirname(LOGF),"mesh-speaking")  # set while the mesh speaks → don't self-hear
 VOICE_OFF=os.path.join(os.path.dirname(LOGF),"room-voice-off")  # operator silence switch: while this file exists, the channel emits ZERO sound to the Bose (gates ALL paths — ack, comment, mind speech). Re-enable = remove it.
+
+# --- AMBIENT LEVEL TAP (senses 2026-08-21, task ambient-level-must-share-the-room-ears-stream-not-grab-a-second-one)
+# THE ROOM HAS EXACTLY ONE MICROPHONE AND THIS DAEMON HOLDS IT, so any second grab on it can only
+# ever return EBUSY. That is not a hypothesis: mesh-ambient-level opened its own 1s arecord on the
+# same card0 (USB2.0 Camera), got `Device or resource busy` every time, fell through to the onboard
+# ALC897 jack with NOTHING plugged into it, and published the empty jack's quantization floor as the
+# room -- 31h of DEAF (last real tape row 2026-08-20T16:18:01Z, 991 UNREACHABLE rows after) while a
+# live stream of that same room ran through the VAD loop below, frame by frame, the whole time.
+# pw-record cannot substitute (measured 2026-08-21): with card0 held, wireplumber never presents the
+# camera at all -- `pactl list short sources` shows ONLY the ALC897 pci device -- and the default
+# source is a MONITOR of a SUSPENDED iec958 output, so pw-record returns 63800 frames of ONE distinct
+# value. There is no second path to this room's sound, and there does not need to be: the loop below
+# already computes audioop.rms() on EVERY 200ms frame. The level is DERIVED from that stream and
+# published here; mesh-ambient-level READS it instead of grabbing. This also removes a second mic
+# grab from the wedge-prone USB silicon that carries this node's sole uplink -- mesh-activity's
+# header already refuses to scan card0 for exactly that reason.
+AMBIENT_TAP=os.environ.get("OH_AMBIENT_TAP") or os.path.join(os.path.dirname(LOGF),".ambient-tap")
+# The window is the CONSUMER's cadence, not a convenient constant: mesh-ambient-tape samples */2, so
+# a 120s window makes a reading COVER its interval instead of reporting 1s of it and calling that a
+# state ([[a-senses-coverage-is-window-over-cadence]]). Flush is far shorter so the artifact's age is
+# a liveness signal with real resolution.
+AMBIENT_TAP_WINDOW=float(os.environ.get("OH_AMBIENT_TAP_WINDOW","120"))
+AMBIENT_TAP_EVERY=float(os.environ.get("OH_AMBIENT_TAP_EVERY","5"))
+AMBIENT_TAP_ON=False        # armed by the daemon branch only -- a --hear/--ingest run must not stamp
+                            # the artifact a watchdog reads for liveness
+_amb=[]                     # [(ts, rms_counts, peak_counts)] inside the rolling window
+_amb_last=0.0
+
+def _tap_dev():
+    if os.environ.get("OH_RECORDER_CMD"): return "recorder-cmd"
+    if os.environ.get("OH_CAPTURE_BACKEND","pw").lower()=="alsa":
+        return os.environ.get("OH_CAPTURE_DEV","plughw:1,0")
+    return "pw-record"
+
+def _ambient_tap(ts, r, pk):
+    """One frame in; a rolling level out every AMBIENT_TAP_EVERY seconds. Never raises into the VAD
+    loop -- the ear's job is the transcript, and a broken tap must not cost the room its ears."""
+    global _amb, _amb_last
+    if not AMBIENT_TAP_ON: return
+    try:
+        _amb.append((ts, r, pk))
+        cut=ts-AMBIENT_TAP_WINDOW
+        while _amb and _amb[0][0] < cut: _amb.pop(0)
+        if ts-_amb_last < AMBIENT_TAP_EVERY: return
+        _amb_last=ts
+        n=len(_amb)
+        if not n: return
+        rms=math.sqrt(sum(float(x[1])*float(x[1]) for x in _amb)/n)   # ENERGY average, not a mean of dB
+        pkm=max(x[2] for x in _amb)
+        rms_db=20*math.log10(rms/32768.0) if rms>0 else -999.0
+        peak_db=20*math.log10(pkm/32768.0) if pkm>0 else -999.0
+        # COVERAGE IS MEASURED, NEVER ASSUMED. A recorder that stalls keeps this deque full of OLD
+        # samples, so the window would still emit a confident dB about audio nobody heard: frames*FSEC
+        # over the wall-clock span they actually span is the only honest answer, and the consumer
+        # gates on it. It is published IN the reading, not inferred by the reader.
+        span=(ts-_amb[0][0])+FSEC
+        cov=min(1.0,(n*FSEC)/span) if span>0 else 0.0
+        line=("ts=%.3f rms_db=%.1f peak_db=%.1f window_s=%.1f span_s=%.1f frames=%d coverage=%.3f "
+              "src=overhear-tap dev=%s\n")%(ts,rms_db,peak_db,AMBIENT_TAP_WINDOW,span,n,cov,_tap_dev())
+        tmp=AMBIENT_TAP+".tmp"
+        with open(tmp,"w") as f: f.write(line)
+        os.replace(tmp,AMBIENT_TAP)   # atomic: a racing reader never sees a half-written level
+    except Exception:
+        pass
 
 # DIAGNOSTIC TAPE — durable, and NOT the transcript window. Every note below ([claim-order], the STT
 # fallbacks, the Groq cooldown) used to append to LOGF in an untabbed `HH:MM:SS  [tag] msg` form while
@@ -1298,10 +1362,16 @@ def capture_utterance():
             buf=read_exact(p.stdout,FBYTES,STALL_SECS)
             if len(buf)<FBYTES: break
             got_frame=True
+            r=audioop.rms(buf,2)
+            # THE TAP IS FED BEFORE THE MUTE DRAIN, DELIBERATELY. MUTE_FLAG means the mesh is
+            # speaking on the Bose, and those frames are wrong for the TRANSCRIPT (we'd hear
+            # ourselves) but exactly right for the LEVEL: mesh-audio-path crosses emission against
+            # this axis, so a tap that went silent while the mesh played would mint the same
+            # "PLAYING + SILENCE -> SINK-DEAD-SUSPECT" accusation the dead mic used to.
+            _ambient_tap(time.time(), r, audioop.max(buf,2))
             if os.path.exists(MUTE_FLAG):     # the mesh is speaking on the Bose → drain, don't capture self
                 capturing=False; frames=[]; silence=0.0
                 continue
-            r=audioop.rms(buf,2)
             if not capturing:
                 if r>=START_RMS: capturing=True; frames=[buf]; silence=0.0
             else:
@@ -1366,6 +1436,7 @@ def relay(prompt):
 mode=sys.argv[1] if len(sys.argv)>1 else ""
 
 if mode=="daemon":
+    AMBIENT_TAP_ON=True   # the ONLY 24/7 reader of this mic is the only honest publisher of its level
     # ON-DEMAND: don't transcribe continuously (that lagged behind reality and desynced what Claude heard
     # — operator 2026-06-20). Just VAD-capture utterances into a cheap rolling AUDIO buffer; whisper runs
     # only at a trigger. default-string does ZERO whisper → never heats; IdeaPad transcribes only on demand.
@@ -1405,6 +1476,21 @@ if mode=="daemon":
                         except (ValueError,OSError): pass
         except Exception:
             time.sleep(0.5)
+
+elif mode=="ambient_tap_probe":
+    # TEST hook: feed synthetic frames straight into the tap and print the line it publishes, so the
+    # gate can be driven RED (a quantization-floor stream must NOT come out as a plausible level; a
+    # stalled recorder must NOT come out at full coverage) without a microphone. argv[2] = amplitude
+    # in raw s16 counts, argv[3] = number of frames, argv[4] = seconds of wall-clock the frames are
+    # spread over (a stall is "few frames over a long span"). Never set in production.
+    AMBIENT_TAP_ON=True
+    AMBIENT_TAP_EVERY=0.0
+    _amp=int(sys.argv[2]); _n=int(sys.argv[3]); _span=float(sys.argv[4]) if len(sys.argv)>4 else None
+    _step=FSEC if _span is None else (_span/max(1,_n-1) if _n>1 else FSEC)
+    _t0=time.time()-(_step*(_n-1))
+    for _i in range(_n):
+        _ambient_tap(_t0+_i*_step, _amp, _amp)
+    sys.stdout.write(open(AMBIENT_TAP).read())
 
 elif mode=="capture_probe":
     # TEST hook: call capture_utterance() once and report the (wav?, err) contract so --test can assert
@@ -1966,6 +2052,35 @@ case "${1:-}" in
     case "$(runpy gate_kind ambient)" in *гул*)    : ;; *) echo "smoke-test: FAIL (gate ambient marker)"; exit 1;; esac
     case "$(runpy gate_kind music)"   in *музыка*) : ;; *) echo "smoke-test: FAIL (gate music marker)"; exit 1;; esac
     echo "  pre-STT VAD gate mapping ok (silence/ambient/music → skip-whisper marker)"
+    # --- AMBIENT LEVEL TAP, both directions + coverage (task ambient-level-must-share-the-room-ears-
+    # stream-not-grab-a-second-one). While this daemon holds card0 the tap is the ONLY path to this
+    # room's level, so it is gated like one: a gate seen only green is not a gate.
+    # DIVERTED FIRST — this dry-run must never stamp the artifact mesh-ambient-level ages for
+    # liveness, or the smoke sweep forges the evidence the freshness check exists to find.
+    _amb_live="$MESH/.ambient-tap"
+    _amb_live_before="$( { [ -e "$_amb_live" ] && stat -c %Y.%y "$_amb_live"; } 2>/dev/null || echo absent )"
+    _amb_tap="$(mktemp "${TMPDIR:-/tmp}"/oh-ambient-tap-XXXXXX)"
+    _amb_field() { printf '%s\n' "$1" | tr ' ' '\n' | sed -n "s/^$2=//p"; }
+    # (a) a real room signal (800 counts ≈ -32dB) must publish a real level at full coverage
+    _amb_out="$(OH_AMBIENT_TAP="$_amb_tap" runpy ambient_tap_probe 800 600)"
+    _amb_db="$(_amb_field "$_amb_out" rms_db)"; _amb_cov="$(_amb_field "$_amb_out" coverage)"
+    case "$_amb_db" in ''|*[!-0-9.]*) echo "smoke-test: FAIL (ambient tap published no rms_db: '${_amb_out:-empty}')"; exit 1 ;; esac
+    awk -v d="$_amb_db" 'BEGIN{exit !(d>-40 && d<-25)}' || { echo "smoke-test: FAIL (800-count frames published rms_db=$_amb_db, expected ≈-32dB — the tap's dB math does not match the analyzer's)"; exit 1; }
+    awk -v c="$_amb_cov" 'BEGIN{exit !(c>0.9)}' || { echo "smoke-test: FAIL (contiguous frames published coverage=$_amb_cov, expected ≈1.0)"; exit 1; }
+    # (b) RED ARM: a stream sitting at the quantization floor must come out AT the floor, never as a
+    # plausible quiet room — that laundering is the whole 31h fault, one layer up.
+    _amb_out="$(OH_AMBIENT_TAP="$_amb_tap" runpy ambient_tap_probe 1 600)"
+    _amb_db="$(_amb_field "$_amb_out" rms_db)"
+    awk -v d="$_amb_db" 'BEGIN{exit !(d<=-85)}' || { echo "smoke-test: FAIL (±1-LSB dither published rms_db=$_amb_db, above the -85dB floor — a dead capture path is being served as a room reading)"; exit 1; }
+    # (c) a STALLED recorder (10 frames spread over 120s) must confess it in coverage, not emit a
+    # confident dB about audio nobody heard.
+    _amb_out="$(OH_AMBIENT_TAP="$_amb_tap" runpy ambient_tap_probe 800 10 120)"
+    _amb_cov="$(_amb_field "$_amb_out" coverage)"
+    awk -v c="$_amb_cov" 'BEGIN{exit !(c<0.5)}' || { echo "smoke-test: FAIL (10 frames over 120s published coverage=$_amb_cov — a stalled recorder reads as a covered window)"; exit 1; }
+    rm -f "$_amb_tap" "$_amb_tap.tmp"
+    _amb_live_after="$( { [ -e "$_amb_live" ] && stat -c %Y.%y "$_amb_live"; } 2>/dev/null || echo absent )"
+    [ "$_amb_live_before" = "$_amb_live_after" ] || { echo "smoke-test: FAIL (the tap dry-run wrote the LIVE $_amb_live — it forges the liveness mesh-ambient-level reads)"; exit 1; }
+    echo "  ambient level tap ok (real signal → level, floor → floor, stall → low coverage, live artifact untouched)"
     # no-backoff respawn gate (discover/overhear-recorder-respawn-loop-no-backoff, 2026-07-27): a recorder
     # that dies instantly with no stdout is a CLEAN short-read, not an exception, so the daemon's
     # except-branch sleep never fired and arecord respawned ~861/s for 4.7h (10% of a core). Assert BOTH

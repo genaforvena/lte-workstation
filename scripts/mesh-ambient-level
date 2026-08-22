@@ -1,8 +1,29 @@
 #!/usr/bin/env bash
-# mesh-ambient-level — ambient sound level sense (IdeaPad mic)
+# mesh-ambient-level — ambient sound level sense
 #
-# Reads 1s of audio from the built-in mic, computes RMS dB, classifies level.
-# Zero phone dependency — runs entirely on the IdeaPad.
+# Computes RMS dB of the room and classifies it. PRIMARY PATH: read the level the room ear
+# (mesh-overhear --daemon) already derives from its own 24/7 capture. FALLBACK: a direct 1s grab,
+# for nodes where nothing else holds the mic.
+#
+# SHARE THE STREAM, NEVER GRAB A SECOND ONE (mesh-home 2026-08-21, senses;
+# task ambient-level-must-share-the-room-ears-stream-not-grab-a-second-one).
+# This room has exactly ONE microphone it is audible on (card0, USB2.0 Camera) and the room ear
+# holds it continuously with a raw-ALSA arecord, because the transcript is the higher-value
+# consumer. So the 1s grab below could only ever return EBUSY — and it did, for 31 hours, falling
+# through to an onboard ALC897 jack with nothing plugged into it and publishing that jack's
+# quantization floor as the room (last real tape row 2026-08-20T16:18:01Z, 991 UNREACHABLE rows
+# after). pw-record cannot substitute: with card0 held, wireplumber never presents the camera at
+# all (`pactl list short sources` shows ONLY the ALC897 pci device) and the default source is a
+# MONITOR of a SUSPENDED iec958 output, so pw-record returns 63800 frames of ONE distinct value.
+# The device loop's per-device honesty (below) was the right diagnosis and the wrong cure: naming
+# the fault precisely still left the room blind. A contended organ is not repaired by probing it
+# harder — the reading has to come from whoever already holds it. mesh-overhear now publishes
+# ~/.mesh/.ambient-tap (rms/peak/coverage over a rolling window, atomically, every few seconds)
+# off the frames it is already rms-ing for VAD, and this sense READS it. Zero extra mic grabs on
+# silicon that wedges (mesh-activity's header already refuses to scan card0 for that reason), and
+# the vantage improves: the level now comes from the mic the room is actually audible on.
+# The tap is trusted only while it is FRESH and COVERED — a dead daemon must age into DEAF, never
+# into a stale plausible SILENCE, which is the same lie in a new costume.
 #
 # Output: SILENCE / QUIET / MODERATE / LOUD + dB reading
 # Exit 2 = mic unreachable (no capture device, arecord fails, or a DEAF capture — see below)
@@ -60,11 +81,111 @@ SAMPLE_WAV="$MESH/.ambient-sample.wav"
 DURATION=1
 RATE=16000
 
-# Capture a real frame from the mic. The default ALSA path is not always the live one on this node:
-# some sessions own capture through PipeWire or a non-default card, so we probe the actual device
-# list first and only fall back to pw-record if raw ALSA cannot produce a frame.
+# The floor is ONE anchored number, read here so the device loop and the verdict gate downstream
+# cannot drift apart into two thresholds that disagree about the same frame.
+FLOOR_DB="${MESH_AMBIENT_FLOOR_DB:--85}"
+
+# THE TAP: the room ear's own level, published by mesh-overhear --daemon (see the header). Trusted
+# only while fresh AND covered. MAX_AGE is a lease over the tap's own ~5s flush — 90s tolerates a
+# busy node without ever laundering a dead daemon; MIN_COVERAGE rejects a reading whose recorder
+# stalled mid-window (the tap measures and publishes that itself, so this is a gate on a real
+# number, not on an assumption).
+TAP_FILE="${MESH_AMBIENT_TAP:-$MESH/.ambient-tap}"
+TAP_MAX_AGE="${MESH_AMBIENT_TAP_MAX_AGE:-90}"
+TAP_MIN_COVERAGE="${MESH_AMBIENT_TAP_MIN_COVERAGE:-0.5}"
+TAP_SRC=""; TAP_AGE=""; TAP_COV=""; TAP_WINDOW=""; TAP_SKIP=""   # why the tap was not used, verbatim, for the verdict
+
+# ONE classifier for BOTH paths. The bands used to live inside the wav analyzer's python; the tap
+# path would have needed its own copy, i.e. a second set of the same three constants free to rot
+# apart from the first. They are read here, once, and the analyzer now returns numbers only.
+SILENCE_MAX_DB="${MESH_AMBIENT_SILENCE_DB:--45}"
+QUIET_MAX_DB="${MESH_AMBIENT_QUIET_DB:--30}"
+MODERATE_MAX_DB="${MESH_AMBIENT_MODERATE_DB:--20}"
+_classify() {  # <rms_db> -> SILENCE|QUIET|MODERATE|LOUD
+  awk -v d="${1:--999}" -v s="$SILENCE_MAX_DB" -v q="$QUIET_MAX_DB" -v m="$MODERATE_MAX_DB" \
+    'BEGIN{ if(d<s) print "SILENCE"; else if(d<q) print "QUIET"; else if(d<m) print "MODERATE"; else print "LOUD" }'
+}
+
+# Per-device outcome, so a verdict can never again name a device it did not read. Empty means the
+# run never reached that outcome — these are reported verbatim in the DEAF line and the JSON.
+CAPTURE_DEV=""    # the device that produced the ACCEPTED reading
+CAPTURE_HELD=""   # devices that returned EBUSY — the mic exists and something else is reading it
+CAPTURE_FLAT=""   # devices that opened and sat at/below the quantization floor (an empty jack)
+CAPTURE_FAIL=""   # devices that produced no usable payload at all
+
+_rms_db() {  # <wav> -> DC-removed rms in dBFS, or -999. Same math as the analyzer below.
+  python3 - "$1" <<'PY' 2>/dev/null
+import sys, wave, struct, math
+try:
+    w = wave.open(sys.argv[1], 'r'); f = w.readframes(w.getnframes()); w.close()
+    s = struct.unpack('<%dh' % (len(f) // 2), f)
+    if not s:
+        print('-999'); raise SystemExit
+    m = sum(s) / len(s)
+    r = math.sqrt(sum((x - m) ** 2 for x in s) / len(s))
+    print('%.1f' % (20 * math.log10(r / 32768)) if r > 0 else '-999')
+except Exception:
+    print('-999')
+PY
+}
+
+_below_floor() {  # <rms_db> -> 0 when the frame carries quantization, not a room
+  python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) <= float(sys.argv[2]) else 1)' \
+    "${1:--999}" "$FLOOR_DB" 2>/dev/null
+}
+
+# READ THE ROOM EAR'S TAP. Sets rms_db/peak_db and returns 0 when the tap carries a usable reading;
+# otherwise records WHY in TAP_SKIP and returns 1 so the caller falls through to the device loop.
+# Every refusal is named — "the tap was not used" with no reason is how a silent fallback starts.
+read_tap() {
+  local line now age cov src
+  [ -s "$TAP_FILE" ] || { TAP_SKIP="absent"; return 1; }
+  line="$(head -n 1 "$TAP_FILE" 2>/dev/null)"
+  # Age off the PUBLISHED ts, not the file mtime: they agree today, and if they ever stop agreeing
+  # the published one is the one that came from the audio.
+  TAP_AGE="$(printf '%s\n' "$line" | tr ' ' '\n' | sed -n 's/^ts=//p')"
+  rms_db="$(printf '%s\n' "$line" | tr ' ' '\n' | sed -n 's/^rms_db=//p')"
+  peak_db="$(printf '%s\n' "$line" | tr ' ' '\n' | sed -n 's/^peak_db=//p')"
+  cov="$(printf '%s\n' "$line" | tr ' ' '\n' | sed -n 's/^coverage=//p')"
+  src="$(printf '%s\n' "$line" | tr ' ' '\n' | sed -n 's/^dev=//p')"
+  TAP_WINDOW="$(printf '%s\n' "$line" | tr ' ' '\n' | sed -n 's/^window_s=//p')"
+  case "$rms_db" in ''|*[!-0-9.]*) TAP_SKIP="unparsable"; return 1 ;; esac
+  case "$TAP_AGE" in ''|*[!-0-9.]*) TAP_SKIP="unparsable"; return 1 ;; esac
+  now="$(date +%s)"
+  age="$(awk -v n="$now" -v t="$TAP_AGE" 'BEGIN{printf "%.0f", n-t}')"
+  TAP_AGE="$age"; TAP_COV="$cov"
+  awk -v a="$age" -v m="$TAP_MAX_AGE" 'BEGIN{exit !(a<=m)}' || { TAP_SKIP="stale(${age}s>${TAP_MAX_AGE}s)"; return 1; }
+  awk -v c="${cov:-0}" -v m="$TAP_MIN_COVERAGE" 'BEGIN{exit !(c>=m)}' || { TAP_SKIP="uncovered(${cov:-na}<${TAP_MIN_COVERAGE})"; return 1; }
+  TAP_SRC="overhear-tap@${src:-unknown}"
+  CAPTURE_DEV="$TAP_SRC"
+  return 0
+}
+
+# THE FLOOR BELONGS IN THE DEVICE LOOP, NOT ONLY AFTER IT (mesh-home 2026-08-21, senses).
+# Measured on the live fault: `arecord -l` lists card0 (USB2.0 Camera — the ONLY mic that carries
+# this room) first, then card2 (onboard ALC897, an analog jack with NOTHING plugged into it). The
+# room ear holds card0 continuously (`arecord -D plughw:CARD=Camera`, a 24/7 raw-ALSA grab), so
+# card0 returns EBUSY, the loop falls THROUGH to card2, card2 opens fine and hands back its own
+# quantization floor — rms -86.0 dB, NINE distinct sample values in 16000 (card2 dev2 gives ONE:
+# literal all-zeros) — and `_has_signal` passed it, because it asks only for a non-zero BYTE.
+# The loop then returned that jack's silence as THE capture, the floor gate downstream fired, and
+# the sense published `DEAF — a dead capture PATH` about a microphone that was merely IN USE.
+# 31 hours of it (last real tape row 2026-08-20T16:18:01Z, 991 UNREACHABLE rows after), with
+# mesh-activity honestly held at UNCERTAIN the whole time and nobody able to read WHY from the
+# artifact. Three separate faults, all in this loop:
+#   (a) a device at the quantization floor is NOT a capture — it is the same non-reading the gate
+#       downstream exists to name, so accepting it here just moves the lie one frame earlier and
+#       short-circuits the pw-record fallback the BUSY comment below was written to reach;
+#   (b) a floor reading from card2 was attributed to "the mic", i.e. to card0 — the verdict named
+#       a device it never read ([[a-shared-failure-mode-lets-a-probe-blame-the-far-end]]);
+#   (c) EBUSY and "opened and produced nothing" are DIFFERENT WORLDS with different remedies —
+#       one is a contended organ (share the stream), the other is broken hardware (fix the mic) —
+#       and the loop collapsed both into one word.
+# So: every device outcome is recorded and NAMED, the floor is applied per-device with the SAME
+# anchored FLOOR_DB the gate downstream uses (no second constant to rot), and a run that captures
+# nothing says which devices were HELD, which sat at the floor, and which simply failed.
 capture_wav() {
-  local out="$1" err="$(mktemp "${TMPDIR:-/tmp}"/ambient-err.XXXXXX)" devs dev
+  local out="$1" err="$(mktemp "${TMPDIR:-/tmp}"/ambient-err.XXXXXX)" devs dev _db
   trap 'rm -f "$err"' RETURN
   # a valid capture = real payload AND at least one non-zero sample: a wrong/muted ALSA device
   # happily writes a full-length ALL-ZERO wav (rms -999 -> fake SILENCE while music played,
@@ -72,24 +193,46 @@ capture_wav() {
   # has a noise floor). Zero-file -> try the next device / pw-record.
   _has_signal() { [ "$(stat -c %s "$1" 2>/dev/null || echo 0)" -gt 1000 ] && [ "$(tail -c +45 "$1" | tr -d '\0' | head -c 1 | wc -c)" -gt 0 ]; }
 
+  _try_dev() {   # <label> <wav> -> 0 when this device produced a REAL room reading
+    local lbl="$1" w="$2"
+    if grep -qiE 'resource busy|device busy' "$err" 2>/dev/null; then
+      # The mic EXISTS and something is reading it. That is not a dead path — it is a contended
+      # organ, and the remedy is to share the stream, never to repair hardware that is working.
+      CAPTURE_HELD="${CAPTURE_HELD:+$CAPTURE_HELD,}$lbl"; return 1
+    fi
+    _has_signal "$w" || { CAPTURE_FAIL="${CAPTURE_FAIL:+$CAPTURE_FAIL,}$lbl"; return 1; }
+    _db="$(_rms_db "$w")"
+    if _below_floor "$_db"; then
+      # Opened, produced a full-length frame, and carried no acoustic information whatsoever.
+      # Named, not silently skipped: this is exactly how an unconnected jack impersonates a mic.
+      CAPTURE_FLAT="${CAPTURE_FLAT:+$CAPTURE_FLAT,}${lbl}@${_db}dB"; return 1
+    fi
+    CAPTURE_DEV="$lbl"; return 0
+  }
+
   if command -v arecord >/dev/null 2>&1; then
     devs="$(arecord -l 2>/dev/null | sed -n 's/^card \([0-9]\+\): .*device \([0-9]\+\):.*/\1,\2/p')"
     for dev in $devs; do
-      rm -f "$out"
+      rm -f "$out"; : > "$err"
       flock -w 8 /tmp/.mesh-mic.lock timeout 3 arecord -f S16_LE -r "$RATE" -c 1 -d "$DURATION" -D "plughw:$dev" "$out" >/dev/null 2>"$err" || true
-      _has_signal "$out" && return 0
+      _try_dev "plughw:$dev" "$out" && return 0
       # BUSY = another capturer (overhear daemon) holds this raw ALSA device — NOT a success:
       # returning 0 with an empty file fed all-zero samples to the analyzer -> a fake SILENCE
       # verdict while music played (ds, 2026-07-05). Try the next device / the pw-record
-      # fallback below — PipeWire multiplexes and captures fine alongside the daemon.
+      # fallback below. NOTE the pw-record claim in that original comment — "PipeWire multiplexes
+      # and captures fine alongside the daemon" — is REFUTED on mesh-home 2026-08-21: with card0
+      # held, wireplumber never presents the camera at all (`pactl list short sources` shows only
+      # the ALC897 pci device) and the default source is a MONITOR of a SUSPENDED iec958 output,
+      # so pw-record returns 63800 frames of ONE distinct value. The fallback is kept because it
+      # is right where PipeWire DOES own the card; it is no longer trusted to exist.
     done
   fi
 
   if command -v pw-record >/dev/null 2>&1; then
-    rm -f "$out"
+    rm -f "$out"; : > "$err"
     XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" \
       timeout 3 pw-record --rate "$RATE" --channels 1 --format s16 "$out" >/dev/null 2>"$err" || true
-    _has_signal "$out" && return 0
+    _try_dev "pw-record" "$out" && return 0
   fi
 
   return 1
@@ -105,6 +248,11 @@ if [ "${1:-}" = --test ]; then
   _live_before="$(stat -c %Y.%y "$MESH/.ambient-level" 2>/dev/null)|$(stat -c %Y.%y "$MESH/.ambient-level-db" 2>/dev/null)"
   export MESH_TEST_SANDBOX=1
   MESH_AMBIENT_SANDBOX_DIR="$(mktemp -d "${TMPDIR:-/tmp}"/ambient-test.XXXXXX)"; export MESH_AMBIENT_SANDBOX_DIR
+  # DIVERT THE TAP TOO. Every stubbed leg below asserts the FALLBACK device loop, and the tap is now
+  # the primary path — on a node where the room ear is running, a live tap would satisfy each of them
+  # before the stub was ever consulted and they would pass while proving nothing. Pointed at a path
+  # that does not exist; each tap leg writes its own fixture there.
+  MESH_AMBIENT_TAP="$MESH_AMBIENT_SANDBOX_DIR/.ambient-tap"; export MESH_AMBIENT_TAP
   trap 'rm -rf "$MESH_AMBIENT_SANDBOX_DIR"' EXIT
 
   # ORDER MATTERS: the live-read leg below exits 0 early on an unreachable mic — and with the floor
@@ -132,13 +280,107 @@ PY
   _ec=0; _out="$(MESH_AMBIENT_FIXTURE_WAV="$_fx/floor.wav" "$0" --json 2>/dev/null)" || _ec=$?
   [ "$_ec" -eq 2 ] || { echo "smoke-test: FAIL (floor fixture rms~-90dB returned exit $_ec, expected 2 — the quantization floor is being served as a room reading)"; exit 1; }
   case "$_out" in *'"label":"DEAF"'*) : ;; *) echo "smoke-test: FAIL (floor fixture labelled '${_out:-empty}', expected DEAF)"; exit 1 ;; esac
-  [ "$(cat "$_fx/.ambient-level" 2>/dev/null)" = DEAF ] || { echo "smoke-test: FAIL (DEAF verdict did not reach the state file — a consumer reading the artifact still sees the stale level)"; exit 1; }
+  [ "$(cat "$_fx/.ambient-level" 2>/dev/null)" = "DEAF|reason=floor" ] || { echo "smoke-test: FAIL (DEAF verdict did not reach the state file as 'DEAF|reason=floor' — got '$(cat "$_fx/.ambient-level" 2>/dev/null)'; a consumer reading the artifact still sees the stale level, or the cause field was dropped)"; exit 1; }
+  # field 1 is the CONTRACT: four consumers cut on '|' or allowlist the bare token, so the cause
+  # field must never displace the label a reader has always seen.
+  [ "$(cut -d'|' -f1 < "$_fx/.ambient-level")" = DEAF ] || { echo "smoke-test: FAIL (field 1 of the state line is not the bare label DEAF — the consumer contract moved)"; exit 1; }
 
   _ec=0; _out="$(MESH_AMBIENT_FIXTURE_WAV="$_fx/tone.wav" "$0" --json 2>/dev/null)" || _ec=$?
   [ "$_ec" -eq 0 ] || { echo "smoke-test: FAIL (-40dBFS tone returned exit $_ec — the floor gate is swallowing real signal)"; exit 1; }
   case "$_out" in *'"label":"QUIET"'*|*'"label":"MODERATE"'*|*'"label":"LOUD"'*) : ;; *) echo "smoke-test: FAIL (-40dBFS tone labelled '${_out:-empty}', expected a real level)"; exit 1 ;; esac
 
-  # Must produce a valid classification, or exit 2 if mic unavailable
+  # --- HELD IS NOT DEAD, AND A FLOOR DEVICE IS NOT THE CAPTURE (2026-08-21, the 31h fault) ---
+  # Stub `arecord` reproduces this node exactly: card0 is the room's real mic and returns EBUSY
+  # (the room ear holds it 24/7), card2 is an onboard jack with nothing in it. Before this fix the
+  # loop skipped card0, ACCEPTED card2's quantization floor, and published `DEAF — a dead capture
+  # PATH` — a verdict about a device it never read. Both directions are asserted: with card2 at
+  # the floor the run must come back HELD and name both cards' outcomes; with card2 carrying a
+  # real tone the SAME loop must accept it, so the gate cannot pass by rejecting everything.
+  _stub="$_fx/stub"; mkdir -p "$_stub"
+  cat > "$_stub/arecord" <<STUB
+#!/bin/sh
+if [ "\$1" = -l ]; then
+  echo 'card 0: Camera [USB2.0 Camera], device 0: USB Audio [USB Audio]'
+  echo 'card 2: Generic [HD-Audio Generic], device 0: ALC897 Analog [ALC897 Analog]'
+  exit 0
+fi
+_dev=; _out=
+while [ \$# -gt 0 ]; do
+  case "\$1" in -D) _dev="\$2"; shift ;; -*) : ;; *) _out="\$1" ;; esac
+  shift
+done
+case "\$_dev" in
+  plughw:0,0) echo 'arecord: main:834: audio open error: Device or resource busy' >&2; exit 1 ;;
+  plughw:2,0) cp "$_fx/\$MESH_STUB_CARD2" "\$_out"; exit 0 ;;
+esac
+exit 1
+STUB
+  printf '#!/bin/sh\nexit 1\n' > "$_stub/pw-record"    # PipeWire does NOT present a held card here
+  chmod +x "$_stub/arecord" "$_stub/pw-record"
+
+  _ec=0; _out="$(MESH_STUB_CARD2=floor.wav PATH="$_stub:/usr/bin:/bin" "$0" --json 2>/dev/null)" || _ec=$?
+  [ "$_ec" -eq 2 ] || { echo "smoke-test: FAIL (busy-mic + empty-jack returned exit $_ec, expected 2 — the unconnected jack is being served as the room)"; exit 1; }
+  case "$_out" in *'"reason":"held"'*) : ;; *) echo "smoke-test: FAIL (a mic that returned EBUSY must render reason=held, not a dead-path verdict; got '${_out:-empty}')"; exit 1 ;; esac
+  case "$_out" in *'"held":"plughw:0,0"'*) : ;; *) echo "smoke-test: FAIL (the HELD device is not named — a busy verdict that cannot say which device is unactionable; got '${_out:-empty}')"; exit 1 ;; esac
+  case "$_out" in *'plughw:2,0@'*) : ;; *) echo "smoke-test: FAIL (the floor device was not recorded in at_floor — it was accepted as the capture, which is the whole fault; got '${_out:-empty}')"; exit 1 ;; esac
+  [ "$(cat "$_fx/.ambient-level" 2>/dev/null)" = "DEAF|reason=held" ] || { echo "smoke-test: FAIL (held cause did not reach the state file — got '$(cat "$_fx/.ambient-level" 2>/dev/null)'; the reader still cannot tell a contended mic from a broken one)"; exit 1; }
+
+  _ec=0; _out="$(MESH_STUB_CARD2=tone.wav PATH="$_stub:/usr/bin:/bin" "$0" --json 2>/dev/null)" || _ec=$?
+  [ "$_ec" -eq 0 ] || { echo "smoke-test: FAIL (a live card2 behind a busy card0 returned exit $_ec — the loop now rejects everything, which is a different lie)"; exit 1; }
+  case "$_out" in *'"dev":"plughw:2,0"'*) : ;; *) echo "smoke-test: FAIL (an accepted reading must name the device it came from; got '${_out:-empty}')"; exit 1 ;; esac
+
+  # --- THE SHARED TAP IS THE PRIMARY PATH (task ambient-level-must-share-the-room-ears-stream-not-
+  # grab-a-second-one). Driven with an arecord stub that would FAIL LOUDLY if it were reached, so a
+  # green here proves the reading came from the tap and no second device was opened — the whole cure.
+  # All four legs share that stub; each writes its own tap fixture.
+  _tapstub="$_fx/tapstub"; mkdir -p "$_tapstub"
+  printf '#!/bin/sh\necho "smoke-test: FAIL (a device was opened while a usable tap existed)" >&2\nexit 1\n' > "$_tapstub/arecord"
+  cp "$_tapstub/arecord" "$_tapstub/pw-record"; chmod +x "$_tapstub/arecord" "$_tapstub/pw-record"
+  _tapfile="$MESH_AMBIENT_TAP"
+  _tap_write() {  # <age_secs> <rms_db> <coverage>
+    printf 'ts=%s rms_db=%s peak_db=%s window_s=120.0 span_s=120.0 frames=600 coverage=%s src=overhear-tap dev=plughw:CARD=Camera,DEV=0\n' \
+      "$(( $(date +%s) - $1 ))" "$2" "$2" "$3" > "$_tapfile"
+  }
+
+  # (a) fresh + covered + a real level -> USE IT, name it, and open nothing
+  _tap_write 5 -25.0 0.998
+  _ec=0; _out="$(PATH="$_tapstub:/usr/bin:/bin" "$0" --json 2>/dev/null)" || _ec=$?
+  [ "$_ec" -eq 0 ] || { echo "smoke-test: FAIL (a fresh covered tap returned exit $_ec — the shared stream is not being read, which is the entire fix)"; exit 1; }
+  case "$_out" in *'"src":"tap"'*) : ;; *) echo "smoke-test: FAIL (reading did not come from the tap; got '${_out:-empty}')"; exit 1 ;; esac
+  case "$_out" in *'"label":"MODERATE"'*) : ;; *) echo "smoke-test: FAIL (-25.0dB off the tap classified as '${_out:-empty}', expected MODERATE — the tap path is not using the shared classifier)"; exit 1 ;; esac
+  case "$_out" in *'"duration":120.0'*) : ;; *) echo "smoke-test: FAIL (tap reading reported a duration that is not its 120s window — a 120s state would be aged as a 1s sample; got '${_out:-empty}')"; exit 1 ;; esac
+  [ "$(cat "$_fx/.ambient-level" 2>/dev/null)" = MODERATE ] || { echo "smoke-test: FAIL (tap reading did not reach the state file; got '$(cat "$_fx/.ambient-level" 2>/dev/null)')"; exit 1; }
+
+  # (b) RED ARM — a STALE tap must NOT be served. A dead room ear ageing into a plausible SILENCE is
+  # the same silent-fallback lie the floor gate exists for, one layer up.
+  _tap_write 4000 -31.4 0.998
+  _ec=0; _out="$(PATH="$_tapstub:/usr/bin:/bin" "$0" --json 2>/dev/null)" || _ec=$?
+  [ "$_ec" -eq 2 ] || { echo "smoke-test: FAIL (a 4000s-old tap returned exit $_ec — a dead room ear is being served as a live room)"; exit 1; }
+  case "$_out" in *'"tap":"stale('*) : ;; *) echo "smoke-test: FAIL (a stale tap must say so in the verdict, with its age; got '${_out:-empty}')"; exit 1 ;; esac
+
+  # (c) RED ARM — a tap whose recorder STALLED mid-window publishes low coverage, and a confident dB
+  # over audio nobody heard is not a reading.
+  _tap_write 5 -31.4 0.02
+  _ec=0; _out="$(PATH="$_tapstub:/usr/bin:/bin" "$0" --json 2>/dev/null)" || _ec=$?
+  [ "$_ec" -eq 2 ] || { echo "smoke-test: FAIL (a tap at coverage 0.02 returned exit $_ec — a stalled recorder reads as a covered room)"; exit 1; }
+  case "$_out" in *'"tap":"uncovered('*) : ;; *) echo "smoke-test: FAIL (an uncovered tap must say so in the verdict; got '${_out:-empty}')"; exit 1 ;; esac
+
+  # (d) the floor gate still binds ON the tap: sharing the stream must not become a way to launder a
+  # dead capture path into a plausible SILENCE.
+  _tap_write 5 -90.1 0.998
+  _ec=0; _out="$(PATH="$_tapstub:/usr/bin:/bin" "$0" --json 2>/dev/null)" || _ec=$?
+  [ "$_ec" -eq 2 ] || { echo "smoke-test: FAIL (a tap sitting at the quantization floor returned exit $_ec — the floor gate does not bind on the shared path)"; exit 1; }
+  case "$_out" in *'"reason":"floor"'*) : ;; *) echo "smoke-test: FAIL (a floor-level tap must render reason=floor; got '${_out:-empty}')"; exit 1 ;; esac
+  rm -f "$_tapfile"
+
+  # Must produce a valid classification, or exit 2 if mic unavailable.
+  # THE REAL TAP, not the fixture: unset the divert so this leg exercises the live shared stream.
+  # Reading it cannot forge anything (the write is mesh-overhear's), and a --test that only ever
+  # sees its own fixtures has asserted nothing about the organ.
+  unset MESH_AMBIENT_TAP
+  # Clear the sandbox state the earlier legs wrote, so the "the child wrote into the sandbox"
+  # assertion below is about THIS run and not about leg (a)'s leftovers.
+  rm -f "$MESH_AMBIENT_SANDBOX_DIR/.ambient-level" "$MESH_AMBIENT_SANDBOX_DIR/.ambient-level-db"
   ec=0
   out="$("$0" --json 2>/dev/null)" || ec=$?
 
@@ -169,17 +411,68 @@ trap 'rm -f "$tmp_wav"' EXIT
 # Test-only capture injection. The FIXTURE IS A WAV, never a pre-computed dB: it enters at the
 # capture boundary and runs the whole analyzer + floor gate, so the gate is asserted on the path
 # the live read uses (a fixture injected past the parser asserts nothing about the parser).
-FLOOR_DB="${MESH_AMBIENT_FLOOR_DB:--85}"
+FROM_TAP=0
 if [ -n "${MESH_AMBIENT_FIXTURE_WAV:-}" ]; then
   cp -f "$MESH_AMBIENT_FIXTURE_WAV" "$tmp_wav" 2>/dev/null \
     || { echo "mesh-ambient-level: FAIL (fixture wav unreadable: $MESH_AMBIENT_FIXTURE_WAV)"; exit 1; }
+elif read_tap; then
+  # THE PRIMARY PATH (see header): the room ear already holds the only mic this room is audible on
+  # and publishes its level. No device is opened here at all — not even to "confirm", because the
+  # only thing a second grab can confirm on this node is EBUSY.
+  FROM_TAP=1
 elif ! capture_wav "$tmp_wav"; then
-  echo "mesh-ambient-level: UNREACHABLE — mic capture failed (exit 2)"
+  # NO DEVICE PRODUCED A ROOM READING. This branch used to exit 2 while leaving the artifact
+  # untouched — the exact stale-value trap the header names one screen up ("an honest exit 2 that
+  # leaves its last value on disk hands the next reader a stale SILENCE"). The DEAF branch below
+  # always wrote its state; this one did not, so the two unreachable paths disagreed about whether
+  # the reader is told anything at all. Both write now.
+  #
+  # FIELD 1 STAYS `DEAF` — that is the whole consumer contract (mesh-activity cuts on '|',
+  # mesh-social-fusion allowlists field 1, mesh-burn-window / mesh-operator-context read the bare
+  # token) and it already means the right thing here: this sense produced no room reading, do NOT
+  # read it as SILENCE. What is NEW is field 2, the CAUSE — additive, same shape as
+  # activity-tempo's `DEGRADED|reason=<slug>` — because "held" and "dead" want opposite repairs
+  # and for 31h the artifact could not tell them apart.
+  _reason="no-capture-device"
+  [ -n "$CAPTURE_FAIL" ] && _reason="capture-failed"
+  [ -n "$CAPTURE_FLAT" ] && _reason="floor"
+  [ -n "$CAPTURE_HELD" ] && _reason="held"     # last, and deliberately: a HELD mic outranks every
+  # other outcome in the same run. If the room's own microphone was busy, whatever some other card
+  # did with an empty jack is not what this sense failed on.
+  # THE TAP IS THE PRIMARY PATH, so a run that reached the device loop at all means the tap failed
+  # first — and on a node where the ear holds the mic, THAT is the actionable fault, not the EBUSY
+  # downstream of it. Naming only the busy device would send a reader to repair a working mic again.
+  _reason_tap="tap-${TAP_SKIP:-unknown}"
+  _detail="tap=${TAP_SKIP:-unknown}${TAP_AGE:+ tap-age=${TAP_AGE}s}${TAP_COV:+ tap-coverage=$TAP_COV} "
+  [ -n "$CAPTURE_HELD" ] && _detail="${_detail}held=$CAPTURE_HELD "
+  [ -n "$CAPTURE_FLAT" ] && _detail="${_detail}at-floor=$CAPTURE_FLAT "
+  [ -n "$CAPTURE_FAIL" ] && _detail="${_detail}no-payload=$CAPTURE_FAIL "
+  _holder=""
+  if [ -n "$CAPTURE_HELD" ] && command -v fuser >/dev/null 2>&1; then
+    # NAME THE HOLDER. "Busy" that cannot say who is holding it is one step from unactionable —
+    # and on this node the holder is another MESH organ (the room ear), which changes the fix from
+    # "repair the mic" to "share the stream".
+    _holder="$(fuser -v /dev/snd/pcmC*c 2>&1 | awk 'NR>1 && $NF!="" {print $NF}' | sort -u | tr '\n' ',' | sed 's/,$//')"
+  fi
+  printf 'DEAF|reason=%s\n' "$_reason" > "$STATE_FILE"
+  printf '%s %s\n' -999 -999 > "$DB_FILE"
+  if [ "${1:-}" = --json ]; then
+    printf '{"label":"DEAF","reason":"%s","tap":"%s","tap_age_s":"%s","tap_coverage":"%s","held":"%s","at_floor":"%s","no_payload":"%s","holder":"%s","rms_db":-999,"peak_db":-999,"floor_db":%s,"duration":%d,"ts":"%s"}\n' \
+      "$_reason" "${TAP_SKIP:-unknown}" "${TAP_AGE:-na}" "${TAP_COV:-na}" "$CAPTURE_HELD" "$CAPTURE_FLAT" "$CAPTURE_FAIL" "$_holder" "$FLOOR_DB" "$DURATION" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  elif [ "$_reason" = held ]; then
+    echo "mesh-ambient-level: DEAF|reason=held — the room's microphone is IN USE, not broken: ${_detail}${_holder:+holder=$_holder }(exit 2). The shared path EXISTS and is the fix: mesh-overhear --daemon publishes $TAP_FILE off the stream it already holds — this run could not use it (${TAP_SKIP:-unknown}), so repair the room ear, not the mic."
+  else
+    echo "mesh-ambient-level: DEAF|reason=$_reason — no capture device produced a room reading: ${_detail:-none of the listed devices opened}(floor ${FLOOR_DB}dB, exit 2; do NOT read this as SILENCE)"
+  fi
   exit 2
 fi
 
 # --- Analyze ---
-read -r rms_db peak_db label <<< "$(python3 -c "
+# THE TAP PATH ALREADY CARRIES rms_db/peak_db (read_tap set them off the room ear's own frames), so
+# there is nothing to analyze and, crucially, no wav to analyze it from — the whole point is that no
+# capture happened here. The wav analyzer below runs only for the fallback grab and the --test fixtures.
+if [ "$FROM_TAP" = 0 ]; then
+read -r rms_db peak_db <<< "$(python3 -c "
 import wave, math, struct, sys
 try:
     w = wave.open('$tmp_wav', 'r')
@@ -187,7 +480,7 @@ try:
     w.close()
     samples = struct.unpack('<%dh' % (len(frames)//2), frames)
     if not samples:
-        print('-999 -999 SILENCE')
+        print('-999 -999')
         sys.exit(0)
     # DC offset removal
     mean = sum(samples) / len(samples)
@@ -198,38 +491,37 @@ try:
     # Peak
     peak = max(abs(s) for s in centered)
     peak_db = 20 * math.log10(peak / 32768) if peak > 0 else -999
-    # Classify
-    if rms_db < -45:
-        label = 'SILENCE'
-    elif rms_db < -30:
-        label = 'QUIET'
-    elif rms_db < -20:
-        label = 'MODERATE'
-    else:
-        label = 'LOUD'
-    print(f'{rms_db:.1f} {peak_db:.1f} {label}')
+    print(f'{rms_db:.1f} {peak_db:.1f}')
 except Exception as e:
-    print(f'-999 -999 SILENCE', file=sys.stderr)
-    print('-999 -999 SILENCE')
+    print(f'-999 -999', file=sys.stderr)
+    print('-999 -999')
 " 2>/dev/null)"
+fi
 
 rms_db="${rms_db:--999}"
 peak_db="${peak_db:--999}"
-label="${label:-SILENCE}"
+# Classification is _classify's, for BOTH paths — the analyzer no longer carries its own copy of the
+# bands, so the tap and the grab can never disagree about what -31.4 dB means.
+label="$(_classify "$rms_db")"
 
 # --- NOISE-FLOOR PLAUSIBILITY GATE (see header) ---
 # Below the floor the capture carries quantization, not a room. Loud + rare by construction: a
 # working mic never reaches here, and when it does fire it names the number and the floor rather
 # than degrading to a plausible SILENCE. State is written DEAF (not left stale) so the artifact
 # and the exit code say the same thing.
-if python3 -c "import sys; sys.exit(0 if float('$rms_db') <= float('$FLOOR_DB') else 1)" 2>/dev/null; then
-  printf 'DEAF\n' > "$STATE_FILE"
+if _below_floor "$rms_db"; then
+  # Defence in depth: the device loop now rejects a floor-level frame per-device, so a live run
+  # reaching here means the frame passed the loop's rms check and failed the analyzer's DC-removed
+  # one (or came in through the --test fixture, which is the point of the fixture). Either way the
+  # verdict now NAMES ITS DEVICE — `DEAF` alone was a claim about "the mic" that could be sourced
+  # from a card the room has never been audible on.
+  printf 'DEAF|reason=floor\n' > "$STATE_FILE"
   printf '%s %s\n' "$rms_db" "$peak_db" > "$DB_FILE"
   if [ "${1:-}" = --json ]; then
-    printf '{"label":"DEAF","rms_db":%s,"peak_db":%s,"floor_db":%s,"duration":%d,"ts":"%s"}\n' \
-      "$rms_db" "$peak_db" "$FLOOR_DB" "$DURATION" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf '{"label":"DEAF","reason":"floor","dev":"%s","rms_db":%s,"peak_db":%s,"floor_db":%s,"duration":%d,"ts":"%s"}\n' \
+      "${CAPTURE_DEV:-fixture}" "$rms_db" "$peak_db" "$FLOOR_DB" "$DURATION" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   else
-    echo "mesh-ambient-level: DEAF — capture is at the quantization floor (rms=${rms_db}dB peak=${peak_db}dB, floor=${FLOOR_DB}dB): a dead capture PATH, not a quiet room (exit 2; do NOT read this as SILENCE)"
+    echo "mesh-ambient-level: DEAF|reason=floor — capture from ${CAPTURE_DEV:-fixture} is at the quantization floor (rms=${rms_db}dB peak=${peak_db}dB, floor=${FLOOR_DB}dB): a dead capture PATH, not a quiet room (exit 2; do NOT read this as SILENCE)"
   fi
   exit 2
 fi
@@ -240,8 +532,14 @@ printf '%s %s\n' "$rms_db" "$peak_db" > "$DB_FILE"
 
 # --- JSON output ---
 if [ "${1:-}" = --json ]; then
-  printf '{"label":"%s","rms_db":%s,"peak_db":%s,"duration":%d,"ts":"%s"}\n' \
-    "$label" "$rms_db" "$peak_db" "$DURATION" "$(date -u +%FT%TZ)"
+  # `dev` rides in the JSON and the human line only — the STATE line stays the bare label, because
+  # four separate consumers read that file and a happy-path format change is a sweep, not a field.
+  # DURATION IS THE WINDOW THE NUMBER CAME FROM, and on the tap path that is the tap's rolling
+  # window (~120s), not this tool's 1s grab. Printing 1 there would understate the coverage of the
+  # reading by two orders of magnitude — the reader would age a 120s state as a 1s sample.
+  printf '{"label":"%s","dev":"%s","src":"%s","rms_db":%s,"peak_db":%s,"duration":%s,"coverage":"%s","age_s":"%s","ts":"%s"}\n' \
+    "$label" "${CAPTURE_DEV:-fixture}" "$([ "$FROM_TAP" = 1 ] && echo tap || echo grab)" "$rms_db" "$peak_db" \
+    "$([ "$FROM_TAP" = 1 ] && echo "${TAP_WINDOW:-0}" || echo "$DURATION")" "${TAP_COV:-na}" "${TAP_AGE:-0}" "$(date -u +%FT%TZ)"
   exit 0
 fi
 
@@ -252,4 +550,10 @@ if [ "$label" != "$prev_label" ] && [ -n "$prev_label" ] && [ "${MESH_TEST_SANDB
   MESH_WHO="ambient@$(hostname)" ~/.local/bin/mesh-chat "[ambient-level] ${prev_label}→${label} (rms=${rms_db}dB)" 2>/dev/null
 fi
 
-printf 'ambient-level: %s (rms=%sdB peak=%sdB)\n' "$label" "$rms_db" "$peak_db"
+if [ "$FROM_TAP" = 1 ]; then
+  printf 'ambient-level: %s (rms=%sdB peak=%sdB over %ss, coverage=%s, age=%ss, shared from %s)\n' \
+    "$label" "$rms_db" "$peak_db" "${TAP_WINDOW:-?}" "${TAP_COV:-na}" "${TAP_AGE:-?}" "${CAPTURE_DEV:-fixture}"
+else
+  printf 'ambient-level: %s (rms=%sdB peak=%sdB over %ss, own grab from %s)\n' \
+    "$label" "$rms_db" "$peak_db" "$DURATION" "${CAPTURE_DEV:-fixture}"
+fi
