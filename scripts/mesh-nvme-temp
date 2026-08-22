@@ -1,18 +1,33 @@
 #!/usr/bin/env bash
 # reflex-cadence: */15 * * * *
 # reflex-args: --edge
-# mesh-nvme-temp — local NVMe controller temperature sense from /sys/class/nvme/*/hwmon*/temp1_input.
+# mesh-nvme-temp — local NVMe controller temperature sense from /sys/class/nvme/*/hwmon*/temp*_input.
 #
 # Why this is new:
 #   The tree already knows chassis / CPU / thermal-zone heat, but not the storage controller's own
 #   temperature. NVMe hwmon is a distinct hardware signal: it can warn about throttling or heat
 #   before generic thermal zones move.
 #
+# THE COMPOSITE IS NOT THE DRIVE'S TEMPERATURE (task mesh-nvme-temp, 2026-08-22).
+#   Until this fix the glob was `temp1_input` ONLY — temp1 is the controller's *Composite*, a
+#   vendor-defined summary, and on the BOOT+ROOT KINGSTON here it read 45.9C/COOL while temp2
+#   ("Sensor 1") sat at 74850 — EXACTLY its own published warning line temp1_max=74850. An alarm
+#   organ blind to N-1 of its N sensors reports the summary and calls it the maximum.
+#   So: enumerate EVERY temp*_input per controller with its _label, publish BOTH the composite and
+#   the hottest sensor plus WHICH label won, and derive the verdict from the hottest.
+#
+# THE ONLY REAL THRESHOLDS ARE temp1_max / temp1_crit.
+#   Per-sensor temp{N>=2}_max on this controller is 65261850 (0xFFFF in the NVMe 0.01K encoding =
+#   "unset") and temp*_min is -273150 (0 K). A ceiling of 65261.85C is not a ceiling: it passes
+#   forever and turns a threshold check into a decoration. Any _max >= 65261850 or _min <= -273150
+#   therefore renders the literal UNSET — loud, in the output, never coerced to a number — and
+#   classify_temp itself REFUSES a sentinel ceiling so no caller can smuggle one in.
+#
 # Honest contract:
 #   no readable NVMe hwmon temperature -> exit 2, never fabricate a reading
 #
 #   mesh-nvme-temp            one read → one classified line
-#   mesh-nvme-temp --json     machine-readable
+#   mesh-nvme-temp --json     machine-readable (incl. the full per-sensor array)
 #   mesh-nvme-temp --edge     emit only on band change (state still refreshed every success)
 #   mesh-nvme-temp --test     fixture-backed classifier + real-read gate
 set -uo pipefail
@@ -28,23 +43,32 @@ OFFLINEFILE="$MESH/.nvme-temp-offline"
 ROOT="${MESH_NVME_ROOT:-/sys/class/nvme}"
 mkdir -p "$MESH" 2>/dev/null || true
 
-discover_nvme() {
-  local f raw best_raw="" best_max="" best_crit="" best_src=""
-  shopt -s nullglob
-  for f in "$ROOT"/*/hwmon*/temp1_input; do
-    [ -r "$f" ] || continue
-    raw="$(cat "$f" 2>/dev/null)"
-    case "$raw" in ''|*[!0-9]*) continue ;; esac
-    if [ -z "$best_raw" ] || [ "$raw" -gt "$best_raw" ]; then
-      best_raw="$raw"
-      best_src="$f"
-      best_max="$(cat "${f%temp1_input}temp1_max" 2>/dev/null || true)"
-      best_crit="$(cat "${f%temp1_input}temp1_crit" 2>/dev/null || true)"
-    fi
-  done
-  shopt -u nullglob
-  [ -n "$best_src" ] || return 1
-  printf '%s\t%s\t%s\t%s\n' "$best_raw" "${best_max:-}" "${best_crit:-}" "$best_src"
+# The controller's "this attribute is not set" encodings, in millidegrees C as hwmon exports them.
+# 0xFFFF * 0.01 K = 655.35 K above 0 K -> 65261850 mC; 0 K -> -273150 mC.
+SENTINEL_MAX=65261850
+SENTINEL_MIN=-273150
+
+# real_thr <raw> <max|min> — prints the value ONLY if it is a threshold the controller actually
+# published. Absent, non-numeric or sentinel -> prints nothing and returns 1 (the caller renders
+# UNSET). Never returns a number for a sentinel: that is the whole point of the fix.
+real_thr() {
+  local v="${1:-}" kind="${2:-max}"
+  case "$v" in ''|-|*[!0-9-]*) return 1 ;; esac
+  case "$kind" in
+    min) [ "$v" -le "$SENTINEL_MIN" ] 2>/dev/null && return 1 ;;
+    *)   [ "$v" -ge "$SENTINEL_MAX" ] 2>/dev/null && return 1 ;;
+  esac
+  printf '%s' "$v"
+}
+
+# json_thr <raw> <max|min> — the JSON rendering of one threshold attribute:
+#   file absent      -> null   (the controller does not publish it)
+#   sentinel present -> "UNSET" (it publishes a non-threshold; say so, do not print 65261850)
+#   otherwise        -> the number
+json_thr() {
+  local v="${1:-}" kind="${2:-max}" ok
+  [ -n "$v" ] || { printf 'null'; return; }
+  if ok="$(real_thr "$v" "$kind")"; then printf '%s' "$ok"; else printf '"UNSET"'; fi
 }
 
 format_c() {
@@ -54,9 +78,14 @@ format_c() {
   }'
 }
 
+# classify_temp <raw> <max> <crit>
+# max/crit are expected pre-sanitised by real_thr, but the sentinel refusal is repeated HERE on
+# purpose: the classifier is what --test drives, so the gate must live where the decision is made.
 classify_temp() {
   local raw="${1:-}" max="${2:-}" crit="${3:-}"
   case "$raw" in ''|*[!0-9]*) echo UNKNOWN; return ;; esac
+  case "$max" in  ''|*[!0-9]*) max="" ;;  *) [ "$max"  -ge "$SENTINEL_MAX" ] 2>/dev/null && max="" ;;  esac
+  case "$crit" in ''|*[!0-9]*) crit="" ;; *) [ "$crit" -ge "$SENTINEL_MAX" ] 2>/dev/null && crit="" ;; esac
   if [ -n "$crit" ] && [ "$crit" -gt 0 ] 2>/dev/null && [ "$raw" -ge "$crit" ] 2>/dev/null; then
     echo CRITICAL
   elif [ -n "$max" ] && [ "$max" -gt 0 ] 2>/dev/null && [ "$raw" -ge "$max" ] 2>/dev/null; then
@@ -68,6 +97,76 @@ classify_temp() {
   else
     echo COOL
   fi
+}
+
+sev_rank() {
+  case "${1:-}" in CRITICAL) echo 3 ;; HOT) echo 2 ;; WARM) echo 1 ;; COOL) echo 0 ;; *) echo -1 ;; esac
+}
+
+# scan_hwmon <hwmon dir> — one controller. Emits ONE tab-separated record:
+#   hot_raw hot_label hot_n hot_src comp_raw comp_label max crit nsensors nunset sensors_json
+# Fields are separated by US (0x1f), NOT tab: tab is an IFS-whitespace character, so `IFS=$'\t' read`
+# COLLAPSES consecutive tabs and an empty (UNSET) threshold would silently shift every later field
+# onto the wrong variable. A non-whitespace IFS preserves empty fields.
+# max/crit are temp1_*'s ONLY, already passed through real_thr (so: a number, or empty=UNSET).
+scan_hwmon() {
+  local d="$1" f n label raw smax scrit smin
+  local comp_raw="" comp_label="" max="" crit=""
+  local hot_raw="" hot_label="" hot_n="" hot_src=""
+  local nsens=0 nunset=0 sj=""
+  shopt -s nullglob
+  for f in "$d"/temp*_input; do
+    n="${f##*/}"; n="${n#temp}"; n="${n%_input}"
+    case "$n" in ''|*[!0-9]*) continue ;; esac
+    [ -r "$f" ] || continue
+    raw="$(cat "$f" 2>/dev/null)"
+    case "$raw" in ''|*[!0-9]*) continue ;; esac
+    label="$(cat "$d/temp${n}_label" 2>/dev/null || true)"
+    label="${label//\"/}"; label="${label//	/ }"
+    [ -n "$label" ] || label="temp${n}"
+    nsens=$((nsens + 1))
+    smax="$(cat "$d/temp${n}_max" 2>/dev/null || true)"
+    scrit="$(cat "$d/temp${n}_crit" 2>/dev/null || true)"
+    smin="$(cat "$d/temp${n}_min" 2>/dev/null || true)"
+    # count every attribute that EXISTS but is a sentinel — this is the loud part
+    [ -n "$smax" ]  && ! real_thr "$smax" max   >/dev/null && nunset=$((nunset + 1))
+    [ -n "$scrit" ] && ! real_thr "$scrit" max  >/dev/null && nunset=$((nunset + 1))
+    [ -n "$smin" ]  && ! real_thr "$smin" min   >/dev/null && nunset=$((nunset + 1))
+    sj="$sj${sj:+,}{\"n\":$n,\"label\":\"$label\",\"mC\":$raw,\"c\":$(format_c "$raw"),\"max_mC\":$(json_thr "$smax" max),\"crit_mC\":$(json_thr "$scrit" max),\"min_mC\":$(json_thr "$smin" min)}"
+    if [ "$n" = 1 ]; then
+      comp_raw="$raw"; comp_label="$label"
+      max="$(real_thr "$smax" max)"; crit="$(real_thr "$scrit" max)"
+    fi
+    if [ -z "$hot_raw" ] || [ "$raw" -gt "$hot_raw" ]; then
+      hot_raw="$raw"; hot_label="$label"; hot_n="$n"; hot_src="$f"
+    fi
+  done
+  shopt -u nullglob
+  [ -n "$hot_raw" ] || return 1
+  printf '%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\037[%s]\n' \
+    "$hot_raw" "$hot_label" "$hot_n" "$hot_src" "$comp_raw" "$comp_label" \
+    "$max" "$crit" "$nsens" "$nunset" "$sj"
+}
+
+# discover_nvme — every controller, worst verdict wins (tie -> hottest sensor). Selecting on the
+# VERDICT and not on the raw degree matters: two drives publish different ceilings, and 74.9C on a
+# 74.85C-warning drive is an incident where the same degree on a 89.85C drive is not.
+discover_nvme() {
+  local d rec best="" best_rank=-2 best_hot=-1 lbl rank hot
+  shopt -s nullglob
+  for d in "$ROOT"/*/hwmon*; do
+    [ -d "$d" ] || continue
+    rec="$(scan_hwmon "$d")" || continue
+    IFS=$'\037' read -r hot _ _ _ _ _ _max _crit _ _ _ <<<"$rec"
+    lbl="$(classify_temp "$hot" "$_max" "$_crit")"
+    rank="$(sev_rank "$lbl")"
+    if [ "$rank" -gt "$best_rank" ] || { [ "$rank" -eq "$best_rank" ] && [ "$hot" -gt "$best_hot" ]; }; then
+      best_rank="$rank"; best_hot="$hot"; best="$rec"$'\037'"$d"
+    fi
+  done
+  shopt -u nullglob
+  [ -n "$best" ] || return 1
+  printf '%s\n' "$best"
 }
 
 if [ "${1:-}" = --test ]; then
@@ -111,17 +210,119 @@ if [ "${1:-}" = --test ]; then
   command -v awk >/dev/null 2>&1 || { echo "smoke-test: FAIL (no awk)"; exit 1; }
   td="$(mktemp -d)" || { echo "smoke-test: FAIL (mktemp)"; exit 1; }
   trap 'rm -rf "$td"' EXIT
-  mkdir -p "$td/nvme0/hwmon0"
-  printf '36850\n' > "$td/nvme0/hwmon0/temp1_input"
-  printf '50000\n' > "$td/nvme0/hwmon0/temp1_max"
-  printf '70000\n' > "$td/nvme0/hwmon0/temp1_crit"
-  got="$(MESH_NVME_ROOT="$td" bash "$0" --json 2>/dev/null)" || { echo "smoke-test: FAIL (fixture read)"; exit 1; }
-  printf '%s\n' "$got" | grep -q '"label":"COOL"' || { echo "smoke-test: FAIL (fixture label COOL: $got)"; exit 1; }
-  printf '%s\n' "$got" | grep -q '"temp_c":36.9' || { echo "smoke-test: FAIL (fixture temp 36.9C: $got)"; exit 1; }
-  printf '%s\n' "$got" | grep -q "\"source\":\"$td/nvme0/hwmon0/temp1_input\"" || {
-    echo "smoke-test: FAIL (fixture source missing: $got)"; exit 1;
+  fail=0
+  nass=0
+  # NEVER hand-maintain a count beside the roster it summarises (the mesh-restore "(15-channel set)"
+  # lesson: the hand-written number was wrong in both directions at once). Count what actually ran.
+  _ok() { nass=$((nass + 1)); }
+  _t() {  # _t <name> <json> <grep-pattern>   — assert the pattern is PRESENT
+    _ok; printf '%s\n' "$2" | grep -qF -- "$3" || { echo "  FAIL $1: missing '$3' in: $2"; fail=1; }
   }
+  _tn() { # _tn <name> <json> <grep-pattern>  — assert the pattern is ABSENT
+    _ok; printf '%s\n' "$2" | grep -qF -- "$3" && { echo "  FAIL $1: forbidden '$3' present in: $2"; fail=1; }
+    return 0
+  }
+  _mk() { # _mk <dir> <n> <input> <label> [max] [crit] [min]
+    mkdir -p "$1"
+    printf '%s\n' "$3" > "$1/temp$2_input"
+    printf '%s\n' "$4" > "$1/temp$2_label"
+    [ -n "${5:-}" ] && printf '%s\n' "$5" > "$1/temp$2_max"
+    [ -n "${6:-}" ] && printf '%s\n' "$6" > "$1/temp$2_crit"
+    [ -n "${7:-}" ] && printf '%s\n' "$7" > "$1/temp$2_min"
+    return 0
+  }
+  _run() { MESH_NVME_ROOT="$1" bash "$0" --json 2>/dev/null; }
 
+  # --- A. legacy single-sensor regression: composite alone still classifies as it always did.
+  _mk "$td/a/nvme0/hwmon0" 1 36850 Composite 50000 70000
+  A="$(_run "$td/a")" || { echo "smoke-test: FAIL (fixture A read)"; exit 1; }
+  _t A-label "$A" '"label":"COOL"'
+  _t A-temp  "$A" '"temp_c":36.9'
+  _t A-hot   "$A" '"hot_label":"Composite"'
+  _t A-src   "$A" "\"source\":\"$td/a/nvme0/hwmon0/temp1_input\""
+
+  # --- B. THE FIX (task scope d). sensor2 is HOTTER than the composite AND its own _max is the
+  # 0xFFFF sentinel. This one fixture kills BOTH failure modes at once:
+  #   * blind to temp2  -> the verdict would be COOL/36.9 off the composite      -> B-label/B-temp red
+  #   * sentinel as ceiling -> 52000 < 65261850, so it would drop to the 45C band -> WARM, B-label red
+  # The right answer is HOT: 52000 >= temp1_max 50000, the ONLY real ceiling published.
+  _mk "$td/b/nvme0/hwmon0" 1 36850 Composite 50000 70000 -273150
+  _mk "$td/b/nvme0/hwmon0" 2 52000 "Sensor 1" 65261850 "" -273150
+  _mk "$td/b/nvme0/hwmon0" 3 41000 "Sensor 2" 65261850 "" -273150
+  B="$(_run "$td/b")" || { echo "smoke-test: FAIL (fixture B read)"; exit 1; }
+  _t  B-label     "$B" '"label":"HOT"'
+  _t  B-hot-temp  "$B" '"temp_c":52.0'
+  _t  B-hot-label "$B" '"hot_label":"Sensor 1"'
+  _t  B-hot-n     "$B" '"hot_n":2'
+  _t  B-composite "$B" '"composite_c":36.9'
+  _t  B-comp-lbl  "$B" '"composite_label":"Composite"'
+  _t  B-src       "$B" "\"source\":\"$td/b/nvme0/hwmon0/temp2_input\""
+  _t  B-nsens     "$B" '"sensors_n":3'
+  _t  B-unset-n   "$B" '"unset_thresholds":5'
+  _t  B-sensor2   "$B" '{"n":2,"label":"Sensor 1","mC":52000,"c":52.0,"max_mC":"UNSET","crit_mC":null,"min_mC":"UNSET"}'
+  # scope (c): the sentinel must NEVER reach the output as a number, anywhere.
+  _tn B-no-sentinel "$B" '65261850'
+  _tn B-no-absmin   "$B" '-273150'
+
+  # --- C. the controller publishes NO real threshold at all (both temp1_* are sentinels): the
+  # verdict must fall back to the absolute bands and both ceilings must render UNSET, never 65261.9C.
+  _mk "$td/c/nvme0/hwmon0" 1 30000 Composite 65261850 65261850 -273150
+  _mk "$td/c/nvme0/hwmon0" 2 62000 "Sensor 1" 65261850 "" -273150
+  C="$(_run "$td/c")" || { echo "smoke-test: FAIL (fixture C read)"; exit 1; }
+  _t  C-label "$C" '"label":"HOT"'
+  _t  C-max   "$C" '"max_mC":"UNSET"'
+  _t  C-crit  "$C" '"crit_mC":"UNSET"'
+  _tn C-no-sentinel "$C" '65261850'
+
+  # --- D. crit still wins over max, measured on the HOTTEST sensor.
+  _mk "$td/d/nvme0/hwmon0" 1 36850 Composite 50000 70000
+  _mk "$td/d/nvme0/hwmon0" 2 71000 "Sensor 1" 65261850
+  D="$(_run "$td/d")"
+  _t D-label "$D" '"label":"CRITICAL"'
+  _t D-temp  "$D" '"temp_c":71.0'
+
+  # --- E. no threshold FILES at all. Guards the field-shift trap: an empty (UNSET) threshold in a
+  # tab-separated record would collapse under IFS-whitespace and slide `source` into `max`.
+  _mk "$td/e/nvme0/hwmon0" 1 30000 Composite
+  _mk "$td/e/nvme0/hwmon0" 2 47000 "Sensor 1"
+  E="$(_run "$td/e")"
+  _t E-label "$E" '"label":"WARM"'
+  _t E-max   "$E" '"max_mC":"UNSET"'
+  _t E-nsens "$E" '"sensors_n":2'
+  _t E-src   "$E" "\"source\":\"$td/e/nvme0/hwmon0/temp2_input\""
+  _t E-unset "$E" '"unset_thresholds":0'
+
+  # --- F. two controllers: the WORST VERDICT wins, not the highest degree. B is 9C hotter but sits
+  # far under its own 89.85C ceiling; A has crossed its own 70C crit. Picking on degrees alone would
+  # report the healthy drive and hide the incident.
+  _mk "$td/f/nvme0/hwmon0" 1 40000 Composite 60000 70000
+  _mk "$td/f/nvme0/hwmon0" 2 76000 "Sensor 1" 65261850
+  _mk "$td/f/nvme1/hwmon1" 1 40000 Composite 89850 94850
+  _mk "$td/f/nvme1/hwmon1" 2 85000 "Sensor 1" 65261850
+  F="$(_run "$td/f")"
+  _t F-label "$F" '"label":"CRITICAL"'
+  _t F-temp  "$F" '"temp_c":76.0'
+  _t F-ctrl  "$F" "\"controller\":\"$td/f/nvme0/hwmon0\""
+
+  # --- G. the classifier itself, called directly: a sentinel ceiling must be REFUSED at the point
+  # of decision, not merely filtered by the caller. (A gate that lives only in the reader is one
+  # refactor away from being bypassed.)
+  # NOTE on what is gateable here: the sentinel refusal on the MAX branch is unobservable by
+  # construction — no physical reading can reach 65261850, so `raw >= max` is false either way and
+  # a mutant that drops it stays green. That leg's REAL gate is real_thr (G-real_thr-max, seen red)
+  # plus fixture B. The CRIT branch, however, does bite: without the refusal a sentinel crit makes
+  # `raw >= crit` decidable and would mint a CRITICAL. Assert the branch that can actually fail.
+  _ok; g1="$(classify_temp 65261850 "" 65261850)"
+  [ "$g1" = HOT ] || { echo "  FAIL G-sentinel-crit: classify_temp accepted the sentinel as a CRITICAL threshold (got '$g1', want HOT via the absolute bands)"; fail=1; }
+  _ok; g2="$(classify_temp 52000 50000 70000)"
+  [ "$g2" = HOT ] || { echo "  FAIL G-real-ceiling: classify_temp ignored a REAL ceiling (got '$g2', want HOT)"; fail=1; }
+  _ok; g3="$(real_thr 65261850 max)"; [ -z "$g3" ] || { echo "  FAIL G-real_thr-max: sentinel rendered as '$g3'"; fail=1; }
+  _ok; g4="$(real_thr -273150 min)"; [ -z "$g4" ] || { echo "  FAIL G-real_thr-min: 0K sentinel rendered as '$g4'"; fail=1; }
+  _ok; g5="$(real_thr 74850 max)"; [ "$g5" = 74850 ] || { echo "  FAIL G-real_thr-live: a real ceiling was dropped (got '$g5')"; fail=1; }
+
+  [ "$fail" = 1 ] && { echo "smoke-test: FAIL"; exit 1; }
+
+  _ok; _ok; _ok; _ok; _ok
   real="$(bash "$0" --json 2>/dev/null)" || { _nt_honesty_gate; echo "smoke-test: n/a (no live NVMe hwmon source on this node)"; exit 2; }
   printf '%s\n' "$real" | grep -q '"source":"/sys/class/nvme/' || {
     echo "smoke-test: FAIL (live read missing sysfs source: $real)"; exit 1;
@@ -129,9 +330,20 @@ if [ "${1:-}" = --test ]; then
   printf '%s\n' "$real" | grep -q '"temp_c":[0-9]' || {
     echo "smoke-test: FAIL (live read missing numeric temperature: $real)"; exit 1;
   }
+  # The live read must ALSO carry the new axes — a real hardware read that publishes only the
+  # composite is exactly the blindness this task closed, and would pass every fixture above.
+  printf '%s\n' "$real" | grep -q '"composite_c":[0-9]' || {
+    echo "smoke-test: FAIL (live read publishes no composite: $real)"; exit 1;
+  }
+  printf '%s\n' "$real" | grep -q '"hot_label":"[^"]\+"' || {
+    echo "smoke-test: FAIL (live read names no winning sensor label: $real)"; exit 1;
+  }
+  printf '%s\n' "$real" | grep -qF '65261850' && {
+    echo "smoke-test: FAIL (live read leaked the 0xFFFF sentinel as a number: $real)"; exit 1;
+  }
   # sandbox honesty gate. Falsify: drop the MESH_TEST_SANDBOX diversion at the STATE assignment.
   _nt_honesty_gate
-  echo "smoke-test: ok (fixture classify + live NVMe hwmon read)"
+  echo "smoke-test: ok ($nass assertions over 6 fixtures + the classifier unit gate + the live read: hot-sensor-beats-composite, sentinel refused by real_thr and never rendered as a number, sentinel CRIT refused in the classifier, crit>max on the hottest sensor, empty-threshold field integrity, worst-verdict-wins across controllers, live NVMe hwmon read carrying composite+hot+no-sentinel)"
   exit 0
 fi
 
@@ -146,24 +358,31 @@ done
 
 readout="$(discover_nvme 2>/dev/null || true)"
 [ -n "$readout" ] || {
-  [ -f "$OFFLINEFILE" ] || { echo "nvme-temp: UNREACHABLE — no readable NVMe hwmon temp1_input" >&2; : > "$OFFLINEFILE"; }
+  [ -f "$OFFLINEFILE" ] || { echo "nvme-temp: UNREACHABLE — no readable NVMe hwmon temp*_input" >&2; : > "$OFFLINEFILE"; }
   exit 2
 }
 rm -f "$OFFLINEFILE" 2>/dev/null || true
 
-IFS=$'\t' read -r RAW MAX CRIT SOURCE <<<"$readout"
+IFS=$'\037' read -r RAW HOTLABEL HOTN SOURCE COMP_RAW COMP_LABEL MAX CRIT NSENS NUNSET SENSORS CTRL <<<"$readout"
 TEMP_C="$(format_c "$RAW")" || { echo "nvme-temp: UNREACHABLE — invalid temperature '$RAW'" >&2; exit 2; }
+COMP_C="$(format_c "$COMP_RAW")" || COMP_C=""
+# MAX/CRIT reached here ONLY through real_thr, so they are a real number or empty. Empty is
+# rendered UNSET everywhere a human or machine reads it — never a number, never silently dropped.
 LABEL="$(classify_temp "$RAW" "$MAX" "$CRIT")"
 TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 PREV_LABEL=""
 [ -f "$STATE" ] && PREV_LABEL="$(cut -d'|' -f1 "$STATE" 2>/dev/null || true)"
 
-printf '%s|%s|%s|%s|%s|%s|%s\n' "$LABEL" "$RAW" "$TEMP_C" "${MAX:-}" "${CRIT:-}" "$SOURCE" "$TS" > "$STATE"
+printf '%s|%s|%s|%s|%s|%s|%s|hot_label=%s|hot_n=%s|composite_mC=%s|composite_c=%s|composite_label=%s|sensors=%s|unset_thresholds=%s|thr_from=temp1_max/temp1_crit\n' \
+  "$LABEL" "$RAW" "$TEMP_C" "${MAX:-UNSET}" "${CRIT:-UNSET}" "$SOURCE" "$TS" \
+  "$HOTLABEL" "$HOTN" "${COMP_RAW:-na}" "${COMP_C:-na}" "${COMP_LABEL:-na}" "$NSENS" "$NUNSET" > "$STATE"
 mesh-state-touch "$STATE"
 
 if [ "$JSON" = 1 ]; then
-  printf '{"label":"%s","temp_mC":%s,"temp_c":%s,"max_mC":%s,"crit_mC":%s,"source":"%s","ts":"%s"}\n' \
-    "$LABEL" "$RAW" "$TEMP_C" "${MAX:-null}" "${CRIT:-null}" "$SOURCE" "$TS"
+  printf '{"label":"%s","temp_mC":%s,"temp_c":%s,"hot_label":"%s","hot_n":%s,"composite_mC":%s,"composite_c":%s,"composite_label":"%s","max_mC":%s,"crit_mC":%s,"thr_from":"temp1_max/temp1_crit","sensors_n":%s,"unset_thresholds":%s,"sensors":%s,"source":"%s","controller":"%s","ts":"%s"}\n' \
+    "$LABEL" "$RAW" "$TEMP_C" "$HOTLABEL" "$HOTN" \
+    "${COMP_RAW:-null}" "${COMP_C:-null}" "${COMP_LABEL:-}" \
+    "${MAX:-\"UNSET\"}" "${CRIT:-\"UNSET\"}" "$NSENS" "$NUNSET" "$SENSORS" "$SOURCE" "$CTRL" "$TS"
   exit 0
 fi
 
@@ -171,5 +390,6 @@ if [ "$EDGE" = 1 ] && [ "$PREV_LABEL" = "$LABEL" ]; then
   exit 0
 fi
 
-printf '[nvme-temp] %s — %s°C (max=%s crit=%s source=%s) @ %s %s\n' \
-  "$LABEL" "$TEMP_C" "${MAX:-?}" "${CRIT:-?}" "$SOURCE" "$(hostname)" "$TS"
+printf '[nvme-temp] %s — %s°C "%s" (composite %s°C "%s"; max=%s crit=%s from temp1_*; sensors=%s unset-thresholds=%s source=%s) @ %s %s\n' \
+  "$LABEL" "$TEMP_C" "$HOTLABEL" "${COMP_C:-na}" "${COMP_LABEL:-na}" \
+  "${MAX:-UNSET}" "${CRIT:-UNSET}" "$NSENS" "$NUNSET" "$SOURCE" "$(hostname)" "$TS"
