@@ -131,6 +131,18 @@ the case is the evidence, and mixing them is what made this section a wall nobod
 - **For a declared network exclusion the artifact is the FIB LOOKUP, never the pref** —
   `ip route get <a real address in the excluded range>`, never your own address, and read the
   DEVICE that comes back. [[a-declared-pref-is-not-the-fib]]
+- **A bounded kernel cache is HISTORY, so absence from it is UNKNOWN — never contacted or evicted —
+  never DOWN**; publish the AGE a reading stands for and render past-horizon values `stale`, count the
+  rows missing the field you want as `na`, and key on the TUPLE the kernel stored, never the identity
+  you were looking for. [[absence-from-a-bounded-cache-is-unknown-never-down]]
+- **When a guard has been widened by one more member three times, invert its POLARITY** — an
+  exclusion allowlist's failure direction is SILENCE, so gate on what the thing CLAIMS to be and
+  let the unlisted case fail LOUD; drive the class leg with the case an allowlist can never cover.
+  [[an-exclusion-allowlist-fails-toward-silence-so-invert-the-polarity]]
+- **A stub on `PATH` is only ahead of the real tool until the subject exports its own `PATH`** —
+  run the child under `env -i HOME=<fake> PATH=/usr/bin:/bin` with the fake home's `.local/bin`
+  BEING the stub dir, and count the live artifact's lines either side of the section.
+  [[a-poisoned-binary-can-lose-a-path-race-to-the-real-one]]
 - **Write the enumerated RIGHTS, never the noun.** A kernel API's restriction covers only what its
   ABI can say — Landlock's "no network" is TCP bind/connect ONLY, and an unhandled right is an
   UNRESTRICTED right; pair it with seccomp-BPF if the network must actually close.
@@ -489,7 +501,7 @@ index** (grouped · `<category>` · `--search <term>` · `--counts`). The catego
 load-bearing tools — run `mesh-tools <category>` for the rest and the full contracts.
 
 - **Coordinate / drive:** `mesh-tell` (`--peek`) · `mesh-watch` (`--until`/`--change`) · `mesh-chat` · `mesh-claim` (`--check`) · `mesh-minds` · `mesh-trace` · `mesh-textin` · `mesh-handoff` (pre-`/clear` work-state → durable file + SessionStart-hook restore) · `mesh-clear` (write handoff → clear → log; `--gate`) · `mesh-clear-log` (the LEDGER + `clear` dash window for every `/clear`, so clears are fixed by numbers, not blind).
-- **Perceive (sensorium):** `mesh-location` · `mesh-body-motion` · `mesh-light` · `mesh-tamper` · `mesh-body-context` · `mesh-presence`(+`-fuse`/`-trends`/`-delta`) · `mesh-arrivals` · `mesh-lan-newdevice`/`mesh-lan-health` · `mesh-wifi-link`/`mesh-wifi-motion` · `mesh-room-sense` · `mesh-say`/`mesh-act` · `mesh-voice-say` (THE clone-synth primitive — every speech organ synthesizes through it via the warm `mesh-voice-clone-daemon`/xtts_v2; piper/ruslan is the LOUD fallback) · `mesh-voice-rx`/`mesh-voice-tx` · `mesh-tg-roz` · `mesh-watchtower`/`mesh-cam-watch`/`mesh-face-recognize` · `mesh-overhear`/`mesh-room`/`mesh-room-trace` (the room "third party": ambient rolling transcript + the room mind's read/say verbs). Perception is re-observed live, never stored (decays on reboot).
+- **Perceive (sensorium):** `mesh-location` · `mesh-body-motion` · `mesh-light` · `mesh-tamper` · `mesh-body-context` · `mesh-presence`(+`-fuse`/`-trends`/`-delta`) · `mesh-arrivals` · `mesh-lan-newdevice`/`mesh-lan-health` · `mesh-tcp-metrics` (the EGRESS PATH census — the kernel's boot-scoped per-dst tcp_metrics cache, the only unprivileged surface that says which SOURCE our traffic actually left by, per destination, hours after every live probe went green again) · `mesh-wifi-link`/`mesh-wifi-motion` · `mesh-room-sense` · `mesh-say`/`mesh-act` · `mesh-voice-say` (THE clone-synth primitive — every speech organ synthesizes through it via the warm `mesh-voice-clone-daemon`/xtts_v2; piper/ruslan is the LOUD fallback) · `mesh-voice-rx`/`mesh-voice-tx` · `mesh-tg-roz` · `mesh-watchtower`/`mesh-cam-watch`/`mesh-face-recognize` · `mesh-overhear`/`mesh-room`/`mesh-room-trace` (the room "third party": ambient rolling transcript + the room mind's read/say verbs). Perception is re-observed live, never stored (decays on reboot).
 - **Fusion / derived state:** `mesh-situation` · `mesh-perimeter` · `mesh-sensorium` · `mesh-stress` · `mesh-operator-home`/`mesh-operator-state` · `mesh-home-state`/`mesh-household-state` · `mesh-ambient-clock` · `mesh-sense-monitor`. Honest-fusion rule: an unreachable input renders UNKNOWN/partial, never a faked all-clear.
 - **Sound studio (records → grind):** `mesh-records` (the ARCHIVIST — keeps + measures every record before its organ prunes it; the ledger `~/.mesh/records.log` outlives the audio) · `mesh-sound-reflex` (the GRINDER — derives each recipe from the record's MEASURED character, repelled from recent renders, bg-grinds via `mesh-room-music`, pokes the mind only on drop/walked-out/outlier/degenerate) · `mesh-soundscape --measure <wav>` (the one measure tract — never add a second librosa analyzer) · `mesh-room-music` (owns the grind invocation + `room-music-params.log`).
   - **Check what your ranker SELECTS FOR, not just that it ranks** — a measure's TOP END can invert what
