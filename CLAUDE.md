@@ -197,6 +197,10 @@ the case is the evidence, and mixing them is what made this section a wall nobod
 - **Never quote the asserted literal in the prose beside a source-text gate** — the comment satisfies
   the gate and the real call site can be deleted green; paraphrase, and prove it by MUTATION.
   [[a-source-text-gate-is-satisfied-by-its-own-explanatory-prose]]
+- **If a trap's job is to reap a child that can HANG, background that child and `wait`** — bash defers
+  a trapped TERM until the current FOREGROUND external command returns, so the hung child IS what
+  holds the trap that exists to kill it; bound it with `timeout -k` too, and reap the process GROUP.
+  [[a-foreground-child-defers-the-signal-trap-that-would-reap-it]]
 
 ## Substrate changes & multi-agent coordination
 
