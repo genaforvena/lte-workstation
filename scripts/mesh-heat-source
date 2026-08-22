@@ -17,8 +17,25 @@
 # node's temp in (or out of) the same room. That fusion is the missing signal.
 #
 # INPUTS (all read cheap, no re-sensing beyond one /sys read):
-#   NODE thermal    thermal_zone*/temp + hwmon*/temp*_input (cross-tier max, live) + cpu-throttle.state field-2
-#                   (THROTTLING) — this node is HOT if max die temp >= HOT_C OR it is actively throttling.
+#   NODE thermal    thermal_zone*/temp + hwmon*/temp*_input + cpu-throttle.state field-2 (THROTTLING).
+#                   Every readable sensor is TIERED (cpu / disk / other) and judged against ITS OWN
+#                   tier's hot line — the node is HOT if ANY sensor crosses ITS OWN threshold, or it
+#                   is actively throttling.
+#
+# THE ARGMAX WAS AN SSD WEARING A CPU-DIE LABEL (task mesh-heat-source, 2026-08-22).
+#   node_c was a bare cross-tier max over both globs. On mesh-home that max is nvme0's "Sensor 1"
+#   (70-74°C) and NOT k10temp/Tctl (59-65°C) — measured 3x — so a disk reading was published in a
+#   field every consumer reads as the die, and judged against HOT_C=80, a CPU number, while that
+#   drive's OWN published warning line is 74.85°C. Two fixes, and dropping the disk tier is NOT one
+#   of them (the hottest thing on this node would then go unwatched by the only organ that sees it):
+#     (a) ATTRIBUTE the argmax — node_c never travels without node_label / node_src / node_tier, so
+#         an attribution is never a bare number [[an-attribution-is-not-a-health-verdict]];
+#     (b) THRESHOLD PER TIER — cpu gets HOT_C, a disk gets the CONTROLLER'S OWN temp1_max (sentinel
+#         65261850 = 0xFFFF "unset" refused, falling back to HEAT_DISK_HOT_C with the fallback NAMED
+#         in node_thr_src), other gets HEAT_OTHER_HOT_C.
+#   The crossing sensor is picked by the LARGEST MARGIN OVER ITS OWN LINE, never by scan order
+#   [[a-first-match-classifier-reports-the-order-not-the-strongest-reason]] — the globs enumerate
+#   hwmon0,1,2… so a first-match hot pick would report the lowest-numbered controller, not the worst.
 #   ENVIRONMENT     .climate-state  out_c=  (outdoor/ambient temp, the shared heat bath the boxes sit in)
 #                   → env_signal HOT (>= ENV_HOT_C) / MILD (known & below) / UNKNOWN (missing|stale).
 #   PEER thermal    imac-therm.state (a SECOND independent node) — HOT / COOL / UNKNOWN. A second box
@@ -43,8 +60,10 @@
 # this node's OWN die temperature cannot be read at all we cannot even assess → CANNOT-ASSESS, exit 2.
 #
 #   mesh-heat-source            fold → one verdict + reason line
-#   mesh-heat-source --json     machine-readable {verdict, partial, node_c, throttling, env_c, env_signal,
-#                               peer, peer_signal, reason, ts}
+#   mesh-heat-source --json     machine-readable {verdict, partial, node_c, node_label, node_src,
+#                               node_tier, node_thr_c, node_thr_src, cpu_c, disk_c, hot_tier,
+#                               hot_label, hot_src, hot_c, hot_thr_c, throttling, env_c, env_signal,
+#                               peer, peer_signal, reason, ts}. A tier with no sensor renders null/na.
 #   mesh-heat-source --edge     emit ONLY on verdict change (for a stream/board consumer)
 #   mesh-heat-source --test     assert the joint attribution rules + a live read yields a valid verdict
 set -uo pipefail
@@ -57,7 +76,12 @@ M="${MESH_DIR:-$HOME/.mesh}"
 STATE="$M/.heat-source.state"
 [ "${MESH_TEST_SANDBOX:-0}" != 1 ] || [ -n "${MESH_DIR:-}" ] || STATE="${TMPDIR:-/tmp}/.heat-source.state.sandbox.$$"
 FRESH_S="${HEAT_FRESH_S:-1800}"          # a context input older than this is UNKNOWN, not trusted-stale
-HOT_C="${HEAT_HOT_C:-80}"                # node die temp (°C) at/above which the node counts as HOT
+HOT_C="${HEAT_HOT_C:-80}"                # CPU-tier die temp (°C) at/above which that sensor is HOT
+DISK_HOT_C="${HEAT_DISK_HOT_C:-70}"      # disk-tier FALLBACK line, used ONLY when the controller
+                                         # publishes no real temp1_max (sentinel/absent) — named as
+                                         # "disk-default" in node_thr_src so a fallback is never
+                                         # mistaken for the drive's own number
+OTHER_HOT_C="${HEAT_OTHER_HOT_C:-$HOT_C}"  # unclassified sensors — no tier knowledge, so CPU's line
 ENV_HOT_C="${HEAT_ENV_HOT_C:-25}"        # outdoor temp (°C) at/above which the environment contributes heat
 NOW="${HEAT_NOW:-$(date +%s)}"
 # Thermal source globs (env-overridable so --test can drive fixture trees). TWO TIERS (2026-07-16,
@@ -66,6 +90,70 @@ NOW="${HEAT_NOW:-$(date +%s)}"
 # (k10temp). Zone-only left this node's own leg blind → CANNOT-ASSESS on every call here.
 HEAT_ZONE_GLOB="${MESH_HEAT_ZONE_GLOB:-/sys/class/thermal/thermal_zone*/temp}"
 HEAT_HWMON_GLOB="${MESH_HEAT_HWMON_GLOB:-/sys/class/hwmon/hwmon*/temp*_input}"
+
+US=$'\x1f'                              # non-whitespace field sep: an empty field must not collapse
+SENTINEL_MAX=65261850                    # 0xFFFF in NVMe's 0.01K encoding = "threshold not
+                                         # implemented"; a 65261°C ceiling passes forever, so it is
+                                         # refused, never rendered as a number
+                                         # [[a-guard-above-every-reachable-value-is-unobservable]]
+
+# ---- tiering: which KIND of thing is this sensor on? ---------------------------------------------
+# An EXPLICIT name→tier map, evaluated per sensor. Unknown names land in `other` (loud, and judged
+# against the CPU line) rather than being silently folded into the die.
+tier_of() {
+  case "${1:-}" in
+    nvme|nvme*|drivetemp|sd[a-z]|hdd*|ssd*)                   echo disk ;;
+    k10temp|k8temp|coretemp|zenpower*|cpu_thermal|x86_pkg_temp|*cpu*|*_pkg_*) echo cpu ;;
+    *)                                                        echo other ;;
+  esac
+}
+
+# real_max_mC <file> — the controller's OWN published ceiling, or nothing. Sentinel and non-numeric
+# both return 1: an unset ceiling must render as "no ceiling", never as 65261850.
+real_max_mC() {
+  local v
+  v="$(cat "${1:-/nonexistent}" 2>/dev/null)" || return 1
+  case "$v" in ''|*[!0-9-]*) return 1 ;; esac
+  [ "$v" -ge "$SENTINEL_MAX" ] 2>/dev/null && return 1
+  [ "$v" -le 0 ] 2>/dev/null && return 1
+  printf '%s' "$v"
+}
+
+# ---- scan_thermal — one US-separated row per readable sensor -------------------------------------
+#   tier <US> deg_c <US> label <US> src <US> thr_c <US> thr_src
+# src is "<hwmon name>:<hwmonN>" (or "thermal:<zoneN>") so an attribution names the ORGAN, not just
+# a number. Nothing here decides hotness; the fold does, per row, against that row's own thr_c.
+scan_thermal() {
+  local z d f n label raw hname base tier thr thrsrc dmax
+  shopt -s nullglob
+  for z in $HEAT_ZONE_GLOB; do
+    [ -r "$z" ] || continue
+    raw="$(cat "$z" 2>/dev/null)"; case "$raw" in ''|*[!0-9]*) continue ;; esac
+    d="${z%/temp}"; base="${d##*/}"
+    label="$(cat "$d/type" 2>/dev/null)"; [ -n "$label" ] || label="$base"
+    tier="$(tier_of "$label")"
+    case "$tier" in cpu) thr="$HOT_C"; thrsrc=cpu-default ;;
+                    disk) thr="$DISK_HOT_C"; thrsrc=disk-default ;;
+                    *) thr="$OTHER_HOT_C"; thrsrc=other-default ;; esac
+    printf '%s%s%s%s%s%s%s%s%s%s%s\n' "$tier" "$US" "$(( raw / 1000 ))" "$US" "$label" "$US" "thermal:$base" "$US" "$thr" "$US" "$thrsrc"
+  done
+  for f in $HEAT_HWMON_GLOB; do
+    [ -r "$f" ] || continue
+    raw="$(cat "$f" 2>/dev/null)"; case "$raw" in ''|*[!0-9]*) continue ;; esac
+    d="${f%/*}"; base="${d##*/}"; n="${f##*/}"; n="${n%_input}"
+    hname="$(cat "$d/name" 2>/dev/null)"; [ -n "$hname" ] || hname="$base"
+    label="$(cat "$d/${n}_label" 2>/dev/null)"; [ -n "$label" ] || label="$n"
+    tier="$(tier_of "$hname")"
+    case "$tier" in
+      cpu)  thr="$HOT_C"; thrsrc=cpu-default ;;
+      disk) # the DRIVE'S own warning line, not a CPU number borrowed from another tier
+            if dmax="$(real_max_mC "$d/temp1_max")"; then thr=$(( dmax / 1000 )); thrsrc="drive(temp1_max)"
+            else thr="$DISK_HOT_C"; thrsrc=disk-default; fi ;;
+      *)    thr="$OTHER_HOT_C"; thrsrc=other-default ;;
+    esac
+    printf '%s%s%s%s%s%s%s%s%s%s%s\n' "$tier" "$US" "$(( raw / 1000 ))" "$US" "$label" "$US" "$hname:$base" "$US" "$thr" "$US" "$thrsrc"
+  done
+}
 
 # ---- pure attribution: the whole fusion logic in one testable function ----------------------------
 # args: node_hot(0|1)  env_signal(HOT|MILD|UNKNOWN)  peer_signal(HOT|COOL|UNKNOWN)
@@ -132,6 +220,66 @@ if [ "${1:-}" = "--test" ]; then
   fj="$(fxrun)"
   printf '%s' "$fj" | grep -q '"node_c":60' || { echo "  FAIL: cross-tier fixture → '$fj' (want node_c:60)"; fail=1; }
   rm -rf "$fx"
+
+  # ---- TIERED ATTRIBUTION fixtures (task mesh-heat-source 2026-08-22) ----------------------------
+  # Each builds a hwmon tree with real `name`/`_label`/`temp1_max` files and drives the glob path.
+  # jf <json> <field> — extract a JSON scalar (string or number) by key
+  jf() { printf '%s' "$1" | grep -oE "\"$2\":(\"[^\"]*\"|-?[0-9]+|null)" | head -1 | cut -d: -f2- | tr -d '"'; }
+  mk_nvme() { # dir  sensor1_mC  temp1_max_mC(or '' = absent)
+    mkdir -p "$1"; printf 'nvme\n' > "$1/name"
+    printf '40850\n' > "$1/temp1_input"; printf 'Composite\n' > "$1/temp1_label"
+    printf '%s\n' "$2" > "$1/temp2_input"; printf 'Sensor 1\n' > "$1/temp2_label"
+    [ -n "${3:-}" ] && printf '%s\n' "$3" > "$1/temp1_max"; return 0
+  }
+  mk_cpu() { # dir  tctl_mC
+    mkdir -p "$1"; printf 'k10temp\n' > "$1/name"
+    printf '%s\n' "$2" > "$1/temp1_input"; printf 'Tctl\n' > "$1/temp1_label"
+  }
+  tier_case() { # name  want_node_c want_tier want_thr want_thr_src want_verdict want_hot_tier want_hot_src
+    local nm="$1" j
+    j="$(fxrun)"
+    local gc gt gth gts gv ght ghs
+    gc="$(jf "$j" node_c)"; gt="$(jf "$j" node_tier)"; gth="$(jf "$j" node_thr_c)"
+    gts="$(jf "$j" node_thr_src)"; gv="$(jf "$j" verdict)"; ght="$(jf "$j" hot_tier)"; ghs="$(jf "$j" hot_src)"
+    local got="$gc|$gt|$gth|$gts|$gv|$ght|$ghs" want="$2|$3|$4|$5|$6|$7|$8"
+    [ "$got" = "$want" ] || { echo "  FAIL: tier fixture '$nm' = '$got', want '$want'"; fail=1; }
+  }
+
+  # (1) the mesh-home shape: a disk sensor IS the argmax, judged against the DRIVE's own line (74),
+  #     NOT the CPU's 80 — and it is BELOW that line, so the node is not hot.
+  fx="$(mktemp -d)"; mkdir -p "$fx/mesh"; mk_nvme "$fx/hwmon0" 72000 74850
+  tier_case "disk argmax under the drive's own line" 72 disk 74 "drive(temp1_max)" COOL na na
+  # (2) same drive 2°C hotter → HOT, and the crossing sensor is ATTRIBUTED (label@organ), not a bare number
+  mk_nvme "$fx/hwmon0" 76000 74850
+  tier_case "disk over the drive's own line" 76 disk 74 "drive(temp1_max)" UNATTRIBUTED disk "nvme:hwmon0"
+  # (3) 0xFFFF sentinel ceiling is REFUSED — the fallback line is used and NAMED as the fallback,
+  #     never rendered as a 65261°C ceiling that can never be crossed
+  mk_nvme "$fx/hwmon0" 72000 65261850
+  tier_case "sentinel ceiling refused → named fallback" 72 disk 70 disk-default UNATTRIBUTED disk "nvme:hwmon0"
+  rm -rf "$fx"
+
+  # (4) THE CORE SPLIT: the argmax is the disk (90°C, but its own line is 95) while the CPU at 82 is
+  #     over ITS line of 80. A single cross-tier max would call the node hot at 90 and blame the disk;
+  #     a disk-tier drop would miss the 90 entirely. Here node_c reports 90 ATTRIBUTED to the disk and
+  #     the HOT verdict is attributed to the CPU. [[an-attribution-is-not-a-health-verdict]]
+  fx="$(mktemp -d)"; mkdir -p "$fx/mesh"; mk_nvme "$fx/hwmon0" 90000 95000; mk_cpu "$fx/hwmon1" 82000
+  tier_case "argmax tier != crossing tier" 90 disk 95 "drive(temp1_max)" UNATTRIBUTED cpu "k10temp:hwmon1"
+  rm -rf "$fx"
+
+  # (5) two sensors BOTH over their own lines: the crossing one is the largest MARGIN (cpu +10),
+  #     not the first scanned (hwmon0, the disk, +2)
+  #     [[a-first-match-classifier-reports-the-order-not-the-strongest-reason]]
+  fx="$(mktemp -d)"; mkdir -p "$fx/mesh"; mk_nvme "$fx/hwmon0" 76000 74850; mk_cpu "$fx/hwmon1" 90000
+  tier_case "crossing sensor is max margin, not scan order" 90 cpu 80 cpu-default UNATTRIBUTED cpu "k10temp:hwmon1"
+  rm -rf "$fx"
+
+  # (6) a tier with NO sensor renders `na`, never 0 — 0 is a temperature
+  #     [[a-summary-line-asserts-legs-that-rendered-na]]
+  fx="$(mktemp -d)"; mkdir -p "$fx/mesh"; mk_nvme "$fx/hwmon0" 50000 74850
+  fj="$(fxrun)"
+  [ "$(jf "$fj" cpu_c)" = null ] || { echo "  FAIL: absent cpu tier → cpu_c '$(jf "$fj" cpu_c)', want null"; fail=1; }
+  printf '%s' "$fj" | grep -q 'cpu=na°C' || { echo "  FAIL: absent cpu tier not rendered na in the reason: '$fj'"; fail=1; }
+  rm -rf "$fx"
   # live gate: a node with ANY readable temp source must assess (exit 0, never CANNOT-ASSESS);
   # a node with none exits 2 honestly — either way honest, fake-green neither
   have_organ=0
@@ -169,23 +317,56 @@ if [ "${1:-}" = "--test" ]; then
     [ "$_hr_b" = "$_hr_a" ] || { echo "smoke-test: FAIL (--test stamped the LIVE state $_hs_live: '$_hs_sig' → '$_hs_sig2' — moved on BOTH attempts, a real sandbox leak, not a concurrent-writer collision)"; exit 1; }
     echo "  note: a LIVE artifact moved during attempt 1 but NOT during the re-run — attributed to a concurrent live writer, not a sandbox leak"
   fi
-  echo "smoke-test: ok (9 attribution asserts + 2 tier fixtures + live read → $v)"
+  echo "smoke-test: ok (9 attribution asserts + 2 glob fixtures + 6 tiered-attribution fixtures + live read → $v)"
   exit 0
 fi
 
-# ---- read NODE die temperature (max thermal zone, °C) + throttle state ----------------------------
-node_c=""
+# ---- read NODE thermal rows, ATTRIBUTED and tiered ------------------------------------------------
+# node_c stays the cross-tier argmax (every existing consumer reads it), but it NEVER travels alone:
+# node_label / node_src / node_tier say WHAT it is, and node_thr_c / node_thr_src say which line it
+# was judged against.
+node_c=""; node_label=na; node_src=na; node_tier=na; node_thr=""; node_thr_src=na
+cpu_c=""; disk_c=""
+hot_tier=na; hot_label=na; hot_src=na; hot_c=""; hot_thr=""
+rows=""
 if [ -n "${MESH_HEAT_NODE_C:-}" ]; then
   node_c="$MESH_HEAT_NODE_C"                       # test/override hook
+  rows="override${US}${node_c}${US}override${US}override${US}${HOT_C}${US}cpu-default"
 else
-  max=0
-  for z in $HEAT_ZONE_GLOB $HEAT_HWMON_GLOB; do   # cross-tier max — see glob comment above
-    [ -r "$z" ] || continue
-    v="$(cat "$z" 2>/dev/null)"; [ -n "$v" ] || continue
-    case "$v" in ''|*[!0-9]*) continue;; esac      # integer millidegrees only
-    [ "$v" -gt "$max" ] && max="$v"
-  done
-  [ "$max" -gt 0 ] && node_c=$(( max / 1000 ))
+  rows="$(scan_thermal)"
+fi
+
+if [ -n "$rows" ]; then
+  best_margin=""
+  while IFS="$US" read -r r_tier r_c r_label r_src r_thr r_thrsrc; do
+    [ -n "${r_c:-}" ] || continue
+    case "$r_c" in ''|*[!0-9-]*) continue ;; esac
+    # cross-tier argmax → node_c, WITH its attribution
+    if [ -z "$node_c" ] || [ "$r_c" -gt "$node_c" ]; then
+      node_c="$r_c"; node_label="$r_label"; node_src="$r_src"
+      node_tier="$r_tier"; node_thr="$r_thr"; node_thr_src="$r_thrsrc"
+    fi
+    case "$r_tier" in
+      cpu)  { [ -z "$cpu_c" ]  || [ "$r_c" -gt "$cpu_c" ]; }  && cpu_c="$r_c" ;;
+      disk) { [ -z "$disk_c" ] || [ "$r_c" -gt "$disk_c" ]; } && disk_c="$r_c" ;;
+    esac
+    # the CROSSING sensor is the one furthest over ITS OWN line — never the first one scanned
+    # [[a-first-match-classifier-reports-the-order-not-the-strongest-reason]]
+    if [ "$r_c" -ge "$r_thr" ] 2>/dev/null; then
+      m=$(( r_c - r_thr ))
+      if [ -z "$best_margin" ] || [ "$m" -gt "$best_margin" ]; then
+        best_margin="$m"; hot_tier="$r_tier"; hot_label="$r_label"; hot_src="$r_src"
+        hot_c="$r_c"; hot_thr="$r_thr"
+      fi
+    fi
+  done <<EOF
+$rows
+EOF
+  # the override hook has no tiering to attribute
+  if [ -n "${MESH_HEAT_NODE_C:-}" ]; then
+    node_label=override; node_src=override; node_tier=override
+    node_thr="$HOT_C"; node_thr_src=cpu-default
+  fi
 fi
 
 # throttle corroborator: cpu-throttle.state field-2 == THROTTLING
@@ -203,16 +384,19 @@ if [ -z "$node_c" ] && [ "$throttling" = no ]; then
   ts="$(date -u +%FT%TZ 2>/dev/null || echo "$NOW")"
   printf 'CANNOT-ASSESS | %s | %s\n' "$reason" "$ts" > "$STATE"
   if [ "${1:-}" = "--json" ]; then
-    printf '{"verdict":"CANNOT-ASSESS","partial":1,"node_c":null,"throttling":"%s","env_c":null,"env_signal":"UNKNOWN","peer":"UNKNOWN","peer_signal":"UNKNOWN","reason":"%s","ts":"%s"}\n' "$throttling" "$reason" "$ts"
+    printf '{"verdict":"CANNOT-ASSESS","partial":1,"node_c":null,"node_label":"na","node_src":"na","node_tier":"na","node_thr_c":null,"node_thr_src":"na","cpu_c":null,"disk_c":null,"hot_tier":"na","hot_label":"na","hot_src":"na","hot_c":null,"hot_thr_c":null,"throttling":"%s","env_c":null,"env_signal":"UNKNOWN","peer":"UNKNOWN","peer_signal":"UNKNOWN","reason":"%s","ts":"%s"}\n' "$throttling" "$reason" "$ts"
   else
     printf 'CANNOT-ASSESS — %s\n' "$reason"
   fi
   exit 2
 fi
 
+# HOT = some sensor crossed ITS OWN tier line (never one tier's number applied to another's part)
 node_hot=0
-[ -n "$node_c" ] && [ "$node_c" -ge "$HOT_C" ] && node_hot=1
-[ "$throttling" = yes ] && node_hot=1
+[ -n "$hot_c" ] && node_hot=1
+if [ "$throttling" = yes ] && [ "$node_hot" -eq 0 ]; then
+  node_hot=1; hot_tier=cpu; hot_label=throttling; hot_src="cpu-throttle.state"; hot_c="${node_c:-?}"; hot_thr="$HOT_C"
+fi
 
 # ---- read_fresh <file> — echo first line if fresh, else empty (UNKNOWN caller-side) --------------
 read_fresh() {
@@ -263,28 +447,42 @@ read verdict partial <<<"$(attribute "$node_hot" "$env_signal" "$peer_signal")"
 nc_disp="${node_c:-?}"; ec_disp="${env_c:-?}"
 partial_tag=""; [ "$partial" -eq 1 ] && partial_tag=" (partial)"
 
+# per-tier maxima render `na` when that tier has NO sensor — never 0, which is a temperature
+# [[a-summary-line-asserts-legs-that-rendered-na]]
+cpu_disp="${cpu_c:-na}"; disk_disp="${disk_c:-na}"
+thr_disp="${node_thr:-?}"
+# the attribution that must accompany every number: WHAT won, on WHICH organ, against WHOSE line
+attrib="argmax=${nc_disp}°C ${node_label}@${node_src} [${node_tier} tier, line ${thr_disp}°C via ${node_thr_src}]; cpu=${cpu_disp}°C disk=${disk_disp}°C"
+crossed="${hot_label}@${hot_src} ${hot_c:-?}°C >= ${hot_thr:-?}°C (${hot_tier} tier)"
+
 # reason line — names each UNKNOWN axis so a degraded read is visibly distinct from a calm one
 unknowns=""
 [ "$env_signal" = UNKNOWN ]  && unknowns="${unknowns} env(no fresh climate out_c)"
 [ "$peer_signal" = UNKNOWN ] && unknowns="${unknowns} peer(no fresh imac-therm)"
 case "$verdict" in
-  COOL)          reason="node ${nc_disp}°C < ${HOT_C}°C and not throttling — not hot" ;;
-  ENVIRONMENTAL) reason="node HOT (${nc_disp}°C, throttling=${throttling}) AND heat bath is warm (env=${ec_disp}°C/${env_signal}, peer ${peer}=${peer_signal}) — shedding load here is low-leverage; cool the room / relocate to a cooler node" ;;
-  WORKLOAD)      reason="node HOT (${nc_disp}°C, throttling=${throttling}) but ambient is fine (env=${ec_disp}°C/${env_signal}, peer ${peer}=${peer_signal}) — heat is this node's own load; shed/throttle HERE" ;;
-  UNATTRIBUTED)  reason="node HOT (${nc_disp}°C, throttling=${throttling}) but both context legs blind —${unknowns:- both unknown}; cannot attribute cause" ;;
+  COOL)          reason="no sensor over its own tier line and not throttling — not hot (${attrib})" ;;
+  ENVIRONMENTAL) reason="node HOT via ${crossed} (throttling=${throttling}) AND heat bath is warm (env=${ec_disp}°C/${env_signal}, peer ${peer}=${peer_signal}) — shedding load here is low-leverage; cool the room / relocate to a cooler node [${attrib}]" ;;
+  WORKLOAD)      reason="node HOT via ${crossed} (throttling=${throttling}) but ambient is fine (env=${ec_disp}°C/${env_signal}, peer ${peer}=${peer_signal}) — heat is this node's own load; shed/throttle HERE [${attrib}]" ;;
+  UNATTRIBUTED)  reason="node HOT via ${crossed} (throttling=${throttling}) but both context legs blind —${unknowns:- both unknown}; cannot attribute cause [${attrib}]" ;;
 esac
 [ -n "$unknowns" ] && [ "$verdict" != UNATTRIBUTED ] && reason="${reason} [UNKNOWN:${unknowns} ]"
 
 ts="$(date -u +%FT%TZ 2>/dev/null || echo "$NOW")"
 
 # persist (unconditionally every run → mtime always fresh, no change-gate false-STALE)
-printf '%s%s | node=%s°C throttling=%s | env=%s°C/%s | peer=%s/%s | %s\n' \
-  "$verdict" "$partial_tag" "$nc_disp" "$throttling" "$ec_disp" "$env_signal" "$peer" "$peer_signal" "$ts" > "$STATE"
+printf '%s%s | node=%s°C(%s@%s/%s tier, line %s°C %s) cpu=%s°C disk=%s°C throttling=%s | env=%s°C/%s | peer=%s/%s | %s\n' \
+  "$verdict" "$partial_tag" "$nc_disp" "$node_label" "$node_src" "$node_tier" "$thr_disp" "$node_thr_src" \
+  "$cpu_disp" "$disk_disp" "$throttling" "$ec_disp" "$env_signal" "$peer" "$peer_signal" "$ts" > "$STATE"
 
 if [ "${1:-}" = "--json" ]; then
   jnc="${node_c:-null}"; jec="${env_c:-null}"
-  printf '{"verdict":"%s","partial":%s,"node_c":%s,"throttling":"%s","env_c":%s,"env_signal":"%s","peer":"%s","peer_signal":"%s","reason":"%s","ts":"%s"}\n' \
-    "$verdict" "$partial" "$jnc" "$throttling" "$jec" "$env_signal" "$peer" "$peer_signal" "$reason" "$ts"
+  jcpu="${cpu_c:-null}"; jdisk="${disk_c:-null}"; jthr="${node_thr:-null}"
+  jhc="${hot_c:-null}"; jht="${hot_thr:-null}"
+  case "$jhc" in ''|*[!0-9-]*) jhc=null ;; esac
+  printf '{"verdict":"%s","partial":%s,"node_c":%s,"node_label":"%s","node_src":"%s","node_tier":"%s","node_thr_c":%s,"node_thr_src":"%s","cpu_c":%s,"disk_c":%s,"hot_tier":"%s","hot_label":"%s","hot_src":"%s","hot_c":%s,"hot_thr_c":%s,"throttling":"%s","env_c":%s,"env_signal":"%s","peer":"%s","peer_signal":"%s","reason":"%s","ts":"%s"}\n' \
+    "$verdict" "$partial" "$jnc" "$node_label" "$node_src" "$node_tier" "$jthr" "$node_thr_src" \
+    "$jcpu" "$jdisk" "$hot_tier" "$hot_label" "$hot_src" "$jhc" "$jht" \
+    "$throttling" "$jec" "$env_signal" "$peer" "$peer_signal" "$reason" "$ts"
   exit 0
 fi
 
