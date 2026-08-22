@@ -161,6 +161,10 @@ the case is the evidence, and mixing them is what made this section a wall nobod
 - **A detector is not a closed loop** — a recurring fault with a one-line idempotent remedy needs a
   RE-APPLIER, and its re-apply RATE must stay loud, or the healer erases the fault signal it rides on.
   [[a-detector-without-a-re-applier-leaves-the-operators-hands-as-the-loop]]
+- **When a SHAPE guess has been widened three times, exempt the POSITION the grammar already fixes**
+  — and never let a sanitizer's CONSTANT placeholder reach a key: many identities collapse onto one
+  row, so one close discharges them all and the netting erases the evidence.
+  [[a-redaction-placeholder-used-as-a-key-is-a-self-erasing-collision]]
 
 ## Substrate changes & multi-agent coordination
 
