@@ -1,0 +1,485 @@
+#!/usr/bin/env bash
+# mesh-tcp-metrics — EGRESS PATH CENSUS from the kernel's per-destination TCP metrics cache.
+#
+# WHAT IS NEW HERE. Every other network sense on this node reads the path AS IT IS RIGHT NOW:
+# mesh-lan-health pings, mesh-lan-jitter bursts, mesh-egress-health fetches an IP, mesh-card
+# routes one address through the FIB. All of them are point samples, and all of them are blind
+# to the question this node keeps failing on — *which source address did our traffic actually
+# leave by, over the last N hours, per destination*. `ip tcp_metrics show` is the only
+# unprivileged surface that answers it: the kernel keeps a per-dst row carrying the SOURCE it
+# last used, so a destination that appears under TWO sources is a recorded path change, dated
+# (loosely — see below) and surviving in kernel memory long after every live probe went green
+# again. On this node that is the exit-node/direct flip: the same public dst reached once via
+# 100.81.222.19 (phaedra exit node) and once via 192.168.8.224 (the RTL8822BU uplink direct).
+#
+# THREE HONESTY GATES, all of them measured on this node before a line of this was written
+# (task tcp-metrics-egress-path-census-organ, discover@ 2026-08-22T13:08:55Z):
+#
+#  (1) THIS IS HISTORY, NOT A LIVE READING. Ages here run to 16546s against a 16666s uptime —
+#      the cache is BOOT-SCOPED and spans the whole boot, so a row is a claim about the past,
+#      not about the path now. Every reading therefore publishes `age=` and `span=`, and any
+#      per-destination rtt older than HORIZON renders the literal `stale`, never a number: an
+#      hours-old rtt printed as a bare figure is exactly the plausible-constant shape
+#      (a-silent-fallback-turns-a-failure-into-a-plausible-constant).
+#
+#  (2) ABSENCE IS UNKNOWN, NEVER DOWN. A dst with no row was never contacted since boot, or was
+#      evicted — the table is a bounded hash, not a log. `--dst <ip>` on a missing dst exits 2
+#      with UNKNOWN and says both reasons out loud. It can never print DOWN; there is no code
+#      path here that could, because this sense has no reachability probe in it at all.
+#
+#  (3) 13 of 108 ROWS CARRY NO rtt AT ALL (measured 2026-08-22T14:2xZ) — source and age only, no
+#      rtt, no cwnd. A reader that assumes rtt renders 0 or dies on 12% of the table. So rtt-less
+#      rows are counted, published as `rtt-cov=`, and rendered `na` — never 0, never dropped
+#      silently (a-summary-line-asserts-legs-that-rendered-na).
+#
+# KEY ON (dst, source), NEVER dst ALONE. Collapsing to dst erases the only thing this surface
+# uniquely knows. 15 of 93 distinct dsts were flipped at 14:2xZ; at 13:08Z the same table showed
+# 2 — that rise IS the signal, and a dst-keyed census would have shown 93 both times.
+#
+# DATING A FLIP. The two rows of a flipped dst have independent ages: the path changed at LATEST
+# min(age) ago (the younger row was written then) and at EARLIEST max(age) ago (before that, the
+# older row's source was in use). So each flip carries an honest BOUND `<min>..<max>s`, and the
+# summary names the tightest one as `last-flip<=`. It is a bound, not a timestamp; do not quote
+# it as one.
+#
+# WHY THERE ARE ONLY TWO BANDS. STEADY (0 flips) / CHURN (>=1). A third "THRASH" band would need
+# a share threshold, and a threshold minted here today would be an uncalibrated constant against
+# an empty corpus (CLAUDE.md: calibrate a derived axis against the LIVE corpus, never an assumed
+# range). The share is PUBLISHED (`flip-share=`) and every band change lands in the log, so the
+# corpus builds itself; add the band when it can be derived, not before.
+#
+# Output (stdout, one line; first token is the verdict — cross-sense vocab contract):
+#   STEADY  flips=0/93 flip-share=0% src=100.81.222.19:68,192.168.8.224:39 rtt-cov=95/108(88%)
+#           age=0.7/1786.8/16546.9s fresh=41/108 horizon=3600s span=16546.9s uptime=16666s
+#           boot=<8hex> kind=history @ <host> <ts>
+#   CHURN   … flips=15/93 flip-share=16% last-flip<=321.9s …
+#   BOOT-RESET is a PREFIX on the band (`CHURN/BOOT-RESET`) for the first run after a reboot,
+#           where every row is new by construction and a flip set diff would be a flood.
+# Exit 2 (honest n/a, stderr): no `ip`, or an EMPTY table — empty is "nothing contacted yet or
+#   all evicted", which is gate (2) at the census level and is not a verdict about the network.
+#
+# STATE (~/.mesh/.tcp-metrics): rewritten UNCONDITIONALLY every run, including the exit-2 ones,
+# which record UNREADABLE with the reason — mtime is ran-live, content is the reading
+# (liveness-touch convention, CLAUDE.md).
+#
+# reflex-cadence: 11-59/15 * * * *
+# reflex-args: --edge
+set -uo pipefail
+
+# CRON SETS PATH=/usr/bin:/bin — ~/.local/bin is NOT on it, so without this line the
+# `command -v mesh-chat` guard on the board post below is FALSE on every scheduled run and the
+# only arm that ever reaches a human is permanently dead, silently. Interactive runs would keep
+# posting, so the fault would be invisible from the pane (a-guard-bound-to-a-node-name-goes-
+# permanently-false, same shape, different binding). Asserted in --test with a fake HOME whose
+# .local/bin holds a poisoned mesh-chat, driven from a cron-like PATH.
+export PATH="$HOME/.local/bin:$PATH"
+
+STATE="${MESH_TCPM_STATE:-$HOME/.mesh/.tcp-metrics}"
+LOG="${MESH_TCPM_LOG:-$HOME/.mesh/tcp-metrics.log}"
+HORIZON="${MESH_TCPM_HORIZON:-3600}"      # seconds; past this a per-dst rtt renders `stale`
+FLIP_NAMES="${MESH_TCPM_FLIP_NAMES:-5}"   # how many flipped dsts to name on the board line
+HOSTN="$(hostname)"
+now_ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+EDGE=0; MODE=census; DST=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --edge)  EDGE=1 ;;
+    --dst)   MODE=dst; DST="${2:-}"; shift ;;
+    --test)  MODE=test ;;
+    --raw)   MODE=raw ;;
+    -h|--help) sed -n '2,60p' "$0"; exit 0 ;;
+    *) echo "mesh-tcp-metrics: unknown flag: $1" >&2; exit 64 ;;
+  esac
+  shift
+done
+
+# ---------------------------------------------------------------------------
+# --test — REAL read first, then the classifier against fixtures, then mutants.
+# A sensor's --test must assert a real hardware read (CLAUDE.md): leg 1 drives the actual
+# kernel surface and fails if the parse cannot pull a source out of it. The fixture legs then
+# pin the three honesty gates so a live table that happens to be boring cannot green them.
+# EVERY child run is pointed at a scratch STATE/LOG — a dry run that writes the durable liveness
+# record forges the evidence it exists to check.
+if [ "$MODE" = test ]; then
+  SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+  TD="$(mktemp -d)"; trap 'rm -rf "$TD"' EXIT INT TERM HUP
+  FAILN=0; OKN=0
+  ok()   { OKN=$((OKN+1)); printf 'ok   %s\n' "$1"; }
+  bad()  { FAILN=$((FAILN+1)); printf 'FAIL %s\n' "$1"; }
+  run()  { env MESH_TCPM_STATE="$TD/state" MESH_TCPM_LOG="$TD/log" "$@"; }
+
+  # --- leg 1: REAL hardware/kernel read (never a fixture) -------------------
+  if ! command -v ip >/dev/null 2>&1; then
+    echo "mesh-tcp-metrics --test: n/a — no \`ip\` on PATH; the metrics cache is unreadable here" >&2
+    exit 2
+  fi
+  REAL="$(ip tcp_metrics show 2>/dev/null)"
+  if [ -z "$(printf '%s' "$REAL" | tr -d '[:space:]')" ]; then
+    echo "mesh-tcp-metrics --test: n/a — live tcp_metrics cache is EMPTY (nothing contacted since boot); cannot assert a real read" >&2
+    exit 2
+  fi
+  printf '%s\n' "$REAL" > "$TD/real"
+  REAL_SRC="$(env MESH_TCPM_FIXTURE="$TD/real" MESH_TCPM_STATE="$TD/state" MESH_TCPM_LOG="$TD/log" \
+                  "$SELF" --raw | awk '$2 != "-"' | wc -l)"
+  if [ "$REAL_SRC" -gt 0 ]; then ok "leg1 real kernel read: $REAL_SRC row(s) parsed with a source out of the LIVE cache"
+  else bad "leg1 real kernel read: the live cache had rows but NONE parsed a source — the parser does not match this kernel's format"; fi
+  REAL_LINE="$(run "$SELF" 2>/dev/null)"
+  case "$REAL_LINE" in
+    STEADY*|CHURN*) ok "leg1b live census renders a band: ${REAL_LINE%% *}" ;;
+    *) bad "leg1b live census produced no band: $REAL_LINE" ;;
+  esac
+  case "$REAL_LINE" in *" kind=history"*) ok "leg1c live line declares kind=history (gate 1: this is not a live reading)" ;;
+    *) bad "leg1c live line omits kind=history" ;; esac
+
+  # --- fixtures -------------------------------------------------------------
+  # flip fixture: 1.1.1.1 under TWO sources (ages 100 / 9000), plus an rtt-less row and a
+  # single-source row. 3 distinct dsts, 4 rows, 3 rows with rtt.
+  cat > "$TD/flip" <<'FIX'
+1.1.1.1 age 100.000sec cwnd 10 rtt 20000us rttvar 5000us source 10.0.0.1
+1.1.1.1 age 9000.000sec cwnd 10 rtt 30000us rttvar 5000us source 192.168.1.5
+2.2.2.2 age 50.000sec source 10.0.0.1
+3.3.3.3 age 200.000sec cwnd 3 rtt 40000us rttvar 1000us source 10.0.0.1
+FIX
+  cat > "$TD/noflip" <<'FIX'
+1.1.1.1 age 100.000sec cwnd 10 rtt 20000us rttvar 5000us source 10.0.0.1
+3.3.3.3 age 200.000sec cwnd 3 rtt 40000us rttvar 1000us source 10.0.0.1
+FIX
+  : > "$TD/empty"
+  fx() { env MESH_TCPM_FIXTURE="$TD/$1" MESH_TCPM_STATE="$TD/s.$1" MESH_TCPM_LOG="$TD/l.$1" \
+             MESH_TCPM_HORIZON="${2:-3600}" "$SELF" "${@:3}"; }
+
+  # --- gate: key on (dst,source), never dst alone --------------------------
+  L="$(fx flip)"
+  case "$L" in *"flips=1/3"*) ok "flip census: 1 flipped dst of 3 (keyed on dst+source)" ;;
+    *) bad "flip census: expected flips=1/3, got: $L" ;; esac
+  case "$L" in *"last-flip<=100s"*|*"last-flip<=100.000s"*) ok "flip bound: last-flip<= the YOUNGER row's age (100s)" ;;
+    *) bad "flip bound: expected last-flip<=100(.000)s, got: $L" ;; esac
+  case "$L" in *"1.1.1.1(100.000..9000.000s"*|*"1.1.1.1(100..9000s"*) ok "flip names the dst with its min..max BOUND, not a timestamp" ;;
+    *) bad "flip naming/bound wrong: $L" ;; esac
+  L2="$(fx noflip)"
+  case "$L2" in STEADY*) ok "no-flip control: STEADY (the band is not stuck on CHURN)" ;;
+    *) bad "no-flip control: expected STEADY, got: $L2" ;; esac
+
+  # --- gate 3: rtt-less rows are counted and rendered na, never 0 ----------
+  case "$L" in *"rtt-cov=3/4(75%)"*) ok "gate3 rtt coverage published: 3/4 rows carry rtt (75%)" ;;
+    *) bad "gate3 rtt coverage wrong: $L" ;; esac
+  D="$(fx flip 3600 --dst 2.2.2.2)"
+  case "$D" in *"rtt=na"*) ok "gate3 an rtt-less row renders rtt=na" ;;
+    *) bad "gate3 rtt-less row did not render na: $D" ;; esac
+  case "$D" in *"rtt=0"*|*"rtt=0.0ms"*) bad "gate3 an rtt-less row rendered a ZERO rtt: $D" ;;
+    *) ok "gate3 no zero rtt was manufactured for a row the kernel left blank" ;; esac
+  case "$D" in *"cwnd=na"*) ok "gate3 an absent cwnd renders na" ;; *) bad "gate3 absent cwnd: $D" ;; esac
+
+  # --- gate 1: past the horizon an rtt is `stale`, never a number ----------
+  D="$(fx flip 3600 --dst 1.1.1.1)"
+  case "$D" in *"rtt=stale"*) ok "gate1 the 9000s row renders rtt=stale against a 3600s horizon" ;;
+    *) bad "gate1 stale not rendered: $D" ;; esac
+  case "$D" in *"rtt=20.0ms"*) ok "gate1 the 100s row still renders its real rtt (the horizon is not blanket)" ;;
+    *) bad "gate1 fresh row lost its rtt: $D" ;; esac
+  D="$(fx flip 99999 --dst 1.1.1.1)"
+  case "$D" in *"rtt=30.0ms"*) ok "gate1 horizon is a PARAMETER: at 99999s the same row renders its number" ;;
+    *) bad "gate1 horizon not honoured: $D" ;; esac
+  case "$L" in *"fresh=3/4"*) ok "gate1 freshness published: 3/4 rows inside the horizon" ;;
+    *) bad "gate1 fresh count wrong: $L" ;; esac
+
+  # --- gate 2: absence is UNKNOWN and exit 2, never DOWN ------------------
+  D="$(fx flip 3600 --dst 9.9.9.9 2>&1)"; RC=$?
+  case "$D" in UNKNOWN*) ok "gate2 an absent dst reads UNKNOWN" ;; *) bad "gate2 absent dst: $D" ;; esac
+  [ "$RC" = 2 ] && ok "gate2 an absent dst exits 2 (honest n/a), not 0 and not 1" || bad "gate2 absent dst rc=$RC, want 2"
+  case "$D" in *"never contacted since boot"*) ok "gate2 names BOTH reasons (never contacted / evicted)" ;;
+    *) bad "gate2 does not name both reasons: $D" ;; esac
+  if grep -qE '(^|[^-])\bDOWN\b' <<<"${D%%never reports DOWN*}"; then
+    bad "gate2 the absent-dst path used the word DOWN as a verdict: $D"
+  else ok "gate2 no DOWN verdict anywhere on the absent-dst path"; fi
+  fx empty >/dev/null 2>&1; [ $? = 2 ] && ok "empty table exits 2 (unknown at the census level), never a band" \
+    || bad "empty table did not exit 2"
+
+  # --- liveness: state written on EVERY run, including the exit-2 ones ----
+  [ -s "$TD/s.empty" ] && ok "state written even on the exit-2 empty-table run (mtime = ran-live)" \
+    || bad "exit-2 run left no state — a dead reflex and an honest n/a would render identically"
+  grep -q 'UNREADABLE reason=empty-table' "$TD/s.empty" && ok "the exit-2 state records the REASON, not a stale positive" \
+    || bad "exit-2 state does not name its reason"
+
+  # --- a --test must not write the durable liveness record ----------------
+  for f in "$HOME/.mesh/tcp-metrics.log" "$HOME/.mesh/.tcp-metrics"; do
+    if [ -e "$f" ]; then B="$(stat -c %Y "$f")"; else B=absent; fi
+    printf '%s\t%s\n' "$f" "$B" >> "$TD/durable.before"
+  done
+
+  # --- MUTANTS: a gate not seen FAIL is not a gate ------------------------
+  # Each mutant is a COPY in $TD — the tree under test is never written to.
+  # $1 = name, $2 = sed program, $3 = the WRONG marker the mutant must now print, $4 = the
+  # RIGHT marker the control prints. Asserting both directions is what makes this a gate: a bare
+  # "output changed" would pass on any perturbation, including one that breaks something else.
+  mutant() {
+    cp "$SELF" "$TD/m"; sed -i "$2" "$TD/m" || { bad "mutant $1: sed failed"; return; }
+    if ! bash -n "$TD/m" 2>/dev/null; then bad "mutant $1: produced a syntax error, so it proves nothing"; return; fi
+    OUT="$(env MESH_TCPM_FIXTURE="$TD/flip" MESH_TCPM_STATE="$TD/ms" MESH_TCPM_LOG="$TD/ml" bash "$TD/m" 2>&1)"
+    case "$CONTROL" in *"$4"*) : ;; *) bad "mutant $1: the CONTROL does not carry '$4' — the assertion is vacuous"; return ;; esac
+    case "$OUT" in
+      *"$3"*) ok "mutant $1 driven RED: control '$4' becomes '$3'" ;;
+      *)      bad "mutant $1 NOT caught: expected '$3', got: $OUT" ;;
+    esac
+  }
+  CONTROL="$(env MESH_TCPM_FIXTURE="$TD/flip" MESH_TCPM_STATE="$TD/ms" MESH_TCPM_LOG="$TD/ml" bash "$SELF" 2>&1)"
+  # m1: key on dst ALONE — the whole point of the sense. Must stop seeing the flip entirely.
+  mutant "key-on-dst-alone" 's/key = \$1 SUBSEP \$2/key = $1/' "flips=0/3" "flips=1/3"
+  # m2: substitute 0 for an absent rtt (gate 3 inverted — the table reads fully covered)
+  mutant "zero-for-absent-rtt" 's/rtt = "-"; cwnd = "-"/rtt = "0"; cwnd = "0"/' "rtt-cov=4/4(100%)" "rtt-cov=3/4(75%)"
+  # m3: drop the horizon so nothing can ever render stale (gate 1 inverted — all rows fresh)
+  mutant "horizon-infinite" 's/^HORIZON="\${MESH_TCPM_HORIZON:-3600}"/HORIZON="${MESH_TCPM_HORIZON:-999999999}"/' "fresh=4/4" "fresh=3/4"
+
+  # --- the board post: live, gated, and reachable under CRON's PATH ---------
+  # THREE arms, and EVERY child runs with a FAKE HOME whose .local/bin holds a poisoned
+  # `mesh-chat`, under `env -i` with cron's own PATH=/usr/bin:/bin. That is not tidiness: the
+  # first version of this leg ran the guard-deleted mutant with the REAL HOME, the tool's own
+  # `export PATH="$HOME/.local/bin:$PATH"` put the REAL mesh-chat ahead of the poison, and the
+  # --test posted two fixture lines to the live board at 2026-08-22T14:34:33Z — the exact forgery
+  # this leg exists to prevent, committed by the leg itself (corrected in-channel). A poison that
+  # can lose a PATH race is not a poison. With env -i the ONLY mesh-chat reachable from the child
+  # is the one under the fake HOME, whatever the tool does to PATH.
+  CHAT_BEFORE="$(grep -c 'tcp-metrics@' "$HOME/.mesh/chat.log" 2>/dev/null || echo 0)"
+  mkdir -p "$TD/bin" "$TD/home/.local"
+  cat > "$TD/bin/mesh-chat" <<'POISON'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$MESH_TCPM_POISON"
+POISON
+  chmod +x "$TD/bin/mesh-chat"; ln -sfn "$TD/bin" "$TD/home/.local/bin"
+  band_change() { # $1 = script, $2 = poison sink — noflip, noflip, flip => one BAND CHANGE
+    rm -f "$TD/bs" "$2"
+    for fx in noflip noflip flip; do
+      env -i HOME="$TD/home" PATH=/usr/bin:/bin \
+          MESH_TCPM_FIXTURE="$TD/$fx" MESH_TCPM_STATE="$TD/bs" MESH_TCPM_LOG="$TD/bl" \
+          MESH_TCPM_POISON="$2" /bin/bash "$1" --edge >/dev/null 2>&1
+    done
+  }
+  # arm A — the shipped tool: a fixture-driven band change must post NOTHING.
+  band_change "$SELF" "$TD/poison.a"
+  [ -s "$TD/poison.a" ] && bad "a fixture-driven --edge band change POSTED: $(cat "$TD/poison.a")" \
+    || ok "board post: a dry/fixture run cannot reach mesh-chat even across a band change"
+  # arm B — guard deleted: the SAME run must post, from cron's PATH. Green here proves three
+  # things at once: the post path is live, the fixture guard is what stopped arm A, and the tool's
+  # PATH export makes mesh-chat resolvable where cron would leave it unreachable.
+  cp "$SELF" "$TD/mb"; sed -i 's/ \&\& \[ -z "${MESH_TCPM_FIXTURE:-}" \]//' "$TD/mb"
+  if bash -n "$TD/mb" 2>/dev/null; then
+    band_change "$TD/mb" "$TD/poison.b"
+    if [ -s "$TD/poison.b" ]; then
+      ok "board post: guard deleted, the same run posts under cron's PATH=/usr/bin:/bin — arm A is a guard, not a dead path"
+      grep -q 'never contacted or evicted' "$TD/poison.b" && ok "the board line carries the UNKNOWN-not-down caveat" \
+        || bad "the board line omits the UNKNOWN-not-down caveat"
+      grep -q 'HISTORY' "$TD/poison.b" && ok "the board line says the reading is HISTORY, not a live probe" \
+        || bad "the board line does not declare itself history"
+    else
+      bad "board post: guard deleted and STILL nothing posted — the post path is DEAD under cron's PATH, so arm A proves nothing"
+    fi
+    # arm C — guard AND the PATH export deleted: nothing can resolve, proving the export is what
+    # carries arm B (and that cron without it would post silence forever).
+    cp "$TD/mb" "$TD/mc"; sed -i '/^export PATH="\$HOME\/\.local\/bin:\$PATH"$/d' "$TD/mc"
+    if bash -n "$TD/mc" 2>/dev/null; then
+      band_change "$TD/mc" "$TD/poison.c"
+      [ -s "$TD/poison.c" ] && bad "cron PATH: mesh-chat resolved with the export deleted — arm B proves nothing about the export" \
+        || ok "cron PATH: deleting the export kills the post — the export is load-bearing, not decoration"
+    else bad "cron-PATH mutant: syntax error, proves nothing"; fi
+  else bad "board-post mutant: syntax error, proves nothing"; fi
+  # the LIVE board must be untouched by all of the above. This is the leg that would have caught
+  # the 14:34:33Z forgery on the spot instead of a human noticing it in the log.
+  CHAT_AFTER="$(grep -c 'tcp-metrics@' "$HOME/.mesh/chat.log" 2>/dev/null || echo 0)"
+  [ "$CHAT_AFTER" = "$CHAT_BEFORE" ] \
+    && ok "the LIVE board is untouched by --test (tcp-metrics@ lines: $CHAT_BEFORE, unchanged)" \
+    || bad "--test POSTED to the live board: tcp-metrics@ lines $CHAT_BEFORE -> $CHAT_AFTER"
+
+  # durable record must be untouched by everything above
+  while IFS="$(printf '\t')" read -r f b; do
+    if [ -e "$f" ]; then A="$(stat -c %Y "$f")"; else A=absent; fi
+    [ "$A" = "$b" ] && ok "durable $f untouched by --test" || bad "--test WROTE the durable record $f ($b -> $A)"
+  done < "$TD/durable.before"
+
+  printf '\nmesh-tcp-metrics --test: %d ok, %d FAIL\n' "$OKN" "$FAILN"
+  [ "$FAILN" -eq 0 ] || exit 1
+  exit 0
+fi
+
+IPBIN="${MESH_TCPM_IP:-ip}"
+command -v "$IPBIN" >/dev/null 2>&1 || {
+  echo "mesh-tcp-metrics: n/a — no \`$IPBIN\` on PATH (cannot read the metrics cache)" >&2
+  printf 'UNREADABLE reason=no-ip-binary @ %s %s\n' "$HOSTN" "$(now_ts)" > "$STATE" 2>/dev/null
+  exit 2
+}
+
+# --- read the table ---------------------------------------------------------
+# MESH_TCPM_FIXTURE lets --test drive the parser off a file with ZERO kernel dependency, so the
+# assertions below are about THIS code and not about whatever the live cache happens to hold.
+read_table() {
+  if [ -n "${MESH_TCPM_FIXTURE:-}" ]; then cat "$MESH_TCPM_FIXTURE"
+  else "$IPBIN" tcp_metrics show 2>/dev/null
+  fi
+}
+
+boot_id() {
+  local b
+  b="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null | tr -d '-')"
+  printf '%s' "${b:0:8}"
+}
+uptime_s() { awk '{printf "%d", $1}' /proc/uptime 2>/dev/null || printf '0'; }
+
+TABLE="$(read_table)"
+ROWS="$(printf '%s\n' "$TABLE" | grep -c '[^[:space:]]')"
+
+if [ "$ROWS" -eq 0 ]; then
+  echo "mesh-tcp-metrics: n/a — the tcp_metrics cache is EMPTY: nothing contacted since boot, or everything evicted. That is UNKNOWN, not a network verdict." >&2
+  printf 'UNREADABLE reason=empty-table boot=%s uptime=%ss @ %s %s\n' "$(boot_id)" "$(uptime_s)" "$HOSTN" "$(now_ts)" > "$STATE" 2>/dev/null
+  exit 2
+fi
+
+# --- the one parse tract ----------------------------------------------------
+# Emits one normalised record per row:  <dst> <source|-> <age|-> <rtt_us|-> <cwnd|->
+# A field the kernel did not print stays `-` all the way to the renderer; nothing here
+# substitutes a zero for an absent field (gate 3).
+parse_rows() {
+  awk '
+    NF == 0 { next }
+    {
+      dst = $1; src = "-"; age = "-"; rtt = "-"; cwnd = "-"
+      for (i = 2; i <= NF; i++) {
+        if ($i == "source" && i < NF)      src  = $(i+1)
+        else if ($i == "cwnd" && i < NF)   cwnd = $(i+1)
+        else if ($i ~ /^age$/ && i < NF)   { age = $(i+1); sub(/sec$/, "", age) }
+        else if ($i == "rtt" && i < NF)    { rtt = $(i+1); sub(/us$/, "", rtt) }
+      }
+      print dst, src, age, rtt, cwnd
+    }'
+}
+
+RECS="$(printf '%s\n' "$TABLE" | parse_rows)"
+
+# --- gate 3: rtt coverage ---------------------------------------------------
+RTT_ROWS="$(printf '%s\n' "$RECS" | awk '$4 != "-"' | grep -c '[^[:space:]]')"
+RTT_PCT="na"
+[ "$ROWS" -gt 0 ] && RTT_PCT="$(awk -v a="$RTT_ROWS" -v b="$ROWS" 'BEGIN{printf "%d", (a*100)/b}')"
+
+# --- gate 1: ages, freshness, span -----------------------------------------
+AGES="$(printf '%s\n' "$RECS" | awk '$3 != "-" {print $3}' | sort -n)"
+AGE_N="$(printf '%s\n' "$AGES" | grep -c '[^[:space:]]')"
+if [ "$AGE_N" -gt 0 ]; then
+  AGE_MIN="$(printf '%s\n' "$AGES" | head -1)"
+  AGE_MAX="$(printf '%s\n' "$AGES" | tail -1)"
+  AGE_MED="$(printf '%s\n' "$AGES" | awk '{a[NR]=$1} END{print (NR%2) ? a[(NR+1)/2] : a[NR/2]}')"
+  FRESH="$(printf '%s\n' "$AGES" | awk -v h="$HORIZON" '$1+0 <= h' | grep -c '[^[:space:]]')"
+  SPAN="$AGE_MAX"
+else
+  AGE_MIN=na; AGE_MAX=na; AGE_MED=na; FRESH=na; SPAN=na
+fi
+
+# --- source census ----------------------------------------------------------
+SRC_CENSUS="$(printf '%s\n' "$RECS" | awk '$2 != "-" {print $2}' | sort | uniq -c | sort -rn \
+  | awk '{printf "%s%s:%s", (NR>1?",":""), $2, $1} END{if (NR==0) printf "na"}')"
+SRC_N="$(printf '%s\n' "$RECS" | awk '$2 != "-" {print $2}' | sort -u | grep -c '[^[:space:]]')"
+
+# --- flips: a dst seen under MORE THAN ONE source --------------------------
+# Each flip carries the honest bound min(age)..max(age) over that dst's rows: the path changed
+# at latest min ago and at earliest max ago. It is a BOUND, never a timestamp.
+FLIPS="$(printf '%s\n' "$RECS" | awk '
+  $2 != "-" {
+    key = $1 SUBSEP $2
+    if (!(key in seen)) { seen[key] = 1; nsrc[$1]++ }
+    if ($3 != "-") {
+      if (!($1 in lo) || $3+0 < lo[$1]) lo[$1] = $3+0
+      if (!($1 in hi) || $3+0 > hi[$1]) hi[$1] = $3+0
+    }
+    srcs[$1] = srcs[$1] (srcs[$1] == "" ? "" : "|") $2
+  }
+  END {
+    for (d in nsrc) if (nsrc[d] > 1)
+      printf "%s %s %s %s\n", d, (d in lo ? lo[d] : "-"), (d in hi ? hi[d] : "-"), srcs[d]
+  }' | sort -k2 -n)"
+FLIP_N="$(printf '%s\n' "$FLIPS" | grep -c '[^[:space:]]')"
+DST_N="$(printf '%s\n' "$RECS" | awk '{print $1}' | sort -u | grep -c '[^[:space:]]')"
+FLIP_SHARE="na"
+[ "$DST_N" -gt 0 ] && FLIP_SHARE="$(awk -v a="$FLIP_N" -v b="$DST_N" 'BEGIN{printf "%d", (a*100)/b}')"
+
+LAST_FLIP="na"
+[ "$FLIP_N" -gt 0 ] && LAST_FLIP="$(printf '%s\n' "$FLIPS" | awk '$2 != "-" {print $2}' | sort -n | head -1)"
+[ -z "$LAST_FLIP" ] && LAST_FLIP="na"
+
+BOOT="$(boot_id)"; UP="$(uptime_s)"
+
+# --- --raw / --dst ----------------------------------------------------------
+if [ "$MODE" = raw ]; then printf '%s\n' "$RECS"; exit 0; fi
+
+if [ "$MODE" = dst ]; then
+  [ -n "$DST" ] || { echo "mesh-tcp-metrics: --dst needs an address" >&2; exit 64; }
+  HIT="$(printf '%s\n' "$RECS" | awk -v d="$DST" '$1 == d')"
+  if [ -z "$HIT" ]; then
+    # GATE 2. Both reasons, every time. There is no DOWN here.
+    echo "UNKNOWN $DST — no row in the tcp_metrics cache: never contacted since boot (uptime ${UP}s), or evicted. This sense cannot see reachability and never reports DOWN." >&2
+    exit 2
+  fi
+  printf '%s\n' "$HIT" | while read -r d s a r c; do
+    rr="$r"
+    if [ "$r" = "-" ]; then rr="na"                                        # gate 3
+    elif [ "$a" != "-" ] && awk -v a="$a" -v h="$HORIZON" 'BEGIN{exit !(a+0 > h)}'; then
+      rr="stale"                                                           # gate 1
+    else rr="$(awk -v r="$r" 'BEGIN{printf "%.1fms", r/1000}')"; fi
+    printf '%s source=%s age=%ss rtt=%s cwnd=%s horizon=%ss kind=history\n' \
+      "$d" "$s" "$a" "$rr" "${c/-/na}" "$HORIZON"
+  done
+  exit 0
+fi
+
+# --- band + boot-reset ------------------------------------------------------
+BAND=STEADY
+[ "$FLIP_N" -gt 0 ] && BAND=CHURN
+
+PREV_BOOT=""; PREV_BAND=""; PREV_FLIPSET=""
+if [ -r "$STATE" ]; then
+  PREV_BOOT="$(sed -n 's/.*[[:space:]]boot=\([0-9a-f]*\).*/\1/p' "$STATE" | head -1)"
+  PREV_BAND="$(awk 'NR==1{print $1}' "$STATE")"
+  PREV_FLIPSET="$(sed -n 's/^#flipset[[:space:]]//p' "$STATE" | head -1)"
+fi
+FLIPSET="$(printf '%s\n' "$FLIPS" | awk '{print $1}' | sort | tr '\n' ',' )"
+
+RESET=0
+[ -n "$PREV_BOOT" ] && [ "$PREV_BOOT" != "$BOOT" ] && RESET=1
+[ -z "$PREV_BOOT" ] && RESET=1
+DISPLAY_BAND="$BAND"
+[ "$RESET" = 1 ] && DISPLAY_BAND="$BAND/BOOT-RESET"
+
+# --- render -----------------------------------------------------------------
+LINE="$DISPLAY_BAND flips=$FLIP_N/$DST_N flip-share=${FLIP_SHARE}%"
+[ "$FLIP_N" -gt 0 ] && LINE="$LINE last-flip<=${LAST_FLIP}s"
+LINE="$LINE src=$SRC_CENSUS srcs=$SRC_N rtt-cov=$RTT_ROWS/$ROWS(${RTT_PCT}%)"
+LINE="$LINE age=$AGE_MIN/$AGE_MED/${AGE_MAX}s fresh=$FRESH/$ROWS horizon=${HORIZON}s"
+LINE="$LINE span=${SPAN}s uptime=${UP}s boot=$BOOT kind=history @ $HOSTN $(now_ts)"
+
+if [ "$FLIP_N" -gt 0 ]; then
+  NAMED="$(printf '%s\n' "$FLIPS" | head -"$FLIP_NAMES" \
+    | awk '{printf "%s%s(%s..%ss via %s)", (NR>1?" ":""), $1, $2, $3, $4}')"
+  MORE=""
+  [ "$FLIP_N" -gt "$FLIP_NAMES" ] && MORE=" +$((FLIP_N - FLIP_NAMES)) more"
+  LINE="$LINE :: flipped: $NAMED$MORE"
+fi
+
+# STATE is written on EVERY successful run, changed or not (liveness-touch convention).
+{ printf '%s\n' "$LINE"; printf '#flipset %s\n' "$FLIPSET"; } > "$STATE" 2>/dev/null
+
+CHANGED=0
+[ "$DISPLAY_BAND" != "$PREV_BAND" ] && CHANGED=1
+[ "$FLIPSET" != "$PREV_FLIPSET" ] && CHANGED=1
+[ "$CHANGED" = 1 ] && printf '%s  %s\n' "$(now_ts)" "$LINE" >> "$LOG" 2>/dev/null
+
+# BOARD ONLY ON A BAND CHANGE — rare and loud. Flip GROWTH is the running detail and belongs in
+# the log (this node's flip set grows through the day as the RTL8822BU uplink drops and the exit
+# node takes over and hands back); boarding every new flipped dst would put ~20 lines/day of
+# detail on a channel whose whole job is to stay scannable. The band is the state; the log is
+# the corpus that a future calibrated third band will be derived from.
+if [ "$EDGE" = 1 ]; then
+  if [ "$DISPLAY_BAND" != "$PREV_BAND" ] && [ -n "$PREV_BAND" ] && command -v mesh-chat >/dev/null 2>&1 \
+     && [ -z "${MESH_TEST_SANDBOX:-}" ] && [ -z "${MESH_TCPM_FIXTURE:-}" ]; then
+    MESH_WHO="tcp-metrics@$HOSTN" mesh-chat "[fyi] tcp-metrics on $HOSTN: egress path census band $PREV_BAND -> $DISPLAY_BAND. $LINE :: this is HISTORY from the kernel's boot-scoped tcp_metrics cache, not a live probe — a flip's date is the BOUND min..max age of that dst's two rows, never a timestamp, and an absent dst is UNKNOWN (never contacted or evicted), never down." >/dev/null 2>&1 || true
+  fi
+  [ "$CHANGED" = 1 ] && printf '%s\n' "$LINE"
+  exit 0
+fi
+printf '%s\n' "$LINE"
+exit 0
