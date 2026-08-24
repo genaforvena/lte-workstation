@@ -191,6 +191,10 @@ the case is the evidence, and mixing them is what made this section a wall nobod
   from real event by the victim's SIZE: a band is a proxy whose failure direction is SILENCE, and an
   unsigned probe must BOARD, not fall into a whitelist it no longer qualifies for.
   [[a-size-band-is-a-proxy-for-identity-and-it-fails-toward-silence]]
+- **When a guard has been re-tuned FOUR times against ONE subject, the missing thing is a WORD, not a
+  fifth threshold** — let the subject DECLARE its discipline, and make the declaration buy a different
+  TAG, never silence: it still alarms past its own measured bound, and an alarming episode is never
+  learned as a sample of normal. [[a-vocabulary-with-two-states-reads-a-discipline-as-an-incident]]
 - **A lint whose predicate is not the PARSER'S OWN predicate is not a guard on that parser** — expose
   the deciding grammar as one entry point both sites call, and remember that a fallback keyed on the
   FAILED text collapses every distinct obligation that failed the same way onto one row.
