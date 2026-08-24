@@ -173,6 +173,11 @@ the case is the evidence, and mixing them is what made this section a wall nobod
 - **A detector is not a closed loop** — a recurring fault with a one-line idempotent remedy needs a
   RE-APPLIER, and its re-apply RATE must stay loud, or the healer erases the fault signal it rides on.
   [[a-detector-without-a-re-applier-leaves-the-operators-hands-as-the-loop]]
+- **A re-applier pays only where the fault's recovery is OVER-dispersed (sharp restart: CV>1), and a
+  healer's own tape cannot prove it** — the `rung=none` arm is that distribution TRUNCATED at the first
+  rung, so "restart does not help" is the DISARMING artifact; issue a positive verdict from a biased
+  arm, never a negative one, and get the negative from a deliberate HOLDOUT arm.
+  [[a-healers-own-tape-truncates-the-tail-that-would-justify-it]]
 - **Once a detector has an actuator, move the ALERT behind it** — fire on the actuator's OUTCOME,
   never on the fault, or every episode the loop repairs itself still wakes a human (twice: the edge
   and the recovery); hold the edge unspent, bound the hold by the gate's own arithmetic, and log
