@@ -191,6 +191,10 @@ the case is the evidence, and mixing them is what made this section a wall nobod
   from real event by the victim's SIZE: a band is a proxy whose failure direction is SILENCE, and an
   unsigned probe must BOARD, not fall into a whitelist it no longer qualifies for.
   [[a-size-band-is-a-proxy-for-identity-and-it-fails-toward-silence]]
+- **A lint whose predicate is not the PARSER'S OWN predicate is not a guard on that parser** — expose
+  the deciding grammar as one entry point both sites call, and remember that a fallback keyed on the
+  FAILED text collapses every distinct obligation that failed the same way onto one row.
+  [[a-lint-that-tests-a-different-predicate-than-the-parser-is-blind]]
 - **A saturated LEVEL is not a state — publish the two opposing RATES that hold it there**, name
   `INERT` (both ≈0) apart from `HOMEOSTASIS` (both large, difference ≈0), and derive residence time
   `τ = N/v_dec` so a consumer's reach is checked against it, never guessed at with a constant.
