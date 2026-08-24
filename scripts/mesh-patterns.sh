@@ -385,6 +385,79 @@ mesh_is_minter(){
   [ "$host" = "$minter" ]
 }
 
+# ---- RSSI sentinel grammar (shared by mesh-wifi-mimo / -quality / -rf / -contention) ----
+#
+# ONE blindness, TWO renderings, and until 2026-08-24 FOUR private copies of the predicate, no two
+# of which agreed. When this node's uplink (RTL8822BU/rtw_8822bu, the sole uplink) goes momentarily
+# blind, nl80211 renders the instant as `signal: 0 dBm` and /proc/net/wireless renders the SAME
+# instant as `level -256.` — discover measured 11/90 samples railed with coincident=11, proc-only=0,
+# iw-only=0, and health replicated it with a read-proc/read-iw/read-proc bracket that rules the
+# inter-read gap out by construction: 16 of 16 coincident among the 79 stable brackets.
+#
+# Why no existing guard caught the nl80211 half: mesh-wifi-quality/-rf's `level_valid` is a
+# MAGNITUDE bound (`> -200`) and it works only because -256 is out of range. **0 dBm is IN range,
+# well-formed and MAXIMAL** — no plausibility bound rejects it, and the rail is ALWAYS toward
+# perfect (valid band here -54..-43, so the rail is +43..+54 dB in the flattering direction).
+# mesh-wifi-contention's `dbm()` rejected 0 but not -256; mesh-wifi-mimo had no guard at all and
+# published `signal=0dBm` into a sense whose whole discriminator is "NSS collapsed WHILE signal
+# held steady" — a rail coinciding with a real NSS collapse manufactures the most emphatic possible
+# instance of that inference out of a blind moment.
+#
+# So: the two sentinels are ONE concept (RAILED) and belong to ONE predicate, exactly as
+# MESH_RL_RE above exists because four detectors of one concept drifted apart in private.
+#
+# rssi_valid is a SENTINEL test, NOT a plausibility bound. It rejects only what the driver emits
+# when it has no reading: >= 0 (nl80211's blind instant, and a receiver RSSI is never positive) and
+# <= RSSI_MIN_DBM (/proc's -256). It deliberately does NOT bound the plausible band — a bound is
+# what failed here, and health measured why a bound cannot be the fix: the rail flips INSIDE the
+# gap between two adjacent reads (22 of 100 brackets had proc CHANGE across one intervening iw
+# call, a few milliseconds), so a single sample is untrustworthy on its face and even a
+# cross-surface agreement check is not a validity proof — it just has a ~78% chance of catching the
+# same instant. What survives is a MEDIAN over a burst. That is rssi_burst, and it is why every
+# consumer publishes its BLIND FRACTION beside the value rather than a quietly cleaned-up number.
+RSSI_MIN_DBM="${MESH_RSSI_MIN_DBM:--200}"
+# Which copy of the grammar is live is a CHECKABLE FACT, not a comment: every consumer carries an
+# inline fallback for a node without this lib, and "the fallback is the same predicate, never a
+# laxer one" is exactly the kind of claim that rots into a comment nobody re-derives. Consumers set
+# this to "inline" in their fallback branch and gate BOTH copies against the same sentinels.
+RSSI_GRAMMAR_SRC="mesh-patterns.sh"
+export RSSI_MIN_DBM RSSI_GRAMMAR_SRC
+rssi_valid() {  # <value> -> 0 iff a real dBm reading (tolerates a trailing '.' or ' dBm')
+  local v="${1:-}"
+  v="${v% dBm}"; v="${v%dBm}"; v="${v%.}"
+  case "$v" in ''|-|NA|na|n/a) return 1;; esac
+  case "$v" in *[!0-9.-]*) return 1;; esac
+  case "$v" in *.*) v="${v%%.*}";; esac       # -49.5 -> -49 (integer compare; dBm resolution is 1)
+  case "$v" in ''|-) return 1;; esac
+  [ "$v" -lt 0 ] 2>/dev/null || return 1      # 0 dBm = nl80211 blind instant; positive is not an RSSI
+  [ "$v" -gt "$RSSI_MIN_DBM" ] 2>/dev/null    # -256 = /proc driver-not-ready sentinel
+}
+# rssi_burst — stdin: one candidate value per line (as read, sentinels included).
+# stdout: "<median|na> <valid> <total>". Median of the VALID samples only; "na" when none are
+# valid, NEVER 0 and never a silently carried last value. Lower median on an even count (a dBm
+# reading is an integer; averaging two would mint a value no sample ever had).
+rssi_burst() {
+  awk -v minv="$RSSI_MIN_DBM" '
+    { total++
+      v = $0
+      sub(/ ?dBm$/, "", v); sub(/\.$/, "", v)
+      if (v !~ /^-?[0-9]+(\.[0-9]+)?$/) next
+      n = int(v + 0)
+      if (n >= 0 || n <= minv) next          # same predicate as rssi_valid, one grammar
+      vals[++k] = n
+    }
+    END {
+      if (k == 0) { printf "na %d %d\n", 0, total; exit }
+      asort_n(vals, k)
+      printf "%d %d %d\n", vals[int((k+1)/2)], k, total
+    }
+    function asort_n(a, n,   i, j, t) {       # tiny insertion sort: k is a burst size, not a corpus
+      for (i = 2; i <= n; i++) { t = a[i]; j = i - 1
+        while (j >= 1 && a[j] > t) { a[j+1] = a[j]; j-- }
+        a[j+1] = t }
+    }'
+}
+
 # Guard: run the test block ONLY when this file is EXECUTED directly — never when SOURCED.
 # (A sourced lib inherits the caller's $1, so without this guard `consumer --test` would trip the
 # lib's own test+exit and hijack the consumer's self-check.)
@@ -604,5 +677,44 @@ PJ
     && { echo "  FAIL: unmatched peer must yield NO ts-live candidate: $_pr_out"; fail=1; }
   ck2 "$(printf '%s\n' "$_pr_out" | wc -l)" 2 "unmatched peer: ladder is slot+LAN only"
   rm -rf "$_prd"
+
+  # ---- RSSI sentinel grammar ----
+  echo "rssi_valid — the two renderings of ONE blind instant must BOTH be rejected:"
+  rssi_valid -49    || { echo "  FAIL: -49 is a real reading";                       fail=1; }
+  rssi_valid -49.   || { echo "  FAIL: -49. (proc trailing dot) is a real reading";  fail=1; }
+  rssi_valid '-54 dBm' || { echo "  FAIL: '-54 dBm' (iw suffix) is a real reading";  fail=1; }
+  rssi_valid -43.5  || { echo "  FAIL: -43.5 is a real reading";                     fail=1; }
+  rssi_valid 0      && { echo "  FAIL: 0 is nl80211's BLIND instant, not a perfect link"; fail=1; }
+  rssi_valid 0.     && { echo "  FAIL: 0. is the same sentinel with proc's dot";     fail=1; }
+  rssi_valid -0     && { echo "  FAIL: -0 is still zero";                            fail=1; }
+  rssi_valid 5      && { echo "  FAIL: a receiver RSSI is never positive";           fail=1; }
+  rssi_valid -256   && { echo "  FAIL: -256 is /proc's driver-not-ready sentinel";   fail=1; }
+  rssi_valid -256.  && { echo "  FAIL: -256. sentinel with the dot";                 fail=1; }
+  rssi_valid -200   && { echo "  FAIL: -200 is at the sentinel floor, not above it"; fail=1; }
+  rssi_valid ''     && { echo "  FAIL: empty is not a reading";                      fail=1; }
+  rssi_valid NA     && { echo "  FAIL: NA is not a reading";                         fail=1; }
+  rssi_valid -      && { echo "  FAIL: '-' is not a reading";                        fail=1; }
+  rssi_valid abc    && { echo "  FAIL: non-numeric is not a reading";                fail=1; }
+  # THE WHOLE POINT: the old magnitude bound (> -200) accepts 0, and that is the dangerous half.
+  # This asserts the two guards are NOT the same predicate, so a regression back to a bound is red.
+  _rv_bound(){ local l="${1%.}"; case "$l" in ''|*[!0-9-]*) return 1;; esac; [ "$l" -gt -200 ] 2>/dev/null; }
+  _rv_bound 0 || { echo "  FAIL: fixture wrong — the OLD level_valid bound does accept 0"; fail=1; }
+  rssi_valid 0 && { echo "  FAIL: rssi_valid must differ from the bound exactly here"; fail=1; }
+
+  echo "rssi_burst — median over a burst, blind fraction published, NEVER 0:"
+  ck2 "$(printf -- '-49\n-50\n-48\n' | rssi_burst)" "-49 3 3"  "all valid: median, 3/3"
+  ck2 "$(printf -- '-49\n0\n-51\n' | rssi_burst)"   "-51 2 3"  "one railed sample is dropped, not averaged in"
+  ck2 "$(printf -- '0\n0\n0\n' | rssi_burst)"       "na 0 3"   "all railed -> na, never 0"
+  ck2 "$(printf -- '-256.\n-49.\n' | rssi_burst)"   "-49 1 2"  "proc rendering: sentinel dropped, dot tolerated"
+  ck2 "$(printf -- '-40\n-50\n-60\n-70\n' | rssi_burst)" "-60 4 4" "even count takes the WEAKER median (never averages two into a value no sample had)"
+  ck2 "$(printf -- '\n' | rssi_burst)"              "na 0 1"   "an empty line is a sample that yielded nothing"
+  ck2 "$(printf -- '' | rssi_burst)"                "na 0 0"   "no samples at all: na with total 0, never a value"
+  # A railed burst must not be rescued into a plausible-looking number by ANY path.
+  printf -- '0\n0\n0\n0\n0\n' | rssi_burst | grep -q '^na ' \
+    || { echo "  FAIL: a fully blind burst must render na"; fail=1; }
+  # ...and a burst that is blind in the /proc rendering must land on the SAME verdict as the
+  # nl80211 one — one blindness, one answer, whichever surface reported it.
+  ck2 "$(printf -- '-256.\n-256.\n' | rssi_burst)"  "na 0 2"   "the twin rendering of the same blindness -> na too"
+
   [ "$fail" = 0 ] && { echo "smoke-test: ok"; exit 0; } || { echo "smoke-test: FAIL"; exit 1; }
 fi
