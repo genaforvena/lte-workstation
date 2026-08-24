@@ -218,6 +218,10 @@ the case is the evidence, and mixing them is what made this section a wall nobod
   a trapped TERM until the current FOREGROUND external command returns, so the hung child IS what
   holds the trap that exists to kill it; bound it with `timeout -k` too, and reap the process GROUP.
   [[a-foreground-child-defers-the-signal-trap-that-would-reap-it]]
+- **A tape that records only what it SAW is a numerator — write the RUN row too**, unconditionally and
+  carrying the attempt's own health, or every silence in it is departure, a refused read and downtime
+  collapsed into one; the cadence is not the denominator.
+  [[a-tape-of-only-positives-is-a-numerator]]
 - **A verdict's FREE TEXT may quote another record's fields, so parse the ledger BY POSITION** — a
   second `score=` in the prose gave one reader a multi-line value, and the malformed row's EMPTY path
   field then wore the "nothing is evictable" sentence, so the drain died loud-looking and silent.
