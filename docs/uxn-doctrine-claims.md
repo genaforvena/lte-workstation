@@ -19,6 +19,30 @@ Classification:
 
 ## STANDING (5)
 
+> **These verdicts are now RE-DERIVED, not stored (2026-08-24).** Every status in the table
+> below was hand-written once from a single sweep, while `mesh-series-stats --claims` — the tool
+> built to keep them live — printed only a ROM-vs-twin *arithmetic* verdict and rendered a bare
+> `[AGREE]` beside claim 2 on a corpus holding `cnt(act>=0.55)=133`. The word `DRIFT` appeared in
+> that tool's header and in the sound dash's legend and in **no code path**, so the gate could not
+> fail in the one direction it existed for. Each claim now carries a predicate and emits its own
+> `=>` verdict (`HOLDS` / `DRIFT` / `REFUTED` / `UNKNOWN`) on every sound-dash frame, separate from
+> `[arith:]`. Every predicate is parameter-free — the claim's own operative consequence, never an
+> invented tolerance: a **bound** tests `cnt(>=t)==0`; a **median** tests whether it still splits
+> the live corpus, against the binomial null `0.5 ± 3·(0.5/√n)`, a band derived from n rather than
+> chosen — and the deviation is printed in that null's own sd units (`z=+9.8 sd`), because the
+> verdict FLAPS at the edge: `dyn` sat at 3.0 sd and crossed HOLDS→DRIFT between two dash frames
+> two minutes apart. Without `z` a reader cannot separate that jitter from a real move and would
+> reach for a wider band — an invented constant — to quiet it. A verdict inside 1 sd of the edge
+> is marked `MARGINAL`. A **comparison** tests DIRECTION and reports its magnitude as explicitly NOT GATED,
+> because the ROM yields no dispersion term and no honest band exists there. An empty or
+> ROM-refused series renders `UNKNOWN`, never `HOLDS`.
+>
+> Live at the time of writing (n≈1614, vs the n=651 sweep recorded below): claim 2 **REFUTED**
+> (133 rows exceed 0.55, up from 24); claim 3 `act` **DRIFT** (z=+6.3), `move` **DRIFT** (z=+9.8), `dyn` **DRIFT but MARGINAL** (z=+3.6, flapping);
+> claim 1 **HOLDS (direction)** with the separation continuing to collapse — 3.39x → 1.5x at
+> n=651 → **1.16x** now. Do not quote those numbers: re-run `mesh-series-stats --claims`.
+
+
 | # | line | claim | status |
 |---|------|-------|--------|
 | 1 | 434 | "over n=215 records, score≥55 averages **3.6 beats** vs **12.2** for everything else" | **REFUTED as stated** — direction survives, magnitude does not |
