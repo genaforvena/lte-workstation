@@ -414,6 +414,30 @@ do_sweep() {
 }
 
 # ---- smoke test -------------------------------------------------------------------------------
+# INTERRUPT SAFETY (2026-08-25, task test-forgery-and-supervise-tests-leak-across-their-longest-window).
+# smoke_test carried NO trap: its sandbox `d` and its background writers were reaped only by the
+# straight-line path at the end, and BOTH noise loops enclose run_detector — the longest and most
+# interruptible stretch in the function (it drives child `--test`s under `timeout`). An interrupt
+# there left a `while :; do echo >> $d/…; sleep 0.05; done` subshell spinning FOREVER against a
+# directory that no longer exists (20 failed opens/s, no output, no owner), plus the TERM-DEAF
+# `sleep 20` fixture, which ignores SIGTERM by construction and so can only be reaped by pid + -9.
+# State is held in SHELL-GLOBAL vars on purpose: an EXIT trap fires after smoke_test has returned,
+# where its `local d` no longer exists. bash runs the EXIT trap under SIGTERM (only SIGKILL leaks —
+# `a-bash-exit-trap-does-run-under-sigterm`), so the EXIT arm is the load-bearing one and INT/TERM/HUP
+# only make the exit status honest. Registered ONCE: a second `trap … EXIT` REPLACES the first.
+_ST_DIR=""; _ST_PIDS=""
+_st_track()   { _ST_PIDS="${_ST_PIDS} $1"; }
+# untrack on the ORDERLY reap, so the trap can never -9 a recycled pid belonging to someone else.
+_st_untrack() { local p out=""; for p in $_ST_PIDS; do [ "$p" = "$1" ] || out="$out $p"; done; _ST_PIDS="$out"; }
+_st_clean() {
+  local p
+  for p in $_ST_PIDS; do kill -9 "$p" 2>/dev/null; done
+  _ST_PIDS=""
+  # the TERM-deaf fixture records its own pid (it survives the exec, so this IS the sleep)
+  [ -n "$_ST_DIR" ] && [ -s "$_ST_DIR/deaf.pid" ] && kill -9 "$(cat "$_ST_DIR/deaf.pid" 2>/dev/null)" 2>/dev/null
+  [ -n "$_ST_DIR" ] && rm -rf "$_ST_DIR"
+  _ST_DIR=""
+}
 smoke_test() {
   local fail=0
   _f() { echo "smoke-test: FAIL ($*)"; fail=1; }
@@ -422,6 +446,10 @@ smoke_test() {
   local REALLOG="$LOG" REALLOG_SZ; REALLOG_SZ="$(size_of "$LOG")"
 
   local d; d="$(mktemp -d)"
+  _ST_DIR="$d"
+  trap '_st_clean' EXIT
+  trap '_st_clean; trap - EXIT; exit 130' INT
+  trap '_st_clean; trap - EXIT; exit 143' TERM HUP
   mkdir -p "$d/.mesh" "$d/bin"
 
   # (1) RED fixture — a forger: its --test appends to the durable log its real path writes.
@@ -478,9 +506,9 @@ EOF
 
   # cron-noise leg: the log moves on its own through BOTH passes and the control window.
   ( while :; do echo noise >> "$d/.mesh/noisy.log"; sleep 0.05; done ) &
-  local noisepid=$!
+  local noisepid=$!; _st_track "$noisepid"
   out="$(run_detector mesh-quiet)"
-  kill "$noisepid" 2>/dev/null; wait "$noisepid" 2>/dev/null
+  kill "$noisepid" 2>/dev/null; wait "$noisepid" 2>/dev/null; _st_untrack "$noisepid"
   grep -q "forgery mesh-quiet" <<<"$out" \
     && _f "NOISE leg: a log growing in the control window must never be a finding (single-pass attribution)"
   grep -q "unattributable mesh-quiet .*noisy\.log" <<<"$out" \
@@ -520,7 +548,7 @@ itself as the writer of every candidate"
   else
     local noisepid2
     ( while :; do echo noise >> "$d/.mesh/noisyforger.log"; sleep 0.05; done ) &
-    noisepid2=$!
+    noisepid2=$!; _st_track "$noisepid2"
     out="$(run_detector mesh-noisyforger 1)"
     grep -qE "^ *forgery mesh-noisyforger .*noisyforger\.log self:" <<<"$out" \
       || _f "attribution: a --test writing a BUSY durable log must be NAMED (writer=self:<comm>) — \
@@ -531,7 +559,7 @@ this is the class the control leg discards; got: $(tr '\n' '|' <<<"$out")"
     # anyway (`a-gate-can-be-vacuous-because-the-live-reading-agrees`).
     rm -f "$d/chat.capture"
     out="$(run_detector mesh-noisyforger 0)"
-    kill "$noisepid2" 2>/dev/null; wait "$noisepid2" 2>/dev/null
+    kill "$noisepid2" 2>/dev/null; wait "$noisepid2" 2>/dev/null; _st_untrack "$noisepid2"
     grep -qE "^ *unattributable mesh-noisyforger .*noisyforger\.log na$" <<<"$out" \
       || _f "attribution off: the writer field must read \`na\` and the verdict must fall back to \
 unattributable — an absent attribution may never read like a present one; got: $(tr '\n' '|' <<<"$out")"
@@ -558,14 +586,14 @@ EOF
   # green the fixture has stopped reproducing the wedge and the -k gate below would be vacuous.
   rm -f "$pf"
   ( export MESH_DEAF_PID="$pf"; TEST_TIMEOUT=1 KILL_AFTER=0 run_test "$d/bin/mesh-deaf" ) &
-  rp=$!
+  rp=$!; _st_track "$rp"
   sleep 3
   kill -0 "$rp" 2>/dev/null \
     || _f "RED arm: a TERM-deferring child must outlive a plain \`timeout 1\` — the fixture no longer \
 reproduces the wedge, so the kill-after gate proves nothing"
   cpid="$(cat "$pf" 2>/dev/null)"
   kill -9 "$rp" 2>/dev/null; [ -n "$cpid" ] && kill -9 "$cpid" 2>/dev/null
-  wait "$rp" 2>/dev/null
+  wait "$rp" 2>/dev/null; _st_untrack "$rp"
 
   # GREEN: -k puts a KILL behind the deferred TERM, at BOTH call sites — the plain one and the
   # setsid one (the wedged run was the setsid path, and an asymmetry there is exactly what hid).
@@ -637,19 +665,20 @@ that exits 0 reads exactly like a clean one"
   # no-overlap: hold the lock and assert the next cadence SKIPS instead of stacking a second pass
   if command -v flock >/dev/null 2>&1; then
     flock -n -o "$d/.mesh/.forgery-sweep.lock" sleep 5 &
-    local hp=$!
+    local hp=$!; _st_track "$hp"
     sleep 0.4
     sout="$(HOME="$d" MESH_HOME="$d/.mesh" MESH_BIN_DIR="$d/bin" MESH_TEST_FORGERY_ATTRIB=0 \
         MESH_TEST_FORGERY_MAX_SECONDS=0 PATH="$d/bin:$PATH" bash "$0" --sweep 2>&1)"
     srct=$?
-    kill "$hp" 2>/dev/null; wait "$hp" 2>/dev/null
+    kill "$hp" 2>/dev/null; wait "$hp" 2>/dev/null; _st_untrack "$hp"
     [ "$srct" = 3 ] \
       || _f "no-overlap: a sweep must SKIP (exit 3) while another holds the lock (got $srct) — the \
 04:41Z run was still alive when the next 04:41Z fire would have landed on it"
     grep -q 'SKIPPED' <<<"$sout" || _f "no-overlap: the skip must be LOUD, not a silent early return"
   fi
 
-  rm -rf "$d"
+  # ONE reap path, orderly and interrupted alike — never a straight-line `rm -rf` the trap duplicates
+  _st_clean
   [ "$(size_of "$REALLOG")" = "$REALLOG_SZ" ] \
     || _f "sandbox: --test APPENDED to the production log $REALLOG — the detector forged its own record"
 
