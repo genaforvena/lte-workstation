@@ -1,0 +1,407 @@
+#!/usr/bin/env python3
+"""mesh-job-apply-getmatch — подать отклики на getmatch, ПОДТВЕРДИВ каждый его же списком откликов.
+
+  mesh-job-apply-getmatch [--top N] [--dry-run] [--json] [--tg]
+  mesh-job-apply-getmatch --test
+
+# reflex-cadence: 19 8,14 * * *
+# reflex-args: --top 6 --tg
+
+Оператор 2026-08-25: «поиск целиком на вас… ваше дело доводить всё до собеседований… нам нужно
+выйти на темп два собеседования в день». hh был единственным каналом подачи и упирался в лимиты
+ОДНОГО аккаунта; getmatch — второй, и подача там идёт напрямую работодателю, а не через агрегатор
+с captive-кнопкой (правило ланы «TAKE, never GIVE» про LinkedIn — про это же).
+
+ЧЕТЫРЕ ВЕЩИ, КОТОРЫЕ ЭТОТ ТУЛ НЕ ДЕЛАЕТ, И КАЖДАЯ — ЧУЖОЙ ВЫУЧЕННЫЙ УРОК:
+
+* **Не сочиняет письмо.** Текст собирает `mesh-job-letter` из АБЗАЦЕВ, которые оператор одобрил,
+  выбирая их по совпадению тегов с текстом вакансии. Модель, которую попросили «написать
+  сопроводительное», сгладит 50 000 HTTP req/s в «50k QPS», выдумает год или пообещает навык — и
+  это неисправимо, потому что работодатель уже прочитал. Меньше двух подходящих абзацев → строка
+  уходит в needs-human, а не получает общее письмо.
+* **Не сочиняет поля.** Зарплатный пол и город берутся из банка ответов (`mesh-job-answers`), а
+  не из головы; если банк молчит — отклик БЛОКИРУЕТСЯ и вопрос уходит оператору. Это то же
+  правило, что и в mesh-job-apply: неподтверждённое поле блокирует подачу.
+* **Не считает клик отправкой.** Отклик засчитывается ТОЛЬКО после того, как вакансия найдена в
+  его собственном списке /applications. mesh-job-apply выучил это дорого: письма писались в
+  `sent/` в момент клика, и партия, которую hh никогда не подтвердил, оставляла на диске каталог
+  «доказательств» отправки.
+* **Не решает, его ли это роль, ВЕСАМИ.** Допуск — предикат (LEAD_RE + DOMAIN_RE по названию),
+  а не сортировочный ключ: ключ решает ПОРЯДОК, и мусор с высоким баллом обгоняет живую вакансию.
+
+ДЕДУП И ПОТОЛОК. Одно место на работодателя за партию (четвёртый отклик в одну компанию читается
+как бот). Дневной потолок — MESH_JOB_DAILY_CAP, общий с hh-ланой, считается по ledger'у отправок.
+"""
+import argparse, json, os, pathlib, re, subprocess, sys, time
+
+os.environ["PATH"] = os.path.expanduser("~/.local/bin") + os.pathsep + os.environ.get("PATH", "/usr/bin:/bin")
+DRIVE, LETTER, ANSWERS, TG = "mesh-hh-drive", "mesh-job-letter", "mesh-job-answers", "mesh-tg"
+
+MESH = pathlib.Path(os.path.expanduser("~/.mesh"))
+BOARD = MESH / "job-board.tsv"
+JOB = MESH / "job"
+SENT = JOB / "sent"
+LEDGER = JOB / "getmatch-sent.log"
+BLACKLIST = JOB / "blacklist.txt"
+PROFILE = os.environ.get("MESH_GETMATCH_PROFILE", "getmatch")
+CAP = int(os.environ.get("MESH_JOB_DAILY_CAP", "20"))
+
+# Допуск, не вес. Обе половины обязаны совпасть в НАЗВАНИИ: «Head of Legal» несёт руководящее
+# слово и не несёт предметного, «Senior Go Developer» — наоборот, и ни то ни другое не его роль
+# по постановке оператора от 2026-08-25 (руководящие позиции, IC-лейн снят).
+# ДВА КЛАССА РУКОВОДЯЩИХ СЛОВ, и они требуют РАЗНОГО.
+#
+# SELF_LEAD — титулы, которые САМИ называют инженерную область: «Tech Lead», «Team Lead»,
+# «тимлид», «Engineering Manager», «CTO», «технический директор». Требовать от них ОТДЕЛЬНОГО
+# предметного слова — значит отбрасывать «Principal Tech Lead, домен Retail» и «Tech lead в Центр
+# Робототехники», то есть ровно те вакансии, ради которых гейт и ставился. Замерено на живой
+# доске 2026-08-25: обе отсеялись как «не его область», будучи инженерными лид-ролями.
+# Это правило CLAUDE.md про освобождение ПОЗИЦИИ, которую грамматика уже зафиксировала.
+#
+# RANK_LEAD — голый РАНГ: «руководитель», «head of», «начальник отдела», «директор по». Ранг есть
+# в каждой отрасли страны («Head of Legal», «Руководитель отдела ХоРеКа»), поэтому здесь и только
+# здесь предметное слово обязано стоять ОТДЕЛЬНО.
+SELF_LEAD_RE = re.compile(r"team\s*lead|teamlead|тимлид|tech\s*lead|techlead|lead manager|"
+                          r"engineering manager|(?<!\w)cto(?!\w)|технический директор|"
+                          r"head of engineering|директор по разработ", re.I)
+RANK_LEAD_RE = re.compile(r"руководител|head of|начальник отдел|директор по|лидер команд", re.I)
+LEAD_RE = re.compile("|".join([SELF_LEAD_RE.pattern, RANK_LEAD_RE.pattern]), re.I)
+DOMAIN_RE = re.compile(r"разработ|develop|инженер|engineer|backend|бэкенд|fullstack|golang|"
+                       r"(?<!\w)go(?!\w)|architect|архитект|devops|(?<!\w)sre(?!\w)|платформ|"
+                       r"platform|engineering|software|программн", re.I)
+VAC_RE = re.compile(r"getmatch\.ru/vacancies/(\d+)")
+
+# Маленькие целые, а не модель: это сортировочный ключ, и он ничего не ДОПУСКАЕТ.
+FIT = [(re.compile(r"(?<!\w)go(?!\w)|golang", re.I), 6),
+       (re.compile(r"rtb|dsp|programmatic|adtech|реклам|adblogger", re.I), 5),
+       (re.compile(r"backend|бэкенд|платформ|platform|highload|нагруз", re.I), 3),
+       (re.compile(r"kafka|clickhouse|dwh|биллинг", re.I), 2),
+       (re.compile(r"android|ios|frontend|фронт|php|1c|1с|qa|тестирован", re.I), -4)]
+
+
+def fit(title):
+    return sum(w for rx, w in FIT if rx.search(title or ""))
+
+
+
+
+def sh(args, timeout=120, inp=None):
+    return subprocess.run(args, capture_output=True, text=True, timeout=timeout, input=inp)
+
+
+def drive(lines, timeout=180):
+    env = dict(os.environ, HH_PROFILE=PROFILE)
+    return subprocess.run([DRIVE, "--run", "\n".join(lines)], capture_output=True, text=True,
+                          timeout=timeout, env=env)
+
+
+def drive_wait(marker, secs=180):
+    env = dict(os.environ, HH_PROFILE=PROFILE)
+    return subprocess.run([DRIVE, "--wait", marker, str(secs)], capture_output=True, text=True,
+                          timeout=secs + 30, env=env)
+
+
+def drive_log_tail(n=40):
+    env = dict(os.environ, HH_PROFILE=PROFILE)
+    r = subprocess.run([DRIVE, "--peek", str(n)], capture_output=True, text=True, timeout=120, env=env)
+    return r.stdout or ""
+
+
+def blacklisted(employer, title):
+    """Тонкая обёртка над файлом чёрного списка. Полная семантика (kind, allow:, слово-vs-подстрока)
+    живёт в mesh-job-apply; здесь нужен только ОТВЕТ да/нет, и он обязан ошибаться в сторону ОТКАЗА:
+    Foxible — прямой запрет оператора («ни в коем случае, я только что там работал»)."""
+    if not BLACKLIST.exists():
+        return None
+    hay = (employer + " " + title).lower()
+    allows, hits = [], []
+    for l in BLACKLIST.read_text(encoding="utf-8").splitlines():
+        l = l.strip()
+        if not l or l.startswith("#"):
+            continue
+        kind, _, rest = l.partition(":")
+        kind, pat = kind.strip().lower(), rest.strip().lower()
+        if not pat:
+            kind, pat = "rule", l.lower()
+        (allows if kind == "allow" else hits).append((kind, pat))
+    for _, pat in allows:
+        if pat in hay:
+            return None
+    for kind, pat in hits:
+        if kind == "former":
+            if re.search(r"(?<!\w)%s(?!\w)" % re.escape(pat), employer.lower()):
+                return "бывший работодатель (%s)" % pat
+        elif pat in hay:
+            return "%s (%s)" % (kind, pat)
+    return None
+
+
+def bank(question):
+    """-> строка ответа | None. rc 2 = банк не знает, и это БЛОКИРУЕТ отклик, а не подставляет
+    умолчание: поле, которого мы не знаем, — его факт, а не наша догадка."""
+    r = sh([ANSWERS, "--match", question], timeout=60)
+    return (r.stdout or "").strip() if r.returncode == 0 and (r.stdout or "").strip() else None
+
+
+def sent_today():
+    if not LEDGER.exists():
+        return 0
+    today = time.strftime("%Y-%m-%d")
+    return sum(1 for l in LEDGER.read_text(encoding="utf-8").splitlines() if l.startswith(today))
+
+
+def rows():
+    """-> [row dict] строк getmatch в состоянии seen. Индекс строки несётся с собой: состояние
+    правится ПО НОМЕРУ, а не поиском по тексту, иначе две вакансии с одним названием сольются."""
+    if not BOARD.exists():
+        return []
+    out = []
+    for i, l in enumerate(BOARD.read_text(encoding="utf-8").splitlines()):
+        f = l.split("\t")
+        if len(f) < 6 or f[4] != "seen":
+            continue
+        m = VAC_RE.search(f[3])
+        if not m:
+            continue
+        out.append({"i": i, "date": f[0], "employer": f[1], "title": f[2], "url": f[3],
+                    "note": f[5], "id": m.group(1)})
+    return out
+
+
+def eligible(rs):
+    """-> (picked, blocked). Отказ возвращается ВМЕСТЕ с выбором: имя, отсеянное молча, оператор
+    встречает только тогда, когда оно уже ушло работодателю под его подписью."""
+    # ПОРЯДОК — здесь и только здесь вес уместен: допуск уже решён предикатами выше, а место
+    # работодателя в партии ОДНО, и без сортировки его занимает та строка, которая раньше легла на
+    # доску. Замерено: у Сбера так выигрывал «Tech lead в Центр Робототехники», а «Team Lead Go
+    # (GigaChat)» — его стек буквально — не подавался вовсе. Порядок доски не есть порядок
+    # соответствия.
+    rs = sorted(rs, key=lambda r: -fit(r["title"]))
+    picked, blocked, seen_emp = [], [], set()
+    for r in rs:
+        hay = r["title"]
+        bl = blacklisted(r["employer"], r["title"])
+        if bl:
+            blocked.append((r, bl)); continue
+        self_lead = SELF_LEAD_RE.search(hay)
+        if not self_lead and not RANK_LEAD_RE.search(hay):
+            blocked.append((r, "не руководящая роль")); continue
+        # Предметное слово требуется только от ГОЛОГО РАНГА; инженерный титул несёт область в себе.
+        if not self_lead and not DOMAIN_RE.search(hay):
+            blocked.append((r, "голый ранг без предметной области — название не заявляет разработку"))
+            continue
+        key = r["employer"].strip().lower()
+        if key in seen_emp:
+            blocked.append((r, "место работодателя занято в этой партии")); continue
+        seen_emp.add(key)
+        picked.append(r)
+    return picked, blocked
+
+
+def letter_for(r):
+    """-> текст | None. mesh-job-letter выходит с 3, когда вакансия ему не по зубам — это НЕ
+    ошибка, это отказ отправить общее письмо, и он обязан остаться отказом."""
+    vac = "%s @ %s\n%s" % (r["title"], r["employer"], r["note"])
+    p = subprocess.run([LETTER, "--vacancy", "-"], capture_output=True, text=True,
+                       timeout=120, input=vac)
+    if p.returncode != 0:
+        return None
+    body = [l for l in (p.stdout or "").splitlines() if not l.startswith("[blocks]")]
+    return "\n".join(body).strip() or None
+
+
+def paragraphs(text):
+    return [x.strip() for x in re.split(r"\n\s*\n", text) if x.strip()]
+
+
+def apply_one(r, floor, city, dry=False):
+    """-> (state, detail). Состояний три и третье не 'нет': sent | needs-human | error."""
+    text = letter_for(r)
+    if not text:
+        return "needs-human", "письмо не собралось: меньше двух подходящих абзацев — вакансия для человека"
+    if dry:
+        return "dry-run", "письмо готово (%d абзац(ев)), ничего не отправлено" % len(paragraphs(text))
+
+    paras = paragraphs(text)
+    cmds = ["goto %s" % r["url"], "wait 5000", "clicktext Откликнуться", "wait 4000",
+            "fill input[placeholder='От'] %s" % floor, "wait 1000"]
+    if city:
+        cmds += ["fill input[placeholder='Укажите город'] %s" % city, "wait 1500"]
+    cmds += ["fill textarea %s" % paras[0].replace("\n", " ")]
+    for p in paras[1:]:
+        cmds += ["press Enter", "press Enter", "type textarea %s" % p.replace("\n", " ")]
+    cmds += ["wait 1500", "clicktext Отправить отклик", "wait 6000",
+             "js JSON.stringify({done:1,url:location.href})"]
+    drive(cmds, timeout=300)
+    drive_wait('"done":1', 240)
+
+    # КЛИК — НЕ ОТПРАВКА. Засчитываем только то, что видно в ЕГО списке откликов.
+    drive(["goto https://getmatch.ru/applications", "wait 6000",
+           "js JSON.stringify({apps:(document.body.innerText||'').slice(0,4000)})"], timeout=200)
+    drive_wait('"apps"', 240)
+    tail = drive_log_tail(6)
+    if r["title"].split("(")[0].strip()[:28] in tail:
+        return "sent", "подтверждено списком откликов на getmatch"
+    return "error", "клик прошёл, но вакансии НЕТ в списке откликов — отправка НЕ подтверждена"
+
+
+def record(r, state, detail, text):
+    lines = BOARD.read_text(encoding="utf-8").split("\n")
+    f = lines[r["i"]].split("\t")
+    if len(f) >= 6:
+        f[4] = state if state in ("sent", "needs-human") else f[4]
+        f[5] = "%s: %s || %s" % (time.strftime("%Y-%m-%d"), detail, f[5])
+        lines[r["i"]] = "\t".join(f)
+        BOARD.write_text("\n".join(lines), encoding="utf-8")
+    if state != "sent":
+        return
+    with LEDGER.open("a", encoding="utf-8") as fh:
+        fh.write("%s\t%s\t%s\t%s\n" % (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                                       r["id"], r["employer"], r["title"]))
+    SENT.mkdir(parents=True, exist_ok=True)
+    (SENT / ("%s-getmatch-%s.md" % (time.strftime("%Y-%m-%d"), r["id"]))).write_text(
+        "# %s — %s\n\n- %s\n- отправлено %s через getmatch, ПОДТВЕРЖДЕНО списком откликов\n\n"
+        "## Текст\n\n%s\n" % (r["employer"], r["title"], r["url"],
+                              time.strftime("%Y-%m-%d"), text or ""), encoding="utf-8")
+
+
+def selftest():
+    fails = []
+
+    def check(name, ok, extra=""):
+        print("%s %s%s" % ("ok:  " if ok else "FAIL:", name, ("  <- " + extra) if extra and not ok else ""))
+        if not ok:
+            fails.append(name)
+
+    mk = lambda i, e, t: {"i": i, "date": "d", "employer": e, "title": t,
+                          "url": "https://getmatch.ru/vacancies/%d" % i, "note": "", "id": str(i)}
+
+    # ДОПУСК — предикат, и обе половины обязаны совпасть В НАЗВАНИИ.
+    got, blk = eligible([mk(1, "LLC ОпенМайГейм", "Head of QA"),
+                         mk(2, "LLC MOLLIS", "Руководитель отдела продаж / Head of Sales"),
+                         mk(3, "VK", "Senior Go Developer"),
+                         mk(4, "UNIREST", "Руководитель группы разработки")])
+    # НЕ Т-Банк в этой фикстуре, и это не косметика: он лежит в blacklist.txt строкой
+    # `dedup: т-банк`, поэтому проходил бы отбор ПО ДРУГОЙ причине и нога стала бы вакуумной —
+    # зелёной независимо от того, работает ли предметный гейт.
+    check("руководящая роль без предметной области НЕ проходит",
+          [r["id"] for r in got] == ["4"], repr([r["id"] for r in got]))
+    check("...и чёрный список НЕ участвовал в этом решении (нога не вакуумна)",
+          blacklisted("UNIREST", "Руководитель группы разработки") is None)
+    check("...и инженерная роль БЕЗ руководящего слова тоже не проходит (IC-лейн снят)",
+          any(r["id"] == "3" and reason == "не руководящая роль" for r, reason in blk))
+    check("...и отказ несёт ПРИЧИНУ, а не просто отсутствие в выборе",
+          all(reason for _, reason in blk))
+
+    # ПОРЯДОК внутри одного работодателя: место одно, и его должна занять подходящая строка,
+    # а не та, что раньше легла на доску.
+    gotf, _ = eligible([mk(20, "Сбер", "Tech lead в Центр Робототехники"),
+                        mk(21, "Сбер", "Team Lead Go (GigaChat)")])
+    check("внутри одного работодателя место занимает БОЛЕЕ подходящая строка, не более ранняя",
+          [r["id"] for r in gotf] == ["21"], repr([r["id"] for r in gotf]))
+
+    # Одно место на работодателя за партию.
+    got2, blk2 = eligible([mk(5, "Сбер", "Team Lead Go (GigaChat)"),
+                           mk(6, "Сбер", "Team Lead команды RAG-платформы")])
+    check("одно место на работодателя за партию", [r["id"] for r in got2] == ["5"])
+    check("...и второй отсеян именно как дедуп",
+          any("место работодателя" in reason for _, reason in blk2))
+
+    # Чёрный список: прямой запрет оператора обязан пережить любой регистр.
+    for spell in ("Foxible", "foxible ltd", "FOXIBLE"):
+        check("Foxible НЕ проходит (%s)" % spell,
+              blacklisted(spell, "Team Lead Go") is not None)
+    check("контрольная компания проходит", blacklisted("Ozon Банк", "Team Lead Go") is None)
+    got3, _ = eligible([mk(7, "Foxible", "Руководитель группы разработки")])
+    check("...и в выбор он не попадает даже с идеальным названием", got3 == [])
+
+    # КРАСНАЯ половина допуска: строка, несущая ОБЕ половины, обязана пройти.
+    got4, _ = eligible([mk(8, "Yadda", "Head of Engineering")])
+    check("роль с обеими половинами ПРОХОДИТ (gate seen open)", [r["id"] for r in got4] == ["8"])
+
+    # РАЗДЕЛЕНИЕ КЛАССОВ. Инженерный титул несёт область в себе; голый ранг — нет.
+    got5, blk5 = eligible([mk(9, "Крупный банк", "Principal Tech Lead, домен Retail"),
+                           mk(10, "Сбер", "Tech lead в Центр Робототехники"),
+                           mk(11, "LLC Суперлига", "Head of Legal"),
+                           mk(12, "IE Магер", "Руководитель отдела продаж (РОП) d2d")])
+    check("инженерный титул проходит БЕЗ отдельного предметного слова",
+          sorted(r["id"] for r in got5) == ["10", "9"], repr([r["id"] for r in got5]))
+    check("...а голый ранг без области по-прежнему НЕ проходит",
+          all("голый ранг" in reason for r, reason in blk5 if r["id"] in ("11", "12")),
+          repr([(r["id"], reason) for r, reason in blk5]))
+
+    check("абзацы режутся по пустой строке, а не по переводу строки",
+          paragraphs("а\nб\n\nв") == ["а\nб", "в"], repr(paragraphs("а\nб\n\nв")))
+
+    # Несочиняемые поля: банк молчит -> None, и вызывающий обязан заблокировать отклик.
+    check("банк на бессмысленный вопрос отвечает None, а не догадкой",
+          bank("какого цвета ваш зонт в четверг?") is None)
+    fl = bank("минимальная зарплата")
+    print("      живой банк: пол=%s" % (repr(fl)[:60]))
+
+    import shutil
+    for tool in (DRIVE, LETTER, ANSWERS):
+        check("сиблинг %s резолвится под PATH крона" % tool, shutil.which(tool) is not None)
+
+    print("smoke-test: %s" % ("ok" if not fails else "FAIL (%s)" % ", ".join(fails)))
+    return 1 if fails else 0
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--top", type=int, default=6)
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--tg", action="store_true")
+    ap.add_argument("--test", action="store_true")
+    a = ap.parse_args()
+    if a.test:
+        return selftest()
+
+    floor = bank("минимальная зарплата")
+    city = bank("в каком городе вы живете?")
+    if not floor:
+        print("БЛОКИРОВАНО: банк не знает зарплатный пол — это его факт, не наша догадка. "
+              "mesh-job-answers --ask", file=sys.stderr)
+        return 2
+    floor_n = re.sub(r"[^\d]", "", floor.split("—")[0])[:9] or None
+    if not floor_n:
+        print("БЛОКИРОВАНО: ответ банка про пол не содержит числа: %r" % floor, file=sys.stderr)
+        return 2
+    city_s = (city or "").split(",")[0].strip() or None
+
+    left = CAP - sent_today()
+    if left <= 0:
+        print("дневной потолок исчерпан (%d за сегодня, MESH_JOB_DAILY_CAP=%d)" % (sent_today(), CAP))
+        return 0
+
+    picked, blocked = eligible(rows())
+    picked = picked[:min(a.top, left)]
+    print("кандидатов: %d, отсеяно: %d, потолок оставляет: %d" % (len(picked), len(blocked), left))
+    for r, why in blocked[:12]:
+        print("  — %-26s %-46s %s" % (r["employer"][:26], r["title"][:46], why))
+
+    results = []
+    for r in picked:
+        text = letter_for(r)
+        state, detail = apply_one(r, floor_n, city_s, dry=a.dry_run)
+        print("  %-12s %-24s %s — %s" % (state, r["employer"][:24], r["title"][:44], detail))
+        if not a.dry_run:
+            record(r, state, detail, text)
+        results.append({"id": r["id"], "employer": r["employer"], "title": r["title"],
+                        "state": state, "detail": detail})
+
+    ok = [x for x in results if x["state"] == "sent"]
+    # Числитель И знаменатель: «0 отправлено» из 6 попыток и из 0 кандидатов — разные предложения.
+    print("\nотправлено и ПОДТВЕРЖДЕНО: %d из %d попыток%s"
+          % (len(ok), len(results), " (dry-run)" if a.dry_run else ""))
+    if a.json:
+        print(json.dumps(results, ensure_ascii=False, indent=1))
+    if a.tg and ok:
+        sh([TG, "getmatch: подано и подтверждено %d — %s" %
+            (len(ok), "; ".join("%s / %s" % (x["employer"], x["title"][:40]) for x in ok))], timeout=90)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
