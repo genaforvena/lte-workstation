@@ -51,7 +51,7 @@ precondition for the first class existing at all.
 |---|-------|------------------------------|-----------|--------|----------|
 | C1 | **Self-grepping gate** | the assertion's evidence is its own source text | mesh-land's push self-heal | `1969a5d` | **D1, built** (§3) |
 | C2 | **Silent fallback** | `cmd 2>/dev/null \|\| echo <default>` makes total failure indistinguishable from a constant | beat detector pinned at 500 for weeks | `f51e36d` | **D2, built** (§3quater) |
-| C3 | **Window < cadence** | sampling window ÷ cadence = coverage; a 10s window on a 600s tick reports a sample, not a state | `mesh-psi` read CALM for 14.2 days on a stalled node | `fe35dd9` | **decidable** (header cadence vs the kernel field read) |
+| C3 | **Window < cadence** | sampling window ÷ cadence = coverage; a 10s window on a 600s tick reports a sample, not a state | `mesh-psi` read CALM for 14.2 days on a stalled node | `fe35dd9` | **D3, built** (§3quinquies) |
 | C4 | **Dry-run writes the liveness log** | a `--test` writing the durable artifact a watchdog reads forges the evidence it exists to check | guardian's mock peer in the real log, reflex not in cron | `09f7914` | **decidable** (a `--test` path writing a `doctor-artifact`) |
 | C5 | **Mode bit ≠ write accepted** | `[ -w f ]` describes the inode; for a pseudo-file the kernel may refuse anyway, with a *misleading errno* | `/proc/pressure/cpu` 0666, every uid-1000 write `EINVAL` | — (node measurement) | **decidable** (`[ -w ]` on a `/proc`/`/sys` path) |
 | C6 | **Executable ≠ loadable** | `[ -x bin ]` is not "it runs"; rpath/ABI failures are a different claim | whisper.cpp `main` +x, `rc=127` for a day | `974d864` | **decidable** (`[ -x ]` gate with no invocation of the wrapped binary in `--test`) |
@@ -355,10 +355,136 @@ occur once in 1296 files of public shell, and occurs 13 times here. That is a sm
 no rate can be built, but it is the exact sub-shape the thesis predicts, and it is the one the
 density argument does *not* explain away.
 
+## 3quinquies. Detector D3 — the window narrower than the cadence
+
+### 3quinquies.0 Decision procedure
+
+A scheduled sense has two clocks: the **window** its probe samples, and the **cadence** on which it
+reports. Their ratio is coverage, and it is almost never written down.
+
+```
+period   := mean seconds between fires, from the EXPANDED fire set
+window   := the span of wallclock the probe's own sample covers
+coverage := window / period
+```
+
+The grading is not on coverage. A narrow window is frequently the only window the kernel offers,
+and a 1.7% sample is a legitimate thing to *hold*. The defect is publishing it as a **state**:
+
+| verdict | condition |
+|---|---|
+| **FULL** | `coverage >= 1` — typically a monotonic accumulator delta'd against a persisted previous sample. The reading spans its own interval by construction. |
+| **HONEST** | `coverage < 1` **and** the tool emits a coverage/window term in its own output. The consumer can weigh it. |
+| **SAMPLE-AS-STATE** | `coverage < 1` and no coverage term. The gap between ticks is unobserved and nothing in the reading records that. |
+| **UNDECIDABLE** | the window, or the cadence, cannot be resolved from the page. |
+
+Three deliberate exclusions, each of which would have inflated the finding:
+
+* **`timeout N` is not a window.** It bounds how long the probe may *take*, not what span of world
+  it *observes*. Grading it as coverage would turn a deadline into evidence — the exact confusion
+  the class is about. It appears in 211 files here; admitting it would have manufactured a window
+  for most of the corpus.
+* **A bare `sleep N` is not a delta.** It is a window only when it separates two reads of one
+  source, and nothing on the page says whether it does; the same construct is retry backoff. 56
+  files land in this bucket and are reported apart, ungraded.
+* **A duration flag is bound to its command, never read bare.** `-l 2` occurs 55 times in this
+  corpus and is essentially never a duration.
+
+**The cadence must be expanded, not read.** `# reflex-cadence: 2-59/5` and `*/5` both give 300s,
+but `50-59/15` fires *once an hour* — the step says 900s and the truth is 3600s, a 4x
+understatement of the unobserved gap. The parser expands the fire set and takes the mean gap; an
+unmodelled calendar field returns n/a rather than a guess.
+
+### 3quinquies.1 Results
+
+Measured 2026-08-25 against the committed tree at `4ef5970` (`git archive HEAD scripts`, not the
+working copy — an in-flight untracked tool shifted the header count by one while this was being
+written, which is reason enough never to quote a corpus figure off a dirty worktree). Over the 320
+tools in `scripts/` carrying a `# reflex-cadence:` header:
+
+| verdict | n | share of graded |
+|---|---|---|
+| SAMPLE-AS-STATE | 11 | 24% |
+| HONEST | 9 | 20% |
+| FULL | 25 | 56% |
+| UNDECIDABLE | 275 | *(not folded into any rate)* |
+
+The graded population is 45 of 320. That is a small fraction, and it is the honest one: a window is
+counted only where the page states it. Two of the undecidables have a *known window and an
+unparseable cadence* — the ratio needs both, and half of it is not a coverage figure.
+
+The eleven, worst first:
+
+| coverage | window | period | tool | what it reads |
+|---|---|---|---|---|
+| 0.0% | 0s | 300s | `mesh-isp-health` | `ping -c 1` ×2 |
+| 0.1% | 1s | 900s | `mesh-ss-clients` | `ping -c 2` |
+| 0.2% | 1s | 514s | `mesh-lan6` | `ping -6 -c 2` |
+| 0.7% | 2s | 300s | `mesh-operator-home` | `ping -c 3` |
+| 3.3% | 60s | 1800s | `mesh-hw-health` | `/proc/loadavg` field 1 |
+| 6.7% | 60s | 900s | `mesh-router-watch` | `/proc/loadavg` over ssh |
+| 8.3% | 10s | 120s | `mesh-mem-guard` | PSI `avg10` |
+| 20.0% | 60s | 300s | `mesh-node-care` | `/proc/loadavg` |
+| 20.0% | 60s | 300s | `mesh-node-health` | *(false positive — see below)* |
+| 20.0% | 60s | 300s | `mesh-sensor-log` | `/proc/loadavg`, logged as `cpu_load1` |
+| 50.0% | 60s | 120s | `mesh-imac-wifi` | `/proc/loadavg` |
+
+**Precision, hand-labelled: 10/11.** Every row was opened and the matching line read in context.
+Ten are production reads. One is not: `mesh-node-health`'s only `/proc/loadavg` read is inside its
+`--test` path; its production classifier fuses *labels written by other tools* out of state files
+and never touches the kernel field. The evidence was real text in the real file and the code does
+not run on the cadence.
+
+The four `ping` rows are the sharpest form of the class, because their window is not merely narrow
+— at `-c 1` it is **zero**. A single packet is not a sample of a link; it is one Bernoulli draw
+published as a link state, which is why a flapping transport reads as an outage and a lossy one
+reads as fine.
+
+### 3quinquies.2 Interpretation — and the detector's own C1 moment
+
+**The cure is cheaper than the coverage, and the corpus already knows it.** 25 tools reach FULL, all
+by the same route: delta a monotonic accumulator against a stored previous sample, and the reading
+spans the whole interval for free. Nine more are HONEST — narrow window, coverage published beside
+the value. So 34 of 45 graded tools have already solved this, which makes the eleven a *lagging*
+population rather than a design norm. That is a different finding from C1 and C2, where the defect
+was the majority behaviour.
+
+The live case is now on the honest side of its own class. `mesh-psi` grades **HONEST at 1.7%** —
+the same 10s window on the same 600s cadence that produced 14.2 days of false CALM (`fe35dd9`), now
+emitting `coverage=` with every reading. Nothing about the window changed. The fix was a word.
+
+**And this detector was C1 for its first two runs, which is the result I would least like to omit.**
+Its first honest run graded `mesh-node-health` SAMPLE-AS-STATE on three `avg10/60/300` mentions that
+were all inside *comments* — prose about a different tool's thresholds. The detector's evidence and
+the file's assertions were the same string, unparsed: the taxonomy's own C1, committed by the
+instrument built to find C3. Stripping comments moved five fixtures to red at once, because the
+fixtures had the same bug — they stated their window in a trailing comment instead of reading it in
+code, exactly as the real tool does not.
+
+The residual is the same shape one ring further in. `mesh-node-health` survives comment-stripping
+because its evidence sits in a `--test` block: source text that is real, parsed, and never executed
+on the cadence. A window found in a code path that does not run is not a window, and this detector
+cannot yet tell those apart. It is reported as the one false positive rather than tuned away,
+because the honest precision figure is worth more than a clean table.
+
+**A guard is not trustworthy until it has been wrong once** (§2). Five mutations of this detector
+were driven and watched go red before restore: reading the cron step instead of expanding the fire
+set (`50-59/15` → 900s instead of 3600s), admitting `timeout` as a capture window, dropping the
+coverage-term check, accepting a `prev`-shaped variable name as an accumulator, and disabling
+comment-stripping. Two of the five were green on the first attempt — the gates for the cadence
+expansion and the accumulator triad were *vacuous*, passing because no fixture discriminated them.
+Both needed a new fixture before the mutation could fail. A mutant that stays green is not a
+passing detector; it is an untested line.
+
 ## 4. Open work
 
-1. Detectors for C3–C10 (each listed decidable above; C2 is now built). C4 and C8 need the cadence
-   header + crontab, which are machine-readable here.
+1. Detectors for C4–C10 (each listed decidable above; C2 and C3 are now built). C4 and C8 need the
+   cadence header + crontab, which are machine-readable here.
+1a. **D3's undecidable bucket is 275 of 320 and is the next real yield.** 56 of those carry a bare
+   `sleep`; deciding whether it separates two reads of one source is a small dataflow question, not
+   a regex one, and would move the largest single block. Separately, D3 cannot yet tell a window in
+   a production path from one in a `--test` block — its single false positive — which is the same
+   `--test`-vs-live distinction C4 is about, and a shared solution would serve both.
 1b. **The numeric bucket.** 533 of 645 silent fallbacks in this system substitute a *number*, and
    static analysis cannot say whether that is the all-clear or a correct empty count — it depends
    on the left-hand command's success domain. A dynamic probe (force the left side to fail, compare
