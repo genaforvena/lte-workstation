@@ -49,6 +49,8 @@
 #   mesh-nvme-health            one read → one classified line
 #   mesh-nvme-health --json     machine-readable
 #   mesh-nvme-health --edge     emit only on band change (state still refreshed every success)
+#   mesh-nvme-health --write-rate  across-boot mean write rate per fs, keyed on the DURABLE identity
+#                                  (LVM UUID / NVMe serial) — refuses rather than crossing a swap
 #   mesh-nvme-health --test     fixture-backed classifier + real-read gate
 set -uo pipefail
 export PATH="$HOME/.local/bin:$PATH"
@@ -80,8 +82,13 @@ discover_dev() {
 }
 
 # every NVMe controller under $ROOT — a node's spare/scratch drive is a SEPARATE controller
-# (nvme0=XF-256 spare on mesh-home wears ~2.6x faster than the root nvme1=KINGSTON — serial-verified,
-# 14.2 vs 5.5 GB/h) and must not be dropped. Match only
+# (on mesh-home the XF-256 spare, ser 0030990070033, wears ~2.6x faster than the KINGSTON root,
+# ser 50026B738382AFD3 — 14.2 vs 5.5 GB/h) and must not be dropped.
+# THE CONTROLLER INDEX IS NOT AN IDENTITY. This comment used to read "nvme0=XF-256 spare … nvme1=
+# KINGSTON" and was INVERTED by a reboot: live sysfs now reads nvme0=KINGSTON, nvme1=XF-256, and
+# CLAUDE.local.md records the pair swapping twice, both times verified. A serial-verified fact
+# filed under an enumeration index decays into a false one without anything having changed but the
+# probe order. Quote serials; treat nvmeN as an address, never a name. Match only
 # the controller nodes (nvmeN), never the namespace/partition nodes (nvmeNnM / nvmeNnMpK).
 discover_devs() {
   local n base found=1
@@ -187,6 +194,40 @@ fs_unit() { if [ "$1" = n/a ]; then printf 'n/a'; else printf '%s%s' "$1" "$2"; 
 # JSON: an n/a axis is null — never 0, which a consumer would read as a measured zero
 jnum() { case "${1:-}" in ''|n/a) printf null ;; *) printf '%s' "$1" ;; esac; }
 
+# --- STABLE IDENTITY (the replica id) ----------------------------------------------------------
+# `dm-0`, `nvme0n1p2` and `nvme0` are KERNEL ENUMERATION ADDRESSES, not identities: this node's two
+# NVMe devices have swapped index twice (CLAUDE.local.md, both times verified), and dm-N follows LVM
+# activation order. The per-boot log below keyed every row on those names alone, so two rows "for
+# the same fs" can be two DIFFERENT physical disks — and the across-boot delta the log exists to
+# make derivable would then be computed across a device swap, silently, possibly negative.
+#
+# This is the identity half of a CRDT counter. lifetime_write_kbytes is a grow-only counter and each
+# boot is a transient replica of it; Almeida & Baquero, "Scalable Eventually Consistent Counters over
+# Unreliable Networks" (arXiv:1307.3207; Distributed Computing 32(1):69-89, 2019) name the failure a
+# naive G-Counter has here — identity explosion — and their Handoff Counters fix it by making the
+# replica id explicit and handing a transient replica's contribution into a DURABLE id before the
+# transient entry is reclaimed. The safety condition that makes handoff sound is the one borrowed
+# here: a value is never folded across an identity boundary. So each row carries its durable id, and
+# any delta REFUSES rather than crossing one.
+#
+# Durable ids available unprivileged: LVM's own UUID for device-mapper (independent of dm-N order),
+# and the NVMe controller serial for a namespace/partition. Neither is derivable from the name.
+fs_ident() { # <block name> -> durable id | na  (NEVER the name: a fallback to the address is the bug)
+  local n="${1:-}" v p
+  [ -n "$n" ] || { printf 'na'; return; }
+  # `-r` first, not `2>/dev/null` on the redirect: a failed OPEN is reported by the SHELL, not by
+  # the command, so `tr < missing 2>/dev/null` still prints "No such file or directory" — and this
+  # resolver runs on every non-dm device, i.e. usually.
+  p="$BLOCK_ROOT/$n/dm/uuid"                                          # LVM-<uuid>, globally unique
+  [ -r "$p" ] && { v="$(tr -d ' \n' < "$p")"; [ -n "$v" ] && { printf '%s' "$v"; return; }; }
+  for p in "$BLOCK_ROOT/$n/../device/serial" "$BLOCK_ROOT/$n/device/serial"; do
+    [ -r "$p" ] || continue
+    v="$(tr -d ' \n' < "$p")"
+    [ -n "$v" ] && { printf 'nvme-%s' "$v"; return; }
+  done
+  printf 'na'
+}
+
 # (c) the per-boot record. lifetime_write_kbytes is superblock-PERSISTENT, so a line per boot makes
 # the across-reboot mean write rate derivable (delta lifetime / delta epoch) — the one question a
 # single boot's session counter structurally cannot answer. Re-armed every $FSLOG_MIN_S so a long
@@ -198,10 +239,18 @@ fs_log() {
   now="$(date -u +%s)"
   up="$(cut -d. -f1 < /proc/uptime 2>/dev/null)"
   case "$up" in ''|*[!0-9]*) up=0 ;; esac
+  local ident lastid
   for row in "$@"; do
     IFS=$'\t' read -r ctrl fsname life sess <<<"$row"
     [ -n "${fsname:-}" ] || continue
-    last="$(grep -a " fs=$fsname " "$FSLOG" 2>/dev/null | tail -n1)"
+    ident="$(fs_ident "$fsname")"
+    # The dedup lookup keys on the DURABLE id when we have one — a name reused by a different device
+    # must not have its first record suppressed by the previous occupant's row.
+    if [ "$ident" != na ]; then
+      last="$(grep -a " id=$ident " "$FSLOG" 2>/dev/null | tail -n1)"
+    else
+      last="$(grep -a " fs=$fsname " "$FSLOG" 2>/dev/null | tail -n1)"
+    fi
     lastboot=""; lastepoch=0
     if [ -n "$last" ]; then
       lastboot="$(sed -n 's/.* boot=\([^ ]*\).*/\1/p' <<<"$last")"
@@ -210,8 +259,8 @@ fs_log() {
     fi
     # same boot AND inside the re-arm window -> already recorded
     if [ "$lastboot" = "$boot" ] && [ "$(( now - lastepoch ))" -lt "$FSLOG_MIN_S" ]; then continue; fi
-    printf '%s epoch=%s boot=%s ctrl=%s fs=%s lifetime_kb=%s session_kb=%s uptime_s=%s\n' \
-      "$TS" "$now" "$boot" "$ctrl" "$fsname" "$life" "$sess" "$up" >> "$FSLOG"
+    printf '%s epoch=%s boot=%s ctrl=%s fs=%s id=%s lifetime_kb=%s session_kb=%s uptime_s=%s\n' \
+      "$TS" "$now" "$boot" "$ctrl" "$fsname" "$ident" "$life" "$sess" "$up" >> "$FSLOG"
   done
 }
 
@@ -431,6 +480,52 @@ EOF
   [ "$used" = 41 ] && [ -z "$spare" ] && [ "$duw" = 9000 ] \
     || { echo "smoke-test: FAIL (absent middle fields shifted the columns: used='$used' spare='$spare' duw='$duw')"; exit 1; }
 
+  # (d) DURABLE IDENTITY + the write-rate reader. The organ's rows used to be keyed on kernel
+  #     enumeration names alone, and this node's two NVMe devices have swapped index twice, so a
+  #     delta between two rows "for the same fs" could span two different disks. These arms drive
+  #     the refusals, because a rate that quietly spans a swap is the failure — not a missing rate.
+  _bt="$(mktemp -d)"; _bl="$_bt/w.log"
+  _mkrow() { # <epoch> <boot> <fs> <id|-> <lifetime_kb>
+    if [ "$4" = "-" ]; then
+      printf '%s epoch=%s boot=%s ctrl=nvme9 fs=%s lifetime_kb=%s session_kb=1 uptime_s=1\n' "T" "$1" "$2" "$3" "$5" >> "$_bl"
+    else
+      printf '%s epoch=%s boot=%s ctrl=nvme9 fs=%s id=%s lifetime_kb=%s session_kb=1 uptime_s=1\n' "T" "$1" "$2" "$3" "$4" "$5" >> "$_bl"
+    fi
+  }
+  # (d1) CONTROL — same fs, same durable id, +3600 kb over 3600 s must be a real 1.0 KB/s.
+  #      Without this every `na` below would be indistinguishable from a reader that never works.
+  : > "$_bl"; _mkrow 1000 b1 dm-9 LVM-AAA 1000; _mkrow 4600 b2 dm-9 LVM-AAA 4600
+  _wr="$(MESH_NVME_HEALTH_FSLOG="$_bl" bash "$0" --write-rate 2>&1)"
+  case "$_wr" in *"rate=1.0 KB/s"*) : ;; *) echo "smoke-test: FAIL (write-rate control: same identity must yield a real rate, got: $_wr)"; rm -rf "$_bt"; exit 1 ;; esac
+  # (d2) THE SWAP — the same NAME, a different disk. Must refuse and NAME the identity change.
+  : > "$_bl"; _mkrow 1000 b1 nvme0n1p2 nvme-OLDSERIAL 900000; _mkrow 4600 b2 nvme0n1p2 nvme-NEWSERIAL 100
+  _wr="$(MESH_NVME_HEALTH_FSLOG="$_bl" bash "$0" --write-rate 2>&1)"
+  case "$_wr" in *"IDENTITY CHANGED"*) : ;; *) echo "smoke-test: FAIL (write-rate: a name that changed disks must REFUSE, not compute across the swap: $_wr)"; rm -rf "$_bt"; exit 1 ;; esac
+  case "$_wr" in *"nvme-OLDSERIAL"*) : ;; *) echo "smoke-test: FAIL (write-rate: the refusal must name the identity it used to be: $_wr)"; rm -rf "$_bt"; exit 1 ;; esac
+  case "$_wr" in *KB/s*) echo "smoke-test: FAIL (write-rate: a rate was printed across an identity change: $_wr)"; rm -rf "$_bt"; exit 1 ;; esac
+  # (d3) LEGACY rows carry no id= at all — unknown identity is `na`, never a number.
+  : > "$_bl"; _mkrow 1000 b1 dm-9 - 1000; _mkrow 4600 b2 dm-9 - 4600
+  _wr="$(MESH_NVME_HEALTH_FSLOG="$_bl" bash "$0" --write-rate 2>&1)"
+  case "$_wr" in *KB/s*) echo "smoke-test: FAIL (write-rate: rows predating identity must not yield a rate: $_wr)"; rm -rf "$_bt"; exit 1 ;; esac
+  case "$_wr" in *"no durable identity"*) : ;; *) echo "smoke-test: FAIL (write-rate: legacy rows must SAY why, not just print na: $_wr)"; rm -rf "$_bt"; exit 1 ;; esac
+  # (d4) a GROW-ONLY counter that shrank falsifies the identity whatever the id claims.
+  : > "$_bl"; _mkrow 1000 b1 dm-9 LVM-AAA 5000; _mkrow 4600 b2 dm-9 LVM-AAA 100
+  _wr="$(MESH_NVME_HEALTH_FSLOG="$_bl" bash "$0" --write-rate 2>&1)"
+  case "$_wr" in *"COUNTER WENT BACKWARDS"*) : ;; *) echo "smoke-test: FAIL (write-rate: a decreasing monotone counter must be caught, got: $_wr)"; rm -rf "$_bt"; exit 1 ;; esac
+  # (d5) n=1 is its own state — a first boot must not read as a device swap.
+  : > "$_bl"; _mkrow 1000 b1 dm-9 LVM-AAA 1000
+  _wr="$(MESH_NVME_HEALTH_FSLOG="$_bl" bash "$0" --write-rate 2>&1)"
+  case "$_wr" in *"n=1"*) : ;; *) echo "smoke-test: FAIL (write-rate: a single row must read n=1, not an identity change: $_wr)"; rm -rf "$_bt"; exit 1 ;; esac
+  # (d6) fs_ident must NEVER fall back to the name, and must be silent on a device with neither
+  #      a dm/uuid nor a serial (the resolver runs on every non-dm device).
+  mkdir -p "$_bt/blk/lonely"
+  _e="$(BLOCK_ROOT="$_bt/blk" fs_ident lonely 2>&1)"
+  [ "$_e" = na ] || { echo "smoke-test: FAIL (fs_ident must render na for an unidentifiable device, and print NOTHING on stderr: '$_e')"; rm -rf "$_bt"; exit 1; }
+  mkdir -p "$_bt/blk/dmx/dm"; printf 'LVM-ZZZ\n' > "$_bt/blk/dmx/dm/uuid"
+  [ "$(BLOCK_ROOT="$_bt/blk" fs_ident dmx 2>/dev/null)" = "LVM-ZZZ" ] \
+    || { echo "smoke-test: FAIL (fs_ident: an LVM uuid must win over the name)"; rm -rf "$_bt"; exit 1; }
+  rm -rf "$_bt"
+
   # (c) the per-boot log: one line per fs per boot, re-armed after FSLOG_MIN_S, and NEVER the durable
   # log during --test (a dry-run writing the liveness record forges the evidence it exists to check)
   tlog="$(mktemp)" || { echo "smoke-test: FAIL (mktemp)"; exit 1; }
@@ -471,7 +566,57 @@ EOF
   if [ -n "${duw:-}" ]; then
     case "$l_wa" in ''|n/a|0.000) echo "smoke-test: FAIL (live wa='$l_wa' despite a live Data Units Written=$duw)"; exit 1 ;; esac
   fi
-  echo "smoke-test: ok (fixture classify x5 + garbage-rejected + ext4 leg: wa-in-bytes, n/a-not-zero, dm-slaves walk, per-boot log dedupe + live NVMe SMART read used=${used}% spare=${spare}% poh=${poh:-n/a} + live ext4 ${l_fs} life=${l_lifetib}TiB boot=${l_boot}GiB wa=${l_wa}x)"
+  echo "smoke-test: ok (fixture classify x5 + garbage-rejected + ext4 leg: wa-in-bytes, n/a-not-zero, dm-slaves walk, per-boot log dedupe + DURABLE IDENTITY (LVM uuid / NVMe serial, never the enumeration name) with --write-rate refusing across a device swap, a backwards monotone counter, and identity-less legacy rows + live NVMe SMART read used=${used}% spare=${spare}% poh=${poh:-n/a} + live ext4 ${l_fs} life=${l_lifetib}TiB boot=${l_boot}GiB wa=${l_wa}x)"
+  exit 0
+fi
+
+# --- --write-rate: the reader the per-boot log never had ----------------------------------------
+# The log has been laying down one row per boot per fs since 2026-08-17 and NOTHING read it — the
+# across-boot mean write rate its own comment (c) says it exists to make derivable was still
+# underivable, because an accumulator with no consumer is a numerator with no reader.
+#
+# Every refusal below is the handoff safety condition (arXiv:1307.3207): a monotone counter's delta
+# is meaningful only WITHIN one durable identity, so this crosses no identity boundary and prints
+# `na` with the reason instead. The reasons are distinct on purpose — "n=1", "identity changed" and
+# "counter went backwards" are three different states of the world, and collapsing them to one `na`
+# would make a device swap indistinguishable from a first boot.
+if [ "${1:-}" = --write-rate ]; then
+  [ -s "$FSLOG" ] || { echo "nvme-write-rate: no per-boot log yet ($FSLOG)" >&2; exit 2; }
+  _field() { sed -n "s/.* $1=\\([^ ]*\\).*/\\1/p" <<<"$2"; }
+  # newest row per fs, then the most recent PRIOR row carrying the same durable id
+  for _fs in $(sed -n 's/.* fs=\([^ ]*\).*/\1/p' "$FSLOG" | sort -u); do
+    _new="$(grep -a " fs=$_fs " "$FSLOG" | tail -n1)"
+    _id="$(_field id "$_new")"; [ -n "$_id" ] || _id=absent
+    _life="$(_field lifetime_kb "$_new")"; _ep="$(_field epoch "$_new")"
+    if [ "$_id" = absent ] || [ "$_id" = na ]; then
+      printf 'write-rate fs=%s id=%s rate=na (this row carries no durable identity — a delta against it could span a device swap)\n' "$_fs" "$_id"
+      continue
+    fi
+    _prev="$(grep -a " id=$_id " "$FSLOG" | grep -av "^$_new$" | tail -n1)"
+    if [ -z "$_prev" ]; then
+      # Distinguish "first row for this disk" from "the name has an older row under ANOTHER disk".
+      _other="$(grep -a " fs=$_fs " "$FSLOG" | grep -av " id=$_id " | tail -n1)"
+      if [ -n "$_other" ]; then
+        printf 'write-rate fs=%s id=%s rate=na (IDENTITY CHANGED: this name previously named %s — the enumeration moved, the disk did not; no delta is taken across it)\n' \
+          "$_fs" "$_id" "$(_field id "$_other")"
+      else
+        printf 'write-rate fs=%s id=%s rate=na (n=1: only one row for this identity — a rate needs two)\n' "$_fs" "$_id"
+      fi
+      continue
+    fi
+    _plife="$(_field lifetime_kb "$_prev")"; _pep="$(_field epoch "$_prev")"
+    case "$_life$_plife$_ep$_pep" in ''|*[!0-9]*) printf 'write-rate fs=%s id=%s rate=na (unparseable row)\n' "$_fs" "$_id"; continue ;; esac
+    _ds=$(( _ep - _pep ))
+    [ "$_ds" -gt 0 ] 2>/dev/null || { printf 'write-rate fs=%s id=%s rate=na (zero/negative interval)\n' "$_fs" "$_id"; continue; }
+    if [ "$_life" -lt "$_plife" ] 2>/dev/null; then
+      # A grow-only counter that shrank falsifies the identity assumption, whatever the id says.
+      printf 'write-rate fs=%s id=%s rate=na (COUNTER WENT BACKWARDS %s -> %s kb over %ss — a superblock reset or a different device wearing this identity; a monotone counter cannot decrease)\n' \
+        "$_fs" "$_id" "$_plife" "$_life" "$_ds"
+      continue
+    fi
+    printf 'write-rate fs=%s id=%s rate=%s KB/s over %ss (%s -> %s kb, n=2 rows)\n' \
+      "$_fs" "$_id" "$(awk -v d="$(( _life - _plife ))" -v s="$_ds" 'BEGIN{printf "%.1f", d/s}')" "$_ds" "$_plife" "$_life"
+  done
   exit 0
 fi
 
