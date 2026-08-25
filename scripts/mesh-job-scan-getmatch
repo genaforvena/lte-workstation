@@ -1,0 +1,264 @@
+#!/usr/bin/env python3
+"""mesh-job-scan-getmatch — the getmatch lane: read @g_jobbot, put its vacancies on the board.
+
+  mesh-job-scan-getmatch [--limit N] [--json] [--quiet] [--dry-run]
+  mesh-job-scan-getmatch --test
+
+# reflex-cadence: 11 */2 * * *
+
+Operator, 2026-08-25 over TG: *«@g_jobbot вот в этом боте куча крутых вакансий + у них есть сайт.
+подавайте там тоже и там много везде где подходит»*. The bot is getmatch's IT feed, read through
+his OWN Telegram account (`mesh-tg-user`, the userbot organ), not through any API key.
+
+WHY THIS SOURCE IS DIFFERENT FROM hh, and the difference is the point:
+
+* **The feed is IT-only, so the domain noise does not exist here.** The same day this was built,
+  a widened hh query set returned 415 rows of which 113 (27%) were about development at all —
+  Head of QA, Head of Legal, Младший юрист, Бригадир участка FBS. hh matches loosely and a query
+  for a TITLE returns the title. The bot posts one curated IT vacancy per message, so the
+  admission problem moves from "is this even engineering" to "is this senior enough".
+* **The fields arrive STRUCTURED, so nothing is scraped.** Each message is markdown with the
+  title and its getmatch link, the company and its link, the salary as a real range
+  («350 000 — 450 000 ₽/мес на руки»), the city, the work format, and the stack. On hh the
+  salary is usually absent and everything else is a `.innerText` blob.
+* **No browser at all.** hh needs the playwright daemon, a RU vantage, and 90s per query; this
+  is one Telethon read. When the hh driver is down — it does not survive a reboot — this lane
+  still produces.
+
+WHAT IT DOES NOT DO. It does not apply. getmatch has its own site and its own form, and the
+apply path is a separate question from the source path; conflating them is how the LinkedIn rows
+came to sit on the board with nothing ever acting on them. This tool's only output is board rows.
+
+DEDUP is on the getmatch vacancy id, which lives in the URL (`/vacancies/35934-...`). The board
+already carries hh ids under `/vacancy/<digits>`; the two namespaces cannot collide because the
+path segment differs (`vacancies` vs `vacancy`), and both are matched anchored on that segment
+rather than on the bare number — a bare-number dedup would have made getmatch 35934 and hh 35934
+the same row.
+"""
+import argparse, json, os, pathlib, re, subprocess, sys, time
+
+os.environ["PATH"] = os.path.expanduser("~/.local/bin") + os.pathsep + os.environ.get("PATH", "/usr/bin:/bin")
+TG = "mesh-tg-user"
+CHAT = os.environ.get("MESH_JOB_GETMATCH_CHAT", "@g_jobbot")
+
+MESH = pathlib.Path(os.path.expanduser("~/.mesh"))
+BOARD = MESH / "job-board.tsv"
+
+# A getmatch link, and the id is the leading digits of the slug.
+VAC_RE = re.compile(r"https://getmatch\.ru/vacancies/(\d+)-[^\s)]*")
+CO_RE = re.compile(r"https://getmatch\.ru/companies/[^\s)]*")
+# The title is the text of the FIRST markdown link, the company the text of the second.
+LINK_RE = re.compile(r"\[\*{0,2}(.+?)\*{0,2}\]\((https://getmatch\.ru/[^)]+)\)", re.S)
+SAL_RE = re.compile(r"([\d    ]{4,})\s*(?:—|-|–)\s*([\d    ]{4,})\s*₽")
+SAL1_RE = re.compile(r"(?:от\s*)?([\d    ]{4,})\s*₽")
+
+
+def digits(s):
+    d = re.sub(r"[^\d]", "", s or "")
+    return int(d) if d else None
+
+
+# Zero-width joiners and the like sit INSIDE getmatch's salary line («350 000 —\u200d 450 000 ₽/\u200dмес»).
+# They are not whitespace, so `\s*` does not cross them: the RANGE pattern failed, the single-number
+# fallback then matched the UPPER bound, and every ranged vacancy went on the board at its top figure —
+# a silent fallback turning a parse failure into a plausible number, and the flattering direction at that.
+ZW_RE = re.compile(r"[\u200b-\u200f\u2060\ufeff]")
+
+
+def parse_salary(text):
+    """-> lower bound in ₽/month, or None. A RANGE gives its LOWER bound, the same convention
+    mesh-job-scan uses, so the two sources are comparable in one column."""
+    text = ZW_RE.sub("", text or "")
+    m = SAL_RE.search(text)
+    if m:
+        return digits(m.group(1))
+    m = SAL1_RE.search(text)
+    return digits(m.group(1)) if m else None
+
+
+def board_ids():
+    """-> set of getmatch ids already on the board. Anchored on the `/vacancies/` segment: the
+    board also holds hh `/vacancy/<n>` rows, and a bare-number dedup would fuse the namespaces."""
+    if not BOARD.exists():
+        return set()
+    return set(re.findall(r"getmatch\.ru/vacancies/(\d+)", BOARD.read_text(encoding="utf-8")))
+
+
+def parse_msg(text):
+    """-> row dict | None. None when the message is not a vacancy post (the bot also sends its
+    own service messages, and a service message parsed as a vacancy is a row nobody can apply to)."""
+    m = VAC_RE.search(text or "")
+    if not m:
+        return None
+    vid = m.group(1)
+    links = LINK_RE.findall(text)
+    title = company = ""
+    for label, href in links:
+        label = re.sub(r"\s+", " ", label.replace("*", "")).strip()
+        if "/vacancies/" in href and not title:
+            title = label
+        elif "/companies/" in href and not company:
+            company = label
+    if not title:
+        return None
+    body = re.sub(r"\[\*{0,2}(.+?)\*{0,2}\]\([^)]+\)", r"\1", text, flags=re.S)
+    body = re.sub(r"[*_`]", "", body)
+    flat = re.sub(r"\s+", " ", body).strip()
+    return {"id": vid, "title": title, "employer": company or "getmatch",
+            "url": "https://getmatch.ru/vacancies/%s" % vid,
+            "salary": parse_salary(flat), "raw": flat[:400]}
+
+
+def read_feed(limit):
+    """-> [message text]. `dump` is used rather than `read` on purpose: `read` truncates each
+    message to 120 chars for a human eye, which would cut the salary, the format and the stack
+    off every row — the very fields this source exists for."""
+    r = subprocess.run([TG, "dump", CHAT, str(limit)], capture_output=True, text=True, timeout=300)
+    if r.returncode != 0:
+        return None, (r.stderr or r.stdout or "").strip()
+    out = []
+    for line in (r.stdout or "").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            out.append(json.loads(line).get("text") or "")
+        except json.JSONDecodeError:
+            continue
+    return out, ""
+
+
+def append(rows, today):
+    lines = []
+    for r in rows:
+        note = "getmatch-scan %s | %s" % (
+            today, ("от %d ₽" % r["salary"]) if r["salary"] else "зарплата не указана")
+        lines.append("\t".join([today, r["employer"], r["title"], r["url"], "seen",
+                                note + " || " + r["raw"].replace("\t", " ")]))
+    if lines:
+        with BOARD.open("a", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+    return len(lines)
+
+
+def selftest():
+    fails = []
+
+    def check(name, ok, extra=""):
+        print("%s %s%s" % ("ok:  " if ok else "FAIL:", name, ("  <- " + extra) if extra and not ok else ""))
+        if not ok:
+            fails.append(name)
+
+    real = ("[**Старший Android-разработчик**](https://getmatch.ru/vacancies/35953-starshii-android"
+            "?s=bot-vacancy-header&utm_source=g_bot)** @ **[**Яндекс (Поисковый портал)**]"
+            "(https://getmatch.ru/companies/YMlwklX7-iandeks?s=bot)\n\n350 000 —‍ 450 000 ₽/‍мес"
+            " на руки\n\n\U0001f4cdМосква\n\n\U0001f3e2 Гибрид\n\n**Стек**: Kotlin, Android SDK.")
+    row = parse_msg(real)
+    check("a real bot post parses to a row", row is not None)
+    check("title is the FIRST link's text, not the company",
+          row and row["title"] == "Старший Android-разработчик", repr(row and row["title"]))
+    check("employer comes from the /companies/ link",
+          row and row["employer"] == "Яндекс (Поисковый портал)", repr(row and row["employer"]))
+    check("the url is the CANONICAL vacancy, tracking params dropped",
+          row and row["url"] == "https://getmatch.ru/vacancies/35953", repr(row and row["url"]))
+    # The salary is why this source is worth having: hh leaves it blank on most rows.
+    check("a range yields its LOWER bound, through hh-style narrow spaces",
+          row and row["salary"] == 350000, repr(row and row["salary"]))
+    check("the stack survives into the raw note", row and "Kotlin" in row["raw"])
+
+    # RED half: a message with no vacancy link is not a vacancy, and a service post must not
+    # become a row nobody can ever apply to.
+    check("a service message is NOT a row", parse_msg("Бот обновился, спасибо что вы с нами") is None)
+    check("a COMPANY link alone is not a vacancy",
+          parse_msg("[Яндекс](https://getmatch.ru/companies/abc-iandeks)") is None)
+    # The RED half of the zero-width fix: the joiner is what broke it, so assert on a string that
+    # still CARRIES one. Without it the fallback returns the UPPER bound and the row is flattered.
+    check("a zero-width joiner inside the range does not fall through to the upper bound",
+          parse_salary("350 000 \u2014\u200d 450 000 \u20bd/\u200d\u043c\u0435\u0441") == 350000,
+          repr(parse_salary("350 000 \u2014\u200d 450 000 \u20bd")))
+    check("no salary reads as None, never 0",
+          (parse_msg("[X](https://getmatch.ru/vacancies/1-x)") or {}).get("salary") is None)
+
+    # The namespace guard: the board's hh ids must never dedup a getmatch id away.
+    global BOARD
+    _b = BOARD
+    import tempfile
+    tmp = pathlib.Path(tempfile.mkdtemp(prefix="mesh-getmatch-"))
+    try:
+        BOARD = tmp / "board.tsv"
+        BOARD.write_text("# d\te\tt\tl\ts\tn\n"
+                         "2026-08-25\tX\tY\thttps://hh.ru/vacancy/35953\tseen\tn\n", encoding="utf-8")
+        check("an hh id does NOT dedup the same-numbered getmatch id (namespaces are separate)",
+              "35953" not in board_ids(), repr(board_ids()))
+        append([row], "2026-08-25")
+        check("...and once appended, the getmatch id IS seen", "35953" in board_ids(), repr(board_ids()))
+        check("append wrote exactly one row",
+              len([l for l in BOARD.read_text(encoding="utf-8").splitlines() if "getmatch" in l]) == 1)
+        check("the appended row keeps the board's 6 columns",
+              all(len(l.split("\t")) == 6
+                  for l in BOARD.read_text(encoding="utf-8").splitlines() if "getmatch" in l))
+    finally:
+        BOARD = _b
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    check("the live board was NOT written by --test",
+          not any("getmatch-scan" in l and "35953" in l
+                  for l in (BOARD.read_text(encoding="utf-8").splitlines() if BOARD.exists() else [])))
+
+    # cron hands PATH=/usr/bin:/bin — the sibling must resolve under it, or the reflex dies at exec.
+    import shutil as _sh
+    check("sibling resolves under cron's PATH", _sh.which(TG) is not None, repr(_sh.which(TG)))
+
+    # LIVE: the organ either answers or says why. A read that cannot run is n/a, never a green 0.
+    msgs, err = read_feed(3)
+    if msgs is None:
+        print("n/a: %s did not answer (%s) — the live assertion has nothing to run against" % (TG, err[:120]))
+    else:
+        check("live: the feed answers with at least one message", len(msgs) >= 1, repr(len(msgs)))
+        parsed = [p for p in (parse_msg(m) for m in msgs) if p]
+        print("      live: %d of %d live message(s) parsed as vacancies" % (len(parsed), len(msgs)))
+
+    print("smoke-test: %s" % ("ok" if not fails else "FAIL (%s)" % ", ".join(fails)))
+    return 1 if fails else 0
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--limit", type=int, default=60)
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--quiet", action="store_true")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--test", action="store_true")
+    a = ap.parse_args()
+    if a.test:
+        return selftest()
+
+    msgs, err = read_feed(a.limit)
+    if msgs is None:
+        print("n/a: %s did not answer — %s" % (TG, err[:200]), file=sys.stderr)
+        return 2
+    seen, got, rows = board_ids(), set(), []
+    for m in msgs:
+        r = parse_msg(m)
+        if not r or r["id"] in seen or r["id"] in got:
+            continue
+        got.add(r["id"])
+        rows.append(r)
+
+    if a.json:
+        print(json.dumps(rows, ensure_ascii=False, indent=1))
+    elif not a.quiet:
+        for r in rows:
+            print("%-9s %-26s %s" % (("%dk" % (r["salary"] // 1000)) if r["salary"] else "—",
+                                     r["employer"][:26], r["title"][:60]))
+    n = 0 if a.dry_run else append(rows, time.strftime("%Y-%m-%d"))
+    # The DENOMINATOR is printed beside the numerator: "0 new" off 60 read messages is a converged
+    # feed, "0 new" off 0 read is a dead organ, and one number cannot tell them apart.
+    print("\n%d new vacancy row(s) from %d message(s) of %s%s"
+          % (n, len(msgs), CHAT, " (dry-run, nothing written)" if a.dry_run else ""))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
