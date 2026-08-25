@@ -137,6 +137,69 @@ CRIT_USE="${MESH_TMP_CRIT_USE:-95}"      # use% at which the mesh-owned floor sc
 CRIT_AGE_MIN="${MESH_TMP_AGE_CRIT_MIN:-30}"  # ...to this many minutes (mesh-owned + sfx legs only)
 WARN_N="${MESH_TMP_WARN_N:-2000}"
 WARN_MB="${MESH_TMP_WARN_MB:-1024}"
+FLUX_STATE="$MESH/.tmp-guard.flux"
+FLUX_LOG="$MESH/tmp-guard-flux.log"
+DISKSTATS="${MESH_TMP_DISKSTATS:-/proc/diskstats}"       # overridable so --test drives real deltas
+CGROUP_IO="${MESH_TMP_CGROUP_IO:-/sys/fs/cgroup/system.slice/cron.service/io.stat}"
+
+# ── THE EFFECT AXIS ──────────────────────────────────────────────────────────────────────────────
+# EVERY OTHER AXIS IN THIS TOOL IS A STOCK, AND THE STOCK CAN BE ZERO WHILE THE FLOW IS A GIGABYTE.
+# entries / swept / freed_mb / other-owner / use% / residue all measure what is SITTING in the temp
+# dirs at the instant of the sweep. That is the RESPONSE side of temp usage — what accumulates when
+# cleanup fails. It is a different function of the same behaviour than the EFFECT side: how many
+# bytes the mesh pushes THROUGH the shared filesystem, which is what actually wears the device and
+# what charged 92% of cron.service's lifetime writes here.
+#
+# The two came apart on this node on 2026-08-25: mesh-spend --tokens copied a 966.5 MiB opencode.db
+# into TMPDIR and rmtree'd it inside the same call, thirteen times in one 300s window — 12.7 GiB
+# through /tmp on the boot NVMe — and left ZERO survivors. Every stock axis above read clean the
+# whole time; this guard was structurally green while the mesh's largest disk writer ran under it.
+# Same shape as [[a-per-call-file-snapshot-is-invisible-to-a-growing-file-hunt]], one ring out: a
+# residue axis cannot see a flow that cleans up after itself, no matter how large the flow is.
+#
+# So the flux is a MONOTONIC KERNEL ACCUMULATOR DELTA'D ACROSS THE INTERVAL, never an instantaneous
+# read: sectors-written for the block device backing the temp dir (whole-node, so it counts mind
+# panes and hand-run tools too, not only cron), plus cron.service's cgroup wbytes for that same
+# device as the attributed share. Both are unprivileged here. Anything that makes the window
+# unreadable renders `na` WITH ITS REASON — first sample, a device that changed under us, a counter
+# that went BACKWARDS (reboot, cgroup recreated) — and never 0, because 0 is the healthy reading on
+# this axis and a broken read must not be able to wear it.
+#
+# NO BAND YET, AND THAT IS DELIBERATE. This tool has never measured flux, so there is no corpus to
+# calibrate a threshold against, and a constant invented here would be exactly the assumed-0..1 axis
+# [[calibrate-a-derived-axis-against-the-live-corpus]] forbids. What ships instead is unit-free and
+# needs no constant: `swept_share` — the bytes this sweep reclaimed as a fraction of the bytes that
+# went through the device in the same window. In the incident above that ratio is ~0, which is the
+# review's whole claim stated as a number the tool computes about itself. FLUX_LOG accumulates the
+# samples a real band can later be derived from.
+
+# dev_of <dir> -> "<kname> <maj> <min>", or "" when nothing block-backed carries it (tmpfs, /dev/shm)
+dev_of() {
+  local d="$1" src node kname line
+  src="$(df -P "$d" 2>/dev/null | tail -n1 | awk '{print $1}')"
+  case "$src" in /dev/*) ;; *) return 0 ;; esac
+  node="$(readlink -f "$src" 2>/dev/null)" || return 0
+  kname="${node##*/}"
+  [ -n "$kname" ] || return 0
+  line="$(awk -v n="$kname" '$3 == n { print $1, $2; exit }' "$DISKSTATS" 2>/dev/null)"
+  [ -n "$line" ] || return 0
+  printf '%s %s
+' "$kname" "$line"
+}
+
+# dev_written <kname> -> lifetime bytes written to that device (sectors * 512), or ""
+dev_written() {
+  awk -v n="$1" '$3 == n { printf "%.0f\n", $10 * 512; exit }' "$DISKSTATS" 2>/dev/null
+}
+
+# cron_written <maj> <min> -> lifetime bytes cron.service wrote to THAT device, or "" if unreadable.
+# Keyed on the device, never summed across all of them: a total would silently mix in a disk this
+# temp dir has nothing to do with, which is the mistake that made mesh-storage-health read HEALTHY
+# on a full /tmp.
+cron_written() {
+  [ -r "$CGROUP_IO" ] || return 0
+  awk -v k="$1:$2" '$1 == k { for (i = 2; i <= NF; i++) if ($i ~ /^wbytes=/) { sub(/^wbytes=/, "", $i); print $i; exit } }'     "$CGROUP_IO" 2>/dev/null
+}
 
 # temp dirs to examine (deduped, existing, directories)
 # MESH_TMP_DIRS is EXCLUSIVE, not additive: it must be possible to point this tool at a sandbox and
@@ -729,9 +792,64 @@ UNWEOF
   live="$(tmp_dirs | wc -l)"
   [ "${live:-0}" -ge 1 ] || { echo "  FAIL real-read: no temp directory found on this node"; fail=1; }
 
+  # --- THE EFFECT AXIS (flux) ---------------------------------------------------------------
+  # Fixture accumulators, so the delta is EXACT and the failure directions can be driven. The
+  # arithmetic leg alone is not enough: an axis that reports a plausible number for a reboot or that
+  # lets a dry-run eat the window is worse than one that reports nothing, so the three na directions
+  # and the dry-run cursor are gated too. Every leg drives the WHOLE tool, not the helper.
+  fx="$sb/flux"; mkdir -p "$fx/tmp" "$fx/mesh"
+  fx_stats() { printf '     7       0 %s 1 0 1 0 1 0 %s 0 0 0 0 0 0 0 0 0\n' "$1" "$2" > "$fx/diskstats"; }
+  fx_cg()    { printf '7:0 rbytes=0 wbytes=%s rios=0 wios=0 dbytes=0 dios=0\n' "$1" > "$fx/io.stat"; }
+  # the fixture device must be the one backing $fx/tmp, or dev_of finds nothing to delta
+  fx_dev="$(readlink -f "$(df -P "$fx/tmp" 2>/dev/null | tail -n1 | awk '{print $1}')" 2>/dev/null)"
+  fx_dev="${fx_dev##*/}"
+  if [ -z "$fx_dev" ]; then
+    echo "  SKIP flux: the sandbox temp dir is not block-backed on this node"
+  else
+    fx_run() { MESH_DIR="$fx/mesh" MESH_TMP_DIRS="$fx/tmp" MESH_TMP_DISKSTATS="$fx/diskstats" \
+                 MESH_TMP_CGROUP_IO="$fx/io.stat" bash "$0" ${1:+"$1"} 2>/dev/null; }
+    # 1) FIRST SAMPLE is na, never 0 — 0 is the healthy reading on this axis, so a blind read that
+    #    wore it would be indistinguishable from a quiet disk.
+    # Each arm sleeps past a whole second first: the window is the wall gap between two sweeps, and
+    # two runs inside one second are honestly na(no-window) — which would mask every OTHER verdict
+    # this block asserts. Capture each run ONCE; re-running inside an error string moves the cursor
+    # and reports a different state than the one that failed.
+    fx_stats "$fx_dev" 1000; fx_cg 500
+    fx_out="$(fx_run)"
+    case "$fx_out" in *'flux=na(first-sample'*) ;;
+      *) echo "  FAIL flux: first sample must be na, got: $fx_out"; fail=1 ;; esac
+    # 2) a REAL delta: +7200 sectors = +3686400 B over the window; the expected rate is recomputed
+    #    here from the tool's OWN published window, so the leg cannot pass on a hardcoded string.
+    sleep 1.1; fx_stats "$fx_dev" 8200; fx_cg 500
+    fx_out="$(fx_run)"
+    # by KEY, never by column: the row's field order is free to change and a positional read would
+    # silently pick up whichever neighbour moved into slot 3.
+    fx_win="$(tail -1 "$fx/mesh/tmp-guard-flux.log" 2>/dev/null | tr ' ' '\n' | sed -n 's/^window_s=//p')"
+    fx_want="$(awk -v b=3686400 -v s="${fx_win:-0}" 'BEGIN{if(s>0) printf "%.1f", b*3600/s/1048576}')"
+    case "$fx_out" in *"flux=${fx_want}MB/h dev=$fx_dev"*) ;;
+      *) echo "  FAIL flux: delta rate for +7200 sectors over ${fx_win}s should be ${fx_want}MB/h: $fx_out"; fail=1 ;; esac
+    # 3) BACKWARDS is a reboot or a recreated cgroup, never negative traffic. A wrapped delta renders
+    #    as an enormous plausible number — the one outcome worse than saying nothing.
+    sleep 1.1; fx_stats "$fx_dev" 12; fx_cg 500
+    fx_out="$(fx_run)"
+    case "$fx_out" in *'flux=na(counter-reset'*) ;;
+      *) echo "  FAIL flux: a backwards counter must be na(counter-reset), got: $fx_out"; fail=1 ;; esac
+    # 4) A DRY-RUN MUST NOT ADVANCE THE CURSOR. It reports without acting everywhere else in this
+    #    tool; if it saved a sample here it would silently consume the next REAL sweep's window and
+    #    blind exactly the axis it was asked about.
+    sleep 1.1; fx_stats "$fx_dev" 90000; fx_cg 500
+    fx_before="$(cat "$fx/mesh/.tmp-guard.flux" 2>/dev/null)"
+    fx_run --dry-run >/dev/null
+    [ "$(cat "$fx/mesh/.tmp-guard.flux" 2>/dev/null)" = "$fx_before" ] \
+      || { echo "  FAIL flux: --dry-run advanced the flux cursor — it ate the next real sweep's window"; fail=1; }
+    # 5) and the ledger only ever carries REAL readings (one row per measured window, none for na)
+    fx_rows="$(wc -l < "$fx/mesh/tmp-guard-flux.log" 2>/dev/null || echo 0)"
+    [ "${fx_rows:-0}" -eq 1 ] || { echo "  FAIL flux: ledger has $fx_rows row(s), expected exactly the 1 measured window"; fail=1; }
+  fi
+
   rm -rf "$sb"; trap - EXIT INT HUP TERM
   [ "$fail" = 1 ] && { echo "smoke-test: FAIL"; exit 1; }
-  echo "smoke-test: ok (classifier x6 + held_by-under-a-200k-list x4 + real sweep x12 incl. dry-run/idempotence/maxdepth + pressure-floor x6 incl. a REAL live CWD holder + sfx-extraction x7 incl. a REAL live mapping + legacy-python-mkdtemp x10 incl. a REAL live CWD holder and the no-pressure-scaling leg + atime-axis x6 incl. a REAL open-FD holder + residue x4 incl. the untargeted-family and NORMAL-silence gates + write-probe x3 + SIGTERM-unwind x2 by real process-group signal, both directions + unwind-scan x6 incl. planted offender/handled/bash/straight-line/no-cleanup + real-read; live temp dirs: $live, unhandled python producers: $scan_reported)"
+  echo "smoke-test: ok (flux effect-axis x5 incl. first-sample/counter-reset na and the dry-run cursor + classifier x6 + held_by-under-a-200k-list x4 + real sweep x12 incl. dry-run/idempotence/maxdepth + pressure-floor x6 incl. a REAL live CWD holder + sfx-extraction x7 incl. a REAL live mapping + legacy-python-mkdtemp x10 incl. a REAL live CWD holder and the no-pressure-scaling leg + atime-axis x6 incl. a REAL open-FD holder + residue x4 incl. the untargeted-family and NORMAL-silence gates + write-probe x3 + SIGTERM-unwind x2 by real process-group signal, both directions + unwind-scan x6 incl. planted offender/handled/bash/straight-line/no-cleanup + real-read; live temp dirs: $live, unhandled python producers: $scan_reported)"
   exit 0
 fi
 
@@ -808,27 +926,78 @@ mb=$((freed / 1048576))
 result="$(classify_tmp "$writable" "$worst_use" "$left" "$mb")"
 label="${result%%|*}"; reason="${result#*|}"
 
+# ── FLUX (the EFFECT axis) — see the block beside dev_of(). Delta'd against the PREVIOUS sweep's
+# sample, so the window is this tool's own cadence and is published with the number rather than
+# assumed. Tied to the SAME directory the use% names, and the device is named in the field, so the
+# figure can never be read as a claim about a disk this temp dir does not live on.
+flux_field="na(unmeasured)"; flux_row=""
+fdev=""; fmaj=""; fmin=""
+flux_dir="${worst_dir:-$(printf '%s\n' "$dirs" | head -1)}"
+now_epoch="$(date -u +%s)"
+read -r fdev fmaj fmin <<<"$(dev_of "$flux_dir")" || true
+if [ -z "$fdev" ]; then
+  flux_field="na(not-block-backed:${flux_dir})"
+else
+  dev_now="$(dev_written "$fdev")"; cron_now="$(cron_written "$fmaj" "$fmin")"
+  p_epoch=""; p_dev=""; p_devb=""; p_cronb=""
+  [ -f "$FLUX_STATE" ] && read -r p_epoch p_dev p_devb p_cronb < "$FLUX_STATE" 2>/dev/null || true
+  if [ -z "${dev_now:-}" ]; then
+    flux_field="na(device-unreadable:${fdev})"
+  elif [ -z "${p_epoch:-}" ]; then
+    flux_field="na(first-sample:${fdev})"
+  elif [ "$p_dev" != "$fdev" ]; then
+    # the temp dir moved to another device: the old accumulator is a different quantity, not a
+    # smaller one, so the window is UNKNOWN rather than a delta between two unrelated counters.
+    flux_field="na(device-changed:${p_dev}->${fdev})"
+  elif [ "$((now_epoch - p_epoch))" -le 0 ]; then
+    flux_field="na(no-window)"
+  elif [ "$dev_now" -lt "${p_devb:-0}" ] 2>/dev/null; then
+    # BACKWARDS is a reboot or a re-created cgroup, never negative traffic. A wrapped delta here
+    # would render as an enormous plausible number, which is worse than saying nothing.
+    flux_field="na(counter-reset:${fdev})"
+  else
+    win_s=$((now_epoch - p_epoch)); dev_d=$((dev_now - p_devb))
+    cron_part="na"
+    if [ -n "${cron_now:-}" ] && [ -n "${p_cronb:-}" ] && [ "$p_cronb" != na ] \
+       && [ "$cron_now" -ge "$p_cronb" ] 2>/dev/null; then
+      cron_part="$(awk -v b="$((cron_now - p_cronb))" -v s="$win_s" 'BEGIN{printf "%.1f", b*3600/s/1048576}')"
+    fi
+    # SWEPT_SHARE is the unit-free half: what this sweep reclaimed against what actually moved
+    # through the device in the same window. It needs no calibrated constant, and it is ~0 exactly
+    # in the failure this axis exists for.
+    share="na"
+    [ "$dev_d" -gt 0 ] && share="$(awk -v f="$freed" -v d="$dev_d" 'BEGIN{printf "%.3f", f*100/d}')"
+    dev_part="$(awk -v b="$dev_d" -v s="$win_s" 'BEGIN{printf "%.1f", b*3600/s/1048576}')"
+    flux_field="${dev_part}MB/h dev=${fdev} cron=${cron_part}MB/h window=${win_s}s swept_share=${share}%"
+    flux_row="$TS dev=$fdev dev_mb_h=$dev_part cron_mb_h=$cron_part window_s=$win_s dev_delta_b=$dev_d freed_b=$freed swept_share_pct=$share"
+  fi
+fi
+
 # The residue is reported only where it is a LEAD — on a verdict that says something is wrong while
 # the sweep found nothing to do. On NORMAL it is just the node's ordinary temp population and would
 # be noise in the state file every reflex reads.
 residue=""
 if [ "$label" != NORMAL ] && [ -n "$res_key" ]; then residue="${res_key}:${res_n}(${res_ex})"; fi
-line="$label|dirs=$ndirs|entries=$left|swept=$swept|freed_mb=$((freed / 1048576))|other-owner=$other|use=${worst_use}%${worst_dir:+ on $worst_dir}${residue:+|residue=$residue}|$reason"
+line="$label|dirs=$ndirs|entries=$left|swept=$swept|freed_mb=$((freed / 1048576))|other-owner=$other|use=${worst_use}%${worst_dir:+ on $worst_dir}${residue:+|residue=$residue}|flux=$flux_field|$reason"
 prev=""; [ -f "$STATE" ] && prev="$(head -1 "$STATE" 2>/dev/null | cut -d'|' -f1)" || true
 if [ "$DRY" = 0 ]; then
   printf '%s\n' "$line" > "$STATE"
+  if [ -n "$fdev" ] && [ -n "${dev_now:-}" ]; then
+    printf '%s %s %s %s\n' "$now_epoch" "$fdev" "$dev_now" "${cron_now:-na}" > "$FLUX_STATE"
+  fi
+  [ -n "$flux_row" ] && printf '%s\n' "$flux_row" >> "$FLUX_LOG"
   [ -x "$HOME/.local/bin/mesh-state-touch" ] && mesh-state-touch "$STATE" >/dev/null 2>&1 || touch "$STATE" 2>/dev/null || true
   [ "$swept" -gt 0 ] && printf '%s swept=%s freed=%sB dirs=%s%s\n' "$TS" "$swept" "$freed" "$ndirs" "$detail" >> "$LOG"
 fi
 
 if [ "$MODE" = --json ]; then
-  printf '{"label":"%s","reason":"%s","dirs":%s,"entries":%s,"swept":%s,"freed_bytes":%s,"other_owner":%s,"use_pct":"%s","worst_dir":"%s","residue":"%s","dry_run":%s,"ts":"%s"}\n' \
-    "$label" "$reason" "$ndirs" "$left" "$swept" "$freed" "$other" "$worst_use" "$worst_dir" "$residue" "$DRY" "$TS"
+  printf '{"label":"%s","reason":"%s","dirs":%s,"entries":%s,"swept":%s,"freed_bytes":%s,"other_owner":%s,"use_pct":"%s","worst_dir":"%s","residue":"%s","flux":"%s","dry_run":%s,"ts":"%s"}\n' \
+    "$label" "$reason" "$ndirs" "$left" "$swept" "$freed" "$other" "$worst_use" "$worst_dir" "$residue" "$flux_field" "$DRY" "$TS"
   exit 0
 fi
 if [ "$DRY" = 1 ]; then
-  printf '[tmp-guard-dry] %s — would-remove=%s (%sB) across %s dir(s); entries=%s other-owner=%s use=%s%%%s%s\n' \
-    "$label" "$swept" "$freed" "$ndirs" "$left" "$other" "$worst_use" "${worst_dir:+ on $worst_dir}" "${residue:+ residue=$residue}"
+  printf '[tmp-guard-dry] %s — would-remove=%s (%sB) across %s dir(s); entries=%s other-owner=%s use=%s%%%s%s flux=%s\n' \
+    "$label" "$swept" "$freed" "$ndirs" "$left" "$other" "$worst_use" "${worst_dir:+ on $worst_dir}" "${residue:+ residue=$residue}" "$flux_field"
   exit 0
 fi
 if [ "$MODE" = --edge ]; then
