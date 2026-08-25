@@ -551,6 +551,11 @@ load-bearing tools — run `mesh-tools <category>` for the rest and the full con
     read the corpus must not carry a constant and must not go blind either (measured-cache → this
     corpus's own median → a MARKED no-rank, each named in the source column).
     [[calibrate-a-derived-axis-against-the-live-corpus]]
+  - **A pooled order statistic over a MIXTURE tests the mixture WEIGHTS, never the material** — apply
+    the claim's own predicate PER SOURCE with each arm's own band (an arm too small to polarize
+    self-excludes, so no new constant), and publish each arm's tie-at-max share: a median of a
+    `clip01(x/K)` axis is not a median of the quantity.
+    [[a-pooled-median-over-a-mixture-tests-the-prune-ratio]]
 - **Liveness / self-tend:** `mesh-card [--refresh]` · `mesh-health`/`mesh-hw-health`/`mesh-egress-health` · `mesh-mca` (the CPU-fault axis: AMD SMCA per-functional-unit corrected-error counters, 0444/no-root; publishes COVERAGE beside the value because all-zero is the healthy reading, so a half-broken read's 0 must not wear it) · `mesh-supervise` · `mesh-verify` · `mesh-tick`/`mesh-heartbeat`/`mesh-selfcare` · `mesh-reflex-health` · `mesh-mind-state` · `mesh-resource-guard` · `mesh-state-touch`.
   - **Liveness-touch convention (conditional-write reflexes):** a reflex that rewrites its STATE artifact ONLY when the VALUE changes leaves mtime frozen on a long-stable-but-LIVE value, so the mtime-aging watchdogs (`mesh-reflex-health`/`mesh-pulse`) misread "value held" as "reflex dead" → false-STALE. **Decouple ran-live from value-changed: call `mesh-state-touch "$STATE"` on EVERY successful eval** — mtime = liveness, content = the reflex's own change-gated write. A dead cron never runs → never touches → still honest-STALE. (For the change-gated/debounce subset only; e.g. `mesh-activity-tempo`, f3f84c1.)
 - **Metabolism (inference):** `mesh-relay` (text→cheapest-available-pool→text; Groq primary + local-mind fallback; key in gitignored `~/.mesh/groq.env`, never the genome).
