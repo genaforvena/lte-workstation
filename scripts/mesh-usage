@@ -70,7 +70,7 @@ def get_opencode_usage():
     db = os.environ.get("MESH_USAGE_DB") or os.path.expanduser("~/.local/share/opencode/opencode.db")
     if not os.path.exists(db):
         return None  # no opencode db on this node (or moved) — can't testify
-    import sqlite3, tempfile, shutil
+    import sqlite3, tempfile, shutil, pathlib
     tmp = None
     try:
         # PREFIXED, not bare: the finally below is not enough — SIGKILL (OOM, power cut) strands the
@@ -80,10 +80,42 @@ def get_opencode_usage():
         # both attributes the survivor and puts it inside mesh-tmp-guard's mesh-owned sweep.
         tmp = tempfile.mkdtemp(prefix="mesh-usage.")
         snap = os.path.join(tmp, "opencode.db")
-        shutil.copy2(db, snap)
-        for ext in ("-wal", "-shm"):
-            if os.path.exists(db + ext):
-                shutil.copy2(db + ext, snap + ext)
+        # SNAPSHOT THE QUERIED TABLE, NOT THE FILE. This function reads exactly one table; measured
+        # on mesh-home 2026-08-25 that table is 0.094 MiB inside a 966.5 MiB opencode.db, 87% of
+        # which is an append-only `event` log nothing here has ever opened. The old whole-file
+        # copy2 made the db's SIZE a multiplier on every call — and unlike mesh-spend this reader
+        # has no TTL cache, so it paid the full gigabyte EVERY time. A WAL reader sees the
+        # uncheckpointed -wal without copying it, so the extract is fresher than the copy it
+        # replaces, which is why the -wal/-shm copies go away with it.
+        narrowed = False
+        try:
+            _src = sqlite3.connect(
+                pathlib.Path(os.path.realpath(db)).as_uri() + "?mode=ro", uri=True, timeout=10)
+            try:
+                if not _src.execute("SELECT name FROM sqlite_master WHERE type='table' "
+                                    "AND name='session'").fetchone():
+                    # SCHEMA DRIFT MUST NOT BECOME A GENUINE ZERO: an empty extract would be
+                    # summed to 0 and reported as real usage. Refuse, and let the copy path decide.
+                    raise RuntimeError("session table absent")
+                _src.execute("ATTACH DATABASE ? AS snap", (snap,))
+                _src.execute("CREATE TABLE snap.session AS SELECT * FROM main.session")
+                _src.commit()
+                _src.execute("DETACH DATABASE snap")
+            finally:
+                _src.close()
+            narrowed = True
+        except Exception as _e:
+            # RARE AND LOUD: the fallback re-copies the whole db, the exact write this removes, so
+            # it never passes silently — stderr is free here (callers capture stdout only).
+            if os.path.exists(snap):
+                try: os.remove(snap)
+                except OSError: pass
+            print(f"mesh-usage: WARN whole-db snapshot fallback ({_e})", file=sys.stderr)
+        if not narrowed:
+            shutil.copy2(db, snap)
+            for ext in ("-wal", "-shm"):
+                if os.path.exists(db + ext):
+                    shutil.copy2(db + ext, snap + ext)
         # TEST SEAM (capped at 10s): holds the snapshot open so --test can deliver a REAL SIGTERM
         # while the temp dir exists, instead of racing a copy whose duration it cannot control.
         _hold = os.environ.get("MESH_USAGE_SNAPSHOT_HOLD_S")
@@ -199,6 +231,58 @@ if len(sys.argv) > 1 and sys.argv[1] == '--test':
             sys.exit(1)
     finally:
         shutil.rmtree(_td2, ignore_errors=True)
+
+    # GATE — THE SNAPSHOT MUST BE THE QUERIED TABLE, NOT THE FILE. The SIGTERM gate above proves the
+    # copy UNWINDS; it says nothing about how big it was, and passes just as well while every call
+    # writes a gigabyte. Measured on mesh-home 2026-08-25: opencode.db 966.5 MiB, of which the
+    # `session` table this reader queries is 0.094 MiB — and this reader has no TTL cache, so it
+    # paid that in full on every invocation. The fixture is shaped like the live db (one session row
+    # beside a fat event table). Uses the existing HOLD seam to stat the snapshot MID-FLIGHT, since
+    # the finally deletes it. Two assertions: an order-of-magnitude size cut (a size-only leg passes
+    # on an empty extract) AND the row still reaching the reading (a content-only leg passes on a
+    # whole-file copy). Disable the narrowing and this goes RED.
+    _td3 = tempfile.mkdtemp(prefix="mesh-usage-narrow.")
+    try:
+        _fx3 = os.path.join(_td3, "oc.db")
+        _c3 = sqlite3.connect(_fx3)
+        _c3.execute("CREATE TABLE session (time_updated INTEGER, tokens_input INTEGER, "
+                    "tokens_output INTEGER, tokens_cache_read INTEGER, tokens_cache_write INTEGER)")
+        _c3.execute("CREATE TABLE event (id TEXT, data TEXT)")
+        _now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        _c3.execute("INSERT INTO session VALUES (?,?,?,?,?)", (_now_ms, 4242, 0, 0, 0))
+        _c3.executemany("INSERT INTO event VALUES (?,?)",
+                        [(str(i), "x" * 4096) for i in range(2000)])
+        _c3.commit(); _c3.close()
+        _src_b = os.path.getsize(_fx3)
+        _sbtmp3 = os.path.join(_td3, "tmp"); os.mkdir(_sbtmp3)
+        _env3 = dict(os.environ, MESH_USAGE_DB=_fx3, MESH_USAGE_SNAPSHOT_HOLD_S="10", TMPDIR=_sbtmp3)
+        _p3 = subprocess.Popen([sys.executable, os.path.abspath(__file__)], env=_env3,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                               start_new_session=True)
+        _snap_b = None
+        for _ in range(150):
+            _dirs = [d for d in os.listdir(_sbtmp3) if d.startswith("mesh-usage.")]
+            if _dirs:
+                _f = os.path.join(_sbtmp3, _dirs[0], "opencode.db")
+                if os.path.exists(_f):
+                    _snap_b = os.path.getsize(_f); break
+            if _p3.poll() is not None: break
+            _tm.sleep(0.1)
+        _out3, _err3 = _p3.communicate(timeout=30)
+        if _snap_b is None:
+            print("smoke-test: FAIL (never observed a snapshot to measure — narrow gate is vacuous)")
+            sys.exit(1)
+        if _snap_b >= _src_b // 10:
+            print(f"smoke-test: FAIL (snapshot is {_snap_b} B of a {_src_b} B source — the whole db "
+                  f"was copied, not the queried table)")
+            sys.exit(1)
+        if "opencode(t=4242)" not in _out3:
+            print(f"smoke-test: FAIL (narrowed snapshot lost the session row: {_out3.strip()!r})")
+            sys.exit(1)
+        if "whole-db snapshot fallback" in _err3:
+            print(f"smoke-test: FAIL (fallback fired: {_err3.strip()!r})"); sys.exit(1)
+    finally:
+        shutil.rmtree(_td3, ignore_errors=True)
     print("smoke-test: ok"); sys.exit(0)
 
 if __name__ == "__main__":

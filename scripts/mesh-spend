@@ -187,8 +187,48 @@ FIXEOF
     [ "$got" -eq "$want" ] || { echo "smoke-test: FAIL (snapshot cache ttl=$ttl: $got copies across 2 calls, expected $want)"; exit 1; }
   done
 
+  # GATE — THE SNAPSHOT MUST BE THE QUERIED TABLES, NOT THE FILE. The TTL gate above only proves the
+  # copy happens ONCE per window; it passes just as well while that one copy is a gigabyte. On
+  # mesh-home 2026-08-25 opencode.db was 966.5 MiB of which this view reads `session` = 0.094 MiB —
+  # 87% of the file is an append-only `event` log no mesh tool has ever opened, so the db's SIZE was
+  # a direct multiplier on every token/spend/pace/ledger read. The fixture below is deliberately
+  # SHAPED like that: a tiny session table beside a fat event table. Two independent assertions,
+  # because either alone can pass vacuously — the snapshot must be an order of magnitude smaller
+  # than its source (a size-only leg passes on an empty extract), AND it must still answer the
+  # session query (a content-only leg passes on a whole-file copy). Rip the narrowing out and the
+  # snapshot becomes the source's size: RED.
+  nb="$(mktemp -d)" || { echo "smoke-test: FAIL (no narrow sandbox)"; exit 1; }
+  mkdir -p "$nb/tmp"
+  python3 - "$nb/oc.db" <<'FIXEOF' || { rm -rf "$nb"; echo "smoke-test: FAIL (fat fixture db)"; exit 1; }
+import sqlite3, sys, time
+c = sqlite3.connect(sys.argv[1])
+c.execute('CREATE TABLE session (model TEXT, cost REAL, tokens_input INT, tokens_output INT, '
+          'tokens_cache_read INT, tokens_cache_write INT, time_updated INT)')
+c.execute('CREATE TABLE event (id TEXT, data TEXT)')
+now = int(time.time() * 1000)
+c.execute('INSERT INTO session VALUES (?,?,?,?,?,?,?)', ('{"id":"m","providerID":"p"}', 1.5, 111, 22, 3, 4, now))
+c.executemany('INSERT INTO event VALUES (?,?)', [(str(i), 'x' * 4096) for i in range(2000)])
+c.commit(); c.close()
+FIXEOF
+  src_b="$(stat -c %s "$nb/oc.db")"
+  out="$(MESH_SPEND_OC_DB="$nb/oc.db" TMPDIR="$nb/tmp" bash "$0" --tokens --json 2>/dev/null)" || {
+    rm -rf "$nb"; echo "smoke-test: FAIL (--tokens errored on the fat fixture)"; exit 1; }
+  snap="$(ls -1 "$nb"/tmp/mesh-spend-snapcache.opencode.db.*/opencode.db 2>/dev/null | head -1)"
+  [ -n "$snap" ] || { rm -rf "$nb"; echo "smoke-test: FAIL (no cached snapshot to measure)"; exit 1; }
+  snap_b="$(stat -c %s "$snap")"
+  # the fixture's event table is >8MB while session is one row, so a narrowed snapshot is <10% of it
+  [ "$snap_b" -lt "$((src_b / 10))" ] || { rm -rf "$nb"
+    echo "smoke-test: FAIL (snapshot is $snap_b B of a $src_b B source — the whole db was copied, not the queried tables)"; exit 1; }
+  # ...and it must still ANSWER: the one session row's tokens must reach the reading
+  printf '%s' "$out" | grep -q '"input": 111' || { rm -rf "$nb"
+    echo "smoke-test: FAIL (narrowed snapshot lost the session row — extract does not answer the query)"; exit 1; }
+  # ...and the fallback must not have fired silently
+  printf '%s' "$out" | grep -q '"snapshot_whole_db": \[\]' || { rm -rf "$nb"
+    echo "smoke-test: FAIL (whole-db fallback fired: $(printf '%s' "$out" | grep -A3 snapshot_whole_db))"; exit 1; }
+  rm -rf "$nb"
+
   rm -rf "$sb"; trap - EXIT
-  echo "smoke-test: ok (sampler samples live windows; unmapped windows attributed by detection; SIGTERM unwinds the db snapshot; TTL cache copies once per TTL, twice at ttl=0)"; exit 0
+  echo "smoke-test: ok (sampler samples live windows; unmapped windows attributed by detection; SIGTERM unwinds the db snapshot; TTL cache copies once per TTL, twice at ttl=0; snapshot carries the queried tables, not the file)"; exit 0
 fi
 
 # ---------- SAMPLER: record a turn on each rising edge into WORKING ----------
@@ -427,12 +467,20 @@ elif view == '--tokens':
     try:    _SNAP_TTL = max(0.0, float(os.environ.get('MESH_SPEND_SNAP_TTL_S') or 300))
     except ValueError: _SNAP_TTL = 300.0
     _snap_age = {}   # basename -> age (s) of the copy actually read; 0.0 = copied by this run
+    _snap_bytes = {} # basename -> size (bytes) of the snapshot actually read
+    _snap_full = []  # basenames that FELL BACK to copying the whole db, with the reason
 
     class _DbSnapshot(object):
         """A TTL-cached copy of a live sqlite db (+ -wal/-shm). Use as a context manager."""
-        def __init__(self, src, basename):
+        def __init__(self, src, basename, tables=None):
             import hashlib
             self.src = src; self.basename = basename
+            # THE TABLES THIS READER ACTUALLY QUERIES. Naming them is what turns the snapshot from a
+            # copy of the whole file into a copy of the rows we read: measured on mesh-home
+            # 2026-08-25, opencode.db is 966.5 MiB of which the `session` table this view reads is
+            # 0.094 MiB — 87% of the file is an append-only `event` log no mesh tool has ever
+            # opened. An empty tuple keeps the old whole-file behaviour.
+            self.tables = tuple(tables or ())
             self.path = None; self._fh = None; self._tmp = None
             key = hashlib.sha1(os.path.realpath(src).encode('utf8')).hexdigest()[:12]
             self.dir = os.path.join(tempfile.gettempdir(),
@@ -469,15 +517,57 @@ elif view == '--tokens':
                 self.__exit__(None, None, None)   # BaseException: SystemExit is what the handler raises
                 raise
             _snap_age[self.basename] = age
+            try: _snap_bytes[self.basename] = os.path.getsize(self.path)
+            except OSError: pass
             return self.path
+
+        def _extract(self, dst):
+            """Snapshot ONLY self.tables, by querying the live db read-only.
+
+            A WAL reader sees the uncheckpointed -wal without copying it, so this is FRESHER than
+            the db+wal+shm copy it replaces, not staler — the reason the old path copied the -wal
+            was to carry rows that had not been checkpointed, and a live reader already has them.
+            Raises on anything unexpected; the caller falls back loudly."""
+            import pathlib
+            uri = pathlib.Path(os.path.realpath(self.src)).as_uri() + '?mode=ro'
+            con = _sq3.connect(uri, uri=True, timeout=10)
+            try:
+                have = set(r[0] for r in con.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"))
+                missing = [t for t in self.tables if t not in have]
+                if missing:
+                    # SCHEMA DRIFT MUST NOT BECOME A GENUINE ZERO. An extract that silently skips a
+                    # renamed table yields an empty snapshot, and this view reports a successful
+                    # read summing to 0 — indistinguishable from an idle engine. Refuse instead.
+                    raise RuntimeError('table(s) absent: ' + ','.join(missing))
+                con.execute('ATTACH DATABASE ? AS snap', (dst,))
+                for t in self.tables:
+                    con.execute('CREATE TABLE snap."%s" AS SELECT * FROM main."%s"' % (t, t))
+                con.commit()
+                con.execute('DETACH DATABASE snap')
+            finally:
+                con.close()
 
         def _refresh(self):
             self._tmp = tempfile.mkdtemp(prefix="mesh-spend.")
             dst = os.path.join(self._tmp, self.basename)
-            shutil.copy2(self.src, dst)
-            for ext in ('-wal', '-shm'):
-                if os.path.exists(self.src + ext):
-                    shutil.copy2(self.src + ext, dst + ext)
+            narrowed = False
+            if self.tables:
+                try:
+                    self._extract(dst); narrowed = True
+                except Exception as e:
+                    # RARE AND LOUD. The fallback writes the whole db again — the exact write this
+                    # narrowing exists to delete — so it is never allowed to look like the normal
+                    # path: it is named in the reading (text header and JSON), with its reason.
+                    if os.path.exists(dst):
+                        try: os.remove(dst)
+                        except OSError: pass
+                    _snap_full.append('%s: %s' % (self.basename, e))
+            if not narrowed:
+                shutil.copy2(self.src, dst)
+                for ext in ('-wal', '-shm'):
+                    if os.path.exists(self.src + ext):
+                        shutil.copy2(self.src + ext, dst + ext)
             # TEST SEAM (capped at 10s): holds the snapshot open so --test can deliver a REAL SIGTERM
             # while the temp dir exists, instead of racing a copy whose duration it cannot control.
             # A racing gate that never lands mid-copy passes vacuously; this one cannot. It sits
@@ -557,7 +647,7 @@ elif view == '--tokens':
     _oc_db = os.environ.get('MESH_SPEND_OC_DB') or os.path.expanduser('~/.local/share/opencode/opencode.db')
     if os.path.exists(_oc_db):
         try:
-            with _DbSnapshot(_oc_db, 'opencode.db') as _snap:
+            with _DbSnapshot(_oc_db, 'opencode.db', tables=('session',)) as _snap:
                 cutoff_ms = int(cut.timestamp() * 1000)
                 con = _sq3.connect(_snap)
                 con.row_factory = _sq3.Row
@@ -596,7 +686,7 @@ elif view == '--tokens':
     _cx_db = os.path.expanduser('~/.codex/state_5.sqlite')
     if os.path.exists(_cx_db):
         try:
-            with _DbSnapshot(_cx_db, 'codex.db') as _snap2:
+            with _DbSnapshot(_cx_db, 'codex.db', tables=('threads',)) as _snap2:
                 cutoff_ms = int(cut.timestamp() * 1000)
                 con2 = _sq3.connect(_snap2)
                 for row in con2.execute(
@@ -639,6 +729,11 @@ elif view == '--tokens':
             # (0.0 = this run took the copy), plus the TTL that bounds it.
             'snapshot_age_s': {k: round(v, 1) for k, v in sorted(_snap_age.items())},
             'snapshot_ttl_s': _SNAP_TTL,
+            # BYTES the snapshot actually cost. The whole point of naming the queried tables is
+            # that this number stops tracking the source file's size; if it ever does again,
+            # 'snapshot_whole_db' below says which read fell back and why.
+            'snapshot_bytes': {k: v for k, v in sorted(_snap_bytes.items())},
+            'snapshot_whole_db': list(_snap_full),
         }, indent=2))
     else:
         hdr_line = f"mesh-spend --tokens · cross-engine · last {win_h:.0f}h · as of {now.strftime('%H:%MZ')}"
@@ -647,6 +742,8 @@ elif view == '--tokens':
             hdr_line += " · sqlite snapshot " + ", ".join(
                 f"{k.replace('.db','')}={v:.0f}s" for k, v in sorted(_snap_age.items())
             ) + f" (ttl {_SNAP_TTL:.0f}s)"
+        if _snap_full:
+            hdr_line += " · WHOLE-DB COPY FELL BACK: " + "; ".join(_snap_full)
         print(hdr_line)
 
         # Claude
