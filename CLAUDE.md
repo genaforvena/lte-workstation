@@ -239,6 +239,10 @@ the case is the evidence, and mixing them is what made this section a wall nobod
   second `score=` in the prose gave one reader a multi-line value, and the malformed row's EMPTY path
   field then wore the "nothing is evictable" sentence, so the drain died loud-looking and silent.
   [[a-verdicts-free-text-quotes-another-records-fields]]
+- **An exemption must cite what LAUNCHES a tool — a cron line, a caller, a unit, a hook — never a
+  capability it merely accepts**, and a self-exemption is a DISAPPEARANCE, so census the launcherless
+  and verify every caller-claim by GREP; after wiring a conditional gate, run it once and read which
+  branch it took. [[an-exemption-that-cites-a-capability-is-not-a-launcher]]
 
 ## Substrate changes & multi-agent coordination
 
