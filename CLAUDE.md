@@ -231,6 +231,10 @@ the case is the evidence, and mixing them is what made this section a wall nobod
   a pass killed mid-way leaves every side effect it already committed invisible to its successor,
   which then repeats them; leave the pre-write distinguishable and publish it.
   [[a-cursor-saved-at-the-end-of-a-pass-repeats-every-fire-a-crash-interrupts]]
+- **A pid-walk names every ANCESTOR, never the writer** — `/proc/PID/io` accumulates REAPED children,
+  so one leaf's bytes read as a multiple under each of its parents; find the leaf by the repeated
+  exact QUANTUM, and know that a snapshot copied and deleted inside one call writes gigabytes that no
+  growing-file sweep can see. [[proc-io-write-bytes-accumulates-reaped-children]]
 - **A verdict's FREE TEXT may quote another record's fields, so parse the ledger BY POSITION** — a
   second `score=` in the prose gave one reader a multi-line value, and the malformed row's EMPTY path
   field then wore the "nothing is evictable" sentence, so the drain died loud-looking and silent.
