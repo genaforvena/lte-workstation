@@ -1,0 +1,466 @@
+#!/usr/bin/env bash
+# reflex-cadence: 7,37 * * * *
+# reflex-args: --edge
+#
+# mesh-drop-stages — the DISCRIMINATOR between the three stages a packet can die at.
+#
+# A packet this node tries to send can die at three independent stages, each with its own
+# unprivileged counter, each blind to the other two. Until this tool the mesh read exactly ONE
+# (stage 1). That blindness is not academic here: the documented LAN-swallow fault
+# (CLAUDE.local.md — the exit node rebuilds table 52 and drops `throw 192.168.8.0/24`) presents as
+# `ping 192.168.8.1` 100% loss while `ip neigh` still reads REACHABLE. A stolen route, a silent
+# segment and an overloaded receive path render IDENTICALLY to every organ we own. These three
+# counters SEPARATE them — so this tool NEVER prints a fused "drops: N". It names WHICH stage moved.
+#
+#   stage 1  backlog    softirq/RPS queue overflow      /proc/net/softnet_stat  -> mesh-net-drop
+#   stage 2  routing    no route matched the dst        nstat Ip{,6}OutNoRoutes
+#   stage 3  neighbour  route found, L2 never resolved  /proc/net/stat/{arp,ndisc}_cache
+#
+# Filing: ~/.mesh/knowledge/capability-three-packet-drop-stages-and-the-mesh-reads-one-mesh-home-20260822.md
+#
+# Usage:
+#   mesh-drop-stages          one-shot, all three legs
+#   mesh-drop-stages --edge   emit only when the verdict changes (cron wiring)
+#   mesh-drop-stages --json   machine-readable
+#   mesh-drop-stages --test   self-test (7 assertions; writes NO durable state, NO liveness log)
+#
+# Exit: 0 read · 1 a leg is dark (coverage < 3/3) · 2 nothing readable at all
+#
+# ---- THE FOUR CONSTRAINTS, all from the filing, all load-bearing -------------------------------
+#
+# (a) COLUMN 1 OF /proc/net/stat/* IS A GAUGE, NOT A PER-CPU COUNTER. `entries` is the single
+#     global table size printed IDENTICALLY on every CPU line; every OTHER column is per-CPU and
+#     must be summed. One file, two aggregation rules, and the header distinguishes them not at
+#     all — so a correct-looking `awk '{s+=$1}'` overstates the neighbour table by exactly $(nproc)
+#     and calls 11/1024 entries "176/1024". This tool takes `entries` from the FIRST data line only
+#     (and says `entries-divergent` if the lines disagree, which would be news), and sums columns
+#     2..N. It resolves every column BY NAME off the header, never by a hardcoded index, because
+#     the kernel has added columns to this file before. The --test asserts the parse against
+#     `ip -4 neigh show nud all | wc -l` — an EXTERNAL truth, never against the tool's own sum.
+#
+# (b) BOTH STAGE-2 AND STAGE-3 COUNTERS ARE BURSTY, SO A SINGLE-WINDOW RATE MEASURES THE OBSERVER.
+#     Measured on this same idle node minutes apart: IpOutNoRoutes 103/s, then 0/s; res_failed
+#     12.6/s, then 0.2/s. The first window had caught one of our own LAN sweeps in flight. So the
+#     HEADLINE quantity here is always the LIFETIME total plus the WINDOW it stands for (= uptime),
+#     and the interval delta is published beside it WITH ITS SPAN, never alone and never as a rate.
+#     The cadence is 30 min on purpose: long enough to contain several */10 sweep cadences.
+#
+# (c) EVERY COUNTER IS BOOT-SCOPED. The state file carries boot_id; a boot change renders every
+#     delta as `reset`, never as a drop to zero. A reboot is not a network that got quiet.
+#
+# (d) res_failed IS A CENSUS OF THE ASKER, NOT OF THE NETWORK. It counts ARP requests WE sent that
+#     nobody answered, and our own .1-.254 sweeps mint ~245 of them by construction. So res_failed
+#     NEVER drives the stage-3 verdict — `unresolved_discards` (real packets thrown away for want
+#     of a neighbour) and `table_fulls` do. A res_failed-only move gets its own tag,
+#     STAGE3-ASKER, which is a different word from STAGE3-MOVED and is never silence.
+#
+# ---- WHAT THIS TOOL DOES NOT DO ---------------------------------------------------------------
+# It does not re-parse /proc/net/softnet_stat. mesh-net-drop is PRIOR ART and owns stage 1; this
+# tool shells out to `mesh-net-drop --json` and renders its numbers under the stage-1 heading. Two
+# parsers of one file is how two blind observers of the same fact end up contradicting each other.
+#
+# It never runs a bare `nstat`. Bare nstat REWRITES ~/.nstat.u<uid> and so steals the delta from
+# every other reader on the node. `-a` absolute, `-s` no-history-write, `-z` show-zeros: all three
+# are required, and the --test asserts the history file was not created.
+
+set -euo pipefail
+
+STATE_DIR="${MESH_STATE_DIR:-$HOME/.mesh}"
+STATE="$STATE_DIR/.drop-stages"
+VSTATE="$STATE_DIR/.drop-stages.verdict"
+BIN="${MESH_BIN:-$HOME/.local/bin}"
+
+# Source paths — overridable so the --test can drive the DARK-LEG arms. The pass/fail asserts for
+# the column-1 trap run against the LIVE files, never against a fixture.
+DS_SOFTNET_TOOL="${DS_SOFTNET_TOOL:-$BIN/mesh-net-drop}"
+DS_ARP="${DS_ARP:-/proc/net/stat/arp_cache}"
+DS_NDISC="${DS_NDISC:-/proc/net/stat/ndisc_cache}"
+DS_SNMP="${DS_SNMP:-/proc/net/snmp}"
+DS_SNMP6="${DS_SNMP6:-/proc/net/snmp6}"
+DS_NSTAT="${DS_NSTAT:-nstat}"
+
+MODE=oneshot
+for a in "$@"; do
+  case "$a" in
+    --edge) MODE=edge ;;
+    --json) MODE=json ;;
+    --test) MODE=test ;;
+  esac
+done
+
+[ "$MODE" = test ] || { "$BIN/mesh-pulse" beat drop-stages; } >/dev/null 2>&1 || true
+
+TS=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+NOW=$(date +%s)
+
+# --- helpers ------------------------------------------------------------------------------------
+
+hms() {  # seconds -> 6h54m / 3d2h / 47m
+  local s=${1:-0} d h m
+  d=$((s/86400)); h=$(((s%86400)/3600)); m=$(((s%3600)/60))
+  if [ "$d" -gt 0 ]; then printf '%dd%dh' "$d" "$h"
+  elif [ "$h" -gt 0 ]; then printf '%dh%dm' "$h" "$m"
+  else printf '%dm' "$m"; fi
+}
+
+# Parse a /proc/net/stat/* file. Emits `name=value` lines:
+#   entries=<gauge from the FIRST data line ONLY — constraint (a)>
+#   entries_lines=<how many data lines carried it>
+#   entries_divergent=<yes|no>
+#   <every other column>=<SUM over data lines>
+# Columns are resolved BY NAME from the header row, never by index.
+parse_neigh_stat() {
+  local f="$1"
+  [ -r "$f" ] || return 1
+  awk '
+    NR==1 { for (i=1;i<=NF;i++) name[i]=$i; ncol=NF; next }
+    NF<1 { next }
+    {
+      lines++
+      for (i=1;i<=NF && i<=ncol;i++) {
+        v = strtonum("0x" $i)
+        if (name[i] == "entries") {
+          if (lines==1) gauge=v; else if (v!=gauge) diverge=1
+        } else sum[i]+=v
+      }
+    }
+    END {
+      if (lines==0) exit 1
+      printf "entries=%d\n", gauge
+      printf "entries_lines=%d\n", lines
+      printf "entries_divergent=%s\n", (diverge?"yes":"no")
+      for (i=1;i<=ncol;i++) if (name[i]!="entries") printf "%s=%d\n", name[i], sum[i]
+    }
+  ' "$f"
+}
+
+# The naive (WRONG) whole-file sum of column 1 — computed ONLY by the --test, to prove the trap is
+# real on this node rather than asserting the parser against itself.
+naive_col1_sum() { awk 'NR>1{s+=strtonum("0x" $1)} END{print s+0}' "$1"; }
+
+# stage 2 — absolute counters. nstat first (the named interface), /proc/net/snmp{,6} as the
+# fallback. The fallback is NOT silent: the source is published in the reading as src=.
+read_no_routes() {
+  local v4="" v6="" src="nstat" out
+  if out=$(command -v "$DS_NSTAT" >/dev/null 2>&1 && "$DS_NSTAT" -asz IpOutNoRoutes Ip6OutNoRoutes 2>/dev/null); then
+    v4=$(awk '$1=="IpOutNoRoutes"{print $2; exit}'  <<<"$out")
+    v6=$(awk '$1=="Ip6OutNoRoutes"{print $2; exit}' <<<"$out")
+  fi
+  if [ -z "$v4" ] || [ -z "$v6" ]; then
+    src="proc"
+    if [ -r "$DS_SNMP" ]; then
+      v4=$(awk '/^Ip: [A-Za-z]/{for(i=1;i<=NF;i++) if($i=="OutNoRoutes") c=i; next}
+                /^Ip: [0-9-]/{if(c){print $c; exit}}' "$DS_SNMP")
+    fi
+    [ -r "$DS_SNMP6" ] && v6=$(awk '$1=="Ip6OutNoRoutes"{print $2; exit}' "$DS_SNMP6")
+  fi
+  # An unreadable leg is na — never 0. A zero here would be indistinguishable from a healthy
+  # node that has never failed to route a packet, which is the exact plausible-constant trap.
+  printf 'v4=%s\nv6=%s\nsrc=%s\n' "${v4:-na}" "${v6:-na}" "$src"
+}
+
+# `reset` when the boot changed, `na` when either end is missing, else the signed delta.
+delta() {
+  local prev="$1" cur="$2"
+  [ "${BOOT_CHANGED:-no}" = yes ] && { echo reset; return; }
+  case "$prev" in ''|na) echo na; return ;; esac
+  case "$cur"  in ''|na) echo na; return ;; esac
+  echo $((cur - prev))
+}
+moved() { case "$1" in ''|na|reset|0|-*) return 1 ;; *) return 0 ;; esac; }
+
+kv() { awk -F= -v k="$2" '$1==k{print $2; exit}' <<<"$1"; }
+
+# --- collect ------------------------------------------------------------------------------------
+
+collect() {
+  BOOT_ID=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown)
+  UPTIME=$(awk '{printf "%d", $1}' /proc/uptime 2>/dev/null || echo 0)
+  COVER=0; DARK=""
+
+  # stage 1 — mesh-net-drop's, cited not duplicated.
+  S1_DROP=na; S1_SQ=na; S1_VERDICT=na; S1_SRC="mesh-net-drop"
+  if [ -x "$DS_SOFTNET_TOOL" ] && j=$("$DS_SOFTNET_TOOL" --json 2>/dev/null); then
+    S1_DROP=$(sed -n 's/.*"dropped":\([0-9]*\).*/\1/p' <<<"$j")
+    S1_SQ=$(sed -n 's/.*"squeezes":\([0-9]*\).*/\1/p' <<<"$j")
+    S1_VERDICT=$(sed -n 's/.*"verdict":"\([A-Z]*\)".*/\1/p' <<<"$j")
+    [ -n "$S1_DROP" ] && COVER=$((COVER+1)) || { S1_DROP=na; S1_SQ=na; DARK="$DARK stage1"; }
+  else
+    DARK="$DARK stage1"
+  fi
+
+  # stage 2 — routing.
+  nr=$(read_no_routes)
+  S2_V4=$(kv "$nr" v4); S2_V6=$(kv "$nr" v6); S2_SRC=$(kv "$nr" src)
+  if [ "$S2_V4" != na ] || [ "$S2_V6" != na ]; then COVER=$((COVER+1)); else DARK="$DARK stage2"; fi
+  # A node with no IPv6 default route makes EVERY v6 send a structural stage-2 death. That is a
+  # declared discipline, so it buys a different TAG — never silence: the number is still published
+  # and the counter still alarms if v4 moves.
+  S2_V6_STRUCTURAL=no
+  [ -z "$(ip -6 route show default 2>/dev/null)" ] && S2_V6_STRUCTURAL=yes
+
+  # stage 3 — neighbour.
+  S3_OK=no; S3_RES=na; S3_UNRES=na; S3_FULL=na; S3_FGC=na; S3_ENT=na; S3_DIV=na
+  S3_RES6=na; S3_UNRES6=na; S3_FULL6=na; S3_ENT6=na
+  if arp=$(parse_neigh_stat "$DS_ARP" 2>/dev/null); then
+    S3_ENT=$(kv "$arp" entries); S3_DIV=$(kv "$arp" entries_divergent)
+    S3_RES=$(kv "$arp" res_failed); S3_UNRES=$(kv "$arp" unresolved_discards)
+    S3_FULL=$(kv "$arp" table_fulls); S3_FGC=$(kv "$arp" forced_gc_runs)
+    S3_OK=yes
+  fi
+  if nd=$(parse_neigh_stat "$DS_NDISC" 2>/dev/null); then
+    S3_ENT6=$(kv "$nd" entries); S3_RES6=$(kv "$nd" res_failed)
+    S3_UNRES6=$(kv "$nd" unresolved_discards); S3_FULL6=$(kv "$nd" table_fulls)
+    S3_OK=yes
+  fi
+  if [ "$S3_OK" = yes ]; then COVER=$((COVER+1)); else DARK="$DARK stage3"; fi
+  GC_THRESH3=$(cat /proc/sys/net/ipv4/neigh/default/gc_thresh3 2>/dev/null || echo na)
+}
+
+# --- state --------------------------------------------------------------------------------------
+
+load_prior() {
+  BOOT_CHANGED=no; PRIOR_TS=""; FIRST=yes
+  P_S1D=na; P_S1S=na; P_S2V4=na; P_S2V6=na; P_S3U=na; P_S3F=na; P_S3R=na; P_S3U6=na
+  if [ -r "$STATE" ]; then
+    s=$(cat "$STATE")
+    pb=$(kv "$s" boot_id); PRIOR_TS=$(kv "$s" ts)
+    FIRST=no
+    if [ "$pb" != "$BOOT_ID" ]; then BOOT_CHANGED=yes; else
+      P_S1D=$(kv "$s" s1_dropped);   P_S1S=$(kv "$s" s1_squeeze)
+      P_S2V4=$(kv "$s" s2_v4);       P_S2V6=$(kv "$s" s2_v6)
+      P_S3U=$(kv "$s" s3_unres);     P_S3F=$(kv "$s" s3_fulls)
+      P_S3R=$(kv "$s" s3_res);       P_S3U6=$(kv "$s" s3_unres6)
+    fi
+  fi
+  SPAN=na
+  case "$PRIOR_TS" in ''|na) : ;; *) SPAN=$((NOW - PRIOR_TS)) ;; esac
+}
+
+save_state() {
+  { printf 'boot_id=%s\nts=%s\n' "$BOOT_ID" "$NOW"
+    printf 's1_dropped=%s\ns1_squeeze=%s\ns2_v4=%s\ns2_v6=%s\n' "$S1_DROP" "$S1_SQ" "$S2_V4" "$S2_V6"
+    printf 's3_unres=%s\ns3_fulls=%s\ns3_res=%s\ns3_unres6=%s\n' "$S3_UNRES" "$S3_FULL" "$S3_RES" "$S3_UNRES6"
+  } > "$STATE.$$" && mv -f "$STATE.$$" "$STATE"
+}
+
+# --- verdict — names WHICH stage moved, constraint (d) -------------------------------------------
+
+judge() {
+  D_S1D=$(delta "$P_S1D" "$S1_DROP");   D_S1S=$(delta "$P_S1S" "$S1_SQ")
+  D_S2V4=$(delta "$P_S2V4" "$S2_V4");   D_S2V6=$(delta "$P_S2V6" "$S2_V6")
+  D_S3U=$(delta "$P_S3U" "$S3_UNRES");  D_S3F=$(delta "$P_S3F" "$S3_FULL")
+  D_S3R=$(delta "$P_S3R" "$S3_RES");    D_S3U6=$(delta "$P_S3U6" "$S3_UNRES6")
+
+  local m=""
+  moved "$D_S1D" || moved "$D_S1S" && m="$m STAGE1"
+  # v6 no-route is structural on a node with no v6 default route: it moves every boot by design,
+  # so it must not be what makes the verdict say "routing broke". v4 always counts.
+  if moved "$D_S2V4"; then m="$m STAGE2"
+  elif moved "$D_S2V6" && [ "$S2_V6_STRUCTURAL" = no ]; then m="$m STAGE2v6"; fi
+  moved "$D_S3U" || moved "$D_S3F" || moved "$D_S3U6" && m="$m STAGE3"
+  m=${m# }
+
+  if [ "$COVER" -eq 0 ]; then VERDICT=UNREADABLE
+  elif [ "$BOOT_CHANGED" = yes ]; then VERDICT=RESET      # constraint (c): a reboot, not a quieting
+  elif [ "$FIRST" = yes ]; then VERDICT=BASELINE
+  elif [ -n "$m" ]; then VERDICT="${m// /+}-MOVED"
+  elif moved "$D_S3R"; then VERDICT=STAGE3-ASKER          # constraint (d): our own sweeps, not the net
+  else VERDICT=QUIET; fi
+  [ "$COVER" -lt 3 ] && [ "$COVER" -gt 0 ] && VERDICT="$VERDICT/PARTIAL"
+  return 0
+}
+
+render() {
+  local win; win=$(hms "$UPTIME")
+  local sp="span=na (first sample this boot)"
+  [ "$SPAN" != na ] && sp="span=${SPAN}s"
+  printf 'drop-stages: %s [boot=%s lifetime-window=%s (uptime) %s coverage=%d/3%s]\n' \
+    "$VERDICT" "${BOOT_ID:0:8}" "$win" "$sp" "$COVER" "${DARK:+ dark:$DARK}"
+  printf '  stage1 backlog  : dropped=%s squeeze=%s over %s | d=%s/%s  (src: %s%s)\n' \
+    "$S1_DROP" "$S1_SQ" "$win" "$D_S1D" "$D_S1S" "$S1_SRC" "${S1_VERDICT:+ says $S1_VERDICT}"
+  local v6tag=""
+  [ "$S2_V6_STRUCTURAL" = yes ] && v6tag="  [v6 STRUCTURAL: no IPv6 default route — every v6 send dies here by design]"
+  printf '  stage2 routing  : IpOutNoRoutes=%s Ip6OutNoRoutes=%s over %s | d=%s/%s  (src: %s)%s\n' \
+    "$S2_V4" "$S2_V6" "$win" "$D_S2V4" "$D_S2V6" "$S2_SRC" "$v6tag"
+  printf '  stage3 neighbr  : unresolved_discards=%s table_fulls=%s forced_gc=%s over %s | d=%s/%s\n' \
+    "$S3_UNRES" "$S3_FULL" "$S3_FGC" "$win" "$D_S3U" "$D_S3F"
+  printf '                    res_failed=%s | d=%s  (ASKER census — our own LAN sweeps mint ~245 each; never the verdict)\n' \
+    "$S3_RES" "$D_S3R"
+  printf '                    entries v4=%s/%s v6=%s (col1 GAUGE, first line only, NOT summed%s) ndisc unres=%s fulls=%s | d=%s\n' \
+    "$S3_ENT" "$GC_THRESH3" "$S3_ENT6" "$([ "$S3_DIV" = yes ] && echo ' — DIVERGENT ACROSS CPUS, news')" \
+    "$S3_UNRES6" "$S3_FULL6" "$D_S3U6"
+}
+
+render_json() {
+  printf '{"verdict":"%s","ts":"%s","boot_id":"%s","uptime_s":%s,"span_s":"%s","coverage":%d,"dark":"%s",' \
+    "$VERDICT" "$TS" "$BOOT_ID" "$UPTIME" "$SPAN" "$COVER" "${DARK# }"
+  printf '"stage1":{"dropped":"%s","squeeze":"%s","d_dropped":"%s","d_squeeze":"%s","src":"%s"},' \
+    "$S1_DROP" "$S1_SQ" "$D_S1D" "$D_S1S" "$S1_SRC"
+  printf '"stage2":{"ip_out_no_routes":"%s","ip6_out_no_routes":"%s","d_v4":"%s","d_v6":"%s","v6_structural":"%s","src":"%s"},' \
+    "$S2_V4" "$S2_V6" "$D_S2V4" "$D_S2V6" "$S2_V6_STRUCTURAL" "$S2_SRC"
+  printf '"stage3":{"unresolved_discards":"%s","table_fulls":"%s","forced_gc_runs":"%s","res_failed":"%s",' \
+    "$S3_UNRES" "$S3_FULL" "$S3_FGC" "$S3_RES"
+  printf '"entries_v4":"%s","entries_v6":"%s","entries_divergent":"%s","gc_thresh3":"%s",' \
+    "$S3_ENT" "$S3_ENT6" "$S3_DIV" "$GC_THRESH3"
+  printf '"d_unres":"%s","d_fulls":"%s","d_res_failed":"%s","d_unres6":"%s"}}\n' \
+    "$D_S3U" "$D_S3F" "$D_S3R" "$D_S3U6"
+}
+
+# --- test ---------------------------------------------------------------------------------------
+
+if [ "$MODE" = test ]; then
+  ( set +e
+    fail() { echo "  FAIL: $*"; exit 1; }
+    T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
+    SELF="${BASH_SOURCE[0]}"
+    # nstat's history lives at /tmp/.nstat.u<uid> (NOT ~/.nstat.u<uid> — checking the home path is
+    # a vacuous gate: the file is never there, so absent==absent passes forever). Point the child
+    # at a PRIVATE seeded copy: the shared file is left untouched, and the gate gets a real subject
+    # that a missing -s would visibly rewrite (measured: -asz leaves it byte-identical, -az does not).
+    # A --test must never write the liveness record a watchdog reads. This tool's own beat is
+    # gated on MODE!=test, but the test RUNS the tool as a child (the live path is the only honest
+    # path to assert), and that child beats — its own pulse AND mesh-net-drop's, since stage 1 is
+    # delegated. Measured: a bare --test bumped both drop-stages.beat and net-drop.beat. So every
+    # child runs with MESH_DIR (mesh-pulse's root) redirected into the temp dir, and the arm below
+    # asserts the REAL beats were untouched.
+    export MESH_DIR="$T"
+    state_before=$(stat -c %Y "$STATE" 2>/dev/null || echo absent)
+    real_pulse="${MESH_STATE_DIR:-$HOME/.mesh}/pulse"
+    beat_before=$(stat -c '%n %Y' "$real_pulse"/drop-stages.beat "$real_pulse"/net-drop.beat 2>/dev/null | sort)
+    export NSTAT_HISTORY="$T/nstat.hist"
+    nstat -n >/dev/null 2>&1
+    [ -s "$NSTAT_HISTORY" ] || fail "could not seed an nstat history — the no-history-write gate would be vacuous"
+    hist_before=$(md5sum "$NSTAT_HISTORY" | cut -d' ' -f1)
+
+    # 1+2 — CONSTRAINT (a), against the LIVE files and an EXTERNAL truth. `ip neigh` and the /proc
+    # file are two reads of a table that gc mutates, so retry: a real x$(nproc) overstatement never
+    # matches on any attempt, while a one-entry race clears immediately.
+    for fam in 4 6; do
+      f=$DS_ARP; [ $fam = 6 ] && f=$DS_NDISC
+      [ -r "$f" ] || { echo "  skip: $f unreadable"; continue; }
+      ok=no; got=; truth=
+      for _ in 1 2 3 4 5; do
+        got=$(parse_neigh_stat "$f" | awk -F= '$1=="entries"{print $2}')
+        truth=$(ip -$fam neigh show nud all 2>/dev/null | wc -l)
+        [ "$got" = "$truth" ] && { ok=yes; break; }
+      done
+      [ "$ok" = yes ] || fail "v$fam entries parsed as $got, ip -$fam neigh show nud all says $truth (x\$(nproc) col1 sum?)"
+      # and prove the trap is REAL here, not merely avoided in theory
+      naive=$(naive_col1_sum "$f"); lines=$(parse_neigh_stat "$f" | awk -F= '$1=="entries_lines"{print $2}')
+      [ "$naive" = "$((got * lines))" ] || fail "v$fam naive col1 sum $naive != entries($got) x lines($lines) — the file changed shape"
+      [ "$lines" -gt 1 ] && [ "$naive" != "$got" ] || echo "  note: v$fam single data line — the col1 trap is not exercisable on this host"
+    done
+
+    # 3 — CONSTRAINT (c): a boot change renders `reset`, never 0 and never a negative.
+    BOOT_CHANGED=yes
+    r=$(delta 500 10); [ "$r" = reset ] || fail "boot change must render 'reset', got '$r'"
+    moved reset && fail "'reset' must not count as a stage moving"
+    BOOT_CHANGED=no
+    r=$(delta 500 10); [ "$r" = "-490" ] || fail "same-boot counter fall must render the negative, got '$r'"
+    r=$(delta na 10);  [ "$r" = na ]     || fail "missing prior must render na, got '$r'"
+
+    # 4 — CONSTRAINT (b): the headline carries a lifetime total AND the window it stands for.
+    out=$(MESH_STATE_DIR="$T" "$SELF" 2>/dev/null) || fail "oneshot run failed"
+    grep -q 'lifetime-window=' <<<"$out" || fail "reading publishes no lifetime window"
+    grep -qE 'IpOutNoRoutes=[0-9]+ .*over [0-9]' <<<"$out" || fail "stage2 lifetime total is not published against a window"
+    grep -q 'span=' <<<"$out" || fail "the interval delta is published without its span"
+
+    # 5 — CONSTRAINT (d): the verdict NAMES the stage. Drive a prior state in which ONLY stage 2
+    # moved and assert stage 2 is named while stages 1 and 3 are not.
+    # NOTE: save_state() replaces the state file by mv, so the fake prior must be written to a temp
+    # and moved in AFTER the sampling run — a `cat > state <<EOS` whose heredoc substitutions run
+    # the tool ends up writing to the inode that mv already unlinked, and the fixture never lands.
+    j=$(MESH_STATE_DIR="$T" "$SELF" --json) || fail "json run failed"
+    jf() { sed -n "s/.*\"$1\":\"\([0-9na-]*\)\".*/\1/p" <<<"$j"; }
+    v4now=$(sed -n 's/.*"ip_out_no_routes":"\([0-9]*\)".*/\1/p' <<<"$j")
+    [ -n "$v4now" ] || fail "no stage2 v4 counter to drive the discriminator with"
+    { printf 'boot_id=%s\n' "$(cat /proc/sys/kernel/random/boot_id)"
+      printf 'ts=%s\n' "$(( $(date +%s) - 1800 ))"
+      printf 's1_dropped=%s\ns1_squeeze=%s\n' "$(jf dropped)" "$(jf squeeze)"
+      printf 's2_v4=%s\ns2_v6=%s\n' "$(( v4now - 4242 ))" 999999999
+      printf 's3_unres=%s\ns3_fulls=%s\ns3_res=%s\ns3_unres6=0\n' \
+        "$(jf unresolved_discards)" "$(jf table_fulls)" "$(jf res_failed)"
+    } > "$T/fake" && mv -f "$T/fake" "$T/.drop-stages"
+    grep -q "^s2_v4=$(( v4now - 4242 ))$" "$T/.drop-stages" || fail "the stage2-only fixture did not land"
+    out=$(MESH_STATE_DIR="$T" "$SELF") || fail "discriminator run failed"
+    v=$(sed -n 's/^drop-stages: \([^ ]*\) .*/\1/p' <<<"$out")
+    case "$v" in *STAGE2*) : ;; *) fail "only stage2 moved but the verdict is '$v' — no discriminator" ;; esac
+    case "$v" in *STAGE1*|*STAGE3*) fail "stage2-only move contaminated the verdict: '$v'" ;; esac
+    grep -q 'drops:' <<<"$out" && fail "a fused 'drops:' figure is published"
+    # and the inverse arm: res_failed moving ALONE is STAGE3-ASKER, never STAGE3-MOVED —
+    # constraint (d), our own sweeps are not the network.
+    j2=$(MESH_STATE_DIR="$T" "$SELF" --json)
+    jf2() { sed -n "s/.*\"$1\":\"\([0-9na-]*\)\".*/\1/p" <<<"$j2"; }
+    r=$(jf2 res_failed)
+    if [ "$r" != na ] && [ "$r" -gt 0 ] 2>/dev/null; then
+      { printf 'boot_id=%s\nts=%s\n' "$(cat /proc/sys/kernel/random/boot_id)" "$(( $(date +%s) - 1800 ))"
+        printf 's1_dropped=%s\ns1_squeeze=%s\n' "$(jf2 dropped)" "$(jf2 squeeze)"
+        printf 's2_v4=%s\ns2_v6=%s\n' "$(jf2 ip_out_no_routes)" 999999999
+        printf 's3_unres=%s\ns3_fulls=%s\ns3_res=%s\ns3_unres6=0\n' \
+          "$(jf2 unresolved_discards)" "$(jf2 table_fulls)" "$(( r - 7 ))"
+      } > "$T/fake" && mv -f "$T/fake" "$T/.drop-stages"
+      v=$(MESH_STATE_DIR="$T" "$SELF" --json | sed -n 's/.*"verdict":"\([^"]*\)".*/\1/p')
+      case "$v" in
+        *STAGE3-ASKER*) : ;;
+        *STAGE2*|*STAGE1*) : ;;   # a live counter moved under us — inconclusive, not a failure
+        *) fail "res_failed-only move rendered '$v' — must be STAGE3-ASKER, never STAGE3-MOVED" ;;
+      esac
+      case "$v" in *STAGE3-MOVED*) fail "res_failed alone must NOT read as STAGE3-MOVED (asker census)" ;; esac
+    fi
+
+    # 6 — a dark leg is na and PARTIAL, never 0.
+    out=$(MESH_STATE_DIR="$T" DS_NSTAT=/nonexistent-nstat DS_SNMP=/nonexistent DS_SNMP6=/nonexistent "$SELF" 2>/dev/null)
+    grep -q 'IpOutNoRoutes=na' <<<"$out" || fail "a dark stage2 must render na, not a number: $(grep stage2 <<<"$out")"
+    grep -q 'coverage=2/3' <<<"$out" || fail "a dark leg must lower the published coverage"
+    grep -q 'PARTIAL' <<<"$out" || fail "a dark leg must mark the verdict PARTIAL"
+    grep -q 'dark:.*stage2' <<<"$out" || fail "a dark leg must be NAMED in the reading"
+
+    # 7 — we must never rewrite nstat's history file and steal every other reader's delta.
+    hist_after=$(md5sum "$NSTAT_HISTORY" | cut -d' ' -f1)
+    [ "$hist_before" = "$hist_after" ] || fail "nstat history was REWRITTEN — an nstat without -s somewhere; that steals every other reader's delta"
+
+    # the test must not have forged either tool's liveness beat
+    beat_after=$(stat -c '%n %Y' "$real_pulse"/drop-stages.beat "$real_pulse"/net-drop.beat 2>/dev/null | sort)
+    [ "$beat_before" = "$beat_after" ] || fail "--test bumped a real pulse beat — it forges the liveness it exists to check
+      before: $beat_before
+      after : $beat_after"
+
+    # and the test must not have touched the REAL state. EXISTENCE is not the predicate: a live
+    # run writes that file legitimately, so `[ -e ... ] && fail` accuses the world for the node's
+    # own history. Compare the stamp across the test instead — the same before/after shape as the
+    # beat arm above, and it stays meaningful whether or not the file was already there.
+    state_after=$(stat -c %Y "$STATE" 2>/dev/null || echo absent)
+    [ "$state_before" = "$state_after" ] || fail "--test wrote the durable state $STATE ($state_before -> $state_after)"
+    echo "smoke-test: ok (col1 gauge vs ip neigh v4+v6 · boot-reset renders reset · lifetime+window+span published · stage2-only move names STAGE2 only · dark leg na+PARTIAL+named · nstat history untouched · --test forges no pulse beat)"
+  )
+  exit $?
+fi
+
+# --- run ----------------------------------------------------------------------------------------
+
+mkdir -p "$STATE_DIR"
+collect
+load_prior
+judge
+save_state
+
+if [ "$MODE" = edge ]; then
+  prev=""; [ -r "$VSTATE" ] && prev=$(cat "$VSTATE")
+  if [ "$VERDICT" = "$prev" ]; then
+    # liveness-touch convention: mtime = ran, content = changed. A stably-QUIET node must not read
+    # as a dead sense. (.drop-stages is rewritten every run anyway; this keeps the verdict file honest.)
+    "$BIN/mesh-state-touch" "$VSTATE" 2>/dev/null || true
+    exit 0
+  fi
+  printf '%s' "$VERDICT" > "$VSTATE"
+fi
+
+case "$MODE" in
+  json) render_json ;;
+  *)    render ;;
+esac
+
+[ "$COVER" -eq 0 ] && exit 2
+[ "$COVER" -lt 3 ] && exit 1
+exit 0
