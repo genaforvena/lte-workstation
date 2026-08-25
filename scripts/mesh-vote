@@ -28,14 +28,41 @@
 #                      a strictly higher ballot. Crash-fault model (simple majority) vs bft's
 #                      2/3 Byzantine quorum — that tradeoff is why the algorithm is selectable.
 #
+# THE QUORUM DENOMINATOR IS THE ACCEPTOR SET, NEVER THE ROUND'S TURNOUT (fixed 2026-08-24).
+# The first cut computed `majority = len(votes)//2 + 1` — a majority of whoever answered THIS
+# round. Every turnout is a majority of itself, so a partition chose values on its own: measured
+# on a 5-worker topic, a 2-of-5 round printed `chosen accepts=2/2` and a SINGLE voter printed
+# `chosen accepts=1/1`, both appending to the log the other three knew nothing about. That is
+# split-brain — precisely what a majority quorum exists to forbid — and it wore the word
+# "chosen", which in Paxos means decided forever. The bar must be a majority of the ACCEPTORS,
+# so a round is now measured against the set:
+#   --acceptors <n> / MESH_VOTE_ACCEPTORS   the configured cluster size, authoritative.
+#   otherwise                                the LEARNED set: every worker ever seen on this
+#                                            topic, persisted in state and monotone — it only
+#                                            grows, so a shrinking partition can never lower its
+#                                            own bar. (Learning cannot help the FIRST round: a
+#                                            cluster that is born partitioned learns the
+#                                            partition as its membership. Configure --acceptors
+#                                            when the size is known; that is the safe form.)
+# A round whose turnout is below that majority HOLDS: no value chosen, log untouched, no leader
+# elected — and NO BALLOT BUMP. A partitioned proposer that raised its ballot every attempt would
+# come back holding the highest ballot and depose the live majority's leader (Paxos's disruptive
+# proposer); it stays quiet instead. Monotone membership costs liveness when a node leaves for
+# good — the bar never falls — so --reconfigure is the escape hatch: it sets the set to THIS
+# round's voters. Membership change is an operator decision taken outside the protocol, which is
+# why it is an explicit flag and never something a partition can do to itself.
+#
 # Usage:
 #   printf 'worker|opinion\n...' | mesh-vote <topic> [--json] [--algo bft|multipaxos]
+#                                   [--acceptors <n>] [--reconfigure]
 #   mesh-vote --test
 # Env: MESH_VOTE_ALGO=bft|multipaxos (default bft; the --algo flag wins).
+#      MESH_VOTE_ACCEPTORS=<n>       (multipaxos; the --acceptors flag wins).
 #
 # State: ~/.mesh/vote-state/<topic>.json —
 #   bft:        {reputation: {worker: 0..1}, last_consensus, last_confidence}
-#   multipaxos: {paxos: {ballot, leader, slot, log: [{slot,ballot,value}...], last_chosen}}
+#   multipaxos: {paxos: {ballot, leader, slot, log: [{slot,ballot,value}...], last_chosen,
+#                        acceptors: [worker...]}}
 # Small in-tree STUDY prototype (idea-queue byzantine-consensus 2026-07-08 + raft-paxos
 # 2026-07-18) — not wired into any dash/cron; a real integration is a separate step.
 # orphan-ok: STUDY prototype, on-demand by design — consensus harness for future status-line
@@ -45,6 +72,7 @@ QUORUM=0.66
 
 _run() {
   local topic="$1" state_dir="$HOME/.mesh/vote-state" state_file json_mode="${2:-0}" algo="${3:-bft}" votes_file
+  local acceptors="${4:-}" reconfigure="${5:-0}"
   mkdir -p "$state_dir" 2>/dev/null
   state_file="$state_dir/$topic.json"
   # heredoc (below) occupies python's stdin, so the caller's piped votes must be captured to a
@@ -55,11 +83,12 @@ _run() {
   # (task:doctor-test-tmpdir-cleanup-traps).
   trap 'rm -f "$votes_file"' RETURN
   cat > "$votes_file"
-  python3 - "$state_file" "$json_mode" "$QUORUM" "$votes_file" "$algo" << 'PYEOF'
+  python3 - "$state_file" "$json_mode" "$QUORUM" "$votes_file" "$algo" "$acceptors" "$reconfigure" << 'PYEOF'
 import sys, json, os
 
 state_file, json_mode, quorum, votes_file, algo = \
     sys.argv[1], sys.argv[2] == "1", float(sys.argv[3]), sys.argv[4], sys.argv[5]
+cfg_acceptors, reconfigure = sys.argv[6], sys.argv[7] == "1"
 
 try:
     with open(state_file) as f:
@@ -92,7 +121,40 @@ if algo == "multipaxos":
         text = f"NO VOTES (0) — holding: {px.get('last_chosen') or 'UNKNOWN'}"
     else:
         n = len(votes)
-        majority = n // 2 + 1
+        # THE ACCEPTOR SET — the denominator. Learned membership is monotone (union with this
+        # round's voters, including a below-quorum round's: raising the bar is always the safe
+        # direction), unless --reconfigure explicitly redefines it or --acceptors configures it.
+        learned = set(px.get("acceptors") or [])
+        learned = set(votes) if reconfigure else (learned | set(votes))
+        px["acceptors"] = sorted(learned)
+        if cfg_acceptors:
+            members, src = int(cfg_acceptors), "configured"
+            if n > members:
+                # Louder than a silent widen: more acceptors answered than the cluster is
+                # declared to have, so the declaration is wrong and every quorum computed from
+                # it would be too. [[a-silent-fallback-turns-a-failure-into-a-plausible-constant]]
+                sys.stderr.write(
+                    "mesh-vote: %d workers voted but the acceptor set is configured at %d — "
+                    "refusing to compute a quorum against a set smaller than its own turnout\n"
+                    % (n, members))
+                sys.exit(1)
+        else:
+            members, src = len(learned), "learned"
+        majority = members // 2 + 1
+        if n < majority:
+            # BELOW QUORUM: hold. No value chosen, log untouched, no leader elected — and the
+            # ballot is NOT raised, so a partitioned proposer cannot return holding the highest
+            # ballot and depose the leader the live majority is using.
+            state["paxos"] = px
+            save()
+            out = {"algo": "multipaxos", "consensus": px.get("last_chosen"), "chosen": False,
+                   "held": True, "reason": "below-quorum", "ballot": px["ballot"],
+                   "leader": px["leader"], "turnout": n, "members": members,
+                   "majority": majority, "acceptors_src": src, "n": n, "slot": px["slot"]}
+            text = (f"{px['last_chosen'] or 'UNKNOWN'} — held (turnout {n}/{members} below "
+                    f"majority {majority}, no leader elected) ballot={px['ballot']}")
+            print(json.dumps(out) if json_mode else text)
+            sys.exit(0)
         phase1 = False
         if not px["leader"] or px["leader"] not in votes:
             # PHASE 1 (prepare): new ballot; elect the proposer from the plurality partition
@@ -124,14 +186,17 @@ if algo == "multipaxos":
         save()
         out = {"algo": "multipaxos", "consensus": proposed if chosen else px["last_chosen"],
                "chosen": chosen, "held": not chosen, "ballot": px["ballot"], "leader": leader,
-               "phase1": phase1, "accepts": accepts, "n": n,
+               "phase1": phase1, "accepts": accepts, "n": n, "turnout": n, "members": members,
+               "majority": majority, "acceptors_src": src,
                "slot": slot_decided if chosen else px["slot"]}
+        if not chosen:
+            out["reason"] = "deposed"
         if chosen:
             p1 = " (phase1)" if phase1 else ""
-            text = f"{proposed} — chosen slot={slot_decided} ballot={px['ballot']} leader={leader} accepts={accepts}/{n}{p1}"
+            text = f"{proposed} — chosen slot={slot_decided} ballot={px['ballot']} leader={leader} accepts={accepts}/{members}{p1}"
         else:
-            text = (f"{px['last_chosen'] or 'UNKNOWN'} — held (no majority: accepts {accepts}/{n}, "
-                    f"leader {leader} deposed) ballot={px['ballot']}")
+            text = (f"{px['last_chosen'] or 'UNKNOWN'} — held (no majority: accepts {accepts}/{members} "
+                    f"acceptors, leader {leader} deposed) ballot={px['ballot']}")
 else:
     reputation = state.get("reputation", {})
     last_consensus = state.get("last_consensus")
@@ -239,20 +304,23 @@ case "${1:-}" in
     # new leader from the live plurality (b), slot 2 chosen.
     mp3="$(printf 'b|red\nc|red\n' | HOME="$tmp" "$0" ptopic --algo multipaxos 2>&1)" || {
       echo "smoke-test: FAIL (paxos failover failed: $mp3)"; exit 1; }
-    printf '%s' "$mp3" | grep -q '^red — chosen slot=2 ballot=2 leader=b accepts=2/2 (phase1)' || {
+    # accepts=2/3, not 2/2: b and c are a majority OF THE THREE ACCEPTORS learned so far, which is
+    # the quantity that decides. The old line printed the turnout as its own denominator.
+    printf '%s' "$mp3" | grep -q '^red — chosen slot=2 ballot=2 leader=b accepts=2/3 (phase1)' || {
       echo "smoke-test: FAIL (leader crash must raise the ballot and elect a new leader: $mp3)"; exit 1; }
 
     # Leader b loses its majority (proposes red, 1/3 accepts) -> NOTHING chosen (safety: held
     # output, log untouched), leader deposed.
     mp4="$(printf 'b|red\nc|blue\nd|blue\n' | HOME="$tmp" "$0" ptopic --algo multipaxos 2>&1)" || {
       echo "smoke-test: FAIL (paxos minority round failed: $mp4)"; exit 1; }
-    printf '%s' "$mp4" | grep -q '^red — held (no majority: accepts 1/3, leader b deposed) ballot=2' || {
+    printf '%s' "$mp4" | grep -q '^red — held (no majority: accepts 1/4 acceptors, leader b deposed) ballot=2' || {
       echo "smoke-test: FAIL (minority proposal must hold + depose, never choose: $mp4)"; exit 1; }
 
-    # Next round after depose: phase 1 at ballot 3, leader from the blue plurality (c), chosen.
+    # Next round after depose: phase 1 at ballot 3, leader from the blue plurality — b, the
+    # lexicographically first of the three blue voters, NOT c.
     mp5="$(printf 'b|blue\nc|blue\nd|blue\n' | HOME="$tmp" "$0" ptopic --algo multipaxos 2>&1)" || {
       echo "smoke-test: FAIL (paxos re-election failed: $mp5)"; exit 1; }
-    printf '%s' "$mp5" | grep -q '^blue — chosen slot=3 ballot=3 leader=b accepts=3/3 (phase1)' || {
+    printf '%s' "$mp5" | grep -q '^blue — chosen slot=3 ballot=3 leader=b accepts=3/4 (phase1)' || {
       echo "smoke-test: FAIL (post-depose round must re-elect at a higher ballot: $mp5)"; exit 1; }
 
     # Log invariants from the REAL state artifact (not the printed lines): append-only,
@@ -273,26 +341,118 @@ PYCHK
     printf '%s' "$mpj" | grep -q '"algo": "multipaxos"' && printf '%s' "$mpj" | grep -q '"chosen": true' || {
       echo "smoke-test: FAIL (paxos json missing algo/chosen: $mpj)"; exit 1; }
 
+    # ---- the quorum denominator is the ACCEPTOR SET, not the round's turnout ----
+    # Driven against the measured split-brain: on a 5-worker topic the first cut printed
+    # `chosen accepts=2/2` for a 2-of-5 partition and `chosen accepts=1/1` for a single voter,
+    # because every turnout is a majority of itself.
+    printf 'a|blue\nb|blue\nc|blue\nd|blue\ne|blue\n' | HOME="$tmp" "$0" qtopic --algo multipaxos >/dev/null 2>&1 || {
+      echo "smoke-test: FAIL (quorum topic setup)"; exit 1; }
+    q1="$(printf 'd|red\ne|red\n' | HOME="$tmp" "$0" qtopic --algo multipaxos 2>&1)" || {
+      echo "smoke-test: FAIL (minority partition round failed: $q1)"; exit 1; }
+    printf '%s' "$q1" | grep -q '^blue — held (turnout 2/5 below majority 3, no leader elected) ballot=1$' || {
+      echo "smoke-test: FAIL (a 2-of-5 partition must HOLD against the acceptor set, never choose on its own: $q1)"; exit 1; }
+    # …and the floor of that defect: one worker is a majority of one.
+    q2="$(printf 'e|yellow\n' | HOME="$tmp" "$0" qtopic --algo multipaxos 2>&1)" || {
+      echo "smoke-test: FAIL (lone-voter round failed: $q2)"; exit 1; }
+    printf '%s' "$q2" | grep -q '^blue — held (turnout 1/5 below majority 3' || {
+      echo "smoke-test: FAIL (a single voter must not constitute a majority: $q2)"; exit 1; }
+    # NEGATIVE ARM — without it "held" is satisfied by a gate that holds unconditionally. A REAL
+    # majority of the same acceptor set still chooses, and still skips phase 1 (leader a survived
+    # the partition), so the Multi-Paxos steady-state optimization is not collateral damage.
+    q3="$(printf 'a|blue\nb|blue\nc|blue\n' | HOME="$tmp" "$0" qtopic --algo multipaxos 2>&1)" || {
+      echo "smoke-test: FAIL (majority round failed: $q3)"; exit 1; }
+    printf '%s' "$q3" | grep -q '^blue — chosen slot=1 ballot=1 leader=a accepts=3/5$' || {
+      echo "smoke-test: FAIL (3-of-5 IS a majority and must choose without a new phase 1: $q3)"; exit 1; }
+    # The state artifact, not the printed lines: the two below-quorum rounds appended NOTHING and
+    # left the ballot alone. A partitioned proposer that bumped its ballot each attempt would
+    # return holding the highest one and depose the live majority's leader.
+    HOME="$tmp" python3 - << 'PYQ' || { echo "smoke-test: FAIL (below-quorum rounds touched the log or the ballot)"; exit 1; }
+import json, os
+px = json.load(open(os.path.expanduser("~/.mesh/vote-state/qtopic.json")))["paxos"]
+assert [e["value"] for e in px["log"]] == ["blue", "blue"], f"minority round reached the log: {px['log']}"
+assert px["ballot"] == 1, f"a below-quorum round raised the ballot to {px['ballot']}"
+assert px["acceptors"] == ["a", "b", "c", "d", "e"], f"acceptor set not learned: {px}"
+PYQ
+    # A cluster BORN partitioned cannot be saved by learning — it learns the partition as its
+    # membership. The configured size is the only thing that covers a fresh topic, so it must be
+    # authoritative with no history at all: 3 of a declared 5 chooses, 2 of 5 holds.
+    c1="$(printf 'a|on\nb|on\nc|on\n' | HOME="$tmp" "$0" ctopic --algo multipaxos --acceptors 5 2>&1)" || {
+      echo "smoke-test: FAIL (configured-set round failed: $c1)"; exit 1; }
+    printf '%s' "$c1" | grep -q '^on — chosen slot=0 ballot=1 leader=a accepts=3/5 (phase1)' || {
+      echo "smoke-test: FAIL (3 of a configured 5 is a majority and must choose: $c1)"; exit 1; }
+    c2="$(printf 'a|off\nb|off\n' | HOME="$tmp" MESH_VOTE_ACCEPTORS=5 "$0" ctopic --algo multipaxos 2>&1)" || {
+      echo "smoke-test: FAIL (configured-set minority round failed: $c2)"; exit 1; }
+    printf '%s' "$c2" | grep -q '^on — held (turnout 2/5 below majority 3' || {
+      echo "smoke-test: FAIL (the env form of the configured set must gate too: $c2)"; exit 1; }
+    # More acceptors answered than the cluster is declared to have: the declaration is wrong, and
+    # every quorum computed from it would be too. Refuse loudly rather than widen in silence.
+    if printf 'a|x\nb|x\nc|x\n' | HOME="$tmp" "$0" ctopic --algo multipaxos --acceptors 2 >/dev/null 2>&1; then
+      echo "smoke-test: FAIL (turnout above the configured acceptor set must be refused)"; exit 1
+    fi
+    # A size that is not a positive integer must die at the flag, never inside the quorum
+    # arithmetic — and 0 must not slip through, since majority 0//2+1 = 1 restores the floor.
+    for bad in 0 -1 abc 2x ''; do
+      if printf 'a|x\n' | HOME="$tmp" "$0" ctopic --algo multipaxos --acceptors "$bad" >/dev/null 2>&1; then
+        echo "smoke-test: FAIL (--acceptors '$bad' must be rejected)"; exit 1
+      fi
+    done
+    # Monotone membership costs liveness when a node leaves for good, so --reconfigure is the
+    # escape hatch — and the round it enables is a genuine majority of the NEW set.
+    r1="$(printf 'a|blue\nb|blue\n' | HOME="$tmp" "$0" qtopic --algo multipaxos --reconfigure 2>&1)" || {
+      echo "smoke-test: FAIL (reconfigure round failed: $r1)"; exit 1; }
+    printf '%s' "$r1" | grep -q '^blue — chosen slot=2 ballot=1 leader=a accepts=2/2' || {
+      echo "smoke-test: FAIL (--reconfigure must reset the acceptor set to this round's voters: $r1)"; exit 1; }
+    # …and it must be the ONLY way the set shrinks: the very same round without the flag holds.
+    HOME="$tmp" python3 -c "
+import json, os
+px = json.load(open(os.path.expanduser('~/.mesh/vote-state/qtopic.json')))['paxos']
+assert px['acceptors'] == ['a', 'b'], px['acceptors']
+" || { echo "smoke-test: FAIL (reconfigure did not narrow the persisted acceptor set)"; exit 1; }
+    # --json must carry the denominator, or a machine reader cannot tell a real majority from a
+    # partition's majority-of-itself — the whole defect, invisible again.
+    qj="$(printf 'a|blue\n' | HOME="$tmp" "$0" qtopic --json --algo multipaxos 2>&1)" || {
+      echo "smoke-test: FAIL (quorum json failed: $qj)"; exit 1; }
+    for f in '"held": true' '"reason": "below-quorum"' '"turnout": 1' '"members": 2' '"majority": 2' '"acceptors_src": "learned"'; do
+      printf '%s' "$qj" | grep -q "$f" || {
+        echo "smoke-test: FAIL (below-quorum json missing $f: $qj)"; exit 1; }
+    done
+
     # Unknown algo must refuse loudly, not silently fall back to bft
     if printf 'a|x\n' | HOME="$tmp" "$0" badalgo --algo raft >/dev/null 2>&1; then
       echo "smoke-test: FAIL (unknown --algo must be rejected)"; exit 1
+    fi
+    # The two new flags belong to multipaxos; against bft they must refuse, never be ignored.
+    if printf 'a|x\n' | HOME="$tmp" "$0" badalgo --acceptors 3 >/dev/null 2>&1; then
+      echo "smoke-test: FAIL (--acceptors under bft must be rejected, not silently ignored)"; exit 1
+    fi
+    if printf 'a|x\n' | HOME="$tmp" "$0" badalgo --reconfigure >/dev/null 2>&1; then
+      echo "smoke-test: FAIL (--reconfigure under bft must be rejected, not silently ignored)"; exit 1
     fi
 
     echo "smoke-test: ok"
     exit 0
     ;;
-  ""|--json|--algo)
-    echo "usage: mesh-vote <topic> [--json] [--algo bft|multipaxos]  (opinions on stdin as worker|opinion)" >&2
+  ""|--json|--algo|--acceptors|--reconfigure)
+    echo "usage: mesh-vote <topic> [--json] [--algo bft|multipaxos] [--acceptors <n>] [--reconfigure]  (opinions on stdin as worker|opinion)" >&2
     exit 1
     ;;
   *)
     topic="$1"; shift
     json_mode=0
+    reconfigure=0
     algo="${MESH_VOTE_ALGO:-bft}"
+    acceptors="${MESH_VOTE_ACCEPTORS:-}"
+    # "given" is tracked apart from the VALUE: `--acceptors ""` (or a trailing --acceptors with
+    # nothing after it) must die at the flag, not silently mean "unset" and fall through to the
+    # learned set — a flag that is accepted and then ignored is the quietest way to lose a quorum.
+    acceptors_given=0
+    [ -n "$acceptors" ] && acceptors_given=1
     while [ $# -gt 0 ]; do
       case "$1" in
         --json) json_mode=1 ;;
         --algo) shift; algo="${1:-}" ;;
+        --acceptors) shift; acceptors="${1:-}"; acceptors_given=1 ;;
+        --reconfigure) reconfigure=1 ;;
         *) echo "mesh-vote: unknown arg '$1'" >&2; exit 1 ;;
       esac
       shift
@@ -301,6 +461,18 @@ PYCHK
       bft|multipaxos) ;;
       *) echo "mesh-vote: unknown algo '$algo' (bft|multipaxos)" >&2; exit 1 ;;
     esac
-    _run "$topic" "$json_mode" "$algo"
+    if [ "$acceptors_given" = 1 ]; then
+      # A malformed size must never reach the quorum arithmetic — an unparsable value would
+      # otherwise become an exception under the heredoc and read as a broken tool, and a 0 would
+      # make majority 1, restoring the very floor this fix removed.
+      case "$acceptors" in
+        ''|*[!0-9]*) echo "mesh-vote: --acceptors must be a positive integer, got '$acceptors'" >&2; exit 1 ;;
+      esac
+      [ "$acceptors" -ge 1 ] || { echo "mesh-vote: --acceptors must be >= 1" >&2; exit 1; }
+      [ "$algo" = multipaxos ] || { echo "mesh-vote: --acceptors applies to --algo multipaxos only" >&2; exit 1; }
+    fi
+    [ "$reconfigure" = 0 ] || [ "$algo" = multipaxos ] || {
+      echo "mesh-vote: --reconfigure applies to --algo multipaxos only" >&2; exit 1; }
+    _run "$topic" "$json_mode" "$algo" "$acceptors" "$reconfigure"
     ;;
 esac
