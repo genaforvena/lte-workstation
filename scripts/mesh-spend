@@ -151,10 +151,44 @@ FIXEOF
   kill -TERM -"$spid" 2>/dev/null
   wait "$spid" 2>/dev/null
   sleep 0.3
-  surv="$(ls -1 "$sb/tmp" 2>/dev/null | wc -l)"
-  [ "$surv" -eq 0 ] || { echo "smoke-test: FAIL (SIGTERM stranded $surv snapshot(s): $(ls -1 "$sb/tmp" | tr '\n' ' ') — the finally did not unwind)"; exit 1; }
+  # WHAT MUST BE ZERO IS BYTES, NOT ENTRIES. The snapshot cache keeps a 0-byte flock file in TMPDIR
+  # for the lifetime of the process, so a bare `ls | wc -l` would now fail on a lock that strands
+  # nothing. Assert the two things that actually mean "stranded": a surviving `mesh-spend.XXXXXXXX`
+  # mkdtemp, or ANY non-empty file left behind (a partial opencode.db is the artifact this catches).
+  surv_dirs="$(ls -d "$sb"/tmp/mesh-spend.* 2>/dev/null | wc -l)"
+  surv_bytes="$(find "$sb/tmp" -type f -size +0c 2>/dev/null | wc -l)"
+  [ "$surv_dirs" -eq 0 ] && [ "$surv_bytes" -eq 0 ] || {
+    echo "smoke-test: FAIL (SIGTERM stranded $surv_dirs snapshot dir(s) / $surv_bytes non-empty file(s): $(find "$sb/tmp" -mindepth 1 2>/dev/null | tr '\n' ' ') — the unwind did not run)"; exit 1; }
+
+  # GATE — THE CACHE MUST ELIDE THE SECOND COPY, and this counts COPIES, not elapsed time (a "it was
+  # faster" leg passes on a warm page cache while the write still happens). _DbSnapshot appends one
+  # line to <cachedir>.copies per real copy, OUTSIDE the cache dir so a refresh cannot reset it.
+  # Both arms run: TTL=300 must copy ONCE across two calls, TTL=0 must copy TWICE — a one-armed
+  # version of this gate passes just as well with the cache ripped out and the TTL ignored.
+  cachedir_copies() { ls -1 "$1"/mesh-spend-snapcache.*.copies 2>/dev/null | head -1; }
+  for arm in "300 1" "0 2"; do
+    set -- $arm; ttl="$1"; want="$2"
+    cb="$(mktemp -d)" || { echo "smoke-test: FAIL (no cache sandbox)"; exit 1; }
+    mkdir -p "$cb/tmp"
+    python3 - "$cb/oc.db" <<'FIXEOF' || { rm -rf "$cb"; echo "smoke-test: FAIL (fixture db)"; exit 1; }
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+c.execute('CREATE TABLE session (model TEXT, cost REAL, tokens_input INT, tokens_output INT, '
+          'tokens_cache_read INT, tokens_cache_write INT, time_updated INT)')
+c.commit(); c.close()
+FIXEOF
+    for _ in 1 2; do
+      MESH_SPEND_OC_DB="$cb/oc.db" MESH_SPEND_SNAP_TTL_S="$ttl" TMPDIR="$cb/tmp" \
+        bash "$0" --tokens --json >/dev/null 2>&1 || { rm -rf "$cb"; echo "smoke-test: FAIL (--tokens errored at ttl=$ttl)"; exit 1; }
+    done
+    cf="$(cachedir_copies "$cb/tmp")"
+    got="$( [ -n "$cf" ] && wc -l < "$cf" || echo 0 )"
+    rm -rf "$cb"
+    [ "$got" -eq "$want" ] || { echo "smoke-test: FAIL (snapshot cache ttl=$ttl: $got copies across 2 calls, expected $want)"; exit 1; }
+  done
+
   rm -rf "$sb"; trap - EXIT
-  echo "smoke-test: ok (sampler samples live windows; unmapped windows attributed by detection; SIGTERM unwinds the db snapshot)"; exit 0
+  echo "smoke-test: ok (sampler samples live windows; unmapped windows attributed by detection; SIGTERM unwinds the db snapshot; TTL cache copies once per TTL, twice at ttl=0)"; exit 0
 fi
 
 # ---------- SAMPLER: record a turn on each rising edge into WORKING ----------
@@ -368,6 +402,112 @@ elif view == '--tokens':
     # Real token usage: Claude (JSONL) + opencode (sqlite session table) + codex (sqlite thread_goals).
     # Granularity: per-API-session for Claude/opencode, per-goal for codex (no per-window breakdown).
     import shutil, tempfile, sqlite3 as _sq3
+
+    # ── DB SNAPSHOT, TTL-CACHED ───────────────────────────────────────────────
+    # THIS COPY WAS THE NODE'S LARGEST DISK WRITER, and it must never be per-call again. Measured on
+    # mesh-home 2026-08-25 (incident io-write-volume-30MBps): opencode.db is 966.5 MiB and its -wal
+    # 8.4 MiB, so ONE `mesh-spend --tokens` wrote 974.9 MiB into TMPDIR — and /tmp here is on dm-0,
+    # the root LV of the boot NVMe. Thirteen of those landed in a single 300s window (mesh-pace
+    # --check -> mesh-labor --json -> mesh-ledger -> here, on nearly every reflex): 12.7 GiB of the
+    # 13.86 GiB charged to cron.service, 92%, against a disk already carrying 39.16 TB lifetime.
+    # NOTHING ON DISK GREW, which is why a file-size hunt found nothing — the bytes are a temp copy
+    # created and rmtree'd inside one call, so the growing-file axis is structurally blind to them.
+    #
+    # So: keep ONE snapshot per source db and re-copy only when it is older than the TTL. A cached
+    # read is a SAMPLE of a moment, never the live state, so the snapshot's AGE is PUBLISHED in the
+    # reading — a token window measured in hours barely moves in 300s, but the consumer is told
+    # rather than left to assume live.
+    #
+    # LOCKING is what makes reuse safe: a reader holds LOCK_SH for its whole sqlite read and a
+    # refresher takes LOCK_EX, so a refresh can never yank the files from under a live reader.
+    # The cold path still goes through a `mesh-spend.XXXXXXXX` mkdtemp and only renames INTO the
+    # cache AFTER the hold seam — so the SIGTERM-unwind gate above still observes a temp dir
+    # mid-copy, still requires it gone afterwards, and a SIGTERM mid-copy still strands no bytes.
+    import time as _time
+    try:    _SNAP_TTL = max(0.0, float(os.environ.get('MESH_SPEND_SNAP_TTL_S') or 300))
+    except ValueError: _SNAP_TTL = 300.0
+    _snap_age = {}   # basename -> age (s) of the copy actually read; 0.0 = copied by this run
+
+    class _DbSnapshot(object):
+        """A TTL-cached copy of a live sqlite db (+ -wal/-shm). Use as a context manager."""
+        def __init__(self, src, basename):
+            import hashlib
+            self.src = src; self.basename = basename
+            self.path = None; self._fh = None; self._tmp = None
+            key = hashlib.sha1(os.path.realpath(src).encode('utf8')).hexdigest()[:12]
+            self.dir = os.path.join(tempfile.gettempdir(),
+                                    'mesh-spend-snapcache.%s.%s' % (basename, key))
+            self.lock = self.dir + '.lock'
+
+        def _age(self):
+            try: return max(0.0, _time.time() - os.path.getmtime(os.path.join(self.dir, self.basename)))
+            except OSError: return None
+
+        def __enter__(self):
+            # EVERYTHING HERE IS WRAPPED, because a `with` arms __exit__ only once __enter__ has
+            # RETURNED. The SIGTERM this file exists to survive lands mid-copy — i.e. inside
+            # __enter__ — so relying on the caller's `with` to unwind leaves the partial snapshot on
+            # disk exactly as the un-caught-signal bug did. Driven red first: the gate below reported
+            # a stranded `mesh-spend.XXXXXXXX` until this try/except was added.
+            import fcntl
+            self.path = os.path.join(self.dir, self.basename)
+            try:
+                self._fh = open(self.lock, 'a+')
+                fcntl.flock(self._fh, fcntl.LOCK_SH)
+                age = self._age()
+                if age is None or age > _SNAP_TTL:
+                    # stale or absent: upgrade and RE-CHECK — another caller may have just refreshed
+                    # it, and re-copying because we lost that race is the cost this cache removes.
+                    fcntl.flock(self._fh, fcntl.LOCK_UN)
+                    fcntl.flock(self._fh, fcntl.LOCK_EX)
+                    age = self._age()
+                    if age is None or age > _SNAP_TTL:
+                        self._refresh(); age = 0.0
+                    fcntl.flock(self._fh, fcntl.LOCK_UN)
+                    fcntl.flock(self._fh, fcntl.LOCK_SH)
+            except BaseException:
+                self.__exit__(None, None, None)   # BaseException: SystemExit is what the handler raises
+                raise
+            _snap_age[self.basename] = age
+            return self.path
+
+        def _refresh(self):
+            self._tmp = tempfile.mkdtemp(prefix="mesh-spend.")
+            dst = os.path.join(self._tmp, self.basename)
+            shutil.copy2(self.src, dst)
+            for ext in ('-wal', '-shm'):
+                if os.path.exists(self.src + ext):
+                    shutil.copy2(self.src + ext, dst + ext)
+            # TEST SEAM (capped at 10s): holds the snapshot open so --test can deliver a REAL SIGTERM
+            # while the temp dir exists, instead of racing a copy whose duration it cannot control.
+            # A racing gate that never lands mid-copy passes vacuously; this one cannot. It sits
+            # BEFORE the rename on purpose: a SIGTERM here must leave the cache untouched.
+            _hold = os.environ.get('MESH_SPEND_SNAPSHOT_HOLD_S')
+            if _hold:
+                try: _time.sleep(min(10.0, float(_hold)))
+                except ValueError: pass
+            shutil.rmtree(self.dir, ignore_errors=True)
+            os.replace(self._tmp, self.dir)   # atomic; both live under gettempdir()
+            self._tmp = None
+            # COPY COUNTER, kept OUTSIDE the cache dir so a refresh cannot reset it — this is what
+            # --test counts to prove the second call elides the copy instead of merely being fast.
+            try:
+                with open(self.dir + '.copies', 'a') as f: f.write('1\n')
+            except OSError: pass
+
+        def __exit__(self, *exc):
+            # cleanup must NOT be conditional on reaching the line after the read: schema drift or a
+            # locked db throws straight past it and strands the whole snapshot.
+            if self._tmp:
+                shutil.rmtree(self._tmp, ignore_errors=True); self._tmp = None
+            if self._fh:
+                try:
+                    import fcntl; fcntl.flock(self._fh, fcntl.LOCK_UN)
+                except Exception: pass
+                try: self._fh.close()
+                except Exception: pass
+                self._fh = None
+            return False
     def parse_ts_iso(s):
         try: return datetime.fromisoformat(s.rstrip('Z')).replace(tzinfo=timezone.utc)
         except Exception: return None
@@ -406,63 +546,45 @@ elif view == '--tokens':
             pass
 
     # ── opencode sqlite ───────────────────────────────────────────────────────
-    # Copy DB + WAL/SHM before reading (opencode holds a write lock on the live DB).
+    # Read a TTL-CACHED copy of DB + WAL/SHM (opencode holds a write lock on the live DB). The copy
+    # itself, taken per call, was the incident above — see _DbSnapshot for the measurement. The
+    # `mesh-spend.XXXXXXXX` prefix on the cold-path temp is deliberate: a stranded `tmpXXXXXXXX`
+    # names nobody, and 13 of them holding a full copy of opencode.db (up to 181MB each) is what
+    # filled phaedra's /tmp on 2026-08-15. The prefix says who leaked it AND falls under
+    # mesh-tmp-guard's mesh-owned sweep — the backstop for the SIGKILL no finally can catch.
     oc_agg = {}   # model_id → {sessions, input, output, cache_read, cache_write, cost}
     oc_err = None
     _oc_db = os.environ.get('MESH_SPEND_OC_DB') or os.path.expanduser('~/.local/share/opencode/opencode.db')
     if os.path.exists(_oc_db):
-        _tmp = None
         try:
-            # PREFIXED, not bare: a stranded `tmpXXXXXXXX` names nobody, and 13 of them holding a
-            # full copy of opencode.db (up to 181MB each) is what filled phaedra's /tmp on
-            # 2026-08-15. `mesh-spend.XXXXXXXX` says who leaked it AND falls under mesh-tmp-guard's
-            # mesh-owned sweep — the backstop for the SIGKILL no finally can catch. (SIGTERM, which
-            # is what `timeout` actually sends, is caught at the top of this file: without that
-            # handler the finally below never ran and this comment was the whole reason why.)
-            _tmp = tempfile.mkdtemp(prefix="mesh-spend.")
-            _snap = os.path.join(_tmp, 'opencode.db')
-            shutil.copy2(_oc_db, _snap)
-            for ext in ('-wal', '-shm'):
-                if os.path.exists(_oc_db + ext):
-                    shutil.copy2(_oc_db + ext, _snap + ext)
-            # TEST SEAM (capped at 10s): holds the snapshot open so --test can deliver a REAL SIGTERM
-            # while the temp dir exists, instead of racing a copy whose duration it cannot control.
-            # A racing gate that never lands mid-copy passes vacuously; this one cannot.
-            _hold = os.environ.get('MESH_SPEND_SNAPSHOT_HOLD_S')
-            if _hold:
-                import time as _time
-                try: _time.sleep(min(10.0, float(_hold)))
-                except ValueError: pass
-            cutoff_ms = int(cut.timestamp() * 1000)
-            con = _sq3.connect(_snap)
-            con.row_factory = _sq3.Row
-            for row in con.execute(
-                'SELECT model, cost, tokens_input, tokens_output, tokens_cache_read, tokens_cache_write '
-                'FROM session WHERE time_updated > ?', (cutoff_ms,)
-            ):
-                raw_model = row['model'] or '{}'
-                try:
-                    obj = json.loads(raw_model)
-                    mid = obj.get('id') or obj.get('model') or raw_model
-                    pid = obj.get('providerID', 'opencode')
-                except Exception:
-                    mid = raw_model; pid = 'opencode'
-                key = f"{mid} ({pid})"
-                r = oc_agg.setdefault(key, {'sessions':0,'input':0,'output':0,'cache_read':0,'cache_write':0,'cost':0.0})
-                r['sessions'] += 1
-                r['input']      += row['tokens_input']  or 0
-                r['output']     += row['tokens_output'] or 0
-                r['cache_read'] += row['tokens_cache_read']  or 0
-                r['cache_write']+= row['tokens_cache_write'] or 0
-                r['cost']       += row['cost'] or 0.0
-            con.close()
+            with _DbSnapshot(_oc_db, 'opencode.db') as _snap:
+                cutoff_ms = int(cut.timestamp() * 1000)
+                con = _sq3.connect(_snap)
+                con.row_factory = _sq3.Row
+                for row in con.execute(
+                    'SELECT model, cost, tokens_input, tokens_output, tokens_cache_read, tokens_cache_write '
+                    'FROM session WHERE time_updated > ?', (cutoff_ms,)
+                ):
+                    raw_model = row['model'] or '{}'
+                    try:
+                        obj = json.loads(raw_model)
+                        mid = obj.get('id') or obj.get('model') or raw_model
+                        pid = obj.get('providerID', 'opencode')
+                    except Exception:
+                        mid = raw_model; pid = 'opencode'
+                    key = f"{mid} ({pid})"
+                    r = oc_agg.setdefault(key, {'sessions':0,'input':0,'output':0,'cache_read':0,'cache_write':0,'cost':0.0})
+                    r['sessions'] += 1
+                    r['input']      += row['tokens_input']  or 0
+                    r['output']     += row['tokens_output'] or 0
+                    r['cache_read'] += row['tokens_cache_read']  or 0
+                    r['cache_write']+= row['tokens_cache_write'] or 0
+                    r['cost']       += row['cost'] or 0.0
+                con.close()
         except Exception as e:
+            # the `with` unwinds the in-progress temp and the lock on ANY exception — schema drift
+            # or a locked db throws straight past the read, and a conditional cleanup strands it.
             oc_err = str(e)
-        finally:
-            # cleanup must NOT be conditional on reaching the line after the read: schema drift or a
-            # locked db throws straight past it and strands the whole snapshot.
-            if _tmp:
-                shutil.rmtree(_tmp, ignore_errors=True)
     else:
         oc_err = 'opencode.db not found'
 
@@ -473,28 +595,19 @@ elif view == '--tokens':
     cx_err = None
     _cx_db = os.path.expanduser('~/.codex/state_5.sqlite')
     if os.path.exists(_cx_db):
-        _tmp2 = None
         try:
-            _tmp2 = tempfile.mkdtemp(prefix="mesh-spend.")
-            _snap2 = os.path.join(_tmp2, 'codex.db')
-            shutil.copy2(_cx_db, _snap2)
-            for ext in ('-wal', '-shm'):
-                if os.path.exists(_cx_db + ext):
-                    shutil.copy2(_cx_db + ext, _snap2 + ext)
-            cutoff_ms = int(cut.timestamp() * 1000)
-            con2 = _sq3.connect(_snap2)
-            for row in con2.execute(
-                'SELECT model, COUNT(*) as n, SUM(tokens_used) as used '
-                'FROM threads WHERE updated_at_ms > ? AND tokens_used > 0 '
-                'GROUP BY model ORDER BY used DESC', (cutoff_ms,)
-            ):
-                cx_rows.append(row)
-            con2.close()
+            with _DbSnapshot(_cx_db, 'codex.db') as _snap2:
+                cutoff_ms = int(cut.timestamp() * 1000)
+                con2 = _sq3.connect(_snap2)
+                for row in con2.execute(
+                    'SELECT model, COUNT(*) as n, SUM(tokens_used) as used '
+                    'FROM threads WHERE updated_at_ms > ? AND tokens_used > 0 '
+                    'GROUP BY model ORDER BY used DESC', (cutoff_ms,)
+                ):
+                    cx_rows.append(row)
+                con2.close()
         except Exception as e:
             cx_err = str(e)
-        finally:
-            if _tmp2:
-                shutil.rmtree(_tmp2, ignore_errors=True)
     else:
         cx_err = 'state_5.sqlite not found'
 
@@ -521,9 +634,19 @@ elif view == '--tokens':
                 {'model': r[0], 'count': r[1], 'tokens_used': r[2] or 0}
                 for r in cx_rows
             ]}),
+            # A CACHED READ IS A SAMPLE OF A MOMENT, so the moment is published rather than assumed:
+            # age in seconds of the sqlite snapshot each engine's figures were actually read from
+            # (0.0 = this run took the copy), plus the TTL that bounds it.
+            'snapshot_age_s': {k: round(v, 1) for k, v in sorted(_snap_age.items())},
+            'snapshot_ttl_s': _SNAP_TTL,
         }, indent=2))
     else:
         hdr_line = f"mesh-spend --tokens · cross-engine · last {win_h:.0f}h · as of {now.strftime('%H:%MZ')}"
+        # the sqlite figures come from a TTL-cached snapshot — say HOW OLD, never let it read live
+        if _snap_age:
+            hdr_line += " · sqlite snapshot " + ", ".join(
+                f"{k.replace('.db','')}={v:.0f}s" for k, v in sorted(_snap_age.items())
+            ) + f" (ttl {_SNAP_TTL:.0f}s)"
         print(hdr_line)
 
         # Claude
