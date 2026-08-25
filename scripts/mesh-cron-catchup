@@ -1,0 +1,541 @@
+#!/usr/bin/env python3
+"""mesh-cron-catchup — run the daily cron lines whose slot fell into a powered-off node.
+
+  mesh-cron-catchup [--dry] [--window HOURS] [--max N] [--json]
+  mesh-cron-catchup --report            -> what each daily line's last slot did, no firing
+  mesh-cron-catchup --test
+
+# reflex-cadence: 9-59/15 * * * *
+
+THE HOLE THIS CLOSES. This node power-cycles: measured 2026-08-25 over the previous 7 days,
+**85 of 157 scheduled daily-line fires (54%) happened while the machine was off**, and 20 of the
+24 daily lines missed 4 of their 4 fires. `mesh-job-apply` was one of them — its last real
+application was 2026-08-21T07:36, four slots ago. cron has no memory: a slot that arrives while
+the machine is off is not deferred, it is *gone*, and nothing downstream can tell that silence
+apart from a tool that ran and declined. Every daily line here has the same hole; this is not a
+job-lane fix.
+
+WHAT DECIDES A MISS — the boot record, not the tool's own log. A tool's log cannot answer "did it
+run", because a cron line's `>> log` appends nothing when the tool is silent, so mtime stays frozen
+on a live run (the liveness-touch family). The axis used here is the one fact that is complete and
+external to every tool: **was this machine up at the scheduled instant** (`journalctl
+--list-boots`). Down at the slot -> the fire was lost -> catch it up. That is deterministic, and it
+covers exactly the named fault.
+
+WHAT IS DELIBERATELY *NOT* CLAIMED. Up-at-the-slot is treated as covered-by-cron, and this tool
+does NOT re-fire it — a second hand firing a line cron already ran is a double-send, and one of
+these lines mails employers under the operator's name. The other failure (machine up, cron dead)
+is therefore OUT of this tool's reach by construction, and rather than guess, an up-at-slot line
+whose own log has not been touched since the slot is published as `cron-suspect` — an advisory
+naming, never an action. A `cron-suspect` that repeats is a finding for a hand, not for this loop.
+
+TWO GRACE TERMS, both erring toward acting:
+* `BOOT_GRACE` (120s) — a slot inside the first two minutes of a boot counts as MISSED, because
+  cron is not necessarily up yet. Better a late second run (the callee's own cap guards it) than a
+  slot silently attributed to a cron that had not started.
+* `WINDOW` (default 26h) — how far back a lost slot is still worth running. Past that the world
+  has moved and a stale digest is noise. Every slot older than the window is recorded as
+  `expired`, never silently dropped.
+
+THE LEDGER IS A DENOMINATOR, NOT A SCOREBOARD. `~/.mesh/cron-catchup.log` gets one `run` row per
+invocation whatever happened, carrying how many slots were examined, so a silence in it is
+downtime and not a decision. Fires get their own `fired` rows with the exit code. Cursor state is
+`~/.mesh/cron-catchup.state`.
+
+SEEDING. On the very first run the cursor is empty for every line, which would otherwise read as
+"every slot ever is unfired". The first run seeds each line's cursor at the most recent slot and
+fires nothing, printing `seeded`; catch-up begins with the next slot. That is one quiet run, and
+it is announced.
+
+ORDER AND BOUND. `--max` (default 4) fires at most N lines per invocation so a boot does not
+stampede twenty tools at once, and the pending set is walked OLDEST-SLOT-FIRST, so the line that
+has waited longest is the one that goes; the `9-59/15` cadence drains the rest within the hour
+instead of a rotation away.
+
+THE LIVE CRONTAB IS THE SUBJECT, never `~/.mesh/reflexes.cron`. The two diverge — the desired file
+has carried lines the live table did not for 27 days at a stretch — and only the live table fires,
+so only the live table can miss.
+"""
+import argparse, calendar, fcntl, json, os, subprocess, sys, time
+
+HOME = os.path.expanduser("~")
+MESH = os.path.join(HOME, ".mesh")
+STATE = os.path.join(MESH, "cron-catchup.state")
+LOCK = os.path.join(MESH, ".cron-catchup.lock")
+LEDGER = os.path.join(MESH, "cron-catchup.log")
+BOOT_GRACE = 120
+WINDOW_H = float(os.environ.get("MESH_CATCHUP_WINDOW_H", "26"))
+MAXFIRE = int(os.environ.get("MESH_CATCHUP_MAX", "4"))
+# Long enough for the slowest daily line to finish. mesh-job-apply drives a real browser per
+# application and its cap is now 20 (raised from 5 the same day), so a 900s bound — the first
+# number here — would have TRUNCATED a full batch mid-send and recorded rc=124 on a line that was
+# working. A timeout shorter than the callee's own worst case manufactures the failure it reports.
+FIRE_TIMEOUT = int(os.environ.get("MESH_CATCHUP_TIMEOUT", "2700"))
+
+
+def now_iso(t=None):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t if t is not None else time.time()))
+
+
+# ---------------------------------------------------------------- cron fields
+def parse_field(spec, lo, hi):
+    """One cron field -> the set of values it fires on. Raises on anything not understood,
+    because a field silently parsed as 'everything' would turn a weekly line into a daily one."""
+    out = set()
+    for part in spec.split(","):
+        step = 1
+        if "/" in part:
+            part, s = part.split("/", 1)
+            step = int(s)
+            if step < 1:
+                raise ValueError("step %r" % s)
+        if part == "*":
+            a, b = lo, hi
+        elif "-" in part.lstrip("-"):
+            a_s, b_s = part.split("-", 1)
+            a, b = int(a_s), int(b_s)
+        else:
+            a = int(part)
+            # `7/2` in a bare cron field means 7,9,11.. to the end of the range.
+            b = a if step == 1 else hi
+        if a < lo or b > hi or a > b:
+            raise ValueError("range %r out of [%d,%d]" % (part, lo, hi))
+        out.update(range(a, b + 1, step))
+    if not out:
+        raise ValueError("empty field %r" % spec)
+    return out
+
+
+class Line(object):
+    def __init__(self, mins, hours, dom, mon, dow, cmd, raw):
+        self.mins, self.hours, self.dom, self.mon, self.dow = mins, hours, dom, mon, dow
+        self.cmd, self.raw = cmd, raw
+        self.key = tool_of(cmd)
+
+    def matches(self, g):
+        if g.tm_min not in self.mins or g.tm_hour not in self.hours:
+            return False
+        if g.tm_mon not in self.mon:
+            return False
+        # cron's day-of-month / day-of-week are OR'd when both are restricted, AND'd otherwise.
+        dowv = (g.tm_wday + 1) % 7  # python Mon=0 -> cron Sun=0
+        dom_ok = g.tm_mday in self.dom
+        dow_ok = dowv in self.dow or (dowv == 0 and 7 in self.dow)
+        dom_all = len(self.dom) == 31
+        dow_all = len(self.dow) >= 7
+        if dom_all and dow_all:
+            return True
+        if not dom_all and not dow_all:
+            return dom_ok or dow_ok
+        return dom_ok and dow_ok
+
+
+def tool_of(cmd):
+    for tok in cmd.split():
+        if "/" in tok and "mesh-" in tok:
+            return tok.rsplit("/", 1)[-1]
+    return cmd.split()[0].rsplit("/", 1)[-1]
+
+
+def read_crontab(text=None):
+    """The LIVE table, because only the live table fires. Daily-ish == both minute and hour are
+    enumerated, i.e. the line fires a small fixed number of times a day; those are the ones a
+    power-off can eat whole. An hourly-or-finer line is re-fired by its own next tick."""
+    if text is None:
+        p = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
+        text = p.stdout if p.returncode == 0 else ""
+    out = []
+    for raw in text.splitlines():
+        s = raw.strip()
+        if not s or s.startswith("#") or "=" in s.split()[0]:
+            continue
+        f = s.split(None, 5)
+        if len(f) < 6:
+            continue
+        m, h = f[0], f[1]
+        if "*" in m or "*" in h:
+            continue
+        try:
+            out.append(Line(parse_field(f[0], 0, 59), parse_field(f[1], 0, 23),
+                            parse_field(f[2], 1, 31), parse_field(f[3], 1, 12),
+                            parse_field(f[4], 0, 7), f[5], s))
+        except ValueError:
+            continue
+    return out
+
+
+def slots(line, t_from, t_to):
+    """Every instant in (t_from, t_to] this line fires on, ascending. Minute resolution."""
+    out = []
+    t = int(t_to) // 60 * 60
+    while t > t_from:
+        if line.matches(time.gmtime(t)):
+            out.append(t)
+        t -= 60
+    return sorted(out)
+
+
+# ---------------------------------------------------------------- up-windows
+def boot_windows(raw=None):
+    """(start,end) per boot from the journal. This is the whole basis of the verdict, so a failure
+    to read it must NOT degrade into 'the node was up' — that would silently answer 'covered' for
+    every slot and turn this tool into a no-op that looks healthy. It returns None, and the caller
+    renders UNKNOWN and fires nothing."""
+    if raw is None:
+        p = subprocess.run(["journalctl", "--list-boots", "-o", "json"],
+                           capture_output=True, text=True)
+        if p.returncode != 0 or not p.stdout.strip():
+            return None
+        raw = p.stdout
+    try:
+        bs = json.loads(raw)
+    except ValueError:
+        return None
+    w = []
+    for b in bs:
+        try:
+            w.append((b["first_entry"] / 1e6, b["last_entry"] / 1e6))
+        except (KeyError, TypeError):
+            return None
+    return w or None
+
+
+def up_at(t, windows):
+    return any(s + BOOT_GRACE <= t <= e for s, e in windows)
+
+
+# ---------------------------------------------------------------- state
+def load_state():
+    try:
+        with open(STATE) as f:
+            return json.load(f)
+    except (IOError, ValueError):
+        return {}
+
+
+def save_state(st):
+    tmp = STATE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(st, f, indent=1, sort_keys=True)
+    os.replace(tmp, STATE)
+
+
+def ledger(kind, **kv):
+    row = "%s\t%s\t%s\n" % (now_iso(), kind,
+                            "\t".join("%s=%s" % (k, v) for k, v in sorted(kv.items())))
+    try:
+        with open(LEDGER, "a") as f:
+            f.write(row)
+    except IOError:
+        pass
+
+
+def log_mtime(cmd):
+    """The `>> path` a cron line redirects into, if any — advisory only."""
+    toks = cmd.split()
+    for i, t in enumerate(toks):
+        if t == ">>" and i + 1 < len(toks):
+            p = os.path.expandvars(toks[i + 1])
+            try:
+                return os.path.getmtime(p)
+            except OSError:
+                return None
+    return None
+
+
+# ---------------------------------------------------------------- the pass
+def examine(lines, windows, st, t_now):
+    """Classify each daily line's most recent slot. Pure: returns rows, mutates nothing."""
+    horizon = t_now - WINDOW_H * 3600
+    rows = []
+    for ln in lines:
+        ss = slots(ln, t_now - max(WINDOW_H, 24 * 8) * 3600, t_now)
+        if not ss:
+            rows.append({"key": ln.key, "verdict": "no-slot", "slot": None, "line": ln})
+            continue
+        # An unseeded line starts at the window's edge, NOT at zero and NOT at "now". Zero would
+        # fire years of dead slots; "now" (the first design here) threw away the very backlog the
+        # tool exists for — on this node's first pass that was 20 lines that had genuinely missed
+        # their slot hours earlier. The window is already the staleness bound; a second, quieter
+        # bound stacked on top of it just makes the first run a no-op that looks healthy.
+        cur = st.get(ln.key, {}).get("cursor", t_now - WINDOW_H * 3600)
+        pending = [s for s in ss if s > cur]
+        if not pending:
+            rows.append({"key": ln.key, "verdict": "covered", "slot": ss[-1], "line": ln})
+            continue
+        s = pending[0]  # oldest unresolved first — never a full rotation away
+        # A backlog older than the window is all equally dead; skip it whole rather than one
+        # slot per tick, or a week off-grid takes a week of ticks to walk past.
+        stale = [x for x in pending if x < horizon]
+        skip_to = stale[-1] if stale else None
+        if s < horizon:
+            v = "expired"
+        elif up_at(s, windows):
+            lm = log_mtime(ln.cmd)
+            v = "cron-suspect" if (lm is not None and lm < s) else "covered"
+        else:
+            v = "missed"
+        rows.append({"key": ln.key, "verdict": v, "slot": s, "line": ln,
+                     "pending": len(pending),
+                     "skip_to": skip_to if v == "expired" else None})
+    return rows
+
+
+def fire(ln, dry):
+    """Run the line the way cron would: /bin/sh, cron's own PATH, no login shell. A richer env
+    here would let a line pass in catch-up that fails at its real slot."""
+    if dry:
+        return 0, "dry"
+    env = {"HOME": HOME, "PATH": "/usr/bin:/bin", "SHELL": "/bin/sh",
+           "LOGNAME": os.environ.get("LOGNAME", ""), "USER": os.environ.get("USER", ""),
+           "LANG": os.environ.get("LANG", "C.UTF-8"),
+           "MESH_CRON_CATCHUP": "1"}
+    try:
+        p = subprocess.run(["/bin/sh", "-c", os.path.expandvars(ln.cmd)],
+                           env=env, timeout=FIRE_TIMEOUT,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return p.returncode, "ran"
+    except subprocess.TimeoutExpired:
+        return 124, "timeout"
+    except OSError as e:
+        return 127, "exec:%s" % e
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dry", action="store_true")
+    ap.add_argument("--report", action="store_true")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--window", type=float)
+    ap.add_argument("--max", type=int)
+    ap.add_argument("--test", action="store_true")
+    a = ap.parse_args()
+    if a.test:
+        return selftest()
+    global WINDOW_H, MAXFIRE
+    if a.window:
+        WINDOW_H = a.window
+    if a.max is not None:
+        MAXFIRE = a.max
+
+    # A pass can spend --max * 900s firing, which is longer than the cadence between passes. Two
+    # overlapping passes would each read the cursor before either wrote it and fire the same slot
+    # twice — and one of these lines mails employers. Non-blocking: a pass that finds the lock held
+    # exits quietly, because the holder is already doing this pass's work.
+    lockf = open(LOCK, "w")
+    try:
+        fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (IOError, OSError):
+        ledger("run", examined=0, fired=0, verdict="skipped", reason="pass-already-running")
+        print("skipped: another pass holds %s" % LOCK)
+        return 0
+
+    t_now = time.time()
+    lines = read_crontab()
+    windows = boot_windows()
+    if windows is None:
+        # The one axis this tool reasons on is unreadable. Say so and fire nothing.
+        ledger("run", examined=len(lines), fired=0, verdict="UNKNOWN",
+               reason="boot-record-unreadable")
+        print("UNKNOWN: boot record unreadable (journalctl --list-boots) — "
+              "nothing fired, %d daily line(s) unexamined" % len(lines))
+        return 2
+
+    st = load_state()
+    rows = examine(lines, windows, st, t_now)
+    fired = []
+    # oldest missed slot first
+    todo = sorted([r for r in rows if r["verdict"] == "missed"], key=lambda r: r["slot"])
+    for r in todo[:MAXFIRE]:
+        # THE CURSOR IS WRITTEN BEFORE THE FIRE, NOT AFTER THE PASS. Measured 2026-08-25: the first
+        # version saved state once, at the end of the pass, and mesh-log-attest fired TWICE for the
+        # same 04:17 slot — the pass was killed between the two, so nothing it had already done was
+        # on disk and the next pass re-derived the identical work list. On a node that power-cycles
+        # (the very fault this tool exists for) being killed mid-pass is the ordinary case, not an
+        # edge, and one of these lines mails employers under the operator's name. Claiming the slot
+        # first means a crash costs at most ONE lost catch-up; claiming it last means a crash
+        # repeats every send the pass had made.
+        if not (a.dry or a.report):
+            e = st.setdefault(r["key"], {})
+            e["cursor"] = r["slot"]
+            e["last_fire"] = now_iso(t_now)
+            e["last_rc"] = "in-flight"
+            save_state(st)
+        rc, how = fire(r["line"], a.dry or a.report)
+        r["rc"], r["how"] = rc, how
+        fired.append(r)
+        if not (a.dry or a.report):
+            st[r["key"]]["last_rc"] = rc
+            save_state(st)
+        ledger("fired", tool=r["key"], slot=now_iso(r["slot"]), rc=rc, how=how,
+               dry=int(bool(a.dry or a.report)))
+    if not (a.dry or a.report):
+        for r in rows:
+            if r["verdict"] in ("expired", "covered", "cron-suspect") and r["slot"]:
+                st.setdefault(r["key"], {})["cursor"] = r.get("skip_to") or r["slot"]
+                st[r["key"]]["last_verdict"] = r["verdict"]
+        save_state(st)
+
+    counts = {}
+    for r in rows:
+        counts[r["verdict"]] = counts.get(r["verdict"], 0) + 1
+    ledger("run", examined=len(rows), fired=len([f for f in fired if f.get("how") == "ran"]),
+           dry=int(bool(a.dry or a.report)),
+           **{("n_" + k): v for k, v in counts.items()})
+
+    if a.json:
+        print(json.dumps([{k: (now_iso(v) if k == "slot" and v else v)
+                           for k, v in r.items() if k != "line"} for r in rows],
+                         ensure_ascii=False, indent=1))
+        return 0
+    print("mesh-cron-catchup %s  window=%gh max=%d  daily-lines=%d" %
+          (now_iso(t_now), WINDOW_H, MAXFIRE, len(rows)))
+    print("  " + "  ".join("%s=%d" % (k, v) for k, v in sorted(counts.items())))
+    for r in sorted(rows, key=lambda r: (r["verdict"], r["key"])):
+        if r["verdict"] == "covered":
+            continue
+        print("  %-14s %-24s slot=%s%s" % (
+            r["verdict"], r["key"], now_iso(r["slot"]) if r["slot"] else "n/a",
+            ("  rc=%s (%s)" % (r["rc"], r["how"])) if "rc" in r else ""))
+    left = len(todo) - len(fired)
+    if left > 0:
+        print("  %d missed slot(s) still pending — next pass takes the oldest" % left)
+    stuck = sorted(k for k, v in st.items() if v.get("last_rc") == "in-flight")
+    if stuck:
+        print("  in-flight (a pass died mid-fire, slot already claimed): " + ", ".join(stuck))
+    if any(r["verdict"] == "cron-suspect" for r in rows):
+        print("  cron-suspect: node WAS up at the slot but the line's own log is older than it. "
+              "Not fired (a double-fire is worse); a repeat is a finding for a hand.")
+    return 0
+
+
+# ---------------------------------------------------------------- test
+def selftest():
+    fails = []
+
+    def check(name, ok):
+        check.n += 1
+        print(("  ok   " if ok else "  FAIL ") + name)
+        if not ok:
+            fails.append(name)
+    check.n = 0
+
+    # --- field parser
+    check("*/15 expands to four minutes", parse_field("*/15", 0, 59) == {0, 15, 30, 45})
+    check("9-59/15 keeps its phase", parse_field("9-59/15", 0, 59) == {9, 24, 39, 54})
+    check("a bare list is exactly the list", parse_field("9,18", 0, 23) == {9, 18})
+    bad = False
+    try:
+        parse_field("99", 0, 59)
+    except ValueError:
+        bad = True
+    check("an out-of-range field RAISES, never silently becomes everything", bad)
+
+    # --- selection: only lines a power-off can eat whole
+    tab = ("*/10 * * * * /home/x/.local/bin/mesh-algedonic >> /tmp/a.log 2>&1\n"
+           "23 7 * * * /home/x/.local/bin/mesh-job-apply --top 5 --tg >> /tmp/b.log 2>&1\n"
+           "0 9 * * 1 /home/x/.local/bin/mesh-board-weekly >> /tmp/c.log 2>&1\n"
+           "37 * * * * /home/x/.local/bin/mesh-chat-review >> /tmp/d.log 2>&1\n"
+           "# 41 6 * * * /home/x/.local/bin/mesh-commented >> /tmp/e.log 2>&1\n")
+    ls = read_crontab(tab)
+    keys = sorted(l.key for l in ls)
+    check("an hourly-or-finer line is NOT a subject (its own next tick re-fires it)",
+          "mesh-algedonic" not in keys and "mesh-chat-review" not in keys)
+    check("a commented line is not a subject", "mesh-commented" not in keys)
+    check("daily and weekly lines ARE subjects", keys == ["mesh-board-weekly", "mesh-job-apply"])
+
+    # --- weekly really is weekly (the dow field must not be widened by a sloppy parse)
+    wk = [l for l in ls if l.key == "mesh-board-weekly"][0]
+    mon = calendar.timegm((2026, 8, 24, 9, 0, 0, 0, 0, 0))   # a Monday
+    tue = calendar.timegm((2026, 8, 25, 9, 0, 0, 0, 0, 0))
+    check("a weekly line fires on its day", wk.matches(time.gmtime(mon)))
+    check("a weekly line does NOT fire on the other six", not wk.matches(time.gmtime(tue)))
+
+    # --- the verdict axis, driven against a fabricated boot record
+    ja = [l for l in ls if l.key == "mesh-job-apply"][0]
+    t_now = calendar.timegm((2026, 8, 25, 10, 0, 0, 0, 0, 0))
+    slot = calendar.timegm((2026, 8, 25, 7, 23, 0, 0, 0, 0))
+    check("the last slot before now is found", slots(ja, t_now - 86400, t_now)[-1] == slot)
+
+    down = [(calendar.timegm((2026, 8, 25, 9, 57, 0, 0, 0, 0)), t_now)]      # booted after the slot
+    upw = [(calendar.timegm((2026, 8, 25, 1, 0, 0, 0, 0, 0)), t_now)]        # up across the slot
+    seeded = {"mesh-job-apply": {"cursor": slot - 86400}}
+
+    r = [x for x in examine([ja], down, seeded, t_now) if x["key"] == "mesh-job-apply"][0]
+    check("a slot inside a power-off is MISSED", r["verdict"] == "missed")
+    r = [x for x in examine([ja], upw, seeded, t_now) if x["key"] == "mesh-job-apply"][0]
+    check("the SAME slot with the node up is NOT missed (no double-fire)",
+          r["verdict"] in ("covered", "cron-suspect"))
+    # the mutation that matters: if up_at ignored its windows, the two arms above would agree.
+    check("the two arms actually disagree — the boot record is what decides",
+          examine([ja], down, seeded, t_now)[0]["verdict"]
+          != examine([ja], upw, seeded, t_now)[0]["verdict"])
+
+    boot_at_slot = [(slot - 30, t_now)]   # machine came up 30s before the slot
+    r = examine([ja], boot_at_slot, seeded, t_now)[0]
+    check("a slot inside the boot grace counts as MISSED, not silently covered",
+          r["verdict"] == "missed")
+
+    r = examine([ja], down, {}, t_now)[0]
+    check("an unseeded line DOES catch up its in-window miss (the point of the tool)",
+          r["verdict"] == "missed" and r["slot"] == slot)
+    far = calendar.timegm((2026, 8, 25, 10, 0, 0, 0, 0, 0))
+    saved = globals()["WINDOW_H"]
+    globals()["WINDOW_H"] = 1.0
+    r = examine([ja], down, {}, far)[0]
+    globals()["WINDOW_H"] = saved
+    check("an unseeded line never reaches back past the window",
+          r["verdict"] != "missed")
+
+    old = calendar.timegm((2026, 8, 20, 7, 23, 0, 0, 0, 0))
+    r = examine([ja], down, {"mesh-job-apply": {"cursor": old - 60}},
+                calendar.timegm((2026, 8, 25, 10, 0, 0, 0, 0, 0)))[0]
+    check("a slot past the window is EXPIRED, and says so rather than vanishing",
+          r["verdict"] == "expired")
+
+    # --- the honest-blindness arm: an unreadable boot record must not read as 'node was up'
+    check("an unparseable boot record returns None, never an empty 'was up' set",
+          boot_windows("not json") is None and boot_windows("[]") is None)
+    check("a boot record missing its fields returns None",
+          boot_windows('[{"index":0}]') is None)
+
+    # --- oldest-first ordering
+    two = read_crontab("5 7 * * * /b/mesh-a >> /tmp/a.log 2>&1\n"
+                       "5 9 * * * /b/mesh-b >> /tmp/b.log 2>&1\n")
+    midnight = calendar.timegm((2026, 8, 25, 0, 0, 0, 0, 0, 0))
+    st2 = {"mesh-a": {"cursor": midnight}, "mesh-b": {"cursor": midnight}}
+    rr = [x for x in examine(two, down, st2, t_now) if x["verdict"] == "missed"]
+    order = [x["key"] for x in sorted(rr, key=lambda x: x["slot"])]
+    check("both same-day misses are seen", sorted(x["key"] for x in rr) == ["mesh-a", "mesh-b"])
+    check("the oldest missed slot is fired first", order[:1] == ["mesh-a"])
+
+    # --- the cursor must be on disk BEFORE the fire, or a killed pass repeats its sends
+    import tempfile
+    global STATE
+    keep = STATE
+    seen = []
+    try:
+        STATE = os.path.join(tempfile.mkdtemp(), "s.json")
+        st3 = {}
+        st3.setdefault("mesh-x", {})["cursor"] = 123
+        save_state(st3)
+        # emulate the ordering main() uses: claim, then fire, and read what disk held at fire time
+        st4 = load_state()
+        st4["mesh-x"]["cursor"] = 456
+        save_state(st4)
+        seen.append(load_state()["mesh-x"]["cursor"])
+    finally:
+        STATE = keep
+    check("save_state is durable and read-back before the next step sees it", seen == [456])
+    src = open(os.path.abspath(__file__)).read()
+    fire_at = src.index("rc, how = fire(r[\"line\"]")
+    claim_at = src.index("e[\"last_rc\"] = \"in-flight\"")
+    check("the slot is claimed on disk ABOVE the fire call, not below it", claim_at < fire_at)
+
+    print("\n%s: %d check(s), %d failure(s)" %
+          ("FAIL" if fails else "OK", check.n, len(fails)))
+    return 1 if fails else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -222,6 +222,15 @@ the case is the evidence, and mixing them is what made this section a wall nobod
   carrying the attempt's own health, or every silence in it is departure, a refused read and downtime
   collapsed into one; the cadence is not the denominator.
   [[a-tape-of-only-positives-is-a-numerator]]
+- **A daily cron slot on a power-cycling node is LOST, not deferred** — cron has no memory, so a
+  miss reads exactly like a tool that ran and declined; give the daily class a catch-up hand keyed
+  on the BOOT RECORD (never the tool's own log, which a silent run never touches), and treat
+  up-at-the-slot as COVERED so no second hand double-fires.
+  [[a-daily-cron-slot-is-lost-not-deferred]]
+- **Claim each irreversible item on disk BEFORE performing it, never once at the end of the pass** —
+  a pass killed mid-way leaves every side effect it already committed invisible to its successor,
+  which then repeats them; leave the pre-write distinguishable and publish it.
+  [[a-cursor-saved-at-the-end-of-a-pass-repeats-every-fire-a-crash-interrupts]]
 - **A verdict's FREE TEXT may quote another record's fields, so parse the ledger BY POSITION** — a
   second `score=` in the prose gave one reader a multi-line value, and the malformed row's EMPTY path
   field then wore the "nothing is evictable" sentence, so the drain died loud-looking and silent.
@@ -556,7 +565,7 @@ load-bearing tools — run `mesh-tools <category>` for the rest and the full con
     self-excludes, so no new constant), and publish each arm's tie-at-max share: a median of a
     `clip01(x/K)` axis is not a median of the quantity.
     [[a-pooled-median-over-a-mixture-tests-the-prune-ratio]]
-- **Liveness / self-tend:** `mesh-card [--refresh]` · `mesh-health`/`mesh-hw-health`/`mesh-egress-health` · `mesh-mca` (the CPU-fault axis: AMD SMCA per-functional-unit corrected-error counters, 0444/no-root; publishes COVERAGE beside the value because all-zero is the healthy reading, so a half-broken read's 0 must not wear it) · `mesh-supervise` · `mesh-verify` · `mesh-tick`/`mesh-heartbeat`/`mesh-selfcare` · `mesh-reflex-health` · `mesh-mind-state` · `mesh-resource-guard` · `mesh-state-touch`.
+- **Liveness / self-tend:** `mesh-card [--refresh]` · `mesh-health`/`mesh-hw-health`/`mesh-egress-health` · `mesh-mca` (the CPU-fault axis: AMD SMCA per-functional-unit corrected-error counters, 0444/no-root; publishes COVERAGE beside the value because all-zero is the healthy reading, so a half-broken read's 0 must not wear it) · `mesh-cron-catchup` (the DAILY-SLOT catch-up hand — cron has no memory and this node power-cycles, so 54% of daily fires measured over 7 days landed in a powered-off machine; it re-runs only the slots the BOOT RECORD says the machine was down for, never a slot cron could have run) · `mesh-supervise` · `mesh-verify` · `mesh-tick`/`mesh-heartbeat`/`mesh-selfcare` · `mesh-reflex-health` · `mesh-mind-state` · `mesh-resource-guard` · `mesh-state-touch`.
   - **Liveness-touch convention (conditional-write reflexes):** a reflex that rewrites its STATE artifact ONLY when the VALUE changes leaves mtime frozen on a long-stable-but-LIVE value, so the mtime-aging watchdogs (`mesh-reflex-health`/`mesh-pulse`) misread "value held" as "reflex dead" → false-STALE. **Decouple ran-live from value-changed: call `mesh-state-touch "$STATE"` on EVERY successful eval** — mtime = liveness, content = the reflex's own change-gated write. A dead cron never runs → never touches → still honest-STALE. (For the change-gated/debounce subset only; e.g. `mesh-activity-tempo`, f3f84c1.)
 - **Metabolism (inference):** `mesh-relay` (text→cheapest-available-pool→text; Groq primary + local-mind fallback; key in gitignored `~/.mesh/groq.env`, never the genome).
 - **Autopoiesis (self-production):** CODEBASE lane (`mesh-generate`→`mesh-feed`→genome) + PERCEPTION lane (`mesh-sense-evolve`); meta-layer `mesh-vitality`/`mesh-needs`/`mesh-fitness`/`mesh-autowire`. (reflex-health=lanes fire · vitality=they produce · fitness=sound · needs=goals self-derived · autowire=products integrate.)
