@@ -36,6 +36,65 @@ CONV_VOICE="${CONV_VOICE:-$MESH/piper/voices/ruslan.onnx}"
 CONV_ACK="${CONV_ACK:-$MESH/mesh-slyshit.wav}"
 CONV_LANG="${CONV_LANG:-ru}"
 CONV_MIN_RMS="${CONV_MIN_RMS:-180}"   # below this the room is "silent" → skip (whisper would invent text)
+
+# ── TURN-END IS AN INFERENCE, NOT AN OBSERVATION ────────────────────────────────────────────────
+# (live-literature review, genome, 2026-08-25;
+#  docs/reviews/fep-turn-end-is-an-inference-not-an-observation-conversation-2026-08-25.md)
+#
+# The session's VAD ends an utterance when silence reaches CONV_END_SIL (0.9s). That treats "the
+# speaker has finished" as something you OBSERVE — a stopwatch on the gap. Active inference says it
+# is a hidden state you INFER, and the evidence for it arrives in the speech BEFORE the gap, not
+# during it. Two consequences, both live in this file:
+#   1. a fixed END_SIL is a FLOOR ON LATENCY — every reply is at least 900ms late, where human
+#      turn-taking latency is ~200ms, i.e. faster than detect-then-react can be. Humans must be
+#      predicting the end, not waiting for it.
+#   2. it CANNOT separate a hesitation from a completion, because it looks only at the gap's
+#      DURATION. A 0.9s thinking-pause mid-sentence truncates the utterance and ships half a thought
+#      to whisper; a speaker who pauses 0.5s between finished sentences waits the full 0.9s anyway.
+#
+# The state of the art is Voice Activity Projection — Ekstedt & Skantze, "Voice Activity Projection:
+# Self-supervised learning of turn-taking events" (INTERSPEECH 2022): instead of detecting silence,
+# continuously PREDICT both parties' future voice activity over 0-200/200-600/600-1200/1200-2000ms
+# bins and act on the prediction. Live follow-on: Inoue, Elmers, Fu et al., "Prompt-Guided Turn-Taking
+# Prediction" (SIGdial 2025, arXiv:2506.21191v2, 3 Jul 2025).
+#
+# WHAT IS LANDED HERE IS A PROXY, AND IT IS NAMED AS ONE. We have no trained VAP model, no stereo
+# channels, and no way to get one on this node — so this is a single-channel ENERGY-ONLY projection:
+# at the moment a pause begins, read the energy trajectory of the voiced tail that preceded it and
+# choose END_SIL from it. Falling energy → a completed turn → commit sooner. Flat or rising → the
+# speaker is mid-thought → hold longer. Same DIRECTION as VAP (the turn-end decision becomes
+# conditioned on what preceded the gap) at a small fraction of its evidence. It is NOT VAP and must
+# not be described as VAP anywhere downstream.
+#
+# It is REPORT-FIRST: every decision logs proj=/slope=/end_sil= so the conversation log becomes the
+# corpus that can later say whether the split was real. The bands below are PROVISIONAL — no live
+# corpus of turn-ends exists on this node yet, so they are stated as a hypothesis with a kill switch
+# (CONV_TURNEND_PROJECT=0 restores the fixed 0.9s exactly), not as a calibrated constant.
+CONV_TURNEND_PROJECT="${CONV_TURNEND_PROJECT:-1}"   # 0 = fixed END_SIL, the pre-review behaviour
+CONV_END_SIL_FAST="${CONV_END_SIL_FAST:-0.45}"      # projected completion → commit sooner
+CONV_END_SIL_SLOW="${CONV_END_SIL_SLOW:-1.60}"      # projected hesitation → hold
+CONV_TAIL_FRAMES="${CONV_TAIL_FRAMES:-5}"           # voiced frames of tail read (5 x 200ms = 1.0s)
+CONV_FALL_AT="${CONV_FALL_AT:--0.25}"               # relative tail slope <= this = falling = done
+CONV_RISE_AT="${CONV_RISE_AT:-0.10}"                # relative tail slope >= this = rising = mid-thought
+
+# ONE definition of the projector, called by BOTH the live session and --test. A gate that re-implements
+# the predicate it is gating is not a gate on that predicate
+# (a-lint-that-tests-a-different-predicate-than-the-parser-is-blind).
+CONV_PROJECT_PY='
+import sys
+# argv: fall_at rise_at fast neutral slow  then the voiced-tail RMS values (oldest..newest)
+fall,rise,fast,neutral,slow = (float(x) for x in sys.argv[1:6])
+tail=[float(x) for x in sys.argv[6:]]
+# TOO LITTLE TAIL IS NOT A PREDICTION. With fewer than 2 voiced frames there is no trajectory; fall
+# back to the NEUTRAL default and say so, rather than reading a slope out of one number.
+if len(tail)<2 or tail[0]<=0:
+    print("neutral na %.2f"%neutral); raise SystemExit
+slope=(tail[-1]-tail[0])/tail[0]
+if   slope<=fall: print("fast %.3f %.2f"%(slope,fast))
+elif slope>=rise: print("slow %.3f %.2f"%(slope,slow))
+else:             print("neutral %.3f %.2f"%(slope,neutral))
+'
+
 CONV_LOG="${CONV_LOG:-$MESH/conversation.log}"
 
 logln() { printf '%sZ  %s\n' "$(date -u +%Y-%m-%dT%H:%M:%S)" "$1" >> "$CONV_LOG" 2>/dev/null || true; }
@@ -137,6 +196,8 @@ turn() {
 # then listen again. Silence/empty room never triggers a reply. The session ends after a long quiet gap.
 session() {
   export CONV_WHISPER CONV_MODEL CONV_PIPER CONV_PIPERLIB CONV_VOICE CONV_ACK CONV_LANG CONV_LOG
+  export CONV_TURNEND_PROJECT CONV_END_SIL_FAST CONV_END_SIL_SLOW CONV_TAIL_FRAMES \
+         CONV_FALL_AT CONV_RISE_AT CONV_PROJECT_PY
   local PY; PY="$(mktemp "${TMPDIR:-/tmp}"/conv-sess-XXXXXX.py)"; trap 'rm -f "$PY"' RETURN
   cat > "$PY" <<'PYEOF'
 import os, sys, time, wave, audioop, subprocess, struct
@@ -145,7 +206,30 @@ RATE=16000; FRAME_MS=int(os.environ.get("CONV_FRAME_MS","200"))
 FRAME=int(RATE*FRAME_MS/1000); FBYTES=FRAME*2; FSEC=FRAME_MS/1000.0
 START_RMS=int(os.environ.get("CONV_START_RMS","600"))   # speech onset
 SIL_RMS  =int(os.environ.get("CONV_SIL_RMS","300"))     # below = silence
-END_SIL  =float(os.environ.get("CONV_END_SIL","0.9"))   # silence that ends an utterance
+END_SIL  =float(os.environ.get("CONV_END_SIL","0.9"))   # silence that ends an utterance (NEUTRAL default)
+PROJECT  =os.environ.get("CONV_TURNEND_PROJECT","1")!="0"
+SIL_FAST =float(os.environ.get("CONV_END_SIL_FAST","0.45"))
+SIL_SLOW =float(os.environ.get("CONV_END_SIL_SLOW","1.60"))
+TAILN    =int(os.environ.get("CONV_TAIL_FRAMES","5"))
+FALL_AT  =float(os.environ.get("CONV_FALL_AT","-0.25"))
+RISE_AT  =float(os.environ.get("CONV_RISE_AT","0.10"))
+PROJECT_PY=os.environ.get("CONV_PROJECT_PY","")
+
+def project_end_sil(tail):
+    """The SAME projector --test drives (CONV_PROJECT_PY), invoked as a child so there is exactly one
+    definition. Returns (label, slope_str, end_sil). Any failure falls back to the NEUTRAL default —
+    a broken projector must not be able to make the organ deaf or make it interrupt."""
+    if not PROJECT or not PROJECT_PY:
+        return ("off","na",END_SIL)
+    try:
+        args=["python3","-c",PROJECT_PY,str(FALL_AT),str(RISE_AT),str(SIL_FAST),str(END_SIL),str(SIL_SLOW)]
+        args+= [str(int(x)) for x in tail]
+        out=subprocess.run(args,capture_output=True,timeout=5).stdout.decode().split()
+        if len(out)!=3: raise ValueError("projector output "+repr(out))
+        return (out[0], out[1], float(out[2]))
+    except Exception as e:
+        logln("turnend-proj-err "+str(e))
+        return ("neutral","err",END_SIL)
 MAX_UTT  =float(os.environ.get("CONV_MAX_UTT","18"))    # hard cap per utterance
 MIN_UTT  =float(os.environ.get("CONV_MIN_UTT","0.4"))   # minimum voiced length to bother
 IDLE_END =float(os.environ.get("CONV_SESSION_IDLE","22"))  # quiet gap that ends the session
@@ -213,6 +297,7 @@ def record_until_pause():
     p=subprocess.Popen(["pw-record","--rate","16000","--channels","1","--format","s16","-"],
         stdout=subprocess.PIPE,stderr=subprocess.DEVNULL)
     frames=[]; capturing=False; silence=0.0; waited=0.0
+    voiced_tail=[]; end_sil=END_SIL
     try:
         while True:
             buf=read_exact(p.stdout,FBYTES)
@@ -221,16 +306,23 @@ def record_until_pause():
             if not capturing:
                 waited+=FSEC
                 if r>=START_RMS:
-                    capturing=True; frames=[buf]; silence=0.0
+                    capturing=True; frames=[buf]; silence=0.0; voiced_tail=[r]; end_sil=END_SIL
                 elif waited>=IDLE_END:
                     return None
             else:
                 frames.append(buf)
                 if r<SIL_RMS:
+                    # PAUSE ONSET is the moment the prediction is made — from the voiced tail that
+                    # came BEFORE it, never from the gap itself.
+                    if silence==0.0:
+                        lbl,sl,end_sil = project_end_sil(voiced_tail[-TAILN:])
+                        logln("turnend proj=%s slope=%s end_sil=%.2f tail=%d"%(lbl,sl,end_sil,len(voiced_tail[-TAILN:])))
                     silence+=FSEC
-                    if silence>=END_SIL: break
+                    if silence>=end_sil: break
                 else:
                     silence=0.0
+                    end_sil=END_SIL          # speech resumed: the previous projection is void
+                    voiced_tail.append(r)
                 if len(frames)*FSEC>=MAX_UTT: break
     finally:
         p.kill()
@@ -293,6 +385,40 @@ case "${1:-}" in
       [ -e "$f" ] || { echo "  MISSING: $f"; miss=1; }
     done
     [ "$miss" = 0 ] || { echo "smoke-test: FAIL (stack pieces missing above)"; exit 1; }
+    # ── TURN-END PROJECTION (2026-08-25 review). Drives the SAME $CONV_PROJECT_PY the live session
+    # calls, so this is a gate on the deciding predicate and not on a re-implementation of it.
+    _proj() { python3 -c "$CONV_PROJECT_PY" "$CONV_FALL_AT" "$CONV_RISE_AT" "$CONV_END_SIL_FAST" "0.9" "$CONV_END_SIL_SLOW" "$@"; }
+    # falling tail (a finished turn trailing off) → commit SOONER than the fixed 0.9s
+    _lbl(){ printf '%s' "${1%% *}"; }
+    _val(){ printf '%s' "${1##* }"; }
+    _r="$(_proj 900 850 700 500 300)"
+    [ "$(_lbl "$_r")" = fast ] && [ "$(_val "$_r")" = "$(printf '%.2f' "$CONV_END_SIL_FAST")" ] \
+      || { echo "smoke-test: FAIL (falling tail must project fast at CONV_END_SIL_FAST=$CONV_END_SIL_FAST, got '$_r')"; exit 1; }
+    # rising tail (mid-thought, the speaker is still building) → HOLD longer, never interrupt
+    _r="$(_proj 300 400 550 700 900)"
+    [ "$(_lbl "$_r")" = slow ] && [ "$(_val "$_r")" = "$(printf '%.2f' "$CONV_END_SIL_SLOW")" ] \
+      || { echo "smoke-test: FAIL (rising tail must project slow at CONV_END_SIL_SLOW=$CONV_END_SIL_SLOW, got '$_r')"; exit 1; }
+    # flat tail → NEUTRAL: the projector must decline to predict rather than guess a direction
+    _r="$(_proj 600 605 598 601 600)"
+    [ "$(_lbl "$_r")" = neutral ] && [ "$(_val "$_r")" = 0.90 ] \
+      || { echo "smoke-test: FAIL (flat tail must fall back to the fixed 0.90s default, got '$_r')"; exit 1; }
+    # TOO LITTLE TAIL IS NOT A PREDICTION — one voiced frame has no trajectory. It must render the
+    # neutral default with slope 'na', never read a direction out of a single number: a slope of
+    # 0.000 computed from one sample masquerades as a MEASURED flat.
+    for _t in "600" ""; do
+      _r="$(_proj $_t)"
+      case "$_r" in neutral\ na\ 0.90) : ;; *) echo "smoke-test: FAIL (a <2-frame tail must be neutral/na/0.90, got '$_r' for tail '$_t')"; exit 1;; esac
+    done
+    # THE PROJECTION IS BOUNDED BY THE FIXED DEFAULT IN BOTH DIRECTIONS. fast must not be so short
+    # that a breath ends a turn, slow must not exceed the session idle-out (the organ would hang up
+    # mid-utterance). These are the two ways this change could make the organ WORSE than the constant
+    # it replaces, so they are asserted rather than assumed.
+    awk -v f="$CONV_END_SIL_FAST" 'BEGIN{exit !(f>=0.3)}'       || { echo "smoke-test: FAIL (CONV_END_SIL_FAST=$CONV_END_SIL_FAST is under 0.3s — a breath would end a turn)"; exit 1; }
+    awk -v s="$CONV_END_SIL_SLOW" -v i="${CONV_SESSION_IDLE:-22}" 'BEGIN{exit !(s<i)}'       || { echo "smoke-test: FAIL (CONV_END_SIL_SLOW=$CONV_END_SIL_SLOW >= session idle ${CONV_SESSION_IDLE:-22}s — the session would hang up mid-utterance)"; exit 1; }
+    # THE KILL SWITCH MUST BE REACHABLE. A projection this un-calibrated has to be revertible to the
+    # exact pre-review behaviour by one env var, and that has to be gated, not asserted in a comment.
+    grep -q 'CONV_TURNEND_PROJECT' <<<"$(declare -p CONV_TURNEND_PROJECT 2>/dev/null)"       || { echo "smoke-test: FAIL (CONV_TURNEND_PROJECT kill switch is not defined)"; exit 1; }
+    echo "  turn-end projection: falling→0.45s  rising→1.60s  flat/short→0.90s (fixed default), bounds ok"
     # regression guard: log-stub _play (via CONV_TEST_PLAY_LOG) to prove the sandbox gate ACTUALLY
     # skips playback (not just reads right by inspection) — recurse once under each mode and assert
     # who got logged. _CONV_SELFTEST_NESTED breaks the recursion.
