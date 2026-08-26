@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # orphan-ok: shared installer sourced/called by the mesh-note3-* native organs (ambient/ear/screen)
-# mesh-note3-tool-install — push the Note3 native HAL clients to the phone if missing.
+# mesh-note3-tool-install — push the Note3 native HAL clients to the phone if missing OR STALE.
 #
 # The Note3 (SM-N900, Android 5.0, ROOTED) has no cross-compiler and no termux; the mesh reads its
 # real sensor/audio/screen HALs through three small NDK-built ARM binaries kept in ~/.mesh/note3/:
@@ -11,9 +11,25 @@
 #   tinycap/tinymix — tinyalsa (kept for codec inspection; slrec is the working mic path)
 # Source of truth for the binaries + C source + BUILD.md: ~/.mesh/note3/  (rebuild recipe in BUILD.md).
 #
-#   mesh-note3-tool-install <bin>   ensure /data/local/tmp/<bin> exists on the phone (push if missing)
-#   mesh-note3-tool-install --all   push all four
-#   mesh-note3-tool-install --test  smoke (exit 2 = phone unreachable)
+# THE EVIDENCE LADDER (why this is not just `[ -x ]`).
+#   This organ is a binary hypothesis test — H+ "the correct build of <bin> is on the phone" vs
+#   H- "it is not" — and what it can possibly find out is decided by the OBSERVABLE it chooses:
+#     mode  `[ -x ]`      separates ABSENT from PRESENT and nothing else. Against a STALE binary
+#                         the two hypotheses give the SAME reading, so no number of repeats moves
+#                         the verdict: a rebuilt stash stays invisible to it forever.
+#     size  `ls -l`       separates a different build by length. On this device it is the ONLY size
+#                         oracle — the toolbox has no `stat`, no `wc`, no `busybox`, and rejects `ls -1`.
+#     md5   `md5`/`md5sum` separates same-length builds. Probed, not assumed; may be absent.
+#   The hot path (7 sensor organs call this before every read) chooses `size`: one adb round trip,
+#   same cost as the old mode test. `--verify`/`--all` escalate to `md5`, and a bin that has ONCE
+#   been caught stale is md5-verified from then on — the observable follows the belief.
+#   A reading whose evidence could not be parsed is `unverifiable`, never `ok`.
+#
+#   mesh-note3-tool-install <bin>     ensure the CURRENT /data/local/tmp/<bin> is on the phone
+#   mesh-note3-tool-install --all     ensure all four (md5 evidence)
+#   mesh-note3-tool-install --verify [bin]  force md5 evidence, report only — never pushes
+#   mesh-note3-tool-install --check   read the ledger: verdict counts + the stale rate
+#   mesh-note3-tool-install --test    smoke (exit 2 = phone unreachable; fixture arms always run)
 set -uo pipefail
 export PATH="$HOME/.local/bin:$PATH"
 [ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
@@ -22,24 +38,221 @@ export PATH="$HOME/.local/bin:$PATH"
 SERIAL="${MESH_NOTE3_ADB_SERIAL:-${MESH_BARO_ADB_SERIAL:-4d00553d61ab90b7}}"
 STASH="$HOME/.mesh/note3"
 ADB="adb -s $SERIAL"
+LEDGER="${MESH_NOTE3_INSTALL_LOG:-$HOME/.mesh/note3-tool-install.log}"
+ESCAL="${MESH_NOTE3_INSTALL_ESCAL:-$HOME/.mesh/.note3-tool-install.escalate}"
+VERIFY_LEVEL="${MESH_NOTE3_VERIFY:-size}"   # size | md5
+
+SELF="$(cd "$(dirname "$0")" 2>/dev/null && pwd)/$(basename "$0")"
+
+now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+# One row per CALL, not only per push: the pushes are a numerator and the calls are its denominator.
+ledger() { mkdir -p "$(dirname "$LEDGER")" 2>/dev/null; printf '%s %s\n' "$(now)" "$*" >>"$LEDGER"; }
 
 note3_reachable() { timeout 8 $ADB shell "echo ok" 2>/dev/null | grep -q ok; }
 
-ensure_bin() {   # ensure one binary is present + executable on the phone
+# --- the observables -------------------------------------------------------------------------
+# One round trip answers mode AND size, so `size` evidence costs exactly what `mode` used to.
+probe_mode_size() {  # -> "XOK|<size-or-empty>"  (empty size = present but unparsable)
+  local b="$1" out size
+  out=$(timeout 8 $ADB shell "[ -x /data/local/tmp/$b ] && echo XOK; ls -l /data/local/tmp/$b" 2>/dev/null | tr -d '\r')
+  case "$out" in *XOK*) ;; *) echo "|"; return 0 ;; esac
+  # Anchor on the grammar the device prints, never on a field offset: the size is the column
+  # immediately before the YYYY-MM-DD stamp. No stamp found -> no size, and we say so.
+  size=$(printf '%s\n' "$out" | awk '
+    { for (i=2;i<=NF;i++) if ($i ~ /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/ && $(i-1) ~ /^[0-9]+$/) { print $(i-1); exit } }')
+  echo "XOK|$size"
+}
+
+phone_md5() {  # -> 32-hex digest, or empty when the device offers no digest tool
   local b="$1"
-  [ -f "$STASH/$b" ] || { echo "missing stash: $STASH/$b (rebuild per BUILD.md)" >&2; return 1; }
-  if timeout 8 $ADB shell "[ -x /data/local/tmp/$b ] && echo y" 2>/dev/null | grep -q y; then return 0; fi
-  timeout 20 $ADB push "$STASH/$b" "/data/local/tmp/$b" >/dev/null 2>&1 || return 1
+  timeout 15 $ADB shell "md5 /data/local/tmp/$b 2>/dev/null || md5sum /data/local/tmp/$b 2>/dev/null || toybox md5sum /data/local/tmp/$b 2>/dev/null" 2>/dev/null \
+    | tr -d '\r' | grep -oE '\b[0-9a-f]{32}\b' | head -1
+}
+
+escalated() { [ -f "$ESCAL" ] && grep -qx "$1" "$ESCAL"; }
+escalate()  { mkdir -p "$(dirname "$ESCAL")" 2>/dev/null; escalated "$1" || echo "$1" >>"$ESCAL"; }
+
+# --- the test ---------------------------------------------------------------------------------
+# Sets VERDICT/EVIDENCE/ACTION. rc 0 = the current build is on the phone (or was just put there).
+ensure_bin() {
+  local b="$1" want_size got want_md5 got_md5 ms level push_rc reverify
+  VERDICT=; EVIDENCE=; ACTION=none
+  [ -f "$STASH/$b" ] || { echo "missing stash: $STASH/$b (rebuild per BUILD.md)" >&2
+                          VERDICT=no-stash; ledger "bin=$b verdict=no-stash action=none"; return 1; }
+  want_size=$(stat -c %s "$STASH/$b" 2>/dev/null)
+
+  ms=$(probe_mode_size "$b"); got="${ms#*|}"
+  level="$VERIFY_LEVEL"; escalated "$b" && level=md5
+
+  if [ "${ms%%|*}" != "XOK" ]; then
+    VERDICT=absent; EVIDENCE=mode
+  elif [ -z "$got" ]; then
+    # Present, but this device's `ls -l` did not parse. Presence is all we know — say exactly that.
+    VERDICT=unverifiable; EVIDENCE=mode
+    ledger "bin=$b verdict=unverifiable evidence=mode want=$want_size got=na action=none"
+    return 0
+  elif [ "$got" != "$want_size" ]; then
+    VERDICT=stale; EVIDENCE=size            # the rebuild case the mode bit can never see
+  elif [ "$level" = md5 ]; then
+    want_md5=$(md5sum "$STASH/$b" 2>/dev/null | cut -d' ' -f1); got_md5=$(phone_md5 "$b")
+    if [ -z "$got_md5" ]; then VERDICT=ok; EVIDENCE=size:md5-absent
+    elif [ "$got_md5" != "$want_md5" ]; then VERDICT=stale; EVIDENCE=md5
+    else VERDICT=ok; EVIDENCE=md5; fi
+  else
+    VERDICT=ok; EVIDENCE=size
+  fi
+
+  if [ "$VERDICT" = ok ]; then
+    ledger "bin=$b verdict=ok evidence=$EVIDENCE want=$want_size got=$got action=none"; return 0
+  fi
+
+  # Disconfirming evidence -> act, then LOOK AGAIN. The push was previously open-loop.
+  ACTION=push
+  timeout 20 $ADB push "$STASH/$b" "/data/local/tmp/$b" >/dev/null 2>&1; push_rc=$?
   timeout 8 $ADB shell "chmod 755 /data/local/tmp/$b" >/dev/null 2>&1
+  ms=$(probe_mode_size "$b"); reverify="${ms#*|}"
+  [ "$VERDICT" = stale ] && escalate "$b"   # once wrong here, verify harder here from now on
+  if [ "${ms%%|*}" = XOK ] && { [ -z "$reverify" ] || [ "$reverify" = "$want_size" ]; }; then
+    ledger "bin=$b verdict=$VERDICT evidence=$EVIDENCE want=$want_size got=$got action=push push=ok verify=${reverify:-na}"
+    return 0
+  fi
+  ledger "bin=$b verdict=$VERDICT evidence=$EVIDENCE want=$want_size got=$got action=push push=rc$push_rc verify=FAIL:${reverify:-na}"
+  return 1
+}
+
+check_report() {
+  [ -f "$LEDGER" ] || { echo "check: no ledger yet ($LEDGER)"; return 0; }
+  awk '{v="";e="";for(i=1;i<=NF;i++){if($i~/^verdict=/)v=substr($i,9);if($i~/^evidence=/)e=substr($i,10)}
+        n++; c[v]++; if(e!="")ev[e]++}
+       END{ printf "check: calls=%d", n
+            for (k in c) printf " %s=%d", k, c[k]
+            printf " | stale-rate=%.3f", (n?c["stale"]/n:0)
+            printf " | evidence:"; for (k in ev) printf " %s=%d", k, ev[k]; printf "\n" }' "$LEDGER"
+}
+
+# --- fixture-driven gate -----------------------------------------------------------------------
+# The phone is dark most of the time, so the arms that decide this organ's contract are driven
+# against a STUB `adb` on PATH. The stub is asserted to have won the PATH race (a stub is only
+# ahead of the real tool until the subject exports its own PATH), and the live phone, when it is
+# reachable, is exercised as a separate arm — a fixture cannot cover the live path.
+fixture_test() {
+  local T S H rc=0 fails=0 arms=0 out WANT rows
+  T=$(mktemp -d); S="$T/stub"; H="$T/home"
+  mkdir -p "$S" "$H/.mesh/note3"
+  printf 'FIXTURE-SENSORCAT-BODY\n' >"$H/.mesh/note3/sensorcat"
+  WANT=$(stat -c %s "$H/.mesh/note3/sensorcat")
+  cat >"$S/adb" <<'EOSTUB'
+#!/usr/bin/env bash
+echo "$*" >>"$STUBDIR/calls"
+case "$*" in
+  *" push "*)  [ -f "$STUBDIR/pushfails" ] && exit 1
+               echo 1 >"$STUBDIR/present"; cat "$STUBDIR/wantsize" >"$STUBDIR/size"; rm -f "$STUBDIR/lsbad"; exit 0 ;;
+  *chmod*)     exit 0 ;;
+  *"-x /data/local/tmp/"*)
+      if [ "$(cat "$STUBDIR/present" 2>/dev/null)" = 1 ]; then
+        echo XOK
+        if [ -f "$STUBDIR/lsbad" ]; then echo "-rwxr-xr-x shell shell ? ? sensorcat"
+        else echo "-rwxr-xr-x shell    shell     $(cat "$STUBDIR/size") 2026-08-26 10:00 sensorcat"; fi
+      else echo "ls: /data/local/tmp/sensorcat: No such file or directory"; fi; exit 0 ;;
+  *md5*)       [ -s "$STUBDIR/md5" ] && echo "$(cat "$STUBDIR/md5")  /data/local/tmp/sensorcat"; exit 0 ;;
+  *"echo ok"*) echo ok; exit 0 ;;
+esac
+exit 0
+EOSTUB
+  chmod 755 "$S/adb"; echo "$WANT" >"$S/wantsize"
+  run() { env -i HOME="$H" PATH="$S:/usr/bin:/bin" STUBDIR="$S" \
+            MESH_NOTE3_INSTALL_LOG="$T/ledger" MESH_NOTE3_INSTALL_ESCAL="$T/escal" \
+            bash "$SELF" "$@" 2>&1; }
+  arms=0
+  arm() { local name="$1" want="$2" got="$3"; arms=$((arms+1))
+          case "$got" in *"$want"*) echo "  ok   $name" ;;
+                         *) echo "  FAIL $name: expected '$want' in: $got"; fails=$((fails+1)) ;; esac; }
+  nay() { local name="$1" bad="$2" got="$3"; arms=$((arms+1))
+          case "$got" in *"$bad"*) echo "  FAIL $name: forbidden '$bad' in: $got"; fails=$((fails+1)) ;;
+                         *) echo "  ok   $name" ;; esac; }
+
+  echo 0 >"$S/present"; : >"$S/size"; : >"$S/md5"
+  out=$(run sensorcat);           arm "absent -> push"        "verdict=absent" "$out"
+  arm "absent pushes"             " push " "$(cat "$S/calls")"
+
+  : >"$S/calls"; echo 1 >"$S/present"; echo "$WANT" >"$S/size"
+  out=$(run sensorcat);           arm "fresh -> ok/size"      "verdict=ok evidence=size" "$out"
+  nay "fresh does not push"       " push " "$(cat "$S/calls")"
+
+  # the rebuild case: present, executable, and NOT the build in the stash. The mode bit cannot see it.
+  : >"$S/calls"; echo $((WANT+7)) >"$S/size"
+  out=$(run sensorcat);           arm "stale size -> stale"   "verdict=stale" "$out"
+  arm "stale pushes"              " push " "$(cat "$S/calls")"
+  arm "escalation armed"          "sensorcat" "$(cat "$T/escal" 2>/dev/null)"
+
+  # once caught stale, the observable follows the belief: size now agrees, md5 does not.
+  : >"$S/calls"; echo "$WANT" >"$S/size"; echo "00000000000000000000000000000000" >"$S/md5"
+  out=$(run sensorcat);           arm "escalated -> md5 sees" "evidence=md5" "$out"
+
+  # present but the device's ls did not parse: presence is all we know, and `ok` is not it.
+  : >"$S/calls"; : >"$S/escal"; touch "$S/lsbad"; echo 1 >"$S/present"
+  out=$(run sensorcat);           arm "unparsed -> unverif"   "verdict=unverifiable" "$out"
+  nay "unverifiable is not ok"    "verdict=ok" "$out"
+  nay "unverifiable does not push" " push " "$(cat "$S/calls")"
+  rm -f "$S/lsbad"
+
+  # the push is not the outcome: look again afterwards, or a failed push reads as a fix.
+  : >"$S/calls"; : >"$S/escal"; echo 0 >"$S/present"; touch "$S/pushfails"
+  out=$(run sensorcat); rc=$?
+  arm "failed push -> FAIL"       "FAIL sensorcat" "$out"
+  if [ "$rc" -ne 0 ]; then echo "  ok   failed push -> rc!=0"; arms=$((arms+1))
+  else echo "  FAIL failed push returned rc 0"; fails=$((fails+1)); arms=$((arms+1)); fi
+  rm -f "$S/pushfails"
+
+  # a stub is only ahead of the real tool until the subject exports its own PATH — prove it won.
+  if [ -s "$S/calls" ]; then echo "  ok   stub adb won the PATH race"
+  else echo "  FAIL stub adb never ran — the real adb won the PATH race"; fails=$((fails+1)); fi
+  # every CALL writes a row, not only the pushes: the pushes are a numerator.
+  rows=$(wc -l <"$T/ledger" 2>/dev/null || echo 0)
+  arms=$((arms+2))
+  if [ "$rows" -eq 6 ]; then echo "  ok   ledger row per call ($rows rows / 6 calls)"
+  else echo "  FAIL ledger row per call: $rows rows for 6 calls"; fails=$((fails+1)); fi
+  arm "ok calls are on the tape too" "verdict=ok" "$(cat "$T/ledger" 2>/dev/null)"
+  arm "check reads the ledger"    "stale-rate=" "$(run --check)"
+
+  rm -rf "$T"
+  echo "fixture: $arms arm(s), $fails failure(s)"
+  [ "$fails" -eq 0 ] || { echo "smoke-test: FAIL (fixture)"; return 1; }
+
+  if ! note3_reachable; then
+    echo "smoke-test: n/a (Note3 unreachable) — coverage: fixture-only, live adb path unexercised"
+    return 2
+  fi
+  if ensure_bin sensorcat; then echo "smoke-test: ok (live: sensorcat verdict=$VERDICT evidence=$EVIDENCE action=$ACTION)"
+  else echo "smoke-test: FAIL (live: verdict=$VERDICT action=$ACTION)"; return 1; fi
   return 0
 }
 
 case "${1:-}" in
   --all)  note3_reachable || { echo "phone unreachable"; exit 2; }
-          for b in sensorcat slrec tinycap tinymix; do ensure_bin "$b" && echo "ok $b" || echo "FAIL $b"; done ;;
-  --test) if ! note3_reachable; then echo "smoke-test: n/a (Note3 unreachable)"; exit 2; fi
-          ensure_bin sensorcat && echo "smoke-test: ok (sensorcat present/pushed)" || { echo "smoke-test: FAIL"; exit 1; } ;;
-  "")     echo "usage: mesh-note3-tool-install <bin>|--all|--test"; exit 1 ;;
+          VERIFY_LEVEL=md5
+          for b in sensorcat slrec tinycap tinymix; do
+            if ensure_bin "$b"; then echo "ok $b (verdict=$VERDICT evidence=$EVIDENCE action=$ACTION)"
+            else echo "FAIL $b (verdict=$VERDICT action=$ACTION)"; fi
+          done ;;
+  --verify) note3_reachable || { echo "phone unreachable"; exit 2; }
+          rc=0
+          for b in ${2:-sensorcat slrec tinycap tinymix}; do
+            [ -f "$STASH/$b" ] || { echo "$b: no-stash"; rc=1; continue; }
+            ms=$(probe_mode_size "$b"); got="${ms#*|}"; want=$(stat -c %s "$STASH/$b" 2>/dev/null)
+            if [ "${ms%%|*}" != XOK ]; then echo "$b: absent (evidence=mode)"; rc=1; continue; fi
+            if [ -z "$got" ]; then echo "$b: unverifiable (evidence=mode — ls -l unparsed)"; rc=1; continue; fi
+            if [ "$got" != "$want" ]; then echo "$b: STALE (evidence=size want=$want got=$got)"; rc=1; continue; fi
+            gm=$(phone_md5 "$b"); wm=$(md5sum "$STASH/$b" 2>/dev/null | cut -d' ' -f1)
+            if   [ -z "$gm" ];       then echo "$b: ok (evidence=size:md5-absent size=$want)"
+            elif [ "$gm" != "$wm" ]; then echo "$b: STALE (evidence=md5 want=$wm got=$gm)"; rc=1
+            else echo "$b: ok (evidence=md5 $gm)"; fi
+          done; exit $rc ;;
+  --check) check_report ;;
+  --test) fixture_test; exit $? ;;
+  "")     echo "usage: mesh-note3-tool-install <bin>|--all|--verify [bin]|--check|--test"; exit 1 ;;
   *)      note3_reachable || { echo "phone unreachable"; exit 2; }
-          ensure_bin "$1" && echo "ok $1" || { echo "FAIL $1"; exit 1; } ;;
+          if ensure_bin "$1"; then echo "ok $1 (verdict=$VERDICT evidence=$EVIDENCE action=$ACTION)"
+          else echo "FAIL $1 (verdict=$VERDICT action=$ACTION)"; exit 1; fi ;;
 esac
