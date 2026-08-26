@@ -376,9 +376,46 @@ def examine(lines, windows, st, t_now):
     return rows
 
 
+def _killpg(p):
+    """TERM the fire's process GROUP, escalate to KILL, and never raise.
+
+    start_new_session below gives each fire its own group, which is the whole point — but it also
+    means `p.kill()` would reap the `sh` and ORPHAN every grandchild it spawned (a browser driver,
+    a python batch). Signal the group, exactly as `timeout` does.
+    """
+    for sig, grace in ((signal.SIGTERM, 10.0), (signal.SIGKILL, 2.0)):
+        try:
+            os.killpg(p.pid, sig)
+        except OSError:
+            return
+        try:
+            p.wait(timeout=grace)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
 def fire(ln, dry):
     """Run the line the way cron would: /bin/sh, cron's own PATH, no login shell. A richer env
-    here would let a line pass in catch-up that fails at its real slot."""
+    here would let a line pass in catch-up that fails at its real slot.
+
+    THE FIRE GETS ITS OWN SESSION, AND THAT IS THE LOAD-BEARING HALF. The cursor is claimed BEFORE
+    the fire (at-most-once, see main()), so a fire that dies has SPENT a slot nothing will re-run.
+    Until 2026-08-26 the child was left in the CALLER'S process group, which means every ordinary
+    group-directed signal aimed at the pass — an operator Ctrl-C in a pane, an agent tool-call
+    timeout, a `timeout` without --foreground anywhere up the chain — landed on the fire too.
+    Measured that day: slot 2026-08-26T07:23:00Z, tool mesh-job-apply, rc=-15 after 46s against a
+    normal pass of 455-980s (`~/.mesh/job-apply.log` run-end rc=143 how=sys.exit); the slot was
+    recorded as spent and the day sent 7 applications instead of 20 against the operator's
+    5 September deadline. The pass itself is disposable — it runs every 15 minutes. The fire is
+    NOT: it holds the only claim on an irreversible slot. So the two must not share a fate.
+    [[a-name-matching-stop-kills-your-other-selves]] one ring out: the signal here is not even
+    name-matched, it is aimed at a group the fire had no business being in.
+
+    This does NOT re-open a killed slot, and must not: re-opening buys a double send on a lane that
+    mails employers under the operator's name (measured 2026-08-25, mesh-log-attest fired twice).
+    The remedy is that the fire stops being killable BY THE PASS, not that a kill stops counting.
+    """
     if dry:
         return 0, "dry"
     env = {"HOME": HOME, "PATH": "/usr/bin:/bin", "SHELL": "/bin/sh",
@@ -386,14 +423,19 @@ def fire(ln, dry):
            "LANG": os.environ.get("LANG", "C.UTF-8"),
            "MESH_CRON_CATCHUP": "1"}
     try:
-        p = subprocess.run(["/bin/sh", "-c", os.path.expandvars(ln.cmd)],
-                           env=env, timeout=FIRE_TIMEOUT,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return p.returncode, "ran"
-    except subprocess.TimeoutExpired:
-        return 124, "timeout"
+        p = subprocess.Popen(["/bin/sh", "-c", os.path.expandvars(ln.cmd)],
+                             env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True)
     except OSError as e:
         return 127, "exec:%s" % e
+    try:
+        return p.wait(timeout=FIRE_TIMEOUT), "ran"
+    except subprocess.TimeoutExpired:
+        # FIRE_TIMEOUT still binds — the detachment buys the fire independence from the pass's
+        # fate, never immortality. A bound whose enforcement the change quietly dropped would be
+        # the worse defect of the two.
+        _killpg(p)
+        return 124, "timeout"
 
 
 def main():
@@ -628,7 +670,7 @@ def selftest():
 
     # --- the cursor must be on disk BEFORE the fire, or a killed pass repeats its sends
     import tempfile
-    global STATE
+    global STATE, FIRE_TIMEOUT
     keep = STATE
     seen = []
     _sd = tempfile.mkdtemp(prefix="cron-catchup-test-")
@@ -762,6 +804,129 @@ def selftest():
               "failed (fire returned rc=7" in _r2.stdout and "only re-runner" in _r2.stdout)
     finally:
         shutil.rmtree(_ed, ignore_errors=True)
+
+    # --- A FIRE MUST NOT SHARE THE PASS'S FATE ---------------------------------------------------
+    # The cursor is claimed BEFORE the fire, so a fire that dies has SPENT a slot nothing re-runs.
+    # Until 2026-08-26 the child ran in the CALLER's process group, so a Ctrl-C in a pane, an agent
+    # tool-call timeout or any `timeout` up the chain reached the fire too — measured that day at
+    # slot 07:23 (mesh-job-apply, rc=-15 at 46s of a 455-980s pass, the day short 13 applications).
+    _fd = tempfile.mkdtemp(prefix="cron-catchup-pgid-")
+    try:
+        _out = os.path.join(_fd, "pgid")
+        # $$ inside `sh -c` is that shell's own pid; field 5 of its stat is its process GROUP.
+        _rc, _how = fire(Line(*([None] * 5 + [
+            "cut -d' ' -f5 /proc/$$/stat > %s" % _out, ""])), False)
+        _got = open(_out).read().strip() if os.path.exists(_out) else ""
+        check("a fire runs in its OWN process group, never the caller's",
+              _rc == 0 and _how == "ran" and _got.isdigit() and int(_got) != os.getpgrp())
+    finally:
+        shutil.rmtree(_fd, ignore_errors=True)
+
+    # DETACHMENT MUST NOT BUY IMMORTALITY. start_new_session moves the fire out of our group, which
+    # is also the reason `p.kill()` is no longer enough: it would reap the `sh` and leave every
+    # grandchild orphaned and running. So the timeout leg is asserted on a GRANDCHILD, not on the
+    # shell — a version that killed only the direct child would pass a shell-only assertion while
+    # leaking the browser batch the cron line actually spawned.
+    # [[a-foreground-child-defers-the-signal-trap-that-would-reap-it]]
+    _td = tempfile.mkdtemp(prefix="cron-catchup-bound-")
+    _keep_to = FIRE_TIMEOUT
+    try:
+        _gpid = os.path.join(_td, "grandchild.pid")
+        FIRE_TIMEOUT = 2
+        _t0 = time.time()
+        # `sleep 60 &` is a GRANDCHILD of the fire: it survives a kill aimed at the shell alone.
+        _rc, _how = fire(Line(*([None] * 5 + [
+            "sleep 60 & echo $! > %s; wait" % _gpid, ""])), False)
+        _el = time.time() - _t0
+        _gone = True
+        try:
+            _gp = int(open(_gpid).read().strip())
+            for _i in range(40):
+                try:
+                    os.kill(_gp, 0)
+                except OSError:
+                    break
+                time.sleep(0.25)
+            else:
+                _gone = False
+                os.kill(_gp, signal.SIGKILL)
+        except (IOError, ValueError):
+            _gone = False
+        check("FIRE_TIMEOUT still binds after the fire was detached",
+              _rc == 124 and _how == "timeout" and _el < 30)
+        check("the timeout reaps the fire's GROUP, so no grandchild outlives the bound", _gone)
+    finally:
+        FIRE_TIMEOUT = _keep_to
+        shutil.rmtree(_td, ignore_errors=True)
+
+    # THE BEHAVIOURAL STRAND. The arm above asserts the mechanism; this one drives the FAULT — a
+    # real pass, signalled the way the pane signalled it, and the artifact is whether the work the
+    # spent slot stood for actually happened. A mechanism assertion alone would go green for a
+    # detachment that some later `timeout` re-attached one layer up.
+    # [[a-behavioural-strand-drill-beats-the-scan-that-named-the-bug]]
+    _kd = tempfile.mkdtemp(prefix="cron-catchup-strand-")
+    try:
+        _kbin = os.path.join(_kd, "bin"); _khome = os.path.join(_kd, "home")
+        os.makedirs(os.path.join(_khome, ".mesh")); os.makedirs(_kbin)
+        _kmark = os.path.join(_kd, "the-work-happened")
+        _kslot = time.time() - 3600.0
+        _kst = time.gmtime(_kslot)
+        _kboots = json.dumps([
+            {"index": -1, "first_entry": int((_kslot - 7200) * 1e6),
+             "last_entry": int((_kslot - 1800) * 1e6)},
+            {"index": 0, "first_entry": int((_kslot + 600) * 1e6),
+             "last_entry": int((time.time() + 60) * 1e6)}])
+        _kline = "%d %d * * * %s/slow-line >> /dev/null 2>&1\n" % (_kst.tm_min, _kst.tm_hour, _kbin)
+        for _n, _body in (
+                ("crontab",    '#!/bin/sh\ncat <<"EOF"\n' + _kline + 'EOF\n'),
+                ("journalctl", "#!/bin/sh\ncat <<'EOF'\n" + _kboots + "\nEOF\n"),
+                ("mesh-chat",  "#!/bin/sh\nexit 0\n"),
+                # Long enough that the TERM lands while it is genuinely mid-fire, short enough
+                # that the suite stays cheap.
+                ("slow-line",  "#!/bin/sh\nsleep 8\n: > %s\nexit 0\n" % _kmark)):
+            with open(os.path.join(_kbin, _n), "w") as f:
+                f.write(_body)
+            os.chmod(os.path.join(_kbin, _n), 0o755)
+        _kenv = {"HOME": _khome, "PATH": _kbin + os.pathsep + "/usr/bin:/bin",
+                 "LANG": "C.UTF-8", "MESH_CATCHUP_TIMEOUT": "60"}
+        # start_new_session here is the TEST's own scaffolding: it gives the pass a group of its
+        # own so the suite can signal exactly that group and nothing else — signalling our own
+        # would kill the suite. [[a-name-matching-stop-kills-your-other-selves]]
+        _kp = subprocess.Popen([sys.executable, os.path.abspath(__file__)], env=_kenv,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               start_new_session=True)
+        _kstate = os.path.join(_khome, ".mesh", "cron-catchup.state")
+        for _i in range(120):                     # wait until the slot is CLAIMED and firing
+            if os.path.exists(_kstate) and "in-flight" in open(_kstate).read():
+                break
+            time.sleep(0.25)
+        _claimed = os.path.exists(_kstate) and "in-flight" in open(_kstate).read()
+        # A group that is already gone means the pass finished before we could signal it — the
+        # drill never ran, and that must read as a FAILED arm, never as a silent pass. An
+        # exception here would take the whole suite down and hide every arm after it.
+        # [[a-red-gate-hides-every-gate-after-it]]
+        try:
+            os.killpg(_kp.pid, signal.SIGTERM)    # exactly what the pane did on 2026-08-26
+            _signalled = True
+        except OSError:
+            _signalled = False
+        try:
+            _kp.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(_kp.pid, signal.SIGKILL)
+            except OSError:
+                pass
+        for _i in range(60):                      # the detached fire should still finish
+            if os.path.exists(_kmark):
+                break
+            time.sleep(0.25)
+        check("STRAND: the pass is signalled only once its slot is genuinely claimed and firing",
+              _claimed and _signalled)
+        check("STRAND: killing the PASS does not kill the fire whose slot it already spent",
+              _claimed and _signalled and os.path.exists(_kmark))
+    finally:
+        shutil.rmtree(_kd, ignore_errors=True)
 
     # The renderer's predicate, called through the SAME entry point the renderer uses.
     _st = {"a": {"last_rc": "in-flight"}, "b": {"last_rc": 0}, "c": {"last_rc": -15},
