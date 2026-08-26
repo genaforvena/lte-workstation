@@ -135,6 +135,67 @@ them.
 That is also a nice reminder that "lower bound" is a claim, not a disclaimer. It was true for
 five rows and false for two, and nothing on the line distinguished them.
 
+## What it cost to fix
+
+I filed that as a defect against the poller. Here is what came back, and it is a better fix
+than the one I proposed.
+
+My suggestion was to trust the field only when no rung ran — `last-rung=none`. That is too
+coarse. The ladder has rungs that *name an intent without ever touching the radio*:
+`reload-skipped` and `replug-skipped` on a node that forbids them, `exhausted`, `none`. On
+those the elapsed span really is a dark lower bound, because nothing of ours was holding the
+link down. The predicate that matters is not "did a rung run" but **"did a rung perturb the
+subject"**:
+
+```sh
+acting_rung() {
+  case "$1" in (reassociate|bounce|reload|replug|replug-failed) return 0 ;; (*) return 1 ;; esac
+}
+```
+
+On rows where that answers no, the old wording survives byte for byte. On rows where it answers
+yes, the line stops claiming darkness at all. Here is the same node, same episode shape — three
+down-checks, `reassociate` — seventy minutes either side of the change:
+
+```
+19:56:01Z  after 3 down-check(s) / >=175s dark (lower bound, window=5s/60s)
+           mlme_dark=63 mlme_episodes=1 ; last rung attempted: reassociate
+
+21:06:01Z  after 3 down-check(s) / 178s to-recovery (elapsed, NOT a dark bound
+           — 1 rung(s) of ours took >=0s of it, window=5s/60s)
+           self_secs=0 self_rungs=1 mlme_dark=127 mlme_episodes=2 ; last rung: reassociate
+```
+
+The top row asserts *at least* 175 seconds of darkness. The frame plane clocks 63. It is not a
+lower bound, it is a 2.8x overshoot wearing the words "lower bound" — worse than the pair I
+originally filed, and it was sitting in the tape the whole time.
+
+The bottom row makes three separate claims and every one of them is true: 178 seconds elapsed
+between detection and recovery; some of that was ours; the darkness was 127 seconds across
+**two** episodes. Read that last part again — one poller row, two real outages. The old wording
+would have rendered those two as a single 178-second blackout. Both biases, in one line, now
+both visible because both answers are on it.
+
+Note what the fix does **not** do. `self_secs=0 self_rungs=1` says one rung of ours ran and the
+measured floor on its contribution is zero seconds. It does not estimate. A plausible constant
+there — "reassociate costs about 8 seconds" — would have fabricated exactly the precision the
+fix exists to remove, and it would have been indistinguishable from a measurement. The honest
+move when you know a quantity is nonzero but cannot measure it is to publish the floor and the
+fact that a floor is what it is.
+
+And the same discipline shows up in how the two "how long was this down" renderings are
+combined at all — `max(ticks, clock)` returning not a number but a number *and which one won*:
+`178 clock`, `3 ticks`, `3 agree`. A reader cannot otherwise tell a counted minute from a
+measured one.
+
+The independent confirmation is my favourite part. Working from the other end, the fix's author
+noticed that **41 of 48 scored episodes on this node land at ≤61 seconds, 18 of them at exactly
+60** — and wrote, correctly, "because that is the stride and not the fault." I found the
+censoring by looking at the episodes that were missing. They found it by looking at the pile-up
+in the ones that survived. Same artifact, opposite directions, and neither of us needed the
+other's data to see it. If your duration histogram has a spike sitting exactly on your polling
+interval, you have this bug, and you can check in one query.
+
 ## No, a faster poll is not the fix
 
 The instinct is to drop the tick. It doesn't work.
@@ -236,12 +297,15 @@ instrument had *confirmed* the old one.
 2. Sums over time survive undersampling. Counts, means, medians and percentiles do not. Your
    availability number looking right is not evidence that anything else is.
 3. If your remediation acts on the thing you are timing, your duration includes your own
-   remediation. Check whether your worst rows are just your busiest rows.
-4. Shortening the period moves the cut, it does not remove it. Subscribe to events; don't ask
+   remediation. Check whether your worst rows are just your busiest rows — and gate on whether
+   a rung *perturbed* the subject, not on whether a rung *ran*.
+4. If your duration histogram spikes exactly on your polling interval, that spike is your
+   sampler, not your fault. One query, and it is the cheapest version of this whole check.
+5. Shortening the period moves the cut, it does not remove it. Subscribe to events; don't ask
    faster.
-5. When the accurate instrument arrives, **publish both answers in separate columns.** The
+6. When the accurate instrument arrives, **publish both answers in separate columns.** The
    disagreement is the finding, and it is what tells you how wrong your archive is.
-6. A coverage term must be able to say *blind*. If a failure of your instrument renders as a
+7. A coverage term must be able to say *blind*. If a failure of your instrument renders as a
    plausible reading, you did not build an instrument. You built a constant.
 
 The cheapest version of this check costs one afternoon: put an event listener beside your
