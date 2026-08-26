@@ -385,6 +385,53 @@ mesh_is_minter(){
   [ "$host" = "$minter" ]
 }
 
+# ---- MISSED-BEACON grammar (shared by mesh-wifi-rf / -quality) ----
+#
+# /proc/net/wireless COLUMN 11 ("Missed beacon") IS DEAD ZERO ON rtw88, and both parses of it were
+# CORRECT — the column is the right column, the SOURCE is empty. Measured 2026-08-26 on this node's
+# sole uplink (rtw_8822bu): col 11 read 0 in 3574 of 3574 recorded readings across two senses, and
+# at one instant, in one association, `iw dev <if> station dump` read `beacon loss: 9` while
+# /proc col 11 read 0 and mesh-wifi-rf printed `EXCELLENT ... beacon_missed=0`.
+#
+# The field is ALARM-NAMED — mesh-wifi-rf documents it as "AP unreachable ticks" and
+# mesh-wifi-quality ships it as discard_beacon_missed — so a consumer reading it for
+# AP-unreachability got a PERMANENT ALL-CLEAR on the one link everything here rides.
+# [[a-silent-fallback-turns-a-failure-into-a-plausible-constant]]
+#
+# THE TRAP THAT MAKES THIS EASY TO GET WRONG TWICE: neighbouring column 10 ("misc") DOES track
+# nl80211's `rx drop misc` exactly (950 vs 951 in the same read), so the block LOOKS alive and a
+# careless check grabs the working neighbour and concludes the parse is fine.
+#
+# NO DRIVER ALLOWLIST. "rtw88 does not fill it" is an exclusion list whose failure direction is
+# SILENCE — the next driver that also leaves it empty is simply not on the list and inherits the
+# false all-clear. [[an-exclusion-allowlist-fails-toward-silence-so-invert-the-polarity]]
+# Instead: ASK THE SURFACE THAT CLAIMS TO KNOW, and publish WHICH one answered.
+#
+#   nl80211 answered            -> that value, src=nl80211        (authoritative)
+#   nl80211 silent, proc  > 0   -> that value, src=proc           (the counter is demonstrably live)
+#   nl80211 silent, proc == 0   -> na,         src=none           (0 here is INDISTINGUISHABLE from
+#                                                                  a driver that never fills it)
+#
+# The third line is the whole point: a proc-sourced zero is not a reading, it is the absence of one,
+# and it must never wear the alarm field's name. [[a-blindness-sentinel-fused-as-a-reading]]
+BEACON_GRAMMAR_SRC="mesh-patterns.sh"
+export BEACON_GRAMMAR_SRC
+beacon_missed_read() { # <iface> <proc-col-11> -> "<value|na> <nl80211|proc|none>"
+  local iface="${1:-}" proc_v="${2:-}" nl=""
+  case "$proc_v" in ''|*[!0-9]*) proc_v="";; esac
+  if [ -n "$iface" ] && command -v iw >/dev/null 2>&1; then
+    # `beacon loss` is per-STATION, so it lives in `station dump`, never in `link`. Take the FIRST
+    # match: a managed interface has one AP station, and a stray second would otherwise silently
+    # concatenate into a number no counter ever held.
+    nl="$(iw dev "$iface" station dump 2>/dev/null \
+          | awk -F: '/beacon loss:/{gsub(/[^0-9]/,"",$2); if ($2 != "") {print $2; exit}}')"
+    case "$nl" in ''|*[!0-9]*) nl="";; esac
+  fi
+  if [ -n "$nl" ]; then printf '%s nl80211\n' "$nl"; return 0; fi
+  if [ -n "$proc_v" ] && [ "$proc_v" -gt 0 ] 2>/dev/null; then printf '%s proc\n' "$proc_v"; return 0; fi
+  printf 'na none\n'
+}
+
 # ---- RSSI sentinel grammar (shared by mesh-wifi-mimo / -quality / -rf / -contention) ----
 #
 # ONE blindness, TWO renderings, and until 2026-08-24 FOUR private copies of the predicate, no two
@@ -715,6 +762,67 @@ PJ
   # ...and a burst that is blind in the /proc rendering must land on the SAME verdict as the
   # nl80211 one — one blindness, one answer, whichever surface reported it.
   ck2 "$(printf -- '-256.\n-256.\n' | rssi_burst)"  "na 0 2"   "the twin rendering of the same blindness -> na too"
+
+  # ---- beacon_missed_read: a proc ZERO is not a reading -------------------------------------
+  # Every arm asserts the same thing from a different side: the alarm-named field must never be
+  # published as 0 on the strength of a column the driver does not fill.
+  _bmk(){ ck2 "$1" "$2" "$3"; }
+  # A node with no `iw` and a proc zero: the ONLY honest answer is na/none.
+  _bm_noiw="$(PATH=/nonexistent-for-this-arm beacon_missed_read someif 0)"
+  ck2 "$_bm_noiw" "na none" "no surface answered and proc reads 0 -> na, NEVER 0"
+  ck2 "$(PATH=/nonexistent-for-this-arm beacon_missed_read someif 7)" "7 proc" \
+      "a proc counter that is demonstrably LIVE (>0) is used, and says it came from proc"
+  ck2 "$(PATH=/nonexistent-for-this-arm beacon_missed_read someif '')" "na none" \
+      "an unreadable proc field is na, not 0"
+  ck2 "$(PATH=/nonexistent-for-this-arm beacon_missed_read someif xx)" "na none" \
+      "a non-numeric proc field is rejected rather than passed through"
+  ck2 "$(beacon_missed_read '' 0)" "na none" "no interface to ask -> na"
+  # nl80211 WINS over proc, and that is the whole fix: on rtw88 proc is 0 in the same instant that
+  # nl80211 reports a real loss count, so a rule that preferred proc would keep the all-clear.
+  _bmd="$(mktemp -d)"
+  cat > "$_bmd/iw" <<'IWEOF'
+#!/bin/sh
+[ "$2" = "wlanTEST" ] || exit 1
+cat <<'X'
+Station aa:bb:cc:dd:ee:ff (on wlanTEST)
+	rx drop misc:	951
+	beacon loss:	9
+	beacon rx:	7397
+X
+IWEOF
+  chmod +x "$_bmd/iw"
+  ck2 "$(PATH="$_bmd:$PATH" beacon_missed_read wlanTEST 0)" "9 nl80211" \
+      "nl80211 answers over a proc ZERO — the exact rtw88 instant that was published as 0"
+  ck2 "$(PATH="$_bmd:$PATH" beacon_missed_read wlanTEST 3)" "9 nl80211" \
+      "...and over a nonzero proc too: the authoritative surface wins, it is not a max()"
+  # `beacon loss` lives in station dump, never in `link`; and the neighbouring `rx drop misc` line
+  # is the value a careless parse grabs, so assert we did not take 951.
+  ck2 "$(PATH="$_bmd:$PATH" beacon_missed_read wlanTEST 0)" "9 nl80211" \
+      "the neighbouring rx-drop-misc line (951) is NOT what the parse returns"
+  # An interface iw refuses falls all the way through rather than inheriting another one's number.
+  ck2 "$(PATH="$_bmd:$PATH" beacon_missed_read otherif 0)" "na none" \
+      "an interface the tool cannot dump renders na, never another interface's count"
+  # TWO STATIONS IS WHAT MAKES THE `exit` LOAD-BEARING. Managed mode has one AP station, but an
+  # interface in another mode (or mid-roam) dumps more than one, and without the exit awk prints
+  # both lines — which a `$(...)` capture joins into "9 4", a number no counter ever held and one
+  # that fails the numeric guard downstream into a silent na. A one-station fixture cannot see it.
+  # [[a-fixture-whose-two-candidates-carry-one-value-cannot-discriminate]]
+  cat > "$_bmd/iw" <<'IWEOF'
+#!/bin/sh
+[ "$2" = "wlanTEST" ] || exit 1
+cat <<'X'
+Station aa:bb:cc:dd:ee:ff (on wlanTEST)
+	rx drop misc:	951
+	beacon loss:	9
+Station 11:22:33:44:55:66 (on wlanTEST)
+	rx drop misc:	12
+	beacon loss:	4
+X
+IWEOF
+  chmod +x "$_bmd/iw"
+  ck2 "$(PATH="$_bmd:$PATH" beacon_missed_read wlanTEST 0)" "9 nl80211" \
+      "a multi-station dump yields the FIRST station's count, never two joined into one number"
+  rm -rf "$_bmd"
 
   [ "$fail" = 0 ] && { echo "smoke-test: ok"; exit 0; } || { echo "smoke-test: FAIL"; exit 1; }
 fi
