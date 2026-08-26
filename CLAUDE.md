@@ -243,6 +243,12 @@ the case is the evidence, and mixing them is what made this section a wall nobod
   acceptance predicate over a sample and publish the pass rate with an interval; value is the
   cheaper question and it can kill the reachability design outright.
   [[a-reachability-debate-that-never-priced-the-material]]
+- **A summary may drop anything except what SPLITS its readers' responses** — adequacy is a property
+  of the field JOINTLY with its readers, so a freshness-guarded reader breaks the coarsening in ONE
+  step; publish the evidence age (mtime is the writer's heartbeat, not the reading's age), pair the
+  verdict with its class instead of minting a word consumers don't know, type the abstention apart
+  from not-applicable, and never change-gate a live quantity.
+  [[a-coarsening-is-safe-only-up-to-the-response-signature]]
 - **An exemption must cite what LAUNCHES a tool — a cron line, a caller, a unit, a hook — never a
   capability it merely accepts**, and a self-exemption is a DISAPPEARANCE, so census the launcherless
   and verify every caller-claim by GREP; after wiring a conditional gate, run it once and read which
