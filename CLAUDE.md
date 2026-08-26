@@ -249,6 +249,11 @@ the case is the evidence, and mixing them is what made this section a wall nobod
   verdict with its class instead of minting a word consumers don't know, type the abstention apart
   from not-applicable, and never change-gate a live quantity.
   [[a-coarsening-is-safe-only-up-to-the-response-signature]]
+- **A corroborating counter's baseline must be sampled BEFORE the event it corroborates** — stamped
+  when the fault is NOTICED it bakes the causing event into itself, so a one-poll episode reads 0 by
+  construction and the "uncorroborated" arm measures episode LENGTH; take it at the last observation
+  of the GOOD state, publish its provenance and AGE, and count pre-field rows apart.
+  [[a-baseline-sampled-after-the-event-it-corroborates]]
 - **An exemption must cite what LAUNCHES a tool — a cron line, a caller, a unit, a hook — never a
   capability it merely accepts**, and a self-exemption is a DISAPPEARANCE, so census the launcherless
   and verify every caller-claim by GREP; after wiring a conditional gate, run it once and read which
