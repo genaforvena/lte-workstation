@@ -18,10 +18,31 @@
 # [egress-quality-bad] (avg=64ms jitter=18.5ms) at 13:45Z — same node, 11 minutes apart. Was the
 # network actually worse, or was an overloaded box just measuring its own scheduling jitter?
 #
-# Inputs (both CACHED, no network calls of its own):
+# Inputs (all CACHED or passive, no network calls of its own):
 #   mesh-egress-health  ~/.mesh/.egress-quality-state   OK|BAD (debounced quality verdict)
+#   mesh-egress-health  ~/.mesh/egress-health.log       where= (hop1-bad | beyond-hop1 | ...)
 #   mesh-stress         ~/.mesh/.swap-rate.state        IDLE|LIGHT|THRASHING|... (mesh-swap-rate producer)
 #   /proc/loadavg + nproc                                load1/nproc, live read (cheap, no caching needed)
+#   iw dev <if> station dump                             tx packets/retries/failed + connected time (PASSIVE)
+#
+# THE RADIO LEG (health 2026-08-26, this node). A THIRD attribution axis, and the one this fold was
+# blind to: with local load calm, a first-hop fault used to fall out as NETWORK-DEGRADED and stop —
+# and on a node whose sole uplink is a known-faulty USB dongle, a human reads NETWORK-DEGRADED at
+# hop1 as "the dongle" by default. Measured, that default is wrong: gateway RTT min71/avg520/max1374ms
+# while the station counters at the SAME instant read tx retries 0, tx failed 1, signal -53 dBm, and a
+# peer-answered ping over the same AP (the TV) was equally slow. Zero retries at a good signal means
+# our frames left on the FIRST attempt: the delay is added AFTER our radio hands the frame off —
+# airtime, the AP, or the router — not by our tx path giving up. The LATENCY axis and the FLAP axis
+# are measuring different faults (44 link-heal RECOVERED the same day stands, and mesh-mlme-tap dates
+# real deauths); this leg is what stops one being read as evidence for the other.
+# WHY AN IN-RUN WINDOW AND NOT THE CUMULATIVE COUNTERS: they are since-ASSOCIATION, and on this node
+# association is measured in minutes — a read taken 4 minutes after one that said 2718s read 55s, the
+# counters having reset under us. A cumulative retry count is therefore not a rate, and a baseline
+# file would be reset-poisoned between runs; two samples RADIO_WIN apart inside one run carry their
+# own window, and a reset landing inside it is caught by connected-time going BACKWARDS.
+# WHY NOT mesh-wifi-quality's discard rate: it keeps its own delta baseline, and a second reader
+# re-running it would shorten that baseline's window under it (the stolen-delta shape). This leg
+# reads the counters directly and stores nothing.
 #
 # Verdict vocabulary (a CONTRACT — do not rename):
 #   CLEAN                 quality=OK -> nothing to attribute
@@ -30,6 +51,18 @@
 #   NETWORK-DEGRADED      quality=BAD AND no local pressure evident -> the path itself is the suspect
 #   BAD-UNATTRIBUTED      quality=BAD but local-load inputs are stale/unreadable -> honest, can't tell
 #   DEGRADED              quality input itself missing/stale -> exit 2, honest n/a (never a faked CLEAN)
+#
+# radio= is a FIELD beside the verdict, never a new verdict word — the four above are a contract and
+# every consumer's alphabet is exactly those. Its own vocabulary:
+#   clean            the window carried real tx frames and NEITHER retries nor failures moved -> the
+#                    hop1 delay is being added past our radio, not by our tx path
+#   implicated       retries+failures reached RADIO_BAD_PCT of the window's tx frames -> our tx path
+#                    is in the story. A RATE, not a >0 trip: one failure in 496 frames is the reading
+#                    the finding itself calls clean, and the floor is provisional and labelled so
+#   unknown:reassoc  association restarted inside the window (counters reset) -> cannot difference
+#   unknown:no-tx    too few tx frames in the window to retry -> a silent radio is NOT a clean one
+#   unknown:*        counters unreadable / reset / first read -> honest blindness, never clean
+#   n/a:*            the leg does not apply (quality OK, fault past hop1, no wifi, no iw)
 #
 #   mesh-egress-attrib          one-line verdict + signals
 #   mesh-egress-attrib --json   machine-readable
@@ -44,6 +77,10 @@ SWAPSTATE="$MESH/.swap-rate.state"
 QFRESH_MIN="${MESH_EGATTR_QFRESH_MIN:-10}"     # egress-health quality runs every 3min; 10 = generous
 SWAP_FRESH_MIN="${MESH_EGATTR_SWAP_FRESH_MIN:-15}"  # matches mesh-stress's own SWAP_FRESH_MIN
 LOAD_NORM_HOT="${MESH_EGATTR_LOAD_NORM_HOT:-1.2}"   # load1/nproc >= this counts as CPU-contended
+QLOG="$MESH/egress-health.log"
+RADIO_WIN="${MESH_EGATTR_RADIO_WIN:-5}"             # seconds between the two in-run station reads
+RADIO_MIN_TX="${MESH_EGATTR_RADIO_MIN_TX:-20}"      # tx frames the window must carry before it may say clean
+RADIO_BAD_PCT="${MESH_EGATTR_RADIO_BAD_PCT:-1.0}"   # % of tx frames retried-or-failed that implicates our tx path
 
 _fresh_mins(){ local f="$1" mins="$2"; [ -f "$f" ] && find "$f" -mmin "-$mins" 2>/dev/null | grep -q .; }
 
@@ -69,6 +106,82 @@ read_load_norm(){  # -> "N.NN" or "?" (live read; fixture-overridable for --test
   load1=$(awk '{print $1}' /proc/loadavg 2>/dev/null)
   [ -n "$load1" ] && [ "$nproc" -gt 0 ] 2>/dev/null || { echo "?"; return; }
   awk -v l="$load1" -v n="$nproc" 'BEGIN{printf "%.2f", l/n}'
+}
+
+read_where(){  # -> hop1-bad|beyond-hop1|hop1-unknown|none|? (the leg the quality tape localized to)
+  local f="${MESH_EGATTR_QLOG_FILE:-$QLOG}" ln
+  _fresh_mins "$f" "$QFRESH_MIN" || { echo "?"; return; }
+  ln=$(grep -a ' QUALITY ' "$f" 2>/dev/null | tail -1)
+  ln=$(printf '%s' "$ln" | grep -oE 'where=[a-z0-9-]+' | head -1)
+  [ -n "$ln" ] && printf '%s\n' "${ln#where=}" || echo "?"
+}
+
+radio_iface(){  # -> the wireless iface carrying a station, or empty
+  local d
+  for d in /sys/class/net/*/wireless; do
+    [ -e "$d" ] || continue
+    d="${d%/wireless}"; printf '%s\n' "${d##*/}"; return 0
+  done
+  return 1
+}
+
+radio_sample(){  # -> "conn_secs tx_packets tx_retries tx_failed signal_dbm", empty on an unreadable read
+  local ifc="$1"
+  # FIRST INTEGER AFTER THE COLON, never a fixed field: "connected time: 2718 seconds" ends in a WORD,
+  # so a $NF read returns nothing for the one field that detects a reset — and an empty conn silently
+  # sank the whole sample. The station dump also lists MULTIPLE stations on an AP-mode iface, so every
+  # key takes the FIRST block only.
+  iw dev "$ifc" station dump 2>/dev/null | awk '
+    function num(l,   p, t) { p = index(l, ":"); t = substr(l, p + 1)
+                              if (match(t, /-?[0-9]+/)) return substr(t, RSTART, RLENGTH); return "" }
+    /connected time:/ { if (c == "") c = num($0) }
+    /tx packets:/     { if (t == "") t = num($0) }
+    /tx retries:/     { if (r == "") r = num($0) }
+    /tx failed:/      { if (f == "") f = num($0) }
+    /signal:/         { if (s == "") s = num($0) }
+    END { if (c != "" && t != "" && r != "" && f != "") printf "%s %s %s %s %s", c, t, r, f, (s == "" ? "?" : s) }'
+}
+
+classify_radio(){  # $1..$5=first sample  $6..$10=second sample  $11=min_tx $12=bad_rate_floor_pct
+  local c1="$1" t1="$2" r1="$3" f1="$4" c2="$6" t2="$7" r2="$8" f2="$9" sg="${10}" mintx="${11}" floor="${12:-1.0}"
+  case "$c1$t1$r1$f1$c2$t2$r2$f2" in ''|*[!0-9]*) echo "unknown:unreadable"; return ;; esac
+  [ "$c2" -lt "$c1" ] && { echo "unknown:reassoc conn ${c1}s->${c2}s"; return; }
+  local dtx=$((t2-t1)) dr=$((r2-r1)) df=$((f2-f1))
+  [ "$dtx" -lt 0 ] || [ "$dr" -lt 0 ] || [ "$df" -lt 0 ] && { echo "unknown:counter-reset"; return; }
+  # A SILENT RADIO IS NOT A CLEAN ONE. Zero retries over a window that sent nothing measures the
+  # absence of traffic, not the health of the tx path — and it would read exactly like the finding.
+  [ "$dtx" -lt "$mintx" ] && { echo "unknown:no-tx txframes=$dtx/$mintx"; return; }
+  # A RATE, NOT A BINARY. The first live run of this leg read `implicated` off ONE tx failure in 496
+  # frames (0.2%) — which is the very reading the finding calls CLEAN: health measured tx retries 0,
+  # tx failed 1 at the instant the gateway RTT averaged 520ms and concluded our frames were leaving
+  # on the first attempt. A >0 trip would therefore have contradicted the finding it encodes.
+  # THE FLOOR IS PROVISIONAL AND SAYS SO IN ITS OWN OUTPUT. There is no corpus for this axis yet, so
+  # the word cannot be calibrated against one; what it can do is refuse to be the only thing a reader
+  # has — the frame count and the rate ride beside it in every render, and the floor names itself as
+  # uncalibrated so nobody quotes the word as a measurement it is not.
+  local rate; rate=$(awk -v b="$((dr+df))" -v t="$dtx" 'BEGIN{printf "%.2f", (t>0? 100*b/t : 0)}')
+  local term=clean
+  awk -v r="$rate" -v fl="$floor" 'BEGIN{exit !(r>=fl)}' && term=implicated
+  echo "$term txframes=$dtx retry=$dr txfail=$df rate=$rate% floor=$floor%:provisional sigdbm=$sg"
+}
+
+read_radio(){  # $1=quality $2=where -> the radio field, sampled ONLY where it can mean something
+  [ "$1" = BAD ]        || { echo "n/a:quality-$1"; return; }
+  case "$2" in
+    hop1-bad) : ;;
+    beyond-hop1) echo "n/a:beyond-hop1"; return ;;
+    *) echo "n/a:where-$2"; return ;;
+  esac
+  if [ -n "${MESH_EGATTR_RADIO_FIX1:-}" ]; then                  # fixture pair, for the --test legs
+    classify_radio ${MESH_EGATTR_RADIO_FIX1} ${MESH_EGATTR_RADIO_FIX2} "$RADIO_MIN_TX" "$RADIO_BAD_PCT"; return
+  fi
+  command -v iw >/dev/null 2>&1 || { echo "n/a:no-iw"; return; }
+  local ifc s1 s2
+  ifc=$(radio_iface) || { echo "n/a:no-wireless"; return; }
+  s1=$(radio_sample "$ifc"); [ -n "$s1" ] || { echo "unknown:unreadable"; return; }
+  sleep "$RADIO_WIN"
+  s2=$(radio_sample "$ifc"); [ -n "$s2" ] || { echo "unknown:unreadable"; return; }
+  classify_radio $s1 $s2 "$RADIO_MIN_TX" "$RADIO_BAD_PCT"
 }
 
 classify(){  # $1=quality $2=swap $3=load_norm $4=load_norm_hot -> verdict
@@ -101,6 +214,72 @@ classify(){  # $1=quality $2=swap $3=load_norm $4=load_norm_hot -> verdict
   # real-read gate: /proc/loadavg + nproc must actually parse on THIS host
   rl=$(read_load_norm)
   [ "$rl" != "?" ] || { echo "FAIL: live read_load_norm() returned ? on a real host (nproc/loadavg unreadable?)"; f=1; }
+  # ── THE RADIO LEG ────────────────────────────────────────────────────────────────────────────
+  # PURE-CLASSIFIER ARMS. Two samples, each "conn tx retries failed signal".
+  [ "$(classify_radio 100 1000 5 2 -53  105 2000 5 2 -53  20 | cut -d' ' -f1)" = clean ] \
+    || { echo "FAIL: radio: a window with traffic and NO counter movement must read clean (got '$(classify_radio 100 1000 5 2 -53 105 2000 5 2 -53 20)')"; f=1; }
+  [ "$(classify_radio 100 1000 5 2 -53  105 1100 55 2 -53  20 | cut -d' ' -f1)" = implicated ] \
+    || { echo "FAIL: radio: retries at 50% of the window's frames must implicate our tx path"; f=1; }
+  [ "$(classify_radio 100 1000 5 2 -53  105 1100 5 52 -53  20 | cut -d' ' -f1)" = implicated ] \
+    || { echo "FAIL: radio: tx FAILURES must implicate too — retries alone is half the tx axis"; f=1; }
+  # THE LIVE CASE THE FINDING IS MADE OF, and the one a >0 trip gets backwards: health measured tx
+  # retries 0 / tx failed 1 while the gateway averaged 520ms and read the radio CLEAN. The first live
+  # run of this leg called that same shape `implicated` off one failure in 496 frames.
+  [ "$(classify_radio 100 1000 0 0 -53  105 1496 0 1 -52  20 | cut -d' ' -f1)" = clean ] \
+    || { echo "FAIL: radio: one tx failure in 496 frames must read clean — that IS the finding's own reading, and a >0 trip contradicts it (got '$(classify_radio 100 1000 0 0 -53 105 1496 0 1 -52 20)')"; f=1; }
+  # ...and the floor must be a floor, not decoration: the same shape past it flips.
+  [ "$(classify_radio 100 1000 0 0 -53  105 1496 0 30 -52  20 | cut -d' ' -f1)" = implicated ] \
+    || { echo "FAIL: radio: 30 failures in 496 frames is past the floor and must implicate — a floor nothing crosses is not a floor"; f=1; }
+  # every render carries the numbers, so the word is never the only thing a reader has
+  case "$(classify_radio 100 1000 0 0 -53  105 1496 0 1 -52  20)" in
+    *txframes=*rate=*floor=*provisional*) : ;;
+    *) echo "FAIL: radio: the clean verdict dropped its frame count / rate / provisional floor — an uncalibrated word alone is not a measurement"; f=1 ;;
+  esac
+  # THE ONE THAT MATTERS MOST: a silent radio must never wear the clean word. Zero retries over a
+  # window that sent nothing measures the absence of traffic, and it renders IDENTICALLY to the
+  # finding this leg exists to publish.
+  [ "$(classify_radio 100 1000 0 0 -53  105 1005 0 0 -53  20 | cut -d' ' -f1)" = "unknown:no-tx" ] \
+    || { echo "FAIL: radio: a window with too few tx frames must be unknown:no-tx, never clean (got '$(classify_radio 100 1000 0 0 -53 105 1005 0 0 -53 20)')"; f=1; }
+  # RE-ASSOCIATION. On this node the counters are since-association and association is measured in
+  # minutes (a read 4 minutes after one saying 2718s said 55s), so this arm is the routine case here,
+  # not the exotic one: connected time going BACKWARDS means the differences are meaningless.
+  [ "$(classify_radio 2718 900000 40 7 -53  55 3000 0 0 -52  20 | cut -d' ' -f1)" = "unknown:reassoc" ] \
+    || { echo "FAIL: radio: an association restart inside the window must be unknown:reassoc — its counters reset, and the raw difference would read as a huge clean window"; f=1; }
+  [ "$(classify_radio 100 1000 5 2 -53  105 900 5 2 -53  20 | cut -d' ' -f1)" = "unknown:counter-reset" ] \
+    || { echo "FAIL: radio: a counter going backwards without a reassoc must be unknown, never clean"; f=1; }
+  [ "$(classify_radio '' '' '' '' ''  '' '' '' '' ''  20)" = "unknown:unreadable" ] \
+    || { echo "FAIL: radio: an unreadable sample must be unknown:unreadable, never clean"; f=1; }
+  # APPLICABILITY. The leg qualifies a FIRST-HOP fault and nothing else, and every skip NAMES itself.
+  [ "$(read_radio OK hop1-bad)" = "n/a:quality-OK" ] \
+    || { echo "FAIL: radio: nothing to attribute on a quality-OK read"; f=1; }
+  [ "$(read_radio BAD beyond-hop1)" = "n/a:beyond-hop1" ] \
+    || { echo "FAIL: radio: a fault measured PAST the gateway says nothing about our radio"; f=1; }
+  [ "$(read_radio BAD '?')" = "n/a:where-?" ] \
+    || { echo "FAIL: radio: an unlocalized fault must name that it is unlocalized, not fall through to a sample"; f=1; }
+  # WIRED: read_radio must actually REACH the classifier on a hop1-bad read (the arms above prove the
+  # classifier, they cannot prove anything calls it — a fixture-driven gate cannot cover the live path).
+  [ "$(MESH_EGATTR_RADIO_FIX1='100 1000 5 2 -53' MESH_EGATTR_RADIO_FIX2='105 2000 5 2 -53' read_radio BAD hop1-bad | cut -d' ' -f1)" = clean ] \
+    || { echo "FAIL: radio: read_radio did not reach classify_radio on a hop1-bad read"; f=1; }
+  # where= comes off the tape's LAST QUALITY line, and a stale tape is not a reading.
+  _wd=$(mktemp -d)
+  printf '2026-08-26T20:00:00Z QUALITY BAD where=beyond-hop1 loss=0%% avg=300ms\n2026-08-26T20:03:00Z QUALITY BAD where=hop1-bad loss=0%% avg=520ms\n' > "$_wd/q.log"
+  [ "$(MESH_EGATTR_QLOG_FILE="$_wd/q.log" read_where)" = "hop1-bad" ] \
+    || { echo "FAIL: radio: read_where must take the LAST QUALITY line's leg, not the first"; f=1; }
+  touch -d '2 hours ago' "$_wd/q.log" 2>/dev/null
+  [ "$(MESH_EGATTR_QLOG_FILE="$_wd/q.log" read_where)" = "?" ] \
+    || { echo "FAIL: radio: a stale quality tape must render ? — a two-hour-old localization is not this run's leg"; f=1; }
+  rm -rf "$_wd"
+  # REAL HARDWARE READ, where there is hardware. Reachability is not producing: the arms above are all
+  # fixtures, and a wireless node whose station dump stopped parsing would keep them all green.
+  if command -v iw >/dev/null 2>&1 && _ri=$(radio_iface); then
+    _rs=$(radio_sample "$_ri")
+    case "$_rs" in
+      [0-9]*' '[0-9]*' '[0-9]*' '[0-9]*' '*) : ;;
+      *) echo "FAIL: radio: live station read on $_ri did not parse (got '$_rs') — the fixtures cannot see this"; f=1 ;;
+    esac
+  else
+    echo "NOTE: radio live-read leg SKIPPED (no iw or no wireless iface here) — this node reads n/a by design." >&2
+  fi
   [ "$f" = 0 ] && echo "smoke-test: PASS" || { echo "smoke-test: FAIL"; exit 1; }
   exit 0
 }
@@ -108,13 +287,24 @@ classify(){  # $1=quality $2=swap $3=load_norm $4=load_norm_hot -> verdict
 q=$(read_quality)
 swap=$(read_swap)
 ln=$(read_load_norm)
+where=$(read_where)
 verdict=$(classify "$q" "$swap" "$ln" "$LOAD_NORM_HOT")
+radio=$(read_radio "$q" "$where")
+
+# The gloss is the whole point of the leg, so it is printed where the reader is — but ONLY when the
+# combination actually holds, and it carries no `key=` of its own (a scraper reading this tape takes
+# the LAST match of a greedy key, so prose that looks like a field would be read as one).
+gloss=""
+case "$verdict:${radio%% *}" in
+  NETWORK-DEGRADED:clean) gloss=" — first hop degraded while our frames left on the first attempt: the delay is added PAST our radio (airtime/AP/router), not by our tx path" ;;
+  NETWORK-DEGRADED:implicated) gloss=" — first hop degraded AND our tx path is retrying: our radio is in the story" ;;
+esac
 
 if [ "${1:-}" = --json ]; then
-  printf '{"verdict":"%s","quality":"%s","swap":"%s","load_norm":"%s","load_norm_hot":%s}\n' \
-    "$verdict" "$q" "$swap" "$ln" "$LOAD_NORM_HOT"
+  printf '{"verdict":"%s","quality":"%s","swap":"%s","load_norm":"%s","load_norm_hot":%s,"where":"%s","radio":"%s"}\n' \
+    "$verdict" "$q" "$swap" "$ln" "$LOAD_NORM_HOT" "$where" "$radio"
 else
-  printf '%s (quality=%s swap=%s load_norm=%s/hot=%s)\n' "$verdict" "$q" "$swap" "$ln" "$LOAD_NORM_HOT"
+  printf '%s (quality=%s swap=%s load_norm=%s/hot=%s where=%s radio=%s)%s\n' "$verdict" "$q" "$swap" "$ln" "$LOAD_NORM_HOT" "$where" "$radio" "$gloss"
 fi
 
 [ "$verdict" = DEGRADED ] && exit 2
