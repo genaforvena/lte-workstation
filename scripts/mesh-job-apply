@@ -46,7 +46,7 @@ Sends real applications under the operator's own name, so every guard here is lo
 Ranking is deterministic: salary floor, keyword weight against his profile, seniority match,
 penalty for a missing salary. Nothing here asks a model what a good job is.
 """
-import argparse, json, os, pathlib, re, shutil, subprocess, sys, tempfile, time
+import argparse, fcntl, json, os, pathlib, re, shutil, subprocess, sys, tempfile, time
 
 import signal
 
@@ -1074,6 +1074,75 @@ def finalize(results, letters, filed, today):
 
 
 # ---------------------------------------------------------------- снятие причины
+# ── SINGLE WRITER ───────────────────────────────────────────────────────────────────────────────
+# THIS LANE HAS THREE SHARED, UNSYNCHRONISED RESOURCES AND NO LOCK UNTIL 2026-08-26: the operator's
+# ONE hh login driven through ONE browser daemon, the board file this rewrites BY ROW INDEX, and the
+# daily budget, which every run computes as `CAP - sent_today(...)` from a board it read at start.
+# Two concurrent runs therefore each see the FULL remaining budget and can together file more
+# applications than the cap the operator set — and their verbs interleave in one browser, which is
+# how 2026-08-20 filed four applications with no cover letter (see mesh-hh-drive's census comment:
+# `click response` fired in one page while `type letter` went to another). That census fixed
+# multiple ENGINES; nothing fixed multiple CLIENTS of one engine.
+#
+# THE ANSWER TO A SECOND WRITER IS A LOCK, NOT A KILL. A kill loses whatever the victim had already
+# done and leaves no artifact naming who did it; a lock makes the second writer WAIT for a resource
+# it cannot share, and if it cannot wait long enough it DECLINES loudly, naming the holder.
+#
+# The wait matters as much as the exclusion: a scheduled run that returns immediately because a hand
+# was mid-batch has silently dropped that slot's applications, and `mesh-cron-catchup` claims a slot
+# before it fires, so nothing re-runs it. Waiting turns a collision into a delay; refusing turns it
+# into a lost day.
+#
+# The lock dies with the process — no stale-pid reaping to get wrong, because flock is released by
+# the kernel when the fd closes, including on SIGKILL. Python opens the fd non-inheritable (PEP 446),
+# so the long-lived browser daemon this starts does NOT carry the lock past our exit; that is
+# asserted in --test, because a lock a child inherits is a lock nobody can ever take again.
+# [[a-killed-process-does-not-release-a-lock-its-children-inherited]]
+APPLY_LOCK = MESH / "job" / ".apply.lock"
+LOCK_WAIT = float(node_env("MESH_JOB_LOCK_WAIT", "1500"))
+
+
+def hold_the_lane(mode, wait_s=None):
+    """Take the single-writer lock over the hh drive, the board and the daily budget.
+
+    -> (fd, "") on success; (None, why) when another writer held it for the whole wait. The fd must
+    stay referenced for the life of the process: closing it releases the lock.
+    """
+    wait_s = LOCK_WAIT if wait_s is None else wait_s
+    try:
+        APPLY_LOCK.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(APPLY_LOCK), os.O_RDWR | os.O_CREAT, 0o644)
+    except OSError as e:
+        # Never fail OPEN on a lock we could not even create: a lane that applies under the
+        # operator's name when its guard is broken is worse than a lane that stops and says so.
+        return None, "не удалось открыть замок %s: %s" % (APPLY_LOCK, e)
+    t0 = time.time()
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            os.ftruncate(fd, 0)
+            os.write(fd, ("pid=%d mode=%s since=%s\n" % (
+                os.getpid(), mode,
+                time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))).encode())
+            os.fsync(fd)
+            return fd, ""
+        except OSError:
+            pass
+        left = wait_s - (time.time() - t0)
+        if left <= 0:
+            # NAME THE HOLDER. "resource busy" sends a reader to guess; the holder's own line says
+            # which pid, which mode and since when, so the collision is diagnosable from the log
+            # the loser wrote. [[a-collapsed-reason-makes-blind-and-quiet-identical]]
+            try:
+                who = os.pread(fd, 200, 0).decode("utf-8", "replace").strip() or "(нет записи)"
+            except OSError:
+                who = "(не прочиталось)"
+            os.close(fd)
+            return None, ("замок %s занят весь таймаут %.0fs — держит: %s"
+                          % (APPLY_LOCK, wait_s, who))
+        time.sleep(min(5.0, left))
+
+
 RETRY_DAYS = float(node_env("MESH_JOB_RETRY_DAYS", "1"))
 RETRY_MAX = int(node_env("MESH_JOB_RETRY_MAX", "3"))
 
@@ -1699,6 +1768,99 @@ def selftest():
           bool(ids) and all(i.isdigit() for i in ids))
     check("...and at least one of them is an application the board recorded",
           bool(ids & board_sent) if board_sent else True)
+    # ── THE SINGLE-WRITER LOCK ──────────────────────────────────────────────────────────────────
+    # Every arm runs against a SANDBOX lock path, never the live one: a suite that takes the real
+    # lane would either block behind a live batch or, worse, hold it while asserting.
+    global APPLY_LOCK
+    _keep_lock = APPLY_LOCK
+    _ld = tempfile.mkdtemp(prefix="job-apply-lock-")
+    try:
+        APPLY_LOCK = pathlib.Path(_ld) / "sub" / ".apply.lock"
+        fd1, why1 = hold_the_lane("first", wait_s=1.0)
+        check("the lane lock is takeable, and creates its own directory", fd1 is not None and not why1)
+        fd2, why2 = hold_the_lane("second", wait_s=0.0)
+        check("a SECOND writer in the same process cannot take a held lane", fd2 is None)
+        # The refusal must be diagnosable. "busy" alone sends the reader guessing; the holder's own
+        # line says pid, mode and since-when.
+        check("...and the refusal NAMES the holder rather than just saying busy",
+              fd2 is None and "pid=%d" % os.getpid() in why2 and "mode=first" in why2)
+
+        # THE LOAD-BEARING ARM: a lock a CHILD inherits is a lock nobody can take again, and this
+        # tool starts a browser daemon that outlives it by design. Assert the fd is not inherited by
+        # driving a real child that tries to take the lane AFTER we have released it.
+        # [[a-killed-process-does-not-release-a-lock-its-children-inherited]]
+        _hold = subprocess.Popen(
+            [sys.executable, "-c",
+             "import fcntl,os,sys,time\n"
+             "fd=os.open(sys.argv[1],os.O_RDWR|os.O_CREAT,0o644)\n"
+             "fcntl.flock(fd,fcntl.LOCK_EX)\n"
+             "sys.stdout.write('held\\n');sys.stdout.flush()\n"
+             "time.sleep(30)\n", str(APPLY_LOCK)],
+            stdout=subprocess.PIPE, text=True)
+        try:
+            os.close(fd1)                      # release ours; the child now holds it
+            _hold.stdout.readline()
+            fd3, why3 = hold_the_lane("third", wait_s=1.0)
+            check("a lane held by ANOTHER PROCESS is refused, not silently shared", fd3 is None)
+            # and the wait is a real wait, not a spin that returns instantly
+            _t0 = time.time()
+            fd4, _ = hold_the_lane("fourth", wait_s=3.0)
+            check("the loser WAITS for the bound it was given before declining",
+                  fd4 is None and time.time() - _t0 >= 2.5)
+        finally:
+            _hold.kill()
+            _hold.wait()
+        # The kernel releases a flock when the holder dies, however it dies — no stale-pid reaping.
+        fd5, _ = hold_the_lane("fifth", wait_s=5.0)
+        check("a lane whose holder was KILLED is takeable again (no stale lock to reap)",
+              fd5 is not None)
+        if fd5 is not None:
+            os.close(fd5)
+        # A lock that cannot be created must FAIL CLOSED. Applying under the operator's name with a
+        # broken guard is the one outcome worse than not applying.
+        APPLY_LOCK = pathlib.Path(_ld) / "not-a-dir" / "x" / ".apply.lock"
+        open(str(pathlib.Path(_ld) / "not-a-dir"), "w").close()   # a FILE where a dir must be
+        fd6, why6 = hold_the_lane("sixth", wait_s=0.0)
+        check("an unopenable lock fails CLOSED, and says why", fd6 is None and "замок" in why6)
+    finally:
+        APPLY_LOCK = _keep_lock
+        shutil.rmtree(_ld, ignore_errors=True)
+
+    # THE GATE IS ONLY REAL IF main() IS BEHIND IT. A suite that proves the primitive works while
+    # nothing calls it tests a different predicate than the one that runs; and a SOURCE-TEXT check
+    # here would be satisfied by this very comment. So drive the real entry point against the real
+    # lock: hold the live lane from a child, run `--dry` (which sends nothing) and read its verdict.
+    # [[a-source-text-gate-is-satisfied-by-its-own-explanatory-prose]]
+    _probe = subprocess.Popen(
+        [sys.executable, "-c",
+         "import fcntl,os,sys,time\n"
+         "fd=os.open(sys.argv[1],os.O_RDWR|os.O_CREAT,0o644)\n"
+         "try:\n"
+         "    fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)\n"
+         "except OSError:\n"
+         "    sys.stdout.write('BUSY\\n');sys.stdout.flush();sys.exit(0)\n"
+         "os.ftruncate(fd,0);os.write(fd,b'pid=probe mode=selftest-holder since=now\\n')\n"
+         "sys.stdout.write('held\\n');sys.stdout.flush()\n"
+         "time.sleep(120)\n", str(APPLY_LOCK)],
+        stdout=subprocess.PIPE, text=True)
+    try:
+        _held = (_probe.stdout.readline().strip() == "held")
+        if not _held:
+            # A live batch already holds the lane. The arm cannot run — say so; a skipped arm that
+            # renders green is the forgery this suite exists to prevent.
+            check("LANE GATE: not asserted — the live lane is held by a real batch (re-run later)",
+                  False)
+        else:
+            _r = subprocess.run([sys.executable, os.path.abspath(__file__), "--dry"],
+                                capture_output=True, text=True, timeout=180)
+            check("LANE GATE: a real run DECLINES (rc=2) while another writer holds the lane",
+                  _r.returncode == 2 and "замок" in _r.stderr)
+            check("...and its refusal names the holder it lost to, not a bare 'busy'",
+                  "mode=selftest-holder" in _r.stderr)
+    finally:
+        _probe.kill()
+        _probe.wait()
+
     print("      live: %d application(s) visible to the verifier, %d also on the board"
           % (len(ids), len(ids & board_sent)))
     return rc
@@ -1751,6 +1913,21 @@ def main():
                                           r["employer"][:24], why))
         print("\nв needs-human: %d" % len(held))
         return 0
+    # EVERY MODE PAST THIS POINT EITHER DRIVES THE BROWSER OR REWRITES THE BOARD BY ROW INDEX, so
+    # each one takes the lane. The read-only modes above (--reasons, --resolve-check, --test, help)
+    # deliberately do not: a lock they cannot need would make a diagnostic block behind a live batch.
+    # --dry IS NOT EXEMPT. It sends nothing, but sync_blacklist() below rewrites blacklist.txt whole
+    # between its markers on every run including a dry one, and two whole-file rewrites clobber. It
+    # gets a SHORT wait instead of the batch wait: a diagnostic that blocks 25 minutes behind a live
+    # batch is useless, and declining tells the hand exactly what is going on.
+    _lock_fd = None                                  # held for the life of the process; never closed
+    _lock_fd, _why = hold_the_lane(" ".join(sys.argv[1:]) or "(no-args)",
+                                   wait_s=20.0 if a.dry else None)
+    if _lock_fd is None:
+        # 2 is this mesh's n/a: this node/lane declined, it did not fault. mesh-cron-catchup tags
+        # rc=2 apart in the board line it raises, so a collision reads as a collision.
+        print("n/a: " + _why, file=sys.stderr)
+        return 2
     if a.backfill_reasons:
         return do_backfill(a.dry, time.strftime("%Y-%m-%d"))
     if a.reopen:
