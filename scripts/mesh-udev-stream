@@ -204,6 +204,105 @@ leak_census(){   # prints "<families> <procs>" — families = distinct foreign l
 # The pgid of a pid, read from /proc (field 3 after the comm parenthesis) rather than `ps -o pgid=`.
 pgid_of(){ sed -n 's/.*) //p' "/proc/$1/stat" 2>/dev/null | awk '{print $3}'; }
 
+# --- reaping a listener family --------------------------------------------------------------------
+# NEVER `kill -- -PGID` on faith. THE PROCESS GROUP IS NOT THE FAMILY. A daemon started by hand from
+# an interactive session — `mesh-udev-stream --daemon` typed at an ssh prompt — inherits the SSH
+# SESSION's process group, so its "group" is the login shell, sshd's child, and whatever else that
+# session ever started. Measured 2026-08-27 on phaedra: `timeout 60 mesh-udev-stream --reap-orphans`
+# run over tailscale-SSH at 02:08:39Z reached tailscaled itself at 02:08:41Z ("tailscaled got signal
+# terminated", NRestarts=0, no systemd "Stopping" line) and took the node off the tailnet for 14h20m
+# — a group kill that severed the very channel it was issued over, which is the self-defeating-change
+# gate in CLAUDE.md failing from inside a reflex instead of from a routing edit.
+# So the group counts as the family ONLY when its LEADER is itself one of our daemons. Otherwise the
+# family is the listener pid and its own descendants, signalled pid by pid, and the rest of that
+# group — the shell, sshd, tailscaled — is never touched. pid<=1, our own pid, our own ancestors and
+# our own process group are hard refusals in both modes.
+is_daemon_pid(){ case "$(tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null)" in *mesh-udev-stream*--daemon*) return 0;; *) return 1;; esac; }
+
+# ppid from /proc/PID/stat, field 2 after the comm parenthesis (the comm can contain spaces AND
+# parens, so everything up to the LAST ')' is dropped — same reason pgid_of does it this way).
+ppid_of(){ sed -n 's/.*) //p' "/proc/$1/stat" 2>/dev/null | awk '{print $2}'; }
+
+# " $root <every descendant> " — one pass over /proc, then a bounded transitive closure. The udevadm
+# holding the udev socket and the gawk folding it are CHILDREN of the daemon shell, so killing the
+# parent alone orphans them with nothing draining the socket; that is why the family, not the pid,
+# is the unit — and why the answer to a foreign group is a narrower walk, never a wider signal.
+family_pids(){
+  # each `local` on its own line: bash declares every name in a single `local` before running its
+  # assignments, so `local root="$1" acc=" $root "` reads root as UNSET and dies under `set -u`.
+  local root="$1"
+  local p pid pp added=1 depth=0 i
+  local acc=" $root "
+  local -a PA=() QA=()
+  for p in /proc/[0-9]*; do
+    pid="${p#/proc/}"
+    pp="$(ppid_of "$pid")" || continue
+    [ -n "$pp" ] || continue
+    PA+=( "$pid" ); QA+=( "$pp" )
+  done
+  # `set --` is deliberately NOT used to iterate these: inside a function it rewrites the function's
+  # own argv, and this file has already paid for that class once (set-dash-dash-in-a-loop-reassigns-
+  # the-scripts-argv). Arrays, indexed in lockstep.
+  while [ "$added" = 1 ] && [ "$depth" -lt 32 ]; do
+    added=0; depth=$((depth+1))
+    for i in "${!PA[@]}"; do
+      case "$acc" in *" ${PA[$i]} "*) continue;; esac
+      case "$acc" in *" ${QA[$i]} "*) acc="$acc${PA[$i]} "; added=1;; esac
+    done
+  done
+  printf '%s' "$acc"
+}
+
+# " 0 1 <us> <our parent> ... " — the pids no reap may ever signal. On phaedra the ssh/tailscaled
+# ancestor was exactly in here, which is what makes this list the gate and not a courtesy.
+self_ancestry(){
+  local p=$$ n=0 out=" 0 1 "
+  while [ -n "$p" ] && [ "${p:-0}" -gt 1 ] 2>/dev/null && [ "$n" -lt 64 ]; do
+    out="$out$p "; p="$(ppid_of "$p")"; n=$((n+1))
+  done
+  printf '%s' "$out"
+}
+
+SELF_PGID="$(pgid_of $$)"; [ -n "$SELF_PGID" ] || SELF_PGID=0
+
+# reap_family <listener-pid> [signal] — sets REAP_MODE to group|walk:<n>|refused:<why>, rc 0 if it
+# signalled anything. Every refusal is LOUD on stderr: a reaper that silently declines is a reaper
+# whose gate nobody has seen fire.
+REAP_MODE=refused
+reap_family(){
+  local pid="${1:-}" sig="${2:--TERM}"
+  REAP_MODE="refused:none"
+  [ -n "$pid" ] && [ "${pid:-0}" -gt 1 ] 2>/dev/null \
+    || { REAP_MODE="refused:pid<=1"; printf 'reap: REFUSED pid %s — pid 1 or invalid; a signal here reaches init\n' "${pid:-?}" >&2; return 1; }
+  [ -r "/proc/$pid/cmdline" ] || { REAP_MODE="refused:gone"; return 1; }
+  is_daemon_pid "$pid" \
+    || { REAP_MODE="refused:not-a-daemon"; printf 'reap: REFUSED pid %s — not a mesh-udev-stream --daemon (pid reuse)\n' "$pid" >&2; return 1; }
+  local taboo; taboo="$(self_ancestry)"
+  case "$taboo" in *" $pid "*)
+    REAP_MODE="refused:self-or-ancestor"; printf 'reap: REFUSED pid %s — it is us or one of our own ancestors\n' "$pid" >&2; return 1;; esac
+  local g; g="$(pgid_of "$pid")"; [ -n "$g" ] || g="$pid"
+  if [ "$g" != "$SELF_PGID" ] && [ "${g:-0}" -gt 1 ] 2>/dev/null && is_daemon_pid "$g"; then
+    # the group LEADER is one of our own daemons, so this group IS the family and nothing else
+    kill "$sig" -- -"$g" 2>/dev/null
+    REAP_MODE=group
+    return 0
+  fi
+  # foreign (or dead) group leader: the group belongs to somebody else — a login shell, sshd,
+  # tailscaled. Walk this listener's own descendants instead. It is narrower than the group by
+  # construction, and narrow is the only safe direction here.
+  printf 'reap: pid %s sits in FOREIGN group %s (leader is not a mesh-udev-stream --daemon) — walking its own descendants instead of signalling the group\n' \
+    "$pid" "$g" >&2
+  local fam k n=0
+  fam="$(family_pids "$pid")"
+  for k in $fam; do
+    case "$taboo" in *" $k "*) continue;; esac
+    [ "${k:-0}" -gt 1 ] 2>/dev/null || continue
+    kill "$sig" "$k" 2>/dev/null && n=$((n+1))
+  done
+  REAP_MODE="walk:$n"
+  [ "$n" -gt 0 ]
+}
+
 # --- the listener ---------------------------------------------------------------------------------
 # One udevadm, one gawk folding each property block into one line, one appending shell that rotates.
 # gawk (not mawk) for systime()/strftime(); without it we render an honest n/a rather than a stream
@@ -302,11 +401,12 @@ stop_listener(){
   # The whole PROCESS GROUP, because the readers of the pipe (udevadm, gawk, the appending shell) are
   # the part that actually holds the udev socket: killing the parent alone orphans them, and an
   # orphaned udevadm monitor lives forever with nothing draining it.
-  local pgid; pgid="$(ps -o pgid= -p "$pid" 2>/dev/null | tr -dc '0-9')"
-  [ -n "$pgid" ] || pgid="$pid"
-  kill -TERM -- -"$pgid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
+  # ...via reap_family, which refuses to signal a group whose LEADER is not one of our daemons. This
+  # path is pidfile-scoped and still needed the gate: a listener started by hand over ssh carries the
+  # SSH session's group, so `--stop` on it would have killed the session it was typed in.
+  reap_family "$pid" -TERM
   local i; for i in 1 2 3 4 5 6 7 8 9 10; do listener_alive || { rm -f "$PIDF"; echo "listener: stopped"; return 0; }; sleep 0.3; done
-  kill -KILL -- -"$pgid" 2>/dev/null
+  reap_family "$pid" -KILL
   for i in 1 2 3 4 5; do listener_alive || { rm -f "$PIDF"; echo "listener: stopped (KILL)"; return 0; }; sleep 0.3; done
   echo "listener: still holding the lock after TERM+KILL"; return 1
 }
@@ -527,15 +627,14 @@ run_test(){
   # families were live on mesh-home when this was written. A test that leaks is not green.
   REAP_DIRS=""
   reap_sandbox(){   # kill the family armed under a sandbox dir, scoped by ITS OWN pidfile
-    local dir="$1" pid pgid i
+    local dir="$1" pid i
     { pid="$(tr -dc '0-9' < "$dir/e.pid")"; } 2>/dev/null || return 0
     [ -n "$pid" ] || return 0
     # the pid is only trusted while it still names a listener (pids are reused) — same rule as --stop
     case "$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)" in *mesh-udev-stream*--daemon*) : ;; *) return 0;; esac
-    pgid="$(pgid_of "$pid")"; [ -n "$pgid" ] || pgid="$pid"
-    kill -TERM -- -"$pgid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
+    reap_family "$pid" -TERM 2>/dev/null || :
     for i in 1 2 3 4 5 6 7 8 9 10; do [ -d "/proc/$pid" ] || return 0; sleep 0.2; done
-    kill -KILL -- -"$pgid" 2>/dev/null
+    reap_family "$pid" -KILL 2>/dev/null || :
     return 0
   }
   test_reap_all(){ local d; for d in $REAP_DIRS; do reap_sandbox "$d"; done; }
@@ -550,7 +649,7 @@ run_test(){
   # by fd 9 against the registered dirs — the same instrument as the census, which needs no pidfile
   # and no cooperation from a process that was never registered anywhere.
   reap_under_dirs(){
-    local p c fd d pid pgid hit
+    local p c fd d pid hit
     for p in /proc/[0-9]*; do
       { c="$(tr '\0' ' ' < "$p/cmdline")"; } 2>/dev/null || continue
       case "$c" in *mesh-udev-stream*--daemon*) : ;; *) continue;; esac
@@ -558,8 +657,8 @@ run_test(){
       fd="${fd% (deleted)}"; hit=0
       for d in $REAP_DIRS; do case "$fd" in "$d"/*) hit=1;; esac; done
       [ "$hit" = 1 ] || continue
-      pid="${p#/proc/}"; pgid="$(pgid_of "$pid")"; [ -n "$pgid" ] || pgid="$pid"
-      kill -TERM -- -"$pgid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
+      pid="${p#/proc/}"
+      reap_family "$pid" -TERM 2>/dev/null || :
     done
   }
   test_clean_all(){ local d
@@ -804,6 +903,86 @@ run_test(){
   case "$out" in *"leak-census: leaked=$pre_f"*) : ;; *) F "--status still reports the reaped orphan (got: $(printf '%s' "$out" | tail -2 | tr '\n' ' '))";; esac
   rm -rf "$sb4"
 
+
+  # (11c) THE PROCESS GROUP IS NOT THE FAMILY — the phaedra incident, driven. On 2026-08-27 a
+  #       `mesh-udev-stream --reap-orphans` issued over tailscale-SSH signalled tailscaled (02:08:41Z,
+  #       "got signal terminated", NRestarts=0, no systemd Stopping line) and left the node off the
+  #       tailnet for 14h20m: the orphan it was reaping had been started by hand from that ssh
+  #       session, so it carried the SESSION's pgid and `kill -TERM -- -PGID` reached everything in
+  #       it. An assertion that only counts REAPED processes cannot see this failure — the whole
+  #       defect is what ELSE died — so the gate below is a CANARY in the orphan's group that must
+  #       still be alive afterwards, plus a group LEADER that is not one of our daemons.
+  #       The fixture is built with MESH_UDEV_STREAM_NO_SETSID because --daemon now setsids itself;
+  #       without that escape the foreign-group case can no longer be constructed at all, which is
+  #       exactly the point of the second half of this fix.
+  local sbG; sbG="$(mktemp -d)"
+  REAP_DIRS="$REAP_DIRS $sbG"
+  cat > "$sbG/fix.sh" <<'FIXEOF'
+#!/usr/bin/env bash
+# runs as a NEW session leader: pid == pgid == sid, and it is a plain bash — NOT a
+# mesh-udev-stream --daemon. Everything below shares its process group.
+d="$1"
+echo $$ > "$d/leader.pid"
+sleep 300 >/dev/null 2>&1 &                       # THE CANARY: tailscaled's stand-in
+echo $! > "$d/canary.pid"
+# the orphan listener: holds fd 9 on a lock that is not the node's, wears the daemon cmdline, and
+# has a child of its own (the udevadm/gawk half of a real family).
+bash -c 'exec 9>>"$1/e.lock"; sleep 300 >/dev/null 2>&1 & echo $! > "$1/child.pid"; exec -a "mesh-udev-stream --daemon" sleep 300' _ "$d" &
+echo $! > "$d/orphan.pid"
+sleep 300
+FIXEOF
+  chmod +x "$sbG/fix.sh"
+  setsid bash "$sbG/fix.sh" "$sbG" >/dev/null 2>&1 &
+  local gi
+  for gi in 1 2 3 4 5 6 7 8 9 10; do [ -s "$sbG/child.pid" ] && break; sleep 0.3; done
+  local G_LEAD G_CAN G_ORPH G_CHILD
+  G_LEAD="$(tr -dc '0-9' < "$sbG/leader.pid" 2>/dev/null)"
+  G_CAN="$(tr -dc '0-9' < "$sbG/canary.pid" 2>/dev/null)"
+  G_ORPH="$(tr -dc '0-9' < "$sbG/orphan.pid" 2>/dev/null)"
+  G_CHILD="$(tr -dc '0-9' < "$sbG/child.pid" 2>/dev/null)"
+  if [ -z "$G_ORPH" ] || [ -z "$G_CAN" ] || [ -z "$G_CHILD" ]; then
+    F "the foreign-group fixture did not arm (leader=$G_LEAD canary=$G_CAN orphan=$G_ORPH child=$G_CHILD) — the reaper's most dangerous path is UNTESTED, which is worse than a red arm"
+  else
+    # the fixture must actually be foreign, or this arm proves nothing: the orphan's group leader is
+    # the plain bash above, and it is NOT a listener.
+    local G_PG; G_PG="$(pgid_of "$G_ORPH")"
+    [ "$G_PG" = "$G_LEAD" ] || F "the fixture's orphan is not in the leader's group (pgid=$G_PG leader=$G_LEAD) — this arm would pass for the wrong reason"
+    is_daemon_pid "$G_LEAD" && F "the fixture's group leader wears the daemon cmdline — then the group IS the family and this arm cannot see the bug"
+    is_daemon_pid "$G_ORPH" || F "the fixture's orphan does not read as a mesh-udev-stream --daemon, so the reaper would skip it for the wrong reason"
+    # REAP IT. rc and mode are asserted too: a group kill here is the incident.
+    reap_family "$G_ORPH" -TERM 2>/dev/null
+    case "$REAP_MODE" in walk:*) : ;; *) F "reap_family took mode '$REAP_MODE' on an orphan in a FOREIGN group — anything but a descendant walk signals processes that are not ours (this is the phaedra cut-off)";; esac
+    for gi in 1 2 3 4 5 6 7 8 9 10; do [ -d "/proc/$G_ORPH" ] || break; sleep 0.2; done
+    [ -d "/proc/$G_ORPH" ] && F "the orphan listener survived the reap"
+    [ -d "/proc/$G_CHILD" ] && F "the orphan's own CHILD survived — killing the parent alone orphans the udevadm that holds the udev socket"
+    # THE GATE. Everything above can be satisfied by a group kill; only these two cannot.
+    [ -d "/proc/$G_CAN" ] || F "THE CANARY IN THE ORPHAN'S PROCESS GROUP WAS KILLED — a reap that signals the group signals whatever else shares it; on phaedra that was tailscaled, 14h20m off the tailnet"
+    [ -d "/proc/$G_LEAD" ] || F "the orphan's GROUP LEADER (a plain bash, not a listener) was killed — the group is not the family"
+    kill -TERM "$G_LEAD" "$G_CAN" 2>/dev/null || :
+    kill -KILL -- -"$G_LEAD" 2>/dev/null || :
+  fi
+  rm -rf "$sbG"
+
+  # (11d) ...and the cure at the source: a --daemon typed by hand must not INHERIT a group at all.
+  #       Started plainly (no setsid in front of it), it must still come up as its own group leader,
+  #       so a future orphan can never sit in an ssh session's group again.
+  local sbS; sbS="$(mktemp -d)"
+  REAP_DIRS="$REAP_DIRS $sbS"
+  local ES=( "MESH_UDEV_STREAM_LOG=$sbS/e.log" "MESH_UDEV_STREAM_STATE=$sbS/e.state" "MESH_UDEV_STREAM_BASE=$sbS/e.base"
+             "MESH_UDEV_STREAM_LOCK=$sbS/e.lock" "MESH_UDEV_STREAM_STARTF=$sbS/e.start" "MESH_UDEV_STREAM_DLOG=$sbS/e.dlog"
+             "MESH_UDEV_STREAM_MARK=$sbS/e.mark" "MESH_UDEV_STREAM_PIDF=$sbS/e.pid" "MESH_UDEV_STREAM_CHAT=0" )
+  env "${ES[@]}" bash "${BASH_SOURCE[0]}" --daemon >/dev/null 2>&1 &
+  for gi in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do [ -s "$sbS/e.pid" ] && break; sleep 0.3; done
+  local S_PID S_PG; S_PID="$(tr -dc '0-9' < "$sbS/e.pid" 2>/dev/null)"
+  if [ -n "$S_PID" ] && [ -d "/proc/$S_PID" ]; then
+    S_PG="$(pgid_of "$S_PID")"
+    [ "$S_PG" = "$S_PID" ] || F "a --daemon started WITHOUT setsid came up in group $S_PG instead of its own ($S_PID) — it inherited its launcher's process group, which is how the phaedra orphan got into tailscaled's"
+    reap_family "$S_PID" -TERM 2>/dev/null || :
+  else
+    F "the plain --daemon wrote no pidfile within 4.5s, so its process group is unmeasured"
+  fi
+  rm -rf "$sbS"
+
   # (12) THE SLOT SPLIT — the regression this section exists for. EVENTS and GAP shared one marker
   #       and one debounce, so the verdict that fires often (GAP, which has a permanent structural
   #       floor) evicted the verdict that names a device (EVENTS) for up to 30 minutes. Driven here
@@ -913,7 +1092,20 @@ run_test(){
 
 case "${1:-}" in
   --test)    run_test ;;
-  --daemon)  daemon; exit $? ;;
+  --daemon)  # OWN THE PROCESS GROUP. `ensure` starts us under `setsid nohup`, but a daemon typed by
+             # hand at an ssh prompt inherits THAT SESSION's group — and a later --reap-orphans then
+             # signals the whole login session (phaedra, 2026-08-27: tailscaled, 14h20m off the
+             # tailnet). The reaper's gate below refuses that group now, but the cure at the source is
+             # to never inherit a foreign group in the first place. setsid(1) only forks when the
+             # caller is already a group leader; we exec it exactly when we are NOT, so the pid — and
+             # therefore the pidfile every scope in this file is pinned to — is preserved.
+             # MESH_UDEV_STREAM_NO_SETSID exists so --test can BUILD a foreign-group orphan to drive
+             # the reaper's gate red; nothing else sets it.
+             if [ -z "${MESH_UDEV_STREAM_NO_SETSID:-}" ] && [ "$(pgid_of $$)" != "$$" ] \
+                && command -v setsid >/dev/null 2>&1; then
+               exec setsid bash "${BASH_SOURCE[0]}" --daemon
+             fi
+             daemon; exit $? ;;
   --ensure)  ensure; exit $? ;;
   --stop)    stop_listener; exit $? ;;
   --check)   pass 0; exit $? ;;
@@ -936,18 +1128,26 @@ case "${1:-}" in
              # $LOCKF — which is the right scope for orphans and also, deliberately, would take out a
              # --test's live sandbox listener. The node's real reflex is excluded by the same fd-9
              # comparison the census uses, not by a name match.
-             rp_n=0
+             # EVERY signal goes through reap_family, which treats the process group as the family
+             # ONLY where the group LEADER is itself one of our daemons and otherwise walks the
+             # listener's own descendants. See the comment on reap_family: this loop is what took
+             # phaedra off the tailnet for 14h20m on 2026-08-27 by signalling tailscaled, which sat
+             # in the same group as a hand-started daemon. How each family was reaped is PRINTED, so
+             # a walk (the safe narrow path) is never silently indistinguishable from a group kill.
+             rp_n=0; rp_grp=0; rp_walk=0; rp_ref=0
              for rp_p in /proc/[0-9]*; do
                { rp_c="$(tr '\0' ' ' < "$rp_p/cmdline")"; } 2>/dev/null || continue
                case "$rp_c" in *mesh-udev-stream*--daemon*) : ;; *) continue;; esac
                rp_fd="$(readlink "$rp_p/fd/9" 2>/dev/null)" || continue
                rp_fd="${rp_fd% (deleted)}"
                [ -n "$rp_fd" ] && [ "$rp_fd" != "$LOCKF" ] || continue
-               rp_pid="${rp_p#/proc/}"; rp_g="$(pgid_of "$rp_pid")"; [ -n "$rp_g" ] || rp_g="$rp_pid"
-               # the whole process group: the udevadm holding the udev socket is a CHILD, and killing
-               # the parent alone orphans it with nothing draining it (same reason --stop does this).
-               kill -TERM -- -"$rp_g" 2>/dev/null || kill -TERM "$rp_pid" 2>/dev/null
-               rp_n=$((rp_n+1))
+               rp_pid="${rp_p#/proc/}"
+               if reap_family "$rp_pid" -TERM; then
+                 rp_n=$((rp_n+1))
+                 case "$REAP_MODE" in group) rp_grp=$((rp_grp+1));; walk:*) rp_walk=$((rp_walk+1));; esac
+               else
+                 rp_ref=$((rp_ref+1))
+               fi
              done
              sleep 1
              for rp_p in /proc/[0-9]*; do
@@ -956,12 +1156,12 @@ case "${1:-}" in
                rp_fd="$(readlink "$rp_p/fd/9" 2>/dev/null)" || continue
                rp_fd="${rp_fd% (deleted)}"
                [ -n "$rp_fd" ] && [ "$rp_fd" != "$LOCKF" ] || continue
-               rp_pid="${rp_p#/proc/}"; rp_g="$(pgid_of "$rp_pid")"; [ -n "$rp_g" ] || rp_g="$rp_pid"
-               kill -KILL -- -"$rp_g" 2>/dev/null
+               rp_pid="${rp_p#/proc/}"
+               reap_family "$rp_pid" -KILL || :
              done
              sleep 0.5
              rp_left="$(leak_census)"
-             echo "reap-orphans: signalled $rp_n orphan listener famil(y/ies) (whole process group each); census now ${rp_left%% *} famil(y/ies) / ${rp_left##* } proc(s)"
+             echo "reap-orphans: signalled $rp_n orphan listener famil(y/ies) ($rp_grp by process group whose leader is one of our daemons, $rp_walk by descendant walk because the group was FOREIGN, $rp_ref refused); census now ${rp_left%% *} famil(y/ies) / ${rp_left##* } proc(s)"
              [ "${rp_left%% *}" = 0 ] && exit 0 || exit 1 ;;
   --gap-floor)
              IFS='|' read -r gf_v gf_n gf_s <<<"$(gap_floor)"
