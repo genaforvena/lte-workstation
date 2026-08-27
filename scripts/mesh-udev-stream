@@ -84,10 +84,26 @@
 #   mesh-udev-stream --status   last reading + a LIVE orphan-listener census, no new read
 #   mesh-udev-stream --reap-orphans  kill every listener family holding a lock that is not ours
 #   mesh-udev-stream --tail [N] the last N named events (default 20)
+#   mesh-udev-stream --gap-floor    this node's own measured GAP floor + the corpus behind it
 #   mesh-udev-stream --daemon   the listener itself (foreground; refuses to double-start)
 #   mesh-udev-stream --ensure   start the listener if none holds the lock; print what it did
 #   mesh-udev-stream --stop     stop the listener
 #   mesh-udev-stream --test     every verdict from fixtures + a real listener capturing a real event
+#
+# WHERE A VERDICT GOES (fixed 2026-08-27, chat-review udev-stream-gap-and-events-share-one-debounce-
+# slot). EVENTS and GAP are boarded through SEPARATE markers under separate debounces, so neither
+# can evict the other — they used to share one file and one 30-minute window, and because GAP has
+# the permanent structural floor described above it fires far more often than a named device event
+# does, so it was crowding the naming verdict off the board (phaedra: 96 GAP vs 8 EVENTS postings,
+# the last 20 all GAP at exact 30m cadence, every one events=0 seqdelta=6 coverage=100%; here, from
+# this node's own cron tape: 422 GAP / 333 EVENTS in the corpus but 142 GAP / 44 EVENTS boarded).
+#   EVENTS -> the board, 30m slot of its own. A named device is the thing this half exists to say.
+#   GAP    -> the board ONLY above this node's own measured GAP floor (a percentile of its own
+#             sampled deltas, never a constant — a constant would be wrong on the next node and
+#             would rot on this one), 180m slot of its own; at or under the floor it goes to
+#             mesh-trace instead, which is the durable tier that keeps the denominator.
+#   No corpus yet => floor `na` => it BOARDS. An exclusion's failure direction is silence, so the
+#   uncalibrated case fails loud; it self-clears after GAP_FLOOR_MIN_N samples.
 #
 # exit 0 = QUIET (listening, fully covered, nothing enumerated) · 1 = EVENTS (named enumerations in
 # the window) · 2 = honest n/a (listener DOWN, coverage PARTIAL, reboot, or GAP vs the counter)
@@ -103,14 +119,33 @@ LOCKF="${MESH_UDEV_STREAM_LOCK:-$HOME/.mesh/.udev-stream.lock}"
 STARTF="${MESH_UDEV_STREAM_STARTF:-$HOME/.mesh/.udev-stream.started}"
 PIDF="${MESH_UDEV_STREAM_PIDF:-$HOME/.mesh/.udev-stream.pid}"
 DLOG="${MESH_UDEV_STREAM_DLOG:-$HOME/.mesh/.udev-stream.daemon.log}"
-MARK="${MESH_UDEV_STREAM_MARK:-$HOME/.mesh/.udev-stream.posted}"
+# ONE MARKER PER VERDICT — never one slot shared by two of them (fixed 2026-08-27, chat-review
+# udev-stream-gap-and-events-share-one-debounce-slot). EVENTS and GAP used to debounce through this
+# single file under one 30-minute window, so whichever fired first evicted the other for half an
+# hour — and since GAP has a permanent structural floor (see the header) it fires FAR more often
+# than a real named device event does. Measured on phaedra: 96 GAP postings vs 8 EVENTS, the last 20
+# all GAP at exact 30-minute cadence, every one events=0 seqdelta=6 coverage=100%. Measured here
+# from this node's own cron tape (1407 passes): corpus 422 GAP / 333 EVENTS, boarded 142 GAP / 44
+# EVENTS — the noisy verdict was crowding the naming verdict off the board. Separate files mean the
+# two can NEVER displace each other, whatever either debounce is set to.
+MARK="${MESH_UDEV_STREAM_MARK:-$HOME/.mesh/.udev-stream.posted}"        # the EVENTS slot
+MARK_GAP="${MESH_UDEV_STREAM_MARK_GAP:-${MARK}.gap}"                    # the GAP slot — derived from
+# MARK on purpose, so a sandboxed run (the test, another node's fixture) that redirects MARK carries
+# every sibling with it and cannot write into the live tier.
+GAPSAMP="${MESH_UDEV_STREAM_GAP_SAMPLES:-${MARK}.gap-samples}"
 SEQF="${MESH_UDEV_STREAM_SEQ:-/sys/kernel/uevent_seqnum}"
 BOOTF="${MESH_UDEV_STREAM_BOOTID:-/proc/sys/kernel/random/boot_id}"
 MAXB="${MESH_UDEV_STREAM_MAXB:-1048576}"          # rotate at this size, keep one generation
 FIRST_WIN="${MESH_UDEV_STREAM_FIRST_WIN:-300}"    # window used on first sight only
 NAMES_MAX="${MESH_UDEV_STREAM_NAMES:-6}"          # how many named events go in the line
-DEBOUNCE_MIN="${MESH_UDEV_STREAM_DEBOUNCE_MIN:-30}"
+DEBOUNCE_MIN="${MESH_UDEV_STREAM_DEBOUNCE_MIN:-30}"          # EVENTS: unchanged
+DEBOUNCE_GAP_MIN="${MESH_UDEV_STREAM_DEBOUNCE_GAP_MIN:-180}" # GAP: longer, and in its own slot
+GAP_FLOOR_PCT="${MESH_UDEV_STREAM_GAP_FLOOR_PCT:-95}"        # the floor is this percentile of...
+GAP_FLOOR_MIN_N="${MESH_UDEV_STREAM_GAP_FLOOR_MIN_N:-20}"    # ...at least this many samples
+GAP_SAMPLES_MAX="${MESH_UDEV_STREAM_GAP_SAMPLES_MAX:-400}"   # bounded tape, newest kept
 CHAT="${MESH_UDEV_STREAM_CHAT:-1}"
+CHAT_CMD="${MESH_UDEV_STREAM_CHAT_CMD:-mesh-chat}"    # test seam
+TRACE_CMD="${MESH_UDEV_STREAM_TRACE_CMD:-mesh-trace}" # test seam
 MONITOR_CMD="${MESH_UDEV_STREAM_MONITOR:-}"       # test seam: a producer standing in for udevadm
 
 stamp(){ date -u +%FT%TZ; }
@@ -334,6 +369,99 @@ decide(){
   printf 'QUIET|0|%s|no device event in the last %ss, listener up for all of it and the seqnum accumulator agrees (delta %s)\n' "$cov" "$win" "$sdelta"
 }
 
+# --- the GAP FLOOR, calibrated against THIS NODE'S OWN corpus --------------------------------------
+# GAP is not a fault, and the header says why: /sys/kernel/uevent_seqnum is global while a
+# netns-tagged uevent is broadcast only into its own netns, so every node with a docker bridge or a
+# PrivateNetwork= unit carries a permanent, irreducible GAP rate. A CONSTANT threshold would be
+# wrong on the next node and would rot on this one (a premise expires and the constant does not
+# notice), so the floor is a percentile of the node's OWN sampled GAP deltas, and the reading names
+# which source it came from. No corpus yet => floor `na` => the reading BOARDS: an exclusion's
+# failure direction is silence, so the uncalibrated case must fail LOUD, not quiet. It is
+# self-limiting — GAP_FLOOR_MIN_N samples arrive within hours on any node that gaps at all.
+#
+# EVERY GAP contributes a sample, including the ones the floor then suppresses. Sampling only the
+# ones that got boarded would let the floor ratchet itself upward off its own selection until
+# nothing could ever clear it.
+gap_sample_add(){   # $1 = seqdelta
+  local d="${1:-na}" n
+  case "$d" in ''|na|*[!0-9]*) return 0;; esac
+  mkdirp "$GAPSAMP"; printf '%s\n' "$d" >> "$GAPSAMP" 2>/dev/null || return 0
+  n="$(grep -c '^[0-9][0-9]*$' "$GAPSAMP" 2>/dev/null | tr -dc '0-9')"; [ -n "$n" ] || n=0
+  if [ "$n" -gt "$GAP_SAMPLES_MAX" ] 2>/dev/null; then
+    tail -n "$GAP_SAMPLES_MAX" "$GAPSAMP" > "$GAPSAMP.tmp" 2>/dev/null && mv "$GAPSAMP.tmp" "$GAPSAMP" 2>/dev/null
+  fi
+}
+gap_floor(){   # -> <floor|na>|<n>|<source>   — source is a FIELD, never a guess a reader has to make
+  local n idx v
+  n=0; [ -s "$GAPSAMP" ] && n="$(grep -c '^[0-9][0-9]*$' "$GAPSAMP" 2>/dev/null | tr -dc '0-9')"
+  [ -n "$n" ] || n=0
+  if [ "$n" -lt "$GAP_FLOOR_MIN_N" ] 2>/dev/null; then
+    printf 'na|%s|unsampled-need-%s\n' "$n" "$GAP_FLOOR_MIN_N"; return
+  fi
+  idx=$(( n * GAP_FLOOR_PCT / 100 )); [ "$idx" -lt 1 ] && idx=1; [ "$idx" -gt "$n" ] && idx="$n"
+  v="$(grep '^[0-9][0-9]*$' "$GAPSAMP" 2>/dev/null | sort -n | sed -n "${idx}p")"
+  case "$v" in ''|*[!0-9]*) printf 'na|%s|unreadable\n' "$n"; return;; esac
+  printf '%s|%s|measured-p%s\n' "$v" "$n" "$GAP_FLOOR_PCT"
+}
+
+# --- the board slots ------------------------------------------------------------------------------
+debounce_ok(){   # $1 markfile $2 minutes $3 now
+  local last=0
+  [ -f "$1" ] && last="$(tr -dc '0-9' < "$1" 2>/dev/null)"
+  [ -n "$last" ] || last=0
+  [ "$(( $3 - last ))" -ge "$(( $2 * 60 ))" ]
+}
+bump_suppressed(){ local f="$1" n=0
+  [ -f "$f" ] && n="$(tr -dc '0-9' < "$f" 2>/dev/null)"; [ -n "$n" ] || n=0
+  mkdirp "$f"; printf '%s\n' "$(( n + 1 ))" > "$f" 2>/dev/null || true; }
+take_suppressed(){ local f="$1" n=0
+  [ -f "$f" ] && n="$(tr -dc '0-9' < "$f" 2>/dev/null)"; [ -n "$n" ] || n=0
+  mkdirp "$f"; printf '0\n' > "$f" 2>/dev/null || true; printf '%s\n' "$n"; }
+
+# board: one slot per verdict, and the FLOOR decides whether GAP reaches the board at all.
+# Prints one line saying what it did — that line is what the test asserts against, so the routing
+# is checked by its OUTCOME and not by re-reading the source.
+board(){   # $1 verdict $2 sdelta $3 now $4 floor $5 n $6 src $7 line
+  local v="$1" sdelta="$2" nowe="$3" floor="$4" fn="$5" fsrc="$6" line="$7" sup extra host
+  [ "$CHAT" = 1 ] || { echo "board: disabled"; return 0; }
+  command -v "${CHAT_CMD%% *}" >/dev/null 2>&1 || { echo "board: no ${CHAT_CMD%% *}"; return 0; }
+  host="$(hostname)"
+  case "$v" in
+    EVENTS)
+      if debounce_ok "$MARK" "$DEBOUNCE_MIN" "$nowe"; then
+        sup="$(take_suppressed "$MARK.suppressed")"; extra=""
+        [ "${sup:-0}" -gt 0 ] 2>/dev/null && extra=" || ${sup} further EVENTS reading(s) were held by the ${DEBOUNCE_MIN}m EVENTS debounce since the last posting"
+        MESH_WHO="udev-stream@$host" $CHAT_CMD "[fyi] udev-stream on $host: ${line}${extra}" >/dev/null 2>&1 || true
+        mkdirp "$MARK"; printf '%s\n' "$nowe" > "$MARK"
+        echo "board: EVENTS posted slot=$MARK"
+      else
+        bump_suppressed "$MARK.suppressed"; echo "board: EVENTS debounced slot=$MARK"
+      fi;;
+    GAP)
+      # THE FLOOR COMES FIRST, before any debounce: a GAP at or under this node's own measured floor
+      # is structurally unattributable background, so it belongs on the durable trace and NOT on the
+      # board. The trace write is unthrottled on purpose — it is the tier that keeps the denominator.
+      if [ "$floor" != na ] && [ "$sdelta" != na ] && [ "$sdelta" -le "$floor" ] 2>/dev/null; then
+        bump_suppressed "$MARK_GAP.suppressed"
+        command -v "${TRACE_CMD%% *}" >/dev/null 2>&1 && \
+          $TRACE_CMD "udev-stream GAP seqdelta=$sdelta at/below this node's own measured GAP floor ($floor, $fsrc over n=$fn) — netns-tagged uevents raise the global counter without reaching any listener, so this is background, not a lost device event; not boarded" >/dev/null 2>&1 || true
+        echo "board: GAP floor-level -> trace sdelta=$sdelta floor=$floor n=$fn src=$fsrc"
+        return 0
+      fi
+      if debounce_ok "$MARK_GAP" "$DEBOUNCE_GAP_MIN" "$nowe"; then
+        sup="$(take_suppressed "$MARK_GAP.suppressed")"
+        MESH_WHO="udev-stream@$host" $CHAT_CMD "[fyi] udev-stream on $host: ${line} || GAP is ABOVE this node's own measured floor (floor=$floor $fsrc n=$fn); ${sup:-0} floor-level or debounced GAP reading(s) went to $TRACE_CMD instead of the board since the last posting" >/dev/null 2>&1 || true
+        mkdirp "$MARK_GAP"; printf '%s\n' "$nowe" > "$MARK_GAP"
+        echo "board: GAP posted slot=$MARK_GAP floor=$floor n=$fn src=$fsrc"
+      else
+        bump_suppressed "$MARK_GAP.suppressed"
+        echo "board: GAP debounced slot=$MARK_GAP (${DEBOUNCE_GAP_MIN}m)"
+      fi;;
+    *) echo "board: $v not a boarding verdict";;
+  esac
+  return 0
+}
+
 # --- one pass -------------------------------------------------------------------------------------
 pass(){   # $1 = 1 write / 0 read-only
   local write="$1" seq boot nowe bseq="" bboot="" bepoch="" win live start events names sgap sdelta bootchg v rc cov msg line
@@ -355,7 +483,14 @@ pass(){   # $1 = 1 write / 0 read-only
   rc="${v#*|}"; rc="${rc%%|*}"; cov="${v#*|*|}"; cov="${cov%%|*}"; msg="${v#*|*|*|}"; v="${v%%|*}"
   local cens cfam cprocs
   cens="$(leak_census)"; cfam="${cens%% *}"; cprocs="${cens##* }"
-  line="$(stamp) $v events=$events window=${win}s coverage=${cov}% seqdelta=$sdelta seq-total=$seq stream-sgap=$sgap listener=$( [ "$live" = 1 ] && echo up || echo down )$( [ "$live" = 1 ] && printf " since=%s" "$start" ) leaked=$cfam${names:+ named=$names} :: $msg"
+  # The floor is read BEFORE this pass's own sample is appended: a reading is judged against the
+  # corpus that PRECEDED it, so a single large outlier cannot partly raise the floor it is being
+  # measured against. It is read on --check too, so a read-only pass shows exactly the routing the
+  # write pass would take.
+  local gfloor gfn gfsrc gfld=""
+  IFS='|' read -r gfloor gfn gfsrc <<<"$(gap_floor)"
+  [ "$v" = GAP ] && gfld=" gap-floor=$gfloor gap-floor-n=$gfn gap-floor-src=$gfsrc"
+  line="$(stamp) $v events=$events window=${win}s coverage=${cov}% seqdelta=$sdelta seq-total=$seq stream-sgap=$sgap listener=$( [ "$live" = 1 ] && echo up || echo down )$( [ "$live" = 1 ] && printf " since=%s" "$start" ) leaked=$cfam$gfld${names:+ named=$names} :: $msg"
   # A leak does not change the VERDICT (the stream is being read either way) — it gets its own loud
   # clause, so `leaked=0` on every healthy line is what makes a non-zero one legible.
   [ "${cfam:-0}" -gt 0 ] 2>/dev/null && line="$line || LEAK: $cfam orphan listener famil(y/ies), $cprocs proc(s), holding a lock that is not $LOCKF — a --test that redirects the lock and dies before its reap leaves exactly this, and the lock-based liveness above is blind to it BY CONSTRUCTION; reap with mesh-udev-stream --reap-orphans"
@@ -370,15 +505,10 @@ pass(){   # $1 = 1 write / 0 read-only
   # mtime = ran-live, content = the reading (liveness-touch convention: a node quiet for days must
   # not read as a dead reflex to mesh-reflex-health/mesh-pulse).
   command -v mesh-state-touch >/dev/null 2>&1 && mesh-state-touch "$STATE" >/dev/null 2>&1
-  if { [ "$v" = EVENTS ] || [ "$v" = GAP ]; } && [ "$CHAT" = 1 ] && command -v mesh-chat >/dev/null 2>&1; then
-    local last=0
-    [ -f "$MARK" ] && last="$(tr -dc '0-9' < "$MARK" 2>/dev/null)"
-    [ -n "$last" ] || last=0
-    if [ "$(( nowe - last ))" -ge "$(( DEBOUNCE_MIN * 60 ))" ]; then
-      MESH_WHO="udev-stream@$(hostname)" mesh-chat "[fyi] udev-stream on $(hostname): $line" >/dev/null 2>&1 || true
-      printf '%s\n' "$nowe" > "$MARK"
-    fi
-  fi
+  # the sample tape grows on every GAP, boarded or not (see gap_sample_add), and only on a WRITE
+  # pass — a --check must not move the corpus its own reading is calibrated against.
+  [ "$v" = GAP ] && gap_sample_add "$sdelta"
+  case "$v" in EVENTS|GAP) board "$v" "$sdelta" "$nowe" "$gfloor" "$gfn" "$gfsrc" "$line" >/dev/null;; esac
   return "$rc"
 }
 
@@ -674,6 +804,92 @@ run_test(){
   case "$out" in *"leak-census: leaked=$pre_f"*) : ;; *) F "--status still reports the reaped orphan (got: $(printf '%s' "$out" | tail -2 | tr '\n' ' '))";; esac
   rm -rf "$sb4"
 
+  # (12) THE SLOT SPLIT — the regression this section exists for. EVENTS and GAP shared one marker
+  #       and one debounce, so the verdict that fires often (GAP, which has a permanent structural
+  #       floor) evicted the verdict that names a device (EVENTS) for up to 30 minutes. Driven here
+  #       through the real board(), with stub chat/trace commands, so the routing is asserted by its
+  #       OUTCOME and not by re-reading the source.
+  local sb5; sb5="$(mktemp -d)"
+  printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s/chat.out"\n' "$sb5" > "$sb5/stub-chat"
+  printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s/trace.out"\n' "$sb5" > "$sb5/stub-trace"
+  chmod +x "$sb5/stub-chat" "$sb5/stub-trace"
+  local SV_MARK="$MARK" SV_MARKG="$MARK_GAP" SV_SAMP="$GAPSAMP" SV_CC="$CHAT_CMD" SV_TC="$TRACE_CMD" SV_CH="$CHAT"
+  # asserted on the values THE CONFIG COMPUTED, before this section overrides them — a test that
+  # only ever drives its own two sandbox paths cannot see the config collapse them back into one.
+  [ "$SV_MARKG" != "$SV_MARK" ] || F "the GAP slot and the EVENTS slot are the SAME file ($SV_MARK) — one marker cannot debounce two verdicts independently, which is the whole regression"
+  [ "$SV_SAMP" != "$SV_MARK" ] || F "the GAP sample tape is the EVENTS marker file"
+  MARK="$sb5/e.mark"; MARK_GAP="$sb5/e.mark.gap"; GAPSAMP="$sb5/e.samples"
+  CHAT_CMD="$sb5/stub-chat"; TRACE_CMD="$sb5/stub-trace"; CHAT=1
+  chat_n(){ grep -c . "$sb5/chat.out" 2>/dev/null || echo 0; }
+  trace_n(){ grep -c . "$sb5/trace.out" 2>/dev/null || echo 0; }
+
+  # (12a) the FLOOR, off a real tape: 20 samples of 3 and one of 90 => p95 is background, not 90.
+  local i; : > "$GAPSAMP"; for i in $(seq 1 20); do echo 3 >> "$GAPSAMP"; done; echo 90 >> "$GAPSAMP"
+  out="$(gap_floor)"
+  case "$out" in 3\|21\|measured-p95) : ;; *) F "gap_floor did not read p95=3 off a 21-sample tape (got: $out)";; esac
+  # ...and an under-sampled tape says so instead of inventing a threshold.
+  : > "$GAPSAMP"; echo 3 >> "$GAPSAMP"
+  out="$(gap_floor)"
+  case "$out" in na\|1\|unsampled*) : ;; *) F "a 1-sample tape produced a floor instead of na (got: $out)";; esac
+  # (12b) POLARITY: with no floor yet, GAP must BOARD. An exclusion that cannot calibrate must fail
+  #       loud — a silent uncalibrated gate is indistinguishable from a gate that never runs.
+  out="$(board GAP 9 $NOW na 1 unsampled-need-20 "line")"
+  case "$out" in *"GAP posted"*) : ;; *) F "an UNCALIBRATED GAP was suppressed instead of boarded — the exclusion fails toward silence (got: $out)";; esac
+  [ "$(chat_n)" = 1 ] || F "the uncalibrated GAP did not reach the chat stub"
+
+  # (12c) THE EVICTION, the actual bug: a GAP posting must NOT be able to consume the EVENTS slot.
+  #       With the old single marker this next call is silently swallowed for 30 minutes.
+  out="$(board EVENTS 0 $NOW 3 21 measured-p95 "named=add:usb:/d/1-2.3")"
+  case "$out" in *"EVENTS posted"*) : ;; *) F "EVENTS was evicted by the GAP posting that preceded it — the shared-slot regression is back (got: $out)";; esac
+  [ "$(chat_n)" = 2 ] || F "the EVENTS posting did not reach the board after a GAP posting (chat lines: $(chat_n))"
+  case "$(tail -1 "$sb5/chat.out")" in *"add:usb:/d/1-2.3"*) : ;; *) F "the boarded EVENTS line lost its named device";; esac
+  # ...and the converse: EVENTS must not consume the GAP slot either. Above-floor GAP still boards.
+  rm -f "$MARK_GAP"
+  out="$(board GAP 40 $NOW 3 21 measured-p95 "line")"
+  case "$out" in *"GAP posted"*) : ;; *) F "an above-floor GAP was evicted by the EVENTS posting before it (got: $out)";; esac
+
+  # (12d) THE FLOOR ROUTES: a GAP at or under this node's own measured floor goes to mesh-trace, not
+  #       to the board — and it must not touch the GAP slot at all, or it would debounce the real
+  #       above-floor case that follows it.
+  local chat_before trace_before; chat_before="$(chat_n)"; trace_before="$(trace_n)"
+  # the stamp is deliberately LATER than the one already in the GAP slot: called with the same
+  # value, a mutant that DOES write the slot writes back the identical bytes and the assertion below
+  # cannot tell the two apart — a fixture whose two candidates carry one value discriminates nothing.
+  local gapmark_before; gapmark_before="$(cat "$MARK_GAP" 2>/dev/null)"
+  out="$(board GAP 3 $(( NOW + 1000 )) 3 21 measured-p95 "line")"
+  case "$out" in *"GAP floor-level -> trace"*) : ;; *) F "a floor-level GAP was boarded instead of traced (got: $out)";; esac
+  [ "$(chat_n)" = "$chat_before" ] || F "a floor-level GAP reached the BOARD (chat $chat_before -> $(chat_n))"
+  [ "$(trace_n)" = "$(( trace_before + 1 ))" ] || F "a floor-level GAP did not reach mesh-trace — it was dropped, not routed (trace $trace_before -> $(trace_n))"
+  [ "$(cat "$MARK_GAP" 2>/dev/null)" = "$gapmark_before" ] || F "a floor-level GAP consumed the GAP debounce slot it never posted to"
+  # ...and one seqnum ABOVE the same floor is the case that must still reach a human.
+  rm -f "$MARK_GAP"
+  out="$(board GAP 4 $NOW 3 21 measured-p95 "line")"
+  case "$out" in *"GAP posted"*) : ;; *) F "seqdelta one above the floor did not board — the floor is a ceiling (got: $out)";; esac
+
+  # (12e) the debounces are the two configured windows, each in its own slot. GAP's must be the
+  #       longer one: the same 30m on both would leave GAP eligible far more often than EVENTS.
+  [ "$DEBOUNCE_GAP_MIN" -gt "$DEBOUNCE_MIN" ] || F "the GAP debounce ($DEBOUNCE_GAP_MIN m) is not longer than the EVENTS debounce ($DEBOUNCE_MIN m)"
+  out="$(board GAP 40 $(( NOW + DEBOUNCE_MIN * 60 + 60 )) 3 21 measured-p95 "line")"
+  case "$out" in *"GAP debounced"*) : ;; *) F "GAP re-posted after only the EVENTS debounce had elapsed (got: $out)";; esac
+  out="$(board GAP 40 $(( NOW + DEBOUNCE_GAP_MIN * 60 + 60 )) 3 21 measured-p95 "line")"
+  case "$out" in *"GAP posted"*) : ;; *) F "GAP never re-posted after its own debounce elapsed (got: $out)";; esac
+  # ...and a debounced/floor-level GAP is COUNTED, so the next posting says what it stood for.
+  case "$(tail -1 "$sb5/chat.out")" in *"went to $TRACE_CMD instead of the board since the last posting"*) : ;; *) F "the GAP posting does not name how many readings it suppressed (got: $(tail -1 "$sb5/chat.out"))";; esac
+  out="$(board EVENTS 0 $(( NOW + 60 )) 3 21 measured-p95 "line")"
+  case "$out" in *"EVENTS debounced"*) : ;; *) F "the EVENTS debounce does not hold inside its own window (got: $out)";; esac
+
+  # (12f) EVERY GAP feeds the tape, including the ones the floor suppressed — sampling only the
+  #       boarded ones would let the floor ratchet up off its own selection until nothing clears it.
+  : > "$GAPSAMP"; gap_sample_add 3; gap_sample_add 3; gap_sample_add na; gap_sample_add ""
+  [ "$(grep -c . "$GAPSAMP")" = 2 ] || F "gap_sample_add stored a non-numeric delta (tape: $(tr '\n' ' ' < "$GAPSAMP"))"
+  local SV_MAX="$GAP_SAMPLES_MAX"; GAP_SAMPLES_MAX=5
+  for i in 1 2 3 4 5 6 7 8; do gap_sample_add "$i"; done
+  [ "$(grep -c . "$GAPSAMP")" -le 5 ] || F "the sample tape is unbounded (lines: $(grep -c . "$GAPSAMP"))"
+  case "$(tail -1 "$GAPSAMP")" in 8) : ;; *) F "the bounded tape kept the OLDEST samples instead of the newest (got: $(tail -1 "$GAPSAMP"))";; esac
+  GAP_SAMPLES_MAX="$SV_MAX"
+  MARK="$SV_MARK"; MARK_GAP="$SV_MARKG"; GAPSAMP="$SV_SAMP"; CHAT_CMD="$SV_CC"; TRACE_CMD="$SV_TC"; CHAT="$SV_CH"
+  rm -rf "$sb5"
+
   # a DOWN pass (lock free) is rc 2 and says blind.
   local d2; d2="$(mktemp -d)"
   out="$(MESH_UDEV_STREAM_LOG=$d2/n.log MESH_UDEV_STREAM_STATE=$d2/n.state MESH_UDEV_STREAM_BASE=$d2/n.base \
@@ -691,7 +907,7 @@ run_test(){
   local FAM1; FAM1="$(leak_census)"; FAM1="${FAM1%% *}"
   [ "$FAM1" = "$FAM0" ] || F "this --test LEAKED listener famil(y/ies): census $FAM0 -> $FAM1 — it armed real setsid'd daemons and did not reap them"
   [ "$fails" = 0 ] || { echo "smoke-test: FAILED ($fails)" >&2; exit 1; }
-  echo "smoke-test: ok (EVENTS/QUIET/DOWN/PARTIAL/GAP/REBOOT/BASELINE each driven; a dead listener never reads quiet; coverage rendered and a partial count labelled a floor; the counter cross-check overrides silence; the fold driven on REAL udevadm output incl. its header and a seqnum gap; scanners span a rotation and name a REMOVAL; a real listener armed, singleton by lock, capturing a real triggered uevent and named by the read; --check writes nothing; --stop is scoped by its own pidfile, reaps its whole process group and leaves a second listener untouched; a REAL orphan under a foreign lock driven, counted by the census, rendered on --status and on the reading, reaped and counted back to zero; and this run leaked nothing)"
+  echo "smoke-test: ok (EVENTS/QUIET/DOWN/PARTIAL/GAP/REBOOT/BASELINE each driven; a dead listener never reads quiet; coverage rendered and a partial count labelled a floor; the counter cross-check overrides silence; the fold driven on REAL udevadm output incl. its header and a seqnum gap; scanners span a rotation and name a REMOVAL; a real listener armed, singleton by lock, capturing a real triggered uevent and named by the read; --check writes nothing; --stop is scoped by its own pidfile, reaps its whole process group and leaves a second listener untouched; a REAL orphan under a foreign lock driven, counted by the census, rendered on --status and on the reading, reaped and counted back to zero; EVENTS and GAP board through SEPARATE slots so neither can evict the other, a floor-level GAP routes to mesh-trace while one seqnum above it still boards, an uncalibrated floor fails LOUD, and this run leaked nothing)"
   exit 0
 }
 
@@ -709,6 +925,9 @@ case "${1:-}" in
              if [ -s "$STATE" ]; then cat "$STATE"; st_rc=0; else echo "no reading yet ($STATE)"; st_rc=2; fi
              printf 'leak-census: leaked=%s orphan listener famil(y/ies) / %s proc(s) holding a lock that is not %s\n' \
                "$st_fam" "$st_procs" "$LOCKF"
+             IFS='|' read -r st_fl st_fn st_fs <<<"$(gap_floor)"
+             printf 'gap-floor: %s (%s, n=%s) — GAP at or under it goes to %s, above it to the board (%sm slot); EVENTS has its own %sm slot\n' \
+               "$st_fl" "$st_fs" "$st_fn" "$TRACE_CMD" "$DEBOUNCE_GAP_MIN" "$DEBOUNCE_MIN"
              [ "${st_fam:-0}" -gt 0 ] 2>/dev/null && printf '%s\n' \
                "  ^ the lock-based liveness check cannot see these BY CONSTRUCTION (they hold a different lock); reap with: $0 --reap-orphans"
              exit "$st_rc" ;;
@@ -744,7 +963,12 @@ case "${1:-}" in
              rp_left="$(leak_census)"
              echo "reap-orphans: signalled $rp_n orphan listener famil(y/ies) (whole process group each); census now ${rp_left%% *} famil(y/ies) / ${rp_left##* } proc(s)"
              [ "${rp_left%% *}" = 0 ] && exit 0 || exit 1 ;;
+  --gap-floor)
+             IFS='|' read -r gf_v gf_n gf_s <<<"$(gap_floor)"
+             printf 'floor=%s source=%s n=%s pct=%s min-n=%s tape=%s\n' "$gf_v" "$gf_s" "$gf_n" "$GAP_FLOOR_PCT" "$GAP_FLOOR_MIN_N" "$GAPSAMP"
+             [ "$gf_v" = na ] && printf '%s\n' "  ^ no floor yet: every GAP boards until n reaches $GAP_FLOOR_MIN_N — an uncalibrated exclusion must fail LOUD, not quiet"
+             exit 0 ;;
   --tail)    n="${2:-20}"; for f in "$LOG.1" "$LOG"; do [ -f "$f" ] && cat "$f"; done 2>/dev/null | tail -n "$n"; exit 0 ;;
   ""|--run)  ensure >/dev/null 2>&1; pass 1; exit $? ;;
-  *) echo "usage: mesh-udev-stream [--check|--status|--tail N|--ensure|--daemon|--stop|--reap-orphans|--test]" >&2; exit 64 ;;
+  *) echo "usage: mesh-udev-stream [--check|--status|--gap-floor|--tail N|--ensure|--daemon|--stop|--reap-orphans|--test]" >&2; exit 64 ;;
 esac
