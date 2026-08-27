@@ -1,0 +1,548 @@
+#!/usr/bin/env bash
+# reflex-cadence: */5 * * * *
+# reflex-state: $HOME/.mesh/.vpn-node-watch.state
+# mesh-vpn-node-watch — is the mesh's VPN/exit node still REACHABLE, and is the path we would
+# recover it over still PROVEN?
+#
+# WHY THIS EXISTS. The mesh depends on one peer for egress and for the client-facing VPN. When that
+# peer's tailscale drops, three completely different worlds render IDENTICALLY to every instrument
+# we had:
+#   (a) the peer is fine, only its tailscaled (or our path to it) died   -> recoverable in one ssh
+#   (b) the peer is off the air entirely                                  -> nothing to ssh into
+#   (c) WE are off the air                                                -> the peer is innocent
+# `mesh-vpn-health --edge` cannot separate them: its whole gather rides ssh over tailscale, so it
+# posts [vpn-blind] and says in the post itself that this is NOT a claim about the peer. That is
+# honest and it is not a watchdog. Nothing on this node fired on "the VPN node's tailscale went
+# away", and the recovery that followed waited on a human noticing.
+#
+# THE SELF-DEFEATING PATH THIS ACTUALLY FIXES (measured 2026-08-27, this node). The recovery story
+# was "the root key is on mesh-home now, so we no longer need ideapad". But the only configured way
+# to reach the subject was its TAILSCALE address (`~/.ssh/config` Host phaedra -> 100.94.116.17,
+# and MESH_NODES carries the same). A key is not a path: in world (a) — the ONLY world the key can
+# repair — tailscale is exactly what is broken, so every configured route to the subject rides the
+# channel whose failure we are recovering from. CLAUDE.md's gate is not "is this reversible?" but
+# "is this reversible FROM OUTSIDE ITSELF?", and it was not. The subject's own public address
+# answers sshd on 0.0.0.0:22 and the key authenticates over it (verified 2026-08-27). So the fix is
+# not more copies of the key — it is an OUT-OF-BAND path, LEARNED while the subject is healthy and
+# re-proven continuously, so it is a capability at the moment it is needed rather than a hope.
+#
+# A KEY THAT HAS NEVER BEEN DRIVEN OVER THE RESCUE PATH IS NOT A RECOVERY CAPABILITY. The
+# verification principle applies to credentials too: "the key is on mesh-home" is the same sentence
+# as "the camera works". This reflex authenticates the recovery key over the OUT-OF-BAND path on a
+# throttled cadence while everything is green, and publishes when it last succeeded — so the
+# recovery claim carries an age instead of an assumption, and a key that has rotted is a finding
+# BEFORE the outage rather than during it.
+#
+# WHY IT IS BOUND TO A ROLE, NOT TO A NODE NAME. The subject is whatever `MESH_VPN_NODE` names
+# (default phaedra), resolved through the same `MESH_NODES` registry `mesh-vpn-health` reads. A
+# guard bound to a hostname goes permanently false the day the role moves; the else-branch here
+# SAYS why it stood down rather than exiting quietly.
+#
+# IT IS A SENSE. It installs nothing, restarts nothing, and never touches the substrate. The one
+# actuator in this loop is a mind's hand holding a claim, so the alert fires on the FAULT — there
+# is no actuator outcome to sit behind yet. It IS held one cadence: a single poll cannot tell a
+# link flap from a departure (a flap and a drop render identically at one instant), so a verdict
+# must be seen twice running before it is spent on the board.
+#
+# HONEST ABSENCE. Every leg can be UNKNOWN and none of them may render as OK:
+#   - our own tailscaled not Running / Self.Online false  -> UNKNOWN(self-blind), the peer is never
+#     accused with our own blindness (mesh-vpn-health paid for this on 2026-08-20).
+#   - no learned OOB address, or one older than MESH_VPN_OOB_MAX_AGE -> the OOB leg renders its own
+#     coverage and staleness; it never silently answers from a constant.
+#   - no recovery key configured/readable -> key=absent, which is itself the finding.
+#
+# `tailscale ping` rc=0 IS NOT "THAT HOST ANSWERED" on this node: the subject is our exit node, so
+# it advertises 0.0.0.0/0 and pongs on behalf of any unassigned tailnet address. Every pong is
+# matched against the address we asked for, never trusted by rc.
+#
+# Config (node-local, ~/.mesh/nodes — the genome stays IP-free):
+#   MESH_VPN_NODE            label in MESH_NODES of the subject      (default: phaedra)
+#   MESH_VPN_PUBIP           the subject's public address            (seeds the OOB leg)
+#   MESH_VPN_OOB_PORT        sshd port on the OOB path               (default 22)
+#   MESH_VPN_RECOVERY_KEY    private key that authorizes recovery    (default ~/.ssh/id_ed25519)
+#   MESH_VPN_OOB_ALIAS       ssh alias for the OOB path, drift-checked(default <MESH_VPN_NODE>-direct)
+#   MESH_VPN_OOB_MAX_AGE     seconds a learned OOB address stands for(default 604800)
+#   MESH_VPN_KEY_PROVE_EVERY seconds between OOB key proofs          (default 3600)
+#
+# Usage: mesh-vpn-node-watch [--edge] [--json] [--check] [--recovery] [--test]
+#   --edge      post board transitions (what cron runs)
+#   --recovery  print the exact recovery procedure with the LAST-KNOWN OOB address and its age
+# reflex-args: --edge
+
+set -uo pipefail
+[ -f "$HOME/.mesh/nodes" ] && . "$HOME/.mesh/nodes"
+
+STATE="$HOME/.mesh/.vpn-node-watch.state"
+LEDGER="$HOME/.mesh/vpn-node-watch.log"
+VPN_NODE="${MESH_VPN_NODE:-phaedra}"
+OOB_PORT="${MESH_VPN_OOB_PORT:-22}"
+# Default to THIS NODE'S OWN key, not a key inherited from another node. Proving a borrowed
+# credential proves the lender is still willing, which is the dependency this whole task exists to
+# remove; a second inherited key staying authorized is a fallback, never the thing under test.
+REC_KEY="${MESH_VPN_RECOVERY_KEY:-$HOME/.ssh/id_ed25519}"
+OOB_MAX_AGE="${MESH_VPN_OOB_MAX_AGE:-604800}"
+KEY_PROVE_EVERY="${MESH_VPN_KEY_PROVE_EVERY:-3600}"
+NOW="$(date -u +%s)"
+STAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+EDGE=0; JSON=0; MODE=run
+
+for a in "$@"; do
+    case "$a" in
+        --edge) EDGE=1 ;;
+        --json) JSON=1 ;;
+        --check) MODE=check ;;
+        --recovery) MODE=recovery ;;
+        --test) MODE=test ;;
+        --help|-h) sed -n '2,80p' "$0" | grep '^#' | cut -c3-; exit 0 ;;
+    esac
+done
+
+# ---------------------------------------------------------------- pure helpers (driven by --test)
+
+# resolve_node <label> -> user@host from MESH_NODES, rc 1 if unlisted.
+resolve_node(){
+    local want="$1" entry
+    for entry in ${MESH_NODES:-}; do
+        [ "${entry%%:*}" = "$want" ] && { printf '%s\n' "${entry#*:}"; return 0; }
+    done
+    return 1
+}
+
+# classify <peer_leg> <self_leg> <oob_leg> -> VERDICT
+#
+# peer_leg: up | down | unknown     (is the subject answering over tailscale)
+# self_leg: ok | blind              (is OUR OWN transport proven this run)
+# oob_leg:  auth | refused | closed | unknown   (the out-of-band path, with the recovery key)
+#
+# The whole point of the tool is that "the subject is gone" and "the subject's tailscale is gone"
+# are different incidents with different remedies, so they get different WORDS. A missing OOB
+# reading may never collapse into either: it becomes UNKNOWN, because with the OOB leg dark we
+# genuinely cannot say which world we are in.
+classify(){
+    local peer="$1" self="$2" oob="$3"
+    [ "$self" = blind ] && { echo "UNKNOWN-SELF-BLIND"; return 0; }
+    case "$peer" in
+        up)      echo OK; return 0 ;;
+        unknown) echo "UNKNOWN-PATH-UNPROVEN"; return 0 ;;
+    esac
+    # peer is down over tailscale — the OOB leg is the only thing that can name the world.
+    case "$oob" in
+        auth)    echo "TS-ONLY" ;;
+        refused) echo "KEY-LOST" ;;
+        closed)  echo "NODE-DOWN" ;;
+        *)       echo "UNKNOWN-OOB-DARK" ;;
+    esac
+}
+
+# hold_decide <prev> <cur> <pending> <pending_since> <now> <hold_s>
+#   -> "post|<cur>"  spend the transition
+#      "hold|<cur>"  seen once, waiting for the second agreeing poll
+#      "quiet|<cur>" nothing changed
+# A single poll cannot separate a flap from a departure, so a NEW verdict is never spent on the
+# first sighting. It must survive one full cadence unchanged. A verdict that flips back inside the
+# hold is discarded silently — that is the flap, and it is exactly what must not wake a human.
+hold_decide(){
+    local prev="$1" cur="$2" pend="$3" since="$4" now="$5" hold="$6"
+    [ "$cur" = "$prev" ] && { echo "quiet|$cur"; return 0; }
+    if [ "$cur" != "$pend" ]; then echo "hold|$cur"; return 0; fi
+    [ -n "$since" ] && [ "$since" -gt 0 ] 2>/dev/null || { echo "hold|$cur"; return 0; }
+    if [ $(( now - since )) -ge "$hold" ]; then echo "post|$cur"; else echo "hold|$cur"; fi
+}
+
+# oob_coverage <learned_at> <now> <max_age> -> "fresh|<age>s" | "stale|<age>s" | "never"
+# The learned address is HISTORY. A reading older than its own bound is published as stale rather
+# than answered from — an address that moved while we were not looking would otherwise send the
+# recovery ssh to a stranger and read the failure as the subject being down.
+oob_coverage(){
+    local at="$1" now="$2" max="$3" age
+    case "$at" in ''|*[!0-9]*) echo never; return 0 ;; esac
+    [ "$at" -gt 0 ] || { echo never; return 0; }
+    age=$(( now - at ))
+    if [ "$age" -le "$max" ]; then echo "fresh|${age}s"; else echo "stale|${age}s"; fi
+}
+
+# ok_post_wanted <prev> — an OK transition is worth the board only if there was something to
+# recover FROM. On the very first run LAST_VERDICT is empty and the verdict is OK, which is a
+# transition by the letter and an arming by the fact; posting "reachable again" there announces a
+# recovery that never happened.
+ok_post_wanted(){ [ -n "${1:-}" ]; }
+
+# _ts_pong <ip> — true ONLY if the pong names the address we asked for.
+# rc alone is a lie here: this node consumes the subject as its exit node, so it answers for every
+# address the tailnet has not assigned. Gate on rc and the leg reads `up` for a peer that never spoke.
+_ts_pong(){
+    local ip="$1" out
+    out="$(timeout 12 tailscale ping --c 1 --timeout 3s "$ip" </dev/null 2>/dev/null)" || return 1
+    printf '%s' "$out" | grep -q "pong from .*($ip)"
+}
+
+# state_get <key> — read one field out of the state file (absent -> empty).
+state_get(){ [ -f "$STATE" ] || return 0; sed -n "s/^$1=//p" "$STATE" | tail -1; }
+
+state_write(){ # key=value pairs on argv
+    local tmp; tmp="$(mktemp "${STATE}.XXXXXX")" || return 1
+    printf '%s\n' "$@" > "$tmp" && mv -f "$tmp" "$STATE"
+}
+
+# ---------------------------------------------------------------- live legs
+
+# self_leg -> "ok" | "blind|<why>"
+# Our own tailscaled's view of ITSELF. If we are not on the tailnet, the subject's Online field is
+# not evidence about the subject, and no verdict about it may be minted from here.
+self_leg(){
+    local out bs on
+    command -v tailscale >/dev/null 2>&1 || { echo "blind|no tailscale binary"; return 0; }
+    out="$(timeout 15 tailscale status --json 2>/dev/null)" || { echo "blind|tailscale status failed"; return 0; }
+    bs="$(printf '%s' "$out" | jq -r '.BackendState // "?"' 2>/dev/null)"
+    on="$(printf '%s' "$out" | jq -r '.Self.Online // false' 2>/dev/null)"
+    [ "$bs" = Running ] || { echo "blind|backend=$bs"; return 0; }
+    [ "$on" = true ] || { echo "blind|self offline"; return 0; }
+    echo ok
+}
+
+# peer_leg <ip> -> "up" | "down" | "unknown|<why>"
+# Online from the control plane is a claim by the coordination server; the pong is the data path.
+# Disagreement is resolved toward the DATA path, and a control plane we could not read renders
+# unknown rather than down.
+peer_leg(){
+    local ip="$1" out online
+    out="$(timeout 15 tailscale status --json 2>/dev/null)" || { echo "unknown|tailscale status failed"; return 0; }
+    # NOT `... | .Online] | first // "absent"`. jq's `//` treats `false` as empty, so an OFFLINE
+    # peer — the ONE state this whole tool exists to catch — came back "absent" and was rendered as
+    # "not a peer of this tailnet", i.e. UNKNOWN instead of down. Measured on the first live fault
+    # drive, 2026-08-27, against a real offline peer. Decide absence by the LENGTH of the match,
+    # never by the truthiness of the field we are asking about.
+    online="$(printf '%s' "$out" \
+        | jq -r --arg ip "$ip" '[.Peer[]? | select((.TailscaleIPs[0]//"") == $ip)]
+                                | if length == 0 then "absent" else (.[0].Online | tostring) end' 2>/dev/null)"
+    case "$online" in
+        absent) echo "unknown|$ip is not a peer of this tailnet" ; return 0 ;;
+    esac
+    if _ts_pong "$ip"; then echo up; return 0; fi
+    [ "$online" = true ] && { echo "down"; return 0; }   # control says up, data path says no: trust the data path
+    echo down
+}
+
+# oob_leg <ip> <port> <key> -> "auth" | "refused" | "closed" | "unknown|<why>"
+# Three outcomes because two cannot express "we could not tell". `closed` is only claimed when the
+# TCP connect itself fails; an sshd that ANSWERS and refuses our key is a CREDENTIAL incident, not
+# a dead node, and collapsing them would send a mind to reboot a box whose key we had simply lost.
+oob_leg(){
+    local ip="$1" port="$2" key="$3" out rc
+    [ -n "$ip" ] || { echo "unknown|no OOB address known"; return 0; }
+    [ -r "$key" ] || { echo "unknown|recovery key unreadable: $key"; return 0; }
+    out="$(timeout 30 ssh -i "$key" -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new \
+            -o PasswordAuthentication=no -p "$port" "root@$ip" 'echo OOB-OK' 2>&1)"; rc=$?
+    case "$out" in
+        *OOB-OK*) echo auth; return 0 ;;
+    esac
+    case "$out" in
+        *"Connection refused"*|*"No route to host"*|*"Connection timed out"*|*"Network is unreachable"*|*"Operation timed out"*)
+            echo closed; return 0 ;;
+        *"Permission denied"*|*"Too many authentication failures"*|*"denied (publickey"*)
+            echo refused; return 0 ;;
+    esac
+    [ "$rc" = 124 ] && { echo closed; return 0; }
+    echo "unknown|ssh rc=$rc: $(printf '%s' "$out" | tail -1 | cut -c1-80)"
+}
+
+# learn_oob <ssh-target> -> "<ip> <port>" — ask the subject, while it is reachable, what its own
+# global address is. The address is learned from the SUBJECT rather than assumed from config, so a
+# server that is renumbered teaches us its new address on the next healthy poll instead of leaving
+# a constant pointing at a stranger.
+learn_oob(){
+    local tgt="$1" out ip
+    out="$(timeout 25 ssh -o BatchMode=yes -o ConnectTimeout=10 "$tgt" \
+        "ip -4 -o addr show scope global 2>/dev/null | awk '{print \$4}'" 2>/dev/null)" || return 1
+    ip="$(printf '%s\n' "$out" | cut -d/ -f1 \
+        | grep -vE '^(10\.|127\.|169\.254\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.)' \
+        | head -1)"
+    [ -n "$ip" ] || return 1
+    printf '%s\n' "$ip"
+}
+
+# ssh_alias_drift <alias> <expected-ip> -> "" | "<configured>"
+# A convenience alias in ~/.ssh/config is a CONSTANT, and the learned address is the live reading.
+# When they disagree the constant is the one that rotted; say so rather than letting a human ssh to
+# a stale address during the one outage the alias exists for.
+ssh_alias_drift(){
+    local alias="$1" want="$2" got
+    got="$(ssh -G "$alias" 2>/dev/null | sed -n 's/^hostname //p' | head -1)"
+    [ -z "$got" ] && { echo ""; return 0; }
+    [ "$got" = "$alias" ] && { echo ""; return 0; }   # no such Host block; ssh echoes the name back
+    [ "$got" = "$want" ] && { echo ""; return 0; }
+    echo "$got"
+}
+
+# ---------------------------------------------------------------- smoke test
+if [ "$MODE" = test ]; then
+    fail=0
+    echo "=== mesh-vpn-node-watch --test ==="
+
+    # --- classify: the three worlds must carry three different words -------------------------
+    [ "$(classify down ok auth)"    = "TS-ONLY" ]   || { echo "  FAIL: peer down + OOB auth must be TS-ONLY"; fail=1; }
+    [ "$(classify down ok closed)"  = "NODE-DOWN" ] || { echo "  FAIL: peer down + OOB closed must be NODE-DOWN"; fail=1; }
+    [ "$(classify down ok refused)" = "KEY-LOST" ]  || { echo "  FAIL: sshd answering and refusing our key is a CREDENTIAL incident, not a dead node"; fail=1; }
+    [ "$(classify up ok closed)"    = "OK" ]        || { echo "  FAIL: peer up must be OK regardless of the OOB leg"; fail=1; }
+    case "$(classify down ok unknown)" in UNKNOWN-*) ;; *) echo "  FAIL: a dark OOB leg must render UNKNOWN, never a world it cannot see"; fail=1 ;; esac
+    echo "  ok: three worlds, three words; a dark OOB leg names neither"
+
+    # --- classify: our own blindness may never be spent as a verdict about the subject --------
+    for _oob in auth refused closed unknown; do
+        case "$(classify down blind "$_oob")" in
+            UNKNOWN-SELF-BLIND) ;;
+            *) echo "  FAIL: self-blind + oob=$_oob accused the subject: $(classify down blind "$_oob")"; fail=1 ;;
+        esac
+    done
+    case "$(classify unknown ok auth)" in UNKNOWN-*) ;; *) echo "  FAIL: an unproven path must not mint a verdict"; fail=1 ;; esac
+    echo "  ok: self-blindness and an unproven path never accuse the subject"
+
+    # --- hold: a new verdict is never spent on its first sighting -----------------------------
+    case "$(hold_decide OK TS-ONLY '' '' 1000 300)"            in hold\|*) ;; *) echo "  FAIL: first sighting posted"; fail=1 ;; esac
+    case "$(hold_decide OK TS-ONLY TS-ONLY 600 1000 300)"      in post\|*) ;; *) echo "  FAIL: a verdict that survived the hold was not spent"; fail=1 ;; esac
+    case "$(hold_decide OK TS-ONLY TS-ONLY 700 1000 300)"      in post\|*) ;; *) echo "  FAIL: past-hold not spent"; fail=1 ;; esac
+    case "$(hold_decide OK TS-ONLY TS-ONLY 900 1050 300)"      in hold\|*) ;; *) echo "  FAIL: spent inside the hold window"; fail=1 ;; esac
+    case "$(hold_decide OK OK OK 100 1000 300)"                in quiet\|*) ;; *) echo "  FAIL: unchanged verdict was not quiet"; fail=1 ;; esac
+    # the flap: TS-ONLY seen, then OK again, then TS-ONLY — the pending must have been reset, so the
+    # second sighting is a FIRST sighting again and nothing is spent.
+    # NOTE the `since`: it must be OLD ENOUGH that the elapsed-time arm alone would spend this
+    # verdict (400s >= the 300s hold). Only the pending-IDENTITY check can hold it back, so this is
+    # the one arm that is actually load-bearing for it. With `since` inside the window the fixture
+    # passes either way and the check is untested — measured: deleting it left the suite green.
+    case "$(hold_decide OK TS-ONLY OK 600 1000 300)"           in hold\|*) ;; *) echo "  FAIL: a flapped verdict was spent as if it had held (the pending-identity check is not load-bearing)"; fail=1 ;; esac
+    echo "  ok: a verdict must survive one cadence unchanged before it wakes anyone"
+
+    # --- oob_coverage: a learned address is history and publishes its age ---------------------
+    [ "$(oob_coverage '' 1000 100)" = never ]        || { echo "  FAIL: unlearned address not rendered never"; fail=1; }
+    [ "$(oob_coverage abc 1000 100)" = never ]       || { echo "  FAIL: unparsable learn time not rendered never"; fail=1; }
+    case "$(oob_coverage 950 1000 100)"  in fresh\|50s) ;;   *) echo "  FAIL: fresh learn: $(oob_coverage 950 1000 100)"; fail=1 ;; esac
+    case "$(oob_coverage 800 1000 100)"  in stale\|200s) ;;  *) echo "  FAIL: a past-horizon learn must render stale, never fresh"; fail=1 ;; esac
+    echo "  ok: the OOB address carries the age it stands for"
+
+    # --- _ts_pong: rc=0 is not 'that host answered' when the subject is our exit node ---------
+    _td="$(mktemp -d)" || { echo "  FAIL: mktemp"; exit 1; }
+    trap 'rm -rf "$_td"' EXIT INT HUP TERM
+    mkdir -p "$_td/bin"
+    # the exit-node lie: rc 0, but the pong names a DIFFERENT address than the one asked for.
+    cat > "$_td/bin/tailscale" <<'STUB'
+#!/usr/bin/env bash
+echo "pong from subject (100.94.116.17) via DERP in 21ms"
+exit 0
+STUB
+    chmod +x "$_td/bin/tailscale"
+    if PATH="$_td/bin:$PATH" _ts_pong 100.99.99.99; then
+        echo "  FAIL: _ts_pong trusted rc=0 for an address the pong never named (the exit-node lie)"; fail=1
+    else
+        echo "  ok: a pong is matched against the address we asked for, never trusted by rc"
+    fi
+    PATH="$_td/bin:$PATH" _ts_pong 100.94.116.17 \
+        || { echo "  FAIL: _ts_pong rejected a pong that DOES name the address asked for"; fail=1; }
+
+    # --- oob_leg: refusal and closure are two claims -------------------------------------------
+    mk_ssh(){ printf '#!/usr/bin/env bash\n%s\n' "$1" > "$_td/bin/ssh"; chmod +x "$_td/bin/ssh"; }
+    _fk="$_td/fakekey"; : > "$_fk"
+    mk_ssh 'echo OOB-OK'
+    [ "$(PATH="$_td/bin:$PATH" oob_leg 1.2.3.4 22 "$_fk")" = auth ]     || { echo "  FAIL: oob auth"; fail=1; }
+    mk_ssh 'echo "root@1.2.3.4: Permission denied (publickey)." >&2; exit 255'
+    [ "$(PATH="$_td/bin:$PATH" oob_leg 1.2.3.4 22 "$_fk")" = refused ]  || { echo "  FAIL: a refused key must not read as a dead node"; fail=1; }
+    mk_ssh 'echo "ssh: connect to host 1.2.3.4 port 22: Connection timed out" >&2; exit 255'
+    [ "$(PATH="$_td/bin:$PATH" oob_leg 1.2.3.4 22 "$_fk")" = closed ]   || { echo "  FAIL: oob closed"; fail=1; }
+    case "$(PATH="$_td/bin:$PATH" oob_leg '' 22 "$_fk")" in unknown\|*) ;; *) echo "  FAIL: no OOB address must render unknown"; fail=1 ;; esac
+    case "$(PATH="$_td/bin:$PATH" oob_leg 1.2.3.4 22 "$_td/nosuchkey")" in unknown\|*) ;; *) echo "  FAIL: a missing recovery key must render unknown, not closed"; fail=1 ;; esac
+    echo "  ok: refusal, closure, and 'could not tell' stay three separate claims"
+
+    # --- learn_oob: the address is learned from the subject, and private ranges are not it -----
+    mk_ssh 'echo "10.66.66.1/24"; echo "100.94.116.17/32"; echo "38.49.216.141/27"'
+    [ "$(PATH="$_td/bin:$PATH" learn_oob root@x)" = 38.49.216.141 ] \
+        || { echo "  FAIL: learn_oob picked a private/CGNAT address: $(PATH="$_td/bin:$PATH" learn_oob root@x)"; fail=1; }
+    mk_ssh 'echo "10.66.66.1/24"; echo "192.168.1.5/24"; echo "100.94.116.17/32"'
+    if PATH="$_td/bin:$PATH" learn_oob root@x >/dev/null 2>&1; then
+        echo "  FAIL: learn_oob invented an OOB address from private ranges only"; fail=1
+    else
+        echo "  ok: the OOB address is learned from the subject and is never a private one"
+    fi
+
+    # --- ssh_alias_drift: the alias is a constant and the learn is the reading -----------------
+    cat > "$_td/bin/ssh" <<'STUB'
+#!/usr/bin/env bash
+# ssh -G <alias>
+echo "hostname ${STUB_HOSTNAME:-$2}"
+STUB
+    chmod +x "$_td/bin/ssh"
+    [ -z "$(PATH="$_td/bin:$PATH" STUB_HOSTNAME=5.6.7.8 ssh_alias_drift a-oob 5.6.7.8)" ] \
+        || { echo "  FAIL: agreeing alias reported drift"; fail=1; }
+    [ "$(PATH="$_td/bin:$PATH" STUB_HOSTNAME=9.9.9.9 ssh_alias_drift a-oob 5.6.7.8)" = 9.9.9.9 ] \
+        || { echo "  FAIL: a stale alias was not reported as drift"; fail=1; }
+    [ -z "$(PATH="$_td/bin:$PATH" STUB_HOSTNAME=a-oob ssh_alias_drift a-oob 5.6.7.8)" ] \
+        || { echo "  FAIL: an absent Host block was reported as drift"; fail=1; }
+    echo "  ok: a stale ssh alias is a finding, an absent one is not"
+
+    # --- arming is not a recovery --------------------------------------------------------------
+    ok_post_wanted "" && { echo "  FAIL: a first-run OK would announce a recovery that never happened"; fail=1; }
+    ok_post_wanted "NODE-DOWN" || { echo "  FAIL: a real return to OK was suppressed"; fail=1; }
+    echo "  ok: an OK transition is spent only when there was something to recover from"
+
+    # --- peer_leg: an OFFLINE peer is DOWN, not absent -----------------------------------------
+    # jq's `//` is an emptiness test, and `false` is empty to it. Asking for `.Online` through `//`
+    # made "the peer is offline" and "the peer is not on this tailnet" render as the same string,
+    # which is precisely the collapse this tool is built to prevent. Fixture-driven so the arm does
+    # not depend on the live tailnet having an offline peer today.
+    cat > "$_td/bin/tailscale" <<'STUB'
+#!/usr/bin/env bash
+case "$*" in
+  *ping*) exit 1 ;;   # data path silent, whatever the control plane claims
+esac
+cat "$STUB_STATUS"
+STUB
+    chmod +x "$_td/bin/tailscale"
+    printf '{"BackendState":"Running","Self":{"Online":true},"Peer":{"x":{"HostName":"subj","TailscaleIPs":["100.64.0.7"],"Online":false}}}' > "$_td/off.json"
+    printf '{"BackendState":"Running","Self":{"Online":true},"Peer":{"x":{"HostName":"other","TailscaleIPs":["100.64.0.8"],"Online":true}}}' > "$_td/absent.json"
+    _pl="$(PATH="$_td/bin:$PATH" STUB_STATUS="$_td/off.json" peer_leg 100.64.0.7)"
+    [ "${_pl%%|*}" = down ] \
+        || { echo "  FAIL: an OFFLINE peer rendered '$_pl' — the one state this tool exists to catch"; fail=1; }
+    _pl="$(PATH="$_td/bin:$PATH" STUB_STATUS="$_td/absent.json" peer_leg 100.64.0.7)"
+    [ "${_pl%%|*}" = unknown ] \
+        || { echo "  FAIL: a peer genuinely absent from the tailnet rendered '$_pl', not unknown"; fail=1; }
+    echo "  ok: offline and not-on-this-tailnet are two different claims"
+
+    # --- resolve_node stands down loudly on an unlisted subject --------------------------------
+    ( MESH_NODES="a:x@1 b:y@2"; resolve_node phaedra >/dev/null 2>&1 ) \
+        && { echo "  FAIL: resolve_node invented a target for an unlisted subject"; fail=1; } \
+        || echo "  ok: an unlisted subject resolves to nothing rather than to a guess"
+
+    [ "$fail" = 0 ] && echo "smoke-test: PASS" || echo "smoke-test: FAIL"
+    exit "$fail"
+fi
+
+# ---------------------------------------------------------------- main
+mkdir -p "$HOME/.mesh"
+
+TARGET="$(resolve_node "$VPN_NODE")" || TARGET=""
+TS_IP="${TARGET##*@}"
+
+# Stand down LOUDLY, never quietly: a node whose registry does not name the VPN subject is not a
+# node where this reflex silently passes — it is a node where it does not apply, and it says so.
+if [ -z "$TARGET" ]; then
+    echo "$STAMP n/a — MESH_VPN_NODE=$VPN_NODE is not listed in MESH_NODES; nothing to watch (set it in ~/.mesh/nodes)"
+    exit 2
+fi
+
+OOB_IP="$(state_get OOB_IP)"
+OOB_AT="$(state_get OOB_LEARNED_AT)"
+KEY_OK_AT="$(state_get KEY_OK_AT)"
+PREV="$(state_get LAST_VERDICT)"
+PEND="$(state_get PENDING_VERDICT)"
+PEND_SINCE="$(state_get PENDING_SINCE)"
+# Seed the OOB address from config the first time only. Config is a constant; every later value is
+# learned from the subject itself, so a renumbered server corrects us instead of stranding us.
+[ -z "$OOB_IP" ] && OOB_IP="${MESH_VPN_PUBIP:-}" && [ -n "$OOB_IP" ] && OOB_AT="$NOW"
+
+if [ "$MODE" = recovery ]; then
+    cov="$(oob_coverage "${OOB_AT:-}" "$NOW" "$OOB_MAX_AGE")"
+    echo "recovery path for $VPN_NODE (subject of MESH_VPN_NODE), $STAMP"
+    echo "  in-band  (dead in exactly the outage this exists for): ssh $TARGET"
+    echo "  OUT-OF-BAND: ssh -i $REC_KEY -p $OOB_PORT root@${OOB_IP:-<unknown>}   (alias: ssh ${MESH_VPN_OOB_ALIAS:-${VPN_NODE}-direct})   [learn=$cov]"
+    echo "  key      : $REC_KEY $( [ -r "$REC_KEY" ] && ssh-keygen -lf "$REC_KEY" 2>/dev/null | awk '{print $2}' || echo UNREADABLE )"
+    echo "  key last proven over the OOB path: $( [ -n "${KEY_OK_AT:-}" ] && date -u -d "@$KEY_OK_AT" +%Y-%m-%dT%H:%M:%SZ || echo NEVER )"
+    echo "  then, on the subject: systemctl status tailscaled; systemctl restart tailscaled; tailscale status"
+    echo "  NOTE: this reflex never restarts anything. Hold a claim (mesh-claim) before touching the subject."
+    [ "${cov%%|*}" = never ] && exit 2
+    exit 0
+fi
+
+# --- legs -------------------------------------------------------------------------------------
+SELF="$(self_leg)"; SELF_V="${SELF%%|*}"; SELF_WHY="${SELF#*|}"; [ "$SELF_V" = "$SELF_WHY" ] && SELF_WHY=""
+PEER="unknown|self blind"; PEER_V=unknown
+if [ "$SELF_V" = ok ]; then PEER="$(peer_leg "$TS_IP")"; PEER_V="${PEER%%|*}"; fi
+PEER_WHY="${PEER#*|}"; [ "$PEER_V" = "$PEER_WHY" ] && PEER_WHY=""
+
+OOB="unknown|not probed"; OOB_V=unknown; KEY_PROVEN=0
+_key_stale=1
+case "${KEY_OK_AT:-}" in ''|*[!0-9]*) _key_stale=1 ;; *) [ $(( NOW - KEY_OK_AT )) -lt "$KEY_PROVE_EVERY" ] && _key_stale=0 ;; esac
+
+if [ "$PEER_V" = up ]; then
+    # Healthy: re-learn the OOB address from the subject, and — throttled — PROVE the recovery key
+    # over that path. Proving it here, while nothing is broken, is the whole difference between a
+    # recovery capability and a recovery assumption.
+    # The learn rides the same throttle as the key proof: both are healthy-path maintenance, and a
+    # re-learn every cadence would put 288 ssh sessions a day on the subject to refresh an address
+    # whose own staleness bound is a week.
+    if [ "$_key_stale" = 1 ] && _learned="$(learn_oob "$TARGET")"; then
+        [ "$_learned" != "$OOB_IP" ] && [ -n "$OOB_IP" ] \
+            && mesh-trace "vpn-node-watch: $VPN_NODE OOB address moved $OOB_IP -> $_learned" >/dev/null 2>&1
+        OOB_IP="$_learned"; OOB_AT="$NOW"
+    fi
+    if [ "$_key_stale" = 1 ]; then
+        OOB="$(oob_leg "$OOB_IP" "$OOB_PORT" "$REC_KEY")"; OOB_V="${OOB%%|*}"
+        [ "$OOB_V" = auth ] && { KEY_OK_AT="$NOW"; KEY_PROVEN=1; }
+    else
+        OOB="auth"; OOB_V=auth   # proven inside the throttle window; the age is published below
+    fi
+elif [ "$PEER_V" = down ]; then
+    # The subject is silent over tailscale — this is the ONE moment the OOB leg decides the world.
+    OOB="$(oob_leg "$OOB_IP" "$OOB_PORT" "$REC_KEY")"; OOB_V="${OOB%%|*}"
+    [ "$OOB_V" = auth ] && KEY_OK_AT="$NOW"
+fi
+OOB_WHY="${OOB#*|}"; [ "$OOB_V" = "$OOB_WHY" ] && OOB_WHY=""
+
+VERDICT="$(classify "$PEER_V" "$SELF_V" "$OOB_V")"
+COV="$(oob_coverage "${OOB_AT:-}" "$NOW" "$OOB_MAX_AGE")"
+[ "${COV%%|*}" = stale ] && case "$VERDICT" in TS-ONLY|NODE-DOWN|KEY-LOST) VERDICT="UNKNOWN-OOB-STALE" ;; esac
+
+# ONE alias per path. A second alias for the same host is drift waiting to happen, so this checks
+# the alias that already exists rather than minting a rival for it.
+OOB_ALIAS="${MESH_VPN_OOB_ALIAS:-${VPN_NODE}-direct}"
+DRIFT="$(ssh_alias_drift "$OOB_ALIAS" "$OOB_IP")"
+KEY_FP="$( [ -r "$REC_KEY" ] && ssh-keygen -lf "$REC_KEY" 2>/dev/null | awk '{print $2}' || echo absent )"
+KEY_AGE="$( case "${KEY_OK_AT:-}" in ''|*[!0-9]*) echo never ;; *) echo "$(( NOW - KEY_OK_AT ))s" ;; esac )"
+
+SUMMARY="$VPN_NODE $VERDICT — ts=$PEER_V${PEER_WHY:+($PEER_WHY)} self=$SELF_V${SELF_WHY:+($SELF_WHY)} oob=$OOB_V${OOB_WHY:+($OOB_WHY)}@${OOB_IP:-none} learn=$COV key=$KEY_FP proven=$KEY_AGE${DRIFT:+ ssh-alias-drift=$OOB_ALIAS->$DRIFT}"
+
+# --- hold and spend ---------------------------------------------------------------------------
+DEC="$(hold_decide "${PREV:-}" "$VERDICT" "${PEND:-}" "${PEND_SINCE:-}" "$NOW" 300)"
+DEC_V="${DEC%%|*}"
+NEW_PREV="${PREV:-}"; NEW_PEND="$VERDICT"; NEW_SINCE="$NOW"
+case "$DEC_V" in
+    quiet) NEW_PEND=""; NEW_SINCE=0 ;;
+    hold)  [ "$PEND" = "$VERDICT" ] && NEW_SINCE="${PEND_SINCE:-$NOW}" ;;
+    post)  NEW_PREV="$VERDICT"; NEW_PEND=""; NEW_SINCE=0 ;;
+esac
+
+if [ "$DEC_V" = post ]; then
+    printf '%s\t%s\t%s\n' "$STAMP" "$VERDICT" "$SUMMARY" >> "$LEDGER"
+    if [ "$EDGE" = 1 ] && command -v mesh-chat >/dev/null 2>&1; then
+        case "$VERDICT" in
+            TS-ONLY)   mesh-chat "[alert] $SUMMARY — the VPN/exit node is ALIVE and only its tailscale is gone. This is the recoverable world and the out-of-band path is PROVEN: run 'mesh-vpn-node-watch --recovery' for the exact command. Take a claim first; this reflex restarts nothing." >/dev/null 2>&1 ;;
+            NODE-DOWN) mesh-chat "[alert] $SUMMARY — the VPN/exit node answers on NEITHER tailscale nor its own public address. Nothing here can be ssh'd back to life; this needs the host's provider, not a restart." >/dev/null 2>&1 ;;
+            KEY-LOST)  mesh-chat "[alert] $SUMMARY — the subject's sshd ANSWERS and refuses our recovery key. This is a CREDENTIAL incident, not a dead node: do not reboot anything, re-establish the key." >/dev/null 2>&1 ;;
+            UNKNOWN-*) mesh-chat "[fyi] $SUMMARY — cannot say whether the VPN/exit node is up. This is our own blindness, NOT a verdict about the subject." >/dev/null 2>&1 ;;
+            OK)        ok_post_wanted "$PREV" && mesh-chat "[fyi] $SUMMARY — the VPN/exit node is reachable again and the recovery path is proven." >/dev/null 2>&1 ;;
+        esac
+    fi
+    mesh-trace "vpn-node-watch: $SUMMARY" >/dev/null 2>&1
+fi
+[ -n "$DRIFT" ] && mesh-trace "vpn-node-watch: ssh alias $OOB_ALIAS points at $DRIFT but the subject reports $OOB_IP" >/dev/null 2>&1
+
+state_write \
+    "STAMP=$STAMP" \
+    "LAST_VERDICT=$NEW_PREV" \
+    "PENDING_VERDICT=$NEW_PEND" \
+    "PENDING_SINCE=$NEW_SINCE" \
+    "OOB_IP=${OOB_IP:-}" \
+    "OOB_LEARNED_AT=${OOB_AT:-0}" \
+    "KEY_OK_AT=${KEY_OK_AT:-}" \
+    "KEY_FP=$KEY_FP"
+command -v mesh-state-touch >/dev/null 2>&1 && mesh-state-touch "$STATE" >/dev/null 2>&1
+
+if [ "$JSON" = 1 ]; then
+    printf '{"stamp":"%s","node":"%s","verdict":"%s","ts":"%s","self":"%s","oob":"%s","oob_ip":"%s","learn":"%s","key_fp":"%s","key_proven_age":"%s","decision":"%s","alias_drift":"%s"}\n' \
+        "$STAMP" "$VPN_NODE" "$VERDICT" "$PEER_V" "$SELF_V" "$OOB_V" "${OOB_IP:-}" "$COV" "$KEY_FP" "$KEY_AGE" "$DEC_V" "${DRIFT:-}"
+else
+    echo "$STAMP $SUMMARY [$DEC_V]"
+fi
+
+case "$VERDICT" in
+    OK)        exit 0 ;;
+    UNKNOWN-*) exit 2 ;;
+    *)         exit 1 ;;
+esac
