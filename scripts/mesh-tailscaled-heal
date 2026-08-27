@@ -1,0 +1,494 @@
+#!/usr/bin/env bash
+# reflex-cadence: * * * * *
+# reflex-state: $HOME/.mesh/.tailscaled-heal.state
+# (Declared so mesh-reflex-health DERIVES us into its watch table. This healer is the ONLY
+#  re-applier of the node's own tailnet membership, and a dead healer looks exactly like a healthy
+#  daemon from every vantage that matters. The state is touch_state()-ed on EVERY successful eval
+#  — ok / acted / stood-down alike — so mtime is ran-live, not value-changed.)
+# mesh-tailscaled-heal — restart the daemon that IS the channel, from INSIDE the node.
+#
+# WHY THIS EXISTS. On 2026-08-27 phaedra's tailscaled took a SIGTERM at 02:08:41Z and stayed down
+# until 16:28:29Z — 14h20m off the tailnet. The box never rebooted (uptime 76d); inet, shadowsocks,
+# trojan and wireguard served throughout. Only the tailnet died, and recovery came by HAND over
+# PUBLIC ssh from the operator's home IP. Per doctrine that IS the incident: the operator's hands
+# were the only re-applier.
+#
+# WHY NO REMOTE HEALER CAN COVER THIS. Every mesh reflex that could notice reaches the node OVER
+# the tailnet. When tailscaled is the thing that died, the observer and the actuator are both on
+# the far side of the break — mesh-vpn-health, mesh-access-probe, mesh-fleet-health and mesh-tell
+# are structurally blind to exactly this fault, and stay blind for as long as it lasts. The
+# re-applier must be node-LOCAL or it does not exist. This one is cron on the node itself.
+#
+# WHY SYSTEMD DID NOT DO IT. `Restart=on-failure` (phaedra, measured 2026-08-27: Restart=on-failure,
+# NRestarts=0, UnitFileState=enabled). tailscaled exits 0 on SIGTERM, so systemd saw a SUCCESSFUL
+# exit and correctly declined to restart. A unit that is `enabled` and `inactive` with no stop job
+# is a node contradicting its own declaration, and that contradiction is this tool's entire trigger.
+#
+# WHY IT CANNOT SEVER THE PATH IT WOULD BE UNDONE OVER (the self-defeating-change gate). Its only
+# write is `systemctl start tailscaled` on a unit that is NOT running. It never stops, never
+# restarts, never reloads, and never touches an active daemon — so there is no state in which it can
+# take down a channel that is currently up. Starting a dead daemon is monotone: strictly more
+# reachability, never less.
+#
+# WHAT IT DELIBERATELY WILL NOT DO — `tailscale up`. A daemon that is Running but NeedsLogin is a
+# DIFFERENT fault, and re-authenticating severs the very session a hand would be fixing it over
+# (CLAUDE.local.md records that trap costing this mesh a tagged identity). This tool reports that
+# state LOUDLY and non-zero, and does not act on it. It also never touches `tailscale down`: that
+# leaves the unit active, so `tailscale down` remains the deliberate, respected way to take a node
+# off the tailnet, and this healer will not fight it.
+#
+# THE MANDATE IS THE UNIT'S OWN DECLARATION, not a hostname and not a list. It heals only a unit
+# whose UnitFileState says it is meant to be running (`enabled`/`enabled-runtime`/`static`).
+# `disabled` means the node said don't run this -> n/a, rc 2. `masked` means a hand deliberately
+# nailed it shut -> REFUSE, loudly, rc 1 (the ollama precedent on mesh-home: a masked unit is a
+# decision, and quietly unmasking it would undo an operator's fix). A node with no tailscaled unit
+# at all exits 2, so mesh-autowire SKIPs wiring it there.
+#
+# THE ARTIFACT IS NEVER "the service started". `systemctl start` returning 0 says a process was
+# spawned; it says nothing about tailnet membership. The verify polls `tailscale status --json`
+# until BackendState=Running AND .Self.Online=true, and reports UNHEALED, non-zero, if that never
+# arrives. .Self.Online is the control plane's own verdict relayed by the local daemon — the
+# closest a node-local tool can stand to a peer's vantage, and its limit is named in the tape.
+#
+#   mesh-tailscaled-heal            one cycle: read the unit, start it if it is dead, verify the tailnet
+#   mesh-tailscaled-heal --check    dry-run — say what WOULD be done, never write
+#   mesh-tailscaled-heal --log [N]  the durable application tape (last N lines, default 20)
+#   mesh-tailscaled-heal --mandate  who authorised this actuator, and how to contest it
+#   mesh-tailscaled-heal --test     smoke test (stubbed systemd + tailscale — touches no real unit)
+set -uo pipefail
+
+usage(){ sed -n '2,/^[^#]/p' "$0" | sed -n 's/^# \?//p'; }
+case "${1:-}" in -h|--help) usage; exit 0 ;; esac
+
+# CRON'S PATH IS NOT YOURS: cron hands a reflex /usr/bin:/bin, so `mesh-trace`/`mesh-chat` are rc=127
+# and every application would be silent — the rate signal is the whole point, so it must survive cron.
+export PATH="$HOME/.local/bin:$PATH"
+
+MESH_DIR="${MESH_DIR:-$HOME/.mesh}"
+UNIT="${MESH_TSH_UNIT:-tailscaled.service}"
+# The tape is NOT the cron stdout log (~/.mesh/tailscaled-heal.log, which autowire owns): sharing it
+# would append every minute's stdout to the file applied_since() counts, and since a real heal prints
+# "APPLIED" that would double-count the rate. Separate file; the counter additionally refuses any
+# line that does not START with a real timestamp.
+LOG="${MESH_TSH_LOG:-$MESH_DIR/tailscaled-heal-applications.log}"
+STATE="${MESH_TSH_STATE:-$MESH_DIR/.tailscaled-heal.state}"
+BOARD_MIN_GAP="${MESH_TSH_BOARD_MIN_GAP:-900}"
+WAIT_S="${MESH_TSH_WAIT:-60}"          # seconds to wait for the tailnet to come back after a start
+POLL_S="${MESH_TSH_POLL:-3}"
+# The off-switch is a FILE, not an env var: this runs from cron, which sources no profile, so an
+# env gate would read as "always armed" exactly where it needs to bind. It is also the documented
+# way to hold the healer off during deliberate maintenance on the daemon.
+OFF_SWITCH="${MESH_TSH_OFF:-$MESH_DIR/tailscaled-heal.off}"
+mkdir -p "$MESH_DIR" 2>/dev/null || true
+
+ts(){ date -u +%Y-%m-%dT%H:%M:%SZ; }
+say(){ printf '%s\n' "$*"; }
+# quiet(): the NO-OP path ONLY. Wired * * * * * with stdout appended to a durable log, a per-minute
+# "nothing to do" would bury the events this exists to make visible. Nothing that WROTE, refused, or
+# failed is ever routed through here.
+quiet(){ if [ -t 1 ] || [ "${DRY:-0}" = 1 ] || [ "${MESH_TSH_VERBOSE:-0}" = 1 ]; then printf '%s\n' "$*"; fi; }
+tape(){ printf '%s  %s\n' "$(ts)" "$*" >> "$LOG" 2>/dev/null || true; }
+trace(){ command -v mesh-trace >/dev/null 2>&1 && mesh-trace "$*" >/dev/null 2>&1 || true; }
+touch_state(){ command -v mesh-state-touch >/dev/null 2>&1 && mesh-state-touch --create "$STATE" >/dev/null 2>&1 || touch "$STATE" 2>/dev/null || true; }
+
+applied_since(){
+  local secs="$1" verb="${2:-APPLIED}" cutoff
+  cutoff=$(date -u -d "@$(( $(date -u +%s) - secs ))" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null) || return 0
+  [ -s "$LOG" ] || { echo 0; return 0; }
+  awk -v c="$cutoff" -v v="$verb" '$1 ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T/ && $1 >= c && $2 == v {n++} END{print n+0}' "$LOG"
+}
+
+case "${1:-}" in
+  --log) n="${2:-20}"; [ -s "$LOG" ] && tail -n "$n" "$LOG" || echo "(no applications recorded yet: $LOG)"; exit 0 ;;
+esac
+
+# ── smoke test ─────────────────────────────────────────────────────────────────────────────────
+# EVERY arm runs the REAL tool against a stubbed systemd + tailscale: a scratch PATH whose
+# `systemctl` answers a fixture and RECORDS every command instead of running it, whose `tailscale`
+# serves a status fixture that flips after the start, and whose `sudo`/`mesh-trace`/`mesh-chat`
+# record to files. No real unit is read, started or reset. The mutants each arm was seen RED
+# against are named beside it (run from a scratch copy, never this tree).
+if [ "${1:-}" = --test ]; then
+  SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+  fails=0; F(){ echo "smoke-test: FAIL ($1)"; fails=1; }
+  td="$(mktemp -d)" || { echo "smoke-test: FAIL (mktemp)"; exit 1; }
+  trap 'rm -rf "$td"' EXIT
+  mkdir -p "$td/bin" "$td/mesh"
+
+  cat > "$td/bin/systemctl" <<'SC'
+#!/bin/sh
+echo "$*" >> "$TSH_TD/systemctl.cmds"
+case "$1" in
+  show)  if [ -f "$TSH_TD/started" ] && [ -s "$TSH_TD/unit.kv2" ]; then cat "$TSH_TD/unit.kv2"; else cat "$TSH_TD/unit.kv"; fi; exit 0 ;;
+  start) if [ -s "$TSH_TD/startfail" ]; then cat "$TSH_TD/startfail" >&2; exit 1; fi
+         : > "$TSH_TD/started"; exit 0 ;;
+  reset-failed) exit 0 ;;
+esac
+exit 0
+SC
+  cat > "$td/bin/tailscale" <<'TS'
+#!/bin/sh
+echo "$*" >> "$TSH_TD/tailscale.cmds"
+case "$*" in
+  "status --json") if [ -f "$TSH_TD/started" ] && [ -s "$TSH_TD/ts.json2" ]; then cat "$TSH_TD/ts.json2"; else cat "$TSH_TD/ts.json"; fi; exit 0 ;;
+esac
+exit 0
+TS
+  cat > "$td/bin/sudo" <<'SU'
+#!/bin/sh
+[ "$1" = -n ] && shift
+[ -f "$TSH_TD/sudoblock" ] && { echo "sudo: a password is required" >&2; exit 1; }
+exec "$@"
+SU
+  printf '#!/bin/sh\necho "$*" >> "$TSH_TD/trace.log"\n' > "$td/bin/mesh-trace"
+  printf '#!/bin/sh\necho "$*" >> "$TSH_TD/chat.log"\n'  > "$td/bin/mesh-chat"
+  chmod +x "$td/bin"/*
+
+  unit(){  # unit <LoadState> <UnitFileState> <ActiveState> [SubState]
+    printf 'LoadState=%s\nUnitFileState=%s\nActiveState=%s\nSubState=%s\nRestart=on-failure\nNRestarts=0\nInactiveEnterTimestamp=Thu 2026-08-27 02:08:41 UTC\n' \
+      "$1" "$2" "$3" "${4:-dead}"
+  }
+  ONLINE='{"BackendState":"Running","Self":{"HostName":"phaedra","Online":true}}'
+  OFFLINE='{"BackendState":"Stopped","Self":{"HostName":"phaedra","Online":false}}'
+  NEEDSLOGIN='{"BackendState":"NeedsLogin","Self":{"HostName":"phaedra","Online":false}}'
+
+  # run <unit-before> <unit-after> <ts-before> <ts-after> [args...]
+  run(){
+    local ub="$1" ua="$2" tb="$3" ta="$4"; shift 4
+    rm -f "$td/systemctl.cmds" "$td/tailscale.cmds" "$td/trace.log" "$td/chat.log" "$td/started" \
+          "$td/mesh/.tailscaled-heal.board" "$td/mesh/.tailscaled-heal.backend"
+    printf '%s' "$ub" > "$td/unit.kv"; printf '%s' "$ua" > "$td/unit.kv2"
+    printf '%s\n' "$tb" > "$td/ts.json"; printf '%s\n' "$ta" > "$td/ts.json2"
+    OUT="$(TSH_TD="$td" PATH="$td/bin:$PATH" HOME="$td" MESH_DIR="$td/mesh" \
+           MESH_TSH_LOG="$td/mesh/heal.log" MESH_TSH_STATE="$td/mesh/state" \
+           MESH_TSH_OFF="$td/off" MESH_TSH_SUDO="sudo -n" \
+           MESH_TSH_WAIT=6 MESH_TSH_POLL=1 \
+           "$SELF" "$@" 2>&1)"; RC=$?
+  }
+  started(){ grep -q '^start ' "$td/systemctl.cmds" 2>/dev/null; }
+
+  # (T1) THE WHOLE POINT: an enabled unit that is dead gets started, and the verdict comes from the
+  #      TAILNET, not from systemctl's exit code. Loud in the trace, on the tape, and carrying a rate.
+  #      mutant: drop the `systemctl start` call -> red (nothing started).
+  run "$(unit loaded enabled inactive)" "$(unit loaded enabled active running)" "$OFFLINE" "$ONLINE"
+  [ "$RC" = 0 ] || F "a dead enabled tailscaled exited $RC: $OUT"
+  started || F "did not start the unit (systemctl calls: $(cat "$td/systemctl.cmds" 2>/dev/null))"
+  grep -q 'APPLIED' "$td/mesh/heal.log" 2>/dev/null || F "the durable tape recorded no application"
+  grep -q 'APPLIED' "$td/trace.log" 2>/dev/null \
+    || F "an application left NO trace — the re-apply rate is the whole signal and it must be loud"
+  grep -q 'in 24h' "$td/trace.log" 2>/dev/null || F "the trace carried no rate: $(cat "$td/trace.log" 2>/dev/null)"
+  grep -q 'status --json' "$td/tailscale.cmds" 2>/dev/null \
+    || F "verified without ever asking the tailnet — 'the service started' is not the artifact"
+
+  # (T2) A RUNNING DAEMON IS NEVER TOUCHED. This is the self-defeating-change gate: the only state in
+  #      which this tool could sever its own channel is one where it acts on a live unit.
+  #      mutant: act on any state != active, or use `restart` instead of `start` -> red.
+  run "$(unit loaded enabled active running)" "$(unit loaded enabled active running)" "$ONLINE" "$ONLINE"
+  [ "$RC" = 0 ] || F "a healthy tailscaled exited $RC: $OUT"
+  started && F "STARTED an already-active tailscaled: $(cat "$td/systemctl.cmds")"
+  grep -qE '^(restart|stop|reload) ' "$td/systemctl.cmds" 2>/dev/null \
+    && F "issued a stop/restart/reload — this tool must only ever START a dead unit"
+
+  # (T3) `activating` / `deactivating` are TRANSIENTS, not the fault. Racing systemd's own boot start
+  #      would double-start at every reboot and make the rate fiction.
+  for st in activating deactivating reloading; do
+    run "$(unit loaded enabled "$st")" "$(unit loaded enabled active running)" "$OFFLINE" "$ONLINE"
+    started && F "acted on transient ActiveState=$st: $(cat "$td/systemctl.cmds")"
+    [ "$RC" = 0 ] || F "transient $st exited $RC (should be a quiet no-op): $OUT"
+  done
+
+  # (T4) MASKED is a DECISION, not a fault (the ollama precedent on mesh-home: a masked unit is
+  #      somebody's fix). Refuse LOUDLY and never unmask.  mutant: fall through to start -> red.
+  run "$(unit masked masked inactive)" "$(unit loaded enabled active running)" "$OFFLINE" "$ONLINE"
+  started && F "started a MASKED unit — that silently undoes a deliberate mask"
+  [ "$RC" = 0 ] && F "a masked unit exited 0 — a refusal that reads as success is a silent skip"
+  grep -q 'MASKED' "$td/mesh/heal.log" 2>/dev/null || F "a masked refusal left no tape row: $OUT"
+  grep -qE '^(unmask) ' "$td/systemctl.cmds" 2>/dev/null && F "tried to unmask"
+
+  # (T5) DISABLED means the node declared this unit should not run -> n/a (rc 2), never a heal.
+  #      The mandate is the unit's own declaration; a hostname list would age out instead.
+  run "$(unit loaded disabled inactive)" "$(unit loaded enabled active running)" "$OFFLINE" "$ONLINE"
+  started && F "started a DISABLED unit — the node said it should not run"
+  [ "$RC" = 2 ] || F "a disabled unit exited $RC, expected 2 (n/a, so autowire SKIPs the node): $OUT"
+
+  # (T6) NO UNIT AT ALL -> rc 2, so this stays green mesh-wide and autowire never wires it on a node
+  #      with no tailscaled.
+  run "$(unit not-found '' inactive)" "$(unit not-found '' inactive)" "$OFFLINE" "$OFFLINE"
+  [ "$RC" = 2 ] || F "a node with no tailscaled unit exited $RC, expected 2: $OUT"
+  started && F "started a unit that does not exist"
+
+  # (T7) FAILED + systemd's start rate limit: reset-failed FIRST or `start` answers "start request
+  #      repeated too quickly" forever — that is the state systemd gives up in permanently.
+  #      mutant: drop the reset-failed -> red.
+  run "$(unit loaded enabled failed failed)" "$(unit loaded enabled active running)" "$OFFLINE" "$ONLINE"
+  [ "$RC" = 0 ] || F "a failed unit exited $RC: $OUT"
+  grep -q '^reset-failed ' "$td/systemctl.cmds" 2>/dev/null \
+    || F "did not reset-failed before starting a failed unit: $(cat "$td/systemctl.cmds")"
+  started || F "did not start a failed unit"
+
+  # (T8) THE VERIFY IS THE TAILNET. The unit came up active and the node is STILL not online ->
+  #      UNHEALED, non-zero.  mutant: drop the post-start verify, or verify on systemctl rc -> red.
+  run "$(unit loaded enabled inactive)" "$(unit loaded enabled active running)" "$OFFLINE" "$OFFLINE"
+  [ "$RC" = 0 ] && F "the daemon started but the node never came online, and the tool exited 0: $OUT"
+  grep -q 'UNHEALED' "$td/trace.log" 2>/dev/null || F "a failed heal left no UNHEALED trace: $OUT"
+  # ...and the tape must say online=FALSE, not online=UNKNOWN. jq's `//` treats `false` as falsy, so
+  # `.Self.Online // "UNKNOWN"` silently renders a genuinely OFFLINE node as a blind read — the one
+  # confusion this tool must never make.  mutant: use `//` in the online read -> red.
+  grep -q 'online=false' "$td/mesh/heal.log" 2>/dev/null \
+    || F "an offline node was not recorded as online=false (blind and offline must never collapse): $(grep UNHEALED "$td/mesh/heal.log" 2>/dev/null)"
+
+  # (T9) NeedsLogin is a DIFFERENT fault and `tailscale up` would sever the session a hand fixes it
+  #      over. Report, never act.  mutant: add a `tailscale up` fallback -> red.
+  run "$(unit loaded enabled inactive)" "$(unit loaded enabled active running)" "$OFFLINE" "$NEEDSLOGIN"
+  [ "$RC" = 0 ] && F "NeedsLogin exited 0 — the node is off the tailnet and nothing said so: $OUT"
+  grep -qE '(^| )up( |$)' "$td/tailscale.cmds" 2>/dev/null \
+    && F "ran 'tailscale up' — re-auth severs the channel it would be undone over"
+  case "$OUT" in *NeedsLogin*) ;; *) F "did not name NeedsLogin in the verdict: $OUT" ;; esac
+
+  # (T10) `systemctl start` itself failing: LOUD and non-zero, never a silent skip.
+  printf 'Job for tailscaled.service failed.\n' > "$td/startfail"
+  run "$(unit loaded enabled inactive)" "$(unit loaded enabled inactive)" "$OFFLINE" "$OFFLINE"
+  rm -f "$td/startfail"
+  [ "$RC" = 0 ] && F "a failed start exited 0: $OUT"
+  grep -q 'START-FAILED' "$td/mesh/heal.log" 2>/dev/null || F "a failed start left no tape row: $OUT"
+
+  # (T11) No passwordless sudo: a real, loud failure. A healer that cannot write must not run green
+  #       forever — that is the reflex-that-was-never-wired shape.
+  : > "$td/sudoblock"
+  run "$(unit loaded enabled inactive)" "$(unit loaded enabled active running)" "$OFFLINE" "$ONLINE"
+  rm -f "$td/sudoblock"
+  [ "$RC" = 0 ] && F "a blocked sudo exited 0: $OUT"
+
+  # (T12) --check NEVER writes, and says what it would do.
+  run "$(unit loaded enabled inactive)" "$(unit loaded enabled active running)" "$OFFLINE" "$ONLINE" --check
+  started && F "--check started the unit"
+  case "$OUT" in *"WOULD START"*) ;; *) F "--check did not say what it would do: $OUT" ;; esac
+
+  # (T13) the off-switch DISARMS the actuator, and says the fault will STAND. Not a silent skip.
+  : > "$td/off"
+  run "$(unit loaded enabled inactive)" "$(unit loaded enabled active running)" "$OFFLINE" "$ONLINE"
+  rm -f "$td/off"
+  started && F "the off-switch was present and the healer started the unit anyway"
+  grep -q 'REVOKED' "$td/mesh/heal.log" 2>/dev/null || F "a revoked pass left no tape row: $OUT"
+  [ "$RC" = 0 ] && F "a revoked pass exited 0 while the node was off the tailnet: $OUT"
+
+  # (T14) ACTIVE but NOT online is a real fault this tool must NOT act on — report it, non-zero,
+  #       and touch nothing.  mutant: treat active as unconditionally ok -> red.
+  run "$(unit loaded enabled active running)" "$(unit loaded enabled active running)" "$NEEDSLOGIN" "$NEEDSLOGIN"
+  started && F "acted on an ACTIVE unit whose backend was NeedsLogin"
+  [ "$RC" = 0 ] && F "an active daemon that is off the tailnet exited 0: $OUT"
+
+  [ "$fails" = 0 ] && echo "smoke-test: OK (14 arms: heal, never-touch-active, transients, masked, disabled, absent, reset-failed, tailnet-verify, needslogin, start-failure, no-sudo, --check, off-switch, active-but-offline)"
+  exit "$fails"
+fi
+
+DRY=0; [ "${1:-}" = --check ] && DRY=1
+
+# PRIVILEGE. `systemctl show` is a read and needs none; `start`/`reset-failed` need root. phaedra's
+# reflexes run AS root, mesh-home's run as a user with NOPASSWD sudo — so the prefix is derived, and
+# the derivation is overridable ONLY so --test can drive the no-sudo arm on either kind of node.
+if [ -n "${MESH_TSH_SUDO+x}" ]; then SUDO="$MESH_TSH_SUDO"
+elif [ "$(id -u)" = 0 ]; then SUDO=""
+else SUDO="sudo -n"; fi
+
+REVOKED=""; [ -f "$OFF_SWITCH" ] && REVOKED="$OFF_SWITCH"
+CONTEST="contest=stop:$OFF_SWITCH|policy:genome/scripts/$(basename "$0")"
+
+if [ "${1:-}" = --mandate ]; then
+  printf 'mandate: the unit'"'"'s OWN declaration — %s is healed only while UnitFileState says it is meant to run\n' "$UNIT"
+  printf 'unit-file-state: %s\n' "$(systemctl show "$UNIT" -p UnitFileState --no-pager 2>/dev/null | sed -n 's/^UnitFileState=//p')"
+  printf 'off-switch: %s (%s)\n' "$OFF_SWITCH" "$([ -f "$OFF_SWITCH" ] && echo 'present — DISARMED, a dead tailscaled will STAND' || echo 'absent — armed')"
+  printf 'privilege: %s\n' "${SUDO:-<running as root, no sudo needed>}"
+  printf '%s\n' "$CONTEST"
+  printf 'who-can-contest: any hand ON THIS NODE — `touch %s` disarms it, `systemctl disable %s` or `systemctl mask %s` withdraws the mandate entirely, and `tailscale down` takes the node off the tailnet WITHOUT this healer fighting it (the unit stays active).\n' "$OFF_SWITCH" "$UNIT" "$UNIT"
+  printf 'policy-level: this node revises the INSTANCE (the off-switch, MESH_TSH_* env). The RULE — which unit states are healable, that a running daemon is never touched, that `tailscale up` is never run — is revised in the genome at scripts/%s and deployed; changing it here would be reverted by mesh-sync-tools.\n' "$(basename "$0")"
+  exit 0
+fi
+
+# ── the tailnet verdict ────────────────────────────────────────────────────────────────────────
+# NEVER "the service started". A spawned process says nothing about membership; .Self.Online is the
+# CONTROL PLANE's verdict, relayed by the local daemon — the closest a node-local tool can stand to a
+# peer's vantage, and that limit is written into the tape rather than left implied. Every read that
+# cannot be made renders UNKNOWN, never a plausible `false` and never an assumed `true`.
+backend_read(){
+  local j
+  command -v tailscale >/dev/null 2>&1 || { printf 'backend: UNKNOWN\nonline: UNKNOWN\nwhy: tailscale CLI not on PATH\n'; return 1; }
+  command -v jq >/dev/null 2>&1        || { printf 'backend: UNKNOWN\nonline: UNKNOWN\nwhy: jq not on PATH, so the status JSON cannot be parsed\n'; return 1; }
+  j="$(tailscale status --json 2>/dev/null)"
+  [ -n "$j" ] || { printf 'backend: UNKNOWN\nonline: UNKNOWN\nwhy: tailscale status --json returned nothing\n'; return 1; }
+  printf 'backend: %s\n' "$(printf '%s' "$j" | jq -r '.BackendState // "UNKNOWN"' 2>/dev/null)"
+  # `// ` is WRONG here: jq treats `false` as falsy, so `.Self.Online // "UNKNOWN"` renders an
+  # OFFLINE node as UNKNOWN — the one answer this tool must never confuse with a blind read.
+  printf 'online: %s\n'  "$(printf '%s' "$j" | jq -r 'if (.Self|not) or (.Self.Online == null) then "UNKNOWN" else (.Self.Online|tostring) end' 2>/dev/null)"
+  printf 'self: %s\n'    "$(printf '%s' "$j" | jq -r '.Self.HostName // "?"' 2>/dev/null)"
+  return 0
+}
+on_tailnet(){ [ "$(printf '%s\n' "$1" | sed -n 's/^backend: //p')" = Running ] \
+           && [ "$(printf '%s\n' "$1" | sed -n 's/^online: //p')"  = true ]; }
+
+wait_online(){
+  local deadline kv
+  deadline=$(( $(date -u +%s) + WAIT_S ))
+  while :; do
+    kv="$(backend_read)"
+    on_tailnet "$kv" && { printf '%s\n' "$kv"; return 0; }
+    [ "$(date -u +%s)" -ge "$deadline" ] && { printf '%s\n' "$kv"; return 1; }
+    sleep "$POLL_S"
+  done
+}
+
+board_post(){
+  local msg="$1" now last since sup_n sup_txt BSTAMP
+  BSTAMP="$MESH_DIR/.tailscaled-heal.board"
+  now=$(date -u +%s); last=0; [ -s "$BSTAMP" ] && last=$(cat "$BSTAMP" 2>/dev/null || echo 0)
+  case "$last" in ''|*[!0-9]*) last=0 ;; esac
+  [ $(( now - last )) -ge "$BOARD_MIN_GAP" ] || return 0
+  command -v mesh-chat >/dev/null 2>&1 || return 0
+  sup_txt=""
+  if [ "$last" -gt 0 ]; then
+    since=$(date -u -d "@$last" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)
+    sup_n=$(awk -v c="$since" '$1 ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T/ && $1 > c && $2 == "APPLIED" {n++} END{print n+0}' "$LOG" 2>/dev/null || echo 0)
+    sup_n=$(( sup_n > 0 ? sup_n - 1 : 0 ))
+    [ "$sup_n" -gt 0 ] && sup_txt=" Plus $sup_n further restart(s) the board throttle suppressed since the last post."
+  fi
+  mesh-chat "$msg$sup_txt" >/dev/null 2>&1 || true
+  echo "$now" > "$BSTAMP" 2>/dev/null || true
+}
+
+# ── read the unit ──────────────────────────────────────────────────────────────────────────────
+UKV="$(systemctl show "$UNIT" -p LoadState -p UnitFileState -p ActiveState -p SubState -p Restart -p NRestarts -p InactiveEnterTimestamp --no-pager 2>/dev/null)"
+LOADSTATE="$(printf '%s\n' "$UKV" | sed -n 's/^LoadState=//p')"
+UFSTATE="$(printf '%s\n'   "$UKV" | sed -n 's/^UnitFileState=//p')"
+ASTATE="$(printf '%s\n'    "$UKV" | sed -n 's/^ActiveState=//p')"
+SUBSTATE="$(printf '%s\n'  "$UKV" | sed -n 's/^SubState=//p')"
+RESTARTPOL="$(printf '%s\n' "$UKV" | sed -n 's/^Restart=//p')"
+DOWNSINCE="$(printf '%s\n' "$UKV" | sed -n 's/^InactiveEnterTimestamp=//p')"
+
+if [ -z "$LOADSTATE" ]; then
+  say "tailscaled-heal: BLIND — 'systemctl show $UNIT' returned no LoadState. $( command -v systemctl >/dev/null 2>&1 || echo 'systemctl is not on PATH (cron?)' )"
+  tape "BLIND systemctl show $UNIT gave no LoadState"
+  trace "[tailscaled-heal] BLIND on $(hostname): systemctl show $UNIT returned no LoadState — the ONLY node-local re-applier of the tailnet cannot see its subject"
+  touch_state; exit 1
+fi
+
+# n/a: no such unit. rc 2 so mesh-autowire SKIPs the node instead of wiring a permanently-red reflex.
+case "$LOADSTATE" in
+  not-found|bad-setting|error)
+    quiet "tailscaled-heal: n/a — no $UNIT on this node (LoadState=$LOADSTATE)"
+    touch_state; exit 2 ;;
+esac
+
+# MASKED is a decision, not a fault. Somebody nailed this unit shut; unmasking it silently would
+# undo their fix (the ollama crash-loop mask on mesh-home is the live precedent). Refuse, loudly.
+if [ "$LOADSTATE" = masked ] || [ "$UFSTATE" = masked ]; then
+  say "tailscaled-heal: REFUSING — $UNIT is MASKED (LoadState=$LOADSTATE UnitFileState=$UFSTATE). A mask is a deliberate hand, and this node is OFF THE TAILNET while it stands. Unmask by hand if that is wrong."
+  tape "MASKED load=$LOADSTATE ufs=$UFSTATE active=$ASTATE $CONTEST"
+  trace "[tailscaled-heal] REFUSED on $(hostname): $UNIT is masked — the node cannot join the tailnet and this healer will not unmask it"
+  touch_state; exit 1
+fi
+
+# THE MANDATE IS THE UNIT'S OWN DECLARATION. A hostname allowlist would age out and fail toward
+# silence; `enabled` is the node saying "this is meant to be running", which is exactly the premise
+# an inactive unit contradicts. Anything else -> n/a, and it SAYS why rather than skipping quietly.
+case "$UFSTATE" in
+  enabled|enabled-runtime|static|indirect|generated) ;;
+  *) quiet "tailscaled-heal: n/a — $UNIT UnitFileState=${UFSTATE:-<empty>}; this node has not declared it should run, so there is no contradiction to heal"
+     touch_state; exit 2 ;;
+esac
+
+# ── the daemon is UP: never touch it, but do not call that a verdict about the tailnet ─────────
+case "$ASTATE" in
+  active)
+    BKV="$(backend_read)"
+    if on_tailnet "$BKV"; then
+      quiet "tailscaled-heal: nothing to do — $UNIT active/$SUBSTATE, $(printf '%s\n' "$BKV" | tr '\n' ' ')"
+      touch_state; exit 0
+    fi
+    # One re-read before shouting: a daemon that came up seconds ago is legitimately not online yet,
+    # and a per-minute alarm on a boot transient would train everyone to ignore this line.
+    sleep "$POLL_S"; BKV="$(backend_read)"
+    if on_tailnet "$BKV"; then
+      quiet "tailscaled-heal: nothing to do — $UNIT active/$SUBSTATE (online on the re-read)"
+      touch_state; exit 0
+    fi
+    BSTATE="$(printf '%s\n' "$BKV" | sed -n 's/^backend: //p')"
+    say "tailscaled-heal: $UNIT is ACTIVE but the node is NOT on the tailnet — $(printf '%s\n' "$BKV" | tr '\n' ' '). This is a DIFFERENT fault and this tool does not act on it: 'tailscale up' would re-authenticate and sever the very session a hand would fix it over."
+    # Tape on CHANGE only. A stuck NeedsLogin would otherwise write 1440 identical rows a day into
+    # the file applied_since() reads, and a tape that is mostly one repeated condition is unreadable.
+    BMARK="$MESH_DIR/.tailscaled-heal.backend"
+    if [ "$(cat "$BMARK" 2>/dev/null)" != "$BSTATE" ]; then
+      printf '%s' "$BSTATE" > "$BMARK" 2>/dev/null || true
+      tape "ACTIVE-OFFLINE backend=$BSTATE $(printf '%s\n' "$BKV" | sed -n 's/^online: /online=/p') sub=$SUBSTATE $CONTEST"
+      trace "[tailscaled-heal] ACTIVE-OFFLINE on $(hostname): $UNIT is running but BackendState=$BSTATE — the daemon is alive and the node is off the tailnet. NOT healable by a restart; a hand must decide (tailscale up re-auths and severs the fixer's own path)."
+      board_post "[fyi] tailscaled-heal@$(hostname): $UNIT is ACTIVE but the node is OFF THE TAILNET (BackendState=$BSTATE). A restart does not fix this and this healer will not run 'tailscale up' — re-auth severs the channel it would be undone over. A hand must decide."
+    fi
+    touch_state; exit 1 ;;
+  activating|deactivating|reloading)
+    # Transients belong to systemd, not to us. Racing its own boot start would double-start at every
+    # reboot and make the application rate — the only signal this tape carries — fiction.
+    quiet "tailscaled-heal: nothing to do — $UNIT is $ASTATE/$SUBSTATE (systemd owns this transition)"
+    touch_state; exit 0 ;;
+  inactive|failed) ;;
+  *) quiet "tailscaled-heal: nothing to do — unrecognised ActiveState='$ASTATE' (sub=$SUBSTATE); refusing to act on a state this tool does not model"
+     touch_state; exit 0 ;;
+esac
+
+# ── the fault: an enabled tailscaled that is not running ───────────────────────────────────────
+DOWN_FOR="unknown"
+if [ -n "$DOWNSINCE" ]; then
+  ds="$(date -u -d "$DOWNSINCE" +%s 2>/dev/null)"
+  [ -n "${ds:-}" ] && DOWN_FOR="$(( $(date -u +%s) - ds ))s"
+fi
+WHAT="$UNIT is $ASTATE/$SUBSTATE while UnitFileState=$UFSTATE (Restart=$RESTARTPOL) — down for $DOWN_FOR since ${DOWNSINCE:-unknown}"
+
+if [ "$DRY" = 1 ]; then
+  say "tailscaled-heal: WOULD START $UNIT — $WHAT"
+  [ "$ASTATE" = failed ] && say "tailscaled-heal:   (and WOULD 'systemctl reset-failed $UNIT' first — systemd's start rate limit makes a failed unit refuse every later start)"
+  say "tailscaled-heal:   privilege=${SUDO:-root}  $CONTEST"
+  touch_state; exit 0
+fi
+
+if [ -n "$REVOKED" ]; then
+  say "tailscaled-heal: REVOKED — the off-switch $REVOKED exists, so this healer is DISARMED and the node STAYS OFF THE TAILNET ($WHAT). Remove that file to re-arm."
+  tape "REVOKED off=$REVOKED $WHAT $CONTEST"
+  touch_state; exit 1
+fi
+
+# systemd's StartLimitBurst (5 by default) makes a repeatedly-failing unit refuse EVERY later start
+# with "start request repeated too quickly" — a permanent give-up that looks identical to a dead
+# healer from outside. Clearing it is the difference between a re-applier and a spectator.
+if [ "$ASTATE" = failed ]; then
+  $SUDO systemctl reset-failed "$UNIT" >/dev/null 2>&1 || true
+fi
+
+OUT="$($SUDO systemctl start "$UNIT" 2>&1)"; SRC=$?
+if [ "$SRC" != 0 ]; then
+  say "tailscaled-heal: START FAILED (rc=$SRC) — $OUT  [$WHAT]"
+  tape "START-FAILED rc=$SRC $WHAT: $OUT $CONTEST"
+  trace "[tailscaled-heal] START FAILED on $(hostname): systemctl start $UNIT -> rc=$SRC $OUT — the node is off the tailnet and the ONLY node-local re-applier could not act. A hand over the out-of-band path is now the loop."
+  board_post "[fyi] tailscaled-heal@$(hostname): could not start $UNIT (rc=$SRC: $OUT). The node is OFF THE TAILNET and the local re-applier failed — every remote healer is blind to this by construction, so a hand over the out-of-band path is the only remaining loop."
+  touch_state; exit 1
+fi
+
+VKV="$(wait_online)"; VRC=$?
+BSTATE="$(printf '%s\n' "$VKV" | sed -n 's/^backend: //p')"
+ONL="$(printf '%s\n'    "$VKV" | sed -n 's/^online: //p')"
+n1h=$(applied_since 3600); n24=$(applied_since 86400)
+
+if [ "$VRC" != 0 ]; then
+  say "tailscaled-heal: STARTED THE DAEMON AND THE NODE IS STILL NOT ON THE TAILNET after ${WAIT_S}s — backend=$BSTATE online=$ONL. $( [ "$BSTATE" = NeedsLogin ] && echo "NeedsLogin: the daemon is healthy and the AUTH is what is missing; this tool will not run 'tailscale up', because re-auth severs the session a hand would fix it over." )"
+  tape "UNHEALED started=$UNIT backend=$BSTATE online=$ONL waited=${WAIT_S}s $WHAT $CONTEST"
+  trace "[tailscaled-heal] UNHEALED on $(hostname): started $UNIT ($WHAT) and after ${WAIT_S}s the tailnet verdict is backend=$BSTATE online=$ONL. 'The service started' is not membership, which is why this exits red."
+  board_post "[fyi] tailscaled-heal@$(hostname): started $UNIT after it was found $ASTATE (down $DOWN_FOR) and the node is STILL not on the tailnet ${WAIT_S}s later — backend=$BSTATE online=$ONL. The restart leg worked; membership did not follow, so this is not a restartable fault."
+  printf 'last-attempt: %s\nresult: unhealed\nbackend: %s\nonline: %s\ndown-for: %s\n' "$(ts)" "$BSTATE" "$ONL" "$DOWN_FOR" > "$STATE" 2>/dev/null || true
+  touch_state; exit 1
+fi
+
+n1h=$(( n1h + 1 )); n24=$(( n24 + 1 ))   # count THIS one: the tape row is written below, after the rate is quoted
+tape "APPLIED systemctl start $UNIT backend=$BSTATE online=$ONL self=$(printf '%s\n' "$VKV" | sed -n 's/^self: //p') $WHAT verify=self.online-via-local-daemon(control-plane verdict, NOT a peer's vantage) $CONTEST"
+say "tailscaled-heal: APPLIED — started $UNIT after it was found $ASTATE (down $DOWN_FOR); node is back on the tailnet (backend=$BSTATE online=$ONL); $n24 restart(s) in 24h"
+trace "[tailscaled-heal] APPLIED on $(hostname): $UNIT was $ASTATE/$SUBSTATE for $DOWN_FOR with Restart=$RESTARTPOL and systemd did not restart it; started it and the node is back on the tailnet (backend=$BSTATE online=$ONL). Restarts: $n1h in 1h, $n24 in 24h. Every one of these is a window in which EVERY remote healer was blind, because the tailnet is the channel — a rising rate is the node losing its own membership, never a node healing itself for free. $CONTEST"
+printf 'last-applied: %s\nresult: healed\nwas: %s/%s\ndown-for: %s\nbackend: %s\nonline: %s\n' "$(ts)" "$ASTATE" "$SUBSTATE" "$DOWN_FOR" "$BSTATE" "$ONL" > "$STATE" 2>/dev/null || true
+board_post "[fyi] tailscaled-heal@$(hostname): RESTARTED $UNIT — it was $ASTATE/$SUBSTATE for $DOWN_FOR with Restart=$RESTARTPOL, so systemd (correctly, on a clean SIGTERM exit) never restarted it, and the node was off the tailnet. Back online now (backend=$BSTATE). $n1h in 1h, $n24 in 24h. This is the ONE fault no remote reflex can see or fix: the tailnet IS the channel, so the observer and the actuator are both on the far side of the break."
+touch_state
+exit 0
