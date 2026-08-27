@@ -8,8 +8,11 @@
 #
 #   mesh-revive --check        one probe + heal attempt; print result
 #   mesh-revive --loop [s]     watch every N sec (default 60); heal + alert on starvation
+#   mesh-revive --rate         the exit-node flip ledger: counts by verb, over the tape's OWN span
 #
 # Consecutive-fail threshold: MESH_REVIVE_THRESHOLD (default 3)
+# Consecutive exit-node-OFFLINE threshold before dropping to direct egress:
+#   MESH_REVIVE_EXITNODE_THRESHOLD (default 3) — see the exit-node block below.
 set -uo pipefail
 export PATH="$HOME/.local/bin:$PATH"   # find sibling reflexes (the layer oracle) regardless of caller's PATH
 PROBES=(1.1.1.1 8.8.8.8 9.9.9.9)
@@ -17,6 +20,43 @@ THRESHOLD="${MESH_REVIVE_THRESHOLD:-3}"
 FLAG="$HOME/.mesh/.revive-starving"
 FAIL_CNT="$HOME/.mesh/.revive-fails"
 REVIVE_EXITNODE_SAVE="$HOME/.mesh/.revive-exitnode"
+
+# ============ THE EXIT NODE IS THIS NODE'S WHOLE EGRESS, AND THE HEAL UNDID ITSELF ============
+# (2026-08-27, board task exit-node-is-a-single-point-of-failure-for-this-nodes-egress {#0790ec30}.)
+#
+# THE DEFECT, and it is structural, not a tuning miss. cycle() ran `heal` — whose rung (2) drops the
+# exit node to direct egress — and then, in the very next statement, asked `internet_up`. On a node
+# whose own uplink works, that probe SUCCEEDS *because of the drop*; cycle() then called
+# restore_exitnode(), which re-pinned the exit node with NO liveness gate on it whatsoever. So the
+# rescue re-attached the corpse it had just escaped, inside one cycle, and then deleted its own save
+# file. **A heal undone by the success it produced**, and one that erases its own evidence on the way
+# out. Live shape it produced: mesh-home 2026-08-27T02:08-16:28Z, egress dead for 14h20m behind a
+# dead phaedra while this reflex ran every 180s.
+#
+# WHY NOTHING COULD SAY WHETHER THE LEG EVEN RAN. mesh-revive's only launcher is
+# `mesh-selfcare --loop 180` (supervise.list), and that child's fd 1 AND fd 2 are BOTH /dev/null —
+# measured on the live pid. Every note() line this tool writes, "(2) fell back to direct egress"
+# included, went to the bit bucket; the ONE durable artifact was $REVIVE_EXITNODE_SAVE, which
+# restore_exitnode() rm -f's on the first good probe. A drop that WORKED erased its own record, so
+# the tape held only failures — the numerator-without-denominator shape one ring out
+# ([[a-tape-of-only-positives-is-a-numerator]], inverted). Hence FLIPS below: append-only, every
+# attempt, kept whatever the outcome.
+#
+# THE PREF IS NOT THE PATH. `tailscale set --exit-node=` returning 0 says the daemon accepted a
+# preference, exactly as `ExitNodeAllowLANAccess: true` said on the node whose LAN was swallowed
+# anyway (CLAUDE.local.md, the whole a-declared-pref-is-not-the-fib case). So both directions verify
+# from the FIB and from a REAL fetch: which DEVICE the kernel would send a public packet out of, and
+# what the world says our address is. Never the pref, never `tailscale status`.
+FLIPS="$HOME/.mesh/revive-exitnode-flips.log"          # DURABLE, append-only, never pruned here
+EXITNODE_OFFLINE_CNT="$HOME/.mesh/.revive-exitnode-offline"
+EGRESS_LAST_GOOD="$HOME/.mesh/.revive-egress-ip"       # the address the world saw while the tunnel was up
+FLIP_FYI_STAMP="$HOME/.mesh/.revive-flip-fyi"          # board throttle (the count it suppressed is printed)
+EXITNODE_THRESHOLD="${MESH_REVIVE_EXITNODE_THRESHOLD:-3}"
+FLIP_FYI_EVERY="${MESH_REVIVE_FLIP_FYI_S:-900}"
+# A PUBLIC address to ask the FIB about — never one of ours (ip rule 0 answers our own address out of
+# table `local` no matter how thoroughly egress is broken) and never the exit node's own endpoint,
+# which mesh-exit-node-lan-heal's rescue leg deliberately excepts with a throw.
+FIB_PROBE="${MESH_REVIVE_FIB_PROBE:-1.1.1.1}"
 note(){ printf '%s  mesh-revive: %s\n' "$(date -u +%H:%M:%SZ)" "$*"; }
 
 # TEST-SANDBOX gate (extends chat-review/doctor-smoke-sandbox-net, same convention as mesh-say:114
@@ -75,6 +115,140 @@ internet_up(){
   return 1
 }
 
+# ---- THE TWO ARTIFACTS. Neither reads a pref, and neither reads `tailscale status`. ----
+# egress_dev: which DEVICE the kernel would actually send a public packet out of. `ip route get`
+# resolves rules + tables + throws in one answer, which is the only thing that survived the
+# a-declared-pref-is-not-the-fib case on this node.
+egress_dev(){ ip route get "$FIB_PROBE" 2>/dev/null | sed -n '1s/.* dev \([^ ]*\).*/\1/p'; }
+# egress_ip: what the WORLD says our address is. Empty = the fetch did not complete; it is never
+# rendered as an address, so "no answer" can never wear "answered with X".
+egress_ip(){ curl -s --max-time 8 https://api.ipify.org 2>/dev/null | tr -dc '0-9.'; }
+# is_tunnel_dev: the device an exit-node path leaves by. Matched on the tailscale interface FAMILY
+# rather than a hardcoded name, since the name is set by tailscaled and differs across nodes.
+is_tunnel_dev(){ case "${1:-}" in tailscale*|ts*) return 0 ;; *) return 1 ;; esac; }
+
+# exit_node_now -> "<id>\t<ip>\t<online>"  (empty line when no exit node is configured).
+# `Online` is read as a THREE-valued thing: jq-style `//` on a boolean collapses false into absent
+# (memory jq-alternative-operator-treats-false-as-empty), and "offline" is the single state this
+# whole reflex exists to catch — so it is tested with `is False` / `is True` and anything else
+# renders `unknown`, never `false`.
+exit_node_now(){
+  tailscale status --json 2>/dev/null | python3 -c '
+import json,sys
+try: d=json.load(sys.stdin)
+except Exception: sys.exit(0)
+es=d.get("ExitNodeStatus") or {}
+ips=[i.split("/")[0] for i in (es.get("TailscaleIPs") or [])]
+if not es.get("ID") and not ips: sys.exit(0)
+o=es.get("Online")
+print("%s\t%s\t%s" % (es.get("ID") or "", ips[0] if ips else "", "true" if o is True else ("false" if o is False else "unknown")))
+' 2>/dev/null
+}
+
+# peer_online <tailscale-ip> -> true | false | unknown.
+# Used AFTER a drop, when ExitNodeStatus is gone by construction: the saved node must be found in the
+# plain peer list instead. `unknown` covers a peer that is not in this tailnet's netmap at all AND a
+# tailscaled we could not read — both are "we cannot say", never "it is back".
+peer_online(){
+  [ -n "${1:-}" ] || { printf 'unknown'; return 0; }
+  tailscale status --json 2>/dev/null | python3 -c '
+import json,sys
+want=sys.argv[1]
+try: d=json.load(sys.stdin)
+except Exception: print("unknown"); sys.exit(0)
+for p in (d.get("Peer") or {}).values():
+    if want in [i.split("/")[0] for i in (p.get("TailscaleIPs") or [])]:
+        o=p.get("Online")
+        print("true" if o is True else ("false" if o is False else "unknown")); sys.exit(0)
+print("unknown")
+' "$1" 2>/dev/null || printf 'unknown'
+}
+
+# ---- THE LEDGER. Every attempt, whatever the outcome, and LOUD. ----
+# Three surfaces, on purpose and each with its own job: the durable file is the RATE (it outlives
+# every pane and is what --rate counts), mesh-trace is the unthrottled per-event mark, and the board
+# [fyi] is throttled — and it NAMES how many flips it suppressed, so the throttle can never make a
+# storm read as a single event.
+flip_log(){
+  local verb="$1"; shift
+  local row; row="$(date -u +%Y-%m-%dT%H:%M:%SZ) $verb $*"
+  printf '%s\n' "$row" >> "$FLIPS" 2>/dev/null || true
+  command -v mesh-trace >/dev/null 2>&1 && mesh-trace "revive-exitnode: $verb $*" >/dev/null 2>&1 || true
+  local now stamp n=0
+  now="$(date +%s)"; stamp=0
+  [ -f "$FLIP_FYI_STAMP" ] && stamp="$(cut -d' ' -f1 "$FLIP_FYI_STAMP" 2>/dev/null || echo 0)"
+  [ -f "$FLIP_FYI_STAMP" ] && n="$(cut -d' ' -f2 "$FLIP_FYI_STAMP" 2>/dev/null || echo 0)"
+  case "$stamp" in ''|*[!0-9]*) stamp=0 ;; esac
+  case "$n"     in ''|*[!0-9]*) n=0 ;; esac
+  if [ $(( now - stamp )) -ge "$FLIP_FYI_EVERY" ]; then
+    command -v mesh-chat >/dev/null 2>&1 && mesh-chat \
+      "[fyi] mesh-revive: egress exit-node $verb on $(hostname) — $* (${n} further flip(s) suppressed since the last post; full tape ~/.mesh/revive-exitnode-flips.log, rate: mesh-revive --rate)" >/dev/null 2>&1 || true
+    printf '%s 0\n' "$now" > "$FLIP_FYI_STAMP" 2>/dev/null || true
+  else
+    printf '%s %s\n' "$stamp" "$(( n + 1 ))" > "$FLIP_FYI_STAMP" 2>/dev/null || true
+  fi
+}
+
+# ts_set — THE ACTUATOR THAT WAS NEVER ALLOWED TO RUN (measured 2026-08-27T18:57Z on mesh-home).
+# `tailscale set --exit-node=…` as uid 1000 on this node answers:
+#     Access denied: checkprefs access denied
+#     Use 'sudo tailscale set …'.  To not require root, use 'sudo tailscale set --operator=$USER'.
+# mesh-revive runs as uid 1000 under `mesh-selfcare --loop`, and BOTH exit-node call sites were
+# written `timeout 15 tailscale set … 2>/dev/null && note "…" || true` — stderr to the bin, rc
+# swallowed by `|| true`. So the entire exit-node rung has been a NO-OP for its whole life, and its
+# denial was indistinguishable from a branch that simply did not apply. That is the answer to "did
+# that leg run at all": it ran, it was REFUSED, and nothing anywhere could say so — the same shape
+# as a silent fallback turning a total failure into a plausible constant.
+# Unprivileged FIRST (a node that has run `tailscale set --operator=$USER` needs no sudo and must
+# not be pushed through one), then `sudo -n` — never a password prompt, which would hang a reflex.
+# The stderr of whichever attempt failed is RETURNED, so the ledger can name the refusal instead of
+# printing a generic non-zero.
+ts_set(){
+  local out
+  if out="$(timeout 15 tailscale set "$@" 2>&1)"; then printf '%s' "$out"; return 0; fi
+  local unpriv="$out"
+  if out="$(timeout 15 sudo -n tailscale set "$@" 2>&1)"; then printf 'via-sudo %s' "$out"; return 0; fi
+  printf '%s | sudo: %s' "$(printf '%s' "$unpriv" | tr '\n' ' ' | cut -c1-90)" "$(printf '%s' "$out" | tr '\n' ' ' | cut -c1-60)"
+  return 1
+}
+
+# drop_exitnode <reason> — rung (2), now with a VERIFIED outcome and a durable row either way.
+drop_exitnode(){
+  local reason="${1:-unspecified}" line id ip
+  if sandboxed; then
+    note "MESH_TEST_SANDBOX — exit-node DROP SUPPRESSED (smoke-sweep context): substrate untouched"
+    return 0
+  fi
+  line="$(exit_node_now)"; id="$(printf '%s' "$line" | cut -f1)"; ip="$(printf '%s' "$line" | cut -f2)"
+  [ -n "$ip" ] || { note "  (2) no exit-node configured — nothing to drop"; return 1; }
+  # SAVE BEFORE THE ACT, never after: a pass killed between the write and the row leaves a side
+  # effect its successor cannot see. Both the IP and the ID, because ExitNodeStatus vanishes the
+  # moment the drop lands and only the ID/IP can find the peer again.
+  printf '%s\n%s\n' "$ip" "$id" > "$REVIVE_EXITNODE_SAVE"
+  note "  (2) saving exit-node $ip ($id) -> $REVIVE_EXITNODE_SAVE; dropping to direct egress"
+  local err
+  if ! err="$(ts_set --exit-node=)"; then
+    flip_log DROP-FAILED "node=$ip id=$id reason=$reason err=[$err]"
+    note "  (2) DROP REFUSED by tailscaled: $err"
+    # The pre-write must be UNDONE when the act it announced did not happen. Leaving it would put
+    # exitnode_watch permanently on the restore branch — the drop it exists to make would never be
+    # retried, and the ledger would fill with restores of a node that was never dropped.
+    rm -f "$REVIVE_EXITNODE_SAVE"
+    return 1
+  fi
+  local dev pub; dev="$(egress_dev)"; pub="$(egress_ip)"
+  if ! is_tunnel_dev "$dev" && [ -n "$pub" ]; then
+    flip_log DROP "node=$ip id=$id reason=$reason fib=${dev:-none} fetch=$pub"
+    note "  (2) fell back to direct egress — fib dev=$dev, world sees $pub"
+    return 0
+  fi
+  # The pref was accepted and the PATH did not move (or the world stopped answering). Say exactly
+  # that; a "dropped" that is still in the tunnel is the failure this verification exists to name.
+  flip_log DROP-UNVERIFIED "node=$ip id=$id reason=$reason fib=${dev:-none} fetch=${pub:-none}"
+  note "  (2) DROP UNVERIFIED — pref accepted but fib dev=${dev:-none} fetch=${pub:-none}"
+  return 1
+}
+
 heal(){
   if sandboxed; then
     note "MESH_TEST_SANDBOX — heal SUPPRESSED (smoke-sweep context): substrate untouched"
@@ -82,34 +256,100 @@ heal(){
   fi
   note "starving — gentle reversible recovery"
   # (1) restart tailscale (idempotent; restores the mesh control path)
-  timeout 15 tailscale up 2>/dev/null && note "  (1) tailscale re-upped" || true
-  # (2) drop exit-node if still starving — automatic, reversible
-  local exitnode_ip
-  exitnode_ip="$(tailscale status --json 2>/dev/null | python3 -c '
-import json,sys
-d=json.load(sys.stdin)
-ips=(d.get("ExitNodeStatus") or {}).get("TailscaleIPs") or []
-print(ips[0].split("/")[0] if ips else "")
-' 2>/dev/null)"
-  if [ -n "$exitnode_ip" ] && ! internet_up; then
-    note "  (2) saving exit-node $exitnode_ip -> $REVIVE_EXITNODE_SAVE; dropping to direct egress"
-    echo "$exitnode_ip" > "$REVIVE_EXITNODE_SAVE"
-    timeout 15 tailscale set --exit-node= 2>/dev/null && note "  (2) fell back to direct egress" || true
+  # Same denial as rung (2) — `tailscale up` is a pref write too, and this line's `|| true` hid it
+  # for exactly as long. Unprivileged first, then sudo -n, and SAY which happened.
+  local upout
+  if upout="$(timeout 15 tailscale up 2>&1)" || upout="$(timeout 15 sudo -n tailscale up 2>&1)"; then
+    note "  (1) tailscale re-upped"
+  else
+    note "  (1) tailscale up REFUSED: $(printf '%s' "$upout" | tr '\n' ' ' | cut -c1-100)"
   fi
+  # (2) drop exit-node if still starving — automatic, reversible, and now VERIFIED from the FIB
+  ! internet_up && drop_exitnode starvation
+  return 0
 }
 
+# restore_exitnode — THE HALF THAT UNDID THE HEAL. It used to fire on `internet_up` alone, which
+# after a successful drop is TRUE *because of the drop*, so it re-pinned the dead node inside the
+# same cycle and then deleted the save. Two changes, and both are the task's own words:
+#   • it restores WHEN THE NODE IS BACK ONLINE — a peer-liveness fact read from the netmap, not from
+#     "the internet works", which is a fact about the path the drop just built;
+#   • it VERIFIES from the FIB and a real fetch, and on failure it KEEPS the save so the next cycle
+#     retries. A save deleted on an unverified restore is a side effect its successor cannot see.
 restore_exitnode(){
-  if sandboxed; then
-    [ -f "$REVIVE_EXITNODE_SAVE" ] && note "MESH_TEST_SANDBOX — exit-node restore SUPPRESSED (smoke-sweep context)"
+  [ -f "$REVIVE_EXITNODE_SAVE" ] || return 0
+  local saved_ip saved_id online
+  saved_ip="$(sed -n 1p "$REVIVE_EXITNODE_SAVE" 2>/dev/null || true)"
+  saved_id="$(sed -n 2p "$REVIVE_EXITNODE_SAVE" 2>/dev/null || true)"
+  [ -n "$saved_ip" ] || { rm -f "$REVIVE_EXITNODE_SAVE"; return 0; }   # an empty save names nothing
+  online="$(peer_online "$saved_ip")"
+  if [ "$online" != true ]; then
+    # NOT a failure and NOT a flip — the node is simply still away. Silent on the ledger by design:
+    # a row per poll would drown the flips the rate is counting. `unknown` lands here too, which is
+    # the safe direction: never re-pin on an unproven liveness.
+    note "  exit-node $saved_ip still ${online} — holding direct egress (restore waits for ONLINE)"
     return 0
   fi
-  if [ -f "$REVIVE_EXITNODE_SAVE" ]; then
-    local saved_ip; saved_ip="$(cat "$REVIVE_EXITNODE_SAVE" 2>/dev/null || true)"
-    if [ -n "$saved_ip" ]; then
-      timeout 15 tailscale set --exit-node="$saved_ip" 2>/dev/null && note "  restored exit-node $saved_ip" || true
-    fi
-    rm -f "$REVIVE_EXITNODE_SAVE"
+  if sandboxed; then
+    note "MESH_TEST_SANDBOX — exit-node restore SUPPRESSED (smoke-sweep context)"
+    return 0
   fi
+  local err
+  if ! err="$(ts_set --exit-node="$saved_ip")"; then
+    flip_log RESTORE-FAILED "node=$saved_ip id=$saved_id err=[$err]"
+    note "  RESTORE REFUSED by tailscaled: $err"
+    return 1
+  fi
+  local dev pub want; dev="$(egress_dev)"; pub="$(egress_ip)"
+  want="$(cat "$EGRESS_LAST_GOOD" 2>/dev/null || true)"
+  if is_tunnel_dev "$dev" && [ -n "$pub" ] && { [ -z "$want" ] || [ "$pub" = "$want" ]; }; then
+    flip_log RESTORE "node=$saved_ip id=$saved_id fib=$dev fetch=$pub want=${want:-unrecorded}"
+    note "  restored exit-node $saved_ip — fib dev=$dev, world sees $pub"
+    rm -f "$REVIVE_EXITNODE_SAVE"
+    return 0
+  fi
+  flip_log RESTORE-UNVERIFIED "node=$saved_ip id=$saved_id fib=${dev:-none} fetch=${pub:-none} want=${want:-unrecorded}"
+  note "  RESTORE UNVERIFIED — pref accepted but fib dev=${dev:-none} fetch=${pub:-none} want=${want:-unrecorded}; save KEPT for retry"
+  return 1
+}
+
+# exitnode_watch — THE TRIGGER THE TASK ASKED FOR, and it is independent of internet_up. An exit
+# node that is OFFLINE has already taken this node's whole egress with it; waiting for three
+# internet probes to time out first only adds ~90s of dark to a fact the netmap already states.
+# N consecutive OFFLINE readings, so a single netmap blip cannot flip the substrate.
+# `unknown` never counts toward the threshold — it is a failure to read, not a reading.
+exitnode_watch(){
+  local line id ip online n=0
+  if [ -f "$REVIVE_EXITNODE_SAVE" ]; then
+    restore_exitnode                       # dropped already: the only question is whether it is back
+    return 0
+  fi
+  line="$(exit_node_now)"
+  ip="$(printf '%s' "$line" | cut -f2)"; id="$(printf '%s' "$line" | cut -f1)"
+  online="$(printf '%s' "$line" | cut -f3)"
+  [ -n "$ip" ] || { rm -f "$EXITNODE_OFFLINE_CNT" 2>/dev/null; return 0; }   # no exit node here
+  if [ "$online" = true ]; then
+    rm -f "$EXITNODE_OFFLINE_CNT" 2>/dev/null
+    # Refresh what the world sees THROUGH the tunnel, so a later restore has something to verify
+    # against. Only while the tunnel is provably the path — an address learned on direct egress
+    # would make every restore look wrong.
+    if is_tunnel_dev "$(egress_dev)"; then
+      local pub; pub="$(egress_ip)"
+      [ -n "$pub" ] && printf '%s\n' "$pub" > "$EGRESS_LAST_GOOD" 2>/dev/null || true
+    fi
+    return 0
+  fi
+  [ "$online" = false ] || return 0        # unknown: we could not read, so we know nothing
+  [ -f "$EXITNODE_OFFLINE_CNT" ] && n="$(cat "$EXITNODE_OFFLINE_CNT" 2>/dev/null || echo 0)"
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  n=$(( n + 1 )); printf '%s\n' "$n" > "$EXITNODE_OFFLINE_CNT" 2>/dev/null || true
+  if [ "$n" -lt "$EXITNODE_THRESHOLD" ]; then
+    note "exit-node $ip OFFLINE ($n/$EXITNODE_THRESHOLD consecutive — holding)"
+    return 0
+  fi
+  note "exit-node $ip OFFLINE $n/$EXITNODE_THRESHOLD consecutive — dropping to direct egress"
+  drop_exitnode "exit-node-offline-${n}x" && rm -f "$EXITNODE_OFFLINE_CNT" 2>/dev/null
+  return 0
 }
 
 alert(){
@@ -123,8 +363,12 @@ alert_sms(){
 }
 
 cycle(){
+  # THE EXIT-NODE AXIS RUNS FIRST AND UNCONDITIONALLY — a step everything downstream depends on must
+  # not ride inside a branch that only fires when something else did. It is also the ONLY caller of
+  # restore_exitnode now: both old call sites sat behind `internet_up`, which is exactly the probe a
+  # successful drop makes true (see the header).
+  exitnode_watch
   if internet_up; then
-    restore_exitnode
     if [ -f "$FLAG" ]; then
       note "RECOVERED"
       alert "🌿 mesh-revive: internet RECOVERED on $(hostname)"
@@ -148,7 +392,9 @@ cycle(){
   note "layer: $(layer_clause "$layer")"
   heal
   if internet_up; then
-    restore_exitnode
+    # NO restore_exitnode HERE. This probe succeeds *because* heal() just dropped the exit node, so a
+    # restore keyed on it re-pinned the very node the drop escaped — inside one cycle — and then
+    # deleted the save. The restore belongs to exitnode_watch alone, gated on the node being ONLINE.
     note "healed after $n failures"
     rm -f "$FAIL_CNT" "$FLAG" 2>/dev/null
     alert "🌿 mesh-revive: $(hostname) crawled out of starvation (self-healed after ${n} failures)"
@@ -165,7 +411,40 @@ cycle(){
   fi
 }
 
+# --rate — THE LOUD SIDE OF THE LEDGER. A flip is a substrate change on this node's only egress, so
+# the number that matters is not "did one happen" but HOW OFTEN, and against WHAT denominator. It
+# prints the tape's own coverage (first row, span) rather than a bare count: a young ledger and a
+# quiet one render identically otherwise, and "0 flips" off a two-minute file is not a rate.
+rate_report(){
+  if [ ! -s "$FLIPS" ]; then
+    echo "mesh-revive --rate: no flip tape yet ($FLIPS) — the ledger has never been written, which is"
+    echo "  UNKNOWN, not zero: nothing here distinguishes a quiet egress from a reflex that never ran."
+    return 0
+  fi
+  local first last span_h
+  first="$(head -n1 "$FLIPS" | cut -d' ' -f1)"; last="$(tail -n1 "$FLIPS" | cut -d' ' -f1)"
+  span_h="$(python3 -c '
+import sys,datetime
+def t(x):
+    return datetime.datetime.strptime(x,"%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
+try:
+    a=t(sys.argv[1]); n=datetime.datetime.now(datetime.timezone.utc)
+    print("%.2f" % max((n-a).total_seconds()/3600.0, 0.01))
+except Exception: print("na")' "$first" 2>/dev/null)"
+  echo "mesh-revive --rate: $(wc -l < "$FLIPS") flip row(s) over ${span_h}h (tape opens $first, last $last)"
+  local v
+  for v in DROP DROP-UNVERIFIED DROP-FAILED RESTORE RESTORE-UNVERIFIED RESTORE-FAILED; do
+    # `grep -c` PRINTS 0 and EXITS 1 on no match, so `|| echo 0` appends a SECOND zero and the row
+    # renders as two lines — a count column that shows "0\n0" for every quiet verb. The rc is not
+    # the absence; the printed number already is.
+    printf '  %-18s %s\n' "$v" "$(grep -c " $v " "$FLIPS" 2>/dev/null; true)"
+  done
+  echo "  (the UNVERIFIED verbs are the ones that matter: the pref was accepted and the PATH did not move)"
+  tail -n 5 "$FLIPS" | sed 's/^/  | /'
+}
+
 case "${1:-}" in
+  --rate) rate_report; exit 0 ;;
   --test)
     command -v tailscale >/dev/null 2>&1 || { echo "smoke-test: FAIL (no tailscale)"; exit 1; }
     command -v curl      >/dev/null 2>&1 || { echo "smoke-test: FAIL (no curl)"; exit 1; }
@@ -255,17 +534,24 @@ TESTEOF
     cat > "$_sb/.local/bin/tailscale" <<EOF
 #!/usr/bin/env bash
 echo "\$*" >> "$_sb/ts-calls.log"
-[ "\${1:-}" = status ] && [ "\${2:-}" = --json ] && echo '{"ExitNodeStatus":{"TailscaleIPs":["100.83.12.34/32"]}}'
+[ "\${1:-}" = status ] && [ "\${2:-}" = --json ] && cat "$_sb/netmap.json"
 exit 0
 EOF
     chmod +x "$_sb/.local/bin/curl" "$_sb/.local/bin/ping" "$_sb/.local/bin/tailscale"
+    # The netmap the shim serves. It carries BOTH halves the code reads — ExitNodeStatus (what the
+    # drop reads) and the Peer row (what the restore's liveness gate reads AFTER a drop has made
+    # ExitNodeStatus disappear). A fixture holding only the first cannot exercise the gate at all.
+    _netmap(){ printf '{"ExitNodeStatus":{"ID":"nTESTID","Online":%s,"TailscaleIPs":["100.83.12.34/32"]},"Peer":{"k":{"HostName":"fixture","Online":%s,"TailscaleIPs":["100.83.12.34"]}}}\n' "$1" "$1" > "$_sb/netmap.json"; }
+    _netmap true
     : > "$_sb/ts-calls.log"
     HOME="$_sb" MESH_TEST_SANDBOX=1 MESH_REVIVE_THRESHOLD=1 PATH="$_sb/.local/bin:$PATH" \
       bash "$0" --check >/dev/null 2>&1
-    # (a) the actuator must have been REACHED — else the gate proves nothing (threshold=1 + a
-    #     failing internet_up means cycle() ran heal(); status --json is heal()'s own exit-node read)
-    grep -qE '^(up|set --exit-node|status --json)' "$_sb/ts-calls.log" && {
-      echo "smoke-test: FAIL (MESH_TEST_SANDBOX gate broken: --check touched tailscale [$(tr '\n' ';' < "$_sb/ts-calls.log")] — a smoke-sweep must never change the substrate)"; exit 1; }
+    # (a) NO MUTATION. The assertion names the WRITING verbs only — `status --json` is a READ, and
+    #     exitnode_watch() now polls it every cycle, so keeping it in this pattern would fire the gate
+    #     on a tool that changed nothing. The reached-actuator proof is leg (b)'s SUPPRESSED marker
+    #     and leg (c)'s unsandboxed control, never the presence of a read.
+    grep -qE '^(up|set --exit-node)' "$_sb/ts-calls.log" && {
+      echo "smoke-test: FAIL (MESH_TEST_SANDBOX gate broken: --check MUTATED tailscale [$(tr '\n' ';' < "$_sb/ts-calls.log")] — a smoke-sweep must never change the substrate)"; exit 1; }
     # (b) the suppression must be VISIBLE, not silent, and it must be heal() that got suppressed
     _sup="$(HOME="$_sb" MESH_TEST_SANDBOX=1 MESH_REVIVE_THRESHOLD=1 PATH="$_sb/.local/bin:$PATH" bash "$0" --check 2>&1)"
     printf '%s' "$_sup" | grep -q 'heal SUPPRESSED' \
@@ -337,18 +623,209 @@ EOF
     # both (mutation-checked — removing restore_exitnode's guard passed the starvation gate green).
     : > "$_sb/ts-calls.log"; rm -f "$_sb/.mesh/.revive-fails"
     printf '#!/usr/bin/env bash\nexit 0\n' > "$_sb/.local/bin/curl"   # internet UP → the restore branch
-    echo "100.83.12.34" > "$_sb/.mesh/.revive-exitnode"
+    printf '100.83.12.34\nnTESTID\n' > "$_sb/.mesh/.revive-exitnode"
     HOME="$_sb" MESH_TEST_SANDBOX=1 PATH="$_sb/.local/bin:$PATH" bash "$0" --check >/dev/null 2>&1
     grep -q 'set --exit-node=100.83.12.34' "$_sb/ts-calls.log" && {
       echo "smoke-test: FAIL (MESH_TEST_SANDBOX gate broken: --check restored an exit-node [$(tr '\n' ';' < "$_sb/ts-calls.log")] — a smoke-sweep must never change the substrate)"; exit 1; }
     # control: unsandboxed, the same fixture MUST reach the restore — else the assert above is vacuous
-    : > "$_sb/ts-calls.log"; echo "100.83.12.34" > "$_sb/.mesh/.revive-exitnode"
+    : > "$_sb/ts-calls.log"; printf '100.83.12.34\nnTESTID\n' > "$_sb/.mesh/.revive-exitnode"
     env -u MESH_TEST_SANDBOX HOME="$_sb" PATH="$_sb/.local/bin:$PATH" bash "$0" --check >/dev/null 2>&1
     grep -q 'set --exit-node=100.83.12.34' "$_sb/ts-calls.log" \
       || { echo "smoke-test: FAIL (control: an UNsandboxed --check did not restore the saved exit-node — the restore gate above is vacuous)"; exit 1; }
+
+    # ================= THE EXIT-NODE SPOF LEGS (2026-08-27, task {#0790ec30}) =================
+    # A separate sandbox from $_sb on purpose: these legs rewrite the netmap between calls, and
+    # sharing a fixture whose shape one leg mutates is how a later leg silently stops discriminating.
+    _xb="$(mktemp -d)" || { echo "smoke-test: FAIL (mktemp)"; exit 1; }
+    trap 'rm -rf "$_td" "$_sb" "$_xb"' EXIT
+    mkdir -p "$_xb/.local/bin" "$_xb/.mesh"
+    # ONLINE state, FIB device and the world's answer are each a FILE, so a leg sets exactly the one
+    # axis it is about. (A leg that has to set three at once cannot say which one it measured.)
+    echo true          > "$_xb/online"
+    echo wlan0         > "$_xb/fibdev"
+    echo 5.5.5.5       > "$_xb/pubip"
+    echo down          > "$_xb/inet"
+    _xnetmap(){ printf '{"ExitNodeStatus":{"ID":"nX","Online":%s,"TailscaleIPs":["100.83.12.34/32"]},"Peer":{"k":{"HostName":"fx","Online":%s,"TailscaleIPs":["100.83.12.34"]}}}\n' "$(cat "$_xb/online")" "$(cat "$_xb/online")" > "$_xb/netmap.json"; }
+    cat > "$_xb/.local/bin/tailscale" <<EOF
+#!/usr/bin/env bash
+echo "\$*" >> "$_xb/ts-calls.log"
+if [ "\${1:-}" = status ] && [ "\${2:-}" = --json ]; then cat "$_xb/netmap.json"; fi
+if [ "\${1:-}" = set ]; then case "\$2" in --exit-node=) echo "" > "$_xb/exitnode-set" ;; --exit-node=*) echo "\${2#--exit-node=}" > "$_xb/exitnode-set" ;; esac; fi
+exit 0
+EOF
+    # curl serves TWO different questions here and they must not be confused: the liveness probe
+    # (internet_up) and the world-address fetch (egress_ip). A single exit-code shim answers both
+    # the same way, which would make "the world stopped answering" and "the internet is down" one
+    # fact — the exact collapse the DROP-UNVERIFIED verb exists to keep apart.
+    cat > "$_xb/.local/bin/curl" <<EOF
+#!/usr/bin/env bash
+case "\$*" in *ipify*) cat "$_xb/pubip"; exit 0 ;; esac
+[ "\$(cat "$_xb/inet")" = up ] && exit 0 || exit 1
+EOF
+    printf '#!/usr/bin/env bash\nexit 1\n' > "$_xb/.local/bin/ping"
+    cat > "$_xb/.local/bin/ip" <<EOF
+#!/usr/bin/env bash
+[ "\${1:-}" = route ] && [ "\${2:-}" = get ] && { echo "1.1.1.1 via 10.0.0.1 dev \$(cat "$_xb/fibdev") src 10.0.0.2 uid 1000"; exit 0; }
+exit 0
+EOF
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$_xb/.local/bin/mesh-trace"
+    printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "$HOME/alerts.log"\n' > "$_xb/.local/bin/mesh-chat"
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$_xb/.local/bin/mesh-tg"
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$_xb/.local/bin/mesh-sms"
+    printf '#!/usr/bin/env bash\necho UP\n'  > "$_xb/.local/bin/mesh-link-heal"
+    chmod +x "$_xb/.local/bin/"*
+    _xrun(){ env -u MESH_TEST_SANDBOX HOME="$_xb" PATH="$_xb/.local/bin:$PATH" \
+               MESH_REVIVE_THRESHOLD="${1:-1}" MESH_REVIVE_EXITNODE_THRESHOLD="${2:-1}" \
+               bash "$0" --check 2>&1; }
+    _xreset(){ rm -f "$_xb/.mesh/.revive-fails" "$_xb/.mesh/.revive-starving" \
+                     "$_xb/.mesh/.revive-exitnode" "$_xb/.mesh/.revive-exitnode-offline" \
+                     "$_xb/.mesh/.revive-flip-fyi" "$_xb/exitnode-set" "$_xb/alerts.log"; : > "$_xb/ts-calls.log"; }
+
+    # (X1) THE SELF-UNDOING HEAL — the whole defect, and it must be seen NOT to happen.
+    #      Before this change cycle() dropped the exit node in heal() and then, on the very next
+    #      statement, asked internet_up — which the drop had just made TRUE — and restored the dead
+    #      node inside the same cycle, then deleted the save. Fixture: exit node OFFLINE, internet
+    #      DOWN until the drop lands. Assert the drop happened, the restore did NOT, and the save
+    #      SURVIVED. (Mutant-checked: re-adding `restore_exitnode` after heal turns this red.)
+    _xreset; echo false > "$_xb/online"; _xnetmap; echo down > "$_xb/inet"
+    _xrun 1 1 >/dev/null 2>&1
+    grep -q '^set --exit-node=$' "$_xb/ts-calls.log" \
+      || { echo "smoke-test: FAIL (X1: a dead exit node was never dropped: $(tr '\n' ';' < "$_xb/ts-calls.log"))"; exit 1; }
+    grep -q '^set --exit-node=100.83.12.34$' "$_xb/ts-calls.log" \
+      && { echo "smoke-test: FAIL (X1: THE SELF-UNDOING HEAL — the drop was reverted onto a node the netmap says is OFFLINE, in the same cycle)"; exit 1; }
+    [ -s "$_xb/.mesh/.revive-exitnode" ] \
+      || { echo "smoke-test: FAIL (X1: the save was deleted, so the next cycle cannot know a drop is outstanding)"; exit 1; }
+    grep -q ' DROP ' "$_xb/.mesh/revive-exitnode-flips.log" 2>/dev/null \
+      || { echo "smoke-test: FAIL (X1: the flip is absent from the DURABLE ledger — the 02:17Z question 'did that leg run at all' stays unanswerable)"; exit 1; }
+
+    # (X2) THE RESTORE WAITS FOR ONLINE, AND ONLY FOR ONLINE. Same save, internet now UP via the
+    #      direct egress the drop built — the exact condition the old code restored on. It must
+    #      still hold while the peer is offline, and fire the moment the peer is back.
+    : > "$_xb/ts-calls.log"; echo up > "$_xb/inet"
+    _xrun 1 1 >/dev/null 2>&1
+    grep -q '^set --exit-node=100.83.12.34$' "$_xb/ts-calls.log" \
+      && { echo "smoke-test: FAIL (X2: restored onto an OFFLINE node because the INTERNET came back — that is a fact about the path the drop built, not about the node)"; exit 1; }
+    : > "$_xb/ts-calls.log"; echo true > "$_xb/online"; _xnetmap; echo tailscale0 > "$_xb/fibdev"
+    _xrun 1 1 >/dev/null 2>&1
+    grep -q '^set --exit-node=100.83.12.34$' "$_xb/ts-calls.log" \
+      || { echo "smoke-test: FAIL (X2: the node came back ONLINE and the exit node was never restored: $(tr '\n' ';' < "$_xb/ts-calls.log"))"; exit 1; }
+    grep -q ' RESTORE ' "$_xb/.mesh/revive-exitnode-flips.log" \
+      || { echo "smoke-test: FAIL (X2: the restore is absent from the durable ledger)"; exit 1; }
+    [ -f "$_xb/.mesh/.revive-exitnode" ] \
+      && { echo "smoke-test: FAIL (X2: a VERIFIED restore left the save behind — the next cycle would restore again forever)"; exit 1; }
+
+    # (X3) VERIFIED FROM THE FIB, NEVER FROM THE PREF. `tailscale set` returns 0 here exactly as it
+    #      does on a healthy node; only the FIB disagrees. A pref-reading restore calls this success.
+    #      This is the same shape as the LAN swallow on this node: ExitNodeAllowLANAccess read true
+    #      while table 52 carried no exclusion at all.
+    _xreset; echo true > "$_xb/online"; _xnetmap
+    printf '100.83.12.34\nnX\n' > "$_xb/.mesh/.revive-exitnode"
+    echo wlan0 > "$_xb/fibdev"          # the pref is accepted and the PATH DOES NOT MOVE
+    _xrun 1 1 >/dev/null 2>&1
+    grep -q ' RESTORE-UNVERIFIED ' "$_xb/.mesh/revive-exitnode-flips.log" \
+      || { echo "smoke-test: FAIL (X3: tailscale set returned 0 and the FIB still said $(cat "$_xb/fibdev"), and the restore was reported as success — the pref was read as the path)"; exit 1; }
+    [ -s "$_xb/.mesh/.revive-exitnode" ] \
+      || { echo "smoke-test: FAIL (X3: an UNVERIFIED restore deleted the save — the retry is gone and the failure is unrecoverable)"; exit 1; }
+    # ...and the same axis on the DROP side, which is a second call site and needs its own witness.
+    _xreset; echo false > "$_xb/online"; _xnetmap; echo down > "$_xb/inet"; echo tailscale0 > "$_xb/fibdev"
+    _xrun 1 1 >/dev/null 2>&1
+    grep -q ' DROP-UNVERIFIED ' "$_xb/.mesh/revive-exitnode-flips.log" \
+      || { echo "smoke-test: FAIL (X4: a drop whose FIB still leaves by the tunnel was booked as a real drop)"; exit 1; }
+
+    # (X5) N CONSECUTIVE, and UNKNOWN IS NOT OFFLINE. Two offline readings under a threshold of 3
+    #      must not touch the substrate; the third must. Then an UNREADABLE netmap — the state a
+    #      dead tailscaled or a parse failure produces — must NOT advance the counter, because
+    #      "we could not read" is not "it is down", and this actuator changes the node's only egress.
+    _xreset; echo false > "$_xb/online"; _xnetmap; echo down > "$_xb/inet"; echo wlan0 > "$_xb/fibdev"
+    _xrun 9 3 >/dev/null 2>&1; _xrun 9 3 >/dev/null 2>&1
+    grep -q '^set --exit-node=$' "$_xb/ts-calls.log" \
+      && { echo "smoke-test: FAIL (X5: dropped the exit node after 2 of 3 required consecutive OFFLINE readings)"; exit 1; }
+    _xrun 9 3 >/dev/null 2>&1
+    grep -q '^set --exit-node=$' "$_xb/ts-calls.log" \
+      || { echo "smoke-test: FAIL (X5: three consecutive OFFLINE readings did not reach the threshold — the trigger is dead)"; exit 1; }
+    # UNKNOWN IS NOT OFFLINE — and the fixture has to reach that branch. A netmap with NO
+    # ExitNodeStatus at all returns from exit_node_now() long before the liveness word is read
+    # (that is the "this node uses no exit node" path), so it cannot discriminate here: the
+    # discriminating shape is an exit node that IS configured whose Online field is ABSENT, which
+    # is what a partially-parsed or older status blob gives. Both are asserted, in that order.
+    _xreset; : > "$_xb/ts-calls.log"
+    printf '{"ExitNodeStatus":{"ID":"nX","TailscaleIPs":["100.83.12.34/32"]}}\n' > "$_xb/netmap.json"
+    _xrun 9 1 >/dev/null 2>&1
+    grep -q '^set --exit-node=$' "$_xb/ts-calls.log" \
+      && { echo "smoke-test: FAIL (X5: an exit node whose liveness is UNKNOWN was dropped as if it had been read OFFLINE — this actuator changes the node's only egress)"; exit 1; }
+    [ -f "$_xb/.mesh/.revive-exitnode-offline" ] \
+      && { echo "smoke-test: FAIL (X5: an UNKNOWN reading advanced the offline counter — repeat it N times and the drop fires on no evidence at all)"; exit 1; }
+    _xreset; echo '{}' > "$_xb/netmap.json"; : > "$_xb/ts-calls.log"
+    _xrun 9 1 >/dev/null 2>&1
+    grep -q '^set --exit-node=$' "$_xb/ts-calls.log" \
+      && { echo "smoke-test: FAIL (X5: a node with NO exit node configured had one dropped anyway)"; exit 1; }
+
+    # (X7) A REFUSED ACTUATOR IS NOT A SILENT ONE — the live defect, measured on this node
+    #      2026-08-27T18:57Z: `tailscale set --exit-node=` as uid 1000 answers "Access denied:
+    #      checkprefs access denied", and both old call sites wrote `… 2>/dev/null && note … || true`.
+    #      The rung had never once run, and its refusal was indistinguishable from a branch that did
+    #      not apply. Assert the row EXISTS, that it CARRIES the refusal text (a generic "nonzero"
+    #      sends the reader to the network instead of to sudo), and that the pre-write is undone.
+    _xreset; echo false > "$_xb/online"; _xnetmap; echo down > "$_xb/inet"; echo wlan0 > "$_xb/fibdev"
+    cat > "$_xb/.local/bin/tailscale" <<EOF
+#!/usr/bin/env bash
+echo "\$*" >> "$_xb/ts-calls.log"
+if [ "\${1:-}" = status ] && [ "\${2:-}" = --json ]; then cat "$_xb/netmap.json"; exit 0; fi
+if [ "\${1:-}" = set ]; then echo "Access denied: checkprefs access denied" >&2; exit 1; fi
+exit 0
+EOF
+    printf '#!/usr/bin/env bash
+exit 1
+' > "$_xb/.local/bin/sudo"   # no root either
+    chmod +x "$_xb/.local/bin/tailscale" "$_xb/.local/bin/sudo"
+    _xrun 1 1 >/dev/null 2>&1
+    grep -q ' DROP-FAILED ' "$_xb/.mesh/revive-exitnode-flips.log" \
+      || { echo "smoke-test: FAIL (X7: tailscaled REFUSED the drop and the ledger has no row for it — the rung reads as never-applicable, which is how it stayed a no-op for its whole life)"; exit 1; }
+    grep -q 'checkprefs access denied' "$_xb/.mesh/revive-exitnode-flips.log" \
+      || { echo "smoke-test: FAIL (X7: the refusal REASON was dropped — a bare non-zero sends the reader to the network when the answer is sudo: $(tail -1 "$_xb/.mesh/revive-exitnode-flips.log"))"; exit 1; }
+    [ -f "$_xb/.mesh/.revive-exitnode" ] \
+      && { echo "smoke-test: FAIL (X7: a REFUSED drop left its pre-write behind — exitnode_watch is now permanently on the restore branch and will never retry the drop)"; exit 1; }
+    # ...and the sudo fallback must be LIVE, not decorative: same refusal unprivileged, sudo works.
+    _xreset
+    cat > "$_xb/.local/bin/sudo" <<EOF
+#!/usr/bin/env bash
+[ "\${1:-}" = -n ] && shift
+echo "sudo \$*" >> "$_xb/ts-calls.log"
+exit 0
+EOF
+    chmod +x "$_xb/.local/bin/sudo"
+    _xrun 1 1 >/dev/null 2>&1
+    grep -q ' DROP ' "$_xb/.mesh/revive-exitnode-flips.log" \
+      || { echo "smoke-test: FAIL (X7: the sudo -n fallback is decorative — an unprivileged refusal was not retried with root)"; exit 1; }
+    grep -q '^sudo tailscale set --exit-node=$' "$_xb/ts-calls.log" \
+      || { echo "smoke-test: FAIL (X7: no sudo attempt was made at all: $(tr '\n' ';' < "$_xb/ts-calls.log"))"; exit 1; }
+
+    # (X6) THE LEDGER IS THE RATE, and --rate must not render a young tape as a quiet one.
+    _rr="$(HOME="$_xb" bash "$0" --rate 2>&1)"
+    # ONE LINE PER VERB — and the fixture must contain a verb with a count of ZERO, which is the
+    # only case that can double. Asserted against a purpose-built one-row ledger, never against
+    # $_xb's, which by this point has every verb non-zero and so cannot discriminate at all.
+    mkdir -p "$_td/.mesh"
+    printf '2026-07-24T00:00:00Z DROP node=1.2.3.4 id=nZ reason=fixture fib=wlan0 fetch=9.9.9.9\n' \
+      > "$_td/.mesh/revive-exitnode-flips.log"
+    _rr0="$(HOME="$_td" bash "$0" --rate 2>&1)"
+    [ "$(printf '%s' "$_rr0" | grep -cE '^  (DROP|RESTORE)')" = 6 ] \
+      || { echo "smoke-test: FAIL (X6: --rate does not render one line per verb: $(printf '%s' "$_rr0" | tr '\n' '|'))"; exit 1; }
+    # ...and NO ORPHAN COUNT LINE. The doubling shows up as a bare number on its OWN line, so a
+    # per-verb line count cannot see it — the verb-prefixed lines stay at six either way. This is
+    # the assertion the mutant actually has to answer to.
+    printf '%s' "$_rr0" | grep -qE '^[0-9]+$' \
+      && { echo "smoke-test: FAIL (X6: a bare count line escaped the verb rows — grep -c PRINTS 0 and EXITS 1, so an || echo 0 emits a SECOND zero for every quiet verb: $(printf '%s' "$_rr0" | tr '\n' '|'))"; exit 1; }
+    printf '%s' "$_rr" | grep -q 'flip row(s) over' \
+      || { echo "smoke-test: FAIL (X6: --rate does not publish the tape's own span, so 0 flips off a two-minute file reads as a quiet egress: ${_rr:0:120})"; exit 1; }
+    rm -f "$_td/.mesh/revive-exitnode-flips.log"
+    _rr2="$(HOME="$_td" bash "$0" --rate 2>&1)"
+    printf '%s' "$_rr2" | grep -q 'UNKNOWN, not zero' \
+      || { echo "smoke-test: FAIL (X6: an ABSENT ledger renders as a rate rather than as UNKNOWN — a reflex that never ran reads as an egress that never flipped: ${_rr2:0:120})"; exit 1; }
+    echo "  ok: exit-node SPOF (the self-undoing heal cannot fire — a drop is not restored by the internet the drop itself brought back; the restore waits for the peer to be ONLINE and is verified from the FIB + a real fetch on BOTH directions, keeping its save when unverified; N consecutive OFFLINE readings are required, and a liveness that reads UNKNOWN advances nothing; a REFUSED actuator is booked as FAILED WITH ITS REASON and undoes its own pre-write while the sudo -n fallback is proven live; every attempt lands in a durable ledger whose --rate publishes its own span and renders an absent tape UNKNOWN)"
     echo "smoke-test: ok (threshold counter + recovery logic + MESH_TEST_SANDBOX substrate-suppression gate on BOTH actuators (heal + exit-node restore), each w/ a reached-actuator control)"; exit 0 ;;
   --loop) iv="${2:-60}"; note "watching every ${iv}s (threshold=${THRESHOLD})"
           while true; do cycle; sleep "$iv"; done ;;
   ""|--check) cycle ;;
-  *) echo "usage: mesh-revive [--check | --loop [sec]]   MESH_REVIVE_THRESHOLD (default 3)" >&2; exit 1 ;;
+  *) echo "usage: mesh-revive [--check | --loop [sec] | --rate]   MESH_REVIVE_THRESHOLD (default 3) · MESH_REVIVE_EXITNODE_THRESHOLD (default 3)" >&2; exit 1 ;;
 esac
