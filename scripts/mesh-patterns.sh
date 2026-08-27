@@ -432,6 +432,98 @@ beacon_missed_read() { # <iface> <proc-col-11> -> "<value|na> <nl80211|proc|none
   printf 'na none\n'
 }
 
+
+# ---- ASSOCIATION-INFO grammar (ssid / bssid / freq / bitrates) ----
+#
+# THE DEPENDENCY WAS NEVER INSTALLED AND THE ABSENCE RENDERED AS A NUMBER. mesh-wifi-quality read
+# ESSID/frequency/AP/bitrate from `iwconfig` and published all four. Measured 2026-08-26 on this
+# node: `iwconfig` does not exist (`dpkg -l wireless-tools` reads `un` — never installed), so its
+# parse helper returned EARLY with no output, its own `${essid:-?}` sentinels were dead code that
+# had never once executed, and the caller's `read` left four empty variables. The render then
+# supplied the defaults: `bitrate_mbps: 0` and `freq_ghz: "0"`. ESSID was set in 0 of 3366 rendered
+# rows; every one of those rows carried `bitrate=?`.
+#
+# A bitrate of 0 is not the absence of a bitrate — it is a link carrying nothing, which is a LOUD
+# reading, and it was published continuously by a link running at 117 MBit/s.
+# [[a-silent-fallback-turns-a-failure-into-a-plausible-constant]]
+#
+# nl80211 answers all four in one call and needs no package this node lacks, so it is asked FIRST
+# and `iwconfig` is the fallback rather than the source. Three distinctions the caller MUST keep:
+#
+#   src=nl80211|iwconfig, assoc=yes  -> real values
+#   src=nl80211|iwconfig, assoc=no   -> a real ANSWER: the interface is up and not associated.
+#                                       Fields are na because there is no association to describe.
+#   src=none,             assoc=unknown -> NOBODY could answer. Not the same fact, and it must not
+#                                       be rendered with the same word.
+# [[a-blindness-sentinel-fused-as-a-reading]] — abstention is typed apart from not-applicable.
+#
+# UNITS DIFFER BETWEEN THE TWO SURFACES and that is the quiet way to be wrong here: `iw` prints
+# `freq: 2427.0` in MHz, `iwconfig` prints `Frequency:2.427 GHz`. Both are normalised to MHz here,
+# once, so a caller cannot inherit whichever surface happened to answer.
+#
+# TWO BITRATES, NOT ONE. `iw` reports `rx bitrate` and `tx bitrate` separately (117.0 and 52.0
+# MBit/s in the same instant here — a 2.25x spread), so a single `bitrate` field is a collapse of
+# two different counters. Both are returned. `iwconfig` reports only its own `Bit Rate=`, which is
+# the TX rate, so under that fallback rx is `na` — never a copy of tx.
+#
+# OUTPUT IS ONE `key=value` PER LINE, never a space-joined tuple: an SSID may contain spaces (and
+# `=`), so a positional split would mangle exactly the networks with human-written names. Read it
+# with `IFS='=' read -r k v`, which splits on the FIRST `=` only.
+# Keys: ssid bssid freq_mhz rx_mbps tx_mbps assoc src   (value `na` where unanswered)
+LINK_INFO_GRAMMAR_SRC="mesh-patterns.sh"
+export LINK_INFO_GRAMMAR_SRC
+link_info_read() { # <iface> -> key=value lines
+  local iface="${1:-}" out="" ssid="na" bssid="na" freq="na" rx="na" tx="na" assoc="unknown" src="none"
+  _li_num(){ case "$1" in ''|*[!0-9.]*) echo "";; *) echo "$1";; esac; }
+  _li_mac(){ case "$1" in [0-9A-Fa-f][0-9A-Fa-f]:*:[0-9A-Fa-f][0-9A-Fa-f]) echo "$1";; *) echo "";; esac; }
+  if [ -n "$iface" ] && command -v iw >/dev/null 2>&1; then
+    out="$(iw dev "$iface" link 2>/dev/null)"
+    if [ -n "$out" ]; then
+      src="nl80211"
+      case "$out" in
+        *"Not connected"*) assoc="no";;
+        *"Connected to"*)
+          assoc="yes"
+          bssid="$(_li_mac "$(printf '%s\n' "$out" | sed -nE 's/^Connected to ([0-9A-Fa-f:]+).*/\1/p' | head -1)")"
+          # SSID may contain spaces; take everything after the first ": " and nothing else.
+          ssid="$(printf '%s\n' "$out" | sed -nE 's/^[[:space:]]*SSID: (.*)$/\1/p' | head -1)"
+          freq="$(_li_num "$(printf '%s\n' "$out" | sed -nE 's/^[[:space:]]*freq: ([0-9.]+).*/\1/p' | head -1)")"
+          rx="$(_li_num "$(printf '%s\n' "$out" | sed -nE 's/^[[:space:]]*rx bitrate: ([0-9.]+) .*/\1/p' | head -1)")"
+          tx="$(_li_num "$(printf '%s\n' "$out" | sed -nE 's/^[[:space:]]*tx bitrate: ([0-9.]+) .*/\1/p' | head -1)")"
+          ;;
+        *) assoc="unknown";;   # iw answered something this grammar does not know — do not guess.
+      esac
+    fi
+  fi
+  if [ "$src" = "none" ] && [ -n "$iface" ] && command -v iwconfig >/dev/null 2>&1; then
+    out="$(iwconfig "$iface" 2>/dev/null)"
+    if [ -n "$out" ]; then
+      src="iwconfig"
+      case "$out" in
+        *'ESSID:off/any'*|*'Not-Associated'*) assoc="no";;
+        *)
+          assoc="yes"
+          ssid="$(printf '%s\n' "$out" | sed -nE 's/.*ESSID:"([^"]*)".*/\1/p' | head -1)"
+          bssid="$(_li_mac "$(printf '%s\n' "$out" | sed -nE 's/.*Access Point: ([0-9A-Fa-f:]+).*/\1/p' | head -1)")"
+          # GHz here, MHz above — normalise so the caller never inherits the surface's unit.
+          freq="$(_li_num "$(printf '%s\n' "$out" | sed -nE 's/.*Frequency:([0-9.]+) GHz.*/\1/p' | head -1)")"
+          [ -n "$freq" ] && freq="$(awk -v g="$freq" 'BEGIN{printf "%.1f", g*1000}')"
+          # `Bit Rate` is the TX rate. rx stays na: a fallback must never invent the field it lacks.
+          tx="$(_li_num "$(printf '%s\n' "$out" | sed -nE 's/.*Bit Rate[=:] ?([0-9.]+) .*/\1/p' | head -1)")"
+          ;;
+      esac
+    fi
+  fi
+  [ "$assoc" = "yes" ] || { ssid=""; bssid=""; freq=""; rx=""; tx=""; }
+  printf 'ssid=%s\n'     "${ssid:-na}"
+  printf 'bssid=%s\n'    "${bssid:-na}"
+  printf 'freq_mhz=%s\n' "${freq:-na}"
+  printf 'rx_mbps=%s\n'  "${rx:-na}"
+  printf 'tx_mbps=%s\n'  "${tx:-na}"
+  printf 'assoc=%s\n'    "$assoc"
+  printf 'src=%s\n'      "$src"
+}
+
 # ---- RSSI sentinel grammar (shared by mesh-wifi-mimo / -quality / -rf / -contention) ----
 #
 # ONE blindness, TWO renderings, and until 2026-08-24 FOUR private copies of the predicate, no two
@@ -824,5 +916,98 @@ IWEOF
       "a multi-station dump yields the FIRST station's count, never two joined into one number"
   rm -rf "$_bmd"
 
+  # ---- link_info_read: an absent dependency must not render as a number -----------------------
+  # The defect this covers: iwconfig was never installed, its parse returned early, and the render
+  # published bitrate 0 / freq "0" on a link running at 117 MBit/s.
+  _lid="$(mktemp -d)"
+  _li(){ printf '%s\n' "$1" | sed -nE "s/^$2=(.*)$/\1/p"; }
+  # 1. NOBODY can answer -> src=none, assoc=unknown. Distinct from "answered: not associated".
+  _li_none="$(PATH=/nonexistent-for-this-arm link_info_read someif)"
+  ck2 "$(_li "$_li_none" src)"      none    "no surface on PATH -> src=none"
+  ck2 "$(_li "$_li_none" assoc)"    unknown "no surface on PATH -> assoc=unknown, NOT 'no'"
+  ck2 "$(_li "$_li_none" tx_mbps)"  na      "an unanswerable bitrate is na — never 0, which is a link carrying nothing"
+  ck2 "$(_li "$_li_none" freq_mhz)" na      "an unanswerable frequency is na — never '0'"
+  ck2 "$(_li "$_li_none" ssid)"     na      "an unanswerable ssid is na — never the empty string"
+  ck2 "$(_li "$(link_info_read '')" src)" none "no interface to ask -> src=none"
+  # 2. nl80211 associated. THE SSID CARRIES SPACES AND AN '=' — a positional split mangles exactly
+  # the networks with human-written names, so the whole tail after 'SSID: ' must survive.
+  cat > "$_lid/iw" <<'IWEOF'
+#!/bin/sh
+[ "$3" = "link" ] || exit 1
+[ "$2" = "wlanTEST" ] || { echo "Not connected."; exit 0; }
+cat <<'X'
+Connected to 76:9b:9f:ab:e7:b5 (on wlanTEST)
+	SSID: My Home Net = 5G
+	freq: 2427.0
+	signal: -55 dBm
+	rx bitrate: 117.0 MBit/s MCS 14
+	tx bitrate: 52.0 MBit/s MCS 11
+X
+IWEOF
+  chmod +x "$_lid/iw"
+  _li_up="$(PATH="$_lid:$PATH" link_info_read wlanTEST)"
+  ck2 "$(_li "$_li_up" src)"      nl80211              "iw answers -> src=nl80211"
+  ck2 "$(_li "$_li_up" assoc)"    yes                  "a Connected-to dump -> assoc=yes"
+  ck2 "$(_li "$_li_up" ssid)"     "My Home Net = 5G"   "an SSID with spaces and '=' survives whole"
+  ck2 "$(_li "$_li_up" bssid)"    76:9b:9f:ab:e7:b5    "bssid comes off the Connected-to line"
+  ck2 "$(_li "$_li_up" freq_mhz)" 2427.0               "iw freq is already MHz and is not re-scaled"
+  # THE COLLAPSE THIS EXISTS TO PREVENT: rx and tx are different counters (2.25x apart here), so a
+  # single 'bitrate' field silently discards one of them.
+  ck2 "$(_li "$_li_up" rx_mbps)"  117.0                "rx bitrate is its own field"
+  ck2 "$(_li "$_li_up" tx_mbps)"  52.0                 "tx bitrate is its own field — not a copy of rx"
+  # 3. nl80211 present and NOT associated: a real answer, and it must not read as blindness.
+  _li_dn="$(PATH="$_lid:$PATH" link_info_read otherif)"
+  ck2 "$(_li "$_li_dn" src)"     nl80211 "an unassociated interface still had a surface answer -> src=nl80211"
+  ck2 "$(_li "$_li_dn" assoc)"   no      "Not connected -> assoc=no, which is NOT assoc=unknown"
+  ck2 "$(_li "$_li_dn" ssid)"    na      "no association -> no ssid to publish"
+  ck2 "$(_li "$_li_dn" tx_mbps)" na      "no association -> no bitrate, and still never 0"
+  # 4. iwconfig FALLBACK, in a dir of its OWN so the iw stub above is genuinely off PATH — and
+  # carrying DIFFERENT values from the iw fixture at every field. A fallback fixture that repeats
+  # the primary's numbers cannot tell "the fallback answered" from "the primary did", which is how
+  # the first run of these arms passed the unit conversion while reading iw's freq.
+  # [[a-fixture-whose-two-candidates-carry-one-value-cannot-discriminate]]
+  # The `iw` stub here answers NOTHING (a real case: iw installed, interface not wireless), which is
+  # both more portable than surgery on PATH and a scenario worth covering — a surface that exists
+  # but cannot answer must fall through, not claim the answer.
+  _licd="$(mktemp -d)"
+  printf '#!/bin/sh\nexit 1\n' > "$_licd/iw"; chmod +x "$_licd/iw"
+  cat > "$_licd/iwconfig" <<'IWCEOF'
+#!/bin/sh
+[ "$1" = "wlanTEST" ] || { echo "wlanTEST  no wireless extensions."; exit 0; }
+cat <<'X'
+wlanTEST  IEEE 802.11  ESSID:"Fallback Net = 2G"
+          Mode:Managed  Frequency:5.18 GHz  Access Point: 11:22:33:44:55:66
+          Bit Rate=39 Mb/s   Tx-Power=20 dBm
+X
+IWCEOF
+  chmod +x "$_licd/iwconfig"
+  _li_ic="$(PATH="$_licd:$PATH" link_info_read wlanTEST)"
+  ck2 "$(_li "$_li_ic" src)"      iwconfig             "iw present but silent, iwconfig answers -> src=iwconfig"
+  ck2 "$(_li "$_li_ic" freq_mhz)" 5180.0               "iwconfig GHz (5.18) is normalised to MHz — a caller never inherits the surface's unit"
+  ck2 "$(_li "$_li_ic" tx_mbps)"  39                   "iwconfig 'Bit Rate' is the TX rate"
+  ck2 "$(_li "$_li_ic" rx_mbps)"  na                   "iwconfig cannot report rx — it is na, NEVER a copy of tx"
+  ck2 "$(_li "$_li_ic" ssid)"     "Fallback Net = 2G"  "iwconfig ESSID with spaces survives whole"
+  ck2 "$(_li "$_li_ic" bssid)"    11:22:33:44:55:66    "iwconfig Access Point is the bssid"
+  # 5. nl80211 WINS when both exist — iwconfig is the fallback, not the source. The two fixtures
+  # disagree on every field, so this arm can actually see which one answered.
+  _li_both="$(PATH="$_lid:$_licd:$PATH" link_info_read wlanTEST)"
+  ck2 "$(_li "$_li_both" src)"      nl80211            "both surfaces present -> src=nl80211"
+  ck2 "$(_li "$_li_both" ssid)"     "My Home Net = 5G" "both present -> iw's ssid, not iwconfig's"
+  ck2 "$(_li "$_li_both" freq_mhz)" 2427.0             "both present -> iw's freq, not iwconfig's 5180"
+  # 6. iwconfig's own unassociated spellings are answers, not values.
+  cat > "$_licd/iwconfig" <<'IWCEOF'
+#!/bin/sh
+cat <<'X'
+wlanTEST  IEEE 802.11  ESSID:off/any
+          Mode:Managed  Access Point: Not-Associated
+X
+IWCEOF
+  chmod +x "$_licd/iwconfig"
+  _li_ico="$(PATH="$_licd:$PATH" link_info_read wlanTEST)"
+  ck2 "$(_li "$_li_ico" src)"   iwconfig "iwconfig answered, so the source is named even with no association"
+  ck2 "$(_li "$_li_ico" assoc)" no "iwconfig ESSID:off/any -> assoc=no"
+  ck2 "$(_li "$_li_ico" ssid)"  na "'off/any' is a state word and must never be published as an ssid"
+  ck2 "$(_li "$_li_ico" bssid)" na "'Not-Associated' is not a MAC and must never be published as one"
+  rm -rf "$_lid" "$_licd"
   [ "$fail" = 0 ] && { echo "smoke-test: ok"; exit 0; } || { echo "smoke-test: FAIL"; exit 1; }
 fi
