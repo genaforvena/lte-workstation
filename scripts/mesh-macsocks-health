@@ -35,6 +35,12 @@
 #   mesh-macsocks-health --check    measure and print, write no ledger row and post nothing
 #   mesh-macsocks-health --log [N]  the durable tape (last N rows, default 20)
 #   mesh-macsocks-health --test     smoke test (stubbed probes — touches no real host)
+#   mesh-macsocks-health --forensic [<startZ> <endZ>]
+#                                   AFTER THE FACT: read the Mac's own unified log to settle which
+#                                   of the four worlds a past reading was in. Not a watchdog — it
+#                                   rides SSH over the same AP that is usually the question, so it
+#                                   answers later, from the log's ~29-day retention. Defaults to
+#                                   the hour around the newest non-OK ledger row.
 set -uo pipefail
 
 MESH_DIR="${MESH_DIR:-$HOME/.mesh}"
@@ -135,9 +141,232 @@ main() {
   fi
   [ "$VERDICT" = "OK" ] || [ "$VERDICT" = "UNKNOWN" ]
 }
+# =============================================================================================
+# --forensic: the FORENSIC arm. Not a watchdog — it settles, AFTER THE FACT, which of the four
+# worlds a past reading was in, using the Mac's own unified log (a ~29-day dated event history
+# that no other mesh tool reads).
+#
+# It cannot be a live watchdog by construction: the read rides SSH over the same AP whose health
+# is usually the question, so when it is most needed it is least able to answer. That is fine —
+# the log is retained, so the answer keeps until the link is back. What is NOT fine is a probe
+# that renders its own blindness as calm, and this plane has FIVE separate ways to do that.
+#
+#   1. A SUBSYSTEM-KEYED PREDICATE IS AN ALLOWLIST WHOSE FAILURE DIRECTION IS SILENCE.
+#      Measured on this Mac, one closed 20m window, no pipe, rc read directly:
+#        --predicate 'subsystem == "com.apple.wifi"'  -> rc 0, 0 event rows
+#        same window, unfiltered                      -> rc 0, 29009 rows, 96 of them wifi BY TEXT
+#      On 10.13 wifi events carry no such label, so that predicate renders a busy log, a
+#      nonexistent label and a dead logd IDENTICALLY. Every count below therefore ships with the
+#      UNFILTERED count over the SAME window beside it, and a zero with a zero control is
+#      UNKNOWN, never quiet. We also key on eventMessage TEXT, never on a subsystem name.
+#
+#   2. `--style compact` IS A LOSSY RENDERER IN TWO INDEPENDENT WAYS AND BOTH MANUFACTURE FACTS.
+#      (a) It truncates microseconds to MILLISECONDS, which fabricates duplicates. Same window,
+#          same predicate, both styles: raw lines 1611 == 1611, but distinct lines are 1377
+#          (compact) vs 1611 (syslog). The "byte-identical triple at the same microsecond" is
+#          three real events at .356429/.356481/.356781. Truncating the syslog output to ms
+#          reproduces compact's 153 repeat-groups exactly, which is the arithmetic proof.
+#          So `wc -l` here does NOT double — it is exact — and DEDUPING is the corruption: it
+#          would have deleted 234 of 1611 genuine kernel events (14.5%) in that one window.
+#      (b) It prints NAKED LOCAL TIME WITH NO OFFSET. This Mac is MSK+0300, so every compact
+#          timestamp is 3h from UTC with nothing in the string saying so — precise and wrong,
+#          which is worse than absent on a plane whose entire value is dating events.
+#      Hence: `--style syslog` everywhere (it carries +0300 in the string), windows passed with
+#      an explicit +0000, and output timestamps converted from their OWN stated offset.
+#
+#   3. GENUINE NEAR-SIMULTANEOUS REPEATS EXIST AND ARE NOT THE SAME THING AS (2a), AND NO EPSILON
+#      SEPARATES THEM. The wake line really is emitted twice, at .319027 and .319028 — 1us apart.
+#      The obvious remedy is to collapse repeats within some epsilon, so the epsilon was calibrated
+#      against the corpus instead of guessed: over 1409 same-message gaps in one 20m window the
+#      distribution is min 4us, p10 119us, p25 1414us, p50 147ms — CONTINUOUS, with no valley
+#      anywhere, and the collapsed-pair count climbs smoothly (1 / 18 / 62 / 132 / 252 / 258 / 668
+#      at eps = 5 / 10 / 50 / 100 / 500 / 1000 / 2000us). There is no principled cut, so a collapsed
+#      count is a JUDGEMENT and must never be the number a verdict turns on.
+#      Therefore: the RAW count is the count — it is exact, since (2a) proved nothing is doubled —
+#      and the collapse ships beside it, labelled with its epsilon, as an unresolved-by-this-plane
+#      hint only. The classifier reads RAW. That is not merely a convention: collapsing can never
+#      turn a positive into a zero, so every verdict below is provably invariant to the epsilon,
+#      and the judgement is fully outside the decision path rather than merely disclosed.
+#
+#   4. RETENTION IS A FORWARD BOUND, NOT A REAR-VIEW NUMBER. The store is SIZE-bounded (32
+#      Persist files, ~279MB), so a noisy day evicts faster. The oldest record is necessary but
+#      not sufficient: measured roll intervals on this store run from 1.29h to 103.69h, and a
+#      real observed cluster of five consecutive full-size rolls at ~2.18h puts the horizon at
+#      2.9 DAYS, not 29. So we publish the oldest record AND a forward horizon from the recent
+#      roll rate AND a floor from the fastest observed rate, and a window older than the oldest
+#      record is UNKNOWN, never empty. Note the reflexive part: driving this Mac over SSH is
+#      itself a write-rate input, so reading this plane shortens the window it can read.
+#      A 103.69h gap in the roll series is the Mac being OFF, not the log being quiet, so the
+#      floor is taken from the fastest rate rather than an average across sleep.
+#
+#   5. A TIMEOUT IS UNKNOWN, NOT QUIET. A 12h query did not return in 180s. Every call is
+#      bounded and a 124 renders UNKNOWN with the bound named.
+#
+#   mesh-macsocks-health --forensic [<startZ> <endZ>]   default: around the newest non-OK row
+# =============================================================================================
+ULOG_STYLE=syslog
+FORENSIC_EPS_US="${MESH_MACSOCKS_EPS_US:-2000}"   # 2ms grouping for the collapsed event count
+FORENSIC_TMO="${MESH_MACSOCKS_ULOG_TIMEOUT:-200}"
+
+# One bounded ssh. Sets ULOG_RC to 0 (ok), 124 (timeout) or anything else (unreachable/refused).
+# Overridable so --test drives the classifier without touching a real host.
+# NOTE: every caller reads this through a command substitution, which is a SUBSHELL — a variable
+# set in here can never reach the caller. The rc must travel as the function's own EXIT STATUS
+# (`txt=$(ulog_run ...); rc=$?`), which is the one channel that does cross that boundary.
+_ulog() { # _ulog <remote log-show argument string>
+  local target="${MESH_MACSOCKS_CLIENT:-}"
+  timeout "$FORENSIC_TMO" ssh -n "${SSH_OPTS[@]}" "$target" "log show $1" 2>/dev/null
+}
+ulog_run()      { ${MESH_MACSOCKS_ULOG_CMD:-_ulog} "$1"; }
+probe_store()   { ${MESH_MACSOCKS_STORE_CMD:-_store_probe}; }
+_store_probe() {
+  local target="${MESH_MACSOCKS_CLIENT:-}"
+  # epoch + size, so nothing has to parse a localised ls date.
+  timeout 40 ssh -n "${SSH_OPTS[@]}" "$target" \
+    'stat -f "%m %z" /var/db/diagnostics/Persist/* 2>/dev/null | sort -n' 2>/dev/null
+}
+
+# Rows only: log show prints a header line, and counting it as an event is how a zero becomes a one.
+_rows() { grep -cE '^[0-9]{4}-[0-9]{2}-[0-9]{2} ' <<<"${1:-}" || true; }
+
+# Collapse repeats of the SAME message within FORENSIC_EPS_US, and report the multiplicity
+# distribution at full precision beside it. Both numbers ship; neither replaces the other.
+_collapse() { # _collapse <syslog text> -> "<raw> <collapsed> <multstring>"
+  awk -v eps="$FORENSIC_EPS_US" '
+    /^[0-9]{4}-[0-9]{2}-[0-9]{2} / {
+      raw++
+      # 2026-08-28 13:56:12.319027+0300  localhost kernel[0]: (msg)
+      ts=$1" "$2; msg=""
+      for(i=4;i<=NF;i++) msg=msg" "$i
+      split($2,tp,"."); frac=substr(tp[2],1,6)+0
+      bucket=int(frac/eps)
+      key=$1" "substr($2,1,8)" "bucket msg
+      if(!(key in seen)) collapsed++
+      seen[key]++
+      exact[$1" "$2 msg]++
+    }
+    END{
+      for(k in exact) m[exact[k]]++
+      s=""
+      for(i=1;i<=8;i++) if(i in m) s=s (s==""?"":",") "x" i ":" m[i]
+      printf "%d %d %s\n", raw+0, collapsed+0, (s==""?"none":s)
+    }' <<<"${1:-}"
+}
+
+# Forward horizon from the roll series. Returns "<oldest_epoch> <total_bytes> <fwd_h> <floor_h> <n>".
+_horizon() { # _horizon <store text: "epoch size" per line, ascending>
+  awk '
+    # n and m MUST be initialised: an unset awk variable used as a subscript is the EMPTY STRING,
+    # not 0, so e[n] on the first row lands in e[""] and e[0] is never assigned. That renders the
+    # oldest record as epoch 0 -- which is not a visible crash, it is a silent "na" in the one
+    # field that decides whether the window is inside the store at all.
+    BEGIN{ n=0; m=0 }
+    NF==2 { e[n]=$1; z[n]=$2; n++; total+=$2 }
+    END{
+      if(n<2){ print (n?e[0]:0), total+0, -1, -1, n+0; exit }
+      # rate for each roll: the bytes of the file that closed, over the interval it took.
+      for(i=1;i<n;i++){
+        dt=e[i]-e[i-1]; if(dt<=0) continue
+        r=z[i]/(dt/3600.0)          # bytes per hour
+        rate[m++]=r
+        if(m<=0) continue
+      }
+      if(m==0){ print e[0], total, -1, -1, n; exit }
+      # recent = median of the last 8 rates (median resists the Mac-was-off outlier);
+      # floor   = the fastest rate observed (a real busy cluster, never an average across sleep).
+      k=0; for(i=(m>8?m-8:0);i<m;i++) last[k++]=rate[i]
+      for(i=0;i<k;i++) for(j=i+1;j<k;j++) if(last[j]<last[i]){t=last[i];last[i]=last[j];last[j]=t}
+      med = (k%2)? last[int(k/2)] : (last[k/2-1]+last[k/2])/2.0
+      fast=0; for(i=0;i<m;i++) if(rate[i]>fast) fast=rate[i]
+      printf "%d %d %.1f %.1f %d\n", e[0], total, (med>0?total/med:-1), (fast>0?total/fast:-1), n
+    }' <<<"${1:-}"
+}
+
+# Verdict. Pure function of parsed inputs so --test can drive every word offline.
+# Reads the RAW counts, never the collapsed ones — see (3): the epsilon has no principled value,
+# and since a collapse cannot turn a positive into a zero every word here is invariant to it.
+classify_forensic() { # <reach> <covered> <control> <wake_raw> <sleep_raw>
+  local reach="$1" covered="$2" control="$3" wake="$4" sleep_="$5"
+  case "$reach" in
+    timeout)     FVERDICT=UNKNOWN; FWHY="the log query exceeded its ${FORENSIC_TMO}s bound — a timeout is UNKNOWN, not a quiet log"; return ;;
+    unreachable) FVERDICT=UNKNOWN; FWHY="the Mac did not answer — this arm rides SSH over the same AP whose health is often the question"; return ;;
+  esac
+  [ "$covered" = past-horizon ] && { FVERDICT=UNKNOWN; FWHY="the window predates the oldest record the size-bounded store still holds — evicted, not empty"; return; }
+  [ "$covered" = unknown ]      && { FVERDICT=UNKNOWN; FWHY="the store's own roll series could not be read, so the covered window is undetermined"; return; }
+  # rc 0 with zero rows is the shape a nonexistent label, a busy log and a dead logd all share.
+  [ "${control:-0}" -eq 0 ]     && { FVERDICT=UNKNOWN; FWHY="the unfiltered positive control returned zero rows for this window — no evidence the log was being written at all"; return; }
+  if [ "${sleep_:-0}" -gt 0 ] && [ "${wake:-0}" -gt 0 ]; then
+    FVERDICT=MAC-SLEPT-AND-WOKE; FWHY="power transitions inside the window ($sleep_ sleep, $wake wake) — a reading here could have caught either state"
+  elif [ "${sleep_:-0}" -gt 0 ]; then
+    FVERDICT=MAC-ASLEEP; FWHY="$sleep_ sleep transition(s) and no wake — the Mac went down inside this window, so an unreachable reading was SLEEP and not the network"
+  elif [ "${wake:-0}" -gt 0 ]; then
+    FVERDICT=MAC-WOKE; FWHY="$wake wake event(s) and no sleep — the Mac was asleep entering this window"
+  else
+    FVERDICT=MAC-AWAKE; FWHY="the log was being written throughout ($control rows) with no power transition — the Mac was UP, so an unreachable reading was the network or the tunnel, never sleep"
+  fi
+}
+
+forensic() {
+  local target="${MESH_MACSOCKS_CLIENT:-}"
+  [ -z "$target" ] && { echo "mesh-macsocks-health: no MESH_MACSOCKS_CLIENT declared in $MESH_DIR/nodes" >&2; return 2; }
+  local s="${1:-}" e="${2:-}"
+  if [ -z "$s" ]; then
+    # Default: the hour around the newest non-OK ledger row — the reading that wants explaining.
+    local ref; ref=$(grep -vE ' (OK) ' "$LEDGER" 2>/dev/null | tail -1 | awk '{print $1}')
+    [ -z "$ref" ] && ref=$(date -u -d '1 hour ago' +%FT%TZ 2>/dev/null)
+    s=$(date -u -d "$ref - 30 minutes" +'%F %T' 2>/dev/null); e=$(date -u -d "$ref + 30 minutes" +'%F %T' 2>/dev/null)
+  fi
+  # Normalise to the explicit-offset form. log show honours a +0000 suffix (measured: a window
+  # given as 20:00:00+0000 returned rows stamped 23:00:00+0300, i.e. it converted rather than
+  # reading the digits as local).
+  s=$(date -u -d "$s" +'%F %T' 2>/dev/null) || { echo "unparseable start" >&2; return 2; }
+  e=$(date -u -d "$e" +'%F %T' 2>/dev/null) || { echo "unparseable end" >&2; return 2; }
+  local W="--start '$s+0000' --end '$e+0000'"
+  local s_ep e_ep span; s_ep=$(date -u -d "$s" +%s); e_ep=$(date -u -d "$e" +%s); span=$((e_ep-s_ep))
+
+  # --- horizon first: a question the store cannot answer must not be asked as if it could ------
+  local store hz oldest total fwd floor nfiles covered
+  store=$(probe_store)
+  hz=$(_horizon "$store"); read -r oldest total fwd floor nfiles <<<"$hz"
+  if [ "${nfiles:-0}" -lt 2 ]; then covered=unknown
+  elif [ "$s_ep" -lt "${oldest:-0}" ]; then covered=past-horizon
+  else covered=yes; fi
+
+  # --- the positive control and the counts, all over the SAME window ---------------------------
+  local reach=ok ctl_txt ctl=0 wake_txt sleep_txt
+  ctl_txt=$(ulog_run "$W --style $ULOG_STYLE"); local rc=$?
+  if [ "$rc" = 124 ]; then reach=timeout; elif [ "$rc" != 0 ]; then reach=unreachable; fi
+  ctl=$(_rows "$ctl_txt")
+
+  local wraw=0 wev=0 wmult=none sraw=0 sev=0 smult=none
+  if [ "$reach" = ok ] && [ "$covered" = yes ]; then
+    # TEXT-keyed, never subsystem-keyed: the subsystem label does not exist on 10.13.
+    wake_txt=$(ulog_run "$W --style $ULOG_STYLE --predicate 'eventMessage CONTAINS \"Wake reason\"'")
+    [ $? = 124 ] && reach=timeout
+    sleep_txt=$(ulog_run "$W --style $ULOG_STYLE --predicate 'eventMessage CONTAINS \"Sleep transition\" OR eventMessage CONTAINS \"Entering Sleep\"'")
+    [ $? = 124 ] && reach=timeout
+    read -r wraw wev wmult <<<"$(_collapse "$wake_txt")"
+    read -r sraw sev smult <<<"$(_collapse "$sleep_txt")"
+  fi
+
+  classify_forensic "$reach" "$covered" "$ctl" "$wraw" "$sraw"
+
+  local oldest_z="na" fwd_s="na" floor_s="na"
+  [ "${oldest:-0}" -gt 0 ] && oldest_z=$(date -u -d "@$oldest" +%FT%TZ)
+  [ "${fwd:--1}" != "-1" ] && fwd_s="${fwd}h"
+  [ "${floor:--1}" != "-1" ] && floor_s="${floor}h"
+  # The wake REASON is the discriminator the plane is worth reading for: RTC (Alarm) is macOS
+  # waking itself for maintenance, EHC2 is a USB controller — a person touching a peripheral.
+  local reasons; reasons=$(grep -oE 'Wake reason: .*$' <<<"${wake_txt:-}" | sed 's/Wake reason: //' | sort -u | paste -sd, - 2>/dev/null)
+  echo "$(now) FORENSIC $FVERDICT window=${s}Z..${e}Z span=$((span/60))m client=$target reach=$reach covered=$covered horizon_oldest=$oldest_z horizon_fwd=$fwd_s horizon_floor=$floor_s store_files=${nfiles:-na} control=$ctl wake_n=$wraw wake_mult=$wmult wake_collapsed=$wev sleep_n=$sraw sleep_mult=$smult sleep_collapsed=$sev collapse_eps_us=$FORENSIC_EPS_US(hint-only,not-decided-on) style=$ULOG_STYLE reasons=${reasons:-none} -- $FWHY"
+  [ "$FVERDICT" = UNKNOWN ] && return 1
+  return 0
+}
+
 
 case "${1:-}" in
   --log) tail -n "${2:-20}" "$LEDGER" 2>/dev/null || echo "no ledger at $LEDGER"; exit 0 ;;
+  --forensic) forensic "${2:-}" "${3:-}"; exit $? ;;
   --test) exec "$0" __test ;;
   __test) ;;
   *) main "${1:-run}"; exit $? ;;
@@ -166,5 +395,82 @@ t TUNNEL-DOWN   "38.49.216.141" "n2sbt7" $'socks=<html>error</html>\ndirect=5.22
 # Unlisted subject: stand down loudly rather than pass quietly.
 out=$(MESH_MACSOCKS_CLIENT="" "$0" --check 2>&1); rc=$?
 if [ "$rc" = 2 ]; then echo "  ok   undeclared client -> rc 2 ($out)"; else echo "  FAIL undeclared client -> rc $rc"; fail=1; fi
+
+# --- forensic arm ------------------------------------------------------------------------------
+# Every word driven offline. The gate that matters most is the positive-control one: rc 0 with zero
+# rows is the shape a nonexistent predicate, a busy log and a dead logd ALL share, so it must render
+# UNKNOWN. If that arm ever goes green as MAC-AWAKE this tool has become a faked calm.
+tf() { # tf <expect> <reach> <covered> <control> <wake_raw> <sleep_raw> <label>
+  FVERDICT=""; FWHY=""
+  classify_forensic "$2" "$3" "$4" "$5" "$6"
+  if [ "$FVERDICT" = "$1" ]; then echo "  ok   $7 -> $FVERDICT"; else echo "  FAIL $7 -> got '$FVERDICT', want '$1'"; fail=1; fi
+}
+echo "-- forensic classifier"
+tf MAC-AWAKE          ok          yes          16465 0 0 "busy log, no power transition"
+tf UNKNOWN            ok          yes          0     0 0 "POSITIVE CONTROL ZERO -> never quiet"
+tf MAC-ASLEEP         ok          yes          100   0 1 "slept, no wake"
+tf MAC-WOKE           ok          yes          100   1 0 "woke, no sleep"
+tf MAC-SLEPT-AND-WOKE ok          yes          100   1 1 "both transitions"
+tf UNKNOWN            timeout     yes          100   0 0 "timeout is UNKNOWN, not quiet"
+tf UNKNOWN            unreachable unknown      0     0 0 "unreachable is UNKNOWN"
+# control is nonzero here ON PURPOSE: with a zero control the later positive-control gate answers
+# this arm too, so the fixture could not tell whether the past-horizon check ran at all.
+tf UNKNOWN            ok          past-horizon 100   0 0 "evicted window is UNKNOWN, not empty"
+tf UNKNOWN            ok          unknown      100   0 0 "unreadable store is UNKNOWN"
+
+echo "-- horizon"
+# Regression gate for the awk subscript trap: an unset awk var used as a subscript is "" and not 0,
+# which silently reported the oldest record as epoch 0 while every other field looked right.
+H=$(_horizon "$(printf '1000000000 10000000\n1000003600 10000000\n1000007200 10000000\n')")
+read -r h_old h_tot h_fwd h_floor h_n <<<"$H"
+if [ "$h_old" = 1000000000 ]; then echo "  ok   oldest record is the first epoch ($h_old)"
+else echo "  FAIL oldest record -> got '$h_old', want 1000000000"; fail=1; fi
+if [ "$h_n" = 3 ] && [ "$h_tot" = 30000000 ]; then echo "  ok   store totals ($h_n files, $h_tot bytes)"
+else echo "  FAIL store totals -> n=$h_n total=$h_tot"; fail=1; fi
+# 10MB per 1h => 10MB/h; 30MB of store => a 3h forward horizon.
+case "$h_fwd" in 3.0) echo "  ok   forward horizon from roll rate ($h_fwd h)";; *) echo "  FAIL forward horizon -> got '$h_fwd', want 3.0"; fail=1;; esac
+H2=$(_horizon ""); read -r _ _ _ _ h2n <<<"$H2"
+if [ "${h2n:-0}" = 0 ]; then echo "  ok   unreadable store -> 0 files (renders covered=unknown)"
+else echo "  FAIL unreadable store -> n=$h2n"; fail=1; fi
+
+echo "-- counting"
+# The real observed wake pair: two records 1us apart. RAW is the count and must stay 2.
+WP=$'2026-08-28 13:56:12.319027+0300  localhost kernel[0]: (AppleACPIPlatform) Wake reason: EHC2\n2026-08-28 13:56:12.319028+0300  localhost kernel[0]: (AppleACPIPlatform) Wake reason: EHC2'
+read -r c_raw c_col c_mult <<<"$(_collapse "$WP")"
+if [ "$c_raw" = 2 ]; then echo "  ok   raw count keeps both records ($c_raw)"
+else echo "  FAIL raw count -> got '$c_raw', want 2 (a dedupe here would delete a real record)"; fail=1; fi
+if [ "$c_col" = 1 ]; then echo "  ok   collapsed hint folds the 1us pair ($c_col, eps=${FORENSIC_EPS_US}us)"
+else echo "  FAIL collapsed hint -> got '$c_col', want 1"; fail=1; fi
+if [ "$c_mult" = "x1:2" ]; then echo "  ok   multiplicity at full us precision ($c_mult — distinct, NOT a duplicate)"
+else echo "  FAIL multiplicity -> got '$c_mult', want x1:2"; fail=1; fi
+# The three IOAudio records compact renders identically: raw must see all three.
+TR=$'2026-08-28 19:46:15.356429+0300  localhost kernel[0]: (IOAudioFamily) clientDied() returns 0x0\n2026-08-28 19:46:15.356481+0300  localhost kernel[0]: (IOAudioFamily) clientDied() returns 0x0\n2026-08-28 19:46:15.356781+0300  localhost kernel[0]: (IOAudioFamily) clientDied() returns 0x0'
+read -r t_raw _ _ <<<"$(_collapse "$TR")"
+if [ "$t_raw" = 3 ]; then echo "  ok   three us-distinct records counted as 3 (compact would show 1)"
+else echo "  FAIL us-distinct records -> got '$t_raw', want 3"; fail=1; fi
+# log show prints a header; counting it as an event turns a zero into a one.
+HDR=$'Timestamp                       (process)[PID]    '
+if [ "$(_rows "$HDR")" = 0 ]; then echo "  ok   header line is not an event row"
+else echo "  FAIL header counted as an event row"; fail=1; fi
+
+echo "-- window and renderer contract"
+# Driven functionally, not by grepping our own source: stub the transport and read back what it was
+# actually asked for. `--style compact` is the trap (naked local time AND ms truncation), and a
+# window without an explicit offset is read as the Mac's local clock, which is +0300 from us.
+_capture() { printf '%s' "$1" >> "$TCAP"; echo "Timestamp  (process)[PID]"; }
+TCAP=$(mktemp); export MESH_MACSOCKS_ULOG_CMD=_capture
+MESH_MACSOCKS_STORE_CMD='printf 1000000000 10000000\n'
+_stub_store() { printf '1756339200 10000000\n1756342800 10000000\n'; }
+MESH_MACSOCKS_STORE_CMD=_stub_store MESH_MACSOCKS_CLIENT="t@t" forensic "2026-08-28 10:00:00" "2026-08-28 11:00:00" >/dev/null 2>&1
+cap=$(cat "$TCAP"); rm -f "$TCAP"; unset MESH_MACSOCKS_ULOG_CMD
+if grep -q -- "--style syslog" <<<"$cap" && ! grep -q -- "--style compact" <<<"$cap"; then
+  echo "  ok   queries use the self-describing renderer, not the lossy one"
+else echo "  FAIL renderer -> asked for: $(grep -o -- '--style [a-z]*' <<<"$cap" | sort -u | tr '\n' ' ')"; fail=1; fi
+if grep -q -- "+0000" <<<"$cap"; then echo "  ok   window carries an explicit UTC offset"
+else echo "  FAIL window has no explicit offset — it would be read on the Mac's local clock"; fail=1; fi
+if grep -q "eventMessage CONTAINS" <<<"$cap" && ! grep -q "subsystem ==" <<<"$cap"; then
+  echo "  ok   predicates are text-keyed, never subsystem-keyed (that label does not exist here)"
+else echo "  FAIL predicate is subsystem-keyed — an allowlist whose failure direction is silence"; fail=1; fi
+
 [ "$fail" = 0 ] && echo "PASS" || echo "FAIL"
 exit $fail
