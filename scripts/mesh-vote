@@ -52,17 +52,50 @@
 # round's voters. Membership change is an operator decision taken outside the protocol, which is
 # why it is an explicit flag and never something a partition can do to itself.
 #
+# A CHOSEN SLOT IS "DECIDED FOREVER", SO THE ARTIFACT THAT CARRIES IT MUST BE ATOMIC, LOCKED AND
+# NEVER SILENTLY RESET (fixed 2026-08-28). The 2026-08-24 quorum fix above closed split-brain at
+# the front door — the denominator — and two doors at the back were still open, both measured
+# live against the tool as it stood:
+#   1. THE STATE WRITE WAS NON-ATOMIC. `open(state,"w")` TRUNCATES before it writes, so a crash,
+#      a SIGTERM or a full disk in that window leaves a half-written JSON.
+#   2. A CORRUPT STATE READ AS A FRESH CLUSTER. The loader caught ValueError beside
+#      FileNotFoundError and answered `state = {}` for both — ballot 0, slot 0, empty log, EMPTY
+#      ACCEPTOR SET. Measured on a 5-acceptor topic whose file was truncated: a LONE voter then
+#      printed `red — chosen slot=0 ballot=1 leader=e accepts=1/1`, re-deciding a slot already
+#      chosen as "blue", at the SAME ballot, with no error — the exact split-brain the quorum fix
+#      forbids, and the exact string its own --test asserts can never happen.
+#      A corrupt file is now a REFUSAL (rc 1, state untouched). Recovery is an operator decision
+#      taken outside the protocol, like --reconfigure: move the file aside deliberately.
+#   3. THE ROUND WAS AN UNLOCKED READ-MODIFY-WRITE. Measured: six concurrent rounds on one topic
+#      printed `chosen slot=1` THREE TIMES with three different values (v1/v2/v3) and `chosen
+#      slot=2` twice; the log kept 4 of 6 entries. Every caller was told a different value was
+#      decided forever at the same slot. The whole round now runs under an exclusive flock on
+#      `<topic>.json.lock`, bounded by MESH_VOTE_LOCK_WAIT (default 10s) — a wait that times out
+#      REFUSES rather than proceeding unlocked.
+# Coverage, stated rather than implied: 11 mutants were driven against the new arms and 10 go
+# red — including the original loader bug, an in-place publish (caught by the state file KEEPING
+# its inode: the inode is the artifact of a rename), a removed lock, a lock timeout that falls
+# through, and a sweep that reaps a live writer's temp. The ONE that survives is REMOVING THE
+# fsync: its absence is observable only across a real power cut, and forcing one on this node to
+# green a test arm is the wrong trade. That claim is reasoned, not driven — say so rather than
+# let the suite's silence read as coverage.
+#
 # Usage:
 #   printf 'worker|opinion\n...' | mesh-vote <topic> [--json] [--algo bft|multipaxos]
 #                                   [--acceptors <n>] [--reconfigure]
 #   mesh-vote --test
 # Env: MESH_VOTE_ALGO=bft|multipaxos (default bft; the --algo flag wins).
 #      MESH_VOTE_ACCEPTORS=<n>       (multipaxos; the --acceptors flag wins).
+#      MESH_VOTE_LOCK_WAIT=<seconds> how long to wait for the per-topic lock (default 10).
+#      MESH_VOTE_CRASH=half          TEST HOOK ONLY — die inside the save window with the temp
+#                                    file half written, so the atomicity claim can be DRIVEN
+#                                    rather than asserted from the source text.
 #
 # State: ~/.mesh/vote-state/<topic>.json —
 #   bft:        {reputation: {worker: 0..1}, last_consensus, last_confidence}
 #   multipaxos: {paxos: {ballot, leader, slot, log: [{slot,ballot,value}...], last_chosen,
 #                        acceptors: [worker...]}}
+#   plus <topic>.json.lock (the round's exclusive lock) and a transient <topic>.json.new.
 # Small in-tree STUDY prototype (idea-queue byzantine-consensus 2026-07-08 + raft-paxos
 # 2026-07-18) — not wired into any dash/cron; a real integration is a separate step.
 # orphan-ok: STUDY prototype, on-demand by design — consensus harness for future status-line
@@ -84,17 +117,49 @@ _run() {
   trap 'rm -f "$votes_file"' RETURN
   cat > "$votes_file"
   python3 - "$state_file" "$json_mode" "$QUORUM" "$votes_file" "$algo" "$acceptors" "$reconfigure" << 'PYEOF'
-import sys, json, os
+import sys, json, os, fcntl, time
 
 state_file, json_mode, quorum, votes_file, algo = \
     sys.argv[1], sys.argv[2] == "1", float(sys.argv[3]), sys.argv[4], sys.argv[5]
 cfg_acceptors, reconfigure = sys.argv[6], sys.argv[7] == "1"
 
+# THE ROUND IS A READ-MODIFY-WRITE AND IT MUST BE SERIALIZED. Unlocked, six concurrent rounds on
+# one topic each announced `chosen` — three of them for slot 1 with three different values — and
+# the log kept 4 of the 6. In Paxos a slot is decided FOREVER; two answers for one slot is the
+# single thing the protocol exists to forbid. The lock is held for the whole load->decide->save.
+lock_fd = os.open(state_file + ".lock", os.O_CREAT | os.O_RDWR, 0o600)
+_deadline = time.time() + float(os.environ.get("MESH_VOTE_LOCK_WAIT", "10"))
+while True:
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        break
+    except OSError:
+        if time.time() >= _deadline:
+            # Proceeding unlocked is how the same slot gets two values. Refuse instead.
+            sys.stderr.write("mesh-vote: another round holds the lock on %s — refusing to run "
+                             "an unserialized round\n" % (state_file + ".lock"))
+            sys.exit(1)
+        time.sleep(0.02)
+
 try:
     with open(state_file) as f:
         state = json.load(f)
-except (FileNotFoundError, ValueError):
-    state = {}
+except FileNotFoundError:
+    state = {}          # genuinely fresh — the ONLY clean empty state
+except ValueError:
+    # A CORRUPT STATE FILE IS NOT A FRESH CLUSTER. This used to sit beside FileNotFoundError and
+    # answer `state = {}` for both, which silently restores ballot 0, slot 0, an empty log and an
+    # EMPTY ACCEPTOR SET — so a lone voter is a majority of itself and re-decides a slot that was
+    # already chosen. [[a-silent-fallback-turns-a-failure-into-a-plausible-constant]]: the
+    # plausible constant here is "a brand-new cluster". Refuse, and leave the bytes alone so the
+    # damage stays inspectable. Recovering is an operator decision taken outside the protocol,
+    # exactly like --reconfigure.
+    sys.stderr.write("mesh-vote: %s is corrupt (unparsable JSON) — refusing to run. A corrupt "
+                     "state is NOT a fresh cluster: resetting it would re-decide slots this "
+                     "cluster has already settled. Inspect it, then move it aside deliberately "
+                     "to start over.\n"
+                     % state_file)
+    sys.exit(1)
 
 votes = {}  # worker -> opinion
 with open(votes_file) as vf:
@@ -110,8 +175,56 @@ for line in vote_lines:
         votes[worker] = opinion
 
 def save():
-    with open(state_file, "w") as f:
-        json.dump(state, f)
+    # ATOMIC + DURABLE. `open(state_file, "w")` truncates before it writes, so a crash in that
+    # window left a half-written JSON that the loader above then read as a fresh cluster. Write a
+    # sibling, fsync it, and os.replace() it in: a reader sees either the whole old state or the
+    # whole new one, never a prefix of either. The directory fsync is what makes the rename
+    # itself survive the crash, not just the bytes.
+    # The temp name is PER-PROCESS. A fixed `.new` sibling is safe only while the lock above
+    # holds — and a durability layer whose correctness rests entirely on another layer is one
+    # removed lock away from publishing a partial state under another writer's rename. Driven:
+    # with the lock mutated out, a shared `.new` made concurrent rounds die renaming a file a
+    # sibling had already taken.
+    tmp = "%s.new.%d" % (state_file, os.getpid())
+    with open(tmp, "w") as f:
+        payload = json.dumps(state)
+        if os.environ.get("MESH_VOTE_CRASH") == "half":
+            # TEST HOOK: die in the exact window the atomicity claim covers. It writes only into
+            # the TEMP file, so a passing drive proves the live state survived a crash mid-save.
+            f.write(payload[:len(payload) // 2])
+            f.flush()
+            os.fsync(f.fileno())
+            os._exit(9)
+        f.write(payload)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, state_file)
+    # Sweep temps stranded by an earlier crash (the hook below, a SIGKILL, a full disk) —
+    # leaving them would grow a file per crash. Reap ONLY a temp whose writer is gone: "the lock
+    # above makes this safe" would make the sweep's correctness rest on another layer, and a
+    # sweep that deletes a LIVE writer's temp destroys the very state it is tidying up after
+    # (driven: with the lock mutated out, an age-blind sweep unlinked a sibling's temp mid-save).
+    # Pid reuse only makes it skip a reap, which is the harmless direction.
+    d = os.path.dirname(state_file) or "."
+    stale_prefix = os.path.basename(state_file) + ".new."
+    for name in os.listdir(d):
+        if not name.startswith(stale_prefix):
+            continue
+        try:
+            owner = int(name[len(stale_prefix):])
+        except ValueError:
+            continue
+        if owner != os.getpid() and os.path.exists("/proc/%d" % owner):
+            continue    # its writer is alive; not ours to reap
+        try:
+            os.unlink(os.path.join(d, name))
+        except OSError:
+            pass
+    dir_fd = os.open(d, os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
 
 if algo == "multipaxos":
     px = state.get("paxos", {"ballot": 0, "leader": None, "slot": 0, "log": [], "last_chosen": None})
@@ -428,6 +541,130 @@ assert px['acceptors'] == ['a', 'b'], px['acceptors']
     if printf 'a|x\n' | HOME="$tmp" "$0" badalgo --reconfigure >/dev/null 2>&1; then
       echo "smoke-test: FAIL (--reconfigure under bft must be rejected, not silently ignored)"; exit 1
     fi
+
+    # ---- DURABILITY: a chosen slot is decided FOREVER, so the artifact must be atomic,
+    # ---- serialized, and never silently reset. All three arms below were driven RED against
+    # ---- the tool as it stood on 2026-08-28; the failing strings are quoted in each.
+
+    # A CORRUPT STATE FILE IS NOT A FRESH CLUSTER. Measured before the fix: truncating a
+    # 5-acceptor topic's state made a LONE voter print
+    #   `red — chosen slot=0 ballot=1 leader=e accepts=1/1 (phase1)`
+    # — re-deciding a slot already chosen as "blue", at the same ballot, with the acceptor set
+    # silently back to one. The whole 2026-08-24 quorum fix, defeated through the loader.
+    printf 'a|blue\nb|blue\nc|blue\nd|blue\ne|blue\n' | HOME="$tmp" "$0" dtopic --algo multipaxos >/dev/null 2>&1 || {
+      echo "smoke-test: FAIL (durability topic setup)"; exit 1; }
+    dfile="$tmp/.mesh/vote-state/dtopic.json"
+    dsz="$(wc -c < "$dfile")"
+    head -c "$((dsz / 2))" "$dfile" > "$dfile.cut" && mv "$dfile.cut" "$dfile"
+    dsum="$(cksum < "$dfile")"
+    dout="$(printf 'e|red\n' | HOME="$tmp" "$0" dtopic --algo multipaxos 2>&1)" && {
+      echo "smoke-test: FAIL (a corrupt state must REFUSE, not run: $dout)"; exit 1; }
+    printf '%s' "$dout" | grep -qi 'corrupt' || {
+      echo "smoke-test: FAIL (the refusal must NAME the corruption: $dout)"; exit 1; }
+    printf '%s' "$dout" | grep -q -- '— chosen slot=' && {
+      echo "smoke-test: FAIL (a corrupt state chose a value: $dout)"; exit 1; }
+    [ "$(cksum < "$dfile")" = "$dsum" ] || {
+      echo "smoke-test: FAIL (the refusal rewrote the corrupt state instead of leaving it inspectable)"; exit 1; }
+    # bft reads the same file through the same loader — the reset there silently drops every
+    # reputation the EWMA spent rounds building, so it must refuse too.
+    printf 'a|x\n' | HOME="$tmp" "$0" dtopic 2>/dev/null && {
+      echo "smoke-test: FAIL (bft must refuse a corrupt state too)"; exit 1; }
+    # NEGATIVE ARM — without it, "refuses" is satisfied by a guard that refuses unconditionally.
+    rm -f "$dfile"
+    printf 'a|blue\nb|blue\nc|blue\n' | HOME="$tmp" "$0" dtopic --algo multipaxos >/dev/null 2>&1 || {
+      echo "smoke-test: FAIL (an ABSENT state file is a genuinely fresh cluster and must run)"; exit 1; }
+
+    # ATOMICITY, DRIVEN rather than grepped for in the source. MESH_VOTE_CRASH=half dies inside
+    # the save window with the temp file half written; the LIVE state must be byte-identical and
+    # still parse. A save that wrote straight into the state file could not pass this.
+    asum="$(cksum < "$dfile")"
+    printf 'a|green\nb|green\nc|green\n' | HOME="$tmp" MESH_VOTE_CRASH=half "$0" dtopic --algo multipaxos >/dev/null 2>&1 && {
+      echo "smoke-test: FAIL (the crash hook must not report success)"; exit 1; }
+    [ "$(cksum < "$dfile")" = "$asum" ] || {
+      echo "smoke-test: FAIL (a crash mid-save changed the live state file)"; exit 1; }
+    HOME="$tmp" python3 -c "
+import json, os, sys
+json.load(open(os.path.expanduser('~/.mesh/vote-state/dtopic.json')))" || {
+      echo "smoke-test: FAIL (a crash mid-save left the live state unparsable)"; exit 1; }
+    # …and the next real round completes and leaves no temp residue behind.
+    printf 'a|green\nb|green\nc|green\n' | HOME="$tmp" "$0" dtopic --algo multipaxos >/dev/null 2>&1 || {
+      echo "smoke-test: FAIL (round after a crashed save failed)"; exit 1; }
+    # The crashed save above stranded its own per-process temp; the next successful round must
+    # sweep it, or a file accumulates per crash forever.
+    [ -z "$(find "$tmp/.mesh/vote-state" -name 'dtopic.json.new.*' -print -quit)" ] || {
+      echo "smoke-test: FAIL (temp state files left behind: $(ls "$tmp/.mesh/vote-state"))"; exit 1; }
+
+    # The sweep's PREDICATE, driven both ways: a temp whose writer is gone is reaped, and one
+    # whose writer is alive is left alone. Without the second half the sweep would delete the
+    # state a concurrent save is in the middle of writing — tidying up by destroying.
+    live_tmp="$dfile.new.$$"; : > "$live_tmp"
+    ( : ) & dead=$!; wait "$dead" 2>/dev/null
+    if [ -d "/proc/$dead" ]; then dead=4194303; fi     # a pid that must not exist
+    if [ ! -d "/proc/$dead" ]; then
+      dead_tmp="$dfile.new.$dead"; : > "$dead_tmp"
+      printf 'a|sweep\nb|sweep\nc|sweep\n' | HOME="$tmp" "$0" dtopic --algo multipaxos >/dev/null 2>&1 || {
+        echo "smoke-test: FAIL (sweep round failed)"; exit 1; }
+      [ -e "$dead_tmp" ] && { echo "smoke-test: FAIL (a temp whose writer is gone was not reaped)"; exit 1; }
+    fi
+    [ -e "$live_tmp" ] || {
+      echo "smoke-test: FAIL (the sweep reaped a LIVE writer's temp — it would destroy a save in flight)"; exit 1; }
+    rm -f "$live_tmp"
+
+    # The publish is a RENAME, and the inode is the artifact of it. A save that truncated the
+    # live file and copied the temp over it would keep the inode — and would be observable
+    # half-written by any concurrent reader, which is the whole property being claimed.
+    ino_before="$(stat -c%i "$dfile")"
+    printf 'a|inode\nb|inode\nc|inode\n' | HOME="$tmp" "$0" dtopic --algo multipaxos >/dev/null 2>&1 || {
+      echo "smoke-test: FAIL (inode round failed)"; exit 1; }
+    [ "$(stat -c%i "$dfile")" != "$ino_before" ] || {
+      echo "smoke-test: FAIL (the state file kept its inode — it was published by an in-place write, not a rename)"; exit 1; }
+
+    # THE ROUND IS A READ-MODIFY-WRITE AND MUST BE SERIALIZED. Measured before the lock: six
+    # concurrent rounds printed `chosen slot=1` THREE times with three different values and
+    # `chosen slot=2` twice, while the log kept 4 of the 6 — one slot, several answers, which is
+    # the one thing consensus exists to forbid.
+    printf 'a|s0\nb|s0\nc|s0\n' | HOME="$tmp" "$0" ltopic --algo multipaxos >/dev/null 2>&1 || {
+      echo "smoke-test: FAIL (concurrency topic setup)"; exit 1; }
+    : > "$tmp/conc.out"
+    for i in 1 2 3 4 5 6; do
+      ( printf 'a|v%s\nb|v%s\nc|v%s\n' "$i" "$i" "$i" | HOME="$tmp" "$0" ltopic --algo multipaxos >> "$tmp/conc.out" 2>&1 ) &
+    done
+    wait
+    nslots="$(grep -c 'chosen slot=' "$tmp/conc.out")"
+    [ "$nslots" = 6 ] || {
+      echo "smoke-test: FAIL (expected 6 chosen rounds, got $nslots: $(cat "$tmp/conc.out"))"; exit 1; }
+    uslots="$(grep -o 'chosen slot=[0-9]*' "$tmp/conc.out" | sort -u | wc -l)"
+    [ "$uslots" = 6 ] || {
+      echo "smoke-test: FAIL (a slot was announced chosen more than once — $uslots distinct of 6: $(cat "$tmp/conc.out"))"; exit 1; }
+    # The state artifact, not the printed lines: nothing was lost to a clobbering write.
+    HOME="$tmp" python3 - << 'PYL' || { echo "smoke-test: FAIL (concurrent rounds lost log entries)"; exit 1; }
+import json, os
+px = json.load(open(os.path.expanduser("~/.mesh/vote-state/ltopic.json")))["paxos"]
+slots = [e["slot"] for e in px["log"]]
+assert slots == list(range(7)), f"log not contiguous 0..6 after 6 concurrent rounds: {slots}"
+assert len({e["value"] for e in px["log"]}) == 7, f"a value was lost to a clobbering write: {px['log']}"
+PYL
+    # A lock it cannot get must REFUSE, never fall through to an unserialized round.
+    HOME="$tmp" python3 -c "
+import fcntl, os, sys, time
+fd = os.open(os.path.expanduser('~/.mesh/vote-state/ltopic.json.lock'), os.O_CREAT | os.O_RDWR, 0o600)
+fcntl.flock(fd, fcntl.LOCK_EX)
+sys.stderr.write('held\n'); sys.stderr.flush()
+time.sleep(4)" 2>"$tmp/held.err" &
+    holder=$!
+    for _ in 1 2 3 4 5 6 7 8 9 10; do grep -q held "$tmp/held.err" 2>/dev/null && break; sleep 0.2; done
+    lsum="$(cksum < "$tmp/.mesh/vote-state/ltopic.json")"
+    lout="$(printf 'a|z\nb|z\nc|z\n' | HOME="$tmp" MESH_VOTE_LOCK_WAIT=1 "$0" ltopic --algo multipaxos 2>&1)" && {
+      kill "$holder" 2>/dev/null; echo "smoke-test: FAIL (a round must refuse when it cannot take the lock: $lout)"; exit 1; }
+    [ "$(cksum < "$tmp/.mesh/vote-state/ltopic.json")" = "$lsum" ] || {
+      kill "$holder" 2>/dev/null; echo "smoke-test: FAIL (the lock-refused round wrote state anyway)"; exit 1; }
+    kill "$holder" 2>/dev/null; wait "$holder" 2>/dev/null
+    # NEGATIVE ARM — with the lock free the very same round chooses, so the refusal above is the
+    # contention and not a gate that fails closed on everything.
+    lok="$(printf 'a|z\nb|z\nc|z\n' | HOME="$tmp" MESH_VOTE_LOCK_WAIT=1 "$0" ltopic --algo multipaxos 2>&1)" || {
+      echo "smoke-test: FAIL (uncontended round failed: $lok)"; exit 1; }
+    printf '%s' "$lok" | grep -q '^z — chosen slot=7' || {
+      echo "smoke-test: FAIL (uncontended round must choose slot 7: $lok)"; exit 1; }
 
     echo "smoke-test: ok"
     exit 0
