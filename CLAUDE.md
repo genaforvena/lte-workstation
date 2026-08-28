@@ -258,6 +258,11 @@ the case is the evidence, and mixing them is what made this section a wall nobod
   capability it merely accepts**, and a self-exemption is a DISAPPEARANCE, so census the launcherless
   and verify every caller-claim by GREP; after wiring a conditional gate, run it once and read which
   branch it took. [[an-exemption-that-cites-a-capability-is-not-a-launcher]]
+- **A liveness measurement layered over a clock must be able to VETO it, not only to ADD to it** — a
+  one-way arm HOLDS the evidence the owner is working and then discards it, and the two outcomes need
+  two WORDS with opposite remedies (EXPIRED = poke the owner to renew · ABANDONED = take the work);
+  the veto mints no immortal claim so long as an untended owner still decays into the second word.
+  [[a-liveness-arm-that-can-only-add-staleness-never-vetoes-the-clock]]
 
 ## Substrate changes & multi-agent coordination
 
