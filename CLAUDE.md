@@ -258,6 +258,10 @@ the case is the evidence, and mixing them is what made this section a wall nobod
   capability it merely accepts**, and a self-exemption is a DISAPPEARANCE, so census the launcherless
   and verify every caller-claim by GREP; after wiring a conditional gate, run it once and read which
   branch it took. [[an-exemption-that-cites-a-capability-is-not-a-launcher]]
+- **A checker that diffs two DECLARATIONS is blind to the actuator between them — assert the
+  DISPATCH**: two correct files prove nothing about whether the scheduler ran either, so read the
+  actuator's own tape, ship its capability + control arms, and clamp the silence to UPTIME.
+  [[a-table-checker-with-no-dispatch-axis-answers-a-question-nobody-asked]]
 - **A liveness measurement layered over a clock must be able to VETO it, not only to ADD to it** — a
   one-way arm HOLDS the evidence the owner is working and then discards it, and the two outcomes need
   two WORDS with opposite remedies (EXPIRED = poke the owner to renew · ABANDONED = take the work);
