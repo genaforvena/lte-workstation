@@ -43,12 +43,17 @@
 #   mesh-claim --done <key>          mark your claim complete
 #   mesh-claim --yield <key>         release your claim without completing
 #   mesh-claim --check <key>         status only, no post — prints verdict, sets exit code:
-#                                      0 unclaimed · 1 yours · 2 theirs(live) · 3 stale
-#   mesh-claim --list                active (unreleased) claims, one per line: key  owner  age  LIVE/STALE
+#                                      0 unclaimed · 1 yours · 2 theirs(live) · 2 expired · 3 stale
+#                                      (expired shares rc 2 on purpose — see EXPIRED IS NOT ABANDONED)
+#   mesh-claim --list                active (unreleased) claims, one per line: key  owner  age  LIVE/EXPIRED/STALE
 #   mesh-claim --test                smoke test (pure: valid_key / parse_latest / classify / is_stale)
 #
-#   mesh-claim --list-stale          ONLY stale active claims, delta-stable lines (no volatile age):
+#   mesh-claim --list-stale          ONLY stale (ABANDONED) active claims, delta-stable lines:
 #                                      "<key>\towner=<who>\tSTALE" — the --sweep state-fn
+#   mesh-claim --list-expired        ONLY EXPIRED active claims (past TTL, owner LIVE) — same shape,
+#                                      the --sweep-expired state-fn. Poke the owner; never take it.
+#   mesh-claim --sweep-expired       surfaces newly-EXPIRED claims as a [fyi] line (NOT [stale] —
+#                                      [stale] is a mesh-interpret detector marker and means "take it")
 #   mesh-claim --sweep               STALE-SWEEP reflex (increment 2): surfaces newly-stale claims to
 #                                      the board as a clean [stale] line, DEBOUNCED — uses mesh-delta as
 #                                      a pure change-detector so an unchanged stale-set posts NOTHING.
@@ -271,36 +276,85 @@ is_stale_clock() {  # <claim_epoch> <ttl> <now> -> 0 stale / 1 fresh
   [ $(( ce + ttl )) -lt "$now" ] && return 0 || return 1
 }
 
-# --- pure: final verdict from (last event type, owner, me, stale-flag) -> "<verdict> <code>" ----------
-classify() {  # <type> <owner> <me> <stale:0|1>  ->  prints "verdict code"
-  local type="${1:-}" owner="${2:-}" me="${3:-}" stale="${4:-0}"
+# --- EXPIRED IS NOT ABANDONED (task {#b2d997b4}, live-reproduced 2026-08-28T16:57Z) -----------------
+# The sibling of IDLE-IS-NOT-ABANDONED one ring down, and it was hiding inside the fix for it. _resolve
+# layered liveness over the clock as a ONE-WAY arm:
+#     if [ "$live" = STALE ]; then stale=1; elif is_stale_clock ...; then stale=1; fi
+# LIVE could only fail to ADD staleness — it could never VETO the clock. So the tool HELD the
+# measurement that the owner was tending its claim and then discarded it: hh-driver, owner
+# senses@mesh-home, claim 15:31:59Z ttl=3600 — mesh-mind-state read WORKING (a turn 53s in) while
+# --check printed "abandoned it (4978s) -> reclaimable" and --sweep posted it [stale] to the board at
+# 16:37Z, inviting a second writer onto contended work. That is the single-writer discipline breaking
+# from the inside, and it is worse than the IDLE bug it grew out of: the idle arm demands strikes AND
+# artifact evidence before convicting, while the clock arm convicted a provably WORKING owner on no
+# evidence at all.
+#
+# The missing thing is a WORD, not a fifth threshold. Two states, OPPOSITE remedies:
+#   ABANDONED (stale, rc 3)  — the owner is gone: DEAD/DEAD-SHELL/AUTH-DEAD, or IDLE past its strikes,
+#                              or past TTL with liveness UNKNOWN (remote/non-window owner — no evidence
+#                              either way, and nothing will ever poke a reflex to renew). -> TAKE IT.
+#   EXPIRED   (expired, rc 2) — the TTL lapsed but the owner is measurably LIVE and tending it.
+#                              -> DO NOT TAKE IT. Poke the owner to renew (mesh-claim <key> --ttl N),
+#                              --yield, or --force past the guard deliberately.
+# A claim can NOT become immortal this way: an owner that stops tending goes IDLE, and the idle arm
+# (untouched artifact + >=MESH_CLAIM_IDLE_STRIKES spaced sweeps) converts EXPIRED -> ABANDONED within a
+# couple of sweeps. Liveness vetoes the clock; it does not repeal it.
+#
+# rc: EXPIRED deliberately reuses code 2 (theirs/live) rather than minting a 4th code. A new sentinel
+# outruns every consumer allowlist ([[a-new-verdict-word-must-be-in-the-consumers-alphabet]]), and 2 is
+# the one code whose existing meaning — "someone else holds this, stand down" — is already the CORRECT
+# behavior for a live owner. Every rc reader (mesh-dms _fence_ok, mesh-interpret already_tracked) gets
+# the right answer with no change. The distinct REMEDY travels in the verdict WORD, which the text
+# readers (--check, --list, mesh-exit-node-lan-heal, mesh-claim-verify) are swept for below.
+
+# --- pure: final verdict from (last event type, owner, me, state-word) -> "<verdict> <code>" ---------
+classify() {  # <type> <owner> <me> <live|expired|abandoned>  ->  prints "verdict code"
+  local type="${1:-}" owner="${2:-}" me="${3:-}" state="${4:-live}"
   case "$type" in
     ""|done|yield) echo "unclaimed 0" ;;
     claim)
-      if [ "$stale" = 1 ]; then echo "stale 3"
-      elif [ "$owner" = "$me" ]; then echo "yours 1"
-      else echo "theirs 2"; fi ;;
+      case "$state" in
+        abandoned) echo "stale 3" ;;
+        # yours-and-expired is still YOURS: you are the one who would renew it, and a re-claim is the
+        # renewal. Only a STRANGER needs the expired word, because only a stranger might take it.
+        expired)   if [ "$owner" = "$me" ]; then echo "yours 1"; else echo "expired 2"; fi ;;
+        *)         if [ "$owner" = "$me" ]; then echo "yours 1"; else echo "theirs 2"; fi ;;
+      esac ;;
     *) echo "unclaimed 0" ;;
   esac
 }
 
-# --- resolve a key's current state into "verdict code owner age_seconds" (the shared read path) -------
-_resolve() {  # <key>  ->  echoes: verdict code owner age
-  local key="$1" rec type who ts ttl epoch now age live stale
+# --- resolve a key's current state into "verdict code owner age why" (the shared read path) ----------
+# Field 5 (why) is the EVIDENCE CLASS the verdict rests on, so a renderer can never write down
+# "abandoned" over a measurement that says the opposite. Every field is non-empty (owner falls back to
+# '-'): callers read by POSITION, and an empty field would shift every field after it.
+_resolve() {  # <key>  ->  echoes: verdict code owner age why
+  local key="$1" rec type who ts ttl epoch now age live state why
   rec="$(parse_latest "$key" < "$BOARD" 2>/dev/null)"
   now="$(date +%s)"
-  if [ -z "$rec" ]; then echo "unclaimed 0  0"; return; fi
+  if [ -z "$rec" ]; then echo "unclaimed 0 - 0 no-claim"; return; fi
   IFS='|' read -r type who ts ttl <<<"$rec"
   epoch="$(date -d "$ts" +%s 2>/dev/null || echo 0)"
   age=$(( now - epoch )); [ "$age" -ge 0 ] || age=0
-  stale=0
+  state=live; why=released
   if [ "$type" = claim ]; then
+    why=owner-live
     live="$(owner_liveness "$who" "$key" "$epoch" "$now")"
-    if [ "$live" = STALE ]; then stale=1
-    elif is_stale_clock "$epoch" "${ttl:-$DEFAULT_TTL}" "$now"; then stale=1; fi
+    if [ "$live" = STALE ]; then
+      state=abandoned; why=owner-dead-or-idle-past-strikes   # POSITIVE evidence the owner walked away
+    elif is_stale_clock "$epoch" "${ttl:-$DEFAULT_TTL}" "$now"; then
+      # THE VETO. Past TTL is not by itself abandonment — it is only abandonment when nothing
+      # contradicts it. A LIVE owner is exactly that contradiction, and discarding it was the bug.
+      if [ "$live" = LIVE ]; then state=expired;   why=past-ttl-owner-live
+      else                        state=abandoned; why=past-ttl-liveness-unknown; fi
+      # liveness UNKNOWN = a remote owner (mesh-mind-state can't see another node) or a non-window
+      # reflex identity (ABSENT). We have no evidence either way, and no owner a nudge could reach, so
+      # the clock stays the only arbiter for that class — unchanged behavior, but it now SAYS so
+      # instead of borrowing the dead owner's word.
+    fi
   fi
-  set -- $(classify "$type" "$who" "$WHO" "$stale")
-  echo "$1 $2 $who $age"
+  set -- $(classify "$type" "$who" "$WHO" "$state")
+  echo "$1 $2 ${who:--} $age $why"
 }
 
 _post() { mesh-chat "$1" >/dev/null; }   # canonical arg form (the whole codebase posts this way)
@@ -331,10 +385,16 @@ _done_gate() {  # <key> <force:0|1>  ->  0 allow (may already be unclaimed/yours
   local key="$1" force="$2" verdict owner
   [ "$force" = 1 ] && return 0
   set -- $(_resolve "$key"); verdict="$1"; owner="${3:-}"
-  if [ "$verdict" = theirs ] && [ "$(_principal "$owner")" != "$(_principal "$WHO")" ]; then
-    echo "mesh-claim: '$key' is held by $owner (live) — refusing --done (use --force to override)" >&2
-    return 2
-  fi
+  # expired is gated exactly like theirs: the TTL lapsing changes the REMEDY (poke to renew), never
+  # who owns the work. A stranger releasing a claim whose owner is measurably mid-turn is the same
+  # 2026-07-06 failure this gate exists for, just with a lapsed clock as the excuse.
+  case "$verdict" in
+    theirs|expired)
+      if [ "$(_principal "$owner")" != "$(_principal "$WHO")" ]; then
+        echo "mesh-claim: '$key' is held by $owner (owner LIVE$([ "$verdict" = expired ] && echo ', TTL lapsed')) — refusing --done (use --force to override)" >&2
+        return 2
+      fi ;;
+  esac
   return 0
 }
 
@@ -380,9 +440,16 @@ case "${1:-}" in
     # classify
     [ "$(classify '' '' me 0)"          = "unclaimed 0" ] || f="$f cl-unclaimed"
     [ "$(classify done a@h me 0)"       = "unclaimed 0" ] || f="$f cl-done"
-    [ "$(classify claim me@h me@h 0)"   = "yours 1" ]     || f="$f cl-yours"
-    [ "$(classify claim other@h me@h 0)" = "theirs 2" ]   || f="$f cl-theirs"
-    [ "$(classify claim other@h me@h 1)" = "stale 3" ]    || f="$f cl-stale"
+    [ "$(classify claim me@h me@h live)"   = "yours 1" ]     || f="$f cl-yours"
+    [ "$(classify claim other@h me@h live)" = "theirs 2" ]   || f="$f cl-theirs"
+    [ "$(classify claim other@h me@h abandoned)" = "stale 3" ] || f="$f cl-stale"
+    # EXPIRED IS NOT ABANDONED (task {#b2d997b4}) — the third state, and its CODE matters as much as
+    # its word: rc 2 is what every existing rc reader (mesh-dms _fence_ok, mesh-interpret) already
+    # treats as "stand down", so the new word cannot outrun a consumer allowlist.
+    [ "$(classify claim other@h me@h expired)" = "expired 2" ] || f="$f cl-expired-word-or-code"
+    [ "$(classify claim me@h me@h expired)"    = "yours 1" ]   || f="$f cl-expired-mine-not-yours"
+    # and expired must NOT collapse back into the reclaimable word from any direction
+    [ "$(classify claim other@h me@h expired)" != "stale 3" ]  || f="$f cl-expired-collapsed-to-stale"
     # WHO identity: NEVER anonymous, caller-distinguishing (chat-review/claim-anonymous-owner-aliasing)
     [ "$(_norm_tag '/home/x/mesh-cpu-throttle')" = "mesh-cpu-throttle" ] || f="$f tag-basename"
     [ "$(_norm_tag '')" = "cron" ]                                       || f="$f tag-empty"   # never empty
@@ -391,7 +458,7 @@ case "${1:-}" in
     who="$(MESH_WHO= USER= derive_who)"                                  # simulate cron: both unset
     case "$who" in *'?'*|*' '*) f="$f who-anon" ;; esac                  # falsify: old fallback minted '?@host'
     [ "$(MESH_WHO=genome@h derive_who)" = "genome@h" ]                  || f="$f who-honored"   # explicit WHO wins
-    [ "$(classify claim '?@h' "$who" 0)" = "theirs 2" ]                 || f="$f who-not-yours" # anon claim, real me -> theirs
+    [ "$(classify claim '?@h' "$who" live)" = "theirs 2" ]              || f="$f who-not-yours" # anon claim, real me -> theirs
     # claim-done-ownership-gate (chat-review/claim-done-ownership-gate, live-reproduced
     # 2026-07-06T15:11:40Z: genome released turbo-lid@'s held actuator claim): _done_gate refuses
     # --done as a DIFFERENT live owner (exit 2, names the owner); allows it as the SAME owner or
@@ -471,14 +538,120 @@ case "${1:-}" in
     # a re-claim (new epoch) restarts the count — a fresh claim never inherits the old one's strikes
     [ "$(owner_liveness "w2@$HOST" "$_cl_gone" $(( _cl_now + 500 )) $(( _cl_now + 900 )))" = LIVE ] \
       || f="$f idle-strikes-survived-reclaim"
-    # (c) THE CLOCK ARM, which this bug made unreachable: a LIVE (WORKING) owner past its TTL → stale.
+    # (c) THE CLOCK ARM, which the IDLE bug made unreachable: a claim past its TTL must reach a
+    # DIFFERENT verdict than one inside it — the ttl= a caller passes has to decide something.
+    #
+    # THIS ARM USED TO ASSERT `= stale` AND THAT ASSERTION *WAS* THE BUG {#b2d997b4}. Written to prove
+    # the clock was reachable, it fixed the reachable state as the RECLAIMABLE one, so the gate itself
+    # certified a WORKING owner's claim as abandoned and would have gone red at the fix. A gate can
+    # enshrine the defect it was built beside; the fix is the word, and the arm now asserts the word.
     _cl_board="$(mktemp)"; _cl_orig_board="$BOARD"; _cl_orig_who="$WHO"; BOARD="$_cl_board"; WHO="genome@$HOST"
     mesh-mind-state(){ printf 'WORKING\ta turn is running\n'; return 0; }
-    printf '%s  wlive@%s  ::  [claim] %s ttl=60\n' "$(date -u -d '-1 hour' +%FT%TZ)" "$HOST" "$_cl_gone" > "$_cl_board"
-    set -- $(_resolve "$_cl_gone"); [ "$1" = stale ] \
-      || f="$f ttl-arm-unreachable (a claim past its TTL must go stale — got '$1')"
+    # ONE timestamp for the whole arm. Deriving it twice from `date -u -d '-1 hour'` puts a second's
+    # tick between the board's claim epoch and anything computed from it, which silently restarts the
+    # idle-strike record (it is keyed on the claim epoch) and turns the decay arm into a coin flip.
+    _cl_ts="$(date -u -d '-1 hour' +%FT%TZ)"; _cl_ce="$(date -d "$_cl_ts" +%s)"
+    # A CHILD PROCESS INHERITS NEITHER $BOARD (a shell variable, not the env) NOR the mesh-mind-state
+    # SHELL FUNCTION. The first draft of these CLI arms ran `"$0" <key>` with both unset: the child
+    # read the REAL board, saw the key unclaimed, and POSTED A LIVE [claim] for a /tmp path — the exact
+    # reflex-test-must-sandbox-outbound hazard this file warns about two screens up, committed by the
+    # gate written to enforce it. The child gets the board by ENV and the stub by PATH, and the
+    # sandbox is asserted below before any arm is allowed to conclude anything.
+    # THE STUB DIR IS A FAKE HOME's .local/bin, NOT a bare PATH prepend. This script's own line 2
+    # does `export PATH="$HOME/.local/bin:$PATH"`, so a stub merely prepended to PATH loses the race
+    # to the REAL mesh-mind-state — measured here: the child answered past-ttl-liveness-unknown
+    # because the real tool read window 'wlive' as ABSENT ([[a-poisoned-binary-can-lose-a-path-race-
+    # to-the-real-one]]). Moving HOME makes the child's own re-export put the stub first.
+    # mesh-chat is stubbed onto the SAME dir so that if the stand-down guard ever regresses, the
+    # phantom [claim] lands in the sandbox board instead of the live one — the leak this arm already
+    # caused once is not allowed to depend on the assertion below being correct.
+    _cl_home="$_cl_dir/home"; _cl_bin="$_cl_home/.local/bin"; mkdir -p "$_cl_bin"
+    printf '#!/bin/sh\nprintf "WORKING\\ta turn is running\\n"\nexit 0\n' > "$_cl_bin/mesh-mind-state"
+    printf '#!/bin/sh\nprintf "%%s  stranger@%s  ::  %%s\\n" "$(date -u +%%FT%%TZ)" "$1" >> "%s"\nexit 0\n' \
+      "$HOST" "$_cl_board" > "$_cl_bin/mesh-chat"
+    chmod +x "$_cl_bin/mesh-mind-state" "$_cl_bin/mesh-chat"
+    _cl_child() { HOME="$_cl_home" MESH_CHAT_LOG="$_cl_board" MESH_CLAIM_STRIKE_DIR="$STRIKE_DIR" \
+                  MESH_WHO="stranger@$HOST" "$0" "$@"; }
+    printf '%s  wlive@%s  ::  [claim] %s ttl=60\n' "$_cl_ts" "$HOST" "$_cl_gone" > "$_cl_board"
+    # falsify the sandbox itself FIRST: if the child were reading the real board it would answer
+    # 'unclaimed' here, and every assertion below would be about the wrong file.
+    # ANCHORED *unclaimed:* with stderr DISCARDED, not `unclaimed:*` with 2>&1 — measured: the
+    # unsandboxed child emits a "No such file or directory" line FIRST, which prefixed the capture and
+    # made this very guard silently unmatchable in the one mutation it exists to catch.
+    case "$(_cl_child --check "$_cl_gone" 2>/dev/null)" in
+      *unclaimed:*) f="$f test-child-not-sandboxed (the child is reading a DIFFERENT board — every arm below is vacuous AND it may post to the real one)" ;;
+    esac
+    set -- $(_resolve "$_cl_gone")
+    [ "$1" = expired ] \
+      || f="$f expired-live-collapsed (a WORKING owner past its TTL is EXPIRED, never abandoned — got '$1')"
+    [ "$2" = 2 ] \
+      || f="$f expired-wrong-rc (expired must carry rc 2 so every existing stand-down reader is right — got '$2')"
+    [ "$5" = past-ttl-owner-live ] \
+      || f="$f expired-wrong-evidence (the verdict must carry the measurement it rests on — got '$5')"
+    # THE LIVE REPRODUCTION, end-to-end through the CLI the way the 16:57Z hh-driver read went:
+    # --check must not print the reclaimable word, and the claim path must STAND DOWN, not take it.
+    _cl_chk="$(_cl_child --check "$_cl_gone" 2>&1)"; _cl_chkrc=$?
+    case "$_cl_chk" in expired:*) : ;; *) f="$f check-expired-render:[$_cl_chk]" ;; esac
+    # keyed on the STALE renderer's exact wording, not on a bare "reclaimable" — the correct expired
+    # line legitimately contains "NOT reclaimable", and a substring test would fail on the fix.
+    case "$_cl_chk" in *"→ reclaimable"*|*abandoned*) f="$f check-expired-says-reclaimable:[$_cl_chk]" ;; esac
+    [ "$_cl_chkrc" = 2 ] || f="$f check-expired-rc:[$_cl_chkrc]"
+    _cl_n0="$(grep -acF "[claim] $_cl_gone" "$_cl_board")"
+    _cl_take="$(_cl_child "$_cl_gone" 2>&1 1>/dev/null)"; _cl_takerc=$?
+    _cl_n1="$(grep -acF "[claim] $_cl_gone" "$_cl_board")"
+    [ "$_cl_takerc" = 2 ] \
+      || f="$f expired-claim-taken (the whole point: a second writer must be refused — rc $_cl_takerc)"
+    [ "$_cl_n1" = "$_cl_n0" ] \
+      || f="$f expired-claim-posted (standing down must post NOTHING — board grew $_cl_n0 -> $_cl_n1)"
+    # ...and it must not be releasable by a stranger either — a lapsed clock changes the remedy,
+    # never the ownership.
+    _done_gate "$_cl_gone" 0 2>/dev/null \
+      && f="$f expired-done-gate-open (a stranger released a live owner's expired claim)"
+    # the SWEEP split: an expired claim must be absent from the [stale] state-fn (that list is what
+    # posted hh-driver to the board at 16:37Z) and present in its own.
+    [ -z "$(_cl_child --list-stale 2>/dev/null | grep -F "$_cl_gone")" ] \
+      || f="$f expired-in-list-stale (the board [stale] cry would advertise a live owner reclaimable)"
+    [ -n "$(_cl_child --list-expired 2>/dev/null | grep -F "$_cl_gone")" ] \
+      || f="$f expired-missing-from-list-expired"
+    [ "$(_cl_child --list 2>/dev/null | awk -F'\t' -v k="$_cl_gone" '$1==k{print $4}')" = EXPIRED ] \
+      || f="$f expired-list-column (mesh-chat's [done] auto-release and the dash both read column 4)"
+    # the census must not depend on WHO is reading it: the OWNER's own view of its own expired claim
+    # is still EXPIRED, even though --check honestly calls it "yours". Live-measured on this node —
+    # the first draft rendered LIVE here and the claim fell out of --list-expired entirely.
+    [ "$(HOME="$_cl_home" MESH_CHAT_LOG="$_cl_board" MESH_CLAIM_STRIKE_DIR="$STRIKE_DIR" MESH_WHO="wlive@$HOST" \
+         "$0" --list 2>/dev/null | awk -F'\t' -v k="$_cl_gone" '$1==k{print $4}')" = EXPIRED ] \
+      || f="$f expired-census-hidden-from-its-own-owner"
+    [ -n "$(HOME="$_cl_home" MESH_CHAT_LOG="$_cl_board" MESH_CLAIM_STRIKE_DIR="$STRIKE_DIR" MESH_WHO="wlive@$HOST" \
+            "$0" --list-expired 2>/dev/null | grep -F "$_cl_gone")" ] \
+      || f="$f expired-owner-view-missing-from-list-expired"
+    # ABANDONED must still be reachable by the clock alone when liveness is UNKNOWABLE — a remote or
+    # non-window owner has no evidence either way and nothing a nudge could reach, so the clock stays
+    # the arbiter for that class. Without this the fix would make every remote claim immortal.
+    mesh-mind-state(){ return 7; }   # ABSENT -> UNKNOWN
+    set -- $(_resolve "$_cl_gone")
+    [ "$1" = stale ] \
+      || f="$f unknown-liveness-past-ttl-not-stale (a claim whose owner cannot be measured must still age out — got '$1')"
+    [ "$5" = past-ttl-liveness-unknown ] \
+      || f="$f unknown-liveness-wrong-evidence (it must not borrow the dead owner's word — got '$5')"
+    # and a REAL abandonment past TTL is still ABANDONED, not softened into expired
+    mesh-mind-state(){ return 5; }   # DEAD
+    set -- $(_resolve "$_cl_gone")
+    [ "$1" = stale ] || f="$f dead-owner-past-ttl-not-stale (got '$1')"
+    [ "$5" = owner-dead-or-idle-past-strikes ] || f="$f dead-owner-wrong-evidence (got '$5')"
+    # NOT IMMORTAL: the same claim, same lapsed clock, once its owner stops tending it. This is the
+    # argument that liveness may veto the clock at all — EXPIRED decays into ABANDONED on its own.
+    mesh-mind-state(){ printf 'IDLE\tready prompt, no turn running\n'; return 0; }
+    touch -d "@1" "$_cl_gone"                                   # artifact untouched since the claim
+    _strike_reset "$_cl_gone"
+    set -- $(_resolve "$_cl_gone"); _cl_v1="$1"                 # sweep 1 — a glance is not a verdict
+    mkdir -p "$STRIKE_DIR"; printf '%s|%s|%s|%s\n' "$_cl_ce" 1 1 1 > "$(_strike_path "$_cl_gone")"
+    set -- $(_resolve "$_cl_gone"); _cl_v2="$1"                 # sweep 2, a real span later
+    [ "$_cl_v1" = expired ] || f="$f expired-decay-first-sweep (got '$_cl_v1')"
+    [ "$_cl_v2" = stale ]   || f="$f expired-never-decays-to-abandoned (an unrenewed claim whose owner walked away must become reclaimable — got '$_cl_v2'; without this the veto would mint immortal claims)"
+    mesh-mind-state(){ printf 'WORKING\ta turn is running\n'; return 0; }
+    touch "$_cl_gone"; _strike_reset "$_cl_gone"
     # and the same owner INSIDE its TTL is theirs/live — the ttl= a caller passes now actually decides
-    printf '%s  wlive@%s  ::  [claim] %s ttl=7200\n' "$(date -u -d '-1 hour' +%FT%TZ)" "$HOST" "$_cl_gone" > "$_cl_board"
+    printf '%s  wlive@%s  ::  [claim] %s ttl=7200\n' "$_cl_ts" "$HOST" "$_cl_gone" > "$_cl_board"
     set -- $(_resolve "$_cl_gone"); [ "$1" = theirs ] \
       || f="$f inside-ttl-swept (a live owner inside its TTL must be theirs — got '$1')"
     # (d) an IDLE owner inside its TTL whose artifact is in flight — the live 07:37 case, end-to-end
@@ -501,16 +674,19 @@ case "${1:-}" in
     BOARD="$_cl_orig_board"; WHO="$_cl_orig_who"; STRIKE_DIR="$_cl_orig_strike"
     rm -rf "$_cl_dir" "$_cl_board"
     if [ -n "$f" ]; then echo "smoke-test: FAIL ($f )"; exit 1; fi
-    echo "smoke-test: ok (valid_key, parse_latest body-anchor, is_stale_clock, classify, WHO-never-anon, + trailing-colon-key rejected + extra-positional-arg rejected exit 64 w/ both tokens in the message, + --done ownership-gated: other's live claim refused exit 2 naming the owner / --force overrides / own claim + stale claim + unclaimed key still release clean, + donegate-caller-tag: same-user-different-caller-tag allowed to release, genuinely-different-user still refused, + owner_liveness: DEAD-SHELL and DEAD both resolve STALE, + claim-idle-is-not-abandoned: IDLE+touched-artifact stays LIVE, IDLE+untouched needs >=2 spaced sweeps (rapid re-check cannot stack), the TTL arm fires past-TTL and holds inside-TTL, DEAD/DEAD-SHELL/AUTH-DEAD still immediate)"; exit 0 ;;
+    echo "smoke-test: ok (valid_key, parse_latest body-anchor, is_stale_clock, classify, WHO-never-anon, + EXPIRED-IS-NOT-ABANDONED {#b2d997b4}: a WORKING owner past its TTL resolves 'expired' rc 2 carrying past-ttl-owner-live, --check never prints the reclaimable word for it, a second writer's claim STANDS DOWN and posts nothing, _done_gate refuses a stranger's release, it is absent from --list-stale (the board [stale] cry) and present in --list-expired with column 4 EXPIRED, an UNKNOWN-liveness owner past TTL is still stale with its OWN evidence word, a DEAD one is still stale, and an EXPIRED claim DECAYS to stale once its owner goes idle past its strikes so the liveness veto cannot mint an immortal claim, + trailing-colon-key rejected + extra-positional-arg rejected exit 64 w/ both tokens in the message, + --done ownership-gated: other's live claim refused exit 2 naming the owner / --force overrides / own claim + stale claim + unclaimed key still release clean, + donegate-caller-tag: same-user-different-caller-tag allowed to release, genuinely-different-user still refused, + owner_liveness: DEAD-SHELL and DEAD both resolve STALE, + claim-idle-is-not-abandoned: IDLE+touched-artifact stays LIVE, IDLE+untouched needs >=2 spaced sweeps (rapid re-check cannot stack), the TTL arm fires past-TTL and holds inside-TTL, DEAD/DEAD-SHELL/AUTH-DEAD still immediate)"; exit 0 ;;
 
   --check)
     key="${2:-}"; valid_key "$key" || { echo "mesh-claim: invalid key (artifact id, no spaces): '$key'" >&2; exit 64; }
-    set -- $(_resolve "$key"); verdict="$1"; code="$2"; owner="${3:-}"; age="${4:-0}"
+    set -- $(_resolve "$key"); verdict="$1"; code="$2"; owner="${3:-}"; age="${4:-0}"; why="${5:-}"
     case "$verdict" in
       unclaimed) echo "unclaimed: $key" ;;
-      yours)     echo "yours: $key (held ${age}s)" ;;
+      yours)     echo "yours: $key (held ${age}s$([ "$why" = past-ttl-owner-live ] && echo ' — TTL LAPSED; re-claim to renew it')" ;;
       theirs)    echo "theirs: $key — held by $owner (${age}s, live)" ;;
-      stale)     echo "stale: $key — $owner abandoned it (${age}s; owner idle/dead or past TTL) → reclaimable" ;;
+      # The two words the whole fix is for. They must never be paraphrased into each other: the
+      # remedies are opposites, and the reader acts on the first word of the line.
+      expired)   echo "expired: $key — held by $owner (${age}s), TTL LAPSED but the owner is LIVE (mesh-mind-state says it is tending this claim) → NOT reclaimable. Poke the owner to renew (mesh-claim $key --ttl <sec>) or hand it back (mesh-claim --yield $key); --force to override deliberately." ;;
+      stale)     echo "stale: $key — $owner abandoned it (${age}s; $why) → reclaimable" ;;
     esac
     exit "$code" ;;
 
@@ -523,18 +699,39 @@ case "${1:-}" in
     [ -n "$keys" ] || exit 0
     while IFS= read -r key; do
       [ -n "$key" ] || continue
-      set -- $(_resolve "$key"); verdict="$1"; owner="${3:-}"; age="${4:-0}"
+      set -- $(_resolve "$key"); verdict="$1"; owner="${3:-}"; age="${4:-0}"; why="${5:-}"
+      # --list is a CENSUS OF STATE, so column 4 keys on the evidence word ($5), never on the
+      # ownership verdict. classify() folds an expired claim of YOUR OWN back into "yours" (correct
+      # for --check and for the claim path — you are the one who renews it), and keying the census on
+      # that made a mind's own expired claims render LIVE and vanish from --list-expired: the state
+      # was measured and then discarded by the renderer, which is the same bug one layer out.
       case "$verdict" in
-        theirs|yours) printf '%s\t%s\t%ss\tLIVE\n'  "$key" "$owner" "$age" ;;
-        stale)        printf '%s\t%s\t%ss\tSTALE\n' "$key" "$owner" "$age" ;;
+        theirs|yours) if [ "$why" = past-ttl-owner-live ]; then printf '%s\t%s\t%ss\tEXPIRED\n' "$key" "$owner" "$age"
+                      else                                     printf '%s\t%s\t%ss\tLIVE\n'    "$key" "$owner" "$age"; fi ;;
+        expired)      printf '%s\t%s\t%ss\tEXPIRED\n' "$key" "$owner" "$age" ;;
+        stale)        printf '%s\t%s\t%ss\tSTALE\n'   "$key" "$owner" "$age" ;;
       esac
     done <<<"$keys"
     exit 0 ;;
 
   --list-stale)
-    # the --sweep state-fn: ONLY stale active claims, DELTA-STABLE (no volatile age → mesh-delta won't
-    # see a fresh delta every run just because seconds ticked; delta-channels-need-gate).
-    mesh-claim --list 2>/dev/null | awk -F'\t' '$4=="STALE"{printf "%s\towner=%s\tSTALE\n",$1,$2}'
+    # the --sweep state-fn: ONLY stale (ABANDONED) active claims, DELTA-STABLE (no volatile age →
+    # mesh-delta won't see a fresh delta every run just because seconds ticked; delta-channels-need-gate).
+    # EXPIRED claims are NOT in here by construction — this list feeds the board [stale] "reclaimable"
+    # cry and mesh-claim-verify's auto-RELEASE path, and both of those are the wrong remedy for a claim
+    # whose owner is mid-turn. That mis-listing IS the 16:37Z hh-driver post.
+    # "$0", never the bare name: `mesh-claim --list` resolves through PATH to the DEPLOYED binary, so
+    # a source tree under test (or mid-deploy drift) has its sub-reads answered by a DIFFERENT version
+    # of itself — measured here, where the deployed copy predated the EXPIRED column and this list
+    # therefore still contained the very claims the fix removes from it.
+    "$0" --list 2>/dev/null | awk -F'\t' '$4=="STALE"{printf "%s\towner=%s\tSTALE\n",$1,$2}'
+    exit 0 ;;
+
+  --list-expired)
+    # the other half of the split: claims past TTL whose owner is measurably LIVE. Same delta-stable
+    # shape as --list-stale so it can drive its own change-gated remedy (poke the owner to renew),
+    # and deliberately a SEPARATE list rather than a column consumers must remember to filter.
+    "$0" --list 2>/dev/null | awk -F'\t' '$4=="EXPIRED"{printf "%s\towner=%s\tEXPIRED\n",$1,$2}'
     exit 0 ;;
 
   --sweep)
@@ -542,14 +739,35 @@ case "${1:-}" in
     # unchanged stale-set emits NOTHING, so we never re-post (the gf-claim-sweep every-minute flood).
     # On a CHANGE we post ONE clean [stale] line; the chat mind reads it and reclaims/clears/redispatches.
     command -v mesh-delta >/dev/null 2>&1 || { echo "mesh-claim --sweep: mesh-delta not found" >&2; exit 0; }
+    # The EXPIRED set rides this same cadence rather than asking mesh-autowire for a second cron line —
+    # it is the same read of the same board, and a surfacing arm that needs its own scheduler is one
+    # more thing that can silently never be wired. It runs FIRST because --sweep below exits early on
+    # an unchanged stale-set, and an early return must not swallow the other half of the split.
+    "$0" --sweep-expired >/dev/null 2>&1 || true
     export MESH_WHO="claim-sweep@$HOST"            # clean board attribution (not the bare $USER@host fallback)
-    stale_now="$(mesh-claim --list-stale 2>/dev/null)"
+    stale_now="$("$0" --list-stale 2>/dev/null)"
     delta="$(printf '%s\n' "$stale_now" | mesh-delta gf-claim-sweep 2>/dev/null)"
     [ -n "$delta" ] || exit 0                      # no change (or stale-set empty) → silent
     [ -n "${stale_now//[[:space:]]/}" ] || exit 0  # change was 'all cleared' → nothing to escalate
     n="$(printf '%s\n' "$stale_now" | grep -c .)"
     keys="$(printf '%s\n' "$stale_now" | awk -F'\t' '{print $1}' | paste -sd, -)"
-    _post "[stale] claim-sweep: $n stale claim(s) — $keys — owner idle/dead or past TTL, reclaimable (mesh-claim --check <key>)"
+    _post "[stale] claim-sweep: $n stale claim(s) — $keys — owner idle/dead, or past TTL with liveness unknown; reclaimable (mesh-claim --check <key>)"
+    exit 0 ;;
+
+  --sweep-expired)
+    # EXPIRED surfacing. Its own mesh-delta channel (never gf-claim-sweep's) so the two sets cannot
+    # debounce each other, and its own marker: [fyi], NOT [stale]. mesh-interpret's DETECTOR_MARKERS
+    # ('stale|drift|fail|red|alert') turns a [stale] line into actionable reclaim/redispatch work —
+    # which is precisely the wrong remedy here, and would re-introduce the bug through the board.
+    command -v mesh-delta >/dev/null 2>&1 || { echo "mesh-claim --sweep-expired: mesh-delta not found" >&2; exit 0; }
+    export MESH_WHO="claim-sweep@$HOST"
+    exp_now="$("$0" --list-expired 2>/dev/null)"
+    delta="$(printf '%s\n' "$exp_now" | mesh-delta gf-claim-sweep-expired 2>/dev/null)"
+    [ -n "$delta" ] || exit 0
+    [ -n "${exp_now//[[:space:]]/}" ] || exit 0
+    n="$(printf '%s\n' "$exp_now" | grep -c .)"
+    keys="$(printf '%s\n' "$exp_now" | awk -F'\t' '{print $1}' | paste -sd, -)"
+    _post "[fyi] claim-sweep: $n EXPIRED claim(s) — $keys — TTL lapsed but the owner is LIVE and tending them. NOT reclaimable: poke the owner to renew (mesh-claim <key> --ttl <sec>) or --yield. Do not take this work."
     exit 0 ;;
 
   --done)
@@ -578,8 +796,11 @@ case "${1:-}" in
     valid_key "$key" || { echo "mesh-claim: invalid key (artifact id, no spaces): '$key'" >&2; exit 64; }
     set -- $(_resolve "$key"); verdict="$1"; owner="${3:-}"
     case "$verdict" in
-      theirs) echo "mesh-claim: '$key' already held by $owner (live) — standing down" >&2; exit 2 ;;
-      yours)  echo "already yours: $key (re-claim is a no-op; not re-posting)"; exit 1 ;;   # debounce: no spam
-      *)      _post "[claim] $key ttl=$ttl"; echo "claimed: $key (ttl=${ttl}s)"; exit 0 ;;   # unclaimed or stale → take it
+      theirs)  echo "mesh-claim: '$key' already held by $owner (live) — standing down" >&2; exit 2 ;;
+      # THE POINT OF THE WHOLE FIX: a lapsed clock is not an invitation. Standing down here is what
+      # stops the second writer the 16:37Z [stale] post was inviting onto contended work.
+      expired) echo "mesh-claim: '$key' held by $owner — its TTL lapsed, but the owner is LIVE and tending it. Standing down. Ask $owner to renew (mesh-claim $key --ttl <sec>) or --yield; --force is not a claim path — take it only after the owner goes idle/dead and it reads 'stale'." >&2; exit 2 ;;
+      yours)   echo "already yours: $key (re-claim is a no-op; not re-posting)"; exit 1 ;;   # debounce: no spam
+      *)       _post "[claim] $key ttl=$ttl"; echo "claimed: $key (ttl=${ttl}s)"; exit 0 ;;   # unclaimed or stale → take it
     esac ;;
 esac
