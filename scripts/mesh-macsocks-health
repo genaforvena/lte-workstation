@@ -1,0 +1,167 @@
+#!/usr/bin/env bash
+# reflex-cadence: 7,37 * * * *
+# reflex-state: $HOME/.mesh/.macsocks-health.state
+# mesh-macsocks-health — does the SOCKS client actually egress where it thinks it does?
+#
+# WHY THIS EXISTS. The operator's iMac cannot run tailscale (macOS 10.13 predates the .pkg's floor,
+# and pkgs.tailscale.com publishes no darwin tarball at all), so its route to phaedra is a forwarded
+# connection opened by THIS node's sshd on its behalf: a LaunchAgent holds `ssh -N -D 127.0.0.1:1080
+# macsocks@mesh-home.local` up, and macOS's system SOCKS setting points every CFNetwork app at it.
+# That chain has four independent members and THREE of them fail toward a plausible constant:
+#
+#   - the tunnel dies            -> KeepAlive respawns it, loudly, and this is the safe one
+#   - the system proxy is off    -> every app egresses on the RU home ISP, nothing says so
+#   - this node drops its exit   -> the tunnel is perfect and carries the RU home ISP
+#   - the Mac is asleep          -> indistinguishable, from here, from all three of the above
+#
+# The failure the operator would actually notice LAST is the quiet one: a live green tunnel
+# carrying the wrong country. So this tool never asks "is the tunnel up" — it asks what address the
+# Mac's own fetch comes out of, and compares it to what THIS node's fetch comes out of.
+#
+# NO CONSTANT EGRESS ADDRESS. CLAUDE.local.md records the same public IP written down as Montreal
+# /AS26832, then NL, then US/AS197537 inside a few weeks — an address pinned in a gate would be
+# wrong before the month was out. The invariant is a RELATION between two live measurements taken in
+# the same run, never a literal.
+#
+# THE PROBE MUST NOT INHERIT THE CALLER'S PROXY. Panes on this node carry HTTPS_PROXY/ALL_PROXY or
+# not depending on when they were started (the tmux global env outlives the restore.env rollback),
+# so a bare curl here measures the pane, not the node. Every local fetch below runs under `env -u`.
+#
+# UNREACHABLE IS UNKNOWN, NEVER DOWN. A desktop that is asleep, or a LAN swallowed by the exit node
+# (which this node has a whole separate healer for), renders UNKNOWN with the reason named. A
+# verdict about the client's egress requires having measured the client's egress.
+#
+#   mesh-macsocks-health            one cycle: measure, record, alert on a bad-verdict edge
+#   mesh-macsocks-health --check    measure and print, write no ledger row and post nothing
+#   mesh-macsocks-health --log [N]  the durable tape (last N rows, default 20)
+#   mesh-macsocks-health --test     smoke test (stubbed probes — touches no real host)
+set -uo pipefail
+
+MESH_DIR="${MESH_DIR:-$HOME/.mesh}"
+LEDGER="$MESH_DIR/macsocks-health.log"
+STATE="$MESH_DIR/.macsocks-health.state"
+SOCKS_PORT="${MESH_MACSOCKS_PORT:-1080}"
+SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new)
+
+# The caller's value wins over the file's. ~/.mesh/nodes exports MESH_MACSOCKS_CLIENT, so sourcing
+# it unconditionally would overwrite an explicit override from the environment — including the
+# deliberately-empty one the undeclared-node arm of --test uses. `+set` keeps set-but-empty distinct
+# from unset, which is the whole distinction that arm turns on.
+_caller_client_set="${MESH_MACSOCKS_CLIENT+set}"; _caller_client="${MESH_MACSOCKS_CLIENT:-}"
+[ -r "$MESH_DIR/nodes" ] && . "$MESH_DIR/nodes" 2>/dev/null
+[ "$_caller_client_set" = set ] && MESH_MACSOCKS_CLIENT="$_caller_client"
+
+now() { date -u +%FT%TZ; }
+# Strip the caller's proxy so a local fetch measures THIS NODE and not the pane it was launched in.
+nofetch_env() { env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy "$@"; }
+
+ipv4_or_empty() { grep -Eo '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' <<<"${1:-}" || true; }
+
+# --- probes (each overridable so --test can drive the classifier without a network) -------------
+probe_node_egress() { ${MESH_MACSOCKS_NODE_EGRESS_CMD:-nofetch_env curl -s --max-time 12 https://api.ipify.org}; }
+probe_exit_node()   { ${MESH_MACSOCKS_EXITNODE_CMD:-_exit_node_id}; }
+probe_client()      { ${MESH_MACSOCKS_CLIENT_CMD:-_client_probe}; }
+
+_exit_node_id() {
+  local j; j=$(timeout 10 tailscale status --json 2>/dev/null) || { echo ""; return; }
+  jq -r '(.ExitNodeStatus.ID // "") | tostring' <<<"$j" 2>/dev/null
+}
+
+# One ssh, three answers, so a sleeping Mac costs one timeout and not three. The proxied fetch is
+# written with an explicit --socks5-hostname rather than relying on the login shell's ALL_PROXY:
+# a non-interactive ssh does not source the rc that exports it, and a probe that silently fell back
+# to the direct route would report the fault as health.
+_client_probe() {
+  local target="${MESH_MACSOCKS_CLIENT:-}"
+  timeout 45 ssh -n "${SSH_OPTS[@]}" "$target" "
+    printf 'socks=%s\n' \"\$(curl -s --max-time 15 --socks5-hostname 127.0.0.1:$SOCKS_PORT https://api.ipify.org)\"
+    printf 'direct=%s\n' \"\$(env -u ALL_PROXY -u all_proxy curl -s --max-time 15 https://api.ipify.org)\"
+    printf 'socksenable=%s\n' \"\$(scutil --proxy | awk '/SOCKSEnable/{print \$3}')\"
+  " 2>/dev/null
+}
+
+classify() {
+  local target="$1" node_eg="$2" exit_id="$3" cli="$4"
+  local mac_socks mac_direct socks_on
+  mac_socks=$(ipv4_or_empty "$(sed -n 's/^socks=//p' <<<"$cli" | head -1)")
+  mac_direct=$(ipv4_or_empty "$(sed -n 's/^direct=//p' <<<"$cli" | head -1)")
+  socks_on=$(sed -n 's/^socksenable=//p' <<<"$cli" | head -1)
+
+  FIELDS="client=$target node_egress=${node_eg:-na} mac_via_socks=${mac_socks:-na}"
+  FIELDS="$FIELDS mac_direct=${mac_direct:-na} socks_pref=${socks_on:-na} exit_node=${exit_id:-none}"
+
+  # Our own measurement failing is a fact about US. Never let it become a verdict about the Mac.
+  [ -z "$node_eg" ] && { VERDICT=UNKNOWN; WHY="this node's own egress probe failed — no baseline to compare against"; return; }
+  [ -z "$cli" ]     && { VERDICT=UNKNOWN; WHY="client unreachable (asleep, off the LAN, or the LAN is swallowed) — an egress verdict needs an egress reading"; return; }
+  [ -z "$mac_socks" ] && { VERDICT=TUNNEL-DOWN; WHY="the client's fetch through 127.0.0.1:$SOCKS_PORT returned nothing — the forwarded door is not open"; return; }
+  [ "$mac_socks" != "$node_eg" ] && { VERDICT=SPLIT; WHY="the tunnel carries $mac_socks while this node egresses $node_eg — the door leads somewhere else"; return; }
+  [ -z "$exit_id" ] && { VERDICT=DIRECT-EGRESS; WHY="the tunnel is live and faithful, but this node consumes no exit node — the client is riding the home ISP with a perfect green path"; return; }
+  # A live tunnel the system has been told not to use is the quiet failure this tool exists for.
+  [ "$socks_on" != "1" ] && { VERDICT=PROXY-OFF; WHY="tunnel live and correct, but macOS SOCKSEnable=${socks_on:-na} — apps are egressing ${mac_direct:-elsewhere}, not through it"; return; }
+  VERDICT=OK; WHY="client egresses $mac_socks, same as this node, via exit node $exit_id"
+}
+
+touch_state() { : > "$STATE".tmp 2>/dev/null && mv -f "$STATE".tmp "$STATE" 2>/dev/null || touch "$STATE" 2>/dev/null; }
+
+main() {
+  local mode="${1:-run}"
+  local target="${MESH_MACSOCKS_CLIENT:-}"
+  if [ -z "$target" ]; then
+    # Bound to the declaration, not to a hostname: a node with no SOCKS client stands down LOUD.
+    echo "mesh-macsocks-health: no MESH_MACSOCKS_CLIENT declared in $MESH_DIR/nodes — nothing to measure here" >&2
+    return 2
+  fi
+  local node_eg exit_id cli
+  node_eg=$(ipv4_or_empty "$(probe_node_egress)")
+  exit_id=$(probe_exit_node)
+  cli=$(probe_client)
+  classify "$target" "$node_eg" "$exit_id" "$cli"
+
+  local row; row="$(now) $VERDICT $FIELDS -- $WHY"
+  echo "$row"
+  [ "$mode" = "--check" ] && return 0
+
+  echo "$row" >> "$LEDGER"
+  touch_state
+
+  # Alert on the EDGE only: a Mac that has been asleep all night must not post 16 identical lines.
+  local prev=""; [ -s "$LEDGER" ] && prev=$(tail -2 "$LEDGER" | head -1 | awk '{print $2}')
+  if [ "$VERDICT" != "OK" ] && [ "$VERDICT" != "UNKNOWN" ] && [ "$VERDICT" != "$prev" ]; then
+    command -v mesh-chat >/dev/null 2>&1 && mesh-chat "[fyi] macsocks $VERDICT: $WHY ($FIELDS)" >/dev/null 2>&1
+    command -v mesh-trace >/dev/null 2>&1 && mesh-trace "macsocks $VERDICT $FIELDS" >/dev/null 2>&1
+  fi
+  [ "$VERDICT" = "OK" ] || [ "$VERDICT" = "UNKNOWN" ]
+}
+
+case "${1:-}" in
+  --log) tail -n "${2:-20}" "$LEDGER" 2>/dev/null || echo "no ledger at $LEDGER"; exit 0 ;;
+  --test) exec "$0" __test ;;
+  __test) ;;
+  *) main "${1:-run}"; exit $? ;;
+esac
+
+# ---------------------------------------------------------------------------------------------
+# --test: drive the classifier over stubbed probes. It asserts the WORDS, because the whole point
+# of this tool is that four different worlds used to render identically.
+fail=0
+t() { # t <name> <expect> <node_eg> <exit_id> <client-blob>
+  VERDICT=""; WHY=""; FIELDS=""
+  classify "someone@somewhere" "$2" "$3" "$4"
+  if [ "$VERDICT" = "$1" ]; then echo "  ok   $5 -> $VERDICT"; else echo "  FAIL $5 -> got '$VERDICT', want '$1'"; fail=1; fi
+}
+echo "mesh-macsocks-health --test"
+GOOD=$'socks=38.49.216.141\ndirect=5.227.27.235\nsocksenable=1'
+t OK            "38.49.216.141" "n2sbt7" "$GOOD"                                            "healthy chain"
+t UNKNOWN       ""              "n2sbt7" "$GOOD"                                            "our own egress probe failed"
+t UNKNOWN       "38.49.216.141" "n2sbt7" ""                                                 "client unreachable"
+t TUNNEL-DOWN   "38.49.216.141" "n2sbt7" $'socks=\ndirect=5.227.27.235\nsocksenable=1'      "proxied fetch empty"
+t SPLIT         "38.49.216.141" "n2sbt7" $'socks=1.2.3.4\ndirect=5.227.27.235\nsocksenable=1' "tunnel leads elsewhere"
+t DIRECT-EGRESS "5.227.27.235"  ""       $'socks=5.227.27.235\ndirect=5.227.27.235\nsocksenable=1' "no exit node — green path, home ISP"
+t PROXY-OFF     "38.49.216.141" "n2sbt7" $'socks=38.49.216.141\ndirect=5.227.27.235\nsocksenable=0' "tunnel live, system told not to use it"
+# A garbage reading must not be mistaken for an address: an HTML error page is not an egress.
+t TUNNEL-DOWN   "38.49.216.141" "n2sbt7" $'socks=<html>error</html>\ndirect=5.227.27.235\nsocksenable=1' "non-address body"
+# Unlisted subject: stand down loudly rather than pass quietly.
+out=$(MESH_MACSOCKS_CLIENT="" "$0" --check 2>&1); rc=$?
+if [ "$rc" = 2 ]; then echo "  ok   undeclared client -> rc 2 ($out)"; else echo "  FAIL undeclared client -> rc $rc"; fail=1; fi
+[ "$fail" = 0 ] && echo "PASS" || echo "FAIL"
+exit $fail
