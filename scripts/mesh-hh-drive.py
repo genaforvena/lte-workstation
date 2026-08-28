@@ -134,15 +134,30 @@ def run():
 
         seen, last = 0, time.time()
         parked = None
+        park_skipped = False
         while time.time() - last < IDLE_LIMIT:
             lines = CMD.read_text(encoding="utf-8").splitlines()
             if len(lines) <= seen:
                 if (PARK_AFTER and parked is None and time.time() - last > PARK_AFTER
                         and pg.url != PARK_URL):
                     want = pg.url
+                    # NEVER PARK A URL WE CANNOT NAVIGATE BACK TO. A failed goto leaves the page on
+                    # chrome-error://chromewebdata/, and Page.goto of a chrome-error URL is
+                    # unconditionally ERR_ABORTED — so parking one converts a transient blip into a
+                    # driver that refuses every later verb. The gate is an ALLOWLIST of the schemes
+                    # this driver legitimately sits on: an unlisted scheme costs the CPU the parker
+                    # exists to save, and says so, which is the loud direction. The other direction
+                    # (park it, wedge, and name the wrong subject) is the failure this replaced.
+                    if not want.startswith(("http://", "https://", "file://")):
+                        if not park_skipped:
+                            out("[park-SKIP]", want, "(not a URL we could un-park to)")
+                            park_skipped = True
+                        time.sleep(2)
+                        continue
                     try:
                         pg.goto(PARK_URL, wait_until="domcontentloaded", timeout=15000)
                         parked = want
+                        park_skipped = False
                         out("[park]", want)
                     except Exception as e:
                         # A park that fails must not be remembered as done: the page is still on
@@ -156,6 +171,7 @@ def run():
                 if not step:
                     continue
                 last = time.time()
+                park_skipped = False   # a new episode must re-announce; a latched flag goes quiet
                 out(f"\n>>> {step}")
                 try:
                     # shlex eats quotes and apostrophes, which is right for `click a.b` and fatal
@@ -173,9 +189,29 @@ def run():
                         # goto replaces the destination anyway and quit is leaving; everything else
                         # assumes the page it was left on, so restore it first.
                         if verb not in ("goto", "quit"):
-                            pg.goto(parked, wait_until="domcontentloaded", timeout=60000)
-                            pg.wait_for_timeout(3500)
-                            out("[unpark]", parked)
+                            try:
+                                pg.goto(parked, wait_until="domcontentloaded", timeout=60000)
+                                pg.wait_for_timeout(3500)
+                                out("[unpark]", parked)
+                            except Exception as e:
+                                # An un-park that fails must be spent, not RETRIED FOREVER. Left
+                                # set, `parked` makes every later shot/js/click re-attempt the same
+                                # dead navigation, so one bad URL wedges the driver until some lane
+                                # happens to send a `goto` (the one verb that skips this branch) —
+                                # and each failure names the verb, never the parked URL that is
+                                # actually refusing. Clearing it costs the page position, which the
+                                # caller can restore; keeping it costs every command after.
+                                out("[unpark-FAIL]", parked, type(e).__name__, str(e)[:160])
+                                # The failed navigation leaves the page mid-flight on an error
+                                # document, so the verb that triggered this un-park dies with
+                                # "Execution context was destroyed" — a message about a race, not
+                                # about the dead URL named on the line above. Land on about:blank
+                                # so that verb runs against a live context and anything it reports
+                                # after this is its own failure.
+                                try:
+                                    pg.goto(PARK_URL, wait_until="domcontentloaded", timeout=15000)
+                                except Exception:
+                                    pass
                         parked = None
                     if verb == "quit":
                         ctx.storage_state(path=str(STATE))
