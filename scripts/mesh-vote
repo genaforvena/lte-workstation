@@ -80,9 +80,61 @@
 # green a test arm is the wrong trade. That claim is reasoned, not driven — say so rather than
 # let the suite's silence read as coverage.
 #
+# THE ALGORITHM IS A PER-INVOCATION FLAG BUT THE CLUSTER IS PER-TOPIC DURABLE STATE, SO IT MUST
+# BE PINNED TO THE STATE (fixed 2026-08-28). The 08-24 quorum fix and the atomicity/lock fixes
+# above closed split-brain at the front door and at the back; the algorithm selector was a THIRD
+# door into the same room, and it opened on a single omitted word at the call site. Both
+# directions were driven against the tool as it stood:
+#   multipaxos topic -> a bft round. A 5-acceptor topic whose last chosen value was "green", run
+#     by a 2-of-5 minority WITHOUT --algo, printed `red — confidence 100% (quorum) n=2`. Under
+#     its own algorithm that round holds (2 < majority 3). The state file then carried two
+#     contradictory answers side by side — paxos.last_chosen "green" and last_consensus "red" —
+#     and nothing anywhere flagged it.
+#   bft topic -> a multipaxos round. A topic with five known workers, entered by a SINGLE
+#     stranger, printed `red — chosen slot=0 ballot=1 leader=z accepts=1/1` — verbatim the string
+#     the 08-24 entry above says is split-brain and that --test asserts can never happen. The
+#     paxos sub-state is born empty, so the acceptor set was learned as ["z"] on a topic whose
+#     membership was sitting in the same file under the other algorithm's key.
+# The two algorithms are different FAULT MODELS — crash-fault simple majority vs a 2/3 Byzantine
+# weight quorum — so a topic silently alternating between them holds neither guarantee. The
+# state now carries the algorithm that wrote it and a mismatch is a REFUSAL (rc 1, state
+# untouched), exactly like the corrupt-state refusal: changing a running cluster's fault model is
+# an operator decision taken outside the protocol. --switch-algo is the explicit escape hatch,
+# the same shape as --reconfigure.
+#   A LEGACY FILE HAS NO STAMP, AND AN ABSENT FIELD MUST NOT ENCODE AGREEMENT
+#   [[an-omitted-field-can-encode-the-default-value]] — defaulting it to whatever was requested
+#   would make the guard vacuous on every state file written before this change, i.e. all of
+#   them. The binding is INFERRED from the keys the state actually carries (`paxos` -> multipaxos,
+#   `reputation`/`last_consensus` -> bft, both -> an already-contaminated topic, which is its own
+#   refusal), and stamped from then on.
+#   AND A SWITCH INTO MULTIPAXOS CARRIES THE MEMBERSHIP THE TOPIC ALREADY KNEW: the outgoing
+#   algorithm's worker set is this topic's own record of who is in the cluster, so the paxos
+#   acceptor set is seeded from it instead of being born empty. That can only RAISE the quorum
+#   bar — the safe direction — where being born empty lowers it to one. The carry is PERSISTED
+#   (px.carried, rendered as acceptors_src=learned+carried), because a bar standing on acceptors
+#   never seen under this algorithm must stay attributable for as long as it stands, not only in
+#   the round that raised it.
+# Coverage, stated rather than implied: 13 mutants were driven against these arms and all 13 go
+# red — guard removed, guard unconditional (the negative arms), no key inference for unstamped
+# files, a resolver that agrees with its caller, the contaminated topic waved through, the stamp
+# never written, the carry removed, the carry not persisted, --switch-algo ignored, a refusal
+# that neither names the binding nor shows the two disagreeing answers, a refused round that
+# writes state anyway, and the guard hoisted above the loader (which would make the corrupt-state
+# refusal unreachable). Two earlier mutants were discarded rather than counted: one was
+# EQUIVALENT (it changed only the genuinely-fresh branch, where "bound to nothing" and "bound to
+# whatever you asked" behave identically) and one was INVALID (it called save() from above its
+# own definition, so it died of NameError without ever saving) — a mutant that goes red for the
+# wrong reason is not coverage [[a-mutant-can-go-red-for-the-wrong-reason]]. The first mutant run
+# of all was thrown away whole: the CONTROL was red too, because the copies were not executable
+# and the suite invokes "$0" directly.
+# Scope of the drive, plainly: this node has never run mesh-vote on a real topic
+# (~/.mesh/vote-state is empty) and nothing in cron or any dash calls it, so every drive above is
+# a hand-built cluster under a scratch HOME. The guard therefore has no live topic to break, and
+# no live topic has exercised it either.
+#
 # Usage:
 #   printf 'worker|opinion\n...' | mesh-vote <topic> [--json] [--algo bft|multipaxos]
-#                                   [--acceptors <n>] [--reconfigure]
+#                                   [--acceptors <n>] [--reconfigure] [--switch-algo]
 #   mesh-vote --test
 # Env: MESH_VOTE_ALGO=bft|multipaxos (default bft; the --algo flag wins).
 #      MESH_VOTE_ACCEPTORS=<n>       (multipaxos; the --acceptors flag wins).
@@ -95,6 +147,7 @@
 #   bft:        {reputation: {worker: 0..1}, last_consensus, last_confidence}
 #   multipaxos: {paxos: {ballot, leader, slot, log: [{slot,ballot,value}...], last_chosen,
 #                        acceptors: [worker...]}}
+#   both:       algo — the algorithm this topic is bound to; a round under any other one refuses.
 #   plus <topic>.json.lock (the round's exclusive lock) and a transient <topic>.json.new.
 # Small in-tree STUDY prototype (idea-queue byzantine-consensus 2026-07-08 + raft-paxos
 # 2026-07-18) — not wired into any dash/cron; a real integration is a separate step.
@@ -105,7 +158,7 @@ QUORUM=0.66
 
 _run() {
   local topic="$1" state_dir="$HOME/.mesh/vote-state" state_file json_mode="${2:-0}" algo="${3:-bft}" votes_file
-  local acceptors="${4:-}" reconfigure="${5:-0}"
+  local acceptors="${4:-}" reconfigure="${5:-0}" switch_algo="${6:-0}"
   mkdir -p "$state_dir" 2>/dev/null
   state_file="$state_dir/$topic.json"
   # heredoc (below) occupies python's stdin, so the caller's piped votes must be captured to a
@@ -116,12 +169,14 @@ _run() {
   # (task:doctor-test-tmpdir-cleanup-traps).
   trap 'rm -f "$votes_file"' RETURN
   cat > "$votes_file"
-  python3 - "$state_file" "$json_mode" "$QUORUM" "$votes_file" "$algo" "$acceptors" "$reconfigure" << 'PYEOF'
+  python3 - "$state_file" "$json_mode" "$QUORUM" "$votes_file" "$algo" "$acceptors" "$reconfigure" \
+          "$switch_algo" << 'PYEOF'
 import sys, json, os, fcntl, time
 
 state_file, json_mode, quorum, votes_file, algo = \
     sys.argv[1], sys.argv[2] == "1", float(sys.argv[3]), sys.argv[4], sys.argv[5]
 cfg_acceptors, reconfigure = sys.argv[6], sys.argv[7] == "1"
+switch_algo = sys.argv[8] == "1"
 
 # THE ROUND IS A READ-MODIFY-WRITE AND IT MUST BE SERIALIZED. Unlocked, six concurrent rounds on
 # one topic each announced `chosen` — three of them for slot 1 with three different values — and
@@ -161,6 +216,53 @@ except ValueError:
                      % state_file)
     sys.exit(1)
 
+# THE ALGORITHM IS PINNED TO THE TOPIC. bft and multipaxos are different fault models — a 2/3
+# Byzantine weight quorum vs a crash-fault simple majority — computed over the same topic's
+# durable state, so a topic that alternates between them holds NEITHER guarantee. Driven both
+# ways (see the header): a 2-of-5 minority that omitted --algo announced a new consensus at 100%
+# confidence on a topic whose own algorithm would have held it, and a lone stranger entering a
+# 5-worker bft topic under --algo multipaxos printed `chosen ... accepts=1/1`.
+def state_algo(st):
+    """The algorithm this topic's state was written by, and how we know.
+
+    NEVER defaults to the requested algorithm. A legacy file predates the stamp, and an absent
+    field that resolves to whatever the caller asked for is a guard that agrees with everyone
+    [[an-omitted-field-can-encode-the-default-value]] — vacuous on exactly the files that need it.
+    Infer from the keys the state actually carries instead."""
+    if isinstance(st.get("algo"), str) and st["algo"]:
+        return st["algo"], "stamped"
+    has_px = "paxos" in st
+    has_bft = any(k in st for k in ("reputation", "last_consensus", "last_confidence"))
+    if has_px and has_bft:
+        return "mixed", "inferred"      # already contaminated — its own refusal
+    if has_px:
+        return "multipaxos", "inferred"
+    if has_bft:
+        return "bft", "inferred"
+    return None, "fresh"                # genuinely nothing decided yet
+
+bound, bound_src = state_algo(state)
+if bound is not None and bound != algo and not switch_algo:
+    if bound == "mixed":
+        why = ("already carries BOTH algorithms' state (paxos slot %s / last_chosen %r beside "
+               "bft last_consensus %r) — it has been run under both and the two answers "
+               "disagree with nothing to arbitrate them"
+               % ((state.get("paxos") or {}).get("slot"),
+                  (state.get("paxos") or {}).get("last_chosen"),
+                  state.get("last_consensus")))
+    else:
+        why = ("is bound to --algo %s (%s) and this round asked for %s"
+               % (bound, bound_src, algo))
+    sys.stderr.write(
+        "mesh-vote: topic state %s %s — refusing to run.\n"
+        "  bft is a 2/3 Byzantine weight quorum; multipaxos is a crash-fault simple majority "
+        "over an acceptor set. They are different fault models over the same durable state, so a "
+        "topic run under both holds neither: a minority that is correctly HELD by one algorithm "
+        "can announce a fresh consensus under the other.\n"
+        "  Pass --algo %s, or --switch-algo to rebind this topic deliberately.\n"
+        % (state_file, why, bound if bound != "mixed" else "<the one this topic should keep>"))
+    sys.exit(1)
+
 votes = {}  # worker -> opinion
 with open(votes_file) as vf:
     vote_lines = vf.readlines()
@@ -185,6 +287,10 @@ def save():
     # removed lock away from publishing a partial state under another writer's rename. Driven:
     # with the lock mutated out, a shared `.new` made concurrent rounds die renaming a file a
     # sibling had already taken.
+    # Stamp the binding on every write, so the NEXT round's guard reads a fact rather than an
+    # inference. Inside save() and not at the decision sites: a stamp written on only some paths
+    # would leave a topic whose last round happened to take an unstamped path looking legacy.
+    state["algo"] = algo
     tmp = "%s.new.%d" % (state_file, os.getpid())
     with open(tmp, "w") as f:
         payload = json.dumps(state)
@@ -238,7 +344,29 @@ if algo == "multipaxos":
         # round's voters, including a below-quorum round's: raising the bar is always the safe
         # direction), unless --reconfigure explicitly redefines it or --acceptors configures it.
         learned = set(px.get("acceptors") or [])
+        carried = set()
+        if not learned:
+            # THE PAXOS SUB-STATE IS BORN EMPTY, BUT THE TOPIC MAY NOT BE NEW. On a topic that
+            # ran under bft, the workers the EWMA has been scoring ARE this cluster's membership
+            # by the topic's own record — the same monotone "every worker ever seen here" rule
+            # the acceptor set already uses, read from the other algorithm's key. Being born
+            # empty instead lets whoever shows up first be a majority of themselves: a lone
+            # stranger entering a 5-worker topic printed `chosen ... accepts=1/1`. Carrying can
+            # only RAISE the bar, which is the direction a quorum is allowed to move by itself.
+            carried = set(state.get("reputation") or {})
+            learned |= carried
         learned = set(votes) if reconfigure else (learned | set(votes))
+        # The carry is PERSISTED, not just noted in the round that performed it. Its whole point
+        # is that some of these acceptors have never been seen voting under this algorithm, so a
+        # reader asking "is this bar real?" needs the provenance for as long as the bar stands —
+        # a label that reverts to plain "learned" on the very next round records the transition
+        # and loses the fact. --reconfigure defines the set outright, so it clears the carry.
+        carried = set() if reconfigure else (carried | set(px.get("carried") or []))
+        carried &= learned
+        if carried:
+            px["carried"] = sorted(carried)
+        else:
+            px.pop("carried", None)
         px["acceptors"] = sorted(learned)
         if cfg_acceptors:
             members, src = int(cfg_acceptors), "configured"
@@ -252,7 +380,7 @@ if algo == "multipaxos":
                     % (n, members))
                 sys.exit(1)
         else:
-            members, src = len(learned), "learned"
+            members, src = len(learned), ("learned+carried" if carried else "learned")
         majority = members // 2 + 1
         if n < majority:
             # BELOW QUORUM: hold. No value chosen, log untouched, no leader elected — and the
@@ -542,6 +670,118 @@ assert px['acceptors'] == ['a', 'b'], px['acceptors']
       echo "smoke-test: FAIL (--reconfigure under bft must be rejected, not silently ignored)"; exit 1
     fi
 
+    # ---- THE ALGORITHM IS PINNED TO THE TOPIC ----
+    # The 08-24 quorum fix closed split-brain at the denominator and the lock/atomicity fixes
+    # closed it at the state write. The algorithm SELECTOR was a third door: it is a
+    # per-invocation flag over per-topic durable state, so one omitted word at a call site ran a
+    # settled cluster under the other fault model. Both directions were measured against the tool
+    # as it stood on 2026-08-28 and the failing strings are quoted in each arm.
+
+    # A 5-acceptor multipaxos topic; a 2-of-5 MINORITY then runs a round without --algo. Before
+    # the guard that printed `red — confidence 100% (quorum) n=2` — a fresh consensus announced
+    # by a partition its own algorithm holds (2 < majority 3).
+    printf 'a|blue\nb|blue\nc|blue\nd|blue\ne|blue\n' | HOME="$tmp" "$0" xalgo1 --algo multipaxos >/dev/null 2>&1 || {
+      echo "smoke-test: FAIL (algo-pin topic setup)"; exit 1; }
+    xsum="$(cksum < "$tmp/.mesh/vote-state/xalgo1.json")"
+    x1="$(printf 'a|red\nb|red\n' | HOME="$tmp" "$0" xalgo1 2>&1)" && {
+      echo "smoke-test: FAIL (a bft round on a multipaxos topic must refuse: $x1)"; exit 1; }
+    printf '%s' "$x1" | grep -q 'bound to --algo multipaxos' || {
+      echo "smoke-test: FAIL (the refusal must NAME the binding it is enforcing: $x1)"; exit 1; }
+    printf '%s' "$x1" | grep -q 'confidence' && {
+      echo "smoke-test: FAIL (the mismatched round produced a consensus: $x1)"; exit 1; }
+    [ "$(cksum < "$tmp/.mesh/vote-state/xalgo1.json")" = "$xsum" ] || {
+      echo "smoke-test: FAIL (the refused round wrote to the topic's state)"; exit 1; }
+    # NEGATIVE ARM — without it "refuses" is satisfied by a guard that refuses unconditionally.
+    x1ok="$(printf 'a|red\nb|red\nc|red\n' | HOME="$tmp" "$0" xalgo1 --algo multipaxos 2>&1)" || {
+      echo "smoke-test: FAIL (the topic's OWN algorithm must still run: $x1ok)"; exit 1; }
+    printf '%s' "$x1ok" | grep -q '^red — chosen slot=1' || {
+      echo "smoke-test: FAIL (matching-algo round must choose: $x1ok)"; exit 1; }
+
+    # The other direction, and the sharper one: a lone stranger entering a 5-worker bft topic
+    # printed `red — chosen slot=0 ballot=1 leader=z accepts=1/1` — verbatim the split-brain
+    # string the 08-24 arms above assert can never happen, reached through the selector.
+    printf 'a|blue\nb|blue\nc|blue\nd|blue\ne|blue\n' | HOME="$tmp" "$0" xalgo2 >/dev/null 2>&1 || {
+      echo "smoke-test: FAIL (bft-side algo-pin setup)"; exit 1; }
+    x2="$(printf 'z|red\n' | HOME="$tmp" "$0" xalgo2 --algo multipaxos 2>&1)" && {
+      echo "smoke-test: FAIL (a multipaxos round on a bft topic must refuse: $x2)"; exit 1; }
+    printf '%s' "$x2" | grep -q -- '— chosen slot=' && {
+      echo "smoke-test: FAIL (a lone stranger chose a value on another algorithm topic: $x2)"; exit 1; }
+
+    # A LEGACY FILE HAS NO STAMP. This is the arm that matters most: every state file written
+    # before this change is unstamped, so a guard that resolved an absent field to the REQUESTED
+    # algorithm would agree with every caller and be vacuous exactly where it is needed
+    # [[an-omitted-field-can-encode-the-default-value]]. The binding must be INFERRED from the
+    # keys the state carries.
+    python3 - "$tmp" << 'PYLEG'
+import json, os, sys
+d = os.path.join(sys.argv[1], ".mesh", "vote-state")
+os.makedirs(d, exist_ok=True)
+json.dump({"paxos": {"ballot": 1, "leader": "a", "slot": 2, "last_chosen": "blue",
+                     "log": [{"slot": 0, "ballot": 1, "value": "blue"}],
+                     "acceptors": ["a", "b", "c", "d", "e"]}},
+          open(os.path.join(d, "xleg1.json"), "w"))
+json.dump({"reputation": {"a": 0.9, "b": 0.9, "c": 0.9, "d": 0.5, "e": 0.5},
+           "last_consensus": "blue", "last_confidence": 1.0},
+          open(os.path.join(d, "xleg2.json"), "w"))
+PYLEG
+    l1="$(printf 'a|red\nb|red\n' | HOME="$tmp" "$0" xleg1 2>&1)" && {
+      echo "smoke-test: FAIL (an UNSTAMPED multipaxos state must be inferred and refuse bft: $l1)"; exit 1; }
+    printf '%s' "$l1" | grep -q 'bound to --algo multipaxos (inferred)' || {
+      echo "smoke-test: FAIL (legacy binding must be inferred from the state's keys: $l1)"; exit 1; }
+    l2="$(printf 'z|red\n' | HOME="$tmp" "$0" xleg2 --algo multipaxos 2>&1)" && {
+      echo "smoke-test: FAIL (an UNSTAMPED bft state must be inferred and refuse multipaxos: $l2)"; exit 1; }
+    printf '%s' "$l2" | grep -q 'bound to --algo bft (inferred)' || {
+      echo "smoke-test: FAIL (legacy bft binding must be inferred: $l2)"; exit 1; }
+    # NEGATIVE ARM for the inference: a legacy file run under its OWN algorithm still runs.
+    printf 'a|red\nb|red\nc|red\n' | HOME="$tmp" "$0" xleg1 --algo multipaxos >/dev/null 2>&1 || {
+      echo "smoke-test: FAIL (a legacy multipaxos topic must still run under multipaxos)"; exit 1; }
+    printf 'a|red\nb|red\nc|red\n' | HOME="$tmp" "$0" xleg2 >/dev/null 2>&1 || {
+      echo "smoke-test: FAIL (a legacy bft topic must still run under bft)"; exit 1; }
+    # …and once it has run, the binding is a STAMP rather than an inference.
+    HOME="$tmp" python3 -c "
+import json, os
+assert json.load(open(os.path.expanduser('~/.mesh/vote-state/xleg1.json')))['algo'] == 'multipaxos'
+assert json.load(open(os.path.expanduser('~/.mesh/vote-state/xleg2.json')))['algo'] == 'bft'
+" || { echo "smoke-test: FAIL (a completed round must stamp the topic's algorithm)"; exit 1; }
+
+    # A topic ALREADY contaminated by the defect carries both key families and two answers that
+    # disagree. Nothing in the protocol can arbitrate them, so it is its own refusal.
+    python3 - "$tmp" << 'PYMIX'
+import json, os, sys
+json.dump({"reputation": {"a": 0.55}, "last_consensus": "red", "last_confidence": 1.0,
+           "paxos": {"ballot": 1, "leader": "a", "slot": 2, "log": [], "last_chosen": "green",
+                     "acceptors": ["a", "b", "c", "d", "e"]}},
+          open(os.path.join(sys.argv[1], ".mesh", "vote-state", "xmix.json"), "w"))
+PYMIX
+    xm="$(printf 'a|x\nb|x\nc|x\n' | HOME="$tmp" "$0" xmix --algo multipaxos 2>&1)" && {
+      echo "smoke-test: FAIL (a topic carrying BOTH algorithms' state must refuse: $xm)"; exit 1; }
+    printf '%s' "$xm" | grep -q "BOTH algorithms" || {
+      echo "smoke-test: FAIL (the refusal must name the contamination: $xm)"; exit 1; }
+    printf '%s' "$xm" | grep -q "'green'" && printf '%s' "$xm" | grep -q "'red'" || {
+      echo "smoke-test: FAIL (the refusal must show BOTH disagreeing answers, or the operator cannot pick: $xm)"; exit 1; }
+
+    # --switch-algo is the explicit escape hatch, the same shape as --reconfigure: rebinding a
+    # running cluster's fault model is an operator decision taken outside the protocol.
+    sw="$(printf 'z|red\n' | HOME="$tmp" "$0" xalgo2 --algo multipaxos --switch-algo 2>&1)" || {
+      echo "smoke-test: FAIL (--switch-algo must be able to rebind the topic: $sw)"; exit 1; }
+    # AND THE SWITCH CARRIES THE MEMBERSHIP THE TOPIC ALREADY KNEW. The paxos sub-state is born
+    # empty, so without the carry this very round is a majority of itself and prints
+    # `chosen ... accepts=1/1` on a topic with five known workers — the switch would hand back
+    # the split-brain the guard just closed. Carrying can only RAISE the bar.
+    printf '%s' "$sw" | grep -q -- '— chosen ' && {
+      echo "smoke-test: FAIL (a lone voter chose on switch — the acceptor set was born empty: $sw)"; exit 1; }
+    printf '%s' "$sw" | grep -q 'turnout 1/6 below majority 4' || {
+      echo "smoke-test: FAIL (the switch must carry bft's 5 known workers into the acceptor set (+z = 6, majority 4): $sw)"; exit 1; }
+    swj="$(printf 'z|red\n' | HOME="$tmp" "$0" xalgo2 --json --algo multipaxos 2>&1)" || {
+      echo "smoke-test: FAIL (post-switch json round failed: $swj)"; exit 1; }
+    printf '%s' "$swj" | grep -q '"acceptors_src": "learned+carried"' || {
+      echo "smoke-test: FAIL (a carried acceptor set must SAY so, or the raised bar looks arbitrary: $swj)"; exit 1; }
+    # NEGATIVE ARM for the carry: a topic with no other-algorithm history reads plain "learned".
+    plainj="$(printf 'a|x\nb|x\n' | HOME="$tmp" "$0" xplain --json --algo multipaxos 2>&1)" || {
+      echo "smoke-test: FAIL (plain multipaxos topic failed: $plainj)"; exit 1; }
+    printf '%s' "$plainj" | grep -q '"acceptors_src": "learned"' || {
+      echo "smoke-test: FAIL (a topic with no carried membership must not claim one: $plainj)"; exit 1; }
+
     # ---- DURABILITY: a chosen slot is decided FOREVER, so the artifact must be atomic,
     # ---- serialized, and never silently reset. All three arms below were driven RED against
     # ---- the tool as it stood on 2026-08-28; the failing strings are quoted in each.
@@ -567,8 +807,13 @@ assert px['acceptors'] == ['a', 'b'], px['acceptors']
       echo "smoke-test: FAIL (the refusal rewrote the corrupt state instead of leaving it inspectable)"; exit 1; }
     # bft reads the same file through the same loader — the reset there silently drops every
     # reputation the EWMA spent rounds building, so it must refuse too.
-    printf 'a|x\n' | HOME="$tmp" "$0" dtopic 2>/dev/null && {
-      echo "smoke-test: FAIL (bft must refuse a corrupt state too)"; exit 1; }
+    dbft="$(printf 'a|x\n' | HOME="$tmp" "$0" dtopic 2>&1)" && {
+      echo "smoke-test: FAIL (bft must refuse a corrupt state too: $dbft)"; exit 1; }
+    # …for the CORRUPTION, and not merely because dtopic is bound to multipaxos. Since the algo
+    # guard landed there are two ways for this round to refuse, and an arm that cannot say which
+    # one fired stops testing the loader it documents [[a-mutant-can-go-red-for-the-wrong-reason]].
+    printf '%s' "$dbft" | grep -qi 'corrupt' || {
+      echo "smoke-test: FAIL (the bft refusal must name the corruption, not some other cause: $dbft)"; exit 1; }
     # NEGATIVE ARM — without it, "refuses" is satisfied by a guard that refuses unconditionally.
     rm -f "$dfile"
     printf 'a|blue\nb|blue\nc|blue\n' | HOME="$tmp" "$0" dtopic --algo multipaxos >/dev/null 2>&1 || {
@@ -669,14 +914,15 @@ time.sleep(4)" 2>"$tmp/held.err" &
     echo "smoke-test: ok"
     exit 0
     ;;
-  ""|--json|--algo|--acceptors|--reconfigure)
-    echo "usage: mesh-vote <topic> [--json] [--algo bft|multipaxos] [--acceptors <n>] [--reconfigure]  (opinions on stdin as worker|opinion)" >&2
+  ""|--json|--algo|--acceptors|--reconfigure|--switch-algo)
+    echo "usage: mesh-vote <topic> [--json] [--algo bft|multipaxos] [--acceptors <n>] [--reconfigure] [--switch-algo]  (opinions on stdin as worker|opinion)" >&2
     exit 1
     ;;
   *)
     topic="$1"; shift
     json_mode=0
     reconfigure=0
+    switch_algo=0
     algo="${MESH_VOTE_ALGO:-bft}"
     acceptors="${MESH_VOTE_ACCEPTORS:-}"
     # "given" is tracked apart from the VALUE: `--acceptors ""` (or a trailing --acceptors with
@@ -690,6 +936,7 @@ time.sleep(4)" 2>"$tmp/held.err" &
         --algo) shift; algo="${1:-}" ;;
         --acceptors) shift; acceptors="${1:-}"; acceptors_given=1 ;;
         --reconfigure) reconfigure=1 ;;
+        --switch-algo) switch_algo=1 ;;
         *) echo "mesh-vote: unknown arg '$1'" >&2; exit 1 ;;
       esac
       shift
@@ -710,6 +957,6 @@ time.sleep(4)" 2>"$tmp/held.err" &
     fi
     [ "$reconfigure" = 0 ] || [ "$algo" = multipaxos ] || {
       echo "mesh-vote: --reconfigure applies to --algo multipaxos only" >&2; exit 1; }
-    _run "$topic" "$json_mode" "$algo" "$acceptors" "$reconfigure"
+    _run "$topic" "$json_mode" "$algo" "$acceptors" "$reconfigure" "$switch_algo"
     ;;
 esac
