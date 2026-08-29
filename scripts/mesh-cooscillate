@@ -148,6 +148,18 @@ MAX_GAP_BINS="${COOSC_MAX_GAP_BINS:-3}"          # a Δ-step may only pair two c
                                                  # (~15min at BIN_S=300) tolerates one missed scan; wider = a
                                                  # snapshot-vs-snapshot levels compare, not a movement measurement.
 MIN_R="${COOSC_MIN_R:-0.6}"                      # |Pearson r| on deltas must exceed this
+REPL_ALPHA="${COOSC_REPL_ALPHA:-0.05}"           # REPLICATION gate: a finding is refused when its window r
+                                                 # and its OUT-OF-WINDOW r differ at this level (Fisher-z
+                                                 # two-sample). Not a second significance floor — the
+                                                 # Bonferroni family below counts pairs in ONE run, and this
+                                                 # tool re-tests the same pairs every 30 min on a sliding
+                                                 # view, so the tests that produce the winner are outside
+                                                 # what any correction on this window can see. Set 0 to
+                                                 # disable (then EVERY finding ships unreplicated).
+REFUSED_LOG="${COOSC_REFUSED_LOG:-$MESH/cooscillate-refused.log}"   # the refusals' OWN durable tape —
+                                                 # deliberately NOT the cron stdout log: sharing them would
+                                                 # make a dry run indistinguishable from a real refusal and
+                                                 # double-count the rate a reader is here for.
 ALPHA="${COOSC_ALPHA:-0.05}"                      # Bonferroni-corrected significance ceiling — a finding
                                                  # must clear p_corr ≤ ALPHA across ALL tested pairs, else
                                                  # it's winner's-curse noise (set 1 to disable the gate)
@@ -188,6 +200,7 @@ analyze() {
   COOSC_LOG="$1" COOSC_WIFI="${WIFI:-}" COOSC_WIFI_IMAC="${WIFI_IMAC:-}" COOSC_WINDOW_H="$WINDOW_H" COOSC_BIN_S="$BIN_S" \
   COOSC_MIN_BINS="$MIN_BINS" COOSC_MIN_OVERLAP="$MIN_OVERLAP" COOSC_MAX_GAP_BINS="$MAX_GAP_BINS" COOSC_MIN_R="$MIN_R" \
   COOSC_ALPHA="$ALPHA" COOSC_FLOOR_DBM="$FLOOR_DBM" COOSC_WIFI_FLOOR="$WIFI_FLOOR" \
+  COOSC_REPL_ALPHA="$REPL_ALPHA" COOSC_REFUSED_LOG="$REFUSED_LOG" \
   COOSC_SENS="${COOSC_SENS:-0}" python3 - <<'PY'
 import os, re, math, collections, datetime as dt
 
@@ -199,6 +212,8 @@ MIN_OVERLAP=int(os.environ["COOSC_MIN_OVERLAP"])
 MAX_GAP=int(os.environ.get("COOSC_MAX_GAP_BINS","3"))
 MIN_R=float(os.environ["COOSC_MIN_R"])
 ALPHA=float(os.environ.get("COOSC_ALPHA","0.05"))
+REPL_ALPHA=float(os.environ.get("COOSC_REPL_ALPHA","0.05"))
+REFUSED_LOG=os.environ.get("COOSC_REFUSED_LOG","")
 FLOOR_DBM=float(os.environ.get("COOSC_FLOOR_DBM","-92"))
 WIFI_FLOOR=float(os.environ.get("COOSC_WIFI_FLOOR","20"))  # positive-scale wifi floor (see WIFI_FLOOR / floor_pinned)
 SENS=os.environ.get("COOSC_SENS","0")=="1"   # report-only sensitivity pass (see --sensitivity)
@@ -306,20 +321,37 @@ def ingest_wifi(path, prefix=""):
 ingest_wifi(WIFI, "")
 ingest_wifi(WIFI_IMAC, "imac:")
 
+# THE TAPE BEFORE THE WINDOW IS EVIDENCE, NOT WASTE (task:CO-OSCILLATION Bluetooth x Smart TV Pro,
+# 2026-08-29). This line used to DELETE every sample older than the window, which is what made the
+# detector unable to check its own findings: it re-runs every 30 min on a SLIDING 48h view, so the
+# same pair is re-tested until one window happens to look strong, and the Bonferroni family it
+# corrects over is the pairs in ONE run — never the windows. Measured on this node's own 45-day
+# presence.log (3661 scans, 1091h): replaying the sweep at the shipped cadence gives 2087 runs, and
+# the reported pair cleared the gate in exactly ONE of them (r=+0.882, nd=9) while its correlation
+# over the WHOLE tape is r=-0.034 over 157 Δ-steps. Every one of the four pairs the sweep ever
+# emitted collapses the same way out of window (see the REPLICATION gate in PASS B). Keeping the
+# older samples costs one more binning pass and buys the only question that separates a finding from
+# a window: does it hold on data the window did not see?
+oow_samples=[]
 if samples:
     tmax=max(s[0] for s in samples)
     tmin=tmax-WINDOW_H*3600
+    oow_samples=[s for s in samples if s[0]<tmin]
     samples=[s for s in samples if s[0]>=tmin]
 
-# bin -> channel -> mean value
-binvals=collections.defaultdict(lambda: collections.defaultdict(list))
-for t,ch,v in samples:
-    binvals[int(t//BIN_S)][ch].append(v)
-series=collections.defaultdict(dict)   # channel -> {bin: mean}
-chans=set()
-for b,chm in binvals.items():
-    for ch,vs in chm.items():
-        series[ch][b]=sum(vs)/len(vs); chans.add(ch)
+def _binned(rows):
+    """rows -> (channel -> {bin: mean}). ONE binning grammar, used for BOTH the window and the tape
+    before it — two differently-binned series are not comparable and the whole gate is a comparison."""
+    bv=collections.defaultdict(lambda: collections.defaultdict(list))
+    for t,ch,v in rows: bv[int(t//BIN_S)][ch].append(v)
+    out=collections.defaultdict(dict)
+    for b,chm in bv.items():
+        for ch,vs in chm.items(): out[ch][b]=sum(vs)/len(vs)
+    return out
+
+series=_binned(samples)          # channel -> {bin: mean}   (the window under test)
+series_oow=_binned(oow_samples)  # channel -> {bin: mean}   (everything the window did NOT see)
+chans=set(series)
 # EPHEMERAL filter: drop channels seen in too few bins (BLE random-MAC churn → spurious short corrs)
 chans={c for c in chans if len(series[c])>=MIN_BINS}
 
@@ -406,6 +438,86 @@ def fisher_p(r,n):
     z=math.atanh(r)*math.sqrt(n-3)
     return math.erfc(abs(z)/math.sqrt(2.0))
 
+def _deltas(sA,sB):
+    """FIRST-DIFFERENCES over TIME-ADJACENT common bins, for two {bin:value} maps. Factored out so
+    PASS A and the REPLICATION gate below build their Δ series with the SAME grammar — a gate whose
+    predicate is not the one the finding was measured with is not a gate on that finding, and the
+    MAX_GAP adjacency rule is exactly the part that is easy to get silently different."""
+    common=sorted(set(sA) & set(sB)); da=[]; db=[]
+    for k in range(1,len(common)):
+        if common[k]-common[k-1] > MAX_GAP: continue   # gap-spanning step is a levels diff, not movement
+        da.append(sA[common[k]]-sA[common[k-1]]); db.append(sB[common[k]]-sB[common[k-1]])
+    return da,db
+
+def common_mode_r(A,B):
+    """MEASURE the driver the appliance branches below NAME, instead of asserting it.
+    "Scanner-side common-mode" is a claim with a test: if the RF path to a zone is rising and falling,
+    it moves EVERY channel there, not just this pair. So correlate each side's Δ against the MEDIAN Δ
+    of all the OTHER channels over the same steps — leave-BOTH-out, so neither side sits inside its
+    own index (the part-whole trap this file already paid for once with `n`). Same-family only: BLE
+    rssi: is negative dBm and wifi: is a POSITIVE Android quality scale, so a median across both is a
+    median of two different quantities. Returns (rA,rB,n) or None — no third channel is an UNKNOWN,
+    never a zero.
+    THE MEASUREMENT THIS WAS BUILT FROM (this node, 2026-08-29, 45-day presence.log / 3661 scans):
+    the driver is ABSENT here. The three always-present fixed broadcasters co-move at |r| <= 0.011
+    (n=2639..3324, every 95% CI inside +-0.05), a leave-one-out common-mode index explains 0.0-0.1%
+    of each one's Δ variance, and the arm restricted to scans with a non-fixed device present — the
+    "someone crosses the RF path" story itself — is r=+0.002..+0.008 on n>2600. So on this node a
+    scanner-zone activity signal has no co-fluctuation to be made of. That is a fact about ONE node's
+    RF environment and it is exactly why this is computed per window rather than written into the
+    text: the next node, or this one after the scanner moves, must be able to disagree with it."""
+    fam = "rssi:" if (A.startswith("rssi:") and B.startswith("rssi:")) else (
+          "wifi:" if (A.startswith("wifi:") and B.startswith("wifi:")) else None)
+    if fam is None: return None
+    others=[c for c in chans if c!=A and c!=B and c.startswith(fam)]
+    if len(others)<2: return None
+    dmap={}
+    for c in [A,B]+others:
+        bs=sorted(series[c]); d={}
+        for k in range(1,len(bs)):
+            if bs[k]-bs[k-1] > MAX_GAP: continue
+            d[bs[k]]=series[c][bs[k]]-series[c][bs[k-1]]
+        dmap[c]=d
+    xa=[];xb=[];idx=[]
+    for b in sorted(set(dmap[A]) & set(dmap[B])):
+        pool=sorted(dmap[c][b] for c in others if b in dmap[c])
+        if len(pool)<2: continue
+        m=pool[len(pool)//2] if len(pool)%2 else (pool[len(pool)//2-1]+pool[len(pool)//2])/2.0
+        xa.append(dmap[A][b]); xb.append(dmap[B][b]); idx.append(m)
+    if len(idx)<MIN_OVERLAP: return None
+    return pearson(xa,idx), pearson(xb,idx), len(idx)
+
+def _cm_clause(A,B,la,lb):
+    """One sentence of MEASURED evidence about the common-mode driver, for the tails that name it."""
+    cm=common_mode_r(A,B)
+    if cm is None:
+        return ("that driver is UNMEASURED here — too few same-family channels in this window to "
+                "build a leave-both-out common-mode index from, so it is a hypothesis, not a finding")
+    ra,rb,ncm=cm
+    pa,pb=fisher_p(ra,ncm),fisher_p(rb,ncm)
+    if pa<=0.05 and pb<=0.05 and (ra>0)==(rb>0):
+        verdict="the driver is PRESENT in this window, so a zone signal has something to be made of"
+    elif pa>0.05 and pb>0.05:
+        verdict=("the driver is ABSENT in this window — neither side tracks the other channels, so "
+                 "there is no co-fluctuation for a scanner-zone signal to be made of and DISCARD is "
+                 "the measured default")
+    else:
+        verdict="the evidence is MIXED — one side tracks the others and one does not"
+    return ("common-mode MEASURED on this window: %s r=%+.2f, %s r=%+.2f against the median Δ of the "
+            "other same-family channels (leave-both-out, n=%d) — %s" % (la,ra,lb,rb,ncm,verdict))
+
+def het_p(r1,n1,r2,n2):
+    """Two-sample Fisher-z test that two correlations DIFFER: z=(atanh r1 - atanh r2)/sqrt(1/(n1-3)+
+    1/(n2-3)), two-tailed. None when either sample is too small to transform — an unknown, never a
+    verdict. This is the replication statistic: it asks whether the window's r is a property of the
+    PAIR or a property of the WINDOW, and it is deliberately NOT another p-multiplier on the same
+    data (correcting the family harder cannot fix a search that never looked outside its own view)."""
+    if n1<=3 or n2<=3: return None
+    if abs(r1)>=1.0: r1=math.copysign(0.999999,r1)
+    if abs(r2)>=1.0: r2=math.copysign(0.999999,r2)
+    z=(math.atanh(r1)-math.atanh(r2))/math.sqrt(1.0/(n1-3)+1.0/(n2-3))
+    return math.erfc(abs(z)/math.sqrt(2.0))
+
 # PASS A — every pair with enough overlap is a STATISTICAL TEST; count them ALL so the significance
 # gate can correct for multiple comparisons. The tool scans C(channels,2) pairs and reports the MAX
 # |r| — so the headline finding is the best-of-N, and "p<0.05 on one pair" means nothing when N pairs
@@ -456,11 +568,7 @@ for i in range(len(chlist:=sorted(chans))):
         # oscillation. Real-data 2026-07-03: n × wifi MTSRouter_904F read r=0.52 over 38 steps, but 0 of
         # them were time-adjacent (32/38 spanned >3 bins, up to 68 = 5.7h); with the gate the pair drops
         # to nd<MIN_OVERLAP and vanishes, as it should. So only difference bins ≤ MAX_GAP bins apart.
-        da=[]; db=[]
-        for k in range(1,len(common)):
-            if common[k]-common[k-1] > MAX_GAP: continue   # gap-spanning step is a levels diff, not movement
-            da.append(series[A][common[k]]-series[A][common[k-1]])
-            db.append(series[B][common[k]]-series[B][common[k-1]])
+        da,db=_deltas(series[A],series[B])
         nd=len(da)
         if nd<MIN_OVERLAP: continue
         tested.append((A,B,pearson(da,db),nd))
@@ -580,6 +688,58 @@ for A,B,r,nd in tested:
     if la==lb: continue
     pcorr=min(1.0, fisher_p(r,nd)*ntests)
     if pcorr>ALPHA: continue                 # winner's-curse noise — do not emit (ALPHA=1 disables)
+    # ── REPLICATION: DOES IT HOLD ON DATA THE WINDOW DID NOT SEE? (task:CO-OSCILLATION Bluetooth x
+    # Smart TV Pro, 2026-08-29) ──────────────────────────────────────────────────────────────────
+    # The Bonferroni gate above corrects across the pairs tested in ONE run. That is the wrong family:
+    # this tool runs `13-59/30 * * * *` over a SLIDING 48h view, so a pair is re-tested until one
+    # window looks strong and the FIRST lucky window is emitted. Correcting harder cannot fix it —
+    # the extra tests are not in the data the correction can see. Measured on this node's own tape
+    # (45 days, 3661 scans), replaying the sweep at the shipped cadence — 2087 runs — the detector
+    # emitted FOUR distinct pairs in its whole life, and every one of them evaporates out of window:
+    #   Bluetooth × Smart TV Pro  r=+0.88 (nd=9)  → out-of-window r=-0.08 over 147 Δ-steps
+    #   Bluetooth × 19-47-…-34-E9 r=+0.86 (nd=9)  → out-of-window r=+0.02 over  48 Δ-steps
+    #   Bose × Smart TV Pro       r=-0.76 (nd=11) → out-of-window r=-0.10 over 145 Δ-steps
+    #   Bose × DV8235             r=-0.75 (nd=11) → out-of-window r=+0.04 over 888 Δ-steps
+    # All four sit at nd=9..11 against MIN_OVERLAP=8 — the smallest admissible sample is the whole
+    # signature. A circular-shift surrogate (one channel's values rotated along its own observation
+    # sequence: presence pattern and autocorrelation kept, cross-coupling destroyed by construction)
+    # reproduces this: 10 of 12 surrogates still emit somewhere in the sweep, and 1 of 12 reproduces
+    # the reported pair itself. So the emitted finding is what the null produces.
+    # The test is HETEROGENEITY, not a second significance floor: if the window's r and the
+    # out-of-window r differ significantly, the correlation is a property of the WINDOW, not of the
+    # pair. A genuine standing coupling has r_oow ≈ r_win and passes untouched.
+    # WITH TOO LITTLE OUT-OF-WINDOW OVERLAP THERE IS NO VERDICT, AND THE FINDING STILL SHIPS — marked.
+    # A pair genuinely co-moving for the first time (two devices in one bag this afternoon) has no
+    # prior overlap by construction, and refusing it would be the same manufactured-claim error in
+    # the opposite direction. It is emitted carrying the word UNREPLICATED instead.
+    doa,dob=_deltas(series_oow.get(A,{}), series_oow.get(B,{}))
+    nd_oow=len(doa)
+    r_oow=pearson(doa,dob) if nd_oow>=2 else 0.0
+    hp = het_p(r,nd,r_oow,nd_oow) if (REPL_ALPHA>0 and nd_oow>=MIN_OVERLAP) else None
+    if hp is not None and hp<=REPL_ALPHA:
+        # LOUD, never silent: a refusal is a finding about the DETECTOR and its rate is the thing a
+        # reader needs. Its own tape — never the cron stdout log a watchdog reads for liveness.
+        if REFUSED_LOG:
+            try:
+                with open(REFUSED_LOG,"a") as _f:
+                    _f.write("%s REFUSED-UNREPLICATED %s x %s r_win=%+.3f nd=%d r_oow=%+.3f nd_oow=%d "
+                             "het_p=%.4f window=%gh\n"
+                             % (dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                                la, lb, r, nd, r_oow, nd_oow, hp, WINDOW_H))
+            except Exception: pass
+        continue
+    # THREE OUTCOMES, THREE WORDS. An off-switch and an absence of data are different facts and must
+    # not share a sentence: with COOSC_REPL_ALPHA=0 the first cut printed "UNREPLICATED: 146
+    # out-of-window Δ-steps — no prior overlap to re-test against", which is false in its own second
+    # clause — the overlap existed and was simply not checked. A disabled gate that reports itself as
+    # missing evidence is worse than one that reports nothing.
+    if hp is not None:
+        repl="out-of-window r=%+.2f over %d Δ-steps, consistent (het p=%.2f)" % (r_oow,nd_oow,hp)
+    elif REPL_ALPHA<=0:
+        repl=("replication gate DISABLED (COOSC_REPL_ALPHA=0) — %d out-of-window Δ-step(s) exist and "
+              "were NOT checked" % nd_oow)
+    else:
+        repl="UNREPLICATED: %d out-of-window Δ-step(s) — no prior overlap to re-test against" % nd_oow
     phase = "in sync (rise & fall together)" if r>0 else "in anti-phase (one rises as the other falls)"
     score=abs(r)*math.sqrt(nd)
     key="coosc:%s:%s" % tuple(sorted([la,lb]))
@@ -617,11 +777,12 @@ for A,B,r,nd in tested:
     elif ca=="APPLIANCE" and cb=="APPLIANCE":
         tail=("both %s and %s are STATIONARY (fixed infrastructure — appliance or WiFi AP) — two fixed appliances cannot co-MOVE, "
               "so this is NOT one carrier and NOT a co-moving presence cluster. Structural coupling needs BOTH "
-              "units able to change (Maturana & Varela): with neither mobile the only shared driver is "
+              "units able to change (Maturana & Varela): with neither mobile the remaining candidate is "
               "SCANNER-SIDE common-mode — the RF path to their shared zone rising/falling as someone crosses it "
-              "or the scanner's gain/multipath drifts. Propose a scanner-zone activity signal (co-fluctuation of "
-              "fixed anchors = motion through that zone) or discard as RF drift."
-              % (la, lb))
+              "or the scanner's gain/multipath drifts. That is a claim with a test, so it is MEASURED, not "
+              "asserted: %s. Propose a scanner-zone activity signal (co-fluctuation of fixed anchors = motion "
+              "through that zone) only if the measurement above supports one."
+              % (la, lb, _cm_clause(A,B,la,lb)))
     elif "APPLIANCE" in (ca,cb):
         # exactly one side is STATIONARY (by name OR behaviour) and the other is NOT a co-mobile personal
         # device (it is AMBIGUOUS — often an anonymous random-MAC "?"). A fixed unit can't be one co-moving
@@ -634,17 +795,20 @@ for A,B,r,nd in tested:
                 "co-movement vs same-zone is undecidable)" % other) if anon
                else ("%s is not a co-mobile personal device" % other))
         tail=("%s is behaviourally STATIONARY (a persistent fixed broadcaster — present across most scans at a "
-              "stable level, so it can't be one co-moving carrier) while %s. The shared driver is SAME-ZONE "
-              "scanner-side RF common-mode (the RF path to their shared zone rising/falling as someone crosses "
-              "it or the scanner's gain/multipath drifts), NOT a co-moving presence cluster. Propose a "
-              "zone-anchor/scanner-zone activity signal, or discard as RF drift."
-              % (fixed, who))
+              "stable level, so it can't be one co-moving carrier) while %s. So this is not a co-moving presence "
+              "cluster; the remaining candidate is SAME-ZONE scanner-side RF common-mode (the RF path to their "
+              "shared zone rising/falling as someone crosses it or the scanner's gain/multipath drifts) — and "
+              "that candidate is MEASURED, not assumed: %s. Propose a zone-anchor/scanner-zone activity signal "
+              "only if the measurement above supports one."
+              % (fixed, who, _cm_clause(A,B,la,lb)))
     else:
         tail=("same carrier/zone, a shared driver, or coincidence? If real, propose a fused sense (e.g. a "
               "co-moving-device cluster as one presence signal) or a reflex; if spurious, discard in one line.")
+    # The PREFIX up to " fluctuate" is mesh-queue-tend's resolver contract (:101) and is untouched;
+    # the replication term rides inside the stats parenthesis, after it.
     idea=("CO-OSCILLATION (auto, real data): %s and %s fluctuate %s (r=%.2f, %d Δ-steps over %.1fh of sensor scans, "
-          "p_corr=%.3f over %d pairs tested) — %s"
-          % (la, lb, phase, r, nd, WINDOW_H, pcorr, ntests, tail))
+          "p_corr=%.3f over %d pairs tested, %s) — %s"
+          % (la, lb, phase, r, nd, WINDOW_H, pcorr, ntests, repl, tail))
     cands.append((score,"COOSC",key,idea))
 
 cands.sort(key=lambda c:-c[0])
@@ -658,10 +822,27 @@ mode="run"
 case "${1:-}" in
   --dry|--list) mode="dry" ;;
   --sensitivity) mode="sens" ;;
+  --refused) mode="refused" ;;
   --test) mode="test" ;;
   "" ) mode="run" ;;
-  *) echo "usage: mesh-cooscillate [--dry|--list|--sensitivity|--test]" >&2; exit 2 ;;
+  *) echo "usage: mesh-cooscillate [--dry|--list|--sensitivity|--refused|--test]" >&2; exit 2 ;;
 esac
+
+# ---------- refused view (the REPLICATION gate's own rate, report-only) ----------
+# A gate nobody can read the rate of is indistinguishable from a gate that never fires. An ABSENT
+# tape is UNKNOWN — never "0 refusals", which would read as "the detector has been clean".
+if [ "$mode" = "refused" ]; then
+  if [ ! -f "$REFUSED_LOG" ]; then
+    echo "[coosc-refused] unmeasured — no ledger at $REFUSED_LOG yet (the gate has never written; that is"
+    echo "                NOT the same as zero refusals). It is written only by a real run that reached PASS B."
+    exit 2
+  fi
+  _n=$(grep -c 'REFUSED-UNREPLICATED' "$REFUSED_LOG" 2>/dev/null || echo 0)
+  _first=$(grep -m1 'REFUSED-UNREPLICATED' "$REFUSED_LOG" 2>/dev/null | awk '{print $1}')
+  echo "[coosc-refused] $_n finding(s) refused as unreplicated${_first:+ since $_first} (repl-alpha=$REPL_ALPHA)"
+  grep 'REFUSED-UNREPLICATED' "$REFUSED_LOG" 2>/dev/null | tail -20
+  exit 0
+fi
 
 # ---------- sensitivity (report-only; never writes state, never emits an idea) ----------
 if [ "$mode" = "sens" ]; then
@@ -673,6 +854,9 @@ if [ "$mode" = "test" ]; then
   _td="$(mktemp -d)"; trap 'rm -rf "$_td"' EXIT
   WIFI=""        # ISOLATE the BLE assertions from the real ~/.mesh/wifi.log (analyze() reads global $WIFI in-process)
   WIFI_IMAC=""   # likewise isolate from the real ~/.mesh/wifi-imac.log (cross-node tape)
+  REFUSED_LOG="$_td/refused.log"   # FENCE the replication ledger: analyze() writes it in-process, and a
+                                   # --test appending to the durable tape a human reads for the gate's RATE
+                                   # forges exactly the evidence that tape exists to carry.
   tp="$_td/presence.log"
   # plant: device AA and device BB RSSI fluctuate IN SYNC; CC moves opposite to AA; n is flat-ish.
   python3 - "$tp" <<'PY'
@@ -1123,7 +1307,158 @@ PY
   [ "$src" = 2 ] || { echo "smoke-test: FAIL (--sensitivity on an empty corpus exited $src, not 2 — an unmeasurable floor must not render as a number): $sempty"; exit 1; }
   printf '%s\n' "$sempty" | grep -q 'unmeasured' \
     || { echo "smoke-test: FAIL (--sensitivity on an empty corpus did not say unmeasured): $sempty"; exit 1; }
-  echo "smoke-test: ok (in-sync pair found & ranked top; anti-phase detected; one finding emitted; seed written; floor-gate holds; behavioural-stationarity reclassifies generic broadcaster; graded matching: emit flips exactly at the published operative floor, blind band non-empty & falsifiable)"
+  # ── REPLICATION GATE: does the finding hold on data the WINDOW DID NOT SEE?
+  # (task:CO-OSCILLATION Bluetooth x Smart TV Pro, 2026-08-29) ────────────────────────────────────
+  # THE ESCAPE THIS CLOSES, and why no arm above could catch it: every fixture in this suite is
+  # SHORTER than WINDOW_H, so the window is the whole tape and there has never been an out-of-window
+  # sample to test against. The live detector is the opposite — a 45-day tape re-tested every 30 min
+  # through a sliding 48h view — and it emitted four pairs in its whole recorded life, all four of
+  # which evaporate outside the window that found them (numbers in the PASS B block). The fixture
+  # below is the first in this file that is LONGER than its own window, which is the only shape that
+  # can discriminate. Three planted pairs, one per outcome, and each is a direction this may not
+  # fail in: a window-only coupling must be REFUSED, a standing one must still SHIP, and one with no
+  # prior overlap must ship MARKED (refusing it would be the same manufactured claim reversed).
+  tp2="$_td/presence-repl.log"
+  python3 - "$tp2" <<'PY'
+import sys, datetime as dt, random
+out=open(sys.argv[1],"w"); random.seed(11)
+base=dt.datetime(2026,6,1,0,0,0,tzinfo=dt.timezone.utc)
+TOTAL=420; WINSTART=TOTAL-288          # 10-min steps; the last 288 (=48h) are the window under test
+def w(): return random.uniform(-6,6)
+for k in range(TOTAL):
+    t=(base+dt.timedelta(minutes=10*k)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    inwin = k>=WINSTART
+    a,b,c = w(), w(), w()
+    d=[]
+    # StableP/StableQ — share ONE wobble for the whole tape: a standing coupling, must survive.
+    d.append("%d|A1:00:00:00:00:01|StableP" % round(-60+a))
+    d.append("%d|A1:00:00:00:00:02|StableQ" % round(-64+a))
+    # WinOnlyP/WinOnlyQ — share a wobble ONLY inside the window, independent before it. This is the
+    # live shape: strong in the window that found it, nothing outside.
+    d.append("%d|B2:00:00:00:00:01|WinOnlyP" % round(-62+b))
+    d.append("%d|B2:00:00:00:00:02|WinOnlyQ" % round(-66+(b if inwin else w())))
+    # FreshP/FreshQ — exist ONLY inside the window: no prior overlap, so nothing can be tested.
+    if inwin:
+        d.append("%d|C3:00:00:00:00:01|FreshP" % round(-63+c))
+        d.append("%d|C3:00:00:00:00:02|FreshQ" % round(-67+c))
+    out.write("%s host n=%d devices=[%s]\n" % (t, len(d), " ".join(d)))
+out.close()
+PY
+  : > "$_td/refused.log"
+  rep="$(WINDOW_H=48 BIN_S=300 MIN_OVERLAP=8 MIN_R=0.6 ALPHA=0.05 REPL_ALPHA=0.05 analyze "$tp2")"
+  # (a) THE ESCAPE: a coupling that exists only inside the discovery window must NOT be emitted.
+  printf '%s\n' "$rep" | grep -q 'WinOnly' \
+    && { echo "smoke-test: FAIL (a pair coupled ONLY inside the window was emitted — this is the live Bluetooth x Smart TV Pro shape: r=+0.88 on 9 Δ-steps in one of 2087 sliding windows, r=-0.08 on 146 outside it): $rep"; exit 1; }
+  # ...and the refusal is LOUD: its own ledger row carrying BOTH correlations and the het p, so the
+  # gate's RATE is readable. A gate that drops findings silently is indistinguishable from a detector
+  # that found nothing.
+  grep -q 'REFUSED-UNREPLICATED .*WinOnly' "$_td/refused.log" \
+    || { echo "smoke-test: FAIL (the refusal left no ledger row — a silently-dropped finding cannot be audited or recovered): $(cat "$_td/refused.log")"; exit 1; }
+  grep -E 'REFUSED-UNREPLICATED .*WinOnly.*r_win=.*nd=.*r_oow=.*nd_oow=.*het_p=' "$_td/refused.log" >/dev/null \
+    || { echo "smoke-test: FAIL (the refusal row does not carry both correlations + their sample sizes + the het p — a reader cannot tell a marginal refusal from this one): $(cat "$_td/refused.log")"; exit 1; }
+  # (b) FALSIFIABLE: with the gate disabled the SAME fixture must emit that pair — proving the plant
+  # is real and the GATE, not the plant, is what suppressed it.
+  loose_r="$(WINDOW_H=48 BIN_S=300 MIN_OVERLAP=8 MIN_R=0.6 ALPHA=0.05 REPL_ALPHA=0 analyze "$tp2")"
+  printf '%s\n' "$loose_r" | grep -q 'WinOnly' \
+    || { echo "smoke-test: FAIL (replication gate disabled but the window-only pair STILL did not emit — it is being dropped by something else, so leg (a) proves nothing): $loose_r"; exit 1; }
+  # ...and turning the gate OFF must not make the tool claim there was nothing to check. A disabled
+  # gate and an absent overlap are different facts; the first cut of this clause printed "no prior
+  # overlap to re-test against" over 146 real out-of-window Δ-steps.
+  printf '%s\n' "$loose_r" | grep -q 'replication gate DISABLED' \
+    || { echo "smoke-test: FAIL (with the gate disabled the finding does not say so): $loose_r"; exit 1; }
+  printf '%s\n' "$loose_r" | grep -E 'WinOnly.*no prior overlap to re-test against' >/dev/null \
+    && { echo "smoke-test: FAIL (a DISABLED gate reported itself as missing evidence — an off-switch wearing the word for an absence, over out-of-window data that exists): $loose_r"; exit 1; }
+  # (c) THE CONTROL ARM — the fix must not buy its silence by refusing everything. A pair coupled
+  # across the WHOLE tape must still ship, and must carry the out-of-window evidence that cleared it.
+  stable="$(printf '%s\n' "$rep" | grep -E 'Stable[PQ].*Stable[PQ]')"
+  [ -n "$stable" ] \
+    || { echo "smoke-test: FAIL (a coupling that holds across the whole tape was refused — the gate is suppressing real findings, not window artifacts): $rep"; exit 1; }
+  printf '%s\n' "$stable" | grep -q 'out-of-window r=.*consistent (het p=' \
+    || { echo "smoke-test: FAIL (a replicated finding does not carry the out-of-window r it was checked against — the claim is unreadable): $stable"; exit 1; }
+  # (d) UNKNOWN MAY NOT MANUFACTURE A REFUSAL EITHER. A pair with no prior overlap (two devices
+  # co-moving for the first time — the canonical one-bag case) cannot be tested, so it SHIPS, wearing
+  # the word UNREPLICATED. Dropping it would be the same fabricated claim in the opposite direction.
+  fresh="$(printf '%s\n' "$rep" | grep -E 'Fresh[PQ].*Fresh[PQ]')"
+  [ -n "$fresh" ] \
+    || { echo "smoke-test: FAIL (a pair with NO out-of-window overlap was refused — an untestable claim is UNKNOWN, and refusing it is as much a fabrication as emitting it confirmed): $rep"; exit 1; }
+  printf '%s\n' "$fresh" | grep -q 'UNREPLICATED' \
+    || { echo "smoke-test: FAIL (an untestable finding shipped WITHOUT the UNREPLICATED mark — it reads exactly like one that passed the gate): $fresh"; exit 1; }
+  printf '%s\n' "$fresh" | grep -q 'consistent (het p=' \
+    && { echo "smoke-test: FAIL (a finding with no out-of-window data claims it is consistent with data that does not exist): $fresh"; exit 1; }
+  # (e) the resolver contract survives: mesh-queue-tend sed's up to " fluctuate", so the replication
+  # term must ride AFTER it. A prefix change here silently strands every CO-OSCILLATION idea as an
+  # unresolvable STIMULUS-STALL re-float.
+  printf '%s\n' "$stable" | grep -qE 'CO-OSCILLATION \(auto, real data\): [^(]* and [^(]* fluctuate ' \
+    || { echo "smoke-test: FAIL (the replication term moved into the prefix mesh-queue-tend keys on): $stable"; exit 1; }
+  # (f) --refused must render an ABSENT ledger as UNKNOWN, never as "0 refusals" — a gate that has
+  # never written and a gate that never fires are different facts with opposite meanings.
+  rmiss="$(COOSC_REFUSED_LOG="$_td/nope.log" bash "$0" --refused 2>&1)"; rrc=$?
+  [ "$rrc" = 2 ] || { echo "smoke-test: FAIL (--refused on an absent ledger exited $rrc, not 2 — an unwritten gate must not render as a clean one): $rmiss"; exit 1; }
+  printf '%s\n' "$rmiss" | grep -q 'unmeasured' \
+    || { echo "smoke-test: FAIL (--refused on an absent ledger did not say unmeasured): $rmiss"; exit 1; }
+  # ── COMMON-MODE IS MEASURED, NOT ASSERTED (task:CO-OSCILLATION Bluetooth x Smart TV Pro,
+  # 2026-08-29) ──────────────────────────────────────────────────────────────────────────────────
+  # The two appliance tails used to STATE that the driver "is SAME-ZONE scanner-side RF common-mode"
+  # and then ask for a zone signal to be built on it. That is a claim with a test, and on the node
+  # that produced this task the test comes back NEGATIVE: the three always-present fixed broadcasters
+  # co-move at |r| <= 0.011 over 2639-3324 Δ-steps and a leave-one-out common-mode index explains
+  # 0.0-0.1% of each one's Δ variance — so the co-fluctuation a scanner-zone signal would be made of
+  # is not there. The fix is not to write that node's answer into the text (the next node must be
+  # able to disagree) but to MEASURE it per window and ship the number. Three fixtures, one per
+  # verdict, because a clause that can only ever say one thing is decoration.
+  _cmlog(){   # <path> <mode: present|absent|solo>
+    python3 - "$1" "$2" <<'PY'
+import sys, datetime as dt, random
+path,mode=sys.argv[1],sys.argv[2]
+out=open(path,"w"); random.seed(5)
+base=dt.datetime(2026,6,10,0,0,0,tzinfo=dt.timezone.utc)
+def w(): return random.uniform(-7,7)
+for k in range(20):
+    t=(base+dt.timedelta(minutes=6*k)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    g=w()                      # the GLOBAL RF wobble — present only in the 'present' fixture
+    p=w()                      # the pair's OWN shared wobble
+    gg = g if mode=="present" else 0.0
+    d=["%d|CC:CC:CC:CC:CC:CC|TV" % round(-70+p+gg),
+       "%d|B0:5E:B0:5E:B0:5E|Bose" % round(-66+p+gg)]
+    if mode!="solo":
+        # six other same-family channels. In 'present' they carry the SAME global wobble (that IS
+        # common-mode); in 'absent' each moves independently, so the index tracks neither side.
+        for i in range(6):
+            d.append("%d|E%d:00:00:00:00:0%d|Other%d" % (round(-64+(gg if mode=="present" else 0)+w()*0.35), i, i, i))
+    out.write("%s host n=%d devices=[%s]\n" % (t, len(d), " ".join(d)))
+out.close()
+PY
+  }
+  for _m in present absent solo; do _cmlog "$_td/cm-$_m.log" "$_m"; done
+  _cmrun(){ WINDOW_H=48 BIN_S=300 MIN_OVERLAP=6 MIN_R=0.6 ALPHA=0.05 analyze "$_td/cm-$1.log" \
+              | grep -E 'TV.*Bose|Bose.*TV' | head -1; }
+  # (a) the clause must SHIP the numbers — both sides' r against the others' median Δ, and its n.
+  cma="$(_cmrun absent)"
+  [ -n "$cma" ] || { echo "smoke-test: FAIL (the common-mode fixture emitted no appliance pair at all — the arms below would be vacuous)"; exit 1; }
+  printf '%s\n' "$cma" | grep -qE 'common-mode MEASURED on this window: .*r=[-+][0-9.]+, .*r=[-+][0-9.]+ against the median Δ of the other same-family channels \(leave-both-out, n=[0-9]+\)' \
+    || { echo "smoke-test: FAIL (the appliance tail names a driver without measuring it — an asserted mechanism is what sent this task out as 'propose a zone signal' over a driver that is not there): $cma"; exit 1; }
+  # (b) ABSENT: a pair coupled ONLY to each other, with every other channel independent. Nothing for a
+  # zone signal to be made of — this is the live case, and the clause must SAY so.
+  printf '%s\n' "$cma" | grep -q 'the driver is ABSENT in this window' \
+    || { echo "smoke-test: FAIL (a pair whose movement is shared with NO other channel was not called ABSENT — the clause cannot deliver a negative, so it can never stop a zone-signal proposal): $cma"; exit 1; }
+  printf '%s\n' "$cma" | grep -q 'DISCARD is the measured default' \
+    || { echo "smoke-test: FAIL (an absent driver did not name discard as the measured default): $cma"; exit 1; }
+  # (c) PRESENT: the SAME pair under a genuine global RF wobble every channel carries. The clause must
+  # flip — a verdict that cannot flip is decoration, and this is the arm that proves the plant works.
+  cmp_="$(_cmrun present)"
+  [ -n "$cmp_" ] || { echo "smoke-test: FAIL (the common-mode PRESENT fixture emitted no appliance pair)"; exit 1; }
+  printf '%s\n' "$cmp_" | grep -q 'the driver is PRESENT in this window' \
+    || { echo "smoke-test: FAIL (a real global common-mode wobble carried by every channel was NOT detected — the clause answers ABSENT unconditionally, so leg (b) proves nothing): $cmp_"; exit 1; }
+  # (d) UNMEASURED: with no third same-family channel there is no index to build. That is an UNKNOWN
+  # and must read as one — never as ABSENT, which would be the tool manufacturing a negative finding
+  # out of having nothing to measure with.
+  cms="$(_cmrun solo)"
+  [ -n "$cms" ] || { echo "smoke-test: FAIL (the 2-channel fixture emitted no appliance pair)"; exit 1; }
+  printf '%s\n' "$cms" | grep -q 'that driver is UNMEASURED here' \
+    || { echo "smoke-test: FAIL (with no third channel to build an index from the clause did not say UNMEASURED): $cms"; exit 1; }
+  printf '%s\n' "$cms" | grep -q 'the driver is ABSENT in this window' \
+    && { echo "smoke-test: FAIL (having nothing to measure with was rendered as a measured ABSENT — an unknown manufacturing a negative): $cms"; exit 1; }
+  echo "smoke-test: ok (in-sync pair found & ranked top; anti-phase detected; one finding emitted; seed written; floor-gate holds; behavioural-stationarity reclassifies generic broadcaster; graded matching: emit flips exactly at the published operative floor, blind band non-empty & falsifiable; REPLICATION gate: window-only coupling refused + ledgered, standing coupling survives carrying its out-of-window r, no-prior-overlap ships marked UNREPLICATED, falsifiable, resolver prefix intact, absent ledger reads unmeasured; common-mode MEASURED per window: absent/present both driven, numbers shipped, no-index reads UNMEASURED)"
   exit 0
 fi
 
