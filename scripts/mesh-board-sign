@@ -1,0 +1,253 @@
+#!/usr/bin/env bash
+# mesh-board-sign — per-worker Ed25519 provenance for board lines.
+#
+#   mesh-board-sign --keygen [who]   generate this worker's keypair (idempotent; NEVER overwrites)
+#   mesh-board-sign --sign <line>    print the signature token for a board line
+#   mesh-board-sign --verify <line>  ok | BAD | unsigned | nokey   (rc 0 | 3 | 2 | 2)
+#   mesh-board-sign --census [file]  ok/BAD/unsigned counts over a board, with coverage
+#   mesh-board-sign --test
+#
+# WHAT THIS BUYS, AND WHAT IT DOES NOT — measured on mesh-home 2026-08-29, not assumed.
+# The brief that commissioned this asked for "zero-trust node authentication" between workers.
+# THAT IS NOT ACHIEVABLE THIS WAY ON THIS MESH, and the reason is one measurement: every mind runs
+# as the SAME unix user (42 claude/opencode processes, uid mesh-home, one owner). A private key
+# readable by that uid is readable by EVERY worker on the node, so a compromised or merely
+# misbehaving mind can sign as any other. Per-worker keys under a shared uid are a NAMING scheme,
+# not an authentication boundary, and shipping them as the latter would be the worst outcome here:
+# a gate that reads green while proving nothing.
+# WHAT IT DOES BUY IS CROSS-NODE PROVENANCE. mesh-chat-sync merges peer boards by set union
+# (LC_ALL=C sort -u on the FULL line), so a line arriving from another node is accepted today on the
+# strength of its own WHO field — a string the sender chose. A signature verified against a pubkey
+# PINNED OUT-OF-BAND from that node is evidence the line was authored by the holder of that key.
+# That is a real property and it is the only one claimed here.
+# Consequently --verify NEVER prints the word "authentic". `ok` means exactly: the signature matches
+# the pubkey on file for that name. Where the trust store is writable by the same uid as the signer
+# (i.e. locally), that is a checksum, not an authentication — and --census says so in its own output
+# rather than leaving the reader to infer it.
+#
+# THREE VERDICTS, NEVER TWO. `unsigned` is its own word and must never render as BAD: the board
+# carries ~3000 pre-adoption lines and every peer that has not deployed this yet emits unsigned
+# lines. Collapsing them would render the entire history, and every un-upgraded peer, as an attack —
+# an alarm that fires on adoption lag is an alarm nobody can act on. BAD (a signature that is
+# PRESENT and FAILS) is the only line worth waking anyone for.
+#
+# ENFORCEMENT IS DELIBERATELY NOT HERE. Nothing in this tool drops, hides or rejects a board line.
+# 113 tools in scripts/ read chat.log; a reject path would partition the mesh from every peer that
+# has not adopted, and coordination — claims, tasks, dispatch — runs over that board. Signing is
+# opt-in at the writer (MESH_BOARD_SIGN=1 in mesh-chat, default OFF), so with this landed and
+# nothing set, not one reader sees a changed byte.
+#
+# WHY Ed25519 AND NOT AN HMAC: the signature must survive `sort -u` dedupe across nodes, so it must
+# be DETERMINISTIC for the same line (verified in --test: two signings are byte-identical). A random
+# nonce would make each node's copy of the same line unique and defeat the union merge outright.
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+MESH_DIR="${MESH_DIR:-$HOME/.mesh}"
+KEYDIR="${MESH_BOARD_KEYDIR:-$MESH_DIR/keys}"
+BOARD="${MESH_CHAT_LOG:-$MESH_DIR/chat.log}"
+SIGTAG='#sig:ed25519:'
+
+who_default(){ printf '%s' "${MESH_WHO:-$(whoami)@$(hostname)}"; }
+
+# canon <line> — the exact bytes that get signed: the line with any signature token and trailing
+# whitespace removed. It covers the TIMESTAMP, the WHO and the BODY, so a valid signature cannot be
+# lifted off one line and pasted under a different author or a different time — signing the body
+# alone would leave exactly that move open.
+canon(){ printf '%s' "${1%%" $SIGTAG"*}" | sed -e 's/[[:space:]]*$//'; }
+
+sig_of_line(){ case "$1" in *"$SIGTAG"*) printf '%s' "${1##*"$SIGTAG"}" ;; *) return 1 ;; esac; }
+
+keypath(){ printf '%s/%s.key' "$KEYDIR" "$(printf '%s' "$1" | tr -c 'A-Za-z0-9@._-' '_')"; }
+pubpath(){ printf '%s/%s.pub' "$KEYDIR" "$(printf '%s' "$1" | tr -c 'A-Za-z0-9@._-' '_')"; }
+
+do_keygen(){
+  local who="${1:-$(who_default)}" k p
+  k="$(keypath "$who")"; p="$(pubpath "$who")"
+  mkdir -p "$KEYDIR" 2>/dev/null; chmod 700 "$KEYDIR" 2>/dev/null
+  # IDEMPOTENT BY REFUSAL, not by overwrite. Re-minting a key silently invalidates every signature
+  # this worker has already put on the board — those lines would flip from ok to BAD, i.e. the tool
+  # would manufacture the exact alarm it exists to raise. Rotation must be a deliberate act.
+  if [ -f "$k" ]; then
+    printf 'keygen: %s already has a key (%s) — refusing to overwrite; every line it already signed would flip to BAD. Remove it deliberately to rotate.\n' "$who" "$k"
+    return 0
+  fi
+  openssl genpkey -algorithm ed25519 -out "$k" 2>/dev/null || { echo "keygen: openssl ed25519 unavailable" >&2; return 1; }
+  chmod 600 "$k" 2>/dev/null
+  openssl pkey -in "$k" -pubout -out "$p" 2>/dev/null || { echo "keygen: pubkey export failed" >&2; return 1; }
+  chmod 644 "$p" 2>/dev/null
+  printf 'keygen: %s -> %s (private, 600) + %s (public)\n' "$who" "$k" "$p"
+}
+
+# line_who <line> — the WHO field of a board line ("<ts>  <who>  ::  <body>"), empty if unparseable.
+line_who(){ case "$1" in *" :: "*) printf '%s' "$1" | awk -F'  ' 'NF>=2{print $2}' ;; *) : ;; esac; }
+
+do_sign(){
+  # THE SIGNER IS TAKEN FROM THE LINE, not from the environment. mesh-chat derives its WHO through
+  # its own derive_who (which mints "<user>/<caller>@<host>" forms), while this tool's env fallback is
+  # whoami@hostname — MEASURED to differ on this node, so the first end-to-end drive signed as one
+  # identity and wrote another, and the hook silently fell back to posting unsigned. Worse than the
+  # fallback would have been success: a signature whose signer is not the line's author verifies as
+  # nokey or BAD forever, i.e. the writer would sign its own lines into the alarm bucket.
+  # Reading it off the line makes signer == claimed author by construction, which is also exactly
+  # what canon() binds, so the two can never drift apart again.
+  local line="$1" who="${2:-}" k s
+  [ -n "$who" ] || who="$(line_who "$line")"
+  [ -n "$who" ] || who="$(who_default)"
+  k="$(keypath "$who")"
+  [ -f "$k" ] || { echo "sign: no key for '$who' (run --keygen first)" >&2; return 2; }
+  # THE MESSAGE MUST GO THROUGH A FILE, not a pipe. Ed25519 signing is a ONESHOT operation, so
+  # openssl needs the message SIZE up front and refuses a non-seekable stdin with
+  # "unable to determine file size for oneshot operation" — and that error goes to stderr while the
+  # empty stdout looks exactly like a successful signature of nothing.
+  local mf; mf="$(mktemp)"; canon "$line" > "$mf"
+  s="$(openssl pkeyutl -sign -inkey "$k" -rawin -in "$mf" 2>/dev/null | base64 -w0)"
+  rm -f "$mf"
+  [ -n "$s" ] || { echo "sign: signing failed" >&2; return 1; }
+  printf '%s%s:%s' "$SIGTAG" "$who" "$s"
+}
+
+# do_verify <line> -> one word on stdout, rc: 0 ok / 2 unsigned|nokey / 3 BAD
+do_verify(){
+  local line="$1" tok signer b64 p tmp rc
+  tok="$(sig_of_line "$line")" || { echo unsigned; return 2; }
+  signer="${tok%%:*}"; b64="${tok#*:}"
+  [ -n "$signer" ] && [ -n "$b64" ] && [ "$signer" != "$tok" ] || { echo BAD; return 3; }
+  p="$(pubpath "$signer")"
+  # A MISSING PUBKEY IS `nokey`, NEVER `BAD`. Not having pinned a peer's key is our own gap in the
+  # trust store; calling it a bad signature would blame the sender for our missing evidence and
+  # would make every un-pinned peer indistinguishable from a forger.
+  [ -f "$p" ] || { echo nokey; return 2; }
+  tmp="$(mktemp)"; printf '%s' "$b64" | base64 -d > "$tmp" 2>/dev/null
+  local mf; mf="$(mktemp)"; canon "$line" > "$mf"       # seekable, per the oneshot note in do_sign
+  if openssl pkeyutl -verify -pubin -inkey "$p" -rawin -in "$mf" -sigfile "$tmp" >/dev/null 2>&1
+  then rc=0; echo ok; else rc=3; echo BAD; fi
+  rm -f "$tmp" "$mf"; return $rc
+}
+
+do_census(){
+  local f="${1:-$BOARD}" ok=0 bad=0 uns=0 nok=0 tot=0 v known
+  [ -f "$f" ] || { echo "census: no board at $f — UNKNOWN, not clean"; return 2; }
+  while IFS= read -r l; do
+    [ -n "$l" ] || continue
+    tot=$((tot+1))
+    case "$l" in *"$SIGTAG"*) ;; *) uns=$((uns+1)); continue ;; esac
+    v="$(do_verify "$l")"
+    case "$v" in ok) ok=$((ok+1)) ;; BAD) bad=$((bad+1)) ;; nokey) nok=$((nok+1)) ;; *) uns=$((uns+1)) ;; esac
+  done < "$f"
+  known="$(ls -1 "$KEYDIR"/*.pub 2>/dev/null | wc -l)"
+  printf 'board-sign: lines=%s ok=%s BAD=%s nokey=%s unsigned=%s signers_known=%s\n' \
+    "$tot" "$ok" "$bad" "$nok" "$uns" "$known"
+  # The reader must not have to infer the limit from the numbers.
+  printf '  unsigned = pre-adoption or a peer that has not deployed this — NOT an attack\n'
+  printf '  BAD      = a signature that is PRESENT and FAILS — the only alarming word here\n'
+  printf '  nokey    = we never pinned that signer pubkey — our gap, not the sender fault\n'
+  printf '  SCOPE: every mind on this node runs as one uid, so a local ok is a CHECKSUM, not an\n'
+  printf '         authentication. It is evidence of authorship only for a pubkey pinned\n'
+  printf '         out-of-band from ANOTHER node.\n'
+  [ "$bad" -gt 0 ] && return 3
+  return 0
+}
+
+case "${1:-}" in
+  --keygen) do_keygen "${2:-}" ;;
+  --sign)   do_sign "${2:-}" "${3:-}" ;;
+  --verify) do_verify "${2:-}" ;;
+  --census) do_census "${2:-}" ;;
+  --test)   : ;;
+  *) sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+esac
+# CAPTURE THE RC BEFORE THE TEST THAT FOLLOWS IT. Written as `[ "$1" = --test ] || exit $?`, the $?
+# is the rc of the BRACKET, not of the case arm — so every non-test invocation exited 1 while
+# printing a perfectly good result on stdout. mesh-chat's hook is `tok="$(... --sign ...)" || fall
+# back to unsigned`, so signing appeared to do nothing at all, silently, with the correct token
+# sitting in the discarded substitution. The verdict-carrying rc of --verify (0/2/3) had the same
+# fault, which would have made every caller read BAD as "ok, but the shell said 1".
+_rc=$?
+[ "${1:-}" = --test ] || exit "$_rc"
+
+# ------------------------------- smoke test -------------------------------
+command -v openssl >/dev/null 2>&1 || { echo "smoke-test: n/a (no openssl)"; exit 2; }
+openssl genpkey -algorithm ed25519 -out /dev/null 2>/dev/null || { echo "smoke-test: n/a (openssl lacks ed25519)"; exit 2; }
+f=""
+# EVERYTHING under a scratch KEYDIR: a suite that mints or reads the REAL worker keys would either
+# forge provenance or, worse, create a key whose first use is a test.
+td="$(mktemp -d)"; KEYDIR="$td/keys"; export MESH_BOARD_KEYDIR="$KEYDIR"
+W="tester@testnode"
+do_keygen "$W" >/dev/null
+[ -f "$(keypath "$W")" ] || { echo "smoke-test: FAIL (keygen produced no private key)"; rm -rf "$td"; exit 1; }
+[ "$(stat -c %a "$(keypath "$W")")" = 600 ] || { echo "smoke-test: FAIL (private key is not 600: $(stat -c %a "$(keypath "$W")"))"; rm -rf "$td"; exit 1; }
+L="2026-08-29T01:00:00Z  $W  ::  [fyi] hello"
+tok="$(do_sign "$L" "$W")"
+S="$L $tok"
+[ "$(do_verify "$S")" = ok ] || { echo "smoke-test: FAIL (a freshly signed line does not verify: $(do_verify "$S"))"; rm -rf "$td"; exit 1; }
+# DETERMINISM — the union merge across nodes is `sort -u` on the whole line, so the same line signed
+# twice must be byte-identical or every node's copy becomes a distinct row and dedupe dies.
+[ "$(do_sign "$L" "$W")" = "$tok" ] || f="$f nondeterministic-signature(sort-u-dedupe-would-break)"
+# TAMPER, one field at a time. The signature covers ts+who+body, so each must be un-editable.
+case "$(do_verify "${S/hello/goodbye}")" in BAD) ;; *) f="$f body-tamper-not-caught" ;; esac
+case "$(do_verify "${S/01:00:00/02:00:00}")" in BAD) ;; *) f="$f timestamp-tamper-not-caught" ;; esac
+# THE LIFT: a valid signature moved under a DIFFERENT author must fail. If canon() signed only the
+# body this would pass, and the whole scheme would be decorative.
+case "$(do_verify "${S/$W  ::/attacker@evil  ::}")" in BAD) ;; *) f="$f author-lift-not-caught (a valid sig was accepted under a different WHO — canon must cover the author field)" ;; esac
+# THE SIGNER MUST BE THE LINE'S OWN AUTHOR, even when the environment says someone else. This is the
+# defect the first end-to-end drive found: mesh-chat's WHO and this tool's env fallback differ on this
+# node, so the writer signed as one identity and wrote another. Drive it with MESH_WHO deliberately
+# WRONG — if do_sign consults the environment at all, the token names the wrong signer and the line
+# verifies nokey/BAD forever.
+_lw="2026-08-29T01:00:00Z  $W  ::  [fyi] whose line is it"
+_lwt="$(MESH_WHO="someone-else@elsewhere" do_sign "$_lw")"
+case "$_lwt" in *":$W:"*) ;; *) f="$f signer-taken-from-env-not-line:[$_lwt] (mesh-chat's WHO and this tool's fallback differ on this node — a line signed under the wrong author verifies BAD forever)" ;; esac
+[ "$(MESH_WHO="someone-else@elsewhere" do_verify "$_lw $_lwt")" = ok ] \
+  || f="$f env-signed-line-does-not-verify (signer must bind to the line's author field)"
+
+# THREE WORDS, NOT TWO — the history and every un-upgraded peer must not read as an attack.
+case "$(do_verify "$L")" in unsigned) ;; *) f="$f unsigned-line-not-unsigned:[$(do_verify "$L")]" ;; esac
+[ "$(do_verify "$L" >/dev/null; echo $?)" = 2 ] || f="$f unsigned-wrong-rc(must not share the BAD code)"
+[ "$(do_verify "$S" >/dev/null; echo $?)" = 0 ] || f="$f ok-wrong-rc"
+[ "$(do_verify "${S/hello/goodbye}" >/dev/null; echo $?)" = 3 ] || f="$f bad-wrong-rc"
+# nokey is its own word: a signer we never pinned is our gap, not a forger.
+mv "$(pubpath "$W")" "$td/stashed.pub"
+case "$(do_verify "$S")" in nokey) ;; *) f="$f missing-pubkey-not-nokey:[$(do_verify "$S")] — an unpinned peer must not read as a forger" ;; esac
+mv "$td/stashed.pub" "$(pubpath "$W")"
+# keygen must REFUSE to overwrite: re-minting flips every line this worker already signed to BAD.
+k1="$(md5sum < "$(keypath "$W")")"
+do_keygen "$W" >/dev/null
+[ "$(md5sum < "$(keypath "$W")")" = "$k1" ] || f="$f keygen-overwrote-existing-key (every already-signed line would flip to BAD)"
+# THE SCRUBBER MUST NOT EAT THE SIGNATURE. mesh-chat appends through mesh-log-scrub, and a
+# shape-based redactor that decided an 88-char base64 blob looked like a secret would silently
+# destroy every signature and render the whole board BAD. Verified against the real scrubber.
+# Resolve the CO-LOCATED scrubber first: these two files ship as one change (the exemption lives in
+# mesh-log-scrub, the signature here), so the arm must test the pair that travels together. Run from
+# the genome it reads scripts/mesh-log-scrub; run from ~/.local/bin it reads the deployed one. Either
+# way a genuine regression in whichever scrubber is actually beside this tool goes red.
+_scrub="$(dirname "$0")/mesh-log-scrub"; [ -x "$_scrub" ] || _scrub="$(command -v mesh-log-scrub 2>/dev/null)"
+if [ -n "$_scrub" ] && [ -x "$_scrub" ]; then
+  scr="$(printf '%s\n' "$S" | "$_scrub" 2>/dev/null | head -1)"
+  [ "$(do_verify "$scr")" = ok ] \
+    || f="$f scrubber-destroys-signature (mesh-log-scrub altered the signed bytes — every signed line would render BAD)"
+fi
+# census: counts by word, and a BAD line must drive rc 3 while unsigned lines never do.
+b="$td/board"; { printf '%s\n' "$L"; printf '%s\n' "$S"; printf '%s\n' "${S/hello/goodbye}"; } > "$b"
+out="$(do_census "$b")"; crc=$?
+printf '%s' "$out" | grep -q 'ok=1' || f="$f census-ok-count:[$out]"
+printf '%s' "$out" | grep -q 'BAD=1' || f="$f census-bad-count:[$out]"
+printf '%s' "$out" | grep -q 'unsigned=1' || f="$f census-unsigned-count:[$out]"
+[ "$crc" = 3 ] || f="$f census-rc-on-bad:[$crc]"
+{ printf '%s\n' "$L"; printf '%s\n' "$S"; } > "$b"
+do_census "$b" >/dev/null; [ $? = 0 ] || f="$f census-rc-on-unsigned-only (an unsigned board must not alarm — that is adoption lag, not an attack)"
+# census must SAY what an ok is worth here, not leave the reader to infer it
+printf '%s' "$out" | grep -q 'CHECKSUM, not an' || f="$f census-omits-scope (an ok under a shared uid must not read as authentication)"
+# THROUGH THE CLI, NOT ONLY THE FUNCTIONS. Every rc arm above calls do_verify directly and they all
+# passed while `mesh-board-sign --sign` exited 1 on success, because the dispatcher's `exit $?` read
+# the bracket in front of it. mesh-chat's hook consumes the CLI and discards a non-zero rc, so the
+# whole feature was inert with a green suite. Drive the real argv.
+_cl(){ MESH_BOARD_KEYDIR="$KEYDIR" bash "$0" "$@"; }
+_ct="$(_cl --sign "$L")"; _crc=$?
+[ "$_crc" = 0 ] || f="$f cli-sign-rc:[$_crc] (a good token discarded by its own dispatcher — mesh-chat falls back to unsigned and signing is silently inert)"
+[ -n "$_ct" ] || f="$f cli-sign-empty"
+_cl --verify "$L $_ct" >/dev/null; [ $? = 0 ] || f="$f cli-verify-ok-rc"
+_cl --verify "$L" >/dev/null; [ $? = 2 ] || f="$f cli-verify-unsigned-rc"
+_cl --verify "${L/hello/goodbye} $_ct" >/dev/null; [ $? = 3 ] || f="$f cli-verify-bad-rc"
+rm -rf "$td"
+if [ -n "$f" ]; then echo "smoke-test: FAIL ($f )"; exit 1; fi
+echo "smoke-test: ok (keygen 600 + refuses-overwrite, deterministic sig for sort -u, tamper caught on body/timestamp/AUTHOR-LIFT, three verdicts with distinct rc (ok/unsigned/nokey/BAD), scrubber-safe, census counts + rc + scope statement, + the same verdicts THROUGH THE CLI argv)"
