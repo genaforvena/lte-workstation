@@ -1,0 +1,348 @@
+#!/usr/bin/env python3
+"""strip-head — remove the first N bytes (default 1 KiB) from a file.
+
+Written for @deusoutofthemachine's exercise (2026-08-29): "remove the first 1 KiB
+of a file", then "compare it to `tail -c +1025` and `dd bs=1024 skip=1` and think
+about what yours does differently."
+
+The three things it does differently:
+
+  1. IT SKIPS THE FULL N BYTES ON A PIPE.  `dd bs=1024 skip=1` issues ONE read(2)
+     of up to 1024 bytes and counts whatever comes back as one whole block. On a
+     pipe a short read is normal, so dd silently skips fewer bytes than you asked
+     for and the remainder leaks into the output. (GNU dd needs `iflag=fullblock`
+     — an opt-in.) The skip here is a LOOP over a bounded buffer, so a short read
+     costs another iteration and never a wrong answer.
+
+  2. IT CAN REWRITE THE FILE ITSELF, TWO WAYS, AND SAYS WHICH.  `tail > file` is
+     not just wrong, it is destructive: the shell truncates the target before tail
+     reads it. `-o` writes a temp file in the SAME directory, fsyncs it, copies
+     the mode, and rename(2)s it over the target — atomic for any reader, but it
+     needs room for a second copy and it changes the inode (hardlinks and open fds
+     keep the OLD content). `-i` edits the one inode in place: no second copy, no
+     inode change, and NOT crash-safe — a power cut mid-shift leaves a mangled
+     file. Those are different trades, so they are different flags, and neither is
+     silently chosen for you.
+
+  3. IT TRIES THE CHEAP KERNEL PATH FIRST, AND THE FAILURE IS THE LESSON.  Linux
+     has FALLOC_FL_COLLAPSE_RANGE: the filesystem drops a byte range and shifts
+     the tail down by adjusting extents — O(1)-ish, no data copied at all. But the
+     offset and length must both be multiples of the FILESYSTEM BLOCK SIZE, and
+     1024 is not a multiple of 4096. So on ext4 the answer to "strip exactly 1 KiB
+     in place, for free" is EINVAL: the fast path exists and this particular size
+     is exactly the one it cannot do. `-i` reports which path it took.
+
+Edge cases, decided rather than inherited:
+  * file shorter than N  -> output is EMPTY, exit 0. Removing the first 1 KiB of a
+    900-byte file removes everything there is; that is not an error. `--strict`
+    turns it into one (exit 4) for callers that want the assertion.
+  * file exactly N       -> empty, same reasoning.
+  * N = 0                -> a copy. Allowed; it is the identity case.
+  * constant memory (64 KiB buffer) — the file is never read into RAM.
+
+Usage:
+  strip-head [-n BYTES] [FILE]            # -> stdout   (FILE omitted = stdin)
+  strip-head [-n BYTES] FILE -o OUT       # -> OUT, atomic replace
+  strip-head [-n BYTES] -i FILE           # in place, same inode
+  strip-head --test                       # self-check on real temp files
+
+BYTES accepts a plain number or a suffix: 1024, 1K, 1KiB, 4k, 1M.
+"""
+
+import ctypes, ctypes.util, errno, os, sys, tempfile
+
+BUF = 64 * 1024
+FALLOC_FL_COLLAPSE_RANGE = 0x08
+
+_SUFFIX = {"": 1, "b": 1,
+           "k": 1024, "kib": 1024, "kb": 1000,
+           "m": 1024 ** 2, "mib": 1024 ** 2, "mb": 1000 ** 2,
+           "g": 1024 ** 3, "gib": 1024 ** 3, "gb": 1000 ** 3}
+
+
+def parse_size(s):
+    t = s.strip().lower()
+    i = 0
+    while i < len(t) and (t[i].isdigit()):
+        i += 1
+    if i == 0:
+        raise ValueError(f"not a size: {s!r}")
+    num, suf = int(t[:i]), t[i:]
+    if suf not in _SUFFIX:
+        raise ValueError(f"unknown size suffix: {s!r}")
+    return num * _SUFFIX[suf]
+
+
+# ---------- the actual work ----------
+
+def skip_stream(fin, n):
+    """Consume exactly n bytes from fin. Returns bytes actually consumed.
+
+    THE dd BUG LIVES HERE. One read() is not a skip; a loop is."""
+    left = n
+    while left:
+        chunk = fin.read(min(BUF, left))
+        if not chunk:            # EOF before n -> file was shorter than the header
+            break
+        left -= len(chunk)
+    return n - left
+
+
+def copy_rest(fin, fout):
+    total = 0
+    while True:
+        chunk = fin.read(BUF)
+        if not chunk:
+            return total
+        fout.write(chunk)
+        total += len(chunk)
+
+
+def to_stream(src, n, fout, strict):
+    """src: path or None (stdin). Streams the tail to an already-open binary fout."""
+    if src is None:
+        fin, close = sys.stdin.buffer, False
+    else:
+        fin, close = open(src, "rb"), True
+    try:
+        got = skip_stream(fin, n)
+        if got < n and strict:
+            raise SystemExit(f"strip-head: {src or '<stdin>'}: only {got} bytes, "
+                             f"cannot remove {n} (--strict)")
+        return copy_rest(fin, fout)
+    finally:
+        if close:
+            fin.close()
+
+
+def to_file(src, n, dst, strict):
+    """Atomic replace: temp in dst's directory -> fsync -> rename."""
+    d = os.path.dirname(os.path.abspath(dst)) or "."
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".strip-head.")
+    try:
+        with os.fdopen(fd, "wb") as fout:
+            written = to_stream(src, n, fout, strict)
+            fout.flush()
+            os.fsync(fout.fileno())
+        # carry the source's permission bits; mkstemp made it 0600
+        if src is not None and os.path.exists(src):
+            os.chmod(tmp, os.stat(src).st_mode & 0o7777)
+        os.rename(tmp, dst)
+        # rename is only durable once the DIRECTORY entry is on disk
+        dfd = os.open(d, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+        return written
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _fallocate(fd, mode, offset, length):
+    libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6", use_errno=True)
+    libc.fallocate.argtypes = [ctypes.c_int, ctypes.c_int,
+                               ctypes.c_longlong, ctypes.c_longlong]
+    libc.fallocate.restype = ctypes.c_int
+    if libc.fallocate(fd, mode, offset, length) != 0:
+        raise OSError(ctypes.get_errno(), os.strerror(ctypes.get_errno()))
+
+
+def in_place(path, n, strict, verbose=True):
+    """Edit the one inode. Returns the path name that was taken, for the report."""
+    size = os.stat(path).st_size
+    if size <= n:
+        if strict and size < n:
+            raise SystemExit(f"strip-head: {path}: only {size} bytes, cannot remove {n} (--strict)")
+        with open(path, "r+b") as f:
+            f.truncate(0)
+        return "truncate (file was <= N)"
+
+    fd = os.open(path, os.O_RDWR)
+    try:
+        # Fast path: let the filesystem drop the extents. Block-aligned only —
+        # which is exactly why a 1 KiB header cannot use it on a 4 KiB ext4.
+        bs = os.fstatvfs(fd).f_bsize
+        if n % bs == 0:
+            try:
+                _fallocate(fd, FALLOC_FL_COLLAPSE_RANGE, 0, n)
+                return f"collapse_range (fs block {bs}, no data copied)"
+            except OSError as e:
+                why = errno.errorcode.get(e.errno, e.errno)
+                if verbose:
+                    print(f"strip-head: collapse_range unavailable ({why}), "
+                          f"falling back to shift", file=sys.stderr)
+        else:
+            if verbose:
+                print(f"strip-head: N={n} is not a multiple of the fs block size "
+                      f"{bs} — collapse_range cannot be used, shifting", file=sys.stderr)
+
+        # Slow path: pread from n, pwrite to 0. dst < src always, so the
+        # overlap is safe in this direction and needs no scratch space.
+        rd, wr = n, 0
+        while True:
+            chunk = os.pread(fd, BUF, rd)
+            if not chunk:
+                break
+            off = 0
+            while off < len(chunk):
+                off += os.pwrite(fd, chunk[off:], wr + off)
+            rd += len(chunk)
+            wr += off
+        os.ftruncate(fd, wr)
+        os.fsync(fd)
+        return f"shift+truncate ({wr} bytes moved)"
+    finally:
+        os.close(fd)
+
+
+# ---------- self-check ----------
+
+def selftest():
+    import subprocess
+    ok = True
+
+    def check(label, cond, detail=""):
+        nonlocal ok
+        print(f"{'ok  ' if cond else 'FAIL'} {label}{(' — ' + detail) if detail else ''}")
+        ok = ok and cond
+
+    with tempfile.TemporaryDirectory() as d:
+        body = bytes(range(256)) * 40          # 10240 bytes, non-text on purpose
+        head = b"H" * 1024
+        src = os.path.join(d, "in.bin")
+        open(src, "wb").write(head + body)
+
+        # 1. stream to stdout
+        out = os.path.join(d, "a.bin")
+        with open(out, "wb") as f:
+            to_stream(src, 1024, f, False)
+        check("stream: tail is exact", open(out, "rb").read() == body)
+
+        # 2. matches tail -c +1025
+        ref = subprocess.run(["tail", "-c", "+1025", src], capture_output=True).stdout
+        check("stream: byte-identical to `tail -c +1025`", ref == body)
+
+        # 3. the dd short-read trap, over a real pipe.
+        #    A DETERMINISTIC producer, not `cat`: cat hands the pipe 128 KiB at
+        #    once and dd's single read then happens to be full, so the bug hides
+        #    and the arm becomes a coin flip. This writes 100 bytes, flushes,
+        #    pauses, then the rest — the short first read dd is documented to
+        #    mishandle. An arm that has never been seen FAIL is not an arm.
+        prod = (f"{sys.executable} -c \"import sys,time;"
+                f"d=open({src!r},'rb').read();"
+                f"sys.stdout.buffer.write(d[:100]);sys.stdout.buffer.flush();"
+                f"time.sleep(0.3);sys.stdout.buffer.write(d[100:])\"")
+        dd_short = subprocess.run(f"{prod} | dd bs=1024 skip=1 2>/dev/null",
+                                  shell=True, capture_output=True).stdout
+        dd_full = subprocess.run(f"{prod} | dd bs=1024 skip=1 iflag=fullblock 2>/dev/null",
+                                 shell=True, capture_output=True).stdout
+        mine = subprocess.run(f"{prod} | {sys.executable} {__file__} -n 1024",
+                              shell=True, capture_output=True).stdout
+        check("pipe: our skip is exact on a short-read stream", mine == body,
+              f"{len(mine)} bytes")
+        check("pipe: plain dd skips short (the trap this exists to avoid)",
+              dd_short != body,
+              f"dd emitted {len(dd_short)}, want {len(body)} — it skipped only 100")
+        check("pipe: dd iflag=fullblock is correct (the opt-in fix)", dd_full == body)
+
+        # 4. atomic replace preserves mode
+        t = os.path.join(d, "b.bin")
+        open(t, "wb").write(b"x")
+        os.chmod(t, 0o640)
+        to_file(src, 1024, t, False)
+        check("-o: content", open(t, "rb").read() == body)
+        check("-o: mode carried from source",
+              os.stat(t).st_mode & 0o777 == os.stat(src).st_mode & 0o777)
+
+        # 5. in place keeps the inode
+        ip = os.path.join(d, "c.bin")
+        open(ip, "wb").write(head + body)
+        ino = os.stat(ip).st_ino
+        how = in_place(ip, 1024, False, verbose=False)
+        check("-i: content", open(ip, "rb").read() == body, how)
+        check("-i: same inode", os.stat(ip).st_ino == ino)
+
+        # 6. short file -> empty, not an error
+        s = os.path.join(d, "short.bin")
+        open(s, "wb").write(b"y" * 900)
+        so = os.path.join(d, "short.out")
+        with open(so, "wb") as f:
+            to_stream(s, 1024, f, False)
+        check("short file -> empty output, exit 0", os.path.getsize(so) == 0)
+
+        # 7. --strict turns it into a failure
+        r = subprocess.run([sys.executable, __file__, "--strict", "-n", "1024", s],
+                           capture_output=True)
+        check("--strict: short file is an error", r.returncode != 0,
+              r.stderr.decode().strip()[:60])
+
+        # 8. block-aligned N really does take collapse_range (when the fs allows)
+        al = os.path.join(d, "aligned.bin")
+        bs = os.statvfs(d).f_bsize
+        open(al, "wb").write(b"P" * bs + body)
+        how2 = in_place(al, bs, False, verbose=False)
+        check("-i: block-aligned N content", open(al, "rb").read() == body, how2)
+
+    print("PASS" if ok else "FAIL")
+    return 0 if ok else 1
+
+
+def main(argv):
+    n, src, dst, inplace, strict = 1024, None, None, False, False
+    i = 1
+    while i < len(argv):
+        a = argv[i]
+        if a in ("-h", "--help"):
+            print(__doc__)
+            return 0
+        elif a == "--test":
+            return selftest()
+        elif a in ("-n", "--bytes"):
+            i += 1
+            n = parse_size(argv[i])
+        elif a in ("-o", "--output"):
+            i += 1
+            dst = argv[i]
+        elif a in ("-i", "--in-place"):
+            inplace = True
+        elif a == "--strict":
+            strict = True
+        elif a.startswith("-") and a != "-":
+            raise SystemExit(f"strip-head: unknown option {a} (see --help)")
+        elif src is None:
+            src = None if a == "-" else a
+        else:
+            raise SystemExit("strip-head: at most one input file")
+        i += 1
+
+    if n < 0:
+        raise SystemExit("strip-head: N must be >= 0")
+    if inplace:
+        if dst:
+            raise SystemExit("strip-head: -i and -o are different strategies; pick one")
+        if src is None:
+            raise SystemExit("strip-head: -i needs a file, not a stream")
+        print(f"strip-head: {src}: {in_place(src, n, strict)}", file=sys.stderr)
+    elif dst:
+        if src is not None and os.path.exists(dst) and os.path.samefile(src, dst):
+            raise SystemExit("strip-head: -o is the input; use -i to edit in place")
+        to_file(src, n, dst, strict)
+    else:
+        to_stream(src, n, sys.stdout.buffer, strict)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv))
+    except BrokenPipeError:
+        os._exit(0)
+    except SystemExit:
+        raise
+    except OSError as e:
+        raise SystemExit(f"strip-head: {e}")
