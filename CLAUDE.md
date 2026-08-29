@@ -274,6 +274,11 @@ the case is the evidence, and mixing them is what made this section a wall nobod
   two WORDS with opposite remedies (EXPIRED = poke the owner to renew · ABANDONED = take the work);
   the veto mints no immortal claim so long as an untended owner still decays into the second word.
   [[a-liveness-arm-that-can-only-add-staleness-never-vetoes-the-clock]]
+- **Swapping a sense's INPUT under an unchanged band table converts bands into DEAD BRANCHES** — the
+  new axis's reachable range is a hardware fact (a P-state residency is FLOORED by the lowest entry
+  in the table), so measure that range first, band on a position NORMALISED to it, and re-hang every
+  band the axis cannot express onto evidence that can — never leave a verdict nothing can produce.
+  [[an-input-swap-under-a-fixed-band-table-kills-the-bands-it-keeps]]
 
 ## Substrate changes & multi-agent coordination
 
