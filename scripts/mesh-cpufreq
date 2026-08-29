@@ -1,216 +1,532 @@
 #!/usr/bin/env bash
 # reflex-cadence: 2-59/5 * * * *
 # reflex-args: --edge
-# mesh-cpufreq — CPU FREQUENCY-SCALING state sense.
-# Reads /sys/devices/system/cpu/cpu*/cpufreq/{scaling_cur_freq,cpuinfo_max_freq,scaling_max_freq,scaling_governor}
-# for every online CPU, computes the per-CPU ratio (cur / cpuinfo_max), and folds the average
-# across all CPUs into a single band:
+# mesh-cpufreq — CPU P-STATE RESIDENCY sense.
 #
-#   BOOST       avg > 1.0 * cpuinfo_max (turbo/boost active — measured > advertised)
-#   NOMINAL     0.85..1.0 * cpuinfo_max (running near rated speed)
-#   REDUCED     0.50..0.85 * cpuinfo_max (powersave / partial throttle)
-#   THROTTLED   < 0.50 * cpuinfo_max (heavy throttle / underclock)
-#   IDLE        avg < 1 GHz across all CPUs (deep idle)
-#   OFFLINE     cannot read scaling_cur_freq on any CPU
+# WHAT CHANGED 2026-08-29 (task {#db611b12}, discover's find): the input was
+# avg(scaling_cur_freq)/cpuinfo_max sampled ONCE per run. That read is IDLE-BLIND by construction —
+# on acpi-cpufreq/intel_pstate the driver derives scaling_cur_freq from APERF/MPERF *during the
+# read*, i.e. exactly while the core is awake servicing our own IPI, so it reports the busy
+# frequency of a core that may have been asleep for the other 299.99 seconds. Measured on mesh-home
+# the same minute: a single cpu0 read said 4599943 kHz (98.6% of cpuinfo_max) while the P-state
+# RESIDENCY over the same 30s said 3002667 kHz (64.4%). The sense was reporting the period of its
+# own sampler.
 #
-# Why this is NEW (not duplicating mesh-cpu-throttle):
-#   - mesh-cpu-throttle counts THERMAL-THROTTLE EVENTS (the hardware's "I reduced freq" counter,
-#     a per-package delta). It answers "did the kernel HWP down-clock this CPU?".
-#   - mesh-cpufreq reads the ACTUAL FREQUENCY at sample time. It answers "what clock is the CPU
-#     running at right now?".
-#   - On intel_pstate, throttle happens in HARDWARE (scaling_max_freq STAYS at the hw max even
-#     while throttling), so mesh-cpu-throttle's event counter is the only throttle signal — but
-#     mesh-cpufreq's cur_freq reading will ALSO drop, complementing the events with magnitude.
-#   - mesh-cpufreq also surfaces the active governor (performance / powersave / schedutil / ondemand
-#     / conservative) — the policy driving the freq, not just the result. powersave + high load =
-#     "we're being throttled by policy"; performance + low freq = "we're being throttled by hw".
+# The input is now the kernel's own monotonic ACCUMULATOR: /sys/.../cpufreq/stats/time_in_state,
+# delta'd across the interval, giving a residency-weighted mean requested P-state. Both windows are
+# published (win= is the accumulator's OWN denominator, gap= the wall interval it stands for), and
+# so is the coverage between them, because this node power-cycles and a window shorter than its gap
+# is a SAMPLE, not a state.
 #
-# Honest-degraded: no /sys/devices/system/cpu/cpu*/cpufreq/ entries (a VM/container without
-# cpufreq exposure) → OFFLINE + exit 2, never a faked NOMINAL. Missing individual fields on
-# some CPUs are tolerated (per-CPU OFFLINE count surfaced) but majority-OFFLINE = OFFLINE.
+# THE BANDS COULD NOT SURVIVE THE INPUT SWAP AS NUMBERS — measured, not assumed. acpi-cpufreq here
+# exposes a THREE-entry table (2200000 2800000 3400000) under a cpuinfo_max of 4663089, so a
+# residency mean has a HARD FLOOR at the lowest P-state:
+#   * against cpuinfo_max the axis lives in [47.2%, 72.9%] -> IDLE(<30), NOMINAL(85..100) and
+#     BOOST(>100) are UNREACHABLE and the sense prints REDUCED forever;
+#   * against the table top it lives in [64.7%, 100%] -> IDLE and THROTTLED(<50) are unreachable.
+# A band that cannot fire is a dead branch wearing a verdict's name, so the band NAMES stay and each
+# predicate is re-hung on evidence that can actually move on this axis:
+#   pos=   residency position INSIDE the policy's own P-state table (0 = the whole window at the
+#          lowest entry, 100 = the whole window at the top). Node-independent by construction — no
+#          threshold here encodes one machine's frequency table.
+#   IDLE / REDUCED / NOMINAL band on pos.
+#   THROTTLED gets its OWN predicate: scaling_max_freq below the policy's own table top, i.e. the
+#          ceiling was LOWERED (bios_limit / thermal cap / hand). mesh-cpu-throttle keeps the
+#          thermal EVENT counters and is deliberately NOT folded in — two instruments, two planes.
+#   BOOST needs TWO pieces of evidence at once (pos >= 85 AND the delivered sample above the table
+#          top), because residency can never exceed 100% of the top entry: turbo is delivered ABOVE
+#          the table and only the instantaneous read can see it.
+#
+# THE SAMPLE IS KEPT AND NEVER FUSED. sample_khz= is still published — the DISAGREEMENT between it
+# and mean_khz= is the finding this rewrite exists to expose, and averaging one into the other would
+# erase it.
+#
+# TWO DENOMINATORS, BOTH NAMED (the trap discover called out — they are different maxes):
+#   pos=   vs the policy's own table [min..top]        (the BAND input)
+#   ratio= vs cpuinfo_max_freq                          (the FIELD mesh-load-gate reads to scale a
+#          threshold; its contract "percent of cpuinfo_max" is unchanged, only the SOURCE moved
+#          from the busy-biased sample to the residency: 64% where the sample said 98%)
+#
+# SIBLING SENSES, so nobody folds them: mesh-cpu-avgfreq reads DELIVERED average frequency from
+# CPPC/APERF feedback counters — a C0-weighted quantity, awake time only. This sense reads REQUESTED
+# P-state residency weighted by WALL time. Different questions; neither substitutes for the other.
+#
+# HONEST-DEGRADED, never a plausible constant: no cpufreq sysfs at all -> OFFLINE + exit 2; cpufreq
+# present but no stats/time_in_state (intel_pstate in active mode exports none) -> UNKNOWN + exit 2
+# naming the driver, and NEVER a silent fall back to the idle-blind sample this rewrite removed.
 #
 #   mesh-cpufreq            one-shot verdict to stdout
 #   mesh-cpufreq --edge     emit only on verdict change (cron reflex)
-#   mesh-cpufreq --json     machine-readable {label, reason, governor, avg_khz, max_khz, per_cpu, n_cpus, n_offline, ts}
-#   mesh-cpufreq --test     smoke test (pure classifier, no /sys reads before the gate)
+#   mesh-cpufreq --json     machine-readable
+#   mesh-cpufreq --test     gate: the pure classifier + the delta arithmetic, AND the live path
+#                           driven end to end over a FABRICATED cpufreq root — never the real
+#                           /sys, and never the real state/snapshot (both are redirected)
 set -uo pipefail
 export PATH="$HOME/.local/bin:$PATH"
 [ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
 
-STATE="$HOME/.mesh/.cpufreq-state"
 MESH="${MESH_DIR:-$HOME/.mesh}"
+STATE="${MESH_CPUFREQ_STATE:-$MESH/.cpufreq-state}"
+SNAP="${MESH_CPUFREQ_SNAP:-$MESH/.cpufreq-residency.snap}"
+CPUROOT="${MESH_CPUFREQ_ROOT:-/sys/devices/system/cpu}"
+CADENCE_S="${MESH_CPUFREQ_CADENCE_S:-300}"     # the interval an --edge run stands for (its own cron line)
+INPROC_S="${MESH_CPUFREQ_INPROC_S:-3}"         # in-process window when no cross-run baseline exists
+COV_FLOOR="${MESH_CPUFREQ_COV_FLOOR:-20}"      # below this the reading is marked a SAMPLE, in the reading
+MIN_WIN_S="${MESH_CPUFREQ_MIN_WIN_S:-1}"       # a cross-run window thinner than this is not an interval
 
 # --- Classifier (pure, offline-testable) ---
-# classify_cpufreq <avg_ratio_pct> <governor> <n_cpus> <n_offline> → "LABEL|reason"
-# avg_ratio_pct: integer 0..100+ of (avg_cur / cpuinfo_max * 100) (e.g. 100 = at max, 50 = half speed)
-# governor: performance | powersave | schedutil | ondemand | conservative | other | OFFLINE | NA
+# classify_cpufreq <pos_pct> <governor> <n_policies> <n_offline> <ceil_pct> <sample_over_top 0|1>
+#   pos_pct: 0..100 residency position inside the policy's own P-state table, or "" / non-numeric
+#   ceil_pct: 100*scaling_max_freq/table_top, worst policy (100 = ceiling at the table top)
 classify_cpufreq() {
-  local ratio="$1" gov="$2" ncpu="$3" noff="$4"
-  if [ "$ncpu" -eq 0 ]; then
-    echo "OFFLINE|no CPUs visible at /sys/devices/system/cpu/cpu*/cpufreq/ (no cpufreq sysfs)"
+  local pos="$1" gov="$2" npol="$3" noff="$4" ceil="$5" over="$6"
+  case "$npol" in ''|*[!0-9]*) npol=0 ;; esac
+  if [ "$npol" -eq 0 ]; then
+    echo "OFFLINE|no policy exposes a P-state residency accumulator (nothing at ${CPUROOT}/cpu*/cpufreq/stats/time_in_state)"
     return
   fi
-  # Majority-offline: if most CPUs can't be read, the sense itself is broken (per-CPU n_offline
-  # surfaces the local count; the BAND honours the ones we did read)
-  if [ "$ratio" = "OFFLINE" ] || [ -z "$ratio" ]; then
-    echo "OFFLINE|ratio unreadable (${noff}/${ncpu} CPUs offline, no cur_freq)"
+  case "$pos" in ''|*[!0-9]*) echo "OFFLINE|residency position unreadable (${noff}/${npol} policies gave no usable delta)"; return ;; esac
+  # THROTTLED is NOT a low-residency band: a lowered CEILING is the only throttle acpi-cpufreq/
+  # intel_pstate state can testify to on its own plane, and it is checked BEFORE the residency
+  # bands because a capped machine pegged at its cap looks NOMINAL on residency alone.
+  case "$ceil" in ''|*[!0-9]*) ceil=100 ;; esac
+  if [ "$ceil" -lt 100 ]; then
+    echo "THROTTLED|ceiling at ${ceil}% of the policy's own P-state table top (scaling_max_freq lowered — bios_limit / thermal cap / hand), residency pos=${pos}%, governor=$gov"
     return
   fi
-  # IDLE: avg < 1 GHz = < 1000000 kHz. We band by ratio (the actual signal) — at 1GHz on a 3.6GHz
-  # CPU, ratio = 27.7%, so IDLE is the natural <50% band. We still surface it as IDLE because
-  # the semantic matters: a powersave-policy idle and a hard-throttled 50% both have low freq,
-  # but the system KNOWS about it (governor + ratio together disambiguate).
-  if [ "$ratio" -lt 30 ] 2>/dev/null; then
-    echo "IDLE|ratio=${ratio}% (deep idle, governor=$gov)"
+  if [ "$pos" -lt 30 ]; then
+    echo "IDLE|pos=${pos}% of the P-state table's own range (the window was spent mostly at the LOWEST P-state), governor=$gov"
     return
   fi
-  if [ "$ratio" -lt 50 ] 2>/dev/null; then
-    echo "THROTTLED|ratio=${ratio}% (heavy underclock, governor=$gov)"
+  if [ "$pos" -lt 85 ]; then
+    echo "REDUCED|pos=${pos}% of the P-state table's own range (mixed residency, not pegged at the top), governor=$gov"
     return
   fi
-  if [ "$ratio" -lt 85 ] 2>/dev/null; then
-    echo "REDUCED|ratio=${ratio}% (powersave / partial throttle, governor=$gov)"
+  if [ "$over" = 1 ]; then
+    echo "BOOST|pos=${pos}% (top P-state requested nearly the whole window) AND the delivered sample reads ABOVE the table top — turbo active, governor=$gov"
     return
   fi
-  if [ "$ratio" -le 100 ] 2>/dev/null; then
-    echo "NOMINAL|ratio=${ratio}% (near-rated, governor=$gov)"
-    return
-  fi
-  # > 100 = boost/turbo active (CPU running ABOVE its cpuinfo_max — intel turbo, AMD PBO, etc.)
-  echo "BOOST|ratio=${ratio}% (turbo active, governor=$gov)"
+  echo "NOMINAL|pos=${pos}% (top P-state requested nearly the whole window, no delivery above the table top), governor=$gov"
 }
 
-# --- Test mode ---
+# --- Delta arithmetic (pure, file-driven, offline-testable) ---
+# delta_stats <prev_cum> <cur_cum> <meta> -> k=v lines
+#   cum files : "<policy>\t<freq_khz>\t<cumulative_10ms>" per line
+#   meta file : "<policy>\t<cpuinfo_max>\t<scaling_max>\t<scaling_cur>\t<governor>" per line
+# Every per-policy quantity is weighted by that policy's OWN accumulated time, so a heterogeneous
+# machine (two tables) is not pooled into one meaningless mean.
+delta_stats() {
+  awk -v PREV="$1" -v CUR="$2" -v META="$3" '
+  BEGIN{
+    reset=0
+    while ((getline line < PREV) > 0) { n=split(line, a, "\t"); if (n==3) prev[a[1] SUBSEP (a[2]+0)]=a[3]+0 }
+    close(PREV)
+    while ((getline line < META) > 0) {
+      n=split(line, a, "\t"); if (n<5) continue
+      cimax[a[1]]=a[2]+0; smax[a[1]]=a[3]+0; ccur[a[1]]=a[4]+0; gov[a[1]]=a[5]
+      if (gov1=="") gov1=a[5]
+    }
+    close(META)
+    while ((getline line < CUR) > 0) {
+      n=split(line, a, "\t"); if (n!=3) continue
+      p=a[1]; f=a[2]+0; c=a[3]+0
+      seen[p]=1
+      if (!(p in minf) || f < minf[p]) minf[p]=f
+      if (!(p in maxf) || f > maxf[p]) maxf[p]=f
+      k=p SUBSEP f
+      if (!(k in prev)) { nobase[p]=1; continue }
+      d = c - prev[k]
+      # A counter that went BACKWARDS is a reboot or an explicit stats reset: the whole cross-run
+      # delta is void. Loud (the caller falls to a marked in-process window), never a quiet zero.
+      if (d < 0) { reset=1; continue }
+      sd[p]+=d; sfd[p]+=f*d
+    }
+    close(CUR)
+    npol=0; nflat=0; nzero=0; nnobase=0; tot=0; totf=0
+    wpos=0; wposw=0; wrat=0; wratw=0; ceil=""; scur=0; scurn=0; stop=0
+    minkhz=""; topkhz=""
+    for (p in seen) {
+      npol++
+      if (!(p in minf)) continue
+      if (minkhz=="" || minf[p] < minkhz) minkhz=minf[p]
+      if (topkhz=="" || maxf[p] > topkhz) topkhz=maxf[p]
+      if (p in nobase) { nnobase++; continue }
+      if (!(p in sd) || sd[p] <= 0) { nzero++; continue }
+      m = sfd[p]/sd[p]
+      tot += sd[p]; totf += sfd[p]
+      if (maxf[p] > minf[p]) { pp = 100*(m-minf[p])/(maxf[p]-minf[p]); wpos += pp*sd[p]; wposw += sd[p] }
+      else nflat++
+      if (cimax[p] > 0) { rr = 100*m/cimax[p]; wrat += rr*sd[p]; wratw += sd[p] }
+      if (maxf[p] > 0 && smax[p] > 0) { cp = 100*smax[p]/maxf[p]; if (ceil=="" || cp < ceil) ceil=cp }
+      if (ccur[p] > 0) { scur += ccur[p]; stop += maxf[p]; scurn++ }
+    }
+    printf "reset=%d\n", reset
+    printf "npol=%d\nnflat=%d\nnzero=%d\nnnobase=%d\n", npol, nflat, nzero, nnobase
+    printf "governor=%s\n", (gov1=="" ? "NA" : gov1)
+    printf "min_khz=%d\ntop_khz=%d\n", (minkhz=="" ? 0 : minkhz), (topkhz=="" ? 0 : topkhz)
+    if (scurn > 0) {
+      printf "sample_khz=%d\n", scur/scurn
+      printf "over=%d\n", ((scur/scurn) > (stop/scurn)) ? 1 : 0
+    } else { printf "sample_khz=0\nover=0\n" }
+    if (tot <= 0 || wposw <= 0) { printf "usable=0\nsum_d=0\n"; exit }
+    printf "usable=1\n"
+    printf "sum_d=%d\n", tot
+    printf "mean_khz=%d\n", totf/tot
+    printf "pos=%d\n", (wpos/wposw) + 0.5
+    printf "ratio=%d\n", (wratw > 0) ? (wrat/wratw) + 0.5 : 0
+    printf "ceil_pct=%d\n", (ceil=="") ? 100 : ceil
+  }' </dev/null
+}
+
+# --- Test mode (pure functions only; no /sys read reaches this branch) ---
 if [ "${1:-}" = --test ]; then
   fail=0
-  # OFFLINE: no CPUs
-  r="$(classify_cpufreq 0 NA 0 0)"
-  echo "$r" | grep -q '^OFFLINE' || { echo "  FAIL OFFLINE-no-cpus: got=$r"; fail=1; }
-  # OFFLINE: ratio unreadable
-  r="$(classify_cpufreq OFFLINE performance 8 8)"
-  echo "$r" | grep -q '^OFFLINE' || { echo "  FAIL OFFLINE-ratio: got=$r"; fail=1; }
-  # IDLE: ratio=20% (deep idle, < 30%)
-  r="$(classify_cpufreq 20 powersave 8 0)"
-  echo "$r" | grep -q '^IDLE' || { echo "  FAIL IDLE-20: got=$r"; fail=1; }
-  r="$(classify_cpufreq 29 powersave 8 0)"
-  echo "$r" | grep -q '^IDLE' || { echo "  FAIL IDLE-29: got=$r (boundary)"; fail=1; }
-  # IDLE boundary: 30% → THROTTLED, not IDLE
-  r="$(classify_cpufreq 30 powersave 8 0)"
-  echo "$r" | grep -q '^IDLE' && { echo "  FAIL IDLE-boundary-30: got=$r (should be THROTTLED)"; fail=1; }
-  # THROTTLED: 30-49%
-  r="$(classify_cpufreq 35 powersave 8 0)"
-  echo "$r" | grep -q '^THROTTLED' || { echo "  FAIL THROTTLED-35: got=$r"; fail=1; }
-  r="$(classify_cpufreq 49 powersave 8 0)"
-  echo "$r" | grep -q '^THROTTLED' || { echo "  FAIL THROTTLED-49: got=$r (boundary)"; fail=1; }
-  # THROTTLED boundary: 50% → REDUCED
-  r="$(classify_cpufreq 50 powersave 8 0)"
-  echo "$r" | grep -q '^THROTTLED' && { echo "  FAIL THROTTLED-boundary-50: got=$r (should be REDUCED)"; fail=1; }
-  # REDUCED: 50-84%
-  r="$(classify_cpufreq 60 schedutil 8 0)"
-  echo "$r" | grep -q '^REDUCED' || { echo "  FAIL REDUCED-60: got=$r"; fail=1; }
-  r="$(classify_cpufreq 84 performance 8 0)"
-  echo "$r" | grep -q '^REDUCED' || { echo "  FAIL REDUCED-84: got=$r (boundary)"; fail=1; }
-  # REDUCED boundary: 85% → NOMINAL
-  r="$(classify_cpufreq 85 performance 8 0)"
-  echo "$r" | grep -q '^REDUCED' && { echo "  FAIL REDUCED-boundary-85: got=$r (should be NOMINAL)"; fail=1; }
-  # NOMINAL: 85-100%
-  r="$(classify_cpufreq 90 performance 8 0)"
-  echo "$r" | grep -q '^NOMINAL' || { echo "  FAIL NOMINAL-90: got=$r"; fail=1; }
-  r="$(classify_cpufreq 100 performance 8 0)"
-  echo "$r" | grep -q '^NOMINAL' || { echo "  FAIL NOMINAL-100: got=$r (boundary)"; fail=1; }
-  # NOMINAL boundary: 101% → BOOST
-  r="$(classify_cpufreq 101 performance 8 0)"
-  echo "$r" | grep -q '^NOMINAL' && { echo "  FAIL NOMINAL-boundary-101: got=$r (should be BOOST)"; fail=1; }
-  # BOOST: > 100%
-  r="$(classify_cpufreq 115 performance 8 0)"
-  echo "$r" | grep -q '^BOOST' || { echo "  FAIL BOOST-115: got=$r"; fail=1; }
-  # Governor sensitivity: powersave with high ratio → still NOMINAL (ratio drives the band)
-  r="$(classify_cpufreq 95 powersave 8 0)"
-  echo "$r" | grep -q '^NOMINAL' || { echo "  FAIL governor-sensitivity-powersave-95: got=$r (should be NOMINAL)"; fail=1; }
-  # Governor sensitivity: performance with low ratio → still IDLE
-  r="$(classify_cpufreq 20 performance 8 0)"
-  echo "$r" | grep -q '^IDLE' || { echo "  FAIL governor-sensitivity-perf-20: got=$r (should be IDLE)"; fail=1; }
+  t() { # t <name> <expect-regex> <got>
+    echo "$3" | grep -qE "$2" || { echo "  FAIL $1: got=$3"; fail=1; }
+  }
+  n() { # n <name> <forbidden-regex> <got>
+    echo "$3" | grep -qE "$2" && { echo "  FAIL $1: got=$3"; fail=1; }
+  }
+  # --- classifier ---
+  t OFFLINE-no-policies '^OFFLINE' "$(classify_cpufreq 50 schedutil 0 0 100 0)"
+  t OFFLINE-pos-unreadable '^OFFLINE' "$(classify_cpufreq '' schedutil 16 16 100 0)"
+  t OFFLINE-pos-garbage '^OFFLINE' "$(classify_cpufreq na schedutil 16 4 100 0)"
+  t IDLE-10 '^IDLE' "$(classify_cpufreq 10 schedutil 16 0 100 0)"
+  t IDLE-29 '^IDLE' "$(classify_cpufreq 29 schedutil 16 0 100 0)"
+  n IDLE-boundary-30 '^IDLE' "$(classify_cpufreq 30 schedutil 16 0 100 0)"
+  t REDUCED-30 '^REDUCED' "$(classify_cpufreq 30 schedutil 16 0 100 0)"
+  t REDUCED-84 '^REDUCED' "$(classify_cpufreq 84 schedutil 16 0 100 0)"
+  n REDUCED-boundary-85 '^REDUCED' "$(classify_cpufreq 85 schedutil 16 0 100 0)"
+  t NOMINAL-85 '^NOMINAL' "$(classify_cpufreq 85 performance 16 0 100 0)"
+  t NOMINAL-100 '^NOMINAL' "$(classify_cpufreq 100 performance 16 0 100 0)"
+  # BOOST needs BOTH pieces of evidence — residency can never exceed the table top on its own.
+  t BOOST-both '^BOOST' "$(classify_cpufreq 95 performance 16 0 100 1)"
+  n BOOST-needs-residency '^BOOST' "$(classify_cpufreq 84 performance 16 0 100 1)"
+  n BOOST-needs-sample '^BOOST' "$(classify_cpufreq 95 performance 16 0 100 0)"
+  # THROTTLED is the CEILING predicate and it OUTRANKS a pegged residency: a capped machine sitting
+  # at its cap reads NOMINAL on residency alone, which is the whole reason this band moved planes.
+  t THROTTLED-ceiling '^THROTTLED' "$(classify_cpufreq 99 performance 16 0 82 0)"
+  t THROTTLED-ceiling-idle '^THROTTLED' "$(classify_cpufreq 10 powersave 16 0 82 0)"
+  n THROTTLED-at-100 '^THROTTLED' "$(classify_cpufreq 99 performance 16 0 100 0)"
+  # The sample can never lift a band on its own (it is published, never fused).
+  t sample-cannot-lift-idle '^IDLE' "$(classify_cpufreq 10 schedutil 16 0 100 1)"
+  t sample-cannot-lift-reduced '^REDUCED' "$(classify_cpufreq 60 schedutil 16 0 100 1)"
+  # Governor never drives the band.
+  t gov-powersave-high '^NOMINAL' "$(classify_cpufreq 95 powersave 16 0 100 0)"
+  t gov-performance-low '^IDLE' "$(classify_cpufreq 12 performance 16 0 100 0)"
+
+  # --- delta arithmetic, on fixtures ---
+  td="$(mktemp -d)"; trap 'rm -rf "$td"' EXIT
+  # Two policies, three P-states, an interval spent 50/50 between min and top on p0 and fully at
+  # the top on p1.  p0 mean = (2200000*100 + 3400000*100)/200 = 2800000 -> pos 50
+  # p1 mean = 3400000 -> pos 100 ;  time-weighted pos = (50*200 + 100*200)/400 = 75
+  printf 'policy0\t2200000\t1000\npolicy0\t2800000\t500\npolicy0\t3400000\t2000\npolicy1\t2200000\t10\npolicy1\t2800000\t20\npolicy1\t3400000\t30\n' > "$td/prev"
+  printf 'policy0\t2200000\t1100\npolicy0\t2800000\t500\npolicy0\t3400000\t2100\npolicy1\t2200000\t10\npolicy1\t2800000\t20\npolicy1\t3400000\t230\n' > "$td/cur"
+  printf 'policy0\t4663089\t3400000\t4599943\tschedutil\npolicy1\t4663089\t3400000\t4400000\tschedutil\n' > "$td/meta"
+  d="$(delta_stats "$td/prev" "$td/cur" "$td/meta")"
+  t delta-usable 'usable=1' "$d"
+  t delta-pos-75 'pos=75' "$d"
+  t delta-mean '^mean_khz=3100000$' "$d"
+  t delta-sum-400 'sum_d=400' "$d"
+  t delta-reset-0 'reset=0' "$d"
+  t delta-ceil-100 'ceil_pct=100' "$d"
+  # ratio is vs cpuinfo_max, pos is vs the policy's own table top — DIFFERENT denominators, and the
+  # fixture is built so the two numbers cannot coincide: 60.05% and 72.91% of cpuinfo_max, weighted
+  # = 66; pos = 75. A single-denominator implementation collapses them onto one value.
+  t delta-ratio-cpuinfomax 'ratio=66' "$d"
+  n delta-ratio-is-not-pos '^ratio=75$' "$d"
+  # the sample leg: avg cur 4499971 > avg table top 3400000 -> over=1, and it is a SEPARATE field
+  t delta-sample 'sample_khz=4499971' "$d"
+  t delta-over 'over=1' "$d"
+  # mean and sample must not be the same number — the disagreement is the whole finding
+  n delta-mean-is-not-sample '^mean_khz=4499971$' "$d"
+  # RESET: a counter that went backwards voids the cross-run delta
+  printf 'policy0\t2200000\t5\npolicy0\t2800000\t1\npolicy0\t3400000\t9\n' > "$td/cur_reset"
+  printf 'policy0\t4663089\t3400000\t3000000\tschedutil\n' > "$td/meta1"
+  d2="$(delta_stats "$td/prev" "$td/cur_reset" "$td/meta1")"
+  t delta-reset-detected 'reset=1' "$d2"
+  t delta-reset-unusable 'usable=0' "$d2"
+  # NO BASELINE: a policy absent from prev contributes nothing and is counted, never zero-filled
+  printf 'policy9\t2200000\t10\npolicy9\t3400000\t90\n' > "$td/cur_new"
+  printf 'policy9\t4663089\t3400000\t3000000\tschedutil\n' > "$td/meta9"
+  d3="$(delta_stats "$td/prev" "$td/cur_new" "$td/meta9")"
+  t delta-nobase 'nnobase=1' "$d3"
+  t delta-nobase-unusable 'usable=0' "$d3"
+  # FLAT table (one P-state): pos is undefined, counted as flat, never silently 0
+  printf 'policyF\t2000000\t100\n' > "$td/prevF"; printf 'policyF\t2000000\t300\n' > "$td/curF"
+  printf 'policyF\t2000000\t2000000\t2000000\tperformance\n' > "$td/metaF"
+  d4="$(delta_stats "$td/prevF" "$td/curF" "$td/metaF")"
+  t delta-flat 'nflat=1' "$d4"
+  t delta-flat-unusable 'usable=0' "$d4"
+  n delta-flat-no-pos-zero '^pos=0$' "$d4"
+  # A LOWERED CEILING is seen by the delta layer (scaling_max 2800000 of table top 3400000 = 82%)
+  printf 'policy0\t4663089\t2800000\t2700000\tschedutil\npolicy1\t4663089\t3400000\t3300000\tschedutil\n' > "$td/meta_cap"
+  d5="$(delta_stats "$td/prev" "$td/cur" "$td/meta_cap")"
+  t delta-ceiling-lowered 'ceil_pct=82' "$d5"
+  t delta-ceiling-drives-throttled '^THROTTLED' "$(classify_cpufreq 75 schedutil 2 0 82 0)"
+
+  # --- LIVE WIRING, against a fabricated cpufreq root -------------------------------------------
+  # The two blocks above test the pure functions. Passing them and being WIRED to them are unrelated
+  # facts: a version that banded on ratio= instead of pos=, or that fell back to the instantaneous
+  # sample where the accumulator is absent, would keep every arm above green. These arms drive the
+  # real script end to end over a fake /sys.
+  mkroot() { # mkroot <dir> <policy> <cur_khz> <cpuinfo_max> <scaling_max> <with_stats 0|1>
+    local r="$1" p="$2" cur="$3" cimax="$4" smax="$5" st="$6"
+    mkdir -p "$r/cpufreq/$p" "$r/${p/policy/cpu}"
+    ln -sfn "../cpufreq/$p" "$r/${p/policy/cpu}/cpufreq"
+    printf '%s\n' "$cur"   > "$r/cpufreq/$p/scaling_cur_freq"
+    printf '%s\n' "$cimax" > "$r/cpufreq/$p/cpuinfo_max_freq"
+    printf '%s\n' "$smax"  > "$r/cpufreq/$p/scaling_max_freq"
+    printf 'schedutil\n'   > "$r/cpufreq/$p/scaling_governor"
+    printf 'fixture-drv\n' > "$r/cpufreq/$p/scaling_driver"
+    if [ "$st" = 1 ]; then
+      mkdir -p "$r/cpufreq/$p/stats"
+      printf '3400000 900\n2800000 100\n2200000 100\n' > "$r/cpufreq/$p/stats/time_in_state"
+    fi
+  }
+  fr="$td/root"; mkroot "$fr" policy0 3300000 8000000 3400000 1
+  # The fixture window is 400 units at the table top and 50 at the bottom: mean 3266666 kHz ->
+  # pos=89 (NOMINAL band). cpuinfo_max is a deliberately absurd 8000000, so ratio = 41% — squarely
+  # inside the OLD THROTTLED band. If the band is ever wired to ratio=, this arm goes red. The
+  # sample (3300000) sits BELOW the table top, so BOOST must not fire off it either.
+  printf 'policy0\t3400000\t500\npolicy0\t2800000\t100\npolicy0\t2200000\t50\n' > "$td/snap_live"
+  cp "$td/snap_live" "$td/snap_live_before"
+  lo="$(MESH_CPUFREQ_ROOT="$fr" MESH_CPUFREQ_STATE="$td/state_live" MESH_CPUFREQ_SNAP="$td/snap_live" bash "$0" 2>&1)"
+  t live-bands-on-pos-not-ratio '^\[cpufreq-nominal\] NOMINAL' "$lo"
+  n live-not-throttled 'THROTTLED' "$lo"
+  t live-pos-89 'pos=89%' "$lo"
+  t live-ratio-41 'ratio=41%' "$lo"
+  t live-sample-published 'sample=3300000 kHz' "$lo"
+  n live-sample-not-fused 'mean=3300000' "$lo"
+  t live-state-written 'ratio=41' "$(cat "$td/state_live" 2>/dev/null)"
+  # Coverage travels IN the reading: a 4s window against a 300s cadence is a SAMPLE and says so.
+  t live-sample-marked '\[SAMPLE: the [0-9]+s window is [0-9]+% of this reflex' "$lo"
+  # THE BASELINE IS NOT OVERWRITTEN BY A WINDOW TOO THIN TO STAND FOR THE CADENCE. The fixture run
+  # above measured a 4s window against a 300s cadence (cadcov=1%): rendering it is right, letting it
+  # reset the baseline is not — the next cron run would then measure 4s instead of 300s, which is
+  # exactly how one consumer's force-refresh collapses the window for every reader.
+  t live-thin-keeps-baseline "^$(md5sum < "$td/snap_live_before" | cut -d' ' -f1)\$" "$(md5sum < "$td/snap_live" | cut -d' ' -f1)"
+  # ...and a window that DOES cover its cadence replaces the baseline (else the sense would freeze
+  # onto its first baseline forever and every later window would be measured from a fossil).
+  printf 'policy0\t3400000\t100\npolicy0\t2800000\t100\npolicy0\t2200000\t100\n' > "$td/snap_full"
+  cp "$td/snap_full" "$td/snap_full_before"
+  MESH_CPUFREQ_ROOT="$fr" MESH_CPUFREQ_STATE="$td/state_full" MESH_CPUFREQ_SNAP="$td/snap_full" MESH_CPUFREQ_CADENCE_S=5 bash "$0" >/dev/null 2>&1
+  n live-full-replaces-baseline "^$(md5sum < "$td/snap_full_before" | cut -d' ' -f1)\$" "$(md5sum < "$td/snap_full" | cut -d' ' -f1)"
+  # THE MIN-WINDOW GUARD: a baseline so young that the delta is under a second is a real delta and
+  # NOT an interval. It must be refused as a cross-run window (the static fixture then yields no
+  # in-process delta at all -> UNKNOWN), never dressed as a 300s verdict off a 0s window.
+  printf 'policy0\t3400000\t899\npolicy0\t2800000\t100\npolicy0\t2200000\t100\n' > "$td/snap_tiny"
+  lo4="$(MESH_CPUFREQ_ROOT="$fr" MESH_CPUFREQ_STATE="$td/state_tiny" MESH_CPUFREQ_SNAP="$td/snap_tiny" bash "$0" 2>&1)"; rc4=$?
+  t live-tiny-window-refused '^\[cpufreq-unknown\] UNKNOWN' "$lo4"
+  t live-tiny-window-fell-to-inproc 'src=in-process' "$lo4"
+  t live-tiny-window-rc2 '^2$' "$rc4"
+  # NO ACCUMULATOR: cpufreq present, stats absent. The pre-2026-08-29 sense produced a full band
+  # here off scaling_cur_freq; that number is exactly the idle-blind reading this tool removed, so
+  # the only honest answer is UNKNOWN + rc 2 — never a band, never the sample wearing one.
+  fr2="$td/root_nostats"; mkroot "$fr2" policy0 3300000 8000000 3400000 0
+  lo2="$(MESH_CPUFREQ_ROOT="$fr2" MESH_CPUFREQ_STATE="$td/state_ns" MESH_CPUFREQ_SNAP="$td/snap_ns" bash "$0" 2>&1)"; rc2=$?
+  t live-nostats-unknown '^\[cpufreq-unknown\] UNKNOWN' "$lo2"
+  t live-nostats-rc2 '^2$' "$rc2"
+  n live-nostats-no-band 'NOMINAL|REDUCED|IDLE|BOOST|THROTTLED' "$lo2"
+  n live-nostats-no-sample-band '3300000' "$lo2"
+  # --edge ON THE DEGRADED PATH: the FIRST reading speaks, the repeat is silent, and rc 2 stands in
+  # both cases. This is the path a node without the accumulator takes on EVERY cron fire.
+  lo2e1="$(MESH_CPUFREQ_ROOT="$fr2" MESH_CPUFREQ_STATE="$td/state_ns_e" MESH_CPUFREQ_SNAP="$td/snap_ns_e" bash "$0" --edge 2>&1)"; rce1=$?
+  lo2e2="$(MESH_CPUFREQ_ROOT="$fr2" MESH_CPUFREQ_STATE="$td/state_ns_e" MESH_CPUFREQ_SNAP="$td/snap_ns_e" bash "$0" --edge 2>&1)"; rce2=$?
+  t live-edge-degraded-first-speaks '^\[cpufreq-unknown\] UNKNOWN' "$lo2e1"
+  t live-edge-degraded-repeat-silent '^$' "$lo2e2"
+  t live-edge-degraded-rc-first '^2$' "$rce1"
+  t live-edge-degraded-rc-repeat '^2$' "$rce2"
+  # NO CPUFREQ AT ALL -> OFFLINE + rc 2
+  mkdir -p "$td/root_empty"
+  lo3="$(MESH_CPUFREQ_ROOT="$td/root_empty" MESH_CPUFREQ_STATE="$td/state_e" MESH_CPUFREQ_SNAP="$td/snap_e" bash "$0" 2>&1)"; rc3=$?
+  t live-nocpufreq-offline '^\[cpufreq-offline\] OFFLINE' "$lo3"
+  t live-nocpufreq-rc2 '^2$' "$rc3"
+
   [ "$fail" = 1 ] && { echo "smoke-test: FAIL"; exit 1; }
-  echo "smoke-test: ok (17 assertions: OFFLINE×2, IDLE×2+1-boundary, THROTTLED×2+1-boundary, REDUCED×2+1-boundary, NOMINAL×2+1-boundary, BOOST×1+1-boundary, governor-sensitivity×2)"
+  echo "smoke-test: ok (21 classifier arms incl. 3 BOOST-needs-both, 3 THROTTLED-ceiling, 2 sample-cannot-lift; 16 delta arms incl. reset / no-baseline / flat-table / lowered-ceiling, and the two denominators asserted apart; 23 LIVE-WIRING arms over a fabricated cpufreq root: band-follows-pos-not-ratio, sample-published-not-fused, no-accumulator -> UNKNOWN rc2 with no band, no-cpufreq -> OFFLINE rc2, coverage-marked-in-the-reading, min-window-guard, baseline-kept-under-a-thin-window / replaced-under-a-full-one, --edge honoured on the DEGRADED path with rc intact)"
   exit 0
 fi
 
 # --- Live read path ---
-# Read every CPU's scaling_cur_freq + cpuinfo_max_freq + governor.
-# Per-CPU n_offline surfaced. Majority-OFFLINE → OFFLINE.
-NCPUS=0
-N_OFFLINE=0
-SUM_CUR=0
-SUM_MAX=0
-GOVERNOR=""
-FIRST_GOVERNOR=""
+mkdir -p "$MESH" 2>/dev/null || true
+TD="$(mktemp -d)"; trap 'rm -rf "$TD"' EXIT
 
-for cpubase in /sys/devices/system/cpu/cpu*/cpufreq; do
-  [ -d "$cpubase" ] || continue
-  cur_file="$cpubase/scaling_cur_freq"
-  max_file="$cpubase/cpuinfo_max_freq"
-  gov_file="$cpubase/scaling_governor"
-  [ -r "$cur_file" ] && [ -r "$max_file" ] || { N_OFFLINE=$((N_OFFLINE+1)); continue; }
-  cur_khz="$(cat "$cur_file" 2>/dev/null | tr -d '\n')"
-  max_khz="$(cat "$max_file" 2>/dev/null | tr -d '\n')"
-  # Validate as integers (some cpufreq subdirs are read-only or return 0)
-  case "$cur_khz" in ''|*[!0-9]*) N_OFFLINE=$((N_OFFLINE+1)); continue;; esac
-  case "$max_khz" in ''|*[!0-9]*) N_OFFLINE=$((N_OFFLINE+1)); continue;; esac
-  if [ "${max_khz:-0}" -le 0 ] 2>/dev/null; then N_OFFLINE=$((N_OFFLINE+1)); continue; fi
-  # Capture the governor once (all CPUs share the same governor on this kernel)
-  if [ -r "$gov_file" ]; then
-    g="$(cat "$gov_file" 2>/dev/null | tr -d '\n')"
-    [ -n "$FIRST_GOVERNOR" ] || FIRST_GOVERNOR="$g"
-  fi
-  SUM_CUR=$((SUM_CUR + cur_khz))
-  SUM_MAX=$((SUM_MAX + max_khz))
-  NCPUS=$((NCPUS+1))
-done
+# Enumerate POLICIES, not CPUs: cpuN/cpufreq is a symlink into cpufreq/policyM, so CPUs sharing a
+# policy would otherwise contribute the same counters several times and inflate the window.
+gather() {
+  local d rp p n_pol=0
+  # Reset the counters: gather() runs a SECOND time on the in-process path, and counters that only
+  # ever incremented would double n_offline on a node where some policies expose no stats.
+  N_CPUFREQ=0; N_NOSTATS=0
+  : > "$TD/cum"; : > "$TD/meta"
+  for d in "$CPUROOT"/cpu[0-9]*/cpufreq; do
+    [ -d "$d" ] || continue
+    rp="$(readlink -f "$d" 2>/dev/null)"; [ -n "$rp" ] || rp="$d"
+    p="$(basename "$rp")"
+    grep -q "^$p	" "$TD/meta" 2>/dev/null && continue
+    N_CPUFREQ=$((N_CPUFREQ+1))
+    if [ ! -r "$rp/stats/time_in_state" ]; then N_NOSTATS=$((N_NOSTATS+1)); continue; fi
+    awk -v p="$p" '$1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ {print p"\t"$1"\t"$2}' "$rp/stats/time_in_state" >> "$TD/cum"
+    printf '%s\t%s\t%s\t%s\t%s\n' "$p" \
+      "$(cat "$rp/cpuinfo_max_freq" 2>/dev/null | tr -dc '0-9')" \
+      "$(cat "$rp/scaling_max_freq" 2>/dev/null | tr -dc '0-9')" \
+      "$(cat "$rp/scaling_cur_freq" 2>/dev/null | tr -dc '0-9')" \
+      "$(cat "$rp/scaling_governor" 2>/dev/null | tr -d '\n\t' | tr -dc 'a-z_')" >> "$TD/meta"
+    n_pol=$((n_pol+1))
+  done
+  N_POLICIES=$n_pol
+}
 
-GOVERNOR="$FIRST_GOVERNOR"
-[ -n "$GOVERNOR" ] || GOVERNOR="NA"
-
-# Compute average ratio
-RATIO="OFFLINE"
-if [ "$NCPUS" -gt 0 ] && [ "$SUM_MAX" -gt 0 ]; then
-  RATIO=$(( SUM_CUR * 100 / SUM_MAX ))
-fi
-
-# Classify
-result="$(classify_cpufreq "$RATIO" "$GOVERNOR" "$NCPUS" "$N_OFFLINE")"
-label="${result%%|*}"
-reason="${result#*|}"
-
-# Surface the per-CPU avg/max for consumers (additive, helpful for mesh-doctor / dashboards)
-AVG_KHZ=0; MAX_KHZ=0
-if [ "$NCPUS" -gt 0 ]; then
-  AVG_KHZ=$((SUM_CUR / NCPUS))
-  MAX_KHZ=$((SUM_MAX / NCPUS))
-fi
+N_CPUFREQ=0; N_NOSTATS=0; N_POLICIES=0
+gather
 
 TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+NOW=$(date +%s)
+DRIVER="$(cat "$CPUROOT"/cpu0/cpufreq/scaling_driver 2>/dev/null | tr -d '\n')"; [ -n "$DRIVER" ] || DRIVER="unknown"
+
+emit_and_exit() { # <label> <reason> <rc>
+  local label="$1" reason="$2" rc="$3" prev=""
+  # --edge MUST be honoured on the degraded path too. It is the path a node WITHOUT the accumulator
+  # takes on every single cron fire, so an unconditional print there is one line every 5 minutes
+  # forever — the reflex log becomes error-spam and real transitions drown in it. Prev is read
+  # BEFORE the write, for the same reason the main path does: reading it after compares the label to
+  # itself and the sense goes structurally mute instead of merely quiet.
+  [ -f "$STATE" ] && prev="$(head -1 "$STATE" 2>/dev/null | cut -d'|' -f1)" || true
+  printf '%s|governor=NA|pos=na|ratio=na|mean_khz=0|sample_khz=0|win_s=0|gap_s=0|cov=0|cadcov=0|src=none|n_policies=%s|n_offline=%s|%s\n' \
+    "$label" "$N_POLICIES" "$N_NOSTATS" "$reason" > "$STATE"
+  mesh-state-touch "$STATE" 2>/dev/null || true
+  # The EXIT CODE is never suppressed — only the repeated LINE is. A watchdog reading rc still sees
+  # rc 2 on every fire; what it stops seeing is the same sentence 288 times a day.
+  if [ "${ARG:-}" = --edge ] && [ "$prev" = "$label" ]; then exit "$rc"; fi
+  if [ "${ARG:-}" = --json ]; then
+    printf '{"label":"%s","reason":"%s","ts":"%s"}\n' "$label" "$reason" "$TS"
+  else
+    printf '[cpufreq-%s] %s — %s\n' "$(printf '%s' "$label" | tr '[:upper:]' '[:lower:]')" "$label" "$reason"
+  fi
+  exit "$rc"
+}
+ARG="${1:-}"
+
+if [ "$N_CPUFREQ" -eq 0 ]; then
+  emit_and_exit OFFLINE "no cpufreq sysfs at ${CPUROOT}/cpu*/cpufreq (VM/container without cpufreq exposure)" 2
+fi
+if [ "$N_POLICIES" -eq 0 ]; then
+  # cpufreq IS there and the accumulator is NOT. The old idle-blind sample would still produce a
+  # number here; refusing it is the point — a fallback indistinguishable from a real reading is one.
+  emit_and_exit UNKNOWN "cpufreq present (driver=$DRIVER, ${N_CPUFREQ} policies) but NO P-state residency accumulator: stats/time_in_state absent on every policy. The residency axis does not exist on this node; the instantaneous sample is NOT substituted for it" 2
+fi
+
+# Cross-run delta first: its window is the whole cron interval, which is what the reading claims.
+SRC=""; DS=""; SNAP_MT=""; NEED_BASELINE=1
+if [ -r "$SNAP" ]; then
+  DS="$(delta_stats "$SNAP" "$TD/cum" "$TD/meta")"
+  SNAP_MT="$(stat -c %Y "$SNAP" 2>/dev/null)"; case "$SNAP_MT" in ''|*[!0-9]*) SNAP_MT="" ;; esac
+  _sd="$(printf '%s\n' "$DS" | awk -F= '$1=="sum_d"{print $2; exit}')"; case "$_sd" in ''|*[!0-9]*) _sd=0 ;; esac
+  _w=0; [ "$N_POLICIES" -gt 0 ] && _w=$(( _sd / N_POLICIES / 100 ))
+  # A baseline written seconds ago (a hand re-run right after the cron one) leaves a sub-second
+  # delta. It is a real delta and it is NOT an interval: accepting it would let a 0s window wear a
+  # verdict about 300s. Fall through to the in-process window, which is at least MIN_WIN_S long.
+  case "$DS" in *"usable=1"*)
+    # The baseline is intact: usable, monotonic, ours. Whether we ACCEPT its window is a separate
+    # question (MIN_WIN_S), and a rejected window must not be a licence to overwrite the baseline.
+    NEED_BASELINE=0
+    [ "$_w" -ge "$MIN_WIN_S" ] && SRC="cross-run" ;;
+  esac
+fi
+if [ -z "$SRC" ]; then
+  # No baseline, the counters reset (reboot), or the baseline is too young to be an interval. Take a
+  # REAL short window in-process rather than inventing one — and mark it, because a 3s window
+  # standing for a 300s cadence is a SAMPLE of it, not a state of it.
+  cp "$TD/cum" "$TD/base" 2>/dev/null
+  sleep "$INPROC_S"
+  gather
+  DS="$(delta_stats "$TD/base" "$TD/cum" "$TD/meta")"
+  SRC="in-process"
+  SNAP_MT=""
+fi
+
+kv() { printf '%s\n' "$DS" | awk -F= -v k="$1" '$1==k {print $2; exit}'; }
+USABLE="$(kv usable)"; RESET="$(kv reset)"
+POS="$(kv pos)"; RATIO="$(kv ratio)"; MEAN="$(kv mean_khz)"; SUM_D="$(kv sum_d)"
+CEIL="$(kv ceil_pct)"; OVER="$(kv over)"; SAMPLE="$(kv sample_khz)"
+TOPK="$(kv top_khz)"; MINK="$(kv min_khz)"; GOVERNOR="$(kv governor)"
+NFLAT="$(kv nflat)"; NZERO="$(kv nzero)"; NNOBASE="$(kv nnobase)"
+[ -n "$GOVERNOR" ] || GOVERNOR="NA"
+N_OFF=$(( ${NFLAT:-0} + ${NZERO:-0} + ${NNOBASE:-0} + N_NOSTATS ))
+
+# TWO windows and TWO coverages, because they answer two different failures and folding them would
+# hide one of each:
+#   win_s  the ACCUMULATOR's own denominator (its cpu-time delta / policies) — what was MEASURED
+#   gap_s  the wall time since the previous reading — what ELAPSED
+#   cov    win/gap    : a suspended node accumulates less than the wall clock (thin -> not a state)
+#   cadcov win/cadence: a window shorter than this reflex's own cron interval is a SAMPLE of it
+# gap_s is never substituted by the cadence on the cross-run path — a substituted denominator would
+# make a hand re-run's 1s gap read as a full interval.
+WIN_S=0
+if [ "${USABLE:-0}" = 1 ] && [ "${SUM_D:-0}" -gt 0 ] && [ "$N_POLICIES" -gt 0 ]; then
+  WIN_S=$(( SUM_D / N_POLICIES / 100 ))
+fi
+if [ "$SRC" = cross-run ] && [ -n "${SNAP_MT:-}" ]; then
+  GAP_S=$(( NOW - SNAP_MT )); [ "${GAP_S:-0}" -gt 0 ] 2>/dev/null || GAP_S=1
+else
+  GAP_S="$WIN_S"; [ "${GAP_S:-0}" -gt 0 ] 2>/dev/null || GAP_S="$INPROC_S"
+fi
+COV=$(( WIN_S * 100 / GAP_S )); [ "$COV" -gt 100 ] && COV=100
+CADCOV=$(( WIN_S * 100 / CADENCE_S )); [ "$CADCOV" -gt 100 ] && CADCOV=100
+
+if [ "${USABLE:-0}" != 1 ]; then
+  why="no usable residency delta"
+  [ "${RESET:-0}" = 1 ] && why="the P-state counters went BACKWARDS (reboot or an explicit stats reset) and the in-process window produced nothing either"
+  [ "${NFLAT:-0}" -gt 0 ] && why="$why; ${NFLAT} policy(ies) expose a single-entry P-state table, on which a residency position is undefined"
+  emit_and_exit UNKNOWN "$why (driver=$DRIVER, policies=$N_POLICIES, src=$SRC, win=${WIN_S}s)" 2
+fi
+
+result="$(classify_cpufreq "$POS" "$GOVERNOR" "$N_POLICIES" "$N_OFF" "${CEIL:-100}" "${OVER:-0}")"
+label="${result%%|*}"
+reason="${result#*|}"
+# Coverage travels IN the reading. A window thinner than the floor is a SAMPLE of the interval, and
+# it says so where the verdict is read — not in a sidecar nobody opens.
+if [ "$CADCOV" -lt "$COV_FLOOR" ]; then
+  reason="$reason [SAMPLE: the ${WIN_S}s window is ${CADCOV}% of this reflex's ${CADENCE_S}s cadence, src=$SRC]"
+fi
+if [ "$COV" -lt "$COV_FLOOR" ]; then
+  reason="$reason [THIN: only ${WIN_S}s accumulated across a ${GAP_S}s wall gap (cov=${COV}%) — the machine was not running for most of it]"
+fi
+
+# PERSIST THE BASELINE ONLY WHEN THE WINDOW EARNED IT. Measured 2026-08-29: mesh-system-vitality
+# force-refreshes this sense on its own */15 line, seconds after our own */5 line ran. That second
+# run's delta is real but 3s long, and overwriting the snapshot with it DESTROYS the 300s baseline
+# the next cron run would have measured — one consumer's refresh silently converts the cadence into
+# a 3s sample for everybody (state seen at 21:56Z: src=cross-run gap_s=3 cadcov=0). A thin reading
+# is still rendered and still marked; it just does not get to reset the clock for the next one.
+# It DOES persist when there is no usable baseline at all (first run, or the counters reset under
+# us) — refusing there would leave the sense permanently baseline-less.
+if [ "$NEED_BASELINE" = 1 ] || [ "$CADCOV" -ge "$COV_FLOOR" ]; then
+  cp "$TD/cum" "$SNAP" 2>/dev/null || true
+fi
+
 # PREV MUST BE CAPTURED BEFORE THE STATE WRITE. The write below is unconditional, so --edge reading
 # prev out of $STATE *after* it has already been overwritten always compares the label to itself and
-# always exits silent. That is not a quiet sense, it is a structurally mute one: this reflex ran
-# ~9,500 times over 33 days and emitted zero lines. Capture here, compare below.
+# always exits silent. That is not a quiet sense, it is a structurally mute one.
 PREV_LABEL=""; [ -f "$STATE" ] && PREV_LABEL="$(head -1 "$STATE" 2>/dev/null | cut -d'|' -f1)" || true
-# Write state + touch liveness on EVERY successful run
-printf '%s|governor=%s|avg_khz=%s|max_khz=%s|ratio=%s|n_cpus=%s|n_offline=%s|%s\n' \
-  "$label" "$GOVERNOR" "$AVG_KHZ" "$MAX_KHZ" "$RATIO" "$NCPUS" "$N_OFFLINE" "$reason" > "$STATE"
-mesh-state-touch "$STATE"
+# ratio= keeps its published contract (percent of cpuinfo_max) for mesh-load-gate; only its SOURCE
+# moved, from the busy-biased instantaneous sample to the residency mean.
+printf '%s|governor=%s|pos=%s|ratio=%s|mean_khz=%s|sample_khz=%s|top_khz=%s|min_khz=%s|win_s=%s|gap_s=%s|cov=%s|cadcov=%s|src=%s|n_policies=%s|n_offline=%s|%s\n' \
+  "$label" "$GOVERNOR" "$POS" "$RATIO" "$MEAN" "$SAMPLE" "$TOPK" "$MINK" "$WIN_S" "$GAP_S" "$COV" "$CADCOV" "$SRC" "$N_POLICIES" "$N_OFF" "$reason" > "$STATE"
+mesh-state-touch "$STATE" 2>/dev/null || true
 
-# --- Output ---
-if [ "${1:-}" = --json ]; then
-  printf '{"label":"%s","reason":"%s","governor":"%s","avg_khz":%s,"max_khz":%s,"ratio":%s,"n_cpus":%s,"n_offline":%s,"ts":"%s"}\n' \
-    "$label" "$reason" "$GOVERNOR" "$AVG_KHZ" "$MAX_KHZ" "$RATIO" "$NCPUS" "$N_OFFLINE" "$TS"
+line="$(printf '[cpufreq-%s] %s — %s (residency mean=%s kHz over %s policies · pos=%s%% of table [%s..%s] · ratio=%s%% of cpuinfo_max · sample=%s kHz · win=%ss/gap=%ss cov=%s%% cadcov=%s%% src=%s)' \
+  "$(printf '%s' "$label" | tr '[:upper:]' '[:lower:]')" "$label" "$reason" \
+  "$MEAN" "$N_POLICIES" "$POS" "$MINK" "$TOPK" "$RATIO" "$SAMPLE" "$WIN_S" "$GAP_S" "$COV" "$CADCOV" "$SRC")"
+
+if [ "$ARG" = --json ]; then
+  printf '{"label":"%s","reason":"%s","governor":"%s","pos":%s,"ratio":%s,"mean_khz":%s,"sample_khz":%s,"top_khz":%s,"min_khz":%s,"win_s":%s,"gap_s":%s,"cov_pct":%s,"cadcov_pct":%s,"src":"%s","n_policies":%s,"n_offline":%s,"driver":"%s","ts":"%s"}\n' \
+    "$label" "$reason" "$GOVERNOR" "$POS" "$RATIO" "$MEAN" "$SAMPLE" "$TOPK" "$MINK" "$WIN_S" "$GAP_S" "$COV" "$CADCOV" "$SRC" "$N_POLICIES" "$N_OFF" "$DRIVER" "$TS"
   exit 0
 fi
-if [ "${1:-}" = --edge ]; then
-  prev="$PREV_LABEL"          # captured ABOVE the state write — see the note there
-  [ "$prev" = "$label" ] && exit 0
-  printf '[cpufreq-%s] %s — %s (governor=%s ratio=%s%% avg=%s kHz across %s CPUs)\n' \
-    "$(printf '%s' "$label" | tr '[:upper:]' '[:lower:]')" "$label" "$reason" "$GOVERNOR" "$RATIO" "$AVG_KHZ" "$NCPUS"
-  exit 0
+if [ "$ARG" = --edge ]; then
+  [ "$PREV_LABEL" = "$label" ] && exit 0
 fi
-printf '[cpufreq-%s] %s — %s (governor=%s ratio=%s%% avg=%s kHz across %s CPUs)\n' \
-  "$(printf '%s' "$label" | tr '[:upper:]' '[:lower:]')" "$label" "$reason" "$GOVERNOR" "$RATIO" "$AVG_KHZ" "$NCPUS"
+printf '%s\n' "$line"
+exit 0
