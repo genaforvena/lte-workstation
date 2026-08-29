@@ -1,5 +1,7 @@
 # senses — the sensorium
 
+goal: держать сенсориум честным: каждый датчик отдаёт живой артефакт либо признаётся слепым
+
 Engine: opencode. This window owns the perception lane: the sensors themselves, their `--test`
 gates, and the fused state derived from them.
 

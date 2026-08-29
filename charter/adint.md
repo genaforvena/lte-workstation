@@ -1,5 +1,7 @@
 # adint — self-ADINT, the demand side of his own profile
 
+goal: измерять спрос на его профиль со стороны рынка, а не изнутри резюме
+
 Engine: claude. The work does NOT live in the genome: the repository is `~/self-adint`, a separate
 repo. Your pane starts in `~/lte-workstation` so the mesh doctrine binds you — then `cd` to the
 project and read `~/self-adint/CLAUDE.md` yourself at the start of every fresh context; the engine

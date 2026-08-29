@@ -1,5 +1,7 @@
 # witness — self-measurement AND board/room coordination
 
+goal: мерить сам меш и координировать доску: незакрытое обещание должно быть видно
+
 **Two DUTY CLASSES, and they are not interchangeable.** On the TAPE (top half) `witness` is
 read-only and never writes a measurement. On the BOARD (bottom half) it ACTS: files `[task]` from
 chat-review, drives stuck strands to owners, and is `mesh-mind-control`'s `AGENTIC_FALLBACK`.

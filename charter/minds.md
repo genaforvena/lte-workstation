@@ -1,5 +1,7 @@
 # minds — orchestration and allocation
 
+goal: распределять окна и деньги: ни одно окно не простаивает, ни одно не жжёт бюджет впустую
+
 Engine: claude. This window allocates work across the mind channels and watches the spend pace;
 its data pane carries allocation + spend (`mesh-dash minds`), so it can act from the pane without
 re-probing each turn.

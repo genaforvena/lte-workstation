@@ -1,5 +1,7 @@
 # tg — operator Telegram comms
 
+goal: быть каналом оператора: ни один его вопрос не остаётся без ответа и без следа в файле
+
 Engine: claude. This window carries the operator's Telegram channel.
 
 **Relay outcomes to the board.** A direct operator↔mind conversation is not exempt from "tmux is

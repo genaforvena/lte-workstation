@@ -1,5 +1,7 @@
 # sound — records, the grind, and the claims that calibrate them
 
+goal: делать звук, который оператор реально слушает, а не тот, который хорошо ранжируется
+
 Engine: claude. This window owns the sound lane end to end: the ARCHIVIST (`mesh-records`, the
 ledger `~/.mesh/records.log`, which outlives the audio), the GRINDER (`mesh-sound-reflex`, one
 recipe per record derived from that record's own measured character and repelled from recent

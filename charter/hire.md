@@ -1,5 +1,7 @@
 # hire — the lane where the AGENT is the candidate
 
+goal: довести агента-кандидата до оплачиваемой работы
+
 Engine: claude. Mission and the honesty rules in full: `~/.mesh/hire-mission.md`.
 
 **The subject of the hire is the mesh itself**, not the operator. Reach the end of a funnel and

@@ -1,5 +1,7 @@
 # wake — the finnegans-fake distillation lane
 
+goal: гнать дистилляцию finnegans-fake до артефакта, а не до плана
+
 Engine: claude. Repo: `~/finnegans-fake` — the distillation of the board corpus into a local
 Finnegans-Wake-style model. Data pane: the `wake)` arm of `mesh-dash` — scored rungs recomputed
 from `wake/recs-*.json`, the trained adapters from their own `trainlog.json`, and whether a run is

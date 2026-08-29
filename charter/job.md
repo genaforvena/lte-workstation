@@ -1,5 +1,9 @@
 # job — the operator's job hunt
 
+goal: найти оператору работу — метрика ИНТЕРВЬЮ, всё остальное накладные расходы
+deadline: 2026-09-05
+progress: mesh-job-funnel --line
+
 Engine: claude. Data pane: `mesh-dash job` — the PIPELINE, not a research feed. Pipeline state:
 `~/.mesh/job-board.tsv`. Mission, duties, and the hard rules: `~/.mesh/job-mission.md` — read it
 at the start of every fresh context; this charter names the boundaries, that file carries them.
