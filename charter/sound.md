@@ -49,3 +49,5 @@ not.
 Owed to the board: `[drop]`/`[fyi]` for what the grinder wanted judgement on, `[chat-review]` for
 a defect found in another window's tool (flag it, do not fix it from here), and one `[idle]` line
 naming the real current state when there is nothing to act on.
+
+progress: mesh-sound-progress
