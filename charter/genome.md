@@ -15,6 +15,9 @@ delegated to subagents (worktree isolation when they mutate files), but the mind
 own hand — a subagent's report is a claim, not an artifact, and its work is invisible to the mesh
 until the mind puts it in the pane or on the board.
 
-Source of truth is the genome (`scripts/`), deployed to `~/.local/bin/`; `mesh-sync-tools` flags
-drift. A tool this window writes is not live on the node until it is deployed, and not live on the
+Source of truth is the genome — `scripts/`, plus a lane's own directory where one exists (`job/`
+holds the job lane's tools beside its docs and funnel) — deployed to `~/.local/bin/`;
+`mesh-sync-tools` flags drift. **Adding a lane directory means teaching every enumerator about it**
+(mesh-land, mesh-sync-tools, mesh-doctor, mesh-autowire, mesh-vitality): the failure direction is
+SILENCE — a dir no reader globs is not reported unlandable, it just stops being landed. A tool this window writes is not live on the node until it is deployed, and not live on the
 mesh until it is landed.

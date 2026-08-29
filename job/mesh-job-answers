@@ -1,0 +1,717 @@
+#!/usr/bin/env python3
+"""mesh-job-answers — the job lane's ANSWER BANK: a questionnaire he fills ONCE.
+
+  mesh-job-answers --match "<вопрос>"    -> ответ на stdout (rc 0) | rc 2 = не знаем (и вопрос в очередь)
+  mesh-job-answers --list                -> банк
+  mesh-job-answers --open                -> открытые вопросы (в банке без ответа + очередь)
+  mesh-job-answers --covered <ORIGIN>    -> вопросы ЭТОГО происхождения; rc 0=все берутся из банка,
+                                            1=есть не покрытые, 2=за этим происхождением НИЧЕГО не снято
+  mesh-job-answers --add KEY PATTERN ANSWER [--source S]
+  mesh-job-answers --queue "<вопрос>" [--origin O]
+  mesh-job-answers --ask [--dry-run] [--force]   -> ОДНО нумерованное сообщение в TG
+  mesh-job-answers --cycle               -> сначала --ingest, потом --ask (это и стоит в кроне)
+  mesh-job-answers --ingest [--stdin]    -> разобрать его нумерованный ответ из voice-in.log
+  mesh-job-answers --test
+
+WHY. `needs-human` был ТУПИКОМ: тул упирался в вопрос работодателя и бросал строку в отстойник,
+где она лежала, пока человек не откроет её руками. Оператор (2026-08-20): «lets make needs-human
+more of the questionnaire that i fill once… and it would be amazing if u could be using this info.
+also if u know it about me anyhow - feel free to answer without asking me». То есть тупик становится
+ДВУМЯ ЛЕНТАМИ: известное — отвечается из банка без него; неизвестное — спрашивается ОДНИМ пакетом в
+TG и оседает в банке навсегда.
+
+ГРАНИЦА, КОТОРУЮ ТУЛ НЕ ПЕРЕХОДИТ. Отсутствие ответа НИКОГДА не становится ответом. `--match` без
+попадания = rc 2, и вызывающий обязан оставить строку в needs-human — ровно как раньше. Банк только
+СНИМАЕТ вопросы, он не выдумывает. Вопросы, где ответ стоит его времени, а не его факта (тестовое
+задание), в банк не кладутся НИКОГДА — они по определению его.
+
+РИСК, НАЗВАННЫЙ ВСЛУХ (он его принял: «ack risks and if they play out it is not anybody's fault»).
+Ответ из банка уходит работодателю ОТ ЕГО ИМЕНИ. Три ограничителя: (1) паттерн должен попасть —
+похожести недостаточно; (2) каждое применение пишется дословно в answers-used.log, так что «что мы
+за него сказали» — артефакт, а не память; (3) очередь помнит ИСХОДНЫЙ текст вопроса, поэтому его
+ответ ложится ровно на тот вопрос, который был задан, а не на наш пересказ.
+"""
+# reflex-cadence: 23 9,18 * * *
+# reflex-args: --cycle
+
+import argparse, json, os, re, subprocess, sys, time
+from pathlib import Path
+
+import signal
+
+# SIGTERM MUST UNWIND, or every `finally` below is decorative. Python's DEFAULT SIGTERM disposition
+# terminates the interpreter WITHOUT running finally blocks, TemporaryDirectory.__exit__ or atexit,
+# so a correct-looking cleanup never executes. The signal is routine here, not hypothetical: GNU
+# `timeout` without --foreground puts its child in its OWN PROCESS GROUP and signals the GROUP, so
+# every timeout-wrapped call site -- mesh-doctor's hourly --test sweep, mesh-autowire's `timeout 30`
+# -- delivers TERM to this process. That is how 950MB of stranded snapshots filled phaedra's /tmp on
+# 2026-08-16 with a `finally: rmtree` sitting right there in the source (first fixed in mesh-spend,
+# d2fd7c9b). sys.exit() from a handler raises SystemExit in the MAIN THREAD, which is what makes
+# try/finally unwind. SIGKILL stays uncatchable -- that half is mesh-tmp-guard's sweep, never this.
+for _sig in (signal.SIGTERM, signal.SIGHUP):
+    signal.signal(_sig, lambda _s, _f: sys.exit(128 + _s))
+
+
+HOME = Path.home()
+
+def node_env(key, default="off"):
+    """Read a node-local knob from ~/.mesh/nodes WITHOUT sourcing it.
+
+    cron gives a reflex an environment with nothing in it — no BASH_ENV, no login shell — and it
+    never sources ~/.mesh/nodes. So a knob read from `os.environ` alone carries its DEFAULT on
+    every scheduled run while a mind's pane shows the operator's value: a config edit that reads
+    as applied and is not. Measured on mesh-job-apply (04f98795), not read off the source — with
+    MESH_JOB_DAILY_CAP=20 in the file, `env -i HOME PATH SHELL` still printed "Бюджет 5 из 5".
+    Process env still wins, so a caller can override for one run."""
+    v = os.environ.get(key)
+    if v is not None:
+        return v
+    try:
+        with open(os.path.join(os.path.expanduser("~"), ".mesh", "nodes"),
+                  encoding="utf-8", errors="replace") as fh:
+            txt = fh.read()
+    except Exception:
+        return default
+    hit = None
+    for line in txt.splitlines():
+        m = re.match(r"\s*(?:export\s+)?%s=[\"\']?([^\"\'#\s]*)" % re.escape(key), line)
+        if m:
+            hit = m.group(1)
+    return hit if hit is not None else default
+
+
+# EVERY node-local knob goes through node_env(), never os.environ — see its docstring, which was
+# written for exactly this trap. The constants sit BELOW its definition on purpose: at module
+# scope a name is not bound above its def, and ast.parse calls such a file perfectly good while
+# the tool dies at import on NameError (mesh-job-apply's first edit did exactly that).
+
+JOB = Path(node_env("MESH_JOB_DIR", str(HOME / ".mesh/job")))
+BANK = Path(node_env("MESH_JOB_ANSWERS", str(JOB / "answers.tsv")))
+QUEUE = Path(node_env("MESH_JOB_QUESTIONS", str(JOB / "questions.tsv")))
+USED = Path(node_env("MESH_JOB_ANSWERS_USED", str(JOB / "answers-used.log")))
+VOICE_IN = Path(node_env("MESH_TG_IN_LOG", str(HOME / ".mesh/voice-in.log")))
+
+# ПОТОЛОК ДЛИНЫ ОТВЕТА. Ответ из банка уходит РАБОТОДАТЕЛЮ ОТ ЕГО ИМЕНИ, и поле формы — это
+# строчка, а не монолог. 2026-08-25 в банке нашлись два ключа с ответами в 15408 и 13670
+# символов: один ingest (2026-08-24T18:23:01Z) вместо текста своего пункта положил ВЕСЬ блоб
+# расшифровки его голосовых — parse_numbered отдаёт последнему номеру весь хвост, а since_lines
+# приносит ВСЕ его сообщения после вопроса, включая совершенно посторонние. Работодатель,
+# спросивший «готовы к релокации?», получил бы 13 тысяч знаков потока сознания под его подписью;
+# не получил только потому, что до этих ключей ни один отклик не дошёл — то есть спасла удача,
+# а не гейт.
+#
+# Потолок стоит НА ОБОИХ КОНЦАХ, и это не избыточность. На приёме — чтобы блоб не осел. На
+# ВЫДАЧЕ — потому что банк на диске уже мог быть отравлен ДО этой версии (и был), а выдача это
+# то, что реально доходит до работодателя: сузить надо тот бит, который читают все, а не только
+# тот, который пишем мы. Перелимитный ответ трактуется РОВНО как пустой — вопрос ОТКРЫТ, уходит
+# ему в анкету. Самый длинный законный ответ в живом банке — 296 символов.
+MAX_ANSWER = int(node_env("MESH_JOB_MAX_ANSWER", "800"))
+# cron hands a reflex PATH=/usr/bin:/bin, and every sibling below lives in ~/.local/bin. Without
+# this line --cycle dies on FileNotFoundError at the --ask step — 6 cron runs out of 6 here,
+# while --test stayed green in a mind's shell whose login PATH hid the fault. The questionnaire
+# was therefore never asked, and every question it would have carried sat in needs-human looking
+# like it was waiting for HIM. `check=False` does not cover it: a missing executable raises at
+# exec, it is not a returncode. Same fix, same reason, as the one at the head of mesh-job-track.
+os.environ["PATH"] = os.path.expanduser("~/.local/bin") + os.pathsep + os.environ.get("PATH", "/usr/bin:/bin")
+TG = node_env("MESH_TG_BIN", "mesh-tg")
+ASK_EVERY_DAYS = float(node_env("MESH_JOB_ASK_EVERY_DAYS", "3"))
+
+
+def now():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def esc(s):
+    return (s or "").replace("\\", "\\\\").replace("\t", "\\t").replace("\n", "\\n")
+
+
+def unesc(s):
+    out, i = [], 0
+    while i < len(s):
+        if s[i] == "\\" and i + 1 < len(s):
+            c = s[i + 1]
+            out.append({"n": "\n", "t": "\t", "\\": "\\"}.get(c, "\\" + c))
+            i += 2
+        else:
+            out.append(s[i])
+            i += 1
+    return "".join(out)
+
+
+def norm(q):
+    """Нормализация ВОПРОСА, не ответа: регистр, пробелы, ё, хвостовая пунктуация."""
+    q = (q or "").replace("\u00a0", " ").replace("ё", "е").lower()
+    return re.sub(r"\s+", " ", q).strip(" \t\n?:.!*—-")
+
+
+def read_rows(path, ncol):
+    if not path.exists():
+        return []
+    rows = []
+    for ln in path.read_text(encoding="utf-8").splitlines():
+        if not ln.strip() or ln.startswith("#"):
+            continue
+        f = ln.split("\t")
+        f += [""] * (ncol - len(f))
+        rows.append([unesc(x) for x in f[:ncol]])
+    return rows
+
+
+def write_rows(path, rows, header):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    body = "\n".join("\t".join(esc(x) for x in r) for r in rows)
+    tmp.write_text(header + "\n" + body + ("\n" if body else ""), encoding="utf-8")
+    tmp.replace(path)
+
+
+def bank():
+    # 6-я колонка `question` — ЧЕЛОВЕЧЕСКИЙ текст вопроса. Без неё анкета в TG печатала слаг
+    # («public work link»), то есть спрашивала его нашим внутренним именем поля, а не вопросом.
+    return read_rows(BANK, 6)          # key, pattern, answer, source, ts, question
+
+
+def queue():
+    return read_rows(QUEUE, 4)         # ts, status, origin, question
+
+
+def save_bank(rows):
+    write_rows(BANK, rows, "# key\tpattern\tanswer\tsource\tts\tquestion")
+
+
+def save_queue(rows):
+    write_rows(QUEUE, rows, "# ts\tstatus\torigin\tquestion")
+
+
+def match(q):
+    """-> (key, answer) | None. Пустой ответ в банке = вопрос ОТКРЫТ, а не отвечен."""
+    n = norm(q)
+    for key, pat, ans, _src, _ts, _q in bank():
+        # Перелимитный ответ = пустой: не отвечаем и не притворяемся, что знаем.
+        if not pat or not ans.strip() or len(ans) > MAX_ANSWER:
+            continue
+        try:
+            if re.search(pat, n, re.I):
+                return key, ans
+        except re.error:
+            continue
+    return None
+
+
+def enqueue(q, origin="match"):
+    """Ключ дедупа — ПАРА (вопрос, происхождение), не один вопрос.
+
+    Дедуп по одному тексту схлопывал разные обязательства в одну строку: две вакансии спрашивают
+    «Ваши зарплатные ожидания?», очередь запоминала ПЕРВУЮ, и вторая вакансия навсегда оставалась
+    «вопросов не снято» — то есть строка, чью причину физически нельзя снять. Вопрос общий, а
+    обязательство перед КАЖДЫМ работодателем своё; анкету в TG от повтора бережёт open_items,
+    который схлопывает по тексту уже на выходе."""
+    n = norm(q)
+    rows = queue()
+    for r in rows:
+        if norm(r[3]) == n and r[2] == origin:
+            return False
+    rows.append([now(), "open", origin, q.strip()])
+    save_queue(rows)
+    return True
+
+
+def open_items():
+    """Открытое = ключ банка без ответа + строки очереди в статусе open/asked."""
+    out = []
+    for key, _pat, ans, _src, _ts, q in bank():
+        if not ans.strip() or len(ans) > MAX_ANSWER:
+            out.append(("bank:" + key, (q.strip() or key.replace("-", " ")), key))
+    # Схлопывание по ТЕКСТУ здесь, а не в очереди: он отвечает на вопрос один раз, сколько бы
+    # работодателей его ни задали, и ответ ложится в банк, который читают все происхождения.
+    # А ЕЩЁ: строка очереди, на которую банк УЖЕ отвечает, открытой не является. Статус
+    # "answered:" ставит только --ingest (его собственный ответ), поэтому вопрос, снятый
+    # через --add из артефактов — тот самый путь, который оператор и просил («if u know it
+    # about me anyhow - feel free to answer without asking me») — оставался в очереди
+    # навсегда и уходил ему в анкете, хотя --match на него отвечал rc 0. Спрашивать его о
+    # том, что мы знаем, — это ровно та трата его внимания, ради экономии которой банк и
+    # заведён. Предикат здесь — САМ match(), а не его копия: иначе у одного факта («знаем
+    # ли мы ответ?») два разных решателя, и они разойдутся в день сдвига формата.
+    asked = set()
+    for ts, st, origin, q in queue():
+        if not (st.startswith("open") or st.startswith("asked")):
+            continue
+        if match(q):
+            continue
+        if norm(q) in asked:
+            continue
+        asked.add(norm(q))
+        out.append(("queue:" + ts, q, origin))
+    return out
+
+
+def last_ask_ts():
+    for ts, st, _o, _q in queue():
+        pass
+    stamps = [st.split(":", 1)[1].split("#")[0] for _t, st, _o, _q in queue() if st.startswith("asked:")]
+    return max(stamps) if stamps else ""
+
+
+def do_ask(dry=False, force=False):
+    items = open_items()
+    if not items:
+        print("нечего спрашивать: открытых вопросов нет")
+        return 0
+    last = last_ask_ts()
+    if last and not force:
+        try:
+            age = time.time() - time.mktime(time.strptime(last, "%Y-%m-%dT%H:%M:%SZ"))
+            if age < ASK_EVERY_DAYS * 86400:
+                print("спрошено %s (%.1f сут назад) — молчу до %.0f сут" % (last, age / 86400, ASK_EVERY_DAYS))
+                return 0
+        except ValueError:
+            pass
+    stamp = now()
+    lines = ["Анкета job-ланы — ответьте номерами, одним сообщением, в любом порядке.",
+             "Отвечу за вас на всё, что уже знаю; ниже только то, чего в артефактах НЕТ.", ""]
+    for i, (_id, q, _origin) in enumerate(items, 1):
+        lines.append("%d. %s" % (i, q))
+    lines += ["", "Формат: «1. ... 2. ...». Пропущенный номер останется открытым, это нормально."]
+    msg = "\n".join(lines)
+    if dry:
+        print(msg)
+        return 0
+    r = subprocess.run([TG, msg], capture_output=True, text=True, timeout=90)
+    if r.returncode != 0:
+        print("mesh-tg rc=%d: %s" % (r.returncode, (r.stderr or "").strip()[:200]), file=sys.stderr)
+        return 1
+    rows = queue()
+    qidx = {norm(q): i for i, (_id, q, _o) in enumerate(items, 1)}
+    for row in rows:
+        i = qidx.get(norm(row[3]))
+        if i and (row[1].startswith("open") or row[1].startswith("asked")):
+            row[1] = "asked:%s#%d" % (stamp, i)
+    save_queue(rows)
+    bidx = [(i, key) for i, (_id, _q, key) in enumerate(items, 1) if _id.startswith("bank:")]
+    (JOB / "ask-map.json").write_text(json.dumps(
+        {"ts": stamp, "items": [{"n": i, "id": _id, "q": q} for i, (_id, q, _o) in enumerate(items, 1)]},
+        ensure_ascii=False, indent=1), encoding="utf-8")
+    print("спрошено %d вопрос(ов) в TG, карта -> %s" % (len(items), JOB / "ask-map.json"))
+    return 0
+
+
+def parse_numbered(text):
+    """'1. ... 2. ...' -> {n: answer}. Работает и в одну строку, и в столбик."""
+    out, cur, buf = {}, None, []
+    for chunk in re.split(r"(?m)(?=^\s*\d{1,2}\s*[.):])|(?<=[.\s])(?=\d{1,2}\s*[.)]\s+\S)", text):
+        m = re.match(r"^\s*(\d{1,2})\s*[.):]\s*(.*)$", chunk, re.S)
+        if not m:
+            if cur is not None:
+                buf.append(chunk)
+            continue
+        if cur is not None:
+            out[cur] = " ".join((" ".join(buf)).split()).strip()
+        cur, buf = int(m.group(1)), [m.group(2)]
+    if cur is not None:
+        out[cur] = " ".join((" ".join(buf)).split()).strip()
+    return {k: v for k, v in out.items() if v}
+
+
+def since_lines(ts):
+    if not VOICE_IN.exists():
+        return []
+    out = []
+    for ln in VOICE_IN.read_text(encoding="utf-8", errors="replace").splitlines():
+        m = re.match(r"^(\S+Z)\s+(TEXT|VOICE)\s+(.*)$", ln)
+        # >= , не > : его ответ, пришедший в ТУ ЖЕ секунду, что и вопрос, иначе теряется молча.
+        # Наше исходящее в voice-in.log не пишется, так что вернуть свой же вопрос отсюда нельзя.
+        if m and (not ts or m.group(1) >= ts):
+            out.append(m.group(3))
+    return out
+
+
+def do_ingest(from_stdin=False):
+    mp = JOB / "ask-map.json"
+    if not mp.exists():
+        print("нет ask-map.json — сначала --ask", file=sys.stderr)
+        return 1
+    m = json.loads(mp.read_text(encoding="utf-8"))
+    text = sys.stdin.read() if from_stdin else "\n".join(since_lines(m["ts"]))
+    if not text.strip():
+        print("после %s от него ничего не пришло" % m["ts"])
+        return 0
+    got = parse_numbered(text)
+    if not got:
+        print("в его сообщениях нет нумерованных ответов (искал после %s)" % m["ts"])
+        return 0
+    by_n = {it["n"]: it for it in m["items"]}
+    brows, qrows, wrote = bank(), queue(), 0
+    for n, ans in sorted(got.items()):
+        it = by_n.get(n)
+        if not it:
+            continue
+        if len(ans) > MAX_ANSWER:
+            # Не молча: отброшенный ответ, о котором никто не сказал, читается как «он не ответил»,
+            # и вопрос уйдёт ему снова с тем же результатом. Вопрос остаётся ОТКРЫТЫМ — что и
+            # является правильным исходом, потому что ответа на поле формы здесь действительно нет.
+            print("пункт %d ОТБРОШЕН: %d символов при потолке %d — это не ответ на поле формы, "
+                  "а хвост расшифровки (parse_numbered отдаёт последнему номеру весь остаток). "
+                  "Вопрос остаётся открытым." % (n, len(ans), MAX_ANSWER), file=sys.stderr)
+            continue
+        if it["id"].startswith("bank:"):
+            key = it["id"].split(":", 1)[1]
+            for r in brows:
+                if r[0] == key:
+                    r[2], r[3], r[4] = ans, "operator-tg", now()
+                    wrote += 1
+        else:
+            q = it["q"]
+            key = "q-" + re.sub(r"[^a-z0-9]+", "-", norm(q)[:40]).strip("-") or ("q-%d" % n)
+            pat = re.escape(norm(q)[:60])
+            brows = [r for r in brows if r[0] != key]
+            brows.append([key, pat, ans, "operator-tg", now(), q])
+            for r in qrows:
+                if norm(r[3]) == norm(q):
+                    r[1] = "answered:" + key
+            wrote += 1
+        print("%d -> %s" % (n, ans[:80]))
+    save_bank(brows)
+    save_queue(qrows)
+    print("записано %d ответ(ов) в %s" % (wrote, BANK))
+    return 0
+
+
+def do_cycle(dry=False, force=False):
+    """Крон запускает ИМЕННО это: сначала забрать его ответ, потом спрашивать.
+
+    Обратный порядок — анкета, которую задают и не читают: он отвечает, ответ лежит в voice-in.log,
+    а следующий тик снова спрашивает его о том же. Вопрос без чтения ответа это не вопрос."""
+    if (JOB / "ask-map.json").exists():
+        do_ingest(False)
+    return do_ask(dry, force)
+
+
+def do_match(q, no_queue=False, origin="match"):
+    hit = match(q)
+    if hit:
+        key, ans = hit
+        USED.parent.mkdir(parents=True, exist_ok=True)
+        with USED.open("a", encoding="utf-8") as f:
+            f.write("%s\t%s\t%s\t%s\n" % (now(), key, esc(q.strip()), esc(ans)))
+        print(ans)
+        return 0
+    if not no_queue:
+        enqueue(q, origin)
+    print("не знаю ответа — вопрос в очереди (%s)" % QUEUE, file=sys.stderr)
+    return 2
+
+
+def selftest():
+    import tempfile
+    global BANK, QUEUE, USED, VOICE_IN, JOB
+    fails = []
+
+    def check(name, ok, detail=""):
+        print("%s %s%s" % ("ok  " if ok else "FAIL", name, ("  -- " + detail) if detail and not ok else ""))
+        if not ok:
+            fails.append(name)
+
+    # EVERY node knob must survive a CRON environment, not just the ones a pane exercises. cron
+    # never sources ~/.mesh/nodes, so a knob read from os.environ carries its DEFAULT on every
+    # scheduled run while the pane shows the operator's value — a config edit that reads as
+    # applied and is not (measured on mesh-job-apply, 04f98795: cap 20 in the file, "5 из 5" on
+    # the run). Driven END TO END, as a subprocess under a fabricated HOME with `env -i`, because
+    # the binding happens at IMPORT: an in-process check cannot see a constant that was already
+    # bound wrong. Two arms with DIFFERENT values, so a tool that ignores the file entirely fails
+    # one of them whatever its own default is. (Mutant seen red: node_env -> os.environ.get.)
+    import tempfile as _tf
+    import shutil as _sh_arm
+    _KEY, _ARMS = "MESH_JOB_MAX_ANSWER", ("137", "251")
+    _seen = []
+    for _want in _ARMS:
+        _h = _tf.mkdtemp(prefix="node-env-arm-")
+        try:
+            os.makedirs(os.path.join(_h, ".mesh", "job"), exist_ok=True)
+            with open(os.path.join(_h, ".mesh", "nodes"), "w") as _f:
+                _f.write("export %s=%s\n" % (_KEY, _want))
+            _p = subprocess.run(["/usr/bin/env", "-i", "HOME=" + _h, "PATH=/usr/bin:/bin",
+                                 "SHELL=/bin/sh", sys.executable, os.path.abspath(__file__),
+                                 "--print-knobs"], capture_output=True, text=True, timeout=60)
+            _seen.append(("%s=%s" % (_KEY, _want)) in _p.stdout)
+        finally:
+            _sh_arm.rmtree(_h, ignore_errors=True)
+    check("%s is read from ~/.mesh/nodes under a CRON environment (arm 1: %s)" % (_KEY, _ARMS[0]),
+          _seen[0])
+    check("...and tracks the file, not a constant (arm 2: %s)" % _ARMS[1], _seen[1])
+
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        real_bank, real_used = BANK, USED
+        JOB, BANK, QUEUE, USED = d, d / "answers.tsv", d / "questions.tsv", d / "used.log"
+        VOICE_IN = d / "voice-in.log"
+
+        save_bank([["salary", r"ожидани[яй] по зарплат|salary expectation", "500 000", "derived", now(), ""],
+                   ["relocation", r"релокац|relocat", "", "open", now(), "Готовы ли переехать?"]])
+        check("known question answers from the bank", match("Ваши ожидания по зарплате?") is not None)
+        check("an EMPTY answer is OPEN, not an answer", match("Готовы к релокации?") is None,
+              "пустой ответ прочитан как ответ")
+        check("unrelated question does not match", match("Какой у вас любимый цвет?") is None)
+
+        rc = do_match("Какой у вас любимый цвет?")
+        check("unknown -> rc 2", rc == 2, "rc=%d" % rc)
+        check("unknown lands in the queue", any("любимый цвет" in r[3] for r in queue()))
+        rc = do_match("Ваши ожидания по зарплате?")
+        check("known -> rc 0", rc == 0, "rc=%d" % rc)
+        check("a used answer is logged verbatim", USED.exists() and "500 000" in USED.read_text())
+        check("the test never touched the REAL bank", BANK != real_bank and USED != real_used)
+
+        n0 = len(queue())
+        enqueue("Какой у вас любимый цвет?")
+        check("the queue does not double the same question from the SAME origin", len(queue()) == n0)
+        enqueue("Какой у вас любимый цвет?", "hh:другая-вакансия")
+        check("the same question from ANOTHER origin IS a second obligation", len(queue()) == n0 + 1)
+        check("but the questionnaire still asks it ONCE",
+              sum(1 for _i, q, _o in open_items() if "любимый цвет" in q) == 1)
+
+        # --covered: три исхода, и «нечего сверять» обязан отличаться от «всё покрыто».
+        # Пустое множество формально покрыто целиком — если бы rc 0 приходил и оттуда,
+        # пере-открыватель открыл бы строку, про которую не выяснено НИЧЕГО.
+        check("--covered on an origin with NOTHING harvested is rc 2, not 0",
+              covered("hh:нет-такого") == 2)
+        enqueue("Ваши ожидания по зарплате?", "hh:111")
+        check("--covered is rc 0 when the bank answers every harvested question",
+              covered("hh:111") == 0)
+        enqueue("Какой у вас любимый цвет?", "hh:222")
+        check("--covered is rc 1 when one harvested question is not in the bank",
+              covered("hh:222") == 1)
+
+        os.environ["MESH_TG_BIN"] = "true"
+        globals()["TG"] = "true"
+        rc = do_ask(force=True)
+        check("--ask sends and marks asked", rc == 0 and any(r[1].startswith("asked:") for r in queue()))
+        mp = json.loads((JOB / "ask-map.json").read_text())
+        check("ask-map numbers every asked item", len(mp["items"]) == len(open_items()) or len(mp["items"]) > 0)
+
+        g = parse_numbered("1. да, готов 2) только Европа\n3: нет")
+        check("an open bank key is asked by its QUESTION, not its slug",
+              any(it["q"] == "Готовы ли переехать?" for it in mp["items"]),
+              repr([it["q"] for it in mp["items"]]))
+        check("numbered reply parses inline and stacked", g.get(1) and g.get(2) == "только Европа" and g.get(3) == "нет",
+              repr(g))
+        check("prose with no numbers parses to nothing", parse_numbered("да конечно давайте") == {})
+
+        n_relo = [it["n"] for it in mp["items"] if it["id"] == "bank:relocation"]
+        if n_relo:
+            VOICE_IN.write_text("%s TEXT %d. готов, Европа и Эмираты\n" % (now(), n_relo[0]), encoding="utf-8")
+            do_ingest()
+            hit = match("Готовы к релокации?")
+            check("his TG answer closes the open bank key", hit is not None and "Европа" in (hit[1] if hit else ""),
+                  "match=%r" % (hit,))
+        else:
+            check("ask-map carries the open bank key", False, "relocation не попал в анкету")
+
+        # --cycle ЧИТАЕТ раньше, чем спрашивает — гоняется РОВНО тот путь, что стоит в кроне.
+        # Ключ снова открывается, вопрос уходит, его ответ кладётся в voice-in.log ПОСЛЕ вопроса,
+        # и один вызов do_cycle обязан его забрать. Порядок наоборот -> ключ остался бы открыт.
+        save_bank([r if r[0] != "relocation" else ["relocation", r"релокац|relocat", "", "open",
+                                                   now(), "Готовы ли переехать?"] for r in bank()])
+        do_ask(force=True)
+        mp2 = json.loads((JOB / "ask-map.json").read_text())
+        n2 = [it["n"] for it in mp2["items"] if it["id"] == "bank:relocation"]
+        VOICE_IN.write_text("%s TEXT %d. да, ЕС\n" % (now(), n2[0]), encoding="utf-8")
+        do_cycle(force=True)
+        check("--cycle ingests before it asks (the cron path itself)",
+              (match("Готовы к релокации?") or ("", ""))[1] == "да, ЕС",
+              repr(match("Готовы к релокации?")))
+
+        # a queue row the bank now answers is NOT open (the --add path, which sets no
+        # "answered:" status) — and the RED half: empty the bank and it comes back open.
+        save_bank([["langs", r"на каких языках.*код", "Go, Scala, Kotlin", "cv", now(), ""]])
+        save_queue([[now(), "open", "hh:1", "на каких языках можете писать код?"]])
+        check("a queue row the bank answers is not asked again",
+              not [i for i in open_items() if "языках" in i[1]],
+              repr(open_items()))
+        save_bank([["langs", r"на каких языках.*код", "", "cv", now(), ""]])
+        check("...and it re-opens when the bank stops answering (gate seen red)",
+              [i for i in open_items() if "языках" in i[1]] != [],
+              repr(open_items()))
+
+        # ПОТОЛОК ДЛИНЫ, оба конца. Живой случай 2026-08-25: два ключа несли 15408 и 13670
+        # символов сырой расшифровки, готовых уйти работодателю под его подписью.
+        save_bank([["relocation", r"релокац|relocat", "x" * 5000, "operator-tg", now(), ""]])
+        check("перелимитный ответ НЕ выдаётся (он ушёл бы работодателю)",
+              match("готовы к релокации?") is None)
+        check("...и такой ключ снова считается ОТКРЫТЫМ, а не отвеченным",
+              any(i[0] == "bank:relocation" for i in open_items()))
+        # КРАСНАЯ половина: тот же ключ в пределах потолка отвечает как обычно — иначе это не
+        # потолок, а глухая стена, и зелёный выше ничего не значит.
+        save_bank([["relocation", r"релокац|relocat", "Готов, ЕС", "operator-tg", now(), ""]])
+        check("...а короткий ответ по тому же ключу выдаётся (gate seen open)",
+              (match("готовы к релокации?") or ("", ""))[1] == "Готов, ЕС")
+
+        # the gate seen RED: break the bank and the same question must stop answering
+        save_bank([["salary", r"ожидани[яй] по зарплат", "", "derived", now(), ""]])
+        check("an emptied answer STOPS being answered (gate seen red)", match("Ваши ожидания по зарплате?") is None)
+
+    # THE CONTRACT EVERY CALLER TESTS: (rc == 0 and stdout non-empty) means "here is an answer".
+    # Anything this tool prints on STDOUT with rc 0 will be typed into an employer's form under the
+    # operator's name — that is what mesh-job-apply does with it, unconditionally. So the two paths
+    # that answer NOTHING must produce NOTHING on stdout and a non-zero rc, and the path that does
+    # answer must still answer. Driven as subprocesses, because the bug was in argparse dispatch and
+    # an in-process call to the same functions cannot see it. (Seen red: `--match ""` returned rc 0
+    # with 2.3 KB of usage text on stdout, and four откликов went out carrying it, 2026-08-26.)
+    _self = os.path.abspath(__file__)
+    for _label, _argv in (("--match с пустым вопросом", ["--match", ""]),
+                          ("вызов без действия", [])):
+        _r = subprocess.run([sys.executable, _self] + _argv,
+                            capture_output=True, text=True, timeout=60)
+        check("%s: НИЧЕГО на stdout" % _label, (_r.stdout or "").strip() == "",
+              (_r.stdout or "")[:70])
+        check("%s: ненулевой код возврата" % _label, _r.returncode != 0, "rc=%s" % _r.returncode)
+    # The positive arm asserts the PROPERTY, not a bank row: whether this question happens to be
+    # answered is a fact about the live анкета, and a test keyed on that accuses the world every
+    # time the operator empties a key. What must never happen is usage text reaching stdout.
+    _r = subprocess.run([sys.executable, _self, "--match", "Ваши ожидания по зарплате?"],
+                        capture_output=True, text=True, timeout=60)
+    check("...а настоящий вопрос НИКОГДА не получает в ответ справку инструмента",
+          not (_r.stdout or "").lstrip().startswith("usage:"),
+          "rc=%s out=%r" % (_r.returncode, (_r.stdout or "")[:60]))
+
+    # THE CRON PATH ARM. --cycle died 6 runs out of 6 on FileNotFoundError('mesh-tg') while every
+    # arm above stayed green, because a mind's login PATH carries ~/.local/bin and cron's does not.
+    # The gate must therefore run the module AS CRON RUNS IT — in a CHILD whose whole environment is
+    # cron's (PATH=/usr/bin:/bin) — and must NOT repair PATH itself: an arm that re-prepends the
+    # directory passes with the module's own line deleted, which is a gate testing its own fixture.
+    # The stub lives in the FAKE HOME's .local/bin, because the line under test expands ~, so a
+    # child that never read HOME cannot find it. Driven red by deleting that line: the child then
+    # dies FileNotFoundError, exactly as cron did.
+    _hp = _tf.mkdtemp(prefix="answers-cronpath-")
+    try:
+        _bin = os.path.join(_hp, ".local", "bin")
+        os.makedirs(_bin, exist_ok=True)
+        os.makedirs(os.path.join(_hp, ".mesh", "job"), exist_ok=True)
+        _stub = os.path.join(_bin, "mesh-tg")
+        with open(_stub, "w", encoding="utf-8") as fh:
+            fh.write("#!/bin/sh\nexit 0\n")
+        os.chmod(_stub, 0o755)
+        # one open question, so --ask has something to send and actually reaches the TG call
+        with open(os.path.join(_hp, ".mesh/job/questions.tsv"), "w", encoding="utf-8") as fh:
+            fh.write("# ts\tstatus\torigin\tquestion\n2026-08-29T00:00:00Z\topen\ttest\tвопрос для гейта PATH\n")
+        _r = subprocess.run([sys.executable, os.path.abspath(__file__), "--ask", "--force"],
+                            env={"PATH": "/usr/bin:/bin", "HOME": _hp,
+                                 "LC_ALL": "C.UTF-8", "PYTHONIOENCODING": "utf-8"},
+                            capture_output=True, text=True, timeout=90)
+        check("--ask reaches mesh-tg under cron's own PATH (child, env=PATH=/usr/bin:/bin)",
+              _r.returncode == 0 and "FileNotFoundError" not in (_r.stderr or ""),
+              "rc=%d %s" % (_r.returncode, (_r.stderr or "").strip().splitlines()[-1:] or ""))
+    finally:
+        _sh_arm.rmtree(_hp, ignore_errors=True)
+
+    print("smoke-test: %s" % ("ok" if not fails else "FAIL (%s)" % ", ".join(fails)))
+    return 1 if fails else 0
+
+
+def covered(origin):
+    """ОДНА точка, отвечающая на вопрос «снята ли причина questions с этой вакансии?».
+
+    Владелец очереди отвечает про свою очередь сам: пере-открыватель в mesh-job-apply НЕ читает
+    questions.tsv своими глазами — иначе у одного факта появилось бы два разных парсера, и они
+    разошлись бы ровно в тот день, когда формат сдвинется.
+
+    Три исхода, и третий — не «нет», а «не могу поместить строку в окно»:
+      rc 0 — вопросы сняты И на каждый есть ответ в банке (причина снята, строку можно открывать)
+      rc 1 — вопросы сняты, но хотя бы один банк не покрывает (нужен ОН, анкета в TG)
+      rc 2 — за этим происхождением НЕ снято НИ ОДНОГО вопроса. Это НЕЗНАНИЕ, а не покрытие:
+             пустое множество формально «покрыто целиком», и вернуть отсюда 0 значило бы открыть
+             строку, про которую мы ничего не выяснили."""
+    items = [(ts, st, q) for ts, st, o, q in queue() if o == origin]
+    if not items:
+        print("%s: вопросов не снято — сверять не с чем" % origin)
+        return 2
+    bad = 0
+    for ts, st, q in items:
+        m = match(q)
+        print("  %-6s %-18s %s" % ("банк" if m else "ОТКРЫТ", (m[0] if m else "-")[:18], q[:90]))
+        if not m:
+            bad += 1
+    print("%s: %d вопрос(ов), не покрыто банком: %d" % (origin, len(items), bad))
+    return 1 if bad else 0
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("--match")
+    ap.add_argument("--queue")
+    ap.add_argument("--origin", default="manual")
+    ap.add_argument("--add", nargs=3, metavar=("KEY", "PATTERN", "ANSWER"))
+    ap.add_argument("--source", default="operator-tg")
+    ap.add_argument("--question", default=None, help="человеческий текст вопроса (для анкеты в TG)")
+    ap.add_argument("--list", action="store_true")
+    ap.add_argument("--open", action="store_true")
+    ap.add_argument("--covered", metavar="ORIGIN")
+    ap.add_argument("--ask", action="store_true")
+    ap.add_argument("--cycle", action="store_true",
+                    help="ingest -> ask. Крон обязан СНАЧАЛА забрать его ответ: анкета, которую "
+                         "спрашивают, но не читают, задаёт вопрос, на который он уже ответил.")
+    ap.add_argument("--ingest", action="store_true")
+    ap.add_argument("--stdin", action="store_true")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--force", action="store_true")
+    ap.add_argument("--no-queue", action="store_true")
+    ap.add_argument("--test", action="store_true")
+    ap.add_argument("--print-knobs", action="store_true", help=argparse.SUPPRESS)
+    a = ap.parse_args()
+    # Internal leg of --test: prints the node knobs AS BOUND AT IMPORT. Binding happens at import,
+    # so only a real subprocess under `env -i` can show which value a cron environment actually got.
+    if a.print_knobs:
+        print("MESH_JOB_DIR=%s" % (JOB,))
+        print("MESH_JOB_MAX_ANSWER=%s" % (MAX_ANSWER,))
+        print("MESH_JOB_ASK_EVERY_DAYS=%s" % (ASK_EVERY_DAYS,))
+        print("MESH_TG_BIN=%s" % (TG,))
+        return 0
+
+    if a.test:
+        return selftest()
+    if a.match is not None:
+        # AN EMPTY --match IS AN ERROR, NEVER A HELP DUMP. `if a.match:` treated "" as "flag not
+        # given" and fell through to print_help() on STDOUT with rc 0, and mesh-job-apply's caller
+        # tests exactly (rc == 0 and stdout non-empty) before typing the result into an employer's
+        # answer field. Measured 2026-08-26: four откликов were SUBMITTED under the operator's name
+        # carrying this tool's own usage block as the answer to a screening question, because a
+        # vacancy had an unlabelled textarea and the question scraped as "". Non-empty is not
+        # correct, and a fallback that ANSWERS is worse than one that fails.
+        if not a.match.strip():
+            print("mesh-job-answers: --match получил пустой вопрос — отвечать не на что",
+                  file=sys.stderr)
+            return 2
+        return do_match(a.match, a.no_queue, a.origin)
+    if a.queue:
+        return 0 if enqueue(a.queue, a.origin) else 0
+    if a.add:
+        key, pat, ans = a.add
+        old = {r[0]: r for r in bank()}
+        rows = [r for r in bank() if r[0] != key]
+        q = a.question if a.question is not None else (old.get(key, ["", "", "", "", "", ""])[5])
+        rows.append([key, pat, ans, a.source, now(), q])
+        save_bank(rows)
+        print("%s <- %s" % (key, ans[:60] or "(ОТКРЫТ)"))
+        return 0
+    if a.list:
+        for key, pat, ans, src, ts, _q in bank():
+            print("%-18s %-9s %s" % (key, src, (ans[:96].replace("\n", " ⏎ ") if ans.strip() else "— ОТКРЫТ —")))
+        return 0
+    if a.open:
+        for _id, q, origin in open_items():
+            print("%-14s %s" % (origin[:14], q))
+        return 0
+    if a.covered:
+        return covered(a.covered)
+    if a.cycle:
+        return do_cycle(a.dry_run, a.force)
+    if a.ask:
+        return do_ask(a.dry_run, a.force)
+    if a.ingest:
+        return do_ingest(a.stdin)
+    # NOTHING TO DO IS NOT SUCCESS. Help belongs on stderr with a non-zero rc: a tool whose
+    # do-nothing path writes to STDOUT and returns 0 hands every caller a plausible answer.
+    ap.print_help(sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

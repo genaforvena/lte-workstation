@@ -1,0 +1,508 @@
+#!/usr/bin/env python3
+"""mesh-job-cal — the operator's interview calendar, and the only place free slots come from.
+
+  mesh-job-cal --agenda [--days N]        что впереди
+  mesh-job-cal --free [--days N] [--dur M] [--max K] [--text]
+  mesh-job-cal --add "<когда> | <компания> | <вакансия> | <вид> | <канал> | <контакт> | <заметка>"
+  mesh-job-cal --confirm ID | --cancel ID | --done ID
+  (MESH_JOB_NOT_BEFORE=YYYY-MM-DD в ~/.mesh/nodes — объявленный отдых, раньше не предлагать)
+  mesh-job-cal --tg           (рефлекс: утренняя повестка + напоминание за час)
+  mesh-job-cal --test
+
+# reflex-cadence: */15 * * * *
+# reflex-args: --tg
+
+Availability is his own, given 2026-08-20: **пн-пт 12:00–19:00 MSK**, nothing on weekends. It
+lives in `MESH_JOB_HOURS` / `MESH_JOB_DAYS` (`~/.mesh/nodes`) so a change is one line, not an
+edit to a tool that also proposes those hours to strangers. Those keys are read out of that file
+directly (`node_env`), because cron runs this binary with no shell and an `os.environ`-only read
+made every one of them dead under the reflex while working by hand — the window held on the code
+default, not on the config.
+
+`MESH_JOB_NOT_BEFORE=YYYY-MM-DD` (MSK) is the declared-rest floor: nothing earlier is ever
+offered. It is a threshold rather than a subtracted day so it expires by itself — a line left
+behind in `~/.mesh/nodes` becomes a no-op instead of locking the lane shut. Set 2026-08-21 when
+he said «сегодня отдыхаю, все выходные, и снова с понедельника».
+
+Why a tool and not a note: the moment the lane answers an employer with «удобно во вторник в
+15:00» it has spent an hour of his life, and a second employer must not be offered the same
+hour. `--free` subtracts everything booked (plus a travel/decompression buffer) and is the ONLY
+sanctioned source of a proposed time — `mesh-job-reply` calls it rather than inventing one.
+
+Times are MSK everywhere in and out; the node runs UTC, and an interview announced an hour late
+is worse than no announcement. Storage is ISO UTC, display is MSK, and the two never mix.
+
+State: `~/.mesh/job/schedule.tsv` (durable, appended and rewritten in place) +
+`~/.mesh/job/cal-state.json` (what has already been announced, so a 15-minute reflex does not
+repeat itself). `--test` writes neither.
+"""
+import argparse, json, os, pathlib, re, subprocess, sys, time
+from datetime import datetime, timedelta, timezone
+
+try:
+    from zoneinfo import ZoneInfo
+    MSK = ZoneInfo("Europe/Moscow")
+except Exception:                                   # pragma: no cover - tzdata is present here
+    MSK = timezone(timedelta(hours=3))
+
+os.environ["PATH"] = os.path.expanduser("~/.local/bin") + os.pathsep + os.environ.get("PATH", "/usr/bin:/bin")
+
+HOME = pathlib.Path.home()
+SCHED = HOME / ".mesh" / "job" / "schedule.tsv"
+STATE = HOME / ".mesh" / "job" / "cal-state.json"
+TG = "mesh-tg"
+COLS = ["id", "state", "start_utc", "dur", "company", "vacancy", "kind", "channel", "contact", "note"]
+
+def node_env(key, default=""):
+    """Прочитать переключатель из ~/.mesh/nodes, НЕ сорся его.
+
+    cron даёт рефлексу пустое окружение — ни BASH_ENV, ни login-шелла, и строка
+    `*/15 … mesh-job-cal --tg` вызывает бинарь напрямую. Ручка, прочитанная одним `os.environ`,
+    вооружена только в панели ума: докстринг обещал `MESH_JOB_HOURS`/`MESH_JOB_DAYS` «одной
+    строкой в ~/.mesh/nodes», а под cron туда никто не смотрел (тот же провал, что у
+    mesh-job-apply, 4 из 4 запусков). Окружение процесса всё ещё выигрывает — вызывающий может
+    перекрыть на один запуск."""
+    v = os.environ.get(key)
+    if v is not None:
+        return v
+    try:
+        txt = (pathlib.Path.home() / ".mesh" / "nodes").read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return default
+    hit = None
+    for line in txt.splitlines():
+        m = re.match(r"\s*(?:export\s+)?%s=[\"']?([^\"'#\s]*)" % re.escape(key), line)
+        if m:
+            hit = m.group(1)
+    return hit if hit is not None else default
+
+
+HOURS = node_env("MESH_JOB_HOURS", "12:00-19:00")
+DAYS = node_env("MESH_JOB_DAYS", "1,2,3,4,5")                # ISO weekday: 1=Mon
+BUFFER_MIN = int(node_env("MESH_JOB_BUFFER_MIN", "30"))
+NOT_BEFORE = node_env("MESH_JOB_NOT_BEFORE", "").strip()     # 'YYYY-MM-DD' MSK: ничего не предлагать раньше
+RU_DOW = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
+
+
+def window():
+    a, b = HOURS.split("-")
+    return tuple(int(x) for x in a.split(":")), tuple(int(x) for x in b.split(":"))
+
+
+def workdays():
+    return {int(d) for d in DAYS.split(",") if d.strip()}
+
+
+def now_msk():
+    return datetime.now(timezone.utc).astimezone(MSK)
+
+
+def fmt(dt):
+    return "%s %02d.%02d %02d:%02d" % (RU_DOW[dt.weekday()], dt.day, dt.month, dt.hour, dt.minute)
+
+# ---------------------------------------------------------------- store
+
+def rows():
+    if not SCHED.exists():
+        return []
+    out = []
+    for line in SCHED.read_text(encoding="utf-8").splitlines():
+        if not line.strip() or line.startswith("#"):
+            continue
+        c = line.split("\t")
+        c += [""] * (len(COLS) - len(c))
+        out.append(dict(zip(COLS, c[:len(COLS)])))
+    return out
+
+
+def write(rs):
+    SCHED.parent.mkdir(parents=True, exist_ok=True)
+    body = "# id\tstate\tstart_utc\tdur\tcompany\tvacancy\tkind\tchannel\tcontact\tnote\n"
+    body += "".join("\t".join((r.get(c, "") or "").replace("\t", " ") for c in COLS) + "\n" for r in rs)
+    tmp = SCHED.with_suffix(".tmp")
+    tmp.write_text(body, encoding="utf-8")
+    tmp.replace(SCHED)
+
+
+def parse_when(s):
+    """'2026-08-26 15:00' | '26.08 15:00' | 'завтра 14:30' -> aware MSK datetime."""
+    s = s.strip().lower()
+    base = now_msk()
+    m = re.match(r"^(сегодня|завтра|послезавтра)\s+(\d{1,2}):(\d{2})$", s)
+    if m:
+        shift = {"сегодня": 0, "завтра": 1, "послезавтра": 2}[m.group(1)]
+        d = base + timedelta(days=shift)
+        return d.replace(hour=int(m.group(2)), minute=int(m.group(3)), second=0, microsecond=0)
+    m = re.match(r"^(\d{4})-(\d{2})-(\d{2})[ t](\d{1,2}):(\d{2})$", s)
+    if m:
+        y, mo, d, h, mi = (int(x) for x in m.groups())
+        return datetime(y, mo, d, h, mi, tzinfo=MSK)
+    m = re.match(r"^(\d{1,2})\.(\d{1,2})(?:\.(\d{4}))?\s+(\d{1,2}):(\d{2})$", s)
+    if m:
+        d, mo, y, h, mi = m.group(1), m.group(2), m.group(3), m.group(4), m.group(5)
+        y = int(y) if y else base.year
+        return datetime(y, int(mo), int(d), int(h), int(mi), tzinfo=MSK)
+    raise ValueError("не разобрал время: %r (жду '2026-08-26 15:00', '26.08 15:00' или 'завтра 14:30')" % s)
+
+
+def to_utc(dt):
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
+
+
+def from_utc(s):
+    return datetime.strptime(s, "%Y-%m-%dT%H:%MZ").replace(tzinfo=timezone.utc).astimezone(MSK)
+
+# ---------------------------------------------------------------- slots
+
+def busy(rs):
+    out = []
+    for r in rs:
+        if r["state"] in ("cancelled", "done"):
+            continue
+        try:
+            st = from_utc(r["start_utc"])
+        except Exception:
+            continue
+        out.append((st, st + timedelta(minutes=int(r["dur"] or 60))))
+    return out
+
+
+def free_slots(rs, days=7, dur=60, limit=6, lead_min=120, per_day=None):
+    """Slots inside his declared hours that nothing else touches.
+
+    `lead_min` keeps the lane from offering an employer a time two minutes from now: a slot he
+    cannot realistically be told about is not free, it is a broken promise waiting.
+
+    `per_day` spreads the offer: five consecutive hours of one Friday reads as an unemployed
+    person's whole day, and if that day is refused the proposal has nothing left.
+
+    IT WAS 2, AND THE TARGET IS 2. Operator, 2026-08-25: «нам нужно выйти на темп два
+    собеседования в день… чтоб было запланировано на каждый будний день». With per_day=2 the lane
+    could never OFFER more than two hours a day, so booking two required every single offered slot
+    to convert — one employer declining a time cost the whole day, and the goal sat exactly ON the
+    ceiling of what the lane was able to propose. A funnel whose mouth equals its target has no
+    funnel in it. Default is now MESH_JOB_SLOTS_PER_DAY (4): still spread, still not his whole
+    day, but with headroom for a refusal. The declared window is 12:00-19:00 MSK — seven hours —
+    so four is well inside what he said he has."""
+    if per_day is None:
+        per_day = int(node_env("MESH_JOB_SLOTS_PER_DAY", "4") or "4")
+    lo, hi = window()
+    wd = workdays()
+    taken = busy(rs)
+    start = now_msk() + timedelta(minutes=lead_min)
+    if NOT_BEFORE:
+        # Отпуск/выходной, объявленный оператором. Порог, а не вычитание дня: он проходит сам
+        # собой, когда дата наступила, поэтому забытая строка в ~/.mesh/nodes не запирает лану
+        # навсегда. Раньше него не предлагается ничего — это единственный источник слотов.
+        try:
+            floor = datetime.strptime(NOT_BEFORE, "%Y-%m-%d").replace(tzinfo=MSK)
+            start = max(start, floor)
+        except ValueError:
+            print("mesh-job-cal: MESH_JOB_NOT_BEFORE=%r не YYYY-MM-DD — игнорирую" % NOT_BEFORE,
+                  file=sys.stderr)
+    out = []
+    day = start.replace(hour=0, minute=0, second=0, microsecond=0)
+    for i in range(days + 1):
+        d = day + timedelta(days=i)
+        if (d.weekday() + 1) not in wd:
+            continue
+        t = d.replace(hour=lo[0], minute=lo[1])
+        end_of_day = d.replace(hour=hi[0], minute=hi[1])
+        while t + timedelta(minutes=dur) <= end_of_day:
+            s, e = t, t + timedelta(minutes=dur)
+            if s >= start:
+                clash = any(s < be + timedelta(minutes=BUFFER_MIN) and be_s - timedelta(minutes=BUFFER_MIN) < e
+                            for be_s, be in taken)
+                if not clash and sum(1 for o in out if o.date() == s.date()) < per_day:
+                    out.append(s)
+                    if len(out) >= limit:
+                        return out
+            t += timedelta(minutes=60)
+    return out
+
+# ---------------------------------------------------------------- announce
+
+def load_state():
+    try:
+        return json.loads(STATE.read_text())
+    except Exception:
+        return {"announced": []}
+
+
+def save_state(st):
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    STATE.write_text(json.dumps(st, ensure_ascii=False, indent=1))
+
+
+def line_of(r):
+    st = from_utc(r["start_utc"])
+    bits = [fmt(st), r["company"] or "?"]
+    if r["vacancy"]:
+        bits.append(r["vacancy"])
+    tail = " · ".join(x for x in (r["kind"], r["channel"], r["contact"]) if x)
+    return " — ".join(bits) + ((" (" + tail + ")") if tail else "") + \
+           (" [%s]" % r["state"] if r["state"] != "confirmed" else "")
+
+# ---------------------------------------------------------------- test
+
+def selftest():
+    ok = True
+    # NOT_BEFORE — ЖИВАЯ настройка оператора (объявленный отдых), а не свойство кода. Пока она
+    # стоит, она клампит каждый вызов free_slots и незаметно ломает проверки, которые меряют
+    # совсем другое (горизонт договорённости, базовую линию). Гасим на всю проверку и включаем
+    # только в том блоке, который её и проверяет.
+    global NOT_BEFORE
+    _nb_live, NOT_BEFORE = NOT_BEFORE, ""
+
+    def check(label, cond, detail=""):
+        nonlocal ok
+        print(("  ok   " if cond else "  FAIL ") + label + ((" — " + detail) if detail else ""))
+        ok = ok and bool(cond)
+
+    lo, hi = window()
+    check("окно из конфига 12:00-19:00", (lo, hi) == ((12, 0), (19, 0)), "%s-%s" % (lo, hi))
+    check("рабочие дни пн-пт", workdays() == {1, 2, 3, 4, 5}, str(sorted(workdays())))
+
+    # Timezone: the node is UTC, he is MSK. A round trip must not drift.
+    d = parse_when("2026-08-26 15:00")
+    check("парсер даёт MSK", d.hour == 15 and d.tzinfo is not None, d.isoformat())
+    check("в UTC сохраняется со сдвигом", to_utc(d) == "2026-08-26T12:00Z", to_utc(d))
+    check("обратно читается как 15:00 MSK", from_utc(to_utc(d)).hour == 15)
+    check("формат для человека", fmt(d) == "ср 26.08 15:00", fmt(d))
+
+    # A synthetic booking must actually remove its own hour AND the buffer around it.
+    fake = [{"id": "t1", "state": "confirmed", "start_utc": None, "dur": "60",
+             "company": "X", "vacancy": "", "kind": "", "channel": "", "contact": "", "note": ""}]
+    slots = free_slots([], days=6, dur=60, limit=40)
+    check("свободные слоты есть и все в окне", slots and all(lo[0] <= s.hour < hi[0] for s in slots),
+          "%d слотов" % len(slots))
+    check("выходных в слотах нет", all((s.weekday() + 1) in workdays() for s in slots))
+    if slots:
+        target = slots[0]
+        fake[0]["start_utc"] = to_utc(target)
+        after = free_slots(fake, days=6, dur=60, limit=40)
+        check("занятый час исчезает из свободных", target not in after, fmt(target))
+        near = [s for s in after if abs((s - target).total_seconds()) < 3600]
+        check("буфер съедает соседний час", not near, ", ".join(fmt(s) for s in near[:3]))
+        check("остальные слоты на месте", len(after) >= len(slots) - 3, "%d -> %d" % (len(slots), len(after)))
+
+    # ПОТОЛОК ПРЕДЛОЖЕНИЯ ДОЛЖЕН БЫТЬ ВЫШЕ ЦЕЛИ. Оператор просит 2 назначенных собеседования на
+    # каждый будний день; при per_day=2 лана физически не могла предложить больше двух часов в
+    # сутки, и каждый отказ работодателя стоил целого дня. Воронка, у которой вход равен цели,
+    # воронкой не является.
+    # Считается по ПОЛНОМУ дню, а не по первому в списке: первый — это СЕГОДНЯ, у которого
+    # часть окна уже позади плюс lead_min, так что он даёт меньше слотов по причине времени
+    # суток, а не по причине потолка. Нога, считающая сегодня, измеряла бы час запуска.
+    _sl = free_slots([], days=6, dur=60, limit=999)
+    _by_day = {}
+    for _s in _sl:
+        _by_day.setdefault(_s.date(), 0)
+        _by_day[_s.date()] += 1
+    check("по умолчанию полный будний день предлагает БОЛЬШЕ, чем цель в 2 собеседования",
+          (max(_by_day.values()) if _by_day else 0) > 2,
+          "по дням: %s" % sorted(_by_day.values(), reverse=True)[:5])
+    spread = free_slots([], days=8, dur=60, limit=6, per_day=2)
+    from collections import Counter
+    per = Counter(x.date() for x in spread)
+    check("предложение размазано по дням, не по одному пятничному дню",
+          spread and max(per.values()) <= 2 and len(per) >= 2,
+          ", ".join(fmt(x) for x in spread))
+
+    lead_min = 3 * 24 * 60
+    lead = free_slots([], days=6, dur=60, limit=40, lead_min=lead_min)
+    floor = now_msk() + timedelta(minutes=lead_min)
+    check("ни один слот не раньше горизонта договорённости", lead and all(s >= floor for s in lead),
+          "%d слотов, первый %s, горизонт %s" % (len(lead), fmt(lead[0]) if lead else "-", fmt(floor)))
+    check("горизонт сдвигает самый ранний слот вперёд", bool(lead) and bool(slots) and lead[0] > slots[0],
+          "%s > %s" % (fmt(lead[0]) if lead else "-", fmt(slots[0]) if slots else "-"))
+
+    # Ручки обещаны «одной строкой в ~/.mesh/nodes», а cron вызывает бинарь без шелла. Проверяем
+    # ЧТЕНИЕ ФАЙЛА, а не то, что переменная есть в панели ума.
+    nodes_txt = ""
+    try:
+        nodes_txt = (pathlib.Path.home() / ".mesh" / "nodes").read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+    probe = None
+    for line in nodes_txt.splitlines():
+        m = re.match(r"\s*(?:export\s+)?(MESH_JOB_[A-Z_]+)=[\"']?([^\"'#\s]*)", line)
+        if m:
+            probe = m.groups()
+    if probe:
+        k, v = probe
+        _saved = os.environ.pop(k, None)
+        try:
+            check("ключ из ~/.mesh/nodes читается без шелла (путь cron)", node_env(k, "<default>") == v,
+                  "%s=%s" % (k, node_env(k, "<default>")))
+            os.environ[k] = "__override__"
+            check("окружение процесса перекрывает файл", node_env(k, "<default>") == "__override__")
+        finally:
+            os.environ.pop(k, None)
+            if _saved is not None:
+                os.environ[k] = _saved
+        check("незнакомый ключ падает в default, а не в чужое значение",
+              node_env("MESH_JOB_NO_SUCH_KEY_ZZZ", "<default>") == "<default>")
+    else:
+        print("  n/a  в ~/.mesh/nodes нет ни одной MESH_JOB_* строки — читать нечего")
+
+    # И весь бинарь целиком под пустым окружением, как его запускает cron.
+    _cron = subprocess.run(["env", "-i", "HOME=" + str(pathlib.Path.home()),
+                            "PATH=/usr/bin:/bin", sys.executable, os.path.abspath(__file__),
+                            "--free", "--text"], capture_output=True, text=True, timeout=60)
+    check("под env -i (окружение cron) инструмент отдаёт слоты, а не падает",
+          _cron.returncode == 0 and _cron.stdout.strip(),
+          (_cron.stdout.strip() or _cron.stderr.strip())[:160])
+
+    # MESH_JOB_NOT_BEFORE — объявленный оператором отдых. Тест обязан видеть РЕАЛЬНЫЙ сдвиг:
+    # порог в прошлом ничего не двигает и зелёный такой проверки ничего не значит.
+    _nb = NOT_BEFORE
+    try:
+        floor_d = (now_msk() + timedelta(days=5)).date()
+        NOT_BEFORE = floor_d.isoformat()
+        held = free_slots([], days=14, dur=60, limit=40)
+        check("MESH_JOB_NOT_BEFORE не даёт предложить раньше порога",
+              held and all(s.date() >= floor_d for s in held),
+              "порог %s, первый %s" % (floor_d, fmt(held[0]) if held else "-"))
+        check("порог реально сдвинул самый ранний слот (иначе проверка вакуумна)",
+              bool(held) and bool(slots) and held[0] > slots[0],
+              "%s > %s" % (fmt(held[0]) if held else "-", fmt(slots[0]) if slots else "-"))
+        NOT_BEFORE = "в понедельник"
+        junk = free_slots([], days=6, dur=60, limit=40)
+        check("мусорный порог игнорируется, а не запирает лану", junk and junk[0] == slots[0],
+              fmt(junk[0]) if junk else "слотов нет")
+    finally:
+        NOT_BEFORE = _nb
+
+    try:
+        parse_when("послезавтра в обед")
+        check("мусорное время отвергается", False)
+    except ValueError:
+        check("мусорное время отвергается", True)
+
+    ids = [r["id"] for r in rows()]
+    check("идентификаторы в расписании уникальны", len(ids) == len(set(ids)),
+          ", ".join(sorted(i for i in ids if ids.count(i) > 1)) or "-")
+
+    check("mesh-tg резолвится", __import__("shutil").which(TG) is not None)
+    n = len(rows())
+    NOT_BEFORE = _nb_live
+    if NOT_BEFORE:
+        print("  fyi  живой MESH_JOB_NOT_BEFORE=%s (объявленный отдых) — на время проверки гасился"
+              % NOT_BEFORE)
+
+    check("расписание читается", True, "%d записей" % n)
+    print("mesh-job-cal --test: " + ("ok" if ok else "FAILED"))
+    return 0 if ok else 1
+
+# ---------------------------------------------------------------- main
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--agenda", action="store_true")
+    ap.add_argument("--free", action="store_true")
+    ap.add_argument("--text", action="store_true", help="слоты одной строкой, как их вставить в ответ")
+    ap.add_argument("--add")
+    ap.add_argument("--confirm"); ap.add_argument("--cancel"); ap.add_argument("--done")
+    ap.add_argument("--days", type=int, default=7)
+    ap.add_argument("--dur", type=int, default=60)
+    ap.add_argument("--max", type=int, default=6)
+    ap.add_argument("--per-day", type=int, default=None)
+    ap.add_argument("--state", default="proposed")
+    ap.add_argument("--tg", action="store_true")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--test", action="store_true")
+    a = ap.parse_args()
+    if a.test:
+        sys.exit(selftest())
+
+    rs = rows()
+
+    if a.add:
+        parts = [p.strip() for p in a.add.split("|")]
+        if len(parts) < 2:
+            print("mesh-job-cal --add \"<когда> | <компания> | [вакансия] | [вид] | [канал] | [контакт] | [заметка]\"",
+                  file=sys.stderr)
+            sys.exit(1)
+        when = parse_when(parts[0])
+        parts += [""] * (7 - len(parts))
+        # Two --add calls in the same second produced the SAME id, and --confirm/--cancel take
+        # the first match: an operator confirming one interview would have confirmed the other.
+        # The id is a handle, so it must be unique against what is already on disk, not merely
+        # against the clock.
+        used = {r["id"] for r in rs}
+        base = "c%s" % int(time.time())
+        rid, n = base, 1
+        while rid in used:
+            rid = "%s-%d" % (base, n)
+            n += 1
+        rs.append({"id": rid, "state": a.state, "start_utc": to_utc(when), "dur": str(a.dur),
+                   "company": parts[1], "vacancy": parts[2], "kind": parts[3] or "созвон",
+                   "channel": parts[4], "contact": parts[5], "note": parts[6]})
+        rs.sort(key=lambda r: r["start_utc"])
+        write(rs)
+        print("добавлено %s: %s" % (rid, line_of([r for r in rs if r["id"] == rid][0])))
+        sys.exit(0)
+
+    for flag, new in ((a.confirm, "confirmed"), (a.cancel, "cancelled"), (a.done, "done")):
+        if flag:
+            hit = [r for r in rs if r["id"] == flag]
+            if not hit:
+                print("нет записи %s" % flag, file=sys.stderr)
+                sys.exit(1)
+            hit[0]["state"] = new
+            write(rs)
+            print("%s -> %s: %s" % (flag, new, line_of(hit[0])))
+            sys.exit(0)
+
+    if a.free:
+        slots = free_slots(rs, days=a.days, dur=a.dur, limit=a.max, per_day=a.per_day)
+        if a.json:
+            print(json.dumps([{"msk": s.strftime("%Y-%m-%d %H:%M"), "label": fmt(s)} for s in slots],
+                             ensure_ascii=False, indent=1))
+        elif a.text:
+            print(", ".join(fmt(s) for s in slots) + " (МСК)" if slots else "свободных слотов нет")
+        else:
+            for s in slots:
+                print(fmt(s) + "  МСК")
+        sys.exit(0)
+
+    upcoming = [r for r in rs if r["state"] not in ("cancelled", "done")
+                and from_utc(r["start_utc"]) > now_msk() - timedelta(minutes=90)]
+    upcoming.sort(key=lambda r: r["start_utc"])
+
+    if a.json:
+        print(json.dumps([{**r, "msk": from_utc(r["start_utc"]).strftime("%Y-%m-%d %H:%M")} for r in upcoming],
+                         ensure_ascii=False, indent=1))
+    elif not a.tg or a.agenda:
+        if not upcoming:
+            print("собеседований не назначено. свободно: " + (", ".join(fmt(s) for s in free_slots(rs, limit=3)) or "—"))
+        for r in upcoming[:a.days * 3]:
+            print("%-12s %s" % (r["id"], line_of(r)))
+
+    if a.tg:
+        st = load_state()
+        seen = set(st.get("announced", []))
+        msgs = []
+        today = now_msk().date()
+        key_day = "day:%s" % today
+        todays = [r for r in upcoming if from_utc(r["start_utc"]).date() == today]
+        if key_day not in seen and now_msk().hour >= 9:
+            if todays:
+                msgs.append("сегодня: \n" + "\n".join("• " + line_of(r) for r in todays))
+            seen.add(key_day)
+        for r in upcoming:
+            st_dt = from_utc(r["start_utc"])
+            mins = (st_dt - now_msk()).total_seconds() / 60
+            key = "soon:%s" % r["id"]
+            if 0 < mins <= 75 and key not in seen:
+                msgs.append("через %d мин: %s" % (int(mins), line_of(r)))
+                seen.add(key)
+        if msgs:
+            subprocess.run([TG, "[job] расписание:\n" + "\n\n".join(msgs)], check=False)
+        st["announced"] = sorted(seen)[-200:]
+        save_state(st)
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

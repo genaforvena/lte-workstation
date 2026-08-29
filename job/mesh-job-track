@@ -1,0 +1,269 @@
+#!/usr/bin/env python3
+"""mesh-job-track — read what employers did with his applications, and say so ONCE.
+
+  mesh-job-track [--quiet] [--tg] [--json]
+  mesh-job-track --test
+
+# reflex-cadence: 17 */3 * * *
+# reflex-args: --tg
+
+Reads hh's own отклики page through the live logged-in browser (mesh-hh-drive) and turns it into
+a diff: for every application, the employer-side status. A status that has not changed since the
+last run is NOT reported — the operator's Telegram is a channel, not a dashboard, and a reflex
+that re-announces "still not viewed" every three hours trains him to ignore it.
+
+Statuses are read from data-qa attributes and the item's own text, and hh serves that text in
+whatever language the session negotiated — this account currently gets ENGLISH strings on a
+Russian account, so both vocabularies are mapped. An unrecognised status is passed through
+verbatim rather than folded into a known one: a silently mislabelled "Отказ" is worse than an
+ugly string.
+
+State: ~/.mesh/job/track-state.json. Board rows in ~/.mesh/job-board.tsv are updated in place, so
+`sent` becomes `viewed` / `invited` / `rejected` and the lane's history stays in one file.
+"""
+import argparse, json, os, pathlib, re, shutil, subprocess, sys, time
+
+# cron hands a reflex PATH=/usr/bin:/bin. Every sibling below lives in ~/.local/bin, so without this
+# line the reflex dies on FileNotFoundError before reading anything — which is exactly what it did,
+# 9 cron runs out of 9, while `--test` stayed green in a mind's shell whose login PATH hid the fault.
+# `check=False` does not cover it either: a missing executable raises at exec, it is not a returncode.
+os.environ["PATH"] = os.path.expanduser("~/.local/bin") + os.pathsep + os.environ.get("PATH", "/usr/bin:/bin")
+# Named once and used at every call site, so the resolve-check below cannot drift from what is run.
+HH, TG = "mesh-hh-drive", "mesh-tg"
+
+MESH = pathlib.Path(os.path.expanduser("~/.mesh"))
+STATE = MESH / "job/track-state.json"
+BOARD = MESH / "job-board.tsv"
+LOG = MESH / "job/hh-drive.log"
+
+# hh serves these in RU or EN depending on what the session negotiated. Map both to one key, and
+# keep the raw string so an unmapped status can still be reported instead of guessed at.
+STATUS = {
+    "не просмотрен": "sent", "not viewed": "sent",
+    "просмотрен": "viewed", "viewed": "viewed",
+    "приглашение": "invited", "invitation": "invited",
+    "собеседование": "interview", "interview": "interview",
+    "выход на работу": "offer", "job offer": "offer",
+    "отказ": "rejected", "discard": "rejected", "declined": "rejected", "rejection": "rejected",
+}
+# Ranked so a reflex can say whether a change was forward or backward; unknown sorts lowest.
+RANK = {"sent": 0, "viewed": 1, "invited": 3, "interview": 4, "offer": 5, "rejected": 2}
+
+JS = ("JSON.stringify(Array.from(document.querySelectorAll('[data-qa=negotiations-item]'))"
+      ".map(e=>({t:(e.innerText||'').split('\\n').slice(0,4),"
+      "h:Array.from(e.querySelectorAll('a')).map(a=>a.getAttribute('href'))"
+      ".filter(x=>x&&x.indexOf('vacancy')>=0)[0]})))")
+
+
+def drive(args, timeout=90):
+    return subprocess.run([HH] + args, capture_output=True, text=True, timeout=timeout)
+
+
+def scrape():
+    """-> list of {vacancy_id, title, employer, status, raw} | None if the driver cannot answer."""
+    if drive(["--alive"]).returncode != 0:
+        return None
+    # --goto retries hh's browser-check interstitial and fails loudly instead of handing back an
+    # empty document that would read as "he has no applications".
+    if drive(["--goto", "https://hh.ru/applicant/negotiations"], timeout=180).returncode != 0:
+        return None
+    mark = LOG.stat().st_size if LOG.exists() else 0
+    drive(["--send", "js " + JS])
+    payload = None
+    for _ in range(30):
+        time.sleep(2)
+        with LOG.open("r", encoding="utf-8", errors="replace") as f:
+            f.seek(mark)
+            for line in f:
+                if line.startswith("[js] ["):
+                    payload = line[len("[js] "):].strip()
+        if payload:
+            break
+    if not payload:
+        return None
+    out = []
+    for it in json.loads(payload):
+        t = [x.strip() for x in it.get("t") or []]
+        if len(t) < 3 or not it.get("h"):
+            continue
+        m = re.search(r"/vacancy/(\d+)", it["h"])
+        if not m:
+            continue
+        raw = t[0]
+        out.append({"vacancy_id": m.group(1), "title": t[1], "employer": t[2],
+                    "status": STATUS.get(raw.lower(), raw), "raw": raw})
+    return out
+
+
+def read_is_trustworthy(rows, prev):
+    """Zero items is not a fact about his applications — at this layer it is the same bytes as a
+    blocked read. It happened for real on 2026-08-16: hh's /vpncheeck wall rendered an empty
+    document, scrape() returned [], and this tool wrote {} over four tracked applications — after
+    which every one of them would have re-announced itself as news. A genuinely empty account
+    (nothing tracked yet) still passes, so a first run is not blocked by this."""
+    return bool(rows) or not prev
+
+
+def load_state():
+    if STATE.exists():
+        try:
+            return json.loads(STATE.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+
+def update_board(rows):
+    if not BOARD.exists():
+        return 0
+    lines = BOARD.read_text(encoding="utf-8").splitlines()
+    n = 0
+    for r in rows:
+        for i, l in enumerate(lines):
+            if "/vacancy/%s" % r["vacancy_id"] in l:
+                f = l.split("\t")
+                if len(f) >= 6 and f[4] != r["status"]:
+                    f[4] = r["status"]
+                    lines[i] = "\t".join(f)
+                    n += 1
+                break
+    if n:
+        BOARD.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return n
+
+
+def ensure_driver():
+    """A cron-fired reflex cannot assume the browser daemon is up — it exits after 45 min idle by
+    design. Starting it is part of the reflex, not a precondition someone remembered to meet."""
+    if subprocess.run([HH, "--alive"], capture_output=True).returncode != 0:
+        subprocess.run([HH, "--start"], capture_output=True, timeout=180)
+
+def selftest():
+    rc = 0
+
+    def check(label, cond):
+        nonlocal rc
+        print(("ok:   " if cond else "FAIL: ") + label)
+        if not cond:
+            rc = 1
+
+    check("RU and EN map to the same key",
+          STATUS["не просмотрен"] == STATUS["not viewed"] == "sent"
+          and STATUS["приглашение"] == STATUS["invitation"] == "invited")
+    check("every mapped status has a rank", all(v in RANK for v in set(STATUS.values())))
+    check("rejection outranks viewed but not invitation",
+          RANK["rejected"] > RANK["viewed"] and RANK["rejected"] < RANK["invited"])
+
+    # An unknown status must survive as itself. Folding it into a known one is the failure this
+    # lane cannot afford: the operator would read a real rejection as "no news".
+    unknown = STATUS.get("совершенно новый статус".lower(), "совершенно новый статус")
+    check("unknown status passes through verbatim", unknown == "совершенно новый статус")
+
+    # The diff is the whole point: same state twice must produce nothing to say.
+    prev = {"1": {"status": "viewed"}}
+    now = [{"vacancy_id": "1", "status": "viewed", "title": "t", "employer": "e", "raw": "Viewed"}]
+    changed = [r for r in now if prev.get(r["vacancy_id"], {}).get("status") != r["status"]]
+    check("unchanged status produces no report", changed == [])
+    now[0]["status"] = "invited"
+    changed = [r for r in now if prev.get(r["vacancy_id"], {}).get("status") != r["status"]]
+    check("changed status produces exactly one report", len(changed) == 1)
+
+    # An empty read must never be written as truth over what is already tracked.
+    tracked = {"1": {"status": "viewed"}}
+    check("0 rows against a non-empty state is a blocked read, not an empty account",
+          not read_is_trustworthy([], tracked))
+    check("a genuine first run may legitimately see nothing", read_is_trustworthy([], {}))
+    check("a non-empty read is always trusted", read_is_trustworthy([{"vacancy_id": "1"}], tracked))
+
+    # The real failure was invisible from a mind's shell, where a login PATH already carries
+    # ~/.local/bin and every sibling resolves — while all 9 cron runs died at exec. So assert
+    # resolution under cron's OWN environment by re-running this file with it. A check that read
+    # this file's text instead would stay green on a tool that still cannot start.
+    probe = subprocess.run([sys.executable, os.path.abspath(__file__), "--resolve-check"],
+                           env={"HOME": os.path.expanduser("~"), "PATH": "/usr/bin:/bin"},
+                           capture_output=True, text=True, timeout=30)
+    check("siblings resolve under cron's PATH=/usr/bin:/bin", probe.returncode == 0)
+    print("      " + (probe.stdout + probe.stderr).strip().splitlines()[-1][:160])
+
+    if drive(["--alive"]).returncode != 0:
+        print("n/a: hh driver not running — cannot assert a real read")
+        return 2 if rc == 0 else rc
+    rows = scrape()
+    if not rows:
+        # hh walling this node is not a defect in this tool, and no edit here can turn it green —
+        # so it is n/a (exit 2), the same verdict an unreachable organ gets. It is NOT silence:
+        # the driver names which wall in its own log, and the reflex says so on every run.
+        print("n/a: hh answered no applications (blocked read — see `mesh-hh-drive --peek`), "
+              "so the row-shape assertion has nothing live to run against")
+        return 2 if rc == 0 else rc
+    check("live read returns at least one application with an id and a status",
+          all(r["vacancy_id"].isdigit() and r["status"] for r in rows))
+    if rows:
+        print("      live: " + ", ".join("%s=%s" % (r["employer"][:18], r["status"]) for r in rows))
+    return rc
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=False)
+    ap.add_argument("--quiet", action="store_true")
+    ap.add_argument("--tg", action="store_true")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--test", action="store_true")
+    ap.add_argument("--resolve-check", action="store_true")
+    ap.add_argument("-h", "--help", action="store_true")
+    a = ap.parse_args()
+    if a.help:
+        print(__doc__)
+        return 0
+    # Internal leg of --test: run under a cron-shaped env, it answers whether this tool can find the
+    # tools it shells out to. Prints what it resolved, so a pass names the paths it passed on.
+    if a.resolve_check:
+        print("resolve-check: " + ", ".join("%s=%s" % (t, shutil.which(t)) for t in (HH, TG)))
+        missing = [t for t in (HH, TG) if shutil.which(t) is None]
+        if missing:
+            print("MISSING: " + " ".join(missing), file=sys.stderr)
+            return 1
+        return 0
+    if a.test:
+        return selftest()
+
+    ensure_driver()
+    rows = scrape()
+    if rows is None:
+        print("n/a: hh driver did not answer (start it: mesh-hh-drive --start)", file=sys.stderr)
+        return 2
+    prev = load_state()
+    if not read_is_trustworthy(rows, prev):
+        print("n/a: hh showed 0 applications while %d are tracked — a blocked read, not an empty "
+              "page; state left as it was" % len(prev), file=sys.stderr)
+        return 2
+    changed = [r for r in rows if prev.get(r["vacancy_id"], {}).get("status") != r["status"]]
+    first_run = not prev
+
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    STATE.write_text(json.dumps({r["vacancy_id"]: r for r in rows}, ensure_ascii=False, indent=1),
+                     encoding="utf-8")
+    moved = update_board(rows)
+
+    if a.json:
+        print(json.dumps({"all": rows, "changed": changed, "board_rows_updated": moved},
+                         ensure_ascii=False, indent=1))
+        return 0
+    if not a.quiet:
+        for r in rows:
+            mark = " <-- изменилось" if r in changed else ""
+            print("%-10s %-22s %s%s" % (r["status"], r["employer"][:22], r["title"][:44], mark))
+    # First run has nothing to diff against, so every row would read as news. Say the count, not
+    # the rows — otherwise wiring the reflex produces one alarming burst on day one.
+    if a.tg and changed and not first_run:
+        body = "\n".join("%s — %s\n   %s" % (r["status"], r["employer"], r["title"])
+                         for r in changed)
+        subprocess.run([TG, "[job] отклики, что изменилось:\n\n" + body], check=False)
+    elif a.tg and first_run:
+        subprocess.run([TG, "[job] слежение за откликами включено: %d в работе, "
+                        "дальше сообщаю только изменения" % len(rows)], check=False)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

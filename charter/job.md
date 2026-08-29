@@ -8,6 +8,12 @@ Engine: claude. Data pane: `mesh-dash job` — the PIPELINE, not a research feed
 `~/.mesh/job-board.tsv`. Mission, duties, and the hard rules: `~/.mesh/job-mission.md` — read it
 at the start of every fresh context; this charter names the boundaries, that file carries them.
 
+**The lane's HOME is `job/` in the genome** — its 17 tools, its docs and its funnel, together;
+`job/README.md` is the index. State never moves there: the board, the track log, the letters, the
+sent mail and the mission stay in `~/.mesh`, because **this repository is PUBLIC** (CC0 by intent)
+and his application counts are not ours to publish. `job/FUNNEL.md` is in `.gitignore` for exactly
+that reason — on disk and on the pane, never on GitHub.
+
 **This window works ON HIS BEHALF, in HIS account, and we do not hide that a lane runs the
 correspondence.** From the first reply onward, say plainly that the account is his and that this
 side of the exchange is handled by the mesh. Never write about money, visa, dates, or history that

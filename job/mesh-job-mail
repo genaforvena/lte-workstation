@@ -1,0 +1,1297 @@
+#!/usr/bin/env python3
+"""mesh-job-mail — read the job lane's INBOX and say only what needs a human.
+
+  mesh-job-mail [--quiet] [--tg] [--json] [--since N] [--dry-run]
+  mesh-job-mail --test
+
+# reflex-cadence: 7,37 * * * *
+# reflex-args: --tg
+
+The lane's incoming side. Everything an employer sends — hh chat messages, invitations,
+rejections, ATS follow-ups, verification codes — arrives in `imozerov@yandex.ru`, and until
+this reflex existed nothing read it: 13 applications went out 2026-08-20 and the five replies
+that came back the same afternoon sat unread. Outgoing had a reflex, incoming had none.
+
+Three things make it non-obvious, all measured:
+
+* **hh's notification mail CARRIES the chat message text.** «Вам написали по вакансии …» quotes
+  the employer's words in full, so the common case needs no browser at all — a 2s IMAP read
+  replaces a 90s chromium drive. `mesh-job-track` still owns the *status* diff (viewed/invited);
+  this owns the *words*.
+* **Most replies are robots.** Т-Банк, Гоуланг, БЮРО 1440 and Uzum all answered with a template
+  («рассмотрим ваше резюме и вернёмся»). Forwarding those to his Telegram would train him to
+  ignore the channel, so an AUTOREPLY is ledgered and never pushed. What gets pushed is a human
+  asking for something: a call, a time, an answer, a code.
+* **The mailbox is reached from the RU uplink, never the exit node.** Yandex flagged this
+  account once already for a datacenter login (`yandex-mail-walled-from-this-node`), and this
+  node's default route is phaedra's exit node. Every socket here is `SO_BINDTODEVICE`-bound to
+  the main table's default device. If that bind fails the tool EXITS — it does not quietly
+  connect over the flagged path, because the cost of the silent fallback is the account.
+
+Mail is read with BODY.PEEK and never marked \\Seen: this is his inbox, and a reflex that eats
+the unread marks destroys the human's own view of it.
+
+**Two mailboxes, two transports.** Applications go out from BOTH `imozerov@yandex.ru` and
+`ilyailiilia@gmail.com` (Kayzen, RTB House, adtelligent and DOU all needed the Google account),
+and for three days this reflex read only the first: RTB House's recruiter answered on
+2026-08-18 and nothing in the mesh saw it until 2026-08-20. The gmail side is read through
+`mesh-gmail-note3` — off the operator's PHYSICAL, rooted Note 3, with no password anywhere in
+the mesh (his own proposal, 2026-08-20: *"вместо того, чтобы я выдавал вам какие-то пароли, у
+вас есть просто физический девайс"*). It is a sliding sync cache, not IMAP, so the gmail lane
+can only ever see what the phone still holds; the two lanes are independent and **either one
+being n/a must not silence the other** — a phone left unplugged is not an empty inbox.
+
+State: `~/.mesh/job/mail-state.json` (UIDVALIDITY + last UID, plus `gmail_last_id`). Ledger:
+`~/.mesh/job-mail.log`, where a gmail row's uid reads `gm:<id>`. `--dry-run` writes to
+`~/.mesh/job-mail.dryrun.log` instead — a test that appends to the durable ledger forges the
+evidence it exists to check.
+
+LANE FRESHNESS. The two lanes fail independently and the tool's rc is an AND over both, so a
+dead lane beside a live one exits 0 forever — and a dark lane produces no `act`, so the TG push
+(gated on there being one) says nothing either. Both branches are right on their own; together
+they make "no international mail" read identically to "the phone is unplugged". So each lane
+publishes its own staleness beside its value on EVERY run — `~/.mesh/job-mail-lanes.log`, one
+row per lane per run, live or dark, because the silences in that tape are denominators — and
+speaks ONE line per dark episode when the staleness passes a bound measured from that lane's own
+history. The bound is in UP-HOURS, never calendar: this node power-cycles (6h25m off on
+2026-08-25 alone) and a calendar delta would call being switched off darkness. rc is left at 0
+on purpose: red on a tract that is working teaches its reader to ignore red.
+"""
+import argparse, calendar, email, html, json, os, pathlib, re, shutil, socket, subprocess, sys, time
+from email.header import decode_header, make_header
+
+import signal
+
+# SIGTERM MUST UNWIND, or every `finally` below is decorative. Python's DEFAULT SIGTERM disposition
+# terminates the interpreter WITHOUT running finally blocks, TemporaryDirectory.__exit__ or atexit,
+# so a correct-looking cleanup never executes. The signal is routine here, not hypothetical: GNU
+# `timeout` without --foreground puts its child in its OWN PROCESS GROUP and signals the GROUP, so
+# every timeout-wrapped call site -- mesh-doctor's hourly --test sweep, mesh-autowire's `timeout 30`
+# -- delivers TERM to this process. That is how 950MB of stranded snapshots filled phaedra's /tmp on
+# 2026-08-16 with a `finally: rmtree` sitting right there in the source (first fixed in mesh-spend,
+# d2fd7c9b). sys.exit() from a handler raises SystemExit in the MAIN THREAD, which is what makes
+# try/finally unwind. SIGKILL stays uncatchable -- that half is mesh-tmp-guard's sweep, never this.
+for _sig in (signal.SIGTERM, signal.SIGHUP):
+    signal.signal(_sig, lambda _s, _f: sys.exit(128 + _s))
+
+
+os.environ["PATH"] = os.path.expanduser("~/.local/bin") + os.pathsep + os.environ.get("PATH", "/usr/bin:/bin")
+
+HOME = pathlib.Path.home()
+MAILENV = HOME / ".mesh" / "mail.env"
+STATE = HOME / ".mesh" / "job" / "mail-state.json"
+LEDGER = HOME / ".mesh" / "job-mail.log"
+DRYLEDGER = HOME / ".mesh" / "job-mail.dryrun.log"
+BOARD = HOME / ".mesh" / "job-board.tsv"
+LANETAPE = HOME / ".mesh" / "job-mail-lanes.log"
+DRYLANETAPE = HOME / ".mesh" / "job-mail-lanes.dryrun.log"
+LANESTATE = HOME / ".mesh" / "job" / "lane-alarm.json"
+TG = "mesh-tg"
+CHAT = "mesh-chat"
+SO_BINDTODEVICE = 25
+
+# ---------------------------------------------------------------- vantage
+
+def uplink_dev():
+    """The device carrying the MAIN table's default route — the node's own RU uplink.
+
+    Never tailscale0: `ip route get` answers from table 52 (the exit node), which is exactly
+    the vantage Yandex flagged. Asking table main by name is the whole point."""
+    try:
+        out = subprocess.run(["ip", "route", "show", "table", "main", "default"],
+                             capture_output=True, text=True, timeout=10).stdout
+    except Exception:
+        return None
+    m = re.search(r"\bdev\s+(\S+)", out)
+    return m.group(1) if m else None
+
+
+def bind_sockets_to(dev):
+    """Bind every subsequent TCP connect to `dev`. Raises if the kernel refuses."""
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        probe.setsockopt(socket.SOL_SOCKET, SO_BINDTODEVICE, dev.encode())
+    finally:
+        probe.close()
+    orig = socket.socket.connect
+
+    def connect(self, addr):
+        self.setsockopt(socket.SOL_SOCKET, SO_BINDTODEVICE, dev.encode())
+        return orig(self, addr)
+    socket.socket.connect = connect
+
+
+def creds():
+    if not MAILENV.exists():
+        return None
+    env = {}
+    for line in MAILENV.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            k, v = line.split("=", 1)
+            env[k.strip()] = v.strip().strip('"').strip("'")
+    user = env.get("MAIL_USER", "")
+    # The app password is the ONLY credential IMAP accepts: MAIL_PASS is the account password,
+    # and Yandex answers it with AUTHENTICATIONFAILED even though the account is healthy.
+    pw = env.get("MAIL_IMAP_PASS") or ""
+    host = env.get("MAIL_IMAP_HOST", "imap.yandex.ru")
+    if not user or not pw:
+        return None
+    return user, pw, host, int(env.get("MAIL_IMAP_PORT", "993"))
+
+# ---------------------------------------------------------------- parsing
+
+def hdr(msg, name):
+    try:
+        return str(make_header(decode_header(msg.get(name, "") or "")))
+    except Exception:
+        return msg.get(name, "") or ""
+
+
+def text_of(msg):
+    parts = []
+    for p in msg.walk():
+        if p.get_content_type() == "text/plain":
+            try:
+                parts.append(p.get_payload(decode=True).decode(p.get_content_charset() or "utf-8", "replace"))
+            except Exception:
+                pass
+    if not parts:
+        for p in msg.walk():
+            if p.get_content_type() == "text/html":
+                try:
+                    h = p.get_payload(decode=True).decode(p.get_content_charset() or "utf-8", "replace")
+                except Exception:
+                    continue
+                h = re.sub(r"(?is)<(script|style|head)[^>]*>.*?</\1>", " ", h)
+                h = re.sub(r"(?i)<br[^>]*>|</p>|</tr>|</div>|</td>", "\n", h)
+                parts.append(html.unescape(re.sub(r"<[^>]+>", " ", h)))
+    txt = "\n".join(parts)
+    txt = txt.replace(" ", " ").replace("⠀", " ").replace("‌", " ")
+    txt = re.sub(r"[ \t\xa0]{2,}", " ", txt)
+    return re.sub(r"\n{3,}", "\n\n", txt).strip()
+
+
+# hh quotes the employer between guillemets; that quote is the only part worth a human's eye.
+QUOTE = re.compile(r"«(.{4,1800}?)»", re.S)
+FIELD = re.compile(r"^\s*(Вакансия|Компани[яи]):\s*(.+?)\s*$", re.M)
+
+# A template acknowledgement. Matching ANY of these makes the message a robot — the phrasings
+# are the actual sent text of Т-Банк / Гоуланг / БЮРО 1440 / Uzum, not invented patterns.
+# ПОРЯДОК ЗДЕСЬ — ЭТО ГАРАНТИЯ БЕЗОПАСНОСТИ: STRONG проверяется РАНЬШЕ AUTOREPLY (см. classify).
+# Поэтому расширять этот список безопасно: письмо с настоящей просьбой уже ушло в act до того, как
+# сюда дошло. Обратное неверно — каждая фраза, которой здесь НЕТ, будит оператора.
+#
+# 2026-08-26, оператор в TG: «вы прислали, что почта требует меня, но почта не требует меня».
+# Два ложняка, и оба — промах шаблона МИМО ЖИВОГО ТЕКСТА на одно слово:
+#   Яндекс 2026-08-26: «Мы сохранили ваше резюме И свяжемся с вами, если ВАШИ навыки и опыт
+#     подойдут» — шаблон ждал `мы свяжемся с вами` (между «мы» и «свяжемся» встало четыре слова)
+#     и `если навыки и опыт подойд` (между «если» и «навыки» встало «ваши»).
+#   Bnovo 2026-08-25: «рекрутер свяжется с тобой до конца недели» — другое лицо глагола И «ты»,
+#     которого в списке не было вообще ни в одной строке.
+# Отсюда правило для этого файла: НИКОГДА не писать сюда фразу целиком с местоимением внутри —
+# писать ЯДРО глагола и допускать вставку. Фикстуры ниже держат ровно эти два живых письма.
+AUTOREPLY = [
+    r"рассмотр\w* ваш\w* (резюме|кандидатур|отклик)", r"рассмотрит ваше резюме",
+    # Ядро «связаться», без местоимений: «мы свяжемся с вами», «рекрутер свяжется с тобой»,
+    # «с вами свяжутся». Одно из двух измеренных писем ловится ровно этой строкой.
+    r"свяж[ую]тся с (вами|тобой)", r"свяж[её]тся с (вами|тобой)", r"свяж[её]мся с (вами|тобой)",
+    r"верн[её]мся к (вам|тебе)", r"сообщит (вам|тебе) о сво[её]м решении",
+    # «если ваши навыки и опыт подойдут» / «если навыки подойдут» — вставка допускается.
+    r"если .{0,24}(навыки|опыт|резюме).{0,24}подойд",
+    r"сохранили ваш[ие] резюме", r"резюме сохранен",
+    r"спасибо,? (за отклик|что откликну)", r"ваш отклик (получен|принят)",
+    r"в случае положительн\w* (рассмотрени|решени|результат)",
+    r"(будем|оста[её]мся|остаемся) на связи",
+    r"thanks for applying", r"we (have )?received your application",
+    r"thank you for (taking the time to )?apply", r"reviewing applications",
+    r"cannot respond to all", r"we will (be in touch|get back to you|reach out)",
+    r"if your (skills|experience|profile).{0,40}(match|fit|suitab)",
+    r"your application (has been|was) received",
+]
+# A DIRECT, second-person ask: he has to answer or nothing happens. These beat AUTOREPLY.
+# Kept narrow on purpose — Braintrust's template says "…you will receive an email to schedule
+# next steps", a conditional about a future robot, and pushing that to his phone is the exact
+# noise this reflex exists to avoid. An imperative or a question addressed to HIM, or nothing.
+STRONG = [
+    r"позвоните", r"наберите", r"свяжитесь с (нами|мной)", r"напишите (в чат|мне|нам)",
+    r"когда вам удобно", r"удобно ли вам", r"в какое время", r"выберите (слот|время)",
+    r"предлага[ею].{0,30}(время|созвон|встреч|интервью|собеседовани)",
+    r"приглаша[ею]м вас", r"пригласить вас на", r"готовы пригласить",
+    r"назначить (созвон|встречу|интервью|собеседовани)", r"назначим",
+    r"ждем (вашего )?ответа", r"жду (вашего )?ответа", r"ответьте",
+    r"ваши ожидания по (зарплате|доход)", r"сколько вы хотите",
+    r"тестово[ег] задани", r"выполнить задани",
+    r"are you available", r"let us know your availability", r"book a (time|slot)",
+    r"pick a time", r"schedule a (call|chat|time)", r"would you be (free|available)",
+    r"could you (share|confirm|let)", r"please (confirm|reply|share|complete)",
+]
+# Weaker job vocabulary — enough to call a message job-RELATED, never enough to wake him.
+JOBWORDS = [
+    r"ваканси", r"резюме", r"отклик", r"собеседовани", r"интервью", r"рекрут", r"HR\b",
+    r"\bposition\b", r"\brole\b", r"\bapplication\b", r"\bapplying\b", r"\brecruit",
+    r"hiring", r"candidate",
+]
+
+REJECT = [
+    r"не готов пригласить", r"вам отказано", r"к сожалению.{0,60}(не готов|отказ|не подход)",
+    r"we (will )?not be moving forward", r"unfortunately.{0,80}(not|other candidates)",
+    r"decided (not )?to (move|proceed)",
+    r"не можем пригласить", r"пока не можем", r"не сможем предложить", r"не подош",
+    # RTB House, 2026-08-18, verbatim: "we have made the difficult decision not to move forward
+    # with your application". Every English pattern above wanted the verb ("decided to move",
+    # "will not be moving") and this one nominalises it, so the mesh's first real international
+    # rejection scored `other` until the noun form was added.
+    r"decision not to (move|proceed|continue)", r"not (be )?(moving|proceeding) forward",
+    r"not to move forward with your application",
+    r"will not be progressing", r"decided to proceed with other",
+]
+CODE = [r"код подтверждения", r"security code", r"verification code", r"одноразовый (код|пароль)"]
+# A CALENDAR INVITE is an act by its shape, not by its words. Yandex.Calendar's invitation for a
+# real interview — «Собеседование», 2026-08-18, artemieva.y@yandex.ru — carries no imperative at
+# all: it states a time, offers «Пойду / Возможно / Не пойду» and links a telemost room. Every
+# STRONG pattern wants somebody to ASK, so it scored `other` and never reached his phone, and
+# the slot (19 Aug 14:30 MSK) passed unanswered. An invite has a DEADLINE, which is exactly the
+# thing a ledger row cannot carry — so it wakes him regardless of vocabulary.
+INVITE = [
+    r"telemost\.yandex\.ru", r"meet\.google\.com/[a-z\-]{8,}", r"zoom\.us/j/\d",
+    r"teams\.microsoft\.com/l/meetup-join", r"\bhttps://[^\s]*calendly\.com/",
+    r"Уведомление отправлено через Яндекс\.Календарь",
+    r"Пойду\s+Возможно, пойду\s+Не пойду",
+    r"(?m)^\s*(BEGIN:VCALENDAR|METHOD:REQUEST)\s*$",
+    r"invitation from Google Calendar", r"has invited you to (a|an) (event|meeting)",
+]
+# Where and when — pulled out so the push says the SLOT, not just "there is an invite".
+WHEN = [
+    re.compile(r"(?:Завтра|Сегодня)?,?\s*(\d{1,2}[-–]?\s*(?:го)?\s*[а-яё]+(?:\s+\d{4})?)\s*,?\s*с?\s*"
+               r"(\d{1,2}:\d{2})\s*(?:до|[-–—])\s*(\d{1,2}:\d{2})\s*\(([^)]+)\)", re.I),
+    re.compile(r"(\w{3},?\s+\w{3}\s+\d{1,2},?\s+\d{4})\s+(\d{1,2}:\d{2}\s*[ap]?m?)\s*[-–—]\s*"
+               r"(\d{1,2}:\d{2}\s*[ap]?m?)\s*\(?([^)\n]*)\)?", re.I),
+]
+MEETLINK = re.compile(r"https://\S*(?:telemost\.yandex\.ru|meet\.google\.com|zoom\.us|"
+                      r"teams\.microsoft\.com|calendly\.com)\S*")
+
+
+def invite_gist(subj, body):
+    """`<when> · <link>` where the mail states them, else the subject. The point of pushing an
+    invite is the SLOT — a notification that says only "you were invited" makes him go dig."""
+    flat = re.sub(r"\s+", " ", body)
+    when = ""
+    for rx in WHEN:
+        m = rx.search(flat)
+        if m:
+            when = "%s %s–%s (%s)" % (m.group(1).strip(), m.group(2), m.group(3), m.group(4).strip())
+            break
+    link = MEETLINK.search(flat.replace(" ", "")) or MEETLINK.search(flat)
+    bits = [b for b in (subj.strip(), when, link.group(0) if link else "") if b]
+    return " · ".join(bits)[:400]
+# Pure noise: hh's own recommendation digests and marketing. Ledgered at level=noise, never pushed.
+NOISE_SUBJ = [
+    r"подходящие вакансии для резюме", r"вчера ваше резюме привлекло внимание",
+    r"лучшие вакансии", r"вакансии недели", r"посмотрел[аи] ваш профиль",
+    r"рассылк", r"дайджест", r"newsletter", r"unsubscribe",
+    r"резюме прошло модерацию", r"резюме опубликовано", r"обновите резюме",
+]
+JOB_SENDERS = [
+    "hh.ru", "headhunter", "ashbyhq.com", "greenhouse", "lever.co", "workable",
+    "career.habr.com", "getmatch.ru", "talantix", "smartrecruiters", "teamtailor",
+]
+
+
+def any_of(pats, s):
+    return any(re.search(p, s, re.I) for p in pats)
+
+
+def extract_code(body):
+    """The digits, not a year. `\\d{4,8}` alone returned "2026" out of every dated footer —
+    a confident wrong answer in exactly the shape of a right one."""
+    # Greenhouse's is an 8-char MIXED token ("RaS3iV1J") sitting alone on its own line, and the
+    # only digits in that mail are its street address — a digits-only reader returned "10011".
+    m = re.search(r"(?:security )?code(?: field on your application)?:?\s*\n+\s*([A-Za-z0-9]{6,10})\s*\n", body, re.I)
+    if m:
+        return m.group(1)
+    for pat in (r"код[^0-9\n]{0,40}(\d{4,8})", r"code[^0-9\n]{0,40}(\d{4,8})",
+                r"(\d{4,8})[^0-9\n]{0,30}(?:—|-|это)?\s*(?:ваш\s+)?код"):
+        m = re.search(pat, body, re.I)
+        if m:
+            return m.group(1)
+    now = time.gmtime().tm_year
+    for m in re.finditer(r"\b(\d{4,8})\b", body):
+        v = m.group(1)
+        if not (len(v) == 4 and abs(int(v) - now) <= 2):
+            return v
+    return ""
+
+
+def classify(frm, subj, body):
+    """-> (level, kind, gist). level: act (wake him) | info (ledger) | noise (ledger, ignore).
+
+    Order matters: a code and a rejection are unambiguous whoever sent them; everything else is
+    judged by WHO sent it first, because Russian marketing mail is full of guillemets and polite
+    imperatives and would otherwise read exactly like an employer writing back."""
+    # hh puts the employer's words in guillemets — but so does the vacancy title and the
+    # company name earlier in the same mail, and taking the FIRST match gave a "message" that
+    # was just «UZUM TECHNOLOGIES». The employer's text is the longest quote in the document.
+    cands = [re.sub(r"\s+", " ", q).strip() for q in QUOTE.findall(body)]
+    quote = max(cands, key=len) if cands else ""
+    if len(quote) < 8:
+        quote = ""
+    hay = quote or body
+    both = subj + "\n" + body
+    job_sender = any(s in frm.lower() for s in JOB_SENDERS)
+    hh_shape = bool(re.search(r"сообщение от работодателя|вам написали по вакансии|новое сообщение", subj, re.I))
+
+    if any_of(CODE, subj) or any_of(CODE, body[:400]):
+        return "act", "code", extract_code(body) or quote[:120] or subj
+    # Before the sender test: an invite arrives from a person's own mailbox, not from an ATS,
+    # so `job_sender` is false and the unknown-sender arm below demands JOBWORDS the invite may
+    # not contain. Shape first — a meeting link plus a time is unambiguous whoever sent it.
+    if any_of(INVITE, both):
+        return "act", "invite", invite_gist(subj, body)
+    if any_of(REJECT, subj) or any_of(REJECT, hay):
+        return "info", "reject", (quote or re.sub(r"\s+", " ", body))[:300]
+    if job_sender or hh_shape:
+        # A digest subject wins over a quote in the body: hh's recommendation mails carry the
+        # resume title and the company name in guillemets, which read exactly like a message.
+        if any_of(NOISE_SUBJ, subj) and not hh_shape:
+            return "noise", "digest", subj
+        if any_of(STRONG, hay):
+            return "act", "employer" if (quote or hh_shape) else "ats", (quote or re.sub(r"\s+", " ", body))[:600]
+        if any_of(AUTOREPLY, hay):
+            return "info", "autoreply", (quote or re.sub(r"\s+", " ", body))[:300]
+        if quote or hh_shape:
+            # ПОЛЯРНОСТЬ. Сюда падает всё, что работодатель написал, а мы НЕ опознали ни как
+            # просьбу (STRONG), ни как автоответ (AUTOREPLY). До 2026-08-26 это было `employer`,
+            # то есть «требует тебя» — и каждая фраза, отсутствующая в AUTOREPLY, звонила ему в
+            # телефон. Список фраз рано или поздно отстаёт от живого языка всегда, поэтому
+            # умолчание не может стоить оператору внимания.
+            # Но и молчать нельзя: неопознанное письмо может быть настоящей просьбой, которой нет
+            # в STRONG. Поэтому неопознанное покупает ДРУГОЙ ЯРЛЫК, а не тишину — оно доходит до
+            # него в том же сообщении, отдельной секцией, без слов «требует тебя».
+            return "act", "employer?", (quote or re.sub(r"\s+", " ", body))[:600]
+        return "info", "other", subj
+    # Unknown sender: employers answer from their own domains too — 2026-08-20 Т-Банк's real
+    # rejection came straight from t_career, not through hh. So judge by the WORDS, but demand
+    # actual job vocabulary before letting a stranger's imperative reach his phone.
+    if any_of(JOBWORDS, both):
+        if any_of(STRONG, hay):
+            return "act", "employer", (quote or re.sub(r"\s+", " ", body))[:600]
+        return "info", "other", subj
+    return "noise", "not-job", subj
+
+
+def fields(body):
+    out = {}
+    for k, v in FIELD.findall(body):
+        out[k.lower()] = re.sub(r"\s+", " ", v).strip()[:120]
+    return out.get("компания", "") or out.get("компании", ""), out.get("вакансия", "")
+
+# ---------------------------------------------------------------- state / ledger
+
+def load_state():
+    try:
+        return json.loads(STATE.read_text())
+    except Exception:
+        return {}
+
+
+def save_state(st):
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = STATE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(st, ensure_ascii=False, indent=1))
+    tmp.replace(STATE)
+
+
+def ledger_write(path, rows):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        for r in rows:
+            f.write("\t".join(str(x).replace("\t", " ").replace("\n", " ⏎ ") for x in r) + "\n")
+
+
+VACID = re.compile(r"hh\.ru/vacancy/(\d+)")
+
+
+def raw_html(msg):
+    for part in msg.walk():
+        if part.get_content_type() == "text/html":
+            try:
+                return part.get_payload(decode=True).decode(part.get_content_charset() or "utf-8", "replace")
+            except Exception:
+                return ""
+    return ""
+
+
+def vacancy_id(msg):
+    """hh's notification mail links the vacancy directly — `hh.ru/vacancy/135526871` — which is
+    the SAME key `mesh-job-track` writes the board by. Use it and nothing else where it exists."""
+    m = VACID.search(raw_html(msg))
+    return m.group(1) if m else ""
+
+
+def board_mark(vid, company, vacancy, state_word):
+    """Flip a board row's status. The key is the vacancy ID; a title is NOT a key.
+
+    Learned the hard way on this very file 2026-08-20: matching rows by title substring alone
+    flipped five different employers' «Senior Golang Developer» rows to `replied` off one
+    company's autoreply, and three «Руководитель группы разработки (Team Lead)» rows to
+    `rejected` off one rejection. A reply is about ONE application; a title is shared."""
+    if not BOARD.exists():
+        return None
+    if not vid and not (company and vacancy):
+        return None
+    try:
+        lines = BOARD.read_text(encoding="utf-8", errors="replace").splitlines()
+    except Exception:
+        return None
+    hit = None
+    for i, line in enumerate(lines):
+        cols = line.split("\t")
+        if len(cols) < 5:
+            continue
+        if vid:
+            if "/vacancy/%s" % vid not in line:
+                continue
+        else:
+            # No link (a direct-from-employer mail): demand BOTH names, and only ever move a row
+            # that is already an application of ours.
+            co_key = re.split(r"[.,]", company)[0].strip().lower()
+            if not co_key or co_key not in cols[1].lower():
+                continue
+            if vacancy.lower() not in cols[2].lower():
+                continue
+            if cols[4] not in ("sent", "viewed", "replied"):
+                continue
+        if cols[4] != state_word:
+            cols[4] = state_word
+            lines[i] = "\t".join(cols)
+            hit = cols[1] + " / " + cols[2]
+        break
+    if hit:
+        BOARD.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return hit
+
+
+# ---------------------------------------------------------------- main read
+
+def _connect():
+    import imaplib
+    user, pw, host, port = creds()
+    M = imaplib.IMAP4_SSL(host, port)
+    M.login(user, pw)
+    M.select("INBOX", readonly=True)
+    return M
+
+
+# Yandex DROPS the connection mid-fetch on a large message — the Foxible thread in this very
+# mailbox carries 10 MB of PDF, and one `BODY.PEEK[]` of it killed the whole run with
+# `socket error: EOF` before a single row was ledgered. So: ask the SIZE first, and take only
+# headers from anything fat. A job reply is a few KB of text; nothing worth reading here is 2 MB.
+BIG = 512 * 1024
+
+
+def fetch(since_days, limit=200):
+    c = creds()
+    if c is None:
+        raise SystemExit(2)
+    dev = uplink_dev()
+    if not dev:
+        print("mesh-job-mail: no default route in table main — refusing to guess a vantage", file=sys.stderr)
+        raise SystemExit(1)
+    bind_sockets_to(dev)
+    M = _connect()
+    validity = M.response("UIDVALIDITY")[1][0]
+    validity = validity.decode() if isinstance(validity, bytes) else str(validity)
+    st = load_state()
+    last = st.get("last_uid", 0) if st.get("uidvalidity") == validity else 0
+    since = time.strftime("%d-%b-%Y", time.gmtime(time.time() - since_days * 86400))
+    if last:
+        typ, data = M.uid("search", None, "UID", "%d:*" % (last + 1))
+    else:
+        typ, data = M.uid("search", None, "SINCE", since)
+    uids = [int(u) for u in data[0].split() if int(u) > last][-limit:]
+
+    sizes = {}
+    if uids:
+        typ, d = M.uid("fetch", ",".join(str(u) for u in uids), "(RFC822.SIZE)")
+        for item in d:
+            if isinstance(item, bytes):
+                m = re.search(rb"UID (\d+).*RFC822.SIZE (\d+)", item) or re.search(rb"RFC822.SIZE (\d+).*UID (\d+)", item)
+                if m:
+                    g = [int(x) for x in m.groups()]
+                    if b"UID" == item[item.index(b"UID"):item.index(b"UID") + 3] and item.index(b"UID") < item.index(b"RFC822.SIZE"):
+                        sizes[g[0]] = g[1]
+                    else:
+                        sizes[g[1]] = g[0]
+
+    msgs, truncated = [], 0
+    for u in uids:
+        big = sizes.get(u, 0) > BIG
+        spec = "(BODY.PEEK[HEADER])" if big else "(BODY.PEEK[])"
+        for attempt in (1, 2):
+            try:
+                typ, d = M.uid("fetch", str(u), spec)
+                break
+            except Exception:
+                # a dropped connection is not a dropped message: reconnect once, then take the
+                # headers, which are always small enough to survive.
+                try:
+                    M.logout()
+                except Exception:
+                    pass
+                M = _connect()
+                spec = "(BODY.PEEK[HEADER])"
+                big = True
+                d = None
+        if not d or not isinstance(d[0], tuple):
+            continue
+        if big:
+            truncated += 1
+        msgs.append((u, email.message_from_bytes(d[0][1]), big))
+    try:
+        M.logout()
+    except Exception:
+        pass
+    return validity, last, msgs, truncated
+
+
+# ---------------------------------------------------------------- gmail lane (Note 3)
+
+GMAIL_TOOL = "mesh-gmail-note3"
+# "Your application for <vacancy> at <company>" / "<vacancy> at <company>" — the Greenhouse and
+# Lever subject shapes. hh's «Компания:/Вакансия:» body fields do not exist in this mail, and
+# `board_mark` refuses to move a row on a title alone, so without a COMPANY the international
+# lane could never settle a board row. Both names or nothing.
+SUBJ_FIELDS = [
+    re.compile(r"your application (?:for|to)\s+(?P<vac>.+?)\s+at\s+(?P<co>[^,\n]+?)\s*$", re.I),
+    re.compile(r"application (?:for|to)\s+(?P<vac>.+?)\s+at\s+(?P<co>[^,\n]+?)\s*$", re.I),
+    re.compile(r"(?:thank you for applying to|your application to)\s+(?P<co>[^,\n]+?)\s*$", re.I),
+]
+
+
+def subject_fields(subj):
+    """(company, vacancy) off an ATS subject line. Empty where it does not clearly say both —
+    a guess here moves the WRONG application's row, and a title is shared across employers."""
+    for rx in SUBJ_FIELDS:
+        m = rx.search(subj.strip())
+        if m:
+            d = m.groupdict()
+            return (d.get("co") or "").strip(), (d.get("vac") or "").strip()
+    return "", ""
+
+
+def _as_mime(rec):
+    """Rebuild one `mesh-gmail-note3` record as a real MIME message, so `classify`, `text_of`,
+    `raw_html` and `vacancy_id` all run on the gmail lane completely unchanged."""
+    from email.message import EmailMessage
+    m = EmailMessage()
+    frm = rec.get("from", "")
+    name = rec.get("from_name", "")
+    m["From"] = ("%s <%s>" % (name, frm)) if name else frm
+    m["To"] = ", ".join(rec.get("to") or [])
+    m["Subject"] = rec.get("subject", "")
+    m["Message-ID"] = rec.get("message_id", "")
+    m["Date"] = rec.get("date", "")
+    m.set_content(rec.get("text", "") or "", subtype="plain")
+    if rec.get("html"):
+        m.add_alternative(rec["html"], subtype="html")
+    return m
+
+
+def gmail_fetch(since_days, last_id=0, limit=200):
+    """-> (messages, newest_id, note, state). `messages` matches the IMAP lane's (uid, msg, big)
+    shape; `state` is "live" or "dark" and comes from the PRODUCER, never re-derived by a reader
+    grepping the note — a classifier keyed on the failed text collapses every distinct way this
+    lane can be absent onto one row.
+
+    Returns ([], last_id, "<why>") — never raises — when the phone is unreachable: the yandex
+    lane must keep running while the Note 3 is unplugged, and an n/a lane is not an empty one.
+    `--json` here carries the pulled window's own coverage; it is logged, because "no job mail
+    in the gmail lane" means nothing without knowing how far back the cache reaches."""
+    if not shutil.which(GMAIL_TOOL):
+        return [], last_id, "%s not on PATH" % GMAIL_TOOL, "dark"
+    try:
+        p = subprocess.run([GMAIL_TOOL, "--json", "--list", "0",
+                            "--since", str(max(since_days, 1))],
+                           capture_output=True, text=True, timeout=600)
+    except Exception as e:
+        return [], last_id, "%s failed: %s" % (GMAIL_TOOL, e), "dark"
+    if p.returncode == 2:
+        return [], last_id, ("phone n/a: %s"
+                             % (p.stderr.strip().split("—")[-1].strip()[:80] or "unreachable")), "dark"
+    if p.returncode != 0:
+        return [], last_id, "%s rc=%d: %s" % (GMAIL_TOOL, p.returncode, p.stderr.strip()[:120]), "dark"
+    try:
+        data = json.loads(p.stdout)
+    except Exception as e:
+        return [], last_id, "unparseable %s output: %s" % (GMAIL_TOOL, e), "dark"
+    cov = data.get("coverage") or {}
+    recs = [r for r in data.get("messages", []) if int(r.get("id", 0)) > last_id]
+    recs.sort(key=lambda r: int(r["id"]))
+    recs = recs[-limit:]
+    note = "window %s..%s (%s msgs), %d new" % (cov.get("oldest"), cov.get("newest"),
+                                                cov.get("n"), len(recs))
+    newest = max([int(r["id"]) for r in data.get("messages", [])] or [last_id])
+    return [("gm:%s" % r["id"], _as_mime(r), False) for r in recs], newest, note, "live"
+
+
+# ---------------------------------------------------------------- lane freshness
+
+def iso(t):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+
+
+def parse_iso(s):
+    try:
+        return calendar.timegm(time.strptime(s.strip(), "%Y-%m-%dT%H:%M:%SZ"))
+    except Exception:
+        return None
+
+
+def up_windows():
+    """[(start, end)] of every window this NODE was powered up — or None when the boot record
+    cannot be read (honest blindness: a caller must then render up-hours `na`, never sum a
+    missing record to zero downtime).
+
+    `mesh-cron-catchup --boot-windows` is the mesh's one parser of `journalctl --list-boots`;
+    a private second copy here would rot on its own. The CURRENT boot comes from /proc/uptime
+    instead, because the journal's `last_entry` lags the clock by however long nothing has
+    logged, and that lag would be counted as the machine being OFF."""
+    try:
+        p = subprocess.run(["mesh-cron-catchup", "--boot-windows"],
+                           capture_output=True, text=True, timeout=60)
+        if p.returncode != 0:
+            return None
+        w = [(float(a), float(b)) for a, b in json.loads(p.stdout)]
+    except Exception:
+        return None
+    if not w:
+        return None
+    try:
+        boot0 = time.time() - float(open("/proc/uptime").read().split()[0])
+    except Exception:
+        return None
+    w = [(a, b) for a, b in w if b < boot0]
+    w.append((boot0, time.time()))
+    return sorted(w)
+
+
+def up_hours(t0, t1, windows):
+    """-> (hours the node was POWERED UP in [t0,t1], floor?). A calendar delta over-reports by
+    however long the machine was off, and this node power-cycles daily — 6h25m of 2026-08-25
+    alone. `floor` is True when the boot record does not reach back to t0: the sum is then a
+    LOWER bound, which is the safe direction for a threshold (it alarms later, never earlier)."""
+    if windows is None or t0 is None or t1 is None:
+        return None, False
+    secs = sum(max(0.0, min(b, t1) - max(a, t0)) for a, b in windows)
+    return secs / 3600.0, t0 < min(a for a, _ in windows)
+
+
+def tape_append(path, rows):
+    """The RUN row, unconditional: one line per LANE per run, live or dark. A tape that records
+    only what it SAW is a numerator — the silences in this one are denominators, so a reader can
+    tell a lane that found nothing from a lane that was never asked."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a") as f:
+            for r in rows:
+                f.write("\t".join(str(x) for x in r) + "\n")
+    except Exception as e:
+        print("lane tape unwritable: %s" % e, file=sys.stderr)
+
+
+def tape_read(path, lane, keep=6000):
+    try:
+        lines = pathlib.Path(path).read_text().splitlines()[-keep:]
+    except Exception:
+        return []
+    out = []
+    for ln in lines:
+        f = ln.split("\t")
+        if len(f) < 3 or f[1] != lane:
+            continue
+        t = parse_iso(f[0])
+        if t is not None:
+            out.append((t, f[2], f[3] if len(f) > 3 else ""))
+    return out
+
+
+def ledger_live_moments(lane, path=None):
+    """The instants this lane DELIVERED, off the durable ledger — which predates the lane tape,
+    so it is what a fresh tape calibrates against. Coarser than the tape (a live run that
+    classified nothing leaves no ledger row), so a gap measured here OVER-states a normal dark
+    stretch: the conservative direction for a threshold."""
+    try:
+        lines = pathlib.Path(path or LEDGER).read_text().splitlines()
+    except Exception:
+        return []
+    ts = set()
+    for ln in lines:
+        f = ln.split("\t")
+        if len(f) < 2:
+            continue
+        if (lane == "gmail") != f[1].startswith("gm:"):
+            continue
+        t = parse_iso(f[0])
+        if t is not None:
+            ts.add(t)
+    return sorted(ts)
+
+
+def _gaps(moments, windows):
+    out = []
+    for a, b in zip(moments, moments[1:]):
+        h, _ = up_hours(a, b, windows)
+        if h is not None:
+            out.append(h)
+    return out
+
+
+def lane_freshness(lane, tape, windows, now=None, ledger_path=None):
+    """Everything a reader needs to tell a DARK lane from an EMPTY one: how many runs it has been
+    n/a in a row, how many UP-hours since its last live window, and the threshold that number is
+    judged against — carrying the SOURCE the threshold was measured from.
+
+    No constant is used as a threshold anywhere. The ladder is measured-then-marked: this lane's
+    own live-to-live gaps in the tape, else its delivery gaps in the ledger, else `unmeasured` —
+    and an unmeasured threshold alarms on NOTHING while still publishing the streak."""
+    now = now or time.time()
+    rows = [r for r in tape if r[1] in ("live", "dark")]
+    dark_runs = 0
+    for _, st, _ in reversed(rows):
+        if st != "dark":
+            break
+        dark_runs += 1
+    live_ts = [t for t, st, _ in rows if st == "live"]
+    last_live, live_src = (live_ts[-1], "tape") if live_ts else (None, "none")
+    lm = None
+    if last_live is None:
+        lm = ledger_live_moments(lane, ledger_path)
+        last_live, live_src = (lm[-1], "ledger") if lm else (None, "none")
+
+    cands, src = _gaps(live_ts, windows), "tape-live-gaps"
+    if len(live_ts) < 3 or not cands:
+        lm = ledger_live_moments(lane, ledger_path) if lm is None else lm
+        g = _gaps(lm, windows)
+        cands, src = (g, "ledger-gaps") if len(g) >= 3 else ([], "unmeasured")
+    thr = max(cands) if cands else None
+    src = "%s(n=%d)" % (src, len(cands)) if cands else src
+
+    dark_uph, floor = up_hours(last_live, now, windows)
+    return {"lane": lane, "dark_runs": dark_runs, "last_live": last_live,
+            "last_live_src": live_src, "dark_uph": dark_uph, "uph_is_floor": floor,
+            "dark_cal_h": (now - last_live) / 3600.0 if last_live else None,
+            "threshold_uph": thr, "threshold_src": src,
+            "over": bool(thr is not None and dark_uph is not None and dark_uph > thr)}
+
+
+def freshness_str(fr, state):
+    if state == "skipped":
+        return "skipped"
+    if state == "live":
+        return "live"
+    bits = ["DARK %d run(s)" % fr["dark_runs"]]
+    if fr["dark_uph"] is None:
+        bits.append("up-h na (boot record unreadable)")
+    else:
+        bits.append("%s%.1f up-h (cal %.1fh)" % (">=" if fr["uph_is_floor"] else "",
+                                                 fr["dark_uph"], fr["dark_cal_h"] or 0.0))
+    bits.append("last live %s (%s)" % (iso(fr["last_live"]) if fr["last_live"] else "never",
+                                       fr["last_live_src"]))
+    bits.append("thr %s src=%s" % ("%.1f up-h" % fr["threshold_uph"]
+                                   if fr["threshold_uph"] is not None else "na",
+                                   fr["threshold_src"]))
+    return "; ".join(bits)
+
+
+def lane_alarm(lane, fr, state, statepath, speak, now=None):
+    """One line per dark EPISODE, not one per tick — and one line when the episode ENDS.
+
+    The episode is keyed on the lane's own last-live instant, so a lane that recovers and goes
+    dark again is a NEW episode and speaks again, while 200 consecutive dark ticks of the same
+    episode speak once. rc is untouched on purpose: the other lane is healthy, and a red exit on
+    a working tract teaches its reader to ignore red."""
+    now = now or time.time()
+    try:
+        st = json.loads(pathlib.Path(statepath).read_text())
+    except Exception:
+        st = {}
+    ep = st.get(lane) or {}
+    key = iso(fr["last_live"]) if fr["last_live"] else "never"
+    verdict = None
+    if state == "live":
+        if ep.get("alarmed"):
+            speak("recovered", "[fyi] job-mail %s lane is LIVE again — dark episode since %s "
+                               "closed after %s up-h" % (lane, ep.get("episode", "?"),
+                                                         ep.get("at_uph", "?")))
+            verdict = "recovered"
+        st.pop(lane, None)
+    elif state == "dark" and fr["over"] and ep.get("episode") != key:
+        speak("alarm", "[fyi] job-mail %s lane DARK past its own measured bound: %s. "
+                       "Nothing from that mailbox reaches the mesh until it is back."
+                       % (lane, freshness_str(fr, state)))
+        st[lane] = {"episode": key, "alarmed": True, "at": iso(now),
+                    "at_uph": "%.1f" % (fr["dark_uph"] or 0.0)}
+        verdict = "alarm"
+    elif state == "dark":
+        st[lane] = dict(ep, episode=key, alarmed=bool(ep.get("alarmed")))
+    try:
+        pathlib.Path(statepath).parent.mkdir(parents=True, exist_ok=True)
+        tmp = pathlib.Path(str(statepath) + ".tmp")
+        tmp.write_text(json.dumps(st, ensure_ascii=False, indent=1))
+        tmp.replace(statepath)
+    except Exception as e:
+        print("lane alarm state unwritable: %s" % e, file=sys.stderr)
+    return verdict
+
+
+
+# ---------------------------------------------------------------- test
+
+def selftest():
+    ok = True
+
+    def check(label, cond, detail=""):
+        nonlocal ok
+        print(("  ok   " if cond else "  FAIL ") + label + ((" — " + detail) if detail else ""))
+        ok = ok and bool(cond)
+
+    dev = uplink_dev()
+    check("uplink device from table main", bool(dev) and dev != "tailscale0", str(dev))
+    if dev:
+        try:
+            bind_sockets_to(dev)
+            check("SO_BINDTODEVICE accepted unprivileged", True, dev)
+        except Exception as e:
+            check("SO_BINDTODEVICE accepted unprivileged", False, repr(e))
+
+    # Classifier fixtures: the LITERAL text these employers sent on 2026-08-17..20.
+    tbank = "Вакансия: Руководитель группы разработки (Team Lead)\nКомпания: Т-Банк. ИТ.\n«Добрый день, Илья ! Большое спасибо за отклик на вакансию. Мы рассмотрим резюме и вернемся к вам с дальнейшей обратной связью.»"
+    lvl, kind, _ = classify("noreply@hh.ru", "Сообщение от работодателя", tbank)
+    check("template ack is INFO, not pushed", (lvl, kind) == ("info", "autoreply"), "%s/%s" % (lvl, kind))
+    co, vac = fields(tbank)
+    check("company+vacancy parsed off hh mail", co.startswith("Т-Банк") and "Team Lead" in vac, "%s | %s" % (co, vac))
+
+    ff = "Вакансия: Head of Engineering DSP\nКомпания: Future Focus\n«Илья, здравствуйте! У вас интересное резюме. Хотели бы с вами связаться и обсудить детали. Позвоните, пожалуйста, в рабочее время по телефону +7 916 212-22-79 или напишите в чат.»"
+    lvl, kind, gist = classify("noreply@hh.ru", "Сообщение от работодателя", ff)
+    check("a human asking to call is ACT", (lvl, kind) == ("act", "employer"), "%s/%s" % (lvl, kind))
+    check("gist carries the ask, not the boilerplate", "Позвоните" in gist)
+
+    # Оператор, TG 2026-08-26: «вы прислали, что почта требует меня, но почта не требует меня».
+    # Ниже — ДОСЛОВНЫЙ текст обоих писем, из-за которых он это написал (ledger job-mail.log,
+    # uid 17886 и 17882). Не перефразировать: оба ложняка были промахом ровно на одно вставленное
+    # слово, и перефразированная фикстура этот класс ошибки не воспроизводит.
+    ya = "Вакансия: Руководитель группы разработки в ML Platform\nКомпания: Yandex Infrastructure\n«Здравствуйте, Илья! Спасибо, что откликнулись на вакансию. Мы сохранили ваше резюме и свяжемся с вами, если ваши навыки и опыт подойдут для этой или похожей вакансии. Остаёмся на связи, рекрутмент Яндекса»"
+    lvl, kind, _ = classify("noreply@hh.ru", "Вам написали по вакансии Руководитель группы разработки в ML Platform", ya)
+    check("вставленное слово между «мы» и «свяжемся» больше не будит его",
+          (lvl, kind) == ("info", "autoreply"), "%s/%s" % (lvl, kind))
+
+    bnovo = "Вакансия: Team Lead PHP/Go Backend Developer\nКомпания: Bnovo\n«Привет, Илья! Спасибо за отклик на вакансию Team Lead PHP/Go Backend Developer. В случае положительного рассмотрения, рекрутер свяжется с тобой до конца рабочей недели) Хорошего дня и будем на связи! HR-команда Bnovo.»"
+    lvl, kind, _ = classify("noreply@hh.ru", "Вам написали по вакансии Team Lead PHP/Go Backend Developer", bnovo)
+    check("автоответ на «ты» и в третьем лице — тоже не будит",
+          (lvl, kind) == ("info", "autoreply"), "%s/%s" % (lvl, kind))
+
+    # КОНТРОЛЬ ПРОТИВОПОЛОЖНОГО НАПРАВЛЕНИЯ: расширять AUTOREPLY безопасно ровно потому, что STRONG
+    # стоит РАНЬШЕ. Это письмо несёт и вежливый автоответный оборот, и настоящую просьбу — и обязано
+    # остаться act, иначе расширение списка куплено глухотой.
+    mixed = "«Илья, здравствуйте! Спасибо за отклик, будем на связи. Подскажите, когда вам удобно созвониться на этой неделе?»"
+    lvl, kind, _ = classify("noreply@hh.ru", "Вам написали по вакансии", mixed)
+    check("вежливый оборот НЕ глушит настоящую просьбу в том же письме",
+          (lvl, kind) == ("act", "employer"), "%s/%s" % (lvl, kind))
+
+    # ПОЛЯРНОСТЬ умолчания: неопознанное письмо работодателя не молчит и не врёт «требует тебя».
+    unk = "«Илья, добрый день. Ваш профиль отправлен нанимающему менеджеру на ознакомление.»"
+    lvl, kind, _ = classify("noreply@hh.ru", "Вам написали по вакансии", unk)
+    check("неопознанное письмо доходит, но под другим ярлыком",
+          (lvl, kind) == ("act", "employer?"), "%s/%s" % (lvl, kind))
+
+    rail = "Hey Ilya,\nOur team was able to have a look at your resume. Unfortunately, we will not be moving forward with the process."
+    lvl, kind, _ = classify("no-reply@ashbyhq.com", "Follow-up from Railway", rail)
+    check("ATS rejection classified", (lvl, kind) == ("info", "reject"), "%s/%s" % (lvl, kind))
+
+    lvl, kind, _ = classify("noreply@hh.ru", "Подходящие вакансии для резюме: «Руководитель группы разработки»", "подборка вакансий")
+    check("hh digest is NOISE despite guillemets in subject", lvl == "noise", "%s/%s" % (lvl, kind))
+
+    lvl, kind, gist = classify("noreply@hh.ru", "Код подтверждения", "Ваш код подтверждения: 4821")
+    check("a verification code is ACT and carries the digits", (lvl, kind, gist) == ("act", "code", "4821"), gist)
+
+    inv = "Вакансия: X\nКомпания: Y\n«Илья, приглашаем вас на техническое интервью, когда вам удобно на следующей неделе?»"
+    lvl, kind, _ = classify("noreply@hh.ru", "Вам написали по вакансии X", inv)
+    check("an interview invitation is ACT", (lvl, kind) == ("act", "employer"))
+
+    bt = "Hi Ilya,\nThank you for taking the time to apply to the Open Source Engineer role at Braintrust. Our hiring team is currently reviewing applications. While we cannot respond to all of our applicants, if there is a match, you will receive an email from one of our team members to schedule next steps!"
+    lvl, kind, _ = classify("no-reply@ashbyhq.com", "Thanks for applying to Braintrust", bt)
+    check("a template promising a FUTURE schedule mail is INFO", (lvl, kind) == ("info", "autoreply"), "%s/%s" % (lvl, kind))
+
+    tb = "Здравствуйте, Илья!\nСпасибо, что откликнулись на вакансию Руководитель группы разработки СПБ. Для нас очень ценно, но пока не можем пригласить вас на эту позицию.\nКоманда рекрутмента Т-Банка"
+    lvl, kind, _ = classify("no-reply@tbank.ru", "Обратная связь по вакансии", tb)
+    check("rejection straight from the employer domain is caught", (lvl, kind) == ("info", "reject"), "%s/%s" % (lvl, kind))
+
+    mk = "Илья, сохраните высокую ставку\n«Фиксированный доход» — откройте вклад и получите ставку. Позвоните нам, чтобы уточнить условия."
+    lvl, kind, _ = classify("partner@alfabank.ru", "Илья, сохраните высокую ставку", mk)
+    check("bank marketing with guillemets+imperative is NOISE", lvl == "noise", "%s/%s" % (lvl, kind))
+
+    rj = "Работодатель не готов\nпригласить вас\nВакансия: Руководитель команды разработки (Go)\nКомпании: Клируэй Текнолоджис"
+    co2, vac2 = fields(rj)
+    check("hh rejection mail says Компании:, not Компания:", co2 == "Клируэй Текнолоджис", "%s | %s" % (co2, vac2))
+
+    gh = "Hi Ilya,\nCopy and paste this code into the security code field on your application:\n\nRaS3iV1J \n\nAfter you enter the code, resubmit your application.\n© 2026 Greenhouse\n18 West 18th Street, New York, NY 10011, USA"
+    lvl, kind, gist = classify("no-reply@eu.greenhouse-mail.io", "Security code for your application to Kayzen", gh)
+    check("Greenhouse code is the token, not the zip code", (lvl, kind, gist) == ("act", "code", "RaS3iV1J"), gist)
+
+    dg = "Вакансия недели\nКомпания «UZUM TECHNOLOGIES» ищет\nПодборка для вас"
+    lvl, kind, _ = classify("noreply@hh.ru", "Вчера ваше резюме привлекло внимание", dg)
+    check("a digest with a quoted company stays NOISE", lvl == "noise", "%s/%s" % (lvl, kind))
+
+    short = "Проверьте чат\nНовое сообщение в чате\n«или можно в тг @AlanHRR»"
+    lvl, kind, gist = classify("noreply@hh.ru", "Новое сообщение от работодателя", short)
+    check("a SHORT real chat line survives as the gist", gist.strip() == "или можно в тг @AlanHRR", gist)
+
+    # Regression, 2026-08-20: title-only matching flipped five employers' rows off one reply.
+    global BOARD
+    real_board, BOARD = BOARD, pathlib.Path("/tmp/mesh-job-mail-test-board.tsv")
+    try:
+        BOARD.write_text(
+            "2026-08-20\tГоуланг Технологии\tSenior Golang Developer\thttps://hh.ru/vacancy/111\tsent\tx\n"
+            "2026-08-20\tVentra\tSenior Golang Developer\thttps://hh.ru/vacancy/222\tsent\tx\n"
+            "2026-08-20\tДом Лента\tSenior Golang Developer\thttps://hh.ru/vacancy/333\tsent\tx\n",
+            encoding="utf-8")
+        board_mark("222", "Ventra", "Senior Golang Developer", "replied")
+        after = BOARD.read_text(encoding="utf-8").splitlines()
+        st = [l.split("\t")[4] for l in after]
+        check("ответ помечает ТОЛЬКО свою вакансию по id", st == ["sent", "replied", "sent"], "/".join(st))
+        board_mark("", "Дом Лента", "Senior Golang Developer", "rejected")
+        st = [l.split("\t")[4] for l in BOARD.read_text(encoding="utf-8").splitlines()]
+        check("без ссылки нужны И компания И вакансия", st == ["sent", "replied", "rejected"], "/".join(st))
+        board_mark("", "Гоуланг", "Senior Golang Developer", "rejected")
+        st = [l.split("\t")[4] for l in BOARD.read_text(encoding="utf-8").splitlines()]
+        check("своя компания находится по имени, соседи не трогаются", st[1] == "replied" and st[2] == "rejected", "/".join(st))
+    finally:
+        try:
+            BOARD.unlink()
+        except Exception:
+            pass
+        BOARD = real_board
+
+    check("mesh-tg resolvable", __import__("shutil").which(TG) is not None)
+
+    # A real read is the gate the offline fixtures cannot be: reachability of the mailbox from
+    # the RU vantage, with the app-password that is the only one IMAP accepts.
+    if creds() is None:
+        print("  n/a  live IMAP read — no MAIL_IMAP_PASS in ~/.mesh/mail.env")
+        print("mesh-job-mail --test: n/a (credential absent)")
+        return 2
+    try:
+        import imaplib
+        user, pw, host, port = creds()
+        M = imaplib.IMAP4_SSL(host, port)
+        M.login(user, pw)
+        M.select("INBOX", readonly=True)
+        typ, d = M.uid("search", None, "ALL")
+        n = len(d[0].split())
+        M.logout()
+        check("live IMAP read returns a non-empty mailbox", n > 0, "%d messages" % n)
+    except Exception as e:
+        check("live IMAP read", False, repr(e))
+
+    # ---- the gmail / Note 3 lane ------------------------------------------------
+    # Both fixtures are VERBATIM text that arrived at ilyailiilia@gmail.com and that this
+    # reflex misread until 2026-08-20 — the rejection scored `other` because every English
+    # REJECT pattern wanted a verb, and the interview invite scored `other` because it asks
+    # nothing at all. The invite's slot had already passed by the time anything read it.
+    rtb = ("Dear Ilya,\n\nThank you again for your interest in RTB House and for taking the "
+           "time to apply for the Engineering Team Leader - Platform Engineering position.\n\n"
+           "After careful review, we have made the difficult decision not to move forward with "
+           "your application at this time.\n\nBest regards,\nThe RTB House Recruiting Team")
+    lvl, kind, gist = classify("iwona.wysocka2@rtbhouse.com",
+                               "Your application for Engineering Team Leader - Platform "
+                               "Engineering at RTB House", rtb)
+    check("nominalised rejection is REJECT, not other", (lvl, kind) == ("info", "reject"),
+          "%s/%s" % (lvl, kind))
+    co, vac = subject_fields("Your application for Engineering Team Leader - Platform "
+                             "Engineering at RTB House")
+    check("ATS subject yields BOTH company and vacancy",
+          co == "RTB House" and vac == "Engineering Team Leader - Platform Engineering",
+          "%s | %s" % (co, vac))
+    check("a bare title yields nothing (a title is not a key)",
+          subject_fields("Senior Golang Developer") == ("", ""))
+
+    inv = ("/ « Собеседование »\n\nЗавтра, 19-го августа, с 14:30 до 15:00 "
+           "(Europe/Moscow, GMT+03:00)\n\nПойду Возможно, пойду Не пойду\n\n"
+           "Описание Ссылка на видеовстречу: https://telemost.yandex.ru/j/85112335375308\n\n"
+           "Организатор artemieva.y@yandex.ru\nПриглашены ilyailiilia@gmail.com\n"
+           "Уведомление отправлено через Яндекс.Календарь")
+    lvl, kind, gist = classify("artemieva.y@yandex.ru", "Собеседование", inv)
+    check("a calendar invite with no imperative is ACT", (lvl, kind) == ("act", "invite"),
+          "%s/%s" % (lvl, kind))
+    check("the invite gist carries the SLOT and the link",
+          "14:30" in gist and "telemost.yandex.ru" in gist, gist[:90])
+    lvl, kind, _ = classify("newsletter@example.com", "Weekly digest",
+                            "Read more at https://example.com/zoom.us-lookalike")
+    check("a lookalike URL is not an invite", kind != "invite", kind)
+
+    msgs, newest, note, gstate = gmail_fetch(3, 0)
+    if "n/a" in note or "not on PATH" in note:
+        print("  n/a  live Note 3 read — %s" % note)
+    else:
+        check("live Note 3 read returns a window", "window" in note and "None" not in note, note)
+        check("gmail messages rebuild as MIME with a sender",
+              all("@" in hdr(m, "From") for _, m, _ in msgs[:20]) if msgs else True,
+              "%d new" % len(msgs))
+        if msgs:
+            check("a gmail uid is namespaced away from IMAP uids",
+                  all(str(u).startswith("gm:") for u, _, _ in msgs))
+            check("gmail bodies survive the MIME round-trip",
+                  sum(1 for _, m, _ in msgs if len(text_of(m)) > 20) >= max(1, len(msgs) // 2))
+            check("no body starts with a decode-failure marker",
+                  not any(text_of(m).startswith("\ufffd") for _, m, _ in msgs))
+    check("the gmail lane's state comes from the producer, not from grepping its note",
+          gstate in ("live", "dark") and (gstate == "live") == ("window" in note), "%s / %s"
+          % (gstate, note[:40]))
+
+    # ---- lane freshness: a dark lane must be distinguishable from an empty one
+    import tempfile
+    H = 3600.0
+    t = 1_756_000_000.0
+    # the node was OFF between -60h and -20h — exactly the shape of 2026-08-25's 6h25m gap
+    W = [(t - 100 * H, t - 60 * H), (t - 20 * H, t)]
+    uph, floor = up_hours(t - 100 * H, t, W)
+    check("up-hours skips the power-off window a calendar delta would count",
+          uph is not None and abs(uph - 60.0) < 0.01 and not floor, str(uph))
+    check("the two arms actually disagree — calendar would be 100h, up-hours is 60h",
+          abs((t - (t - 100 * H)) / H - 60.0) > 1)
+    uph2, floor2 = up_hours(t - 200 * H, t, W)
+    check("a t0 the boot record cannot reach back to renders a FLOOR, not a bigger number",
+          floor2 and abs(uph2 - 60.0) < 0.01, "%s floor=%s" % (uph2, floor2))
+    check("an unreadable boot record renders up-hours None, never 0 downtime",
+          up_hours(t - 10 * H, t, None) == (None, False))
+
+    with tempfile.TemporaryDirectory() as td:
+        td = pathlib.Path(td)
+        empty = td / "empty.log"
+        empty.write_text("")
+        fr = lane_freshness("gmail", [], W, now=t, ledger_path=empty)
+        check("an unmeasured threshold alarms on NOTHING and says so",
+              fr["threshold_src"] == "unmeasured" and fr["threshold_uph"] is None
+              and not fr["over"], fr["threshold_src"])
+
+        # ledger seed: four delivery instants an up-hour apart, all inside the -100h..-60h
+        # powered window — so this lane's own history says a 1-up-hour silence is normal
+        led = td / "led.log"
+        led.write_text("".join(
+            "%s\tgm:%d\tinfo\treject\t-\t-\ts\tg\n" % (iso(x), i)
+            for i, x in enumerate([t - 95 * H, t - 94 * H, t - 93 * H, t - 92 * H])))
+        fr = lane_freshness("gmail", [], W, now=t, ledger_path=led)
+        check("with no tape the threshold is measured off the LEDGER and names that source",
+              fr["threshold_src"].startswith("ledger-gaps(n=3)")
+              and fr["threshold_uph"] is not None, str(fr["threshold_src"]))
+        check("the last live instant falls back to the ledger and is marked as such",
+              fr["last_live_src"] == "ledger" and fr["last_live"] == t - 92 * H)
+        check("52 up-hours of darkness against this lane's own 1-up-hour bound reads as OVER",
+              fr["over"] and abs(fr["dark_uph"] - 52.0) < 0.01
+              and abs(fr["threshold_uph"] - 1.0) < 0.01,
+              "%.1f vs %.1f" % (fr["dark_uph"] or -1, fr["threshold_uph"] or -1))
+        check("the same 52 up-hours is 92 CALENDAR hours — the axis choice is not cosmetic",
+              abs(fr["dark_cal_h"] - 92.0) < 0.01, "%.1f" % fr["dark_cal_h"])
+
+        # a tape with its own live history WINS over the ledger seed
+        tape = [(t - 90 * H, "live", ""), (t - 80 * H, "dark", ""), (t - 70 * H, "live", ""),
+                (t - 65 * H, "live", ""), (t - 30 * H, "dark", ""), (t - 1 * H, "dark", "")]
+        fr = lane_freshness("gmail", tape, W, now=t, ledger_path=led)
+        check("a tape with >=3 live rows calibrates on itself, not on the ledger",
+              fr["threshold_src"].startswith("tape-live-gaps"), fr["threshold_src"])
+        check("the dark-run streak counts only the TRAILING dark rows", fr["dark_runs"] == 2,
+              str(fr["dark_runs"]))
+        check("last live comes from the tape once the tape has one",
+              fr["last_live_src"] == "tape" and fr["last_live"] == t - 65 * H)
+        check("the freshness string carries streak, up-hours, last-live AND the bound's source",
+              all(x in freshness_str(fr, "dark")
+                  for x in ["DARK 2 run(s)", "up-h", "last live", "src=tape-live-gaps"]),
+              freshness_str(fr, "dark"))
+
+        # ---- the alarm: ONE line per episode, and a line when the episode ends
+        stp = td / "alarm.json"
+        said = []
+        sp = lambda k, txt: said.append((k, txt))
+        over = dict(fr, over=True)
+        check("a dark lane past its bound speaks once",
+              lane_alarm("gmail", over, "dark", stp, sp) == "alarm" and len(said) == 1)
+        check("the SAME episode does not speak again on the next tick",
+              lane_alarm("gmail", over, "dark", stp, sp) is None and len(said) == 1)
+        check("a lane INSIDE its bound never speaks at all",
+              lane_alarm("gmail", dict(fr, over=False), "dark", stp, sp) is None
+              and len(said) == 1)
+        check("the episode ending is itself an event",
+              lane_alarm("gmail", fr, "live", stp, sp) == "recovered" and len(said) == 2)
+        nxt = dict(over, last_live=t - 0.5 * H)
+        check("a NEW dark episode speaks again — the throttle is per episode, not forever",
+              lane_alarm("gmail", nxt, "dark", stp, sp) == "alarm" and len(said) == 3)
+        check("the alarm text names the lane and its staleness, not just 'a lane is down'",
+              "gmail" in said[0][1] and "DARK" in said[0][1] and "up-h" in said[0][1],
+              said[0][1][:80])
+
+    # ---- the RUN row is unconditional: drive the real tool and read the artifact it left
+    before = len([1 for _ in tape_read(DRYLANETAPE, "gmail")]), \
+             len([1 for _ in tape_read(DRYLANETAPE, "yandex")])
+    r = subprocess.run([sys.executable, os.path.abspath(__file__),
+                        "--dry-run", "--quiet", "--since", "1"],
+                       capture_output=True, text=True, timeout=900)
+    after = len([1 for _ in tape_read(DRYLANETAPE, "gmail")]), \
+            len([1 for _ in tape_read(DRYLANETAPE, "yandex")])
+    check("a real run appends a RUN row for EVERY lane, dark ones included",
+          after == (before[0] + 1, before[1] + 1), "%s -> %s" % (before, after))
+    check("one lane dark leaves rc at 0 while the other lane works — red is reserved for a "
+          "tract that is actually broken", r.returncode == 0, "rc=%d %s" % (r.returncode,
+                                                                            r.stderr[-120:]))
+    check("--dry-run writes the rehearsal tape, never the durable one",
+          "dryrun" in str(DRYLANETAPE) and DRYLANETAPE != LANETAPE)
+
+    print("mesh-job-mail --test: " + ("ok" if ok else "FAILED"))
+    return 0 if ok else 1
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--tg", action="store_true")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--quiet", action="store_true")
+    ap.add_argument("--since", type=int, default=3, help="days to scan on a cold state")
+    ap.add_argument("--dry-run", action="store_true", help="classify and print; ledger goes to the dry-run file")
+    ap.add_argument("--no-gmail", action="store_true", help="skip the Note 3 lane")
+    ap.add_argument("--no-yandex", action="store_true", help="skip the IMAP lane")
+    ap.add_argument("--test", action="store_true")
+    a = ap.parse_args()
+    if a.test:
+        sys.exit(selftest())
+
+    st0 = load_state()
+    # The two lanes are independent: yandex may have no password and the Note 3 may be
+    # unplugged, and neither absence may be allowed to silence the other. Only BOTH being n/a
+    # is n/a — a single reachable lane still has to run.
+    yandex_ok = creds() is not None
+    validity, last, msgs, truncated = ("", 0, [], 0)
+    ynote = "" if yandex_ok else "n/a — no MAIL_IMAP_PASS in ~/.mesh/mail.env"
+    ystate = "live" if yandex_ok else "dark"
+    if yandex_ok and not a.no_yandex:
+        validity, last, msgs, truncated = fetch(a.since)
+    elif a.no_yandex:
+        ynote, ystate = "skipped (--no-yandex)", "skipped"
+
+    gmsgs, gnewest, gnote, gstate = ([], st0.get("gmail_last_id", 0),
+                                     "skipped (--no-gmail)", "skipped")
+    if not a.no_gmail:
+        gmsgs, gnewest, gnote, gstate = gmail_fetch(a.since, st0.get("gmail_last_id", 0))
+    if not yandex_ok and not gmsgs and "n/a" in gnote:
+        print("mesh-job-mail: n/a — yandex: %s; gmail: %s" % (ynote, gnote), file=sys.stderr)
+        sys.exit(2)
+
+    # LANE FRESHNESS. rc stays 0 while ONE lane is dark and the other works — a red exit on a
+    # healthy tract teaches its reader to ignore red — so the dark lane has to be audible some
+    # other way. It publishes its own staleness beside its value on every run, and speaks ONCE
+    # per dark episode when that staleness passes a bound measured from its own history. The
+    # bound is in UP-HOURS: this node power-cycled 6h25m on 2026-08-25 alone, and a calendar
+    # delta would call that downtime darkness.
+    now_t = time.time()
+    tapepath = DRYLANETAPE if a.dry_run else LANETAPE
+    windows = up_windows()
+    lanes = (("yandex", ystate, ynote or "%d new" % len(msgs)), ("gmail", gstate, gnote))
+    # THE RUN ROW GOES DOWN FIRST, then the reading is taken off the tape including it — so the
+    # streak a run publishes counts that run. Read first and every reading is one run stale, and
+    # the very first dark run of an episode would report a streak of zero.
+    tape_append(tapepath, [(iso(now_t), lane, state, note) for lane, state, note in lanes])
+    fresh = {}
+    for lane, state, note in lanes:
+        fresh[lane] = lane_freshness(lane, tape_read(tapepath, lane), windows, now_t)
+        fresh[lane]["state"], fresh[lane]["note"] = state, note
+    if not a.quiet and not a.json:
+        print("lanes: %s  yandex[%s: %s]  gmail/note3[%s: %s]"
+              % (iso(now_t), freshness_str(fresh["yandex"], ystate), ynote or "%d new" % len(msgs),
+                 freshness_str(fresh["gmail"], gstate), gnote))
+    if not a.dry_run:
+        # --dry-run must not speak and must not move the episode cursor: a rehearsal that spends
+        # the one line an episode gets is the same forgery as a test writing the live ledger.
+        def speak(kind, text):
+            subprocess.run([CHAT, text], check=False)
+            if a.tg:
+                subprocess.run([TG, text.replace("[fyi] ", "")], check=False)
+        for lane in ("yandex", "gmail"):
+            lane_alarm(lane, fresh[lane], fresh[lane]["state"], LANESTATE, speak, now_t)
+    msgs = msgs + gmsgs
+    rows, acts = [], []
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    for uid, msg, big in msgs:
+        frm, subj = hdr(msg, "From"), hdr(msg, "Subject")
+        body = text_of(msg) if not big else "[тело не читалось: письмо >512K, только заголовки]"
+        lvl, kind, gist = classify(frm, subj, body)
+        co, vac = fields(body)
+        if not (co and vac):
+            # hh's «Компания:/Вакансия:» fields do not exist in ATS mail; the subject carries
+            # both names instead. Only used where the body fields are absent.
+            sco, svac = subject_fields(subj)
+            co, vac = co or sco, vac or svac
+        vid = vacancy_id(msg)
+        rows.append((now, uid, lvl, kind, co or "-", vac or "-", subj[:120], gist[:400]))
+        if not a.dry_run:
+            # --dry-run must not move the board either: the board IS the lane's durable record,
+            # and a rehearsal that edits it is the same forgery as a test writing the live log.
+            if kind == "reject":
+                board_mark(vid, co, vac, "rejected")
+            elif kind in ("employer", "employer?", "autoreply"):
+                board_mark(vid, co, vac, "replied")
+        if lvl == "act":
+            acts.append((kind, co, vac, gist, frm, subj))
+
+    ledger_write(DRYLEDGER if a.dry_run else LEDGER, rows)
+    if not a.dry_run and msgs:
+        imap_uids = [u for u, _, _ in msgs if not str(u).startswith("gm:")]
+        st = dict(st0)
+        st.update({"ran": now, "seen": len(msgs)})
+        if imap_uids:
+            st.update({"uidvalidity": validity, "last_uid": max(imap_uids)})
+        # Advance the gmail cursor to the newest id the phone HELD, not the newest we acted on:
+        # a run that classified nothing still consumed the window, and re-reading it every tick
+        # would re-push the same recruiter mail forever.
+        st["gmail_last_id"] = max(gnewest, st0.get("gmail_last_id", 0))
+        save_state(st)
+
+    if a.json:
+        print(json.dumps({"lanes": {k: dict(v, last_live=iso(v["last_live"]) if v["last_live"]
+                                            else None) for k, v in fresh.items()},
+                          "rows": [{"uid": r[1], "level": r[2], "kind": r[3], "company": r[4],
+                                    "vacancy": r[5], "subject": r[6], "gist": r[7]}
+                                   for r in rows]},
+                         ensure_ascii=False, indent=1))
+    elif not a.quiet:
+        if not rows:
+            print("job-mail: ничего нового (last uid %s)" % last)
+        for r in rows:
+            print("%-5s %-9s %-22s %s" % (r[2], r[3], (r[4] or "-")[:22], (r[7] or r[6])[:90]))
+
+    if a.tg and acts and not a.dry_run:
+        # ЗАГОЛОВОК — ЭТО УТВЕРЖДЕНИЕ, и оно должно быть верным. «Требует тебя» носят только
+        # опознанные просьбы; неопознанное (`employer?`) идёт второй секцией и своими словами.
+        def render(items):
+            out = []
+            for kind, co, vac, gist, frm, subj in items:
+                head = {"code": "🔑 код", "employer": "✉️ живое письмо", "ats": "✉️ ATS",
+                        "employer?": "✉️ письмо, прямого вопроса не вижу",
+                        "invite": "📅 ПРИГЛАШЕНИЕ (есть время — ответь)"}.get(kind, kind)
+                who = co or re.sub(r".*<|>.*", "", frm)
+                out.append("%s — %s%s\n%s" % (head, who, (" / " + vac) if vac else "", gist[:400]))
+            return out
+
+        hard = [x for x in acts if x[0] != "employer?"]
+        soft = [x for x in acts if x[0] == "employer?"]
+        parts = []
+        if hard:
+            parts.append("[job] почта, требует тебя (%d):\n\n" % len(hard)
+                         + "\n\n".join(render(hard[:8])))
+        if soft:
+            parts.append("[job] почта, действий не требует, но ты в курсе (%d):\n\n" % len(soft)
+                         + "\n\n".join(render(soft[:8])))
+        subprocess.run([TG, "\n\n".join(parts)], check=False)
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

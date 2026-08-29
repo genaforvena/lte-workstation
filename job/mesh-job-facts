@@ -1,0 +1,834 @@
+#!/usr/bin/env python3
+"""mesh-job-facts — гейт на КОРРЕКТНОСТЬ фактов о человеке в job-ленте. Он УВЕДОМЛЯЕТ, НЕ БЛОКИРУЕТ.
+
+  mesh-job-facts                 скан + уведомление в TG, если есть что сказать (это стоит в кроне)
+  mesh-job-facts --check         то же, но только на stdout: ничего не шлёт, ничего не пишет
+  mesh-job-facts --confirm KEY VALUE [--source S]   зафиксировать ПОДТВЕРЖДЁННОЕ им значение
+  mesh-job-facts --confirmed     показать подтверждённое
+  mesh-job-facts --ack ID [--why "..."]   снять находку, которую чинить НЕЛЬЗЯ (уже отправлено)
+  mesh-job-facts --sources       что и откуда прочиталось (покрытие ридеров)
+  mesh-job-facts --test
+
+ЧЕГО ЭТОТ ТУЛ НЕ УМЕЕТ И НИКОГДА НЕ БУДЕТ. Он не знает, какой у человека телефон. Правда о человеке
+живёт только в человеке — внешнего источника истины у job-ленты нет, и любой тул, который заявит
+«факт верный», соврёт. Поэтому здесь проверяется РОВНО то, что машина проверить может:
+
+  WRONG        артефакт расходится с тем, что оператор ПОДТВЕРДИЛ (сильнейший сигнал)
+  DIVERGE      два живых артефакта расходятся между собой — кто-то из них неверен, и это факт,
+               а не мнение (ровно форма провала 2026-08-15: телефон в PDF ≠ телефон в форме)
+  UNCONFIRMED  факт УХОДИТ НАРУЖУ, но его никто никогда не подтверждал (форма провала 2026-08-20:
+               «Инженер, электроника и электротехника» месяц стоял в CV, взявшись из черновика)
+  SHIPPED      расхождение внутри уже ОТПРАВЛЕННОГО (sent/, letters/) — починить нельзя, знать надо
+  BLIND        ридер источника вернул НОЛЬ фактов — сломанный экстрактор читается как «всё сходится»,
+               поэтому пустота здесь findings, а не тишина ([[an-all-blind-fixture-cannot-catch-a-
+               miswired-reader]])
+
+ПОЧЕМУ УВЕДОМЛЯЕТ, А НЕ БЛОКИРУЕТ (оператор, 2026-08-20: «but gate notifies me, does not block
+anything»). Единственный, кто может отличить верный факт от неверного, — он. Гейт, который на своём
+догадливом расхождении остановил бы отклик, останавливал бы отклики на СВОИХ ошибках; цена ложного
+блока здесь выше цены ложного письма. Так что этот тул НИКОГДА не правит артефакт, не трогает
+очередь откликов и всегда выходит 0.
+
+ЧТО СЧИТАЕТСЯ ПОДТВЕРЖДЁННЫМ. Строки банка ответов (`answers.tsv`) с source `operator-*` — то, что он
+сказал сам, — плюс явные `--confirm`. Всё остальное (черновики, artifact:*, наши сборки) — НЕ
+подтверждение: именно так неверное образование и прожило месяц.
+"""
+# reflex-cadence: 41 8 * * *
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+import signal
+
+# SIGTERM MUST UNWIND, or every `finally` below is decorative. Python's DEFAULT SIGTERM disposition
+# terminates the interpreter WITHOUT running finally blocks, TemporaryDirectory.__exit__ or atexit,
+# so a correct-looking cleanup never executes. The signal is routine here, not hypothetical: GNU
+# `timeout` without --foreground puts its child in its OWN PROCESS GROUP and signals the GROUP, so
+# every timeout-wrapped call site -- mesh-doctor's hourly --test sweep, mesh-autowire's `timeout 30`
+# -- delivers TERM to this process. That is how 950MB of stranded snapshots filled phaedra's /tmp on
+# 2026-08-16 with a `finally: rmtree` sitting right there in the source (first fixed in mesh-spend,
+# d2fd7c9b). sys.exit() from a handler raises SystemExit in the MAIN THREAD, which is what makes
+# try/finally unwind. SIGKILL stays uncatchable -- that half is mesh-tmp-guard's sweep, never this.
+for _sig in (signal.SIGTERM, signal.SIGHUP):
+    signal.signal(_sig, lambda _s, _f: sys.exit(128 + _s))
+
+
+HOME = Path.home()
+
+def node_env(key, default="off"):
+    """Read a node-local knob from ~/.mesh/nodes WITHOUT sourcing it.
+
+    cron gives a reflex an environment with nothing in it — no BASH_ENV, no login shell — and it
+    never sources ~/.mesh/nodes. So a knob read from `os.environ` alone carries its DEFAULT on
+    every scheduled run while a mind's pane shows the operator's value: a config edit that reads
+    as applied and is not. Measured on mesh-job-apply (04f98795), not read off the source — with
+    MESH_JOB_DAILY_CAP=20 in the file, `env -i HOME PATH SHELL` still printed "Бюджет 5 из 5".
+    Process env still wins, so a caller can override for one run."""
+    v = os.environ.get(key)
+    if v is not None:
+        return v
+    try:
+        with open(os.path.join(os.path.expanduser("~"), ".mesh", "nodes"),
+                  encoding="utf-8", errors="replace") as fh:
+            txt = fh.read()
+    except Exception:
+        return default
+    hit = None
+    for line in txt.splitlines():
+        m = re.match(r"\s*(?:export\s+)?%s=[\"\']?([^\"\'#\s]*)" % re.escape(key), line)
+        if m:
+            hit = m.group(1)
+    return hit if hit is not None else default
+
+
+# EVERY node-local knob goes through node_env(), never os.environ — see its docstring, which was
+# written for exactly this trap. The constants sit BELOW its definition on purpose: at module
+# scope a name is not bound above its def, and ast.parse calls such a file perfectly good while
+# the tool dies at import on NameError (mesh-job-apply's first edit did exactly that).
+
+JOB = Path(node_env("MESH_JOB_DIR", str(HOME / ".mesh/job")))
+CONFIRMED = Path(node_env("MESH_JOB_FACTS_CONFIRMED", str(JOB / "facts-confirmed.tsv")))
+ACKED = Path(node_env("MESH_JOB_FACTS_ACKED", str(JOB / "facts-acked.tsv")))
+STATE = Path(node_env("MESH_JOB_FACTS_STATE", str(JOB / "facts.state")))
+LOG = Path(node_env("MESH_JOB_FACTS_LOG", str(HOME / ".mesh/job-facts.log")))
+BANK = Path(node_env("MESH_JOB_ANSWERS", str(JOB / "answers.tsv")))
+def resolve_bin(name, extra_dirs=None):
+    """Абсолютный путь к mesh-тулу. В КРОНЕ PATH = /usr/bin:/bin, где никаких mesh-* нет:
+    вызов по голому имени тихо не сработает, и уведомление, которое «отправлено», не уйдёт никуда
+    ([[invoked-by-is-not-ever-runs]]). Поэтому имя резолвится здесь, а не доверяется среде."""
+    if os.path.sep in name:
+        return name
+    hit = shutil.which(name)
+    if hit:
+        return hit
+    for d in (extra_dirs or [HOME / ".local/bin", Path("/usr/local/bin")]):
+        cand = Path(d) / name
+        if os.access(cand, os.X_OK):
+            return str(cand)
+    return name
+
+
+TG = node_env("MESH_TG_BIN", "mesh-tg")
+RENOTIFY_DAYS = float(node_env("MESH_JOB_FACTS_RENOTIFY_DAYS", "3"))
+MAX_SHOW = int(node_env("MESH_JOB_FACTS_MAX_SHOW", "12"))
+
+
+def now():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+# ─────────────────────────────── поля и нормализация ───────────────────────────────
+# Каждое поле: как достать (список regex) и как привести к канону. Нормализация — это ВСЁ:
+# «+7 910 886-57-83» и «+79108865783» должны быть одним значением, иначе гейт кричит на форматирование.
+
+def n_phone(m):
+    d = re.sub(r"\D", "", m)
+    return d[-10:] if len(d) >= 10 else None
+
+
+def n_lower(m):
+    return m.strip().lower().rstrip(".,;")
+
+
+def n_int(m):
+    d = re.sub(r"[^\d]", "", m)
+    return d or None
+
+
+def n_rps(m):
+    s = m.lower().replace(" ", "").replace(" ", "").replace(",", "").replace(".", "")
+    mm = re.match(r"(\d+)k$", s)
+    if mm:
+        return str(int(mm.group(1)) * 1000)
+    return s if s.isdigit() else None
+
+
+def n_years(m):
+    a, b = re.findall(r"(?:19|20)\d{2}", m)[:2]
+    return "%s-%s" % (a, b)
+
+
+# Факультет/специальность нормализуется в ТОКЕН, иначе ru и en строки несравнимы,
+# а именно между ними и разъехалось 2026-08-20.
+EDU_TOKENS = [
+    (r"радиофиз|radiophys|распространени[ея] радиоволн|radio wave propagation", "radiophysics"),
+    (r"\bВМК\b|вычислительн\w+ математик|computational mathematics|cybernetics", "cmc"),
+    (r"электроник\w*\s+и\s+электротехник|electronics\s*(?:&|and)?\s*electrical", "electronics"),
+    (r"информатик|computer science", "computer-science"),
+    (r"физфак|(?<!радио)физическ\w+ факультет|(?<!radio)physics(?!.*radio)", "physics"),
+    (r"машинн\w+ обучени|machine learning", "machine-learning"),
+]
+
+FIELDS = {
+    "phone": dict(
+        single=True,
+        label="телефон",
+        pats=[r"\+7[\s\-\(\)]?\d{3}[\s\-\(\)]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}"],
+        norm=n_phone,
+    ),
+    "email": dict(
+        single=True,
+        label="email",
+        pats=[r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"],
+        norm=n_lower,
+    ),
+    "github": dict(
+        single=True,
+        label="github",
+        pats=[r"github\.com/[A-Za-z0-9._\-]+"],
+        norm=n_lower,
+    ),
+    "edu-token": dict(
+        label="факультет/специальность",
+        tokens=EDU_TOKENS,
+    ),
+    "edu-years": dict(
+        label="годы обучения",
+        # ТОЛЬКО внутри блока образования: без scope сюда падают даты мест работы,
+        # и гейт кричит «2019-2023 не подтверждено» про строку опыта. Нет блока — нет значения.
+        scope=r"(?:Образовани\w*|Education)\b",
+        scope_chars=420,
+        pats=[r"(?:19|20)\d{2}\s*[–—\-]\s*(?:19|20)\d{2}"],
+        norm=n_years,
+    ),
+    "rps": dict(
+        single=True,
+        label="RPS в проде",
+        pats=[
+            r"(\d[\d\s,\.]{2,}|\d+\s*k)(?=\s*(?:HTTP\s*)?(?:requests?/s|req/s|rps\b))",
+            r"(\d[\d\s,\.]{2,}|\d+\s*k)(?=\s*(?:HTTP-?)?запрос\w*\s*/?\s*(?:с|сек))",
+        ],
+        norm=n_rps,
+    ),
+    "experience-years": dict(
+        single=True,
+        label="лет опыта",
+        pats=[
+            r"(\d{1,2})\+?(?=\s*(?:лет|года?)\s*(?:в разработке|высоконагруж|опыта|бэкенд))",
+            r"(\d{1,2})\+?(?=\s*years?\s*(?:of\s*)?(?:high-?load|backend|experience|in ))",
+        ],
+        norm=n_int,
+    ),
+}
+
+# Наружу уходят эти поля — для них отсутствие подтверждения само по себе находка.
+OUTWARD = ("phone", "email", "github", "edu-token", "edu-years")
+
+
+# ─────────────────────────────── источники ───────────────────────────────
+# Классы: live = то, что ещё можно починить; shipped = уже ушло к работодателю.
+
+def html_text(s):
+    s = re.sub(r"(?is)<(script|style).*?</\1>", " ", s)
+    s = re.sub(r"(?s)<[^>]+>", " ", s)
+    return (s.replace("&amp;", "&").replace("&nbsp;", " ")
+             .replace("&mdash;", "—").replace("&#39;", "'").replace("&quot;", '"'))
+
+
+def pdf_text(p):
+    if not shutil.which("pdftotext"):
+        return None  # честное «не смог», не пустая строка: пустая читалась бы как согласие
+    try:
+        r = subprocess.run(["pdftotext", str(p), "-"], capture_output=True, timeout=60)
+        return r.stdout.decode("utf-8", "replace") if r.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def read_text(p):
+    try:
+        if p.suffix.lower() == ".pdf":
+            return pdf_text(p)
+        s = p.read_text(encoding="utf-8", errors="replace")
+        return html_text(s) if p.suffix.lower() in (".html", ".htm") else s
+    except Exception:
+        return None
+
+
+# Не отклик и не резюме: юридическая переписка несёт ЧУЖИЕ контакты, и без этого фильтра
+# info@foxible.ru читается как ЕГО email. Исключения считаются вслух в --sources.
+NON_APPLICATION = re.compile(r"pretenz|pretenс|otvet-na-|dispute", re.I)
+EXCLUDED = []
+
+
+def sources():
+    """-> [(name, path, cls)] ; cls: live | shipped."""
+    out = []
+    EXCLUDED.clear()
+    for pat, cls in (("cv-ru.md", "live"), ("cv-en.md", "live"),
+                     ("*CV*.html", "live"), ("*CV*.pdf", "live")):
+        for p in sorted(JOB.glob(pat)):
+            if p.name.startswith(".bak-") or "SUPERSEDED" in p.name:
+                continue
+            out.append((p.name, p, cls))
+    for sub in ("letters", "sent"):
+        d = JOB / sub
+        if d.is_dir():
+            for p in sorted(d.iterdir()):
+                if p.suffix.lower() not in (".md", ".txt", ".pdf"):
+                    continue
+                if NON_APPLICATION.search(p.name):
+                    EXCLUDED.append("%s/%s" % (sub, p.name))
+                    continue
+                out.append(("%s/%s" % (sub, p.name), p, "shipped"))
+    return out
+
+
+def extract(text, scoped=True):
+    """-> {key: set(values)}. Пустой dict у непустого текста = ридер слеп, и это видно снаружи."""
+    found = {}
+    if not text:
+        return found
+    for key, spec in FIELDS.items():
+        vals = set()
+        area = text
+        if scoped and spec.get("scope"):
+            m = re.search(spec["scope"], text, re.I)
+            if not m:
+                continue  # нет блока — нет значения; выдумывать из всего документа нельзя
+            area = text[m.start():m.start() + spec.get("scope_chars", 400)]
+        for tok_re, tok in spec.get("tokens", []):
+            if re.search(tok_re, area, re.I):
+                vals.add(tok)
+        for pat in spec.get("pats", []):
+            for m in re.finditer(pat, area, re.I):
+                raw = m.group(1) if m.groups() else m.group(0)
+                try:
+                    v = spec["norm"](raw)
+                except Exception:
+                    v = None
+                if v:
+                    vals.add(v)
+        if vals:
+            found[key] = vals
+    return found
+
+
+# ─────────────────────────────── подтверждённое ───────────────────────────────
+
+# Строка банка — это УЖЕ ответ на конкретный вопрос, поэтому scope-окно к ней не применяется
+# (в ответе про вуз нет заголовка «Образование»), но взять из неё разрешено только те поля,
+# про которые её и спрашивали: иначе год из ответа про зарплату станет годом обучения.
+BANK_KEY_FIELDS = {
+    "university": ("edu-token", "edu-years"),
+    "phone": ("phone",),
+    "email": ("email",),
+    "public-work-link": ("github",),
+}
+
+
+def bank_confirmed():
+    """Строки банка ответов, сказанные ИМ (source operator-*), — это подтверждение."""
+    out = {}
+    if not BANK.exists():
+        return out
+    for line in BANK.read_text(encoding="utf-8", errors="replace").splitlines():
+        if line.startswith("#") or not line.strip():
+            continue
+        f = line.split("\t")
+        if len(f) < 4 or not f[2].strip() or not f[3].startswith("operator-"):
+            continue
+        allow = BANK_KEY_FIELDS.get(f[0])
+        for key, vals in extract(f[2], scoped=allow is None).items():
+            if allow is not None and key not in allow:
+                continue
+            out.setdefault(key, set()).update(vals)
+    return out
+
+
+def ledger_confirmed():
+    out = {}
+    if not CONFIRMED.exists():
+        return out
+    for line in CONFIRMED.read_text(encoding="utf-8", errors="replace").splitlines():
+        if line.startswith("#") or not line.strip():
+            continue
+        f = line.split("\t")
+        if len(f) >= 2 and f[1].strip():
+            out.setdefault(f[0], set()).update(v for v in f[1].split("|") if v)
+    return out
+
+
+def confirmed_all():
+    out = bank_confirmed()
+    for k, v in ledger_confirmed().items():
+        out.setdefault(k, set()).update(v)
+    return out
+
+
+def confirm(key, value, source):
+    if key not in FIELDS:
+        print("неизвестное поле %r; известные: %s" % (key, " ".join(FIELDS)), file=sys.stderr)
+        return 1
+    vals = extract(value).get(key) or set()
+    if not vals:  # значение, которое наш же экстрактор не видит, — бесполезное подтверждение
+        print("не смог нормализовать %r как %s — подтверждение не записано" % (value, key),
+              file=sys.stderr)
+        return 1
+    rows = []
+    if CONFIRMED.exists():
+        rows = [l for l in CONFIRMED.read_text(encoding="utf-8").splitlines()
+                if l.strip() and not l.startswith("#") and l.split("\t")[0] != key]
+    rows.append("\t".join([key, "|".join(sorted(vals)), source, now(), value.replace("\t", " ")]))
+    CONFIRMED.parent.mkdir(parents=True, exist_ok=True)
+    CONFIRMED.write_text("# key\tvalues\tsource\tts\traw\n" + "\n".join(sorted(rows)) + "\n",
+                         encoding="utf-8")
+    print("%s <- %s" % (key, "|".join(sorted(vals))))
+    return 0
+
+
+# ─────────────────────────────── сам скан ───────────────────────────────
+
+def scan():
+    conf = confirmed_all()
+    per_src, blind = {}, []
+    for name, path, cls in sources():
+        text = read_text(path)
+        if text is None:
+            blind.append((name, "ридер не смог прочитать (нет pdftotext / битый файл)"))
+            continue
+        got = extract(text)
+        if not got and text.strip() and cls == "live":
+            blind.append((name, "резюме прочитано (%d симв.), но НИ ОДНОГО факта не извлечено"
+                          % len(text)))
+        per_src[name] = (got, cls)
+
+    findings = []
+    for key, spec in FIELDS.items():
+        live, shipped = {}, {}   # значение -> [источники]
+        sets_live = {}           # источник -> множество значений (для сравнения ЦЕЛИКОМ)
+        for name, (got, cls) in per_src.items():
+            vals = got.get(key)
+            if not vals:
+                continue
+            bucket = shipped if cls == "shipped" else live
+            for v in vals:
+                bucket.setdefault(v, []).append(name)
+            if cls != "shipped":
+                sets_live[name] = frozenset(vals)
+            # MIXED: два разных значения ОДНОзначного поля внутри одного документа — само по себе
+            # расхождение, даже если оба «встречаются где-то ещё» (случай письма с двумя телефонами).
+            if spec.get("single") and len(vals) > 1:
+                findings.append(dict(cls="SHIPPED" if cls == "shipped" else "MIXED", key=key,
+                                     label=spec["label"], value=" и ".join(sorted(vals)),
+                                     where=[name], expect=[]))
+        ok = conf.get(key)
+        # WRONG / SHIPPED: артефакт против ПОДТВЕРЖДЁННОГО
+        if ok:
+            for v, names in sorted(live.items()):
+                if v not in ok:
+                    findings.append(dict(cls="WRONG", key=key, label=spec["label"], value=v,
+                                         where=names, expect=sorted(ok)))
+            for v, names in sorted(shipped.items()):
+                if v not in ok:
+                    findings.append(dict(cls="SHIPPED", key=key, label=spec["label"], value=v,
+                                         where=names, expect=sorted(ok)))
+        # DIVERGE: сравниваются МНОЖЕСТВА по источникам, а не отдельные значения — у образования
+        # два диплома законно дают две пары годов, и повалить на этом гейт значит его выключить.
+        # Расходятся именно НАБОРЫ: один и тот же документ-класс говорит про человека разное.
+        elif len(set(sets_live.values())) > 1:
+            groups = {}
+            for name, fs in sets_live.items():
+                groups.setdefault(fs, []).append(name)
+            findings.append(dict(
+                cls="DIVERGE", key=key, label=spec["label"],
+                value=" ≠ ".join("{%s}" % ", ".join(sorted(fs)) for fs in sorted(groups, key=sorted)),
+                where=[n for g in sorted(groups, key=sorted) for n in sorted(groups[g])], expect=[]))
+        # UNCONFIRMED: уходит наружу, а подтверждения не было ни разу
+        if key in OUTWARD and not ok and live:
+            findings.append(dict(cls="UNCONFIRMED", key=key, label=spec["label"],
+                                 value=", ".join(sorted(live)),
+                                 where=sorted({n for ns in live.values() for n in ns})[:4],
+                                 expect=[]))
+    for name, why in blind:
+        findings.append(dict(cls="BLIND", key="-", label="ридер", value=why, where=[name], expect=[]))
+
+    order = {"WRONG": 0, "MIXED": 1, "SHIPPED": 2, "DIVERGE": 3, "BLIND": 4, "UNCONFIRMED": 5}
+    findings.sort(key=lambda f: (order[f["cls"]], f["key"], f["value"]))
+    return findings, per_src, conf
+
+
+def live_findings(findings):
+    """Без снятых. Снятые не исчезают из мира — они лежат в facts-acked.tsv и видны в --check --all."""
+    acks = acked_ids()
+    return [f for f in findings if fid(f) not in acks]
+
+
+def fid(f):
+    """Стабильный id находки — по нему её можно снять, не привязываясь к номеру в списке."""
+    raw = "|".join([f["cls"], f["key"], f["value"], ",".join(sorted(f["where"]))])
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:8]
+
+
+def acked_ids():
+    out = {}
+    if ACKED.exists():
+        for line in ACKED.read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.startswith("#") or not line.strip():
+                continue
+            f = line.split("\t")
+            out[f[0]] = f[-1] if len(f) > 1 else ""
+    return out
+
+
+def ack(fid_, why):
+    """Снять находку НАВСЕГДА. Нужно потому, что уже ОТПРАВЛЕННОЕ починить нельзя: без этого
+    вечная неснимаемая находка каждые RENOTIFY_DAYS превращает гейт в шум, который перестают читать."""
+    findings, _, _ = scan()
+    match = [f for f in findings if fid(f) == fid_]
+    if not match:
+        print("нет такой находки: %s (mesh-job-facts --check покажет id)" % fid_, file=sys.stderr)
+        return 1
+    f = match[0]
+    ACKED.parent.mkdir(parents=True, exist_ok=True)
+    head = "" if ACKED.exists() else "# id\tts\tcls\tkey\tvalue\twhy\n"
+    with ACKED.open("a", encoding="utf-8") as fh:
+        fh.write(head + "\t".join([fid_, now(), f["cls"], f["key"],
+                                   f["value"].replace("\t", " "), why.replace("\t", " ")]) + "\n")
+    print("снято: %s [%s] %s: %s" % (fid_, f["cls"], f["label"], f["value"]))
+    return 0
+
+
+def render(findings):
+    lines = []
+    for i, f in enumerate(findings[:MAX_SHOW], 1):
+        head = "%d. [%s] %s: %s  (id %s)" % (i, f["cls"], f["label"], f["value"], fid(f))
+        if f["expect"]:
+            head += "  ← подтверждено: %s" % ", ".join(f["expect"])
+        lines.append(head)
+        lines.append("   где: %s" % ", ".join(f["where"][:4]) +
+                     (" и ещё %d" % (len(f["where"]) - 4) if len(f["where"]) > 4 else ""))
+    if len(findings) > MAX_SHOW:
+        lines.append("… и ещё %d находок — mesh-job-facts --check" % (len(findings) - MAX_SHOW))
+    return "\n".join(lines)
+
+
+def notify(findings, dry=False):
+    """-> True если отправили. Молчит, когда набор находок не менялся и ещё не прошло RENOTIFY_DAYS."""
+    h = hashlib.sha1(json.dumps([[f["cls"], f["key"], f["value"]] for f in findings],
+                                ensure_ascii=False).encode()).hexdigest()[:12]
+    st = {}
+    if STATE.exists():
+        try:
+            st = json.loads(STATE.read_text())
+        except Exception:
+            st = {}
+    age_days = (time.time() - float(st.get("last_notify", 0))) / 86400.0
+    if st.get("hash") == h and age_days < RENOTIFY_DAYS:
+        return False
+    body = ("Проверка фактов о вас в job-ленте — %d %s. Ничего не заблокировано и не исправлено, "
+            "это только сигнал.\n\n%s\n\n"
+            "Что не так — скажите значение, я запишу как подтверждённое и починю артефакты."
+            % (len(findings), "расхождение" if len(findings) == 1 else "расхождений", render(findings)))
+    if dry:
+        print(body)
+        return True
+    subprocess.run([resolve_bin(TG), body], check=False)
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    STATE.write_text(json.dumps({"hash": h, "last_notify": time.time(), "n": len(findings)}))
+    with LOG.open("a", encoding="utf-8") as fh:
+        fh.write("%s\tnotify\tn=%d\thash=%s\n" % (now(), len(findings), h))
+    return True
+
+
+def touch_state():
+    """Ран-лайв ≠ значение-изменилось: mtime трогаем всегда, содержимое — только при отправке."""
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    if not STATE.exists():
+        STATE.write_text(json.dumps({"hash": "", "last_notify": 0, "n": 0}))
+    subprocess.run([resolve_bin("mesh-state-touch"), str(STATE)], check=False,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+# ─────────────────────────────── тест ───────────────────────────────
+
+def _fixture(root, phone_pdf_variant=False, edu_wrong=False, blind=False,
+             no_bank=False, mixed=False):
+    (root / "letters").mkdir(parents=True, exist_ok=True)
+    good_phone = "+7 910 886-57-83"
+    # Строка ОПЫТА с годами стоит здесь нарочно: без scope-окна её 2019–2023 попадёт
+    # в «годы обучения» и гейт начнёт кричать на верное резюме.
+    work = "Опыт: SoundCloud — бэкенд высоконагруженного ad delivery · 2019–2023\n"
+    (root / "cv-ru.md").write_text(
+        "Илья Мозеров · %s · imozerov@yandex.ru · github.com/genaforvena\n" % good_phone
+        + work +
+        "Образование\n"
+        "Специалитет, радиофизический факультет, распространение радиоволн — ННГУ · 2008–2013\n"
+        "Магистратура, ВМК, машинное обучение — ННГУ · 2014–2016\n", encoding="utf-8")
+    edu_en = ("Engineer's degree, Electronics & Electrical Engineering, 2008–2013"
+              if edu_wrong else
+              "Specialist degree, Radiophysics (radio wave propagation), 2008–2013")
+    (root / "cv-en.md").write_text(
+        "Ilya Mozerov · %s · imozerov@yandex.ru · github.com/genaforvena\n"
+        % ("+7 930 802 31 12" if phone_pdf_variant else good_phone)
+        + "Experience: SoundCloud — high-load ad delivery backend, 2019–2023\n"
+        + "Education\n%s\n" % edu_en +
+        "M.Sc., Computational Mathematics & Cybernetics (machine learning), 2014–2016\n",
+        encoding="utf-8")
+    (root / "letters" / "2026-01-01-x.txt").write_text(
+        "" if blind else
+        ("Ilya · %s · +7 930 802 31 12 · imozerov@yandex.ru\n" % good_phone if mixed else
+         "Ilya · imozerov@yandex.ru · github.com/genaforvena\n"), encoding="utf-8")
+    if no_bank:   # ничего не подтверждено — проверяем ЧИСТОЕ сравнение артефактов между собой
+        (root / "answers.tsv").write_text("# key\tpattern\tanswer\tsource\tts\tquestion\n",
+                                          encoding="utf-8")
+        return
+    (root / "answers.tsv").write_text(
+        "# key\tpattern\tanswer\tsource\tts\tquestion\n"
+        "phone\tp\t%s\toperator-tg-2026-08-16\tts\t\n"
+        "university\tp\tННГУ: специалитет радиофизический факультет (распространение радиоволн) "
+        "2008–2013, магистратура ВМК машинное обучение 2014–2016\toperator-tg-2026-08-20\tts\t\n"
+        "email\tp\timozerov@yandex.ru\toperator-tg-2026-08-16\tts\t\n"
+        "github\tp\tgithub.com/genaforvena\toperator-tg-2026-08-16\tts\t\n" % good_phone,
+        encoding="utf-8")
+
+
+def run_test():
+    global JOB, BANK, CONFIRMED, STATE, LOG, TG
+    ok, fail = [], []
+
+    def chk(name, cond, detail=""):
+        (ok if cond else fail).append(name + ((" — " + detail) if detail and not cond else ""))
+
+    # EVERY node knob must survive a CRON environment, not just the ones a pane exercises. cron
+    # never sources ~/.mesh/nodes, so a knob read from os.environ carries its DEFAULT on every
+    # scheduled run while the pane shows the operator's value — a config edit that reads as
+    # applied and is not (measured on mesh-job-apply, 04f98795: cap 20 in the file, "5 из 5" on
+    # the run). Driven END TO END, as a subprocess under a fabricated HOME with `env -i`, because
+    # the binding happens at IMPORT: an in-process check cannot see a constant that was already
+    # bound wrong. Two arms with DIFFERENT values, so a tool that ignores the file entirely fails
+    # one of them whatever its own default is. (Mutant seen red: node_env -> os.environ.get.)
+    import tempfile as _tf
+    import shutil as _sh_arm
+    _KEY, _ARMS = "MESH_JOB_FACTS_MAX_SHOW", ("7", "19")
+    _seen = []
+    for _want in _ARMS:
+        _h = _tf.mkdtemp(prefix="node-env-arm-")
+        try:
+            os.makedirs(os.path.join(_h, ".mesh", "job"), exist_ok=True)
+            with open(os.path.join(_h, ".mesh", "nodes"), "w") as _f:
+                _f.write("export %s=%s\n" % (_KEY, _want))
+            _p = subprocess.run(["/usr/bin/env", "-i", "HOME=" + _h, "PATH=/usr/bin:/bin",
+                                 "SHELL=/bin/sh", sys.executable, os.path.abspath(__file__),
+                                 "--print-knobs"], capture_output=True, text=True, timeout=60)
+            _seen.append(("%s=%s" % (_KEY, _want)) in _p.stdout)
+        finally:
+            _sh_arm.rmtree(_h, ignore_errors=True)
+    chk("%s is read from ~/.mesh/nodes under a CRON environment (arm 1: %s)" % (_KEY, _ARMS[0]),
+          _seen[0])
+    chk("...and tracks the file, not a constant (arm 2: %s)" % _ARMS[1], _seen[1])
+
+    tmp = Path(tempfile.mkdtemp(prefix="job-facts-test-"))
+    # Ядовитый TG: если тест хоть раз пошлёт настоящее сообщение — он упадёт, а не пройдёт тихо.
+    poison = tmp / "poison-tg"
+    poison.write_text("#!/bin/sh\necho 'TEST CALLED REAL TG' >&2\nexit 3\n")
+    poison.chmod(0o755)
+    real_log, real_state = LOG, STATE
+    TG = str(poison)
+
+    def use(root):
+        global JOB, BANK, CONFIRMED, STATE, LOG
+        JOB = root
+        BANK = root / "answers.tsv"
+        CONFIRMED = root / "facts-confirmed.tsv"
+        STATE = root / "facts.state"
+        LOG = root / "job-facts.log"
+
+    try:
+        # 1. КОНТРОЛЬ: всё сходится → детектор молчит. Без этого «всегда красный» прошёл бы как гейт.
+        c = tmp / "control"
+        _fixture(c)
+        use(c)
+        f_ctl, per_src, conf = scan()
+        chk("контроль: согласованное дерево не даёт находок", not f_ctl,
+            "; ".join("%s:%s" % (x["cls"], x["value"]) for x in f_ctl))
+        chk("контроль: подтверждённое вычитано из банка (phone/edu/email/github)",
+            all(k in conf for k in ("phone", "edu-token", "email", "github")), str(sorted(conf)))
+        chk("контроль: прочитаны все 3 источника", len(per_src) == 3, str(sorted(per_src)))
+
+        # 2. Телефон в одном артефакте другой — ровно провал 2026-08-15.
+        p = tmp / "phone"
+        _fixture(p, phone_pdf_variant=True)
+        use(p)
+        f_ph, _, _ = scan()
+        chk("телефон: расхождение с подтверждённым поймано",
+            any(x["cls"] == "WRONG" and x["key"] == "phone" and x["value"] == "9308023112"
+                for x in f_ph), str(f_ph))
+
+        # 3. Образование в en-версии из черновика — провал 2026-08-20.
+        e = tmp / "edu"
+        _fixture(e, edu_wrong=True)
+        use(e)
+        f_ed, _, _ = scan()
+        chk("образование: 'electronics' против подтверждённого radiophysics поймано",
+            any(x["cls"] == "WRONG" and x["key"] == "edu-token" and x["value"] == "electronics"
+                for x in f_ed), str([x for x in f_ed if x["key"] == "edu-token"]))
+
+        # 4. Слепой ридер на РЕЗЮМЕ — обязан быть находкой, а не тишиной: сломанный экстрактор
+        #    иначе читается как «всё сходится». А короткая реплика в чате без фактов — норма.
+        b = tmp / "blind"
+        _fixture(b, blind=True)
+        use(b)
+        (b / "cv-en.md").write_text("Резюме без единого факта: ни телефона, ни вуза.\n",
+                                    encoding="utf-8")
+        (b / "letters" / "2026-01-02-y.txt").write_text("Спасибо, жду ответа.\n", encoding="utf-8")
+        f_bl, _, _ = scan()
+        chk("слепое РЕЗЮМЕ отчитывается как BLIND, а не как согласие",
+            any(x["cls"] == "BLIND" and "cv-en.md" in x["where"] for x in f_bl), str(f_bl))
+        chk("короткая отправленная реплика без фактов НЕ считается слепотой",
+            not any(x["cls"] == "BLIND" and any("letters/" in w for w in x["where"]) for x in f_bl),
+            str([x for x in f_bl if x["cls"] == "BLIND"]))
+
+        # 4b. scope: годы МЕСТА РАБОТЫ не должны попадать в «годы обучения».
+        use(c)
+        _, per_c, _ = scan()
+        yrs = per_c["cv-ru.md"][0].get("edu-years", set())
+        chk("годы работы (2019-2023) не считаются годами обучения",
+            yrs == {"2008-2013", "2014-2016"}, str(sorted(yrs)))
+
+        # 4c. Расхождение БЕЗ подтверждения: два резюме говорят про человека разное.
+        #     Ровно 2026-08-20, но поймать это можно было и не спрашивая его.
+        d = tmp / "diverge"
+        _fixture(d, edu_wrong=True, no_bank=True)
+        use(d)
+        f_dv, _, _ = scan()
+        chk("расхождение НАБОРОВ между cv-ru и cv-en ловится без всякого подтверждения",
+            any(x["cls"] == "DIVERGE" and x["key"] == "edu-token" for x in f_dv),
+            str([x["cls"] + ":" + x["key"] for x in f_dv]))
+        chk("два законных диплома (две пары годов) НЕ считаются расхождением",
+            not any(x["cls"] == "DIVERGE" and x["key"] == "edu-years" for x in f_dv),
+            str([x for x in f_dv if x["key"] == "edu-years"]))
+
+        # 4d. Два телефона в ОДНОМ отправленном письме — расхождение внутри документа.
+        mx = tmp / "mixed"
+        _fixture(mx, mixed=True)
+        use(mx)
+        f_mx, _, _ = scan()
+        chk("два телефона в одном документе пойманы",
+            any(x["key"] == "phone" and " и " in x["value"] for x in f_mx),
+            str([x for x in f_mx if x["key"] == "phone"]))
+
+        # 4e. Кроновый PATH: голое имя mesh-тула из крона не находится — резолвер обязан найти сам.
+        saved_path = os.environ.get("PATH", "")
+        try:
+            os.environ["PATH"] = "/usr/bin:/bin"
+            got = resolve_bin("poison-tg", extra_dirs=[tmp])
+            chk("резолвер находит тул при кроновом PATH", got == str(poison), got)
+            chk("резолвер не выдумывает путь для несуществующего", 
+                resolve_bin("mesh-nope-xyz", extra_dirs=[tmp]) == "mesh-nope-xyz")
+        finally:
+            os.environ["PATH"] = saved_path
+
+        # 5. Подтверждение: --confirm пишет леджер и снимает находку.
+        use(p)
+        confirm("phone", "+7 930 802 31 12", "test")
+        f_after, _, _ = scan()
+        chk("--confirm добавляет значение, и WRONG по нему снимается",
+            not any(x["cls"] == "WRONG" and x["key"] == "phone" for x in f_after), str(f_after))
+        chk("--confirm отказывается писать ненормализуемое значение",
+            confirm("phone", "не телефон вовсе", "test") == 1)
+
+        # 6. Гейт «уведомляет, не блокирует»: у скана нет ни одного пути записи в артефакт.
+        use(c)
+        before = {q.name: q.read_bytes() for q in c.iterdir() if q.is_file()}
+        scan()
+        chk("скан не изменил ни одного файла в job-дереве",
+            all(q.read_bytes() == before[q.name] for q in c.iterdir()
+                if q.is_file() and q.name in before))
+
+        # 7. Дребезг: тот же набор находок не шлётся второй раз.
+        use(p)
+        n1 = notify(scan()[0], dry=True)
+        STATE.write_text(json.dumps({"hash": hashlib.sha1(json.dumps(
+            [[x["cls"], x["key"], x["value"]] for x in scan()[0]],
+            ensure_ascii=False).encode()).hexdigest()[:12], "last_notify": time.time(), "n": 1}))
+        n2 = notify(scan()[0], dry=True)
+        chk("уведомление не повторяется на неизменном наборе", n1 and not n2)
+
+        # 8. Тест не пишет в ДУРАБЛЬНЫЙ лог/state, по которому смотрят живость (mesh-test-forgery).
+        chk("тест не тронул настоящий job-facts.log", LOG != real_log and not (tmp / "REAL").exists())
+        chk("тест не тронул настоящий facts.state", STATE != real_state)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    for name in ok:
+        print("  ok   %s" % name)
+    for name in fail:
+        print("  FAIL %s" % name)
+    print("mesh-job-facts --test: %d ok, %d fail" % (len(ok), len(fail)))
+    return 1 if fail else 0
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("--check", action="store_true", help="только stdout, ничего не слать")
+    ap.add_argument("--confirm", nargs=2, metavar=("KEY", "VALUE"))
+    ap.add_argument("--source", default="operator-tg")
+    ap.add_argument("--confirmed", action="store_true")
+    ap.add_argument("--ack", metavar="ID")
+    ap.add_argument("--why", default="")
+    ap.add_argument("--all", action="store_true", help="--check: показать и снятые находки")
+    ap.add_argument("--sources", action="store_true")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--test", action="store_true")
+    ap.add_argument("--print-knobs", action="store_true", help=argparse.SUPPRESS)
+    a = ap.parse_args()
+    # Internal leg of --test: prints the node knobs AS BOUND AT IMPORT. Binding happens at import,
+    # so only a real subprocess under `env -i` can show which value a cron environment actually got.
+    if a.print_knobs:
+        print("MESH_JOB_DIR=%s" % (JOB,))
+        print("MESH_JOB_FACTS_MAX_SHOW=%s" % (MAX_SHOW,))
+        print("MESH_JOB_FACTS_RENOTIFY_DAYS=%s" % (RENOTIFY_DAYS,))
+        print("MESH_TG_BIN=%s" % (TG,))
+        return 0
+
+    if a.test:
+        return run_test()
+    if a.confirm:
+        return confirm(a.confirm[0], a.confirm[1], a.source)
+    if a.ack:
+        return ack(a.ack, a.why)
+    if not JOB.is_dir():
+        print("job-дерева нет (%s) — органа нет, не находка" % JOB, file=sys.stderr)
+        return 2  # честный n/a: mesh-land/autowire читают 2 как «не применимо здесь»
+
+    if a.confirmed:
+        for k, v in sorted(confirmed_all().items()):
+            print("%-18s %s" % (k, ", ".join(sorted(v))))
+        return 0
+    if a.sources:
+        _, per_src, _ = scan()
+        for name, (got, cls) in sorted(per_src.items()):
+            print("%-34s %-8s %s" % (name, cls,
+                                     ", ".join("%s=%s" % (k, "/".join(sorted(v)))
+                                               for k, v in sorted(got.items())) or "— НИЧЕГО —"))
+        return 0
+
+    findings, _, _ = scan()
+    n_all = len(findings)
+    if not a.all:
+        findings = live_findings(findings)
+    touch_state()
+    if a.check or a.dry_run:
+        print(render(findings) if findings else "расхождений нет")
+        if n_all != len(findings) and not a.all:
+            print("(снято ранее: %d — mesh-job-facts --check --all)" % (n_all - len(findings)))
+        if a.dry_run and findings:
+            notify(findings, dry=True)
+        return 0
+    if findings:
+        notify(findings)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
