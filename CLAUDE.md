@@ -262,6 +262,13 @@ the case is the evidence, and mixing them is what made this section a wall nobod
   DISPATCH**: two correct files prove nothing about whether the scheduler ran either, so read the
   actuator's own tape, ship its capability + control arms, and clamp the silence to UPTIME.
   [[a-table-checker-with-no-dispatch-axis-answers-a-question-nobody-asked]]
+- **A discharge matcher correct for one family is a BLINDNESS in its sibling — price it against the
+  live corpus before porting.** A claim is a debt to REPORT (any report discharges it); a hold is a
+  LOCK (a report is not a yield), and the naive port would have released 35 live holds on heartbeats
+  and progress notes matching the poster's own window name; where the port over-fires, make the
+  subject DECLARE (name the marker it withdraws) and keep bystander safety in the CANDIDATE SET, so
+  an unrecognised withdrawal fails toward the ALARM.
+  [[a-matcher-correct-for-one-family-is-a-blindness-in-its-sibling]]
 - **A liveness measurement layered over a clock must be able to VETO it, not only to ADD to it** — a
   one-way arm HOLDS the evidence the owner is working and then discards it, and the two outcomes need
   two WORDS with opposite remedies (EXPIRED = poke the owner to renew · ABANDONED = take the work);
