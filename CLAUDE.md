@@ -647,7 +647,13 @@ dead-on-arrival orphan stays visible.
   `mesh-gpu-accounting.service` (GPU node only — root oneshot re-asserting per-process accounting mode at
   boot; the durable source for `mesh-gpu-ledger`'s charged local-inference lane)
 - **Node-bound senses/reflexes (run only on the node whose organ they read — unwired elsewhere by design):**
-  `mesh-phone-beacon2` · `mesh-sms-monitor` · `mesh-sms-rx` (phone BODY / Termux) · `mesh-tg-watchdog`
+  `mesh-phone-beacon2` (the ONLY true phone-BODY tool here — Termux shebang, deployed ON the phone,
+  zero ssh) · `mesh-sms-monitor` · `mesh-sms-rx` (**NOT phone-body — they run FROM a mesh node and
+  `ssh -p 8022 u0_a380@<phone>` INTO it, exactly like the cron-wired `mesh-phone-ap`/`-prox`/`-audio`;
+  they self-wire via their own `# reflex-cadence:` and autowire's `--test` gate, which exits 2 → SKIP
+  on a node with no ssh path to the phone. They wore beacon2's parenthetical by ADJACENCY until
+  2026-08-29, and it made the operator's inbound SMS floor invisible on the one node that has the
+  path) · `mesh-tg-watchdog`
   (default-string's TG organ) · `mesh-tv-watch` (the TV-reachable node) · `mesh-wan-traffic` (GL-MT3000 router) ·
   `mesh-ss-altport` (phaedra SS admin, operator-driven) · `mesh-fail2ban-watch` (the WAN-jail intrusion
   sense — reads fail2ban's sshd jail; self-wires via `# reflex-cadence:` ONLY where `fail2ban-client`
