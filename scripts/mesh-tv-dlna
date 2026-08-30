@@ -8,6 +8,22 @@ import sys, socket, time, re, subprocess, urllib.request, urllib.parse, xml.etre
 
 def log(*a): print("[mesh-tv-dlna]", *a, flush=True)
 
+# Every HTTP request this tool makes is to the TV on the LOCAL LAN — dmr.xml, the AVTransport SOAP
+# control point, the Bravia IRCC endpoint. urllib honours http_proxy/https_proxy from the environment,
+# and on a node whose shells are universally proxied (mesh-home, 2026-08-28: three export sites plus
+# the tmux global env plus environment.d, so even long-lived units carry it) every one of those LAN
+# requests was handed to privoxy → an ssh tunnel → phaedra, which has never heard of 192.168.8.0/24.
+# Measured 2026-08-30 the moment SSDP discovery started working again: renderer found at
+# http://192.168.8.130:52323/dmr.xml, then `HTTP Error 503: Forwarding failure`. A proxy env is a
+# REPLACEMENT, not a fallback ([[a-proxy-env-is-a-replacement-not-a-fallback]]), and NO_PROXY cannot
+# be relied on here — the oldest reader on this LAN speaks neither CIDR nor wildcards
+# ([[no-proxy-does-not-speak-cidr-or-wildcards]]). So bypass it in code, for this tool's own opener
+# only: yt-dlp is a separate process and keeps whatever egress the operator configured.
+_DIRECT = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+def http_open(req, timeout):
+    """Open a LAN URL with the ambient proxy explicitly bypassed."""
+    return _DIRECT.open(req, timeout=timeout)
+
 def yt_supports(flag):
     """True iff the installed yt-dlp advertises `flag` in --help. A too-old yt-dlp that
     doesn't know an optional flag we inject dies 'no such option' and downloads nothing —
@@ -20,11 +36,74 @@ def yt_supports(flag):
     except Exception:
         return False
 
+def lan_src():
+    """The address to pin a multicast socket to: the MAIN table's default-route source, never the
+    source `ip route get <group>` reports (that lookup is answered by the exit-node table that is
+    doing the swallowing). Empty string when there is no default route — pin nothing, and let the
+    guard say so rather than inventing an address."""
+    import os as _o
+    if "MESH_TV_LAN_SRC" in _o.environ: return _o.environ["MESH_TV_LAN_SRC"]
+    try:
+        r = subprocess.run(["ip", "route", "show", "default"], capture_output=True, text=True, timeout=5)
+        for ln in (r.stdout or "").splitlines():
+            f = ln.split()
+            if f and f[0] == "default" and "src" in f:
+                return f[f.index("src") + 1]
+    except Exception:
+        pass
+    return ""
+
+def mcast_path():
+    """The multicast-path blindness guard, asked of the ONE tool that owns the predicate.
+
+    Discovery here is an M-SEARCH to 239.255.255.250 — MULTICAST. On a node consuming a tailscale
+    exit node the exit-node table's default swallows 224.0.0.0/4 (its throw set is unicast-only),
+    so the query leaves by the tunnel, nobody answers, and this tool used to blame the TV:
+    "TV off or not on WiFi" / "TV on + on home WiFi?" — a cause never measured, while the Bravia
+    answered 200 on http://192.168.8.130:52323/dmr.xml over unicast in the same minute
+    (discover/health {#39af3e18}, verified live 2026-08-30).
+
+    The predicate is NOT reimplemented here. `mesh-upnp-census --mcast-path` is the single entry
+    point; a second copy drifts the day one of them is widened. Returns the tool's line, or None
+    when the guard itself could not be run — and None must never be reported as "the TV is off":
+    an unavailable guard is an unknown, not an all-clear."""
+    try:
+        r = subprocess.run(["mesh-upnp-census", "--mcast-path"], capture_output=True, text=True, timeout=10)
+        line = (r.stdout or "").strip().splitlines()
+        return line[0] if r.returncode == 0 and line and line[0].startswith("state=") else None
+    except Exception:
+        return None
+
+def no_renderer_reason():
+    """What to SAY when discovery found nothing. Names the swallowed path when that is what the FIB
+    says, an honest unknown when the guard is unavailable, and only in the ok case is 'the TV is off'
+    a reading this tool is entitled to."""
+    mc = mcast_path()
+    if mc is None:
+        return ("no DLNA renderer answered, and the multicast-path guard could not be run "
+                "(mesh-upnp-census --mcast-path) — cause UNKNOWN; not claiming the TV is off")
+    if mc.startswith("state=swallowed"):
+        return ("no DLNA renderer answered, and the SSDP query never reached the LAN: " + mc +
+                " — this is BLINDNESS, not a TV that is off. A unicast GET of the renderer's own "
+                "dmr.xml still works; fix the multicast route, not the TV")
+    if mc.startswith("state=ok"):
+        return "no DLNA renderer answered down a multicast path that DOES reach the LAN (" + mc + ") — TV off/asleep or not on this LAN"
+    return "no DLNA renderer answered, and the multicast path is unattestable: " + mc + " — cause UNKNOWN"
+
 def discover():
     """SSDP → return (location_url) of a MediaRenderer (Bravia/Sony preferred)."""
     msg = b"\r\n".join([b"M-SEARCH * HTTP/1.1", b"HOST:239.255.255.250:1900",
         b'MAN:"ssdp:discover"', b"MX:2", b"ST:urn:schemas-upnp-org:device:MediaRenderer:1", b"", b""])
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.settimeout(4)
+    # PIN the egress interface to the MAIN table's own default-route source. Unpinned, this M-SEARCH
+    # follows the FIB, and under a tailscale exit node the FIB sends 224.0.0.0/4 down the tunnel — so
+    # the query never reaches the LAN and the TV is blamed for the silence ({#39af3e18}). The address
+    # must NOT come from `ip route get 239.255.255.250`: that lookup is answered by the swallowing
+    # table and hands back the tunnel's own source (100.81.222.19 here, vs the LAN's 192.168.8.224).
+    src = lan_src()
+    if src:
+        try: s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(src))
+        except OSError as e: log("warn: could not pin multicast egress to", src, "-", e)
     s.sendto(msg, ("239.255.255.250", 1900)); found = {}
     t = time.time()
     while time.time() - t < 4:
@@ -43,7 +122,7 @@ def discover():
 def control_url(dmr_loc):
     """Fetch dmr.xml, return (absolute AVTransport control URL, serviceType). Regex-based — UPnP device
     descriptions carry prefixed/namespaced tags (dlna:, pnpx:, df:) that trip a strict XML parser."""
-    xml = urllib.request.urlopen(dmr_loc, timeout=6).read().decode("utf-8", "replace")
+    xml = http_open(dmr_loc, 6).read().decode("utf-8", "replace")
     base = "{0.scheme}://{0.netloc}".format(urllib.parse.urlparse(dmr_loc))
     for m in re.finditer(r"<service\b[^>]*>(.*?)</service>", xml, re.S | re.I):
         blk = m.group(1)
@@ -65,7 +144,7 @@ def soap(ctrl, service_type, action, body):
         "Content-Type": 'text/xml; charset="utf-8"',
         "SOAPACTION": f'"{service_type}#{action}"'})
     try:
-        return urllib.request.urlopen(req, timeout=8).read().decode("utf-8", "replace")
+        return http_open(req, 8).read().decode("utf-8", "replace")
     except urllib.error.HTTPError as e:
         fault = e.read().decode("utf-8", "replace")
         em = re.search(r"<errorDescription>([^<]+)", fault) or re.search(r"<errorCode>([^<]+)", fault)
@@ -153,8 +232,16 @@ def serve(directory, port):
     time.sleep(1)
 
 def main():
-    if len(sys.argv) < 2: log("usage: mesh-tv-dlna <video-url> | --test | status | pause | resume | stop"); sys.exit(1)
+    if len(sys.argv) < 2: log("usage: mesh-tv-dlna <video-url> | --test | --mcast-reason | status | pause | resume | stop"); sys.exit(1)
     arg = sys.argv[1]
+
+    # Diagnostic + test seam: print the exact sentence this tool would give for "no renderer found",
+    # WITHOUT a 4s SSDP wait. It runs the production function and the production subprocess call, so
+    # an arm driving it exercises the real PATH lookup and the real wording — the two things that
+    # were wrong. Kept as a verb rather than an env knob: an env-only seam can be green while the
+    # live call site is broken.
+    if arg == "--mcast-reason":
+        print(no_renderer_reason()); return
 
     if arg == "--test":
         # 1. yt-dlp must be installed and respond — the hard runtime dep (never checked otherwise)
@@ -172,16 +259,159 @@ def main():
             print(f"smoke-test: FAIL (yt-dlp={ver} lacks --js-runtimes, which is injected when node is "
                   f"present → YouTube casts die 'no such option'; upgrade yt-dlp)")
             sys.exit(1)
+        # ── MULTICAST-PATH wording arms ({#39af3e18}) ──────────────────────────────────────────
+        # The defect was never the exit code (rc=2 is the honest organ-absent code, measured by
+        # health 2026-08-30 — an earlier rc=0 reading came from a pipe, where rc is the last stage's).
+        # It was the WORDING: "TV off or not on WiFi" named a cause nobody measured. So these arms
+        # assert the SENTENCE, under a stubbed guard, one state at a time.
+        # The stub lives INSIDE a fake HOME's .local/bin AND is first on PATH, and every arm asserts
+        # the stub was REACHED — a fence you cannot see fail is not a fence
+        # ([[path-stub-cannot-shadow-a-mesh-tool]]).
+        import os, tempfile, shutil
+        tmp = tempfile.mkdtemp()
+        try:
+            binn = os.path.join(tmp, ".local", "bin"); os.makedirs(binn)
+            hit = os.path.join(tmp, "hit")
+            def stub(line):
+                pth = os.path.join(binn, "mesh-upnp-census")
+                with open(pth, "w") as fh:
+                    fh.write("#!/bin/sh\necho reached >> %s\n%s\n" % (hit, ("echo '%s'" % line) if line else "exit 1"))
+                os.chmod(pth, 0o755)
+                env = dict(os.environ, HOME=tmp, PATH=binn + os.pathsep + os.environ.get("PATH", ""))
+                r = subprocess.run([sys.executable, os.path.abspath(__file__), "--mcast-reason"],
+                                   capture_output=True, text=True, timeout=30, env=env)
+                return r.stdout.strip()
+            bad = []
+            SW = ("state=swallowed group=239.255.255.250 dev=tun0 lan_dev=lan0 (the group does NOT "
+                  "leave by the LAN device)")
+            out = stub(SW)
+            if not os.path.exists(hit): bad.append("stub was never reached — the guard call does not go through PATH")
+            if "BLINDNESS" not in out or "dev=tun0" not in out:
+                bad.append("swallowed path did not produce a BLINDNESS sentence naming the device: %r" % out)
+            for w in ("TV off", "not on WiFi", "home WiFi"):
+                if w in out: bad.append("swallowed path still blames the TV (%r): %r" % (w, out))
+            out = stub("state=ok group=239.255.255.250 dev=lan0 lan_dev=lan0 (the group leaves by the LAN device)")
+            if "TV off" not in out:
+                bad.append("with a HEALTHY multicast path the tool must be entitled to say the TV is off: %r" % out)
+            if "BLINDNESS" in out:
+                bad.append("healthy path wrongly reported blindness — the arm above proves nothing if both states say the same thing: %r" % out)
+            out = stub("")   # guard itself unrunnable (rc 1)
+            if "UNKNOWN" not in out or "TV off" in out:
+                bad.append("an unavailable guard must render UNKNOWN, never an all-clear about the TV: %r" % out)
+            if bad:
+                for b in bad: print("smoke-test: FAIL (%s)" % b)
+                sys.exit(1)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        # ── PROXY BYPASS for LAN HTTP ({#39af3e18}, second half) ───────────────────────────────
+        # Two REAL servers, so the arm and its control differ by exactly one thing: which opener.
+        #   origin — bound to this node's own LAN address, answering "origin"
+        #   proxy  — a stand-in on 127.0.0.1 answering "PROXIED" to anything
+        # With http_proxy pointed at the stand-in, the DEFAULT opener must come back "PROXIED" and
+        # http_open() must come back "origin". The first draft bound the origin to 127.0.0.1 and the
+        # control arm CAUGHT ITSELF: urllib always bypasses proxies for localhost, so both openers
+        # succeeded and the whole arm was vacuous. A node with no default-route src cannot run this
+        # and says so — it does not quietly pass.
+        import http.server, threading, os as _os
+        lsrc = lan_src()
+        if not lsrc:
+            print("smoke-test: note (LAN HTTP proxy-bypass arm SKIPPED — no default-route src to bind an "
+                  "off-loopback origin to; the bypass is unverified on this node, not verified-ok)")
+        else:
+            def _mk(host, body):
+                class _H(http.server.BaseHTTPRequestHandler):
+                    def do_GET(self):
+                        self.send_response(200); self.send_header("Content-Length", str(len(body)))
+                        self.end_headers(); self.wfile.write(body)
+                    def log_message(self, *a): pass
+                srv = http.server.HTTPServer((host, 0), _H)
+                threading.Thread(target=srv.serve_forever, daemon=True).start()
+                return srv
+            origin = _mk(lsrc, b"origin"); proxy = _mk("127.0.0.1", b"PROXIED")
+            url = "http://%s:%d/dmr.xml" % (lsrc, origin.server_address[1])
+            keys = ("http_proxy", "HTTP_PROXY", "all_proxy", "ALL_PROXY", "no_proxy", "NO_PROXY")
+            saved = {k: _os.environ.get(k) for k in keys}
+            try:
+                for k in keys: _os.environ.pop(k, None)
+                _os.environ["http_proxy"] = "http://127.0.0.1:%d/" % proxy.server_address[1]
+                pbad = []
+                try:
+                    got = http_open(url, 5).read()
+                    if got != b"origin":
+                        pbad.append("http_open did not bypass the proxy (got %r)" % got)
+                except Exception as e:
+                    pbad.append("http_open raised while bypassing: %s" % e)
+                try:
+                    ctl = urllib.request.build_opener().open(url, timeout=5).read()
+                except Exception as e:
+                    ctl = ("<error %s>" % e).encode()
+                if ctl != b"PROXIED":
+                    pbad.append("CONTROL: the default opener did NOT go through the proxy (got %r) — this "
+                                "environment cannot discriminate, so the bypass arm above is vacuous" % ctl)
+                if pbad:
+                    for x in pbad: print("smoke-test: FAIL (%s)" % x)
+                    sys.exit(1)
+            finally:
+                for k, v in saved.items():
+                    if v is None: _os.environ.pop(k, None)
+                    else: _os.environ[k] = v
+                origin.shutdown(); proxy.shutdown()
+        # ── THE PIN'S SOURCE ({#39af3e18}) ─────────────────────────────────────────────────────
+        # lan_src() must be the MAIN table's default-route src. `ip route get 239.255.255.250` is the
+        # obvious-looking source and is answered by the table doing the swallowing — it returns the
+        # TUNNEL's address, so pinning to it pins to the interface being escaped. On a live-swallowed
+        # node the two differ and this arm discriminates; where they agree it says so rather than
+        # counting a pass. (The applied-arm below cannot cover this: it overrides the value.)
+        def _rt(args, key):
+            try:
+                rr = subprocess.run(args, capture_output=True, text=True, timeout=5)
+                for ln in (rr.stdout or "").splitlines():
+                    f = ln.split()
+                    if key in f: return f[f.index(key) + 1]
+            except Exception: pass
+            return ""
+        _dsrc = _rt(["ip", "route", "show", "default"], "src")
+        _gsrc = _rt(["ip", "route", "get", "239.255.255.250"], "src")
+        if _dsrc:
+            if lan_src() != _dsrc:
+                print("smoke-test: FAIL (lan_src is not the main default route's src: %r vs %r)" % (lan_src(), _dsrc)); sys.exit(1)
+            if _gsrc and _gsrc != _dsrc and lan_src() == _gsrc:
+                print("smoke-test: FAIL (lan_src took the swallowing table's own src %r)" % _gsrc); sys.exit(1)
+            if not _gsrc or _gsrc == _dsrc:
+                print("smoke-test: note (default-route src and the group lookup agree here — the "
+                      "discriminating half of the pin-source arm cannot run on this node)")
+        # ── THE PIN IS APPLIED, not merely computed ({#39af3e18}) ──────────────────────────────
+        # A pin that is calculated and never passed to setsockopt leaves discovery following the FIB
+        # — i.e. exactly the pre-fix behaviour — while every other arm stays green. Drive discover()
+        # with an UNASSIGNABLE source and require the failure to be LOUD: if the value never reaches
+        # the socket there is nothing to fail on and the warn never appears. (The narrow arm is the
+        # right one: "found nothing on a swallowed node" cannot be asserted, because a genuinely-off
+        # TV must still be allowed to answer nothing.)
+        import io, contextlib, os as _os2
+        _sv = _os2.environ.get("MESH_TV_LAN_SRC")
+        _os2.environ["MESH_TV_LAN_SRC"] = "203.0.113.9"      # TEST-NET-3, never assignable here
+        _buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(_buf): discover()
+        except Exception:
+            pass
+        finally:
+            if _sv is None: _os2.environ.pop("MESH_TV_LAN_SRC", None)
+            else: _os2.environ["MESH_TV_LAN_SRC"] = _sv
+        if "could not pin multicast egress to 203.0.113.9" not in _buf.getvalue():
+            print("smoke-test: FAIL (the multicast pin never reached the socket — an unassignable "
+                  "source produced no warn, so discovery is still following the FIB: %r)" % _buf.getvalue()[:200])
+            sys.exit(1)
         # 2. SSDP discover — checks LAN reachability to the TV (exit 2 = TV off/not found, not a dep failure)
         loc = discover()
         if not loc:
-            print(f"smoke-test: n/a (yt-dlp={ver} ok; no DLNA renderer on LAN — TV off or not on WiFi)")
+            print(f"smoke-test: n/a (yt-dlp={ver} ok; {no_renderer_reason()})")
             sys.exit(2)
-        print(f"smoke-test: ok (yt-dlp={ver}; renderer={loc})")
+        print(f"smoke-test: ok (yt-dlp={ver}; renderer={loc}; multicast-path wording swallowed/ok/unavailable asserted; LAN HTTP proxy-bypass driven against a live socket with a failing control arm; multicast pin proven APPLIED via an unassignable source and its SOURCE proven to be the main default route)")
         sys.exit(0)
 
     log("discovering DLNA TV..."); loc = discover()
-    if not loc: log("FAIL: no DLNA renderer found (TV on + on home WiFi?)"); sys.exit(2)
+    if not loc: log("FAIL:", no_renderer_reason()); sys.exit(2)
     log("renderer:", loc)
     ctrl, stype = control_url(loc); log("AVTransport control:", ctrl)
     # status — query CurrentTransportState (PLAYING/STOPPED/PAUSED_PLAYBACK/NO_MEDIA_PRESENT)
@@ -215,7 +445,7 @@ def main():
                     "SOAPACTION": '"urn:schemas-sony-com:service:IRCC:1#X_SendIRCC"',
                     "X-Auth-PSK": "0000"})
                 try:
-                    urllib.request.urlopen(ircc_req, timeout=6)
+                    http_open(ircc_req, 6)
                     log("✅ IRCC Pause sent to TV"); return
                 except Exception as ie:
                     log(f"IRCC Pause also failed ({ie}) — use the TV remote or re-send the URL"); sys.exit(4)
