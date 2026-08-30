@@ -643,7 +643,15 @@ load-bearing tools — run `mesh-tools <category>` for the rest and the full con
   cost; an undeclared subject is `na` in its own column with the population as the denominator, NEVER
   folded into clean. Subjects opt in with `# observer-probe:` — an allowlist on purpose, since this
   category holds `mesh-say`/`mesh-act`/`mesh-tg-roz` and a denylist that had merely never heard of an
-  actuator would drive it K+1 times) ·
+  actuator would drive it K+1 times. THREE THINGS ITS OWN FIRST LIVE PASS TAUGHT IT, 2026-08-30:
+  one pair of windows is ONE observation of a noisy difference, so a candidate is re-run on a
+  SECOND independent pair and confirmed by the SIGN it holds, never by clearing a bigger constant —
+  an unreplicated candidate gets its own word `UNCONFIRMED`, folded neither into contaminated nor
+  into clean. Its name arm's control term CANCELLED ALGEBRAICALLY — `(self−solo)−(neutral−solo)` is
+  just `self−neutral`, two consecutive reads — so the neutral condition is now read on BOTH sides of
+  the self read and scored against their midpoint, which cancels a per-read drift exactly. And its
+  EXIT CODE is about the RUN, never the finding: `1 = contamination found` made `mesh-cron-catchup`
+  log a perfect pass as `outcome=failed … slot CLOSED, a hand is the only re-runner`) ·
   `mesh-fswriter` (the ATTRIBUTION probe — fanotify names the pid/comm/cmdline that wrote a named
   artifact, which inotify structurally cannot: its event struct has no pid field. Turns mtime from a
   touch into a sign relation, the gap behind `writer-redundancy-blinds-mtime-liveness`. Arms as root
