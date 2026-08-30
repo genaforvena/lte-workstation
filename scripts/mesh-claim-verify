@@ -42,6 +42,13 @@ HOST="$(hostname)"
 SEEN="$HOME/.mesh/.claim-verify-seen"
 CLAIM_MIN="${MESH_CLAIM_VERIFY_MIN:-1}"                 # a stale claim younger than this many minutes is skipped (grace)
 NUDGE_CD="${MESH_CLAIM_VERIFY_NUDGE_COOLDOWN:-30}"      # minutes between re-nudges of the same key
+# A COOLDOWN IS NOT A GIVEUP (chat-review/rate-limited-owner-reads-live {#4cdb7881}). NUDGE_CD only
+# spaces the nudges out; nothing above ever STOPS. Live case: hh-browser collected 38 nudges over
+# 450 minutes while its owner (job@mesh-home) sat behind a quota wall and could not read one of them —
+# a forever loop with no escalation and no reader. Modelled on mesh-channel-keepalive's AUTH_GIVEUP=3:
+# after this many nudges on the SAME claim generation, stop poking and say ONE loud thing instead.
+NUDGE_GIVEUP="${MESH_CLAIM_VERIFY_NUDGE_GIVEUP:-3}"     # nudges on one claim generation before escalating
+
 INTERVAL="${MESH_CLAIM_VERIFY_INTERVAL:-30}"           # --watch refresh seconds
 : "${MESH_WHO:=claim-verify@$HOST}"; export MESH_WHO   # posts/releases attributed to the reflex, not '?'
 # load-time touch below runs on EVERY invocation, --test included — divert the seen-file when this IS
@@ -108,6 +115,12 @@ EOF
 claims_to_verify() {
   mesh-claim --list-stale   2>/dev/null | awk -F'\t' '{ w=$2; sub(/^owner=/,"",w); print $1 "\t" w "\tSTALE" }'
   mesh-claim --list-expired 2>/dev/null | awk -F'\t' '{ w=$2; sub(/^owner=/,"",w); print $1 "\t" w "\tEXPIRED" }'
+  # HELD-INCAPABLE (mesh-claim {#4cdb7881}): the owner window is RATE-LIMITED — quota wall / keepalive
+  # shed. It is pulled in HERE, deliberately, rather than left out of every list: a claim this reflex
+  # never sees is a claim nobody is looking at. It gets NEITHER remedy — no release (the owner did not
+  # walk away) and no nudge (it cannot read one; that is precisely the 38-nudge forever loop) — only a
+  # surfaced line. Absent from this list the tool would be silently right; present, it is auditably so.
+  mesh-claim --list-held-incapable 2>/dev/null | awk -F'\t' '{ w=$2; sub(/^owner=/,"",w); print $1 "\t" w "\tHELD-INCAPABLE" }'
 }
 # latest [claim] line for <key> -> "ts_iso<TAB>intent" (intent = text after "[claim] <key> ttl=<sec>").
 claim_line() {
@@ -131,13 +144,25 @@ evidence_lines() {
 }
 
 # --- nudge dedup -----------------------------------------------------------------------------------
-nudge_due() {  # <key> -> 0 due / 1 cooling down
+# SEEN rows are "key<TAB>epoch<TAB>claim_ts<TAB>verb". The claim_ts is what makes the streak a
+# property of ONE claim generation: a re-claim (new [claim] line, new ts) starts the count clean, so a
+# key that legitimately cycles can never inherit a giveup from a claim that closed months ago. Rows
+# written before this field simply carry no generation and match no live claim — the streak restarts
+# once, which is the safe direction.
+nudge_count() {  # <key> <claim_ts> -> nudges already sent on THIS claim generation
+  awk -F'\t' -v k="$1" -v g="$2" '$1==k && $3==g && $4!="giveup"{n++} END{print n+0}' "$SEEN" 2>/dev/null
+}
+gave_up() {      # <key> <claim_ts> -> 0 if the escalation was already posted for this generation
+  [ "$(awk -F'\t' -v k="$1" -v g="$2" '$1==k && $3==g && $4=="giveup"{n++} END{print n+0}' "$SEEN" 2>/dev/null)" -gt 0 ] 2>/dev/null
+}
+nudge_due() {  # <key> [<claim_ts>] -> 0 due / 1 cooling down
   local key="$1" last
-  last="$(awk -F'\t' -v k="$key" '$1==k{v=$2} END{print v}' "$SEEN" 2>/dev/null)"
+  last="$(awk -F'\t' -v k="$key" '$1==k && $4!="giveup"{v=$2} END{print v}' "$SEEN" 2>/dev/null)"
   [ -n "$last" ] || return 0
   [ "$(mins_since "$last")" -ge "$NUDGE_CD" ]
 }
-mark_nudged() { printf '%s\t%s\n' "$1" "$(now_epoch)" >> "$SEEN"; }
+mark_nudged() { printf '%s\t%s\t%s\t%s\n' "$1" "$(now_epoch)" "${2:-}" nudge  >> "$SEEN"; }
+mark_gaveup() { printf '%s\t%s\t%s\t%s\n' "$1" "$(now_epoch)" "${2:-}" giveup >> "$SEEN"; }
 
 # owner window if the owner is a LOCAL, injectable mind window (bare "window@thishost"); else "".
 # A "user/caller@host" identity (derive_who's reflex/cron form) has a slash and is NOT a tmux window —
@@ -165,6 +190,14 @@ verify_pass() {
     if [ "$age_min" -lt "$CLAIM_MIN" ]; then n_skip=$((n_skip+1)); continue; fi
     # EXPIRED skips the whole release ladder — see claims_to_verify. It falls straight through to the
     # nudge, which is the remedy the word exists to name.
+    # A shed owner is neither released nor nudged — surfaced only, with the reason NAMED so the line
+    # cannot be read as an omission. It converts itself: mesh-claim's hold is bounded by arithmetic,
+    # so an owner that never comes back ages into STALE and reaches this loop's release ladder then.
+    if [ "$state" = HELD-INCAPABLE ]; then
+      printf '  \302\267 %-34s HELD-INCAPABLE %sm, owner %s is RATE-LIMITED — not released (it did not walk away), not nudged (it cannot read one)\n' \
+        "$key" "$age_min" "$who"
+      n_skip=$((n_skip+1)); continue
+    fi
     local evidence=""
     [ "$state" = EXPIRED ] || evidence="$(evidence_lines "$ts" | evidence_match "$key")" || evidence=""
     if [ -n "$evidence" ]; then
@@ -182,6 +215,23 @@ verify_pass() {
       printf '  \302\267 %-34s %s %sm, owner %s (remote/uninjectable) — surfaced only\n' "$key" "$state" "$age_min" "$who"
       n_skip=$((n_skip+1)); continue
     fi
+    # THE GIVEUP, ahead of the cooldown: a cooldown that has already fired NUDGE_GIVEUP times is not
+    # spacing a conversation out, it is repeating into a room with nobody in it. Say one loud thing,
+    # once per claim generation, and stop — an unanswered nudge streak is evidence about the OWNER
+    # (shed, wedged, gone), and the remedy for that is a human or a reallocation, not nudge #39.
+    local nudges; nudges="$(nudge_count "$key" "$ts")"
+    if [ "$nudges" -ge "$NUDGE_GIVEUP" ] 2>/dev/null; then
+      if gave_up "$key" "$ts"; then
+        printf '  \302\267 %-34s %s, GAVE UP after %s nudges — already escalated\n' "$key" "$state" "$nudges"
+      else
+        printf '  \342\232\240 %-34s GIVEUP %s after %s nudges (%s %sm)\n' "$key" "$win" "$nudges" "$state" "$age_min"
+        if [ "$dry" = 0 ]; then
+          mesh-chat "[fyi] claim-verify: GIVEUP on [claim] $key — $nudges nudges to $who over ${age_min}m and it is still $state. Nudging stops here (cooldown ${NUDGE_CD}m x ${NUDGE_GIVEUP}); the owner is not answering, so this needs a hand: release it (mesh-claim --done $key), hand it back (mesh-claim --yield $key), or re-dispatch the work.${intent:+ Intent: $intent}" >/dev/null 2>&1
+          mark_gaveup "$key" "$ts"
+        fi
+      fi
+      n_skip=$((n_skip+1)); continue
+    fi
     if ! nudge_due "$key"; then
       printf '  \302\267 %-34s %s, nudged recently — skip\n' "$key" "$state"; n_skip=$((n_skip+1)); continue
     fi
@@ -193,11 +243,11 @@ verify_pass() {
       if [ "$state" = EXPIRED ]; then
         printf 'Your claim "%s" has EXPIRED (%sm old, past its ttl) — but you read LIVE, so nobody is taking it. RENEW it: mesh-claim %s --ttl <sec>. If you are actually finished: mesh-claim --done %s; if you are not going to finish: mesh-claim --yield %s.%s' \
           "$key" "$age_min" "$key" "$key" "$key" "${intent:+ Intent: $intent}" \
-          | mesh-nudge "$win" >/dev/null 2>&1 && mark_nudged "$key"
+          | mesh-nudge "$win" >/dev/null 2>&1 && mark_nudged "$key" "$ts"
       else
         printf 'Your claim "%s" is STALE (%sm old). Is the work done? If yes: mesh-claim --done %s. If not: finish it or hand it back with mesh-claim --yield %s.%s' \
           "$key" "$age_min" "$key" "$key" "${intent:+ Intent: $intent}" \
-          | mesh-nudge "$win" >/dev/null 2>&1 && mark_nudged "$key"
+          | mesh-nudge "$win" >/dev/null 2>&1 && mark_nudged "$key" "$ts"
       fi
     fi
     n_nudge=$((n_nudge+1))
@@ -300,8 +350,61 @@ CVSTUB
       && f="$f expired-owner-told-its-claim-is-stale (telling a mind mid-turn its work was abandoned is the same misreading, addressed to the owner)"
     rm -rf "$_cv_d"
 
+    # --- THE THIRD WORD + THE GIVEUP ({#4cdb7881}) -------------------------------------------------
+    # Live case: hh-browser, owner job@mesh-home, EXPIRED 360m -> 450m, 38 nudges, owner behind a quota
+    # wall the whole time. Two independent defects: the owner's word (mesh-claim's side) and the
+    # absence of any stop condition here. Both are driven below over a fresh sandbox.
+    _cv_d2="$(mktemp -d)"; mkdir -p "$_cv_d2/.local/bin" "$_cv_d2/.mesh"
+    cat > "$_cv_d2/.local/bin/mesh-claim" <<CVSTUB2
+#!/bin/sh
+case "\$1" in
+  --list-stale)          printf 'cvtest/nudge-key\towner=genome@$HOST\tSTALE\n' ;;
+  --list-expired)        : ;;
+  --list-held-incapable) printf 'cvtest/shed-key\towner=job@$HOST\tHELD-INCAPABLE\n' ;;
+  --done)                printf '%s\n' "\$2" >> "$_cv_d2/released" ;;
+esac
+exit 0
+CVSTUB2
+    printf '#!/bin/sh\ncat >> "%s/nudged"\nprintf "WIN=%%s\\n" "$1" >> "%s/nudged"\nexit 0\n' "$_cv_d2" "$_cv_d2" > "$_cv_d2/.local/bin/mesh-nudge"
+    printf '#!/bin/sh\nprintf "%%s\\n" "$1" >> "%s/posted"\nexit 0\n' "$_cv_d2" > "$_cv_d2/.local/bin/mesh-chat"
+    chmod +x "$_cv_d2/.local/bin/mesh-claim" "$_cv_d2/.local/bin/mesh-nudge" "$_cv_d2/.local/bin/mesh-chat"
+    _cv_ts2="$(date -u -d '-450 min' +%FT%TZ)"
+    {
+      printf '%s  genome@%s  ::  [claim] cvtest/nudge-key ttl=60 drive the browser\n' "$_cv_ts2" "$HOST"
+      printf '%s  job@%s  ::  [claim] cvtest/shed-key ttl=60 drive the browser\n'     "$_cv_ts2" "$HOST"
+    } > "$_cv_d2/.mesh/chat.log"
+    _cv_ob2="$BOARD"; _cv_os2="$SEEN"; _cv_ocd="$NUDGE_CD"
+    BOARD="$_cv_d2/.mesh/chat.log"; SEEN="$_cv_d2/seen"; NUDGE_CD=0   # cooldown out of the way: the GIVEUP is under test, not the spacing
+    : > "$SEEN"
+    # NUDGE_GIVEUP+2 passes. Without a giveup this is NUDGE_GIVEUP+2 nudges — the forever loop.
+    _cv_p=0; while [ "$_cv_p" -lt $(( NUDGE_GIVEUP + 2 )) ]; do
+      PATH="$_cv_d2/.local/bin:$PATH" verify_pass 0 >/dev/null 2>&1; _cv_p=$(( _cv_p + 1 ))
+    done
+    _cv_nudges="$(grep -c 'WIN=' "$_cv_d2/nudged" 2>/dev/null || echo 0)"
+    [ "$_cv_nudges" = "$NUDGE_GIVEUP" ] \
+      || f="$f nudge-giveup-not-enforced (a cooldown spaces nudges out, it never STOPS them — $(( NUDGE_GIVEUP + 2 )) passes produced $_cv_nudges nudges, want exactly $NUDGE_GIVEUP; this is the 38-nudge hh-browser loop)"
+    [ "$(grep -c 'GIVEUP on \[claim\] cvtest/nudge-key' "$_cv_d2/posted" 2>/dev/null || echo 0)" = 1 ] \
+      || f="$f nudge-giveup-not-escalated-exactly-once (the forever loop must become ONE loud line — a silent stop is just a quieter forever loop, and a repeated one is the flood again)"
+    # THE SHED CLAIM: neither released nor nudged, and NOT silent.
+    grep -qx 'cvtest/shed-key' "$_cv_d2/released" 2>/dev/null \
+      && f="$f held-incapable-released (its owner is behind a quota wall, not gone — releasing it hands a second writer live work)"
+    grep -q 'cvtest/shed-key' "$_cv_d2/nudged" 2>/dev/null \
+      && f="$f held-incapable-nudged (a shed mind cannot read a nudge — this is the no-op loop the giveup exists to end, entered from the other side)"
+    _cv_surf="$(PATH="$_cv_d2/.local/bin:$PATH" verify_pass 1 2>/dev/null)"
+    case "$_cv_surf" in *cvtest/shed-key*HELD-INCAPABLE*) : ;; *) f="$f held-incapable-invisible (not acted on must not mean unreported: [$_cv_surf])" ;; esac
+    case "$_cv_surf" in *RATE-LIMITED*) : ;; *) f="$f held-incapable-reason-unnamed (a skipped line with no reason reads as an omission)" ;; esac
+    # a RE-CLAIM starts the streak clean — the giveup is a property of one claim generation, never of
+    # the key forever, or a key that legitimately cycles inherits a giveup from a claim long closed.
+    printf '%s  genome@%s  ::  [claim] cvtest/nudge-key ttl=60 drive the browser again\n' \
+      "$(date -u -d '-10 min' +%FT%TZ)" "$HOST" >> "$_cv_d2/.mesh/chat.log"
+    PATH="$_cv_d2/.local/bin:$PATH" verify_pass 0 >/dev/null 2>&1
+    [ "$(grep -c 'WIN=' "$_cv_d2/nudged" 2>/dev/null || echo 0)" = "$(( NUDGE_GIVEUP + 1 ))" ] \
+      || f="$f giveup-outlives-the-claim-generation (a re-claimed key must be nudgeable again)"
+    BOARD="$_cv_ob2"; SEEN="$_cv_os2"; NUDGE_CD="$_cv_ocd"
+    rm -rf "$_cv_d2"
+
     if [ -n "$f" ]; then echo "smoke-test: FAIL ($f )"; exit 1; fi
-    echo "smoke-test: ok (key_parts drops <=3-char tokens, evidence_match: exact-key + all-parts-AND, partial-token does NOT false-release, local_window resolves local/strips-tag/rejects-remote, deps present, + TWO WORDS TWO REMEDIES {#b2d997b4}: one driven pass over a board holding a STALE and an EXPIRED claim BOTH carrying [done]-shaped evidence — the stale one is released, the expired one is NEVER released, its owner is poked with the RENEW remedy, and is never told its live work is stale)"; exit 0 ;;
+    echo "smoke-test: ok (key_parts drops <=3-char tokens, evidence_match: exact-key + all-parts-AND, partial-token does NOT false-release, local_window resolves local/strips-tag/rejects-remote, deps present, + TWO WORDS TWO REMEDIES {#b2d997b4}: one driven pass over a board holding a STALE and an EXPIRED claim BOTH carrying [done]-shaped evidence — the stale one is released, the expired one is NEVER released, its owner is poked with the RENEW remedy, and is never told its live work is stale, + THE THIRD WORD AND THE GIVEUP {#4cdb7881}: NUDGE_GIVEUP+2 passes produce exactly NUDGE_GIVEUP nudges and ONE escalation post (a cooldown spaces nudges out, it never stops them — hh-browser took 38), the streak is a property of one claim generation so a re-claim is nudgeable again, and a HELD-INCAPABLE claim is neither released nor nudged yet still SURFACED with its reason named) and is never told its live work is stale)"; exit 0 ;;
   --once)  verify_pass 0 ;;
   --dry)   verify_pass 1 ;;
   --watch) watch_display ;;
