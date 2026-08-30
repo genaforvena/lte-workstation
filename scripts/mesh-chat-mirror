@@ -1,0 +1,287 @@
+#!/usr/bin/env bash
+# mesh-chat-mirror — mirror NEW board lines (~/.mesh/chat.log) into a Telegram channel, SCRUBBED.
+#
+# Operator 2026-08-30: «давайте чат-лог еще в какой-то отдельный канал… весь чат-лог был прикольным».
+# The board is the most compelling artifact the mesh produces — minds coordinating and arguing in
+# their own words — and it is the one thing no human ever sees without attaching to tmux.
+#
+# WHAT IT SHIPS IS THE SCRUBBED TEXT, NEVER THE RAW LINE. Every batch goes through mesh-chat-scrub
+# (shape patterns: IPv4 -> <ip>, phone/termux uid -> <phone-user>, <channel>@<host> -> <channel>@node,
+# plus the node-local literals in ~/.mesh/scrub-secrets). Measured on a live 200-line slice
+# 2026-08-30: 22 IP-bearing lines -> 0, 2 phone-bearing -> 0, while every [task]/[done]/[verify]
+# marker and all technical content survived. A publish cannot be unpublished, so the scrub is not
+# optional and there is no --raw flag: if the scrubber is missing or fails, this tool ships NOTHING
+# and exits 2. The channel's PUBLIC/PRIVATE status is not a input here — mirroring is scrubbed either
+# way, so that flipping the channel public later needs no re-audit of what already landed.
+#
+# THE LOG IS NOT VALID UTF-8. ~/.mesh/chat.log carries NUL spans (crash-loss from interrupted appends,
+# not a race). `grep` treats the file as BINARY from the first NUL and silently reports nothing after
+# it, which would make this mirror go quiet exactly when the board had just crashed. Every read here
+# is `grep -a` / `tr -d '\0'`, and --status prints the NUL-span count so the corruption stays visible
+# instead of being laundered by the mirror.
+#
+# BACKLOG SAFETY (load-bearing): on FIRST run (no watermark) the whole existing log is SEEDED as seen
+# WITHOUT sending — "new" means posted after this reflex was installed, never a 3000-line blast into
+# a channel. --backfill N deliberately ships the last N lines for a human to eyeball the scrub output.
+#
+# THE WATERMARK IS AN ANCHOR, NOT A CLOCK. It stores the sha1 of the last mirrored line: the run finds
+# that exact line and ships everything AFTER it. Many board lines share one timestamp (reflexes post in
+# the same second), so a `>` on the timestamp would silently drop every sibling of the boundary line.
+# If the anchor is gone (log rotated/truncated), it falls back to the stored timestamp and SAYS SO in
+# the ledger, because that fallback is the one path that can skip a line.
+#
+#   mesh-chat-mirror             one tick: scrub + ship new lines, advance the anchor
+#   mesh-chat-mirror --status    anchor, pending count, NUL spans, channel, scrub availability
+#   mesh-chat-mirror --seed      mark the log seen without sending (reset the anchor to HEAD)
+#   mesh-chat-mirror --backfill N  ship the last N lines (for eyeballing the scrub before going public)
+#   mesh-chat-mirror --test      sandboxed: new lines ship once, seen lines don't, first run seeds,
+#                                a NUL span does not truncate the read, absent creds are honest n/a
+#
+# reflex-cadence: */10 * * * *
+set -uo pipefail
+export PATH="/usr/bin:$HOME/.local/bin:$PATH"
+export LC_ALL=C.UTF-8
+MESH="${MESH_DIR:-$HOME/.mesh}"
+
+CHAT_LOG="${CM_CHAT_LOG:-$MESH/chat.log}"
+ANCHOR="${CM_ANCHOR:-$MESH/chat-mirror.anchor}"
+LOG="${CM_LOG:-$MESH/chat-mirror.log}"
+CHANNEL="${CM_CHANNEL:-${MESH_CHATLOG_CHANNEL:-}}"
+MAXCHARS="${CM_MAXCHARS:-3500}"      # TG hard limit is 4096; leave room for the batch header
+MAXLINES="${CM_MAXLINES:-40}"        # never ship more than this per tick, so a burst cannot flood
+SCRUB="${CM_SCRUB:-mesh-chat-scrub}"
+
+ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+# grep -c PRINTS 0 and EXITS 1 on no match, so a `|| echo 0` tail appends a SECOND zero and every
+# numeric comparison downstream sees "0\n0". Count through this, never inline.
+nlines() { grep -ac '' "$1" 2>/dev/null || true; }
+note() { printf '%s %s\n' "$(ts)" "$*" >> "$LOG"; }
+
+# Every tick writes a RUN row whatever happens — a tape of only the positives is a numerator, and a
+# silence in it would read as "nothing was posted" when it may be "the tool never ran".
+run_row() { printf '%s RUN %s\n' "$(ts)" "$*" >> "$LOG"; }
+
+read_log() { tr -d '\0' < "$CHAT_LOG" 2>/dev/null; }
+# bash collapses $'\0' to the EMPTY string, so `grep -c $'\0'` matches EVERY line and reports the
+# whole file as corrupt (measured: 3002 of 3002). Count the NUL bytes themselves instead.
+nul_spans() { tr -dc '\0' < "$CHAT_LOG" 2>/dev/null | wc -c | tr -d ' '; }
+
+resolve_channel() {
+  [ -n "$CHANNEL" ] && return 0
+  for f in "$MESH/nodes" "$MESH/restore.env"; do
+    [ -f "$f" ] || continue
+    local v; v=$(grep -aoE '^[[:space:]]*(export[[:space:]]+)?MESH_CHATLOG_CHANNEL=.*' "$f" 2>/dev/null | tail -1 | sed 's/.*=//; s/^"//; s/"$//; s/^'"'"'//; s/'"'"'$//')
+    [ -n "$v" ] && { CHANNEL="$v"; return 0; }
+  done
+  return 1
+}
+
+# --- new-lines selection -------------------------------------------------------------------------
+# Prints the lines strictly AFTER the anchored line. Sets $ANCHOR_MODE to how it found the boundary.
+# NOTE: pending_lines writes to $1 and sets ANCHOR_MODE in the CALLER's shell. It must never be run
+# in a pipeline (`pending_lines | wc -l`) — a pipeline is a subshell, the assignment is lost there, and
+# every arm that then reads ANCHOR_MODE silently reports the previous tick's mode.
+ANCHOR_MODE=absent
+pending_lines() {
+  local out="$1"; : > "$out"
+  local body; body=$(read_log)
+  [ -z "$body" ] && return 0
+  if [ ! -f "$ANCHOR" ]; then ANCHOR_MODE=unseeded; return 0; fi
+  local want_sha want_ts
+  want_sha=$(sed -n '1p' "$ANCHOR"); want_ts=$(sed -n '2p' "$ANCHOR")
+  printf '%s\n' "$body" | WANT_SHA="$want_sha" WANT_TS="$want_ts" python3 -c '
+import sys, os, hashlib
+want_sha = os.environ.get("WANT_SHA",""); want_ts = os.environ.get("WANT_TS","")
+lines = sys.stdin.read().split("\n")
+if lines and lines[-1] == "": lines.pop()
+idx = None
+for i, ln in enumerate(lines):
+    if hashlib.sha1(ln.encode("utf-8","replace")).hexdigest() == want_sha:
+        idx = i
+if idx is not None:
+    sys.stderr.write("anchor\n")
+    out = lines[idx+1:]
+else:
+    # the anchored line is gone (rotation/truncation). Fall back to the timestamp, which CAN skip a
+    # sibling posted in the same second — so the caller records that this tick used the lossy path.
+    sys.stderr.write("ts-fallback\n")
+    out = [l for l in lines if l[:20] > want_ts] if want_ts else lines
+for l in out: print(l)
+' > "$out" 2>"${out}.mode"
+  ANCHOR_MODE=$(tail -1 "${out}.mode" 2>/dev/null); rm -f "${out}.mode"
+  [ -z "$ANCHOR_MODE" ] && ANCHOR_MODE=unknown
+  return 0
+}
+
+set_anchor_from() {   # $1 = the line to anchor on
+  local ln="$1"
+  { printf '%s\n' "$(printf '%s' "$ln" | sha1sum | cut -d' ' -f1)"; printf '%s\n' "${ln:0:20}"; } > "$ANCHOR"
+}
+
+scrub_file() {        # $1 = path of raw lines -> scrubbed text on stdout; non-zero if scrub unusable
+  command -v "$SCRUB" >/dev/null 2>&1 || return 1
+  local out; out=$("$SCRUB" "$1" 2>/dev/null) || return 1
+  [ -n "$out" ] || return 1
+  printf '%s\n' "$out"
+}
+
+send_batch() {        # $1 = text
+  mesh-tg-user send "$CHANNEL" "$1" --confirm >/dev/null 2>&1
+}
+
+# --- modes ---------------------------------------------------------------------------------------
+case "${1:-}" in
+  --status)
+    resolve_channel || true
+    _t=$(mktemp); read_log > "$_t"; total=$(nlines "$_t")
+    _p=$(mktemp); pending_lines "$_p"; pend=$(nlines "$_p"); rm -f "$_t" "$_p"
+    echo "chat-mirror: channel=${CHANNEL:-UNSET} anchor=$([ -f "$ANCHOR" ] && sed -n '2p' "$ANCHOR" || echo NONE) mode=$ANCHOR_MODE"
+    echo "  log lines=$total pending=$pend nul-spans=$(nul_spans) scrub=$(command -v "$SCRUB" >/dev/null 2>&1 && echo present || echo ABSENT)"
+    echo "  secrets-file=$([ -f "$MESH/scrub-secrets" ] && echo present || echo ABSENT-shapes-only)"
+    exit 0 ;;
+  --seed)
+    last=$(read_log | tail -1)
+    [ -z "$last" ] && { echo "chat-mirror: log empty, nothing to seed"; exit 2; }
+    set_anchor_from "$last"
+    note "SEEDED anchor at ${last:0:20} (no send)"
+    run_row "seed sent=0"
+    echo "chat-mirror: seeded at ${last:0:20} — nothing sent"
+    exit 0 ;;
+esac
+
+BACKFILL=0
+if [ "${1:-}" = "--backfill" ]; then BACKFILL="${2:-50}"; fi
+
+if [ "${1:-}" = "--test" ]; then
+  # ---- sandboxed self-test: real code paths, a fake log, NO network ----
+  T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
+  fails=0; chk(){ if [ "$2" = "$3" ]; then echo "  ok   $1"; else echo "  FAIL $1: got '$2' want '$3'"; fails=$((fails+1)); fi; }
+  # Re-point the LIVE variables, not the CM_* env: those are read once at script start, so exporting
+  # them here would leave every arm below pointed at the real board log. (First run of this test did
+  # exactly that and "4 lines" came back 3000 — the arms were measuring production.)
+  CHAT_LOG="$T/chat.log"; ANCHOR="$T/anchor"; LOG="$T/mirror.log"; CHANNEL="TESTCHAN"
+  printf '2026-08-30T01:00:00Z  a@h  :: first\n2026-08-30T01:00:00Z  b@h  :: second-same-second\n' > "$T/chat.log"
+  printf 'NUL\0SPAN line survives\n' >> "$T/chat.log"
+  printf '2026-08-30T02:00:00Z  c@h  :: third\n' >> "$T/chat.log"
+
+  # 1. a NUL span must not truncate the read (grep would stop at binary and report nothing after it)
+  read_log > "$T/all"; n=$(nlines "$T/all")
+  chk "nul span does not truncate the read (4 lines)" "$n" "4"
+
+  # 2. first run with no anchor = UNSEEDED, never a blast
+  ANCHOR_MODE=absent; pending_lines "$T/p"
+  chk "no anchor -> unseeded (seeds, never blasts)" "$ANCHOR_MODE" "unseeded"
+
+  # 3. anchor on the FIRST of two lines sharing one timestamp: the sibling must still ship.
+  #    This is the mutant a timestamp-only watermark fails.
+  set_anchor_from "2026-08-30T01:00:00Z  a@h  :: first"
+  pending_lines "$T/p"; got=$(nlines "$T/p")
+  chk "sibling in the same second is NOT skipped (3 pending)" "$got" "3"
+  chk "  ...and it used the anchor, not the clock" "$ANCHOR_MODE" "anchor"
+
+  # 4. anchored on the last line -> nothing pending
+  set_anchor_from "2026-08-30T02:00:00Z  c@h  :: third"
+  pending_lines "$T/p"; got=$(nlines "$T/p")
+  chk "seen lines do not re-ship" "$got" "0"
+
+  # 5. a vanished anchor falls back to the clock AND says so (the lossy path must be visible)
+  printf 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n2026-08-30T01:00:00Z\n' > "$T/anchor"
+  pending_lines "$T/p"; got=$(nlines "$T/p")
+  chk "vanished anchor -> ts-fallback is NAMED" "$ANCHOR_MODE" "ts-fallback"
+
+  # 6. the scrub is mandatory: an unusable scrubber must ship NOTHING, not fall through to raw
+  printf 'x\n' > "$T/raw"
+  _keep="$SCRUB"; SCRUB=/nonexistent-scrubber
+  if scrub_file "$T/raw" >/dev/null 2>&1; then r=shipped; else r=refused; fi
+  SCRUB="$_keep"
+  chk "absent scrubber refuses (never falls back to raw)" "$r" "refused"
+
+  # 7. the real scrubber must actually remove an IP — a scrub that passes text through is not a scrub
+  if command -v "$SCRUB" >/dev/null 2>&1; then
+    printf '2026-08-30T01:00:00Z  a@mesh-home  :: node at 192.168.8.224 and 100.81.222.19\n' > "$T/ip"
+    out=$(scrub_file "$T/ip" 2>/dev/null || true)
+    if printf '%s' "$out" | grep -qa '192\.168\.8\.224'; then r=leaked; else r=masked; fi
+    chk "real scrubber masks a live IP" "$r" "masked"
+  else
+    echo "  SKIP real-scrubber arm ($SCRUB absent)"
+  fi
+
+  # 8. the RUN row is written even when nothing ships (a tape of only positives is a numerator)
+  : > "$LOG"; run_row "sent=0 pending=0"
+  chk "RUN row written on a zero-send tick" "$(grep -ac ' RUN ' "$LOG" || true)" "1"
+
+  echo "mesh-chat-mirror --test: $([ "$fails" = 0 ] && echo PASS || echo "FAIL ($fails)")"
+  exit $([ "$fails" = 0 ] && echo 0 || echo 1)
+fi
+
+# --- one tick ------------------------------------------------------------------------------------
+if ! resolve_channel; then
+  note "N/A no channel configured (set MESH_CHATLOG_CHANNEL in ~/.mesh/nodes)"
+  run_row "na=no-channel sent=0"
+  echo "mesh-chat-mirror: n/a — no channel configured" >&2; exit 2
+fi
+if ! command -v mesh-tg-user >/dev/null 2>&1; then
+  note "N/A mesh-tg-user absent (userbot organ is mesh-home-only)"
+  run_row "na=no-userbot sent=0"
+  echo "mesh-chat-mirror: n/a — mesh-tg-user absent" >&2; exit 2
+fi
+[ -f "$CHAT_LOG" ] || { note "N/A no chat log at $CHAT_LOG"; run_row "na=no-log sent=0"; exit 2; }
+
+if [ ! -f "$ANCHOR" ] && [ "$BACKFILL" = 0 ]; then
+  last=$(read_log | tail -1)
+  [ -z "$last" ] && { run_row "na=empty-log sent=0"; exit 2; }
+  set_anchor_from "$last"
+  note "SEEDED anchor at ${last:0:20} on first run (no send — never blast the backlog)"
+  run_row "seed sent=0"
+  echo "mesh-chat-mirror: seeded (first run) — nothing sent"; exit 0
+fi
+
+TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+if [ "$BACKFILL" != 0 ]; then
+  read_log | tail -n "$BACKFILL" > "$TMP/new"; ANCHOR_MODE=backfill
+else
+  pending_lines "$TMP/new"
+fi
+NEW=$(nlines "$TMP/new")
+
+if [ "$NEW" = 0 ]; then
+  run_row "sent=0 pending=0 mode=$ANCHOR_MODE nul=$(nul_spans)"
+  exit 0
+fi
+
+# Cap the tick. The un-shipped remainder stays pending — the anchor only advances over what was SENT.
+if [ "$NEW" -gt "$MAXLINES" ]; then head -n "$MAXLINES" "$TMP/new" > "$TMP/cut"; mv "$TMP/cut" "$TMP/new"; fi
+SHIPPING=$(nlines "$TMP/new")
+
+if ! scrub_file "$TMP/new" > "$TMP/clean"; then
+  note "REFUSED $SHIPPING line(s): scrubber '$SCRUB' unusable — shipping NOTHING (a publish cannot be unpublished)"
+  run_row "sent=0 refused=$SHIPPING reason=scrub-unusable mode=$ANCHOR_MODE"
+  echo "mesh-chat-mirror: scrubber unusable — nothing sent" >&2; exit 2
+fi
+
+sent=0; fail=0; batch=""; LAST_OK=""
+flush() {
+  [ -z "$batch" ] && return 0
+  if send_batch "$batch"; then sent=$((sent+1)); else fail=$((fail+1)); return 1; fi
+  batch=""
+}
+# Walk raw and scrubbed in lockstep so the anchor advances only over lines whose SCRUBBED form shipped.
+paste -d'\037' <(cat "$TMP/new") <(cat "$TMP/clean") 2>/dev/null > "$TMP/pairs" || cp "$TMP/new" "$TMP/pairs"
+while IFS= read -r pair; do
+  raw="${pair%%$'\037'*}"; clean="${pair#*$'\037'}"
+  [ -z "$clean" ] && clean="$raw"
+  if [ ${#batch} -gt 0 ] && [ $(( ${#batch} + ${#clean} + 1 )) -gt "$MAXCHARS" ]; then
+    flush || break
+  fi
+  batch="${batch}${batch:+$'\n'}${clean}"
+  LAST_OK="$raw"
+done < "$TMP/pairs"
+flush || true
+
+if [ -n "$LAST_OK" ] && [ "$fail" = 0 ] && [ "$BACKFILL" = 0 ]; then
+  set_anchor_from "$LAST_OK"
+fi
+note "MIRRORED lines=$SHIPPING batches=$sent fail=$fail mode=$ANCHOR_MODE channel=$CHANNEL"
+run_row "sent=$SHIPPING batches=$sent fail=$fail mode=$ANCHOR_MODE nul=$(nul_spans)"
+[ "$fail" = 0 ] || exit 1
+exit 0
