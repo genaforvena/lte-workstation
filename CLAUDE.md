@@ -629,6 +629,21 @@ load-bearing tools — run `mesh-tools <category>` for the rest and the full con
 - **Channels / streams:** `mesh-stream` · `mesh-channels` · `mesh-nodestate` · `mesh-fleet-feed` · `mesh-channel-tg`.
 - **Organs / actuators:** `mesh-organ` (capability router) · `mesh-tv-dlna` · `mesh-sms` · `mesh-phone-*` (`-ip`/`-watch`/`-ear`/`-sensors`/`-convo`) · `mesh-sensor-log`.
 - **On-demand / audit:** `mesh-tools` (the index itself) · `mesh-doctor` · `mesh-digest`/`mesh-since`/`mesh-morning`/`mesh-novelty` · `mesh-review`/`mesh-study`/`mesh-claude-check` · `mesh-test-forgery` (daily: runs one tool's `--test` and watches which `~/.mesh/*.log` grew — a dry-run writing the durable liveness record forges the evidence it exists to check; a candidate is only a finding if it repeats AND does not grow in an equal control window) ·
+  `mesh-observer-effect` (the SECOND-ORDER probe — asks, as a CLASS, whether RUNNING a sense moves a
+  quantity that sense REPORTS; we had rediscovered that shape one incident at a time and `mesh-test-forgery`
+  covers exactly one narrow case of it, "did a dry-run grow a durable log". Every subject gets a CONTROL
+  window of equal length in which it is NOT run, because drift is the null hypothesis and without the
+  control arm ordinary drift and self-contamination are the same reading. The estimator solves
+  `c = (d_treat − r·d_ctrl)/(K+1−r)` rather than dividing the excess by K — the control arm's own closing
+  read is itself contamination, and the naive denominator biases every verdict toward `accumulator`, i.e.
+  toward declaring a contaminated sense innocent. A second arm covers the LEVEL offset a delta is blind to
+  (a census that counts its own reader): J decoys wearing the subject's name via `exec -a`, against J
+  neutral ones as the control. A quantity that moves with TIME gets its own word, `accumulator`, never a
+  contamination verdict; a subject too expensive to run K+3 times self-excludes LOUDLY with its measured
+  cost; an undeclared subject is `na` in its own column with the population as the denominator, NEVER
+  folded into clean. Subjects opt in with `# observer-probe:` — an allowlist on purpose, since this
+  category holds `mesh-say`/`mesh-act`/`mesh-tg-roz` and a denylist that had merely never heard of an
+  actuator would drive it K+1 times) ·
   `mesh-fswriter` (the ATTRIBUTION probe — fanotify names the pid/comm/cmdline that wrote a named
   artifact, which inotify structurally cannot: its event struct has no pid field. Turns mtime from a
   touch into a sign relation, the gap behind `writer-redundancy-blinds-mtime-liveness`. Arms as root
