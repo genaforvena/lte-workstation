@@ -279,6 +279,11 @@ the case is the evidence, and mixing them is what made this section a wall nobod
   in the table), so measure that range first, band on a position NORMALISED to it, and re-hang every
   band the axis cannot express onto evidence that can — never leave a verdict nothing can produce.
   [[an-input-swap-under-a-fixed-band-table-kills-the-bands-it-keeps]]
+- **A settle gate measures AGE, not ORIGIN — so a tree a tool REPLAYED settles exactly as hard as a
+  thought a mind finished**, and form gates cannot help: a revert is somebody's formerly working code,
+  so parse and `--test` are green by construction; discriminate on content PROVENANCE against the
+  ancestor blob, and give the hold its own REMEDY, since "review + apply" completes the defect.
+  [[a-settle-gate-measures-age-not-origin-so-a-replayed-tree-settles-like-a-thought]]
 
 ## Substrate changes & multi-agent coordination
 
