@@ -174,6 +174,9 @@ _claim_id_of_uncached(){
 }
 claim_id_of(){
   local __k="$1"
+  # bash cannot subscript an associative array with the empty string ("bad array subscript" on stderr,
+  # twice per call). An empty body has no id anyway — answer before the memo, not inside it.
+  [ -n "$__k" ] || return 0
   case "${_CID_MEMO[$__k]+set}" in set) printf '%s' "${_CID_MEMO[$__k]}"; return ;; esac
   local __v; __v="$(_claim_id_of_uncached "$1")"
   _CID_MEMO[$__k]="$__v"
