@@ -172,6 +172,41 @@ origin_fetch(){
   return $rc
 }
 
+# remote_head <repo> — the sha the SERVER says refs/heads/main is at, on stdout; rc 1 when the server
+# could not be asked. This is the only thing that answers "did the push land"; the local
+# refs/remotes/origin/main is a CACHE the client updates only if it lived long enough to do so, which
+# is precisely what a timeout means it did not. Bounded, because on the link this exists for (20% loss,
+# 378ms RTT measured 2026-08-30) an unbounded ask would hang the tick it is trying to describe.
+remote_head(){
+  local r="$1" out
+  out="$(timeout "${MESH_LAND_LSREMOTE_TIMEOUT:-20}" git -C "$r" ls-remote origin refs/heads/main 2>/dev/null)" || return 1
+  out="$(printf '%s' "$out" | awk 'NR==1{print $1}')"
+  [ -n "$out" ] || return 1
+  printf '%s' "$out"
+}
+
+# push_landed_anyway <repo> <local-sha> — after a push that did NOT exit 0, did the ref move anyway?
+#   0 = yes, the server has it (or is ahead of it)   1 = no, it genuinely is not there
+#   2 = cannot tell — the server could not be asked, or answered with an object we do not have
+# A TIMED-OUT PUSH IS NOT A FAILED PUSH (health, measured live 2026-08-30T07:02-07:04Z): git can send
+# the pack and the server can complete the ref update AFTER the client's own deadline expires, so a
+# 15s bound on a degraded link times out routinely while the write succeeds. mesh-land converted that
+# timeout into a positive assertion about repository state — LOCAL-ONLY — which it never measured: a
+# verdict about the CLIENT'S PATIENCE, reported as the remote's content. It was FALSE on its first
+# live occurrence (df07cf7: `git rev-list --count origin/main..main` = 0, `git push` = "Everything
+# up-to-date"). Same rule as a pref that is not the FIB and a mode bit that is not the write — the
+# artifact is the REMOTE REF, never the exit status of the attempt to move it. Note the polarity of
+# the unknown: an unaskable server is UNKNOWN, never LOCAL-ONLY, because the mesh's standing doctrine
+# is "always push", so a false LOCAL-ONLY sends the next mind chasing a push that already happened.
+push_landed_anyway(){
+  local r="$1" hl="$2" rh
+  rh="$(remote_head "$r")" || return 2
+  [ "$rh" = "$hl" ] && return 0
+  git -C "$r" cat-file -e "$rh" 2>/dev/null || return 2   # server ahead with objects we lack: undecidable here
+  git -C "$r" merge-base --is-ancestor "$hl" "$rh" 2>/dev/null && return 0
+  return 1
+}
+
 push_heal(){
   local r="$1" hl ho fresh
   origin_fetch "$r"; fresh=$?
@@ -188,14 +223,28 @@ push_heal(){
     # repeats every tick. rc=124 is the ONE case that really is a slow/blocked egress (timeout fired) —
     # it is now claimed only when MEASURED, never assumed.
     local perr prc
-    perr="$(timeout 15 git -C "$r" push --quiet origin main 2>&1)"; prc=$?
+    local _pt="${MESH_LAND_PUSH_TIMEOUT:-15}"
+    perr="$(timeout "$_pt" git -C "$r" push --quiet origin main 2>&1)"; prc=$?
     if [ "$prc" = 0 ]; then
       echo "$(date -u +%FT%TZ) push-heal: pushed stranded local main ${hl:0:7} -> origin (was ${ho:0:7})"
       return 0
     fi
     perr="$(printf '%s' "$perr" | tr '\n' ' ' | cut -c1-300)"
+    # ASK THE SERVER before naming the outcome — the push's rc describes the client, not the ref.
+    push_landed_anyway "$r" "$hl"; local _la=$?
+    if [ "$_la" = 0 ]; then
+      # the cache is what is stale now, not the genome: bring refs/remotes/origin/main up to what the
+      # server actually holds, or the very next in_origin() re-derives LOCAL-ONLY from this same lie.
+      git -C "$r" update-ref refs/remotes/origin/main "$hl" 2>/dev/null || true
+      echo "$(date -u +%FT%TZ) push-heal: push exited rc=$prc after ${_pt}s but the SERVER HAS ${hl:0:7} — it landed; the client's deadline expired, the ref update did not fail"
+      return 0
+    fi
+    if [ "$_la" = 2 ]; then
+      echo "$(date -u +%FT%TZ) push-heal: push exited rc=$prc after ${_pt}s and the server could not be asked (${perr:-git said nothing}) — whether ${hl:0:7} landed is UNKNOWN, NOT local-only; retry next tick"
+      return 2
+    fi
     if [ "$prc" = 124 ]; then
-      echo "$(date -u +%FT%TZ) push-heal: local ${hl:0:7} ahead of origin ${ho:0:7}, push TIMED OUT after 15s (slow egress) — retry next tick"
+      echo "$(date -u +%FT%TZ) push-heal: local ${hl:0:7} ahead of origin ${ho:0:7}, push TIMED OUT after ${_pt}s (slow egress) and the server confirms it does NOT have it — retry next tick"
     else
       echo "$(date -u +%FT%TZ) push-heal: local ${hl:0:7} ahead of origin ${ho:0:7}, push FAILED rc=$prc: ${perr:-(git said nothing)} — retry next tick"
     fi
@@ -219,14 +268,22 @@ push_heal(){
 #   0 = HEAD is an ancestor of origin/main       → it landed; the genome has it
 #   1 = it is not                                → committed, LOCAL-ONLY; a steward must push
 #   2 = no origin/main ref to compare against    → UNKNOWN; never "landed"
-# rc 1 is safe to word absolutely even when the fetch failed: a commit made seconds ago cannot be in
-# origin unless THIS run pushed it, so "not in origin/main" is true whether or not origin was reachable.
+# THE OLD JUSTIFICATION FOR rc 1 IS REFUTED AND IS KEPT HERE ONLY AS THE THING THAT WAS WRONG. It read:
+# "rc 1 is safe to word absolutely even when the fetch failed: a commit made seconds ago cannot be in
+# origin unless THIS run pushed it". THIS RUN DID PUSH IT — that is the whole timeout case. The client's
+# deadline expired while the server completed the ref update, so refs/remotes/origin/main (a CACHE the
+# client updates only if it lived long enough) still points at the old sha and this function derived
+# LOCAL-ONLY from the client's patience. Live on 2026-08-30T07:02Z with df07cf7 (health): the commit was
+# on origin the whole time, and the [strand] sent a mind chasing a push that had already happened.
+# So the CHEAP path stays cheap — a cached ref that already contains HEAD is proof and costs nothing —
+# but the NEGATIVE is never spoken from the cache: it is re-asked of the server, and an unaskable
+# server is UNKNOWN (2), never LOCAL-ONLY (1).
 in_origin(){
   local r="$1" ho
   ho="$(git -C "$r" rev-parse --verify --quiet origin/main 2>/dev/null)"
   [ -n "$ho" ] || return 2
   git -C "$r" merge-base --is-ancestor HEAD "$ho" 2>/dev/null && return 0
-  return 1
+  push_landed_anyway "$r" "$(git -C "$r" rev-parse HEAD 2>/dev/null)"
 }
 
 # stale_autostash <repo> → one line per PARKED autostash entry older than SETTLE, or empty.
@@ -1280,6 +1337,70 @@ EOF
     && { echo "smoke-test: FAIL (push_heal returned success on a DIVERGED origin)"; exit 1; }
   [ "$(git -C "$_ph_d/origin.git" rev-parse main)" = "$_ph_peer" ] \
     || { echo "smoke-test: FAIL (push_heal MOVED a diverged public origin — the peer's commit was destroyed)"; exit 1; }
+  # ── A TIMED-OUT PUSH IS NOT A FAILED PUSH ─────────────────────────────────────────────────────
+  # health, measured live 2026-08-30T07:02-07:04Z on this node's degraded egress (20% loss, 378ms RTT):
+  # mesh-land printed "push TIMED OUT after 15s" and then "PUSH FAILED — the commit is LOCAL-ONLY",
+  # and `git rev-list --count origin/main..main` answered 0 — the commit (df07cf7) was on origin the
+  # whole time. git can send the pack and the server can complete the ref update AFTER the client's
+  # deadline; the rc describes the CLIENT'S PATIENCE, and mesh-land reported it as the remote's content.
+  # The fixture reproduces exactly that: a `git` stub that PERFORMS the push and then outlives the
+  # bound, so the ref really does move while the command really does get killed. rc=124, ref at HEAD.
+  _to_d="$(mktemp -d)"; [ -d "${_to_d:-}" ] || { echo "mesh-land --test: FAIL (mktemp -d gave no scratch dir for the push-timeout fixture)" >&2; exit 1; }
+  _REALGIT="$(command -v git)"
+  git init -q --bare "$_to_d/origin.git"
+  git clone -q "$_to_d/origin.git" "$_to_d/work" 2>/dev/null
+  git -C "$_to_d/work" config user.email t@t; git -C "$_to_d/work" config user.name t
+  echo one > "$_to_d/work/f"; git -C "$_to_d/work" add f; git -C "$_to_d/work" commit -qm one
+  git -C "$_to_d/work" branch -M main; git -C "$_to_d/work" push -q -u origin main
+  mkdir -p "$_to_d/bin"
+  # stub 1: the SERVER completes the ref update, then the client outlives its own deadline. The move is
+  # done from the BARE side on purpose — a plain `git push` would also update the caller's
+  # refs/remotes/origin/main, and that cache being STALE is half the live defect (a killed client never
+  # writes it). Reproduce the server-moved / cache-stale state, or the cache-repair arm is vacuous.
+  { echo '#!/usr/bin/env bash'
+    echo "for a in \"\$@\"; do [ \"\$a\" = push ] && { $_REALGIT -C '$_to_d/origin.git' fetch -q '$_to_d/work' main:main >/dev/null 2>&1; sleep 5; exit 0; }; done"
+    echo "exec $_REALGIT \"\$@\""
+  } > "$_to_d/bin/git"
+  # stub 2: the push never reaches the server, and simply outlives the deadline
+  mkdir -p "$_to_d/bin2"
+  printf '#!/usr/bin/env bash\nfor a in "$@"; do [ "$a" = push ] && { sleep 5; exit 0; }; done\nexec %s "$@"\n' "$_REALGIT" > "$_to_d/bin2/git"
+  # stub 3: the push outlives the deadline AND the server cannot be asked afterwards
+  mkdir -p "$_to_d/bin3"
+  printf '#!/usr/bin/env bash\nfor a in "$@"; do [ "$a" = push ] && { sleep 5; exit 0; }; [ "$a" = ls-remote ] && exit 1; done\nexec %s "$@"\n' "$_REALGIT" > "$_to_d/bin3/git"
+  chmod +x "$_to_d/bin/git" "$_to_d/bin2/git" "$_to_d/bin3/git"
+  echo two > "$_to_d/work/f"; git -C "$_to_d/work" commit -qam two
+  _to_want="$(git -C "$_to_d/work" rev-parse main)"
+  # ARM 1 (the measured case, MUST be red against the pre-fix code): killed client, moved ref → landed.
+  # NOTE the assignment discipline: `VAR=x some_function` PERSISTS in bash (it is not a command), so a
+  # `PATH=... push_heal` prefix would leave the stub on PATH for every later arm in this file. Set and
+  # restore explicitly instead.
+  _to_oldpath="$PATH"
+  PATH="$_to_d/bin:$PATH"; MESH_LAND_PUSH_TIMEOUT=1; _to_out="$(push_heal "$_to_d/work" 2>&1)"; _to_rc=$?; PATH="$_to_oldpath"
+  [ "$(git -C "$_to_d/origin.git" rev-parse main)" = "$_to_want" ] \
+    || { echo "smoke-test: FAIL (push-timeout fixture never moved the origin ref — the fixture cannot reproduce the bug it is for)"; exit 1; }
+  [ "$_to_rc" = 0 ] && printf '%s' "$_to_out" | grep -qF 'SERVER HAS' \
+    || { echo "smoke-test: FAIL (a push that TIMED OUT while the server completed the ref update was reported as not-landed: rc=$_to_rc '$_to_out') — the client's patience is being reported as the remote's content"; exit 1; }
+  # …and the local cache must be repaired, or the very next in_origin() re-derives LOCAL-ONLY from it.
+  [ "$(git -C "$_to_d/work" rev-parse refs/remotes/origin/main)" = "$_to_want" ] \
+    || { echo "smoke-test: FAIL (push_heal proved the server has the commit but left refs/remotes/origin/main stale — the next reader repeats the false LOCAL-ONLY)"; exit 1; }
+  in_origin "$_to_d/work" \
+    || { echo "smoke-test: FAIL (in_origin still says the commit is not in origin after push_heal proved the server has it)"; exit 1; }
+  # ARM 2 — CONTROL, the same timeout with the ref NOT moved: the old absolute wording is still right.
+  # Without this arm ARM 1 would pass on code that simply never says LOCAL-ONLY again.
+  echo three > "$_to_d/work/f"; git -C "$_to_d/work" commit -qam three
+  PATH="$_to_d/bin2:$_to_oldpath"; _to_out2="$(push_heal "$_to_d/work" 2>&1)"; _to_rc2=$?; PATH="$_to_oldpath"
+  [ "$_to_rc2" = 1 ] && printf '%s' "$_to_out2" | grep -qF 'does NOT have it' \
+    || { echo "smoke-test: FAIL (a push that timed out and genuinely did NOT reach the server was not reported as not-landed: rc=$_to_rc2 '$_to_out2')"; exit 1; }
+  in_origin "$_to_d/work" \
+    && { echo "smoke-test: FAIL (in_origin called a genuinely unpushed commit landed — the cure inverted the verdict)"; exit 1; }
+  # ARM 3 — the polarity of the UNKNOWN: server unaskable is rc 2, never LOCAL-ONLY. "always push" is
+  # standing doctrine, so a false LOCAL-ONLY sends the next mind chasing a push that already happened.
+  PATH="$_to_d/bin3:$_to_oldpath"; _to_out3="$(push_heal "$_to_d/work" 2>&1)"; _to_rc3=$?
+  [ "$_to_rc3" = 2 ] && printf '%s' "$_to_out3" | grep -qF 'UNKNOWN' \
+    || { echo "smoke-test: FAIL (an unaskable server did not render UNKNOWN rc=2: rc=$_to_rc3 '$_to_out3')"; exit 1; }
+  in_origin "$_to_d/work" > /dev/null 2>&1; _to_io=$?; PATH="$_to_oldpath"; unset MESH_LAND_PUSH_TIMEOUT
+  [ "$_to_io" = 2 ] || { echo "smoke-test: FAIL (in_origin answered $_to_io, not UNKNOWN(2), while the server could not be asked — the board post would name a state nobody measured)"; exit 1; }
+  rm -rf "$_to_d"
   # UNREACHABLE ORIGIN (2026-08-16 14:33Z): the same repo, the same local commits, the only change is
   # that origin cannot be reached — so every ref comparison below runs against a STALE cached
   # origin/main. Both readers must render UNKNOWN, and reconcile_divergence must post NO strand.
@@ -2289,7 +2410,11 @@ _ci_err="$(git commit -q -m "$commit_msg" -- "${cands[@]}" ${removals[@]+"${remo
 # (113 posts, not one of them naming the conflicting commit, so nobody ever picked it up).
 _push_reason="$(push_heal "$REPO")"; _push_rc=$?
 [ -n "$_push_reason" ] && printf '%s\n' "$_push_reason"
-[ "$_push_rc" = 0 ] || echo "mesh-land: PUSH FAILED — the commit is LOCAL-ONLY (deploy below still ran); --push-heal retries next tick"
+case "$_push_rc" in
+  0) : ;;
+  2) echo "mesh-land: PUSH UNKNOWN — the push did not exit 0 and the server could not be asked, so whether the commit reached the genome is UNMEASURED (deploy below still ran); --push-heal retries next tick" ;;
+  *) echo "mesh-land: PUSH FAILED — the server was asked and does NOT have the commit, so it is LOCAL-ONLY (deploy below still ran); --push-heal retries next tick" ;;
+esac
 _push_reason="$(printf '%s' "$_push_reason" | tail -1 | sed -E 's/^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]+Z //')"
 # ATOMIC deploy (.tmp → mv -f): mesh-land deploys mesh-* tools, many cron-wired, into the LIVE bin.
 # A bare 'cp' truncate-then-writes in place → a concurrent cron exec can read a half-written file →
