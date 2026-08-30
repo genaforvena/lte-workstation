@@ -27,11 +27,25 @@
 # not be pushed through one), then `sudo -n` — never a password prompt, which would hang a reflex.
 # The stderr of whichever attempt failed is RETURNED, so the ledger can name the refusal instead of
 # printing a generic non-zero.
+#
+# A TIMEOUT IS NOT A DENIAL, and both used to print the same shape. Measured on mesh-home
+# 2026-08-30T21:21:13Z: `RESTORE-FAILED ... err=[Access denied: checkprefs access denied ... | sudo: ]`
+# — the sudo half's text is EMPTY, because `timeout 15` killed it (rc 124) rather than sudo refusing.
+# The bound bites exactly when this actuator matters: a pref write during a degraded uplink is the
+# SLOW case, so a 15s cap turns "the network is struggling" into "the restore is impossible", and the
+# node stays off its exit node with every mind dark. The refusal string now NAMES which happened, and
+# the bound is generous and overridable. [[a-timed-out-push-is-not-a-failed-push]]
+TS_SET_TIMEOUT="${MESH_TS_SET_TIMEOUT:-45}"
 ts_set(){
-  local out
-  if out="$(timeout 15 tailscale set "$@" 2>&1)"; then printf '%s' "$out"; return 0; fi
-  local unpriv="$out"
-  if out="$(timeout 15 sudo -n tailscale set "$@" 2>&1)"; then printf 'via-sudo %s' "$out"; return 0; fi
-  printf '%s | sudo: %s' "$(printf '%s' "$unpriv" | tr '\n' ' ' | cut -c1-90)" "$(printf '%s' "$out" | tr '\n' ' ' | cut -c1-60)"
+  local out rc unpriv urc
+  out="$(timeout "$TS_SET_TIMEOUT" tailscale set "$@" 2>&1)"; rc=$?
+  [ "$rc" = 0 ] && { printf '%s' "$out"; return 0; }
+  unpriv="$out"; urc=$rc
+  out="$(timeout "$TS_SET_TIMEOUT" sudo -n tailscale set "$@" 2>&1)"; rc=$?
+  [ "$rc" = 0 ] && { printf 'via-sudo %s' "$out"; return 0; }
+  # 124 is timeout(1)'s own verdict; anything else with empty text is a silent non-zero, which is a
+  # THIRD thing and must not wear either word.
+  _w(){ case "$1" in 124) printf 'TIMED-OUT after %ss' "$TS_SET_TIMEOUT" ;; *) [ -n "$2" ] && printf '%s' "$(printf '%s' "$2" | tr '\n' ' ' | cut -c1-90)" || printf 'rc=%s with no message' "$1" ;; esac; }
+  printf 'unpriv: %s | sudo: %s' "$(_w "$urc" "$unpriv")" "$(_w "$rc" "$out")"
   return 1
 }
