@@ -450,9 +450,18 @@ restores the state, the wakeup restarts the motion. Rules:
   job; STOP it (`stop: true`) the moment you post `[done]`/`[yield]` or go idle. An idle mind's cadence
   belongs to the board/dispatch reflexes with their central spend pace — a self-scheduled wakeup mints
   paid turns off-ledger, exactly the pace-bypass the dispatch hold exists to prevent.
-- **The wakeup prompt carries the pointer, the handoff carries the detail.** Name the task slug + next
-  step in the prompt, so a post-/clear wake knows what it's tending before reading the restored handoff.
-  Make the prompt self-rescheduling — a one-shot wakeup dies silently after one cycle.
+- **The wakeup prompt is a CONSTANT, never a bespoke pointer (operator 2026-08-31, supersedes the
+  "name the task slug in the prompt" rule this line used to state).** A slug baked into the `/loop`
+  prompt string is frozen at schedule time and can go stale before it ever fires; the pane is not — it
+  is exactly the "liveness as a lease" state the top-pane already exists to hold. So the prompt says
+  no more than "check your top-pane" (or is the literal `<<autonomous-loop-dynamic>>` sentinel), and
+  the TASK SLUG + NEXT STEP live on the dash instead — the same move already made for the `goal:` line
+  in the `minds` pane. This is the loop applying the data-pane rule below to itself: a recurring probe
+  a nudge would otherwise re-state every cycle belongs on top, not in the trigger text. **The dash
+  carries the pointer, the handoff carries the full detail** — a mind offloading something for its
+  later self should land the live pointer on the dash immediately and save the narrative for the
+  handoff, not fold both into one text document. Still make the prompt self-rescheduling regardless —
+  a one-shot wakeup dies silently after one cycle.
 - **Delay: match what you're waiting for**; 1200–1800s as the do-work fallback. Never sub-5-min polling
   for something the harness will notify you about anyway.
 - **A pending wakeup is INVISIBLE state** — nothing in the pane or board shows it exists. Treat a loop
