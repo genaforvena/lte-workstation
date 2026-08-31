@@ -284,6 +284,11 @@ the case is the evidence, and mixing them is what made this section a wall nobod
   so parse and `--test` are green by construction; discriminate on content PROVENANCE against the
   ancestor blob, and give the hold its own REMEDY, since "review + apply" completes the defect.
   [[a-settle-gate-measures-age-not-origin-so-a-replayed-tree-settles-like-a-thought]]
+- **Every suppressor added to an alarm's BAD edge must be ANSWERED at its OK edge** — gate the
+  recovery on "was the degradation actually announced?", assert it ONCE after the whole suppressor
+  chain (no single suppressor can own it), and give a suppressed recovery its own WORD so it stays
+  countable; a recovery for an outage nobody was told about teaches the reader the tag means nothing.
+  [[a-suppressor-added-to-one-edge-orphans-its-opposite-edge]]
 
 ## Substrate changes & multi-agent coordination
 
