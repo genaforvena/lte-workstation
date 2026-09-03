@@ -709,6 +709,9 @@ dead-on-arrival orphan stays visible.
   `mesh-gmail-note3` (the PHYSICAL-DEVICE credential lane — reads the operator's Gmail off his
   rooted Note 3 over adb, no password anywhere in the mesh; consumed by `mesh-job-mail`'s second
   lane, invoked by hand otherwise) ·
+  `mesh-contact-name` (caller-ID off the same Note3 lane — resolves a bare number to a
+  contacts2.db display_name; consumed by `mesh-sms`/`mesh-sms-rx`/`mesh-sms-monitor` display lines,
+  invoked by hand otherwise) ·
   `mesh-overview` · `mesh-operator-context` · `mesh-operator-engagement` (these two overlap — operator-activity
   fusion) · `mesh-social-fusion` · `mesh-net-io` · `mesh-socket-state` · `mesh-power-source` ·
   `mesh-travels`
