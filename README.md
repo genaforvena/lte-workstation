@@ -94,6 +94,24 @@ write-ups of one specific investigation — and most of those are post-mortems o
 - **Produces** — a sound-studio lane that measures a recording's character and grinds it into new
   audio; a publishing lane; a Uxn lane where gates compile to tiny ROMs that run byte-identically on
   x86 and 32-bit ARM ([`mesh-uxn-core`](https://github.com/genaforvena/mesh-uxn-core)).
+- **Measures its own drift** — [`mesh-tiny-fleet`](scripts/mesh-tiny-fleet) trains two tiny models on
+  different codebase snapshots (M₁ on v1.0, M₂ on v2.0), prompts both with the same incomplete input,
+  and measures the divergence. The difference *is* the architectural drift, expressed generatively.
+  ([full report →](docs/tiny-fleet-drift-report.md))
+
+  > **Key finding:** over 3 months (807 → 4,276 commits), the codebase grew 22x in size — but its
+  > conceptual vocabulary grew **231x** (`coverage`: 6 → 1,383). The drift score between the two
+  > versions' models is **0.50** (135m) / **0.80** (3b). v1 thinks in `check`, `error`, `warn`;
+  > v2 thinks in `gate`, `verdict`, `cadence`, `coverage`, `arm`, `ledger`. The system didn't just
+  > get bigger — it developed a *theory of itself*.
+  >
+  > | Concept | v1 → v2 | Multiplier |
+  > |---------|---------|------------|
+  > | `coverage` | 6 → 1,383 | **231x** |
+  > | `cadence` | 22 → 2,077 | **94x** |
+  > | `arm` | 5 → 2,289 | **458x** |
+  > | `ledger` | 9 → 2,729 | **303x** |
+  > | `verdict` | 131 → 7,672 | **58x** |
 
 ## Plant your own mesh
 
@@ -166,6 +184,7 @@ mesh-tools <category>      # e.g. "Perceive (sensorium)", "Liveness / self-tend"
 | [`docs/coordination.md`](docs/coordination.md) | substrate changes and the single-writer protocol |
 | [`docs/body.md`](docs/body.md) | phone-as-body: termux-api senses and actuators, with verification |
 | [`docs/distributed-embodied-agent.md`](docs/distributed-embodied-agent.md) | the theory, and a Guattari appendix |
+| [`docs/tiny-fleet-drift-report.md`](docs/tiny-fleet-drift-report.md) | architectural drift measurement: how the codebase's vocabulary and concepts evolved |
 | [`CLAUDE.md`](CLAUDE.md) | the doctrine every mind reads on waking |
 
 ## tmux as the nervous system
