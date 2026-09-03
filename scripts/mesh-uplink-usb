@@ -20,10 +20,14 @@
 #   mesh-uplink-usb --up            link up + addr + table 42 default + oif rule   (needs sudo)
 #   mesh-uplink-usb --up --mobile   ...and force the PHONE onto its radio first (see EGRESS below)
 #   mesh-uplink-usb --down          full idempotent rollback (incl. restoring the phone's wifi)
+#   mesh-uplink-usb --heal          EXPLICIT watchdog/dead-tx healer: journal evidence +
+#                                   link down/up, then per-interface driver unbind/bind.
+#                                   Refuses on a healthy link; never runs unwired (see HEAL).
 #   mesh-uplink-usb --status        WHAT IS ACTUALLY UP, item by item — never a bare "ok"
 #   mesh-uplink-usb --probe [host]  curl --interface <dev>; reports the public IP AND classifies
 #                                   the egress against this node's main-route IP
-#   mesh-uplink-usb --test          artifact gate: main bitwise-unchanged, egress classified,
+#   mesh-uplink-usb --test          artifact gate: reason-classifier 3/3, heal-gate 3/3,
+#                                   main bitwise-unchanged, egress classified,
 #                                   --down returns rule+table to empty
 #
 # EGRESS — the thing this tool exists to get, and the thing it must not fake:
@@ -71,6 +75,26 @@
 #        acts, precisely because it is an actuator on the operator's handset. A silent rebind inside
 #        --up would be the same class of act with none of the consent.
 #   If a rebind is ever wanted it belongs in an explicit verb a human types, never in --up.
+#
+# HEAL — that explicit verb is `--heal` (added 2026-09-03 for the 2026-08-31 NETDEV
+#   WATCHDOG wedge: rndis tx queue timeout 01:51:39Z, 9min of tailscale 'network is
+#   unreachable', then a hard power-cycle — the second hand-fix in one night with no
+#   healer owning the class). It is the compliant form of the rebind this note refuses
+#   to put in --up:
+#     · EXPLICIT and UNWIRED. Nothing calls it on a cadence — this tool stays orphan-ok
+#       (a raised tether is a metered SIM) and --up never invokes it. A human types it
+#       instead of power-cycling the node.
+#     · HEALTH-GATED. It refuses when the link looks alive (operstate up, addressed,
+#       zero WATCHDOG lines for the device in the current boot journal), so it can never
+#       sever a working path — the same safety shape as mesh-link-heal's "fires only
+#       when already not carrying traffic".
+#     · LADDER, in increasing blast radius: (1) `ip link down/up` on the netdev;
+#       (2) per-interface unbind/bind of the USB interface on its driver (NOT a
+#       composite reset — the adb interface 3-1:1.2 is untouched by the write itself,
+#       but Android may still tear down its rndis function on a host-side link drop,
+#       so the verb says so and re-checks adb afterwards where possible).
+#   Evidence first: every run prints the journal WATCHDOG count for the device (current
+#   boot) plus operstate/addr, so a no-evidence run is a diagnosis, not a repair.
 #
 # BOUNDARIES (fixed in the header so nothing re-derives them from a stale note):
 #   · HSDPA on a metered MTS SIM. This is a MEASUREMENT and emergency-control channel, not bulk.
@@ -352,6 +376,141 @@ do_down() {
   mesh-trace "uplink-usb: --down $DEV (rule+table $TBL cleared, addr removed, link down)" >/dev/null 2>&1 || true
 }
 
+# ── HEAL: explicit watchdog/dead-tx ladder (see HEAL note in --help) ──────────────
+# Fixture hooks: MESH_USB_UPLINK_JOURNAL (a file standing in for `journalctl -b 0 -k`),
+# MESH_USB_UPLINK_ADDRS ("none" or a canned addr line), MESH_USB_UPLINK_DRYRUN=1
+# (print the ladder without writing link/driver state). NETROOT already overrides sysfs.
+operstate_of() { cat "$NETROOT/$1/operstate" 2>/dev/null || ip link show "$1" 2>/dev/null | grep -o 'state [A-Z]*' | awk '{print tolower($2)}'; }
+addrs_of() {
+  [ -n "${MESH_USB_UPLINK_ADDRS:-}" ] && { [ "$MESH_USB_UPLINK_ADDRS" = "none" ] || echo "$MESH_USB_UPLINK_ADDRS"; return; }
+  ip -4 -br addr show "$1" 2>/dev/null | awk '{print $3}' | grep .
+}
+watchdog_count() {   # $1 = dev (may be empty → any rndis/cdc watchdog line)
+  local j="${MESH_USB_UPLINK_JOURNAL:-}" lines
+  if [ -n "$j" ]; then lines="$(cat "$j" 2>/dev/null | grep 'NETDEV WATCHDOG' || true)"
+  else lines="$(journalctl -b 0 -k 2>/dev/null | grep 'NETDEV WATCHDOG' || true)"; fi
+  [ -z "$lines" ] && { echo 0; return; }
+  if [ -n "$1" ]; then echo "$lines" | grep -c "$1\|rndis_host\|rndis_wlan\|cdc_ether" || true
+  else echo "$lines" | grep -c 'rndis_host\|rndis_wlan\|cdc_ether' || true; fi
+}
+link_recovered() {   # DEV must exist, operstate up, any v4 addr
+  [ -n "$DEV" ] || return 1
+  [ "$(operstate_of "$DEV")" = "up" ] || return 1
+  [ -n "$(addrs_of "$DEV")" ] || return 1
+  return 0
+}
+usbif_for_dev() {   # $1 = netdev → "<usbif-path>\t<driver>"
+  local want ifs TAB
+  TAB="$(printf '\t')"
+  want="$(readlink -f "$NETROOT/$1/device" 2>/dev/null)"
+  [ -n "$want" ] || return 1
+  ifs="$(tether_usbifs)"
+  echo "$ifs" | while IFS="$TAB" read -r usbif drv; do
+    [ "$usbif" = "$want" ] && { printf '%s\t%s\n' "$usbif" "$drv"; exit 0; }
+  done
+}
+
+do_heal() {
+  local wd op addrs row usbif drv TAB dry
+  TAB="$(printf '\t')"
+  dry="${MESH_USB_UPLINK_DRYRUN:-0}"
+  if [ -z "$DEV" ] && [ -z "$(tether_usbifs)" ]; then
+    echo "uplink-usb --heal: n/a (no rndis/cdc tether interface — phone not on USB, or tethering off)"
+    log "heal n/a no-dev state=NO-TETHER-IFACE"; exit 2
+  fi
+  wd="$(watchdog_count "$DEV")"
+  if [ -n "$DEV" ]; then op="$(operstate_of "$DEV")"; addrs="$(addrs_of "$DEV" | tr '\n' ' ')"
+  else op="(no netdev)"; addrs=""; fi
+  echo "heal evidence: dev=${DEV:-<none>} operstate=$op addrs=${addrs:-none} watchdog_current_boot=$wd"
+  if [ -n "$DEV" ] && [ "$op" = "up" ] && [ -n "$addrs" ] && [ "$wd" = 0 ]; then
+    echo "heal: REFUSING — link looks alive (up + addressed + zero WATCHDOG lines this boot)."
+    echo "      --heal is for a wedged tether, not a working one; see --status."
+    log "heal REFUSED healthy dev=$DEV"; exit 1
+  fi
+  # Rung 1 — link bounce (netdev exists only).
+  if [ -n "$DEV" ]; then
+    echo "heal rung 1: ip link down/up $DEV"
+    if [ "$dry" = 1 ]; then echo "  (dry-run: no writes) rung 1 attempted"
+    elif sudo ip link set dev "$DEV" down 2>/dev/null && sleep 2 && sudo ip link set dev "$DEV" up 2>/dev/null; then
+      sleep 3
+      if link_recovered; then
+        echo "heal: RECOVERED at rung 1 (link bounce) — dev=$DEV operstate=$(operstate_of "$DEV") addrs=$(addrs_of "$DEV" | tr '\n' ' ')"
+        log "heal RECOVERED rung=1 dev=$DEV wd=$wd"; mesh-trace "uplink-usb: --heal RECOVERED at rung 1 (link bounce) $DEV" >/dev/null 2>&1 || true
+        exit 0
+      else echo "  rung 1 done, link still not recovered (operstate=$(operstate_of "$DEV"), addrs=$(addrs_of "$DEV" | tr '\n' ' ' || echo none)) — continuing"
+      fi
+    else echo "  rung 1 FAILED (link write refused — need root); continuing to rung 2's diagnosis"
+    fi
+  else echo "heal rung 1: SKIPPED (no netdev — nothing to bounce; see BOUND-NO-NETDEV in --status)"
+  fi
+  # Rung 2 — per-interface driver unbind/bind.
+  row="$(usbif_for_dev "$DEV" 2>/dev/null || true)"
+  [ -z "$row" ] && row="$(tether_usbifs | head -1)"
+  usbif="${row%%$TAB*}"; drv="${row##*$TAB}"
+  if [ -z "$usbif" ] || [ -z "$drv" ]; then
+    echo "heal rung 2: no bound tether USB interface found — nothing to rebind."
+    log "heal FAILED rung=2 no-usbif dev=$DEV wd=$wd"; exit 1
+  fi
+  echo "heal rung 2: rebind $(basename "$usbif") on driver $drv (per-interface only — NOT a composite reset;"
+  echo "  the adb interface on the same device is untouched by the write itself, but Android may tear"
+  echo "  down its rndis function on a host-side link drop: re-check adb + tethering afterwards)"
+  if [ "$dry" = 1 ]; then
+    echo "  (dry-run: no writes) rung 2 attempted — real commands:"
+    echo "    echo $(basename "$usbif") | sudo tee /sys/bus/usb/drivers/$drv/unbind"
+    echo "    echo $(basename "$usbif") | sudo tee /sys/bus/usb/drivers/$drv/bind"
+    log "heal dry-run rung=2 usbif=$(basename "$usbif") drv=$drv wd=$wd"; exit 1
+  fi
+  if echo "$(basename "$usbif")" | sudo tee "/sys/bus/usb/drivers/$drv/unbind" >/dev/null 2>&1; then
+    sleep 3
+    if echo "$(basename "$usbif")" | sudo tee "/sys/bus/usb/drivers/$drv/bind" >/dev/null 2>&1; then
+      sleep 5
+      DEV="$(find_dev)"
+      if [ -n "$DEV" ] && link_recovered; then
+        echo "heal: RECOVERED at rung 2 (rebind) — dev=$DEV operstate=$(operstate_of "$DEV")"
+        log "heal RECOVERED rung=2 dev=$DEV wd=$wd"; mesh-trace "uplink-usb: --heal RECOVERED at rung 2 (rebind) $DEV" >/dev/null 2>&1 || true
+        exit 0
+      fi
+      echo "heal: rung 2 writes succeeded but link not recovered (dev=${DEV:-<none>}) — needs a human (re-toggle tethering on the handset, then --status)"
+      log "heal FAILED rung=2 writes-ok dev=${DEV:-none} wd=$wd"; exit 1
+    fi
+  fi
+  echo "heal: rung 2 REFUSED/FAILED (driver bind/unbind needs root) — by hand:"
+  echo "    echo $(basename "$usbif") | sudo tee /sys/bus/usb/drivers/$drv/unbind"
+  echo "    echo $(basename "$usbif") | sudo tee /sys/bus/usb/drivers/$drv/bind"
+  log "heal FAILED rung=2 refused dev=$DEV wd=$wd"; exit 1
+}
+
+# Fixture gate for --heal: H1 absent-hardware → rc 2 n/a; H2 healthy fixture → REFUSE;
+# H3 wedged fixture (dry-run) → ladder attempted, never refused. Throwaway log throughout.
+heal_fixture_gate() {
+  local F out rc f=0
+  F="$(mktemp -d)" || { echo "  FAIL: heal-gate could not make a fixture dir"; return 1; }
+  mkdir -p "$F/net" "$F/usb0" "$F/net2/enx9/device" "$F/usb2/3-9:1.0" "$F/drv"
+  : > "$F/drv/rndis_host"
+  : > "$F/empty.journal"
+  printf 'rndis_host 3-1:1.0 enx9: NETDEV WATCHDOG: CPU: 0: transmit queue 0 timed out 5195 ms\n' > "$F/wd.journal"
+  # H2/H3 fake netdev enx9 bound to rndis_host, on USB iface 3-9:1.0
+  # (net2/enx9/device is a symlink to the USB interface dir, as on a live node)
+  ln -s "$F/drv/rndis_host" "$F/usb2/3-9:1.0/driver"; echo e0 > "$F/usb2/3-9:1.0/bInterfaceClass"
+  mkdir -p "$F/net2/enx9"; ln -s "$F/usb2/3-9:1.0" "$F/net2/enx9/device"
+  # H1: nothing bound anywhere.
+  out="$(MESH_USB_UPLINK_USBROOT="$F/usb0" MESH_USB_UPLINK_NETROOT="$F/net" MESH_USB_UPLINK_DEV="" MESH_USB_UPLINK_LOG="$F/f.log" "$0" --heal 2>&1)"; rc=$?
+  case "$out" in *"n/a"*) ;; *) echo "  FAIL: heal-gate H1 (absent hw) did not say n/a"; echo "$out" | sed 's/^/      /'; f=1;; esac
+  [ "$rc" = 2 ] || { echo "  FAIL: heal-gate H1 rc=$rc, want 2"; f=1; }
+  # H2: healthy — operstate up + addr + zero watchdog → REFUSE.
+  echo up > "$F/net2/enx9/operstate"
+  out="$(MESH_USB_UPLINK_USBROOT="$F/usb2" MESH_USB_UPLINK_NETROOT="$F/net2" MESH_USB_UPLINK_DEV="enx9" MESH_USB_UPLINK_ADDRS="192.168.42.130/24" MESH_USB_UPLINK_JOURNAL="$F/empty.journal" MESH_USB_UPLINK_LOG="$F/f.log" "$0" --heal 2>&1)"; rc=$?
+  case "$out" in *"REFUSING"*) ;; *) echo "  FAIL: heal-gate H2 (healthy) did not REFUSE"; echo "$out" | sed 's/^/      /'; f=1;; esac
+  [ "$rc" = 1 ] || { echo "  FAIL: heal-gate H2 rc=$rc, want 1"; f=1; }
+  # H3: wedged — operstate down + watchdog present → ladder attempted (dry-run, no writes).
+  echo down > "$F/net2/enx9/operstate"
+  out="$(MESH_USB_UPLINK_USBROOT="$F/usb2" MESH_USB_UPLINK_NETROOT="$F/net2" MESH_USB_UPLINK_DEV="enx9" MESH_USB_UPLINK_ADDRS="none" MESH_USB_UPLINK_JOURNAL="$F/wd.journal" MESH_USB_UPLINK_DRYRUN=1 MESH_USB_UPLINK_LOG="$F/f.log" "$0" --heal 2>&1)"; rc=$?
+  case "$out" in *"rung 1"*|*"rung 2"*) ;; *) echo "  FAIL: heal-gate H3 (wedged) attempted no rung"; echo "$out" | sed 's/^/      /'; f=1;; esac
+  case "$out" in *"REFUSING"*) echo "  FAIL: heal-gate H3 REFUSED a wedged link"; f=1;; esac
+  rm -rf "$F"
+  return "$f"
+}
+
 classify_egress() {   # $1 = probe IP, $2 = main IP → prints the verdict, names the mechanism
   local pip="$1" mip="$2" pdev roam
   if [ -z "$pip" ]; then
@@ -387,6 +546,8 @@ case "${1:---status}" in
   do_up "$M"; echo; exec "$0" --status
   ;;
 --down) do_down; echo "down: rule/table $TBL cleared"; ;;
+
+--heal) do_heal; ;;
 
 --status)
   [ -n "$DEV" ] || no_dev
@@ -427,6 +588,11 @@ case "${1:---status}" in
     echo "  reason-classifier: 3/3 arms asserted (no-iface · bound-no-netdev · data-iface-only)"
   else
     echo "  reason-classifier: FAILED (see above)"; f=1
+  fi
+  if heal_fixture_gate; then
+    echo "  heal-gate: 3/3 arms asserted (absent-n/a · healthy-refuse · wedged-ladder)"
+  else
+    echo "  heal-gate: FAILED (see above)"; f=1
   fi
   [ -n "$DEV" ] || { [ "$f" = 0 ] || { echo "smoke-test: FAIL"; exit 1; }; echo "smoke-test: n/a (no tether interface — reason classifier asserted)"; exit 2; }
   phone_up || { echo "smoke-test: n/a (phone not on adb)"; exit 2; }
