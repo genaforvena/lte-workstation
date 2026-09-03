@@ -1,0 +1,376 @@
+#!/usr/bin/env python3
+# orphan-ok: on-demand lookup pulled by mesh-sms-rx/mesh-sms-monitor/mesh-sms, never itself scheduled.
+"""mesh-contact-name — caller-ID resolution off the Note3's synced Contacts DB.
+
+  mesh-contact-name <number>   print the contact's display_name (exit 0),
+                               exit 1 = no match, exit 2 = organ unreachable
+  mesh-contact-name --refresh  force a fresh pull, then resolve (or just refresh)
+  mesh-contact-name --status   cache age + row counts, no pull
+  mesh-contact-name --test     selftest (drives the REAL phone path)
+
+Same rooted-adb lane mesh-gmail-note3 already uses for mail: `su -c` for root,
+`adb exec-out` (NEVER `adb shell` — it mangles binary LF->CRLF on this device)
+for the pull, byte-exactness asserted against the device's own `ls -l`.
+Read-only; nothing is written to the phone.
+
+Source: /data/data/com.android.providers.contacts/databases/contacts2.db
+(+ -wal/-shm siblings; WAL mode needs them alongside). Join:
+  raw_contacts.display_name via data.raw_contact_id = raw_contacts._id
+  where mimetypes.mimetype = 'vnd.android.cursor.item/phone_v2'
+(`contacts` carries no display_name — that lives on raw_contacts.)
+
+Two measured quirks of THIS db (2026-09-03, re-proven live — sizes byte-exact
+1150976/32768/4280712, 327 non-deleted raw_contacts, 334 phone rows):
+* Samsung's PHONEBOOK collation lives ONLY on sort_key/sort_key_alt + index;
+  the 2026-09-03 probe tripped it via `pragma integrity_check`, which walks
+  that index. This tool's join path never compares those columns, so there is
+  deliberately NO collation shim — a no-shim mutant of this file goes green,
+  which is the standing proof (not an untested claim).
+* `pragma integrity_check` reports "row 3 missing from index
+  raw_contact_sort_key2_index" on a HEALTHY byte-exact pull — so the pull is
+  gated on the size match (the doctrine's artifact), never on integrity_check.
+  mesh-gmail-note3 gates on integrity_check for ITS db; that gate does not
+  transfer here.
+
+Number matching: stored numbers mix +7/8-trunk, spaces, parens, and USSD
+short codes (*100#). Both sides reduce to digits; a match needs either exact
+equality or a shared suffix with the shorter side >= 7 digits (last-10 wins
+for full RU mobiles, so 8-trunk and +7-trunk collide). Short codes match
+exactly only. Longest stored match wins.
+
+Cache: ~/.mesh/contact-name/ (db + siblings, refreshed when older than 24h).
+Operator's own device, same consent model as the gmail lane (access = holding
+the phone, nothing replayable). Callers MUST fall back to the bare number on
+exit 1/2 — an unreachable phone is never a failed SMS poll.
+"""
+import argparse
+import json
+import os
+import pathlib
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+
+HOME = pathlib.Path.home()
+CACHE = HOME / ".mesh" / "contact-name"
+CDIR = "/data/data/com.android.providers.contacts/databases"
+CDB = "contacts2.db"
+MAXAGE = 86400        # seconds a cached pull stays usable without --refresh
+PHONE_MIMETYPE = "vnd.android.cursor.item/phone_v2"
+
+
+class Absent(Exception):
+    """Organ unreachable — renders n/a (exit 2), never a fabricated miss."""
+
+
+def adb(*args, timeout=90, binary=False):
+    cmd = ["adb"] + list(args)
+    try:
+        p = subprocess.run(cmd, capture_output=True, timeout=timeout)
+    except FileNotFoundError:
+        raise Absent("adb not installed")
+    except subprocess.TimeoutExpired:
+        raise Absent("adb timed out: " + " ".join(args))
+    if binary:
+        return p.returncode, p.stdout, p.stderr.decode("utf-8", "replace")
+    return p.returncode, p.stdout.decode("utf-8", "replace"), p.stderr.decode("utf-8", "replace")
+
+
+def device():
+    rc, out, _ = adb("devices", timeout=20)
+    if rc != 0:
+        raise Absent("adb devices failed")
+    devs = [l.split()[0] for l in out.splitlines()[1:] if l.strip().endswith("device")]
+    if not devs:
+        raise Absent("no adb device attached (Note 3 off or unplugged)")
+    return devs[0]
+
+
+def su(cmd, timeout=120, binary=False):
+    """Run cmd as root on the phone. exec-out, NEVER shell (CRLF mangling)."""
+    return adb("exec-out", "su -c '%s'" % cmd, timeout=timeout, binary=binary)
+
+
+def dev_size(path):
+    """Device's own size for path via `ls -l` (no wc/stat/busybox on this phone)."""
+    rc, out, _ = su("ls -l %s" % path, timeout=30)
+    if rc != 0 or not out.strip():
+        return None
+    for line in out.splitlines():
+        t = line.split()
+        for i, tok in enumerate(t):
+            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", tok) and i and t[i - 1].isdigit():
+                return int(t[i - 1])
+    return None
+
+
+def pull(destdir):
+    """Pull db+wal+shm byte-exactly into destdir. Raises Absent/SystemExit."""
+    destdir.mkdir(parents=True, exist_ok=True)
+    for suffix in ("", "-wal", "-shm"):
+        src = "%s/%s%s" % (CDIR, CDB, suffix)
+        want = dev_size(src)
+        if want is None:
+            if suffix:  # missing -shm (or -wal) is normal on a checkpointed db
+                (destdir / (CDB + suffix)).unlink(missing_ok=True)
+                continue
+            raise Absent("cannot stat %s on device" % src)
+        rc, data, err = su("cat %s" % src, timeout=240, binary=True)
+        if rc != 0:
+            raise Absent("root cat %s failed: %s" % (src, err.strip()[:120]))
+        if len(data) != want:
+            raise SystemExit(
+                "mesh-contact-name: pulled %d bytes, device says %d for %s — "
+                "transport mangled it. Refusing to read." % (len(data), want, src))
+        if not suffix and not data.startswith(b"SQLite format 3\x00"):
+            raise SystemExit("mesh-contact-name: %s is not a SQLite file" % src)
+        (destdir / (CDB + suffix)).write_bytes(data)
+    return destdir / CDB
+
+
+def open_db(path):
+    """Read-only open. No collation shim: Samsung's PHONEBOOK collation lives
+    ONLY on raw_contacts.sort_key/sort_key_alt and their index (that index is
+    what broke `pragma integrity_check` in the 2026-09-03 probe) — this tool's
+    join path never compares those columns, proven by the --test live arms
+    running shim-less. If a future query touches sort_key, THAT change adds
+    the create_collation line and a red-proven arm with it."""
+    return sqlite3.connect("file:%s?mode=ro" % path, uri=True)
+
+
+def pairs(dbpath):
+    """All (raw_number, display_name) phone rows for live contacts.
+
+    ORDER BY raw_contact_id: one number can sit under several near-duplicate
+    contacts (measured live: the same ...4001 under '09 Вторая память' AND
+    '09.Вторая память'), so ties resolve to the lowest id — deterministic
+    across pulls, never row-order luck."""
+    con = open_db(dbpath)
+    try:
+        return con.execute(
+            "select d.data1, rc.display_name from data d "
+            "join mimetypes m on d.mimetype_id = m._id "
+            "join raw_contacts rc on d.raw_contact_id = rc._id "
+            "where m.mimetype = ? and rc.deleted = 0 "
+            "and d.data1 is not null and rc.display_name is not null "
+            "order by rc._id",
+            (PHONE_MIMETYPE,)).fetchall()
+    finally:
+        con.close()
+
+
+def digits(s):
+    return re.sub(r"\D", "", s or "")
+
+
+def match_score(query_d, stored_d):
+    """Match strength, or None. Exact > long shared suffix; shorts exact-only."""
+    if not query_d or not stored_d:
+        return None
+    if query_d == stored_d:
+        return (2, len(stored_d))
+    short = min(len(query_d), len(stored_d))
+    if short < 7:
+        return None
+    if query_d.endswith(stored_d) or stored_d.endswith(query_d):
+        return (1, short)
+    # RU trunk tolerance: +7 vs 8 prefix — compare last 10 where both allow
+    if len(query_d) >= 10 and len(stored_d) >= 10 \
+            and query_d[-10:] == stored_d[-10:]:
+        return (1, 10)
+    return None
+
+
+def resolve(number, rows):
+    """Best display_name for number over (raw_number, display_name) rows."""
+    q = digits(number)
+    if not q:
+        return None
+    best = None  # (score_tuple, name)
+    for raw, name in rows:
+        s = match_score(q, digits(raw))
+        if s is None:
+            continue
+        if best is None or s > best[0]:
+            best = (s, name)
+    return best[1] if best else None
+
+
+def local_db(refresh=False):
+    CACHE.mkdir(parents=True, exist_ok=True)
+    dest = CACHE / CDB
+    if not refresh and dest.exists() and time.time() - dest.stat().st_mtime < MAXAGE:
+        return dest, False
+    device()
+    pull(CACHE)
+    return dest, True
+
+
+def cache_age():
+    dest = CACHE / CDB
+    if not dest.exists():
+        return None
+    return time.time() - dest.stat().st_mtime
+
+
+def selftest():
+    ok = True
+
+    def chk(name, cond, detail=""):
+        nonlocal ok
+        print("  %s %s%s" % ("ok  " if cond else "FAIL", name,
+                             (" — " + detail) if detail else ""))
+        ok = ok and cond
+
+    print("mesh-contact-name --test")
+    # Leg 1 — pure normalization fixtures (no phone; must hold regardless).
+    chk("exact match wins", resolve("+79001234567", [("+79001234567", "A")]) == "A")
+    chk("8-trunk matches +7 (last-10)",
+        resolve("89001234567", [("+79001234567", "B")]) == "B")
+    chk("spaced/paren format matches",
+        resolve("+7 (900) 123-45-67", [("89001234567", "C")]) == "C")
+    chk("short code needs exact",
+        resolve("*100#", [("*100#", "Bal")]) == "Bal")
+    chk("short code does not suffix-match",
+        resolve("00#", [("*100#", "Bal")]) is None)
+    chk("unknown long number misses",
+        resolve("+79990000000", [("+79001234567", "A")]) is None)
+    chk("empty query misses", resolve("", [("+79001234567", "A")]) is None)
+    chk("longest stored match wins",
+        resolve("+79001234567", [("1234567", "Short"), ("+79001234567", "Full")]) == "Full")
+
+    # Leg 2 — the REAL path: live pull, byte-exact, live lookup self-consistency.
+    try:
+        dev = device()
+    except Absent as e:
+        print("  n/a — %s" % e)
+        print("mesh-contact-name: organ absent (exit 2)")
+        return 2
+    print("  device: %s" % dev)
+    sizes_ok = True
+    for suffix in ("", "-wal", "-shm"):
+        want = dev_size("%s/%s%s" % (CDIR, CDB, suffix))
+        if want is None and suffix:
+            print("  (no %s%s on device — checkpointed, ok)" % (CDB, suffix))
+            continue
+        chk("device reports a size for %s%s" % (CDB, suffix), bool(want), str(want))
+        sizes_ok = sizes_ok and bool(want)
+    tmp = pathlib.Path(tempfile.mkdtemp(prefix="mesh-contact-name-test-"))
+    try:
+        try:
+            dbpath = pull(tmp)
+        except Absent as e:
+            print("  n/a — %s" % e)
+            return 2
+        # Byte-exactness re-asserted locally: what we hold == what device said.
+        for suffix in ("", "-wal", "-shm"):
+            want = dev_size("%s/%s%s" % (CDIR, CDB, suffix))
+            got = tmp / (CDB + suffix)
+            if want is None:
+                chk("no %s%s on either side" % (CDB, suffix), not got.exists())
+            else:
+                chk("exec-out pull of %s%s is byte-exact" % (CDB, suffix),
+                    got.exists() and got.stat().st_size == want,
+                    "%d vs %d" % (got.stat().st_size if got.exists() else -1, want))
+        try:
+            rows = pairs(dbpath)
+        except sqlite3.OperationalError as e:
+            chk("db opens under the PHONEBOOK shim (got: %s)" % e, False)
+            rows = []
+        chk("phone-number rows present", len(rows) > 0, "%d rows" % len(rows))
+        # Self-consistency on LIVE data: a stored number must resolve to a
+        # name stored FOR THOSE DIGITS (membership, not identity — one number
+        # can sit under several near-duplicate contacts, measured live, so
+        # asserting "its own row's name" over-claims; determinism comes from
+        # the ORDER BY in pairs(), asserted by resolving twice).
+        from collections import defaultdict
+        by_digits = defaultdict(set)
+        for raw, name in rows:
+            by_digits[digits(raw)].add(name)
+        sample = [r for r in rows if len(digits(r[0])) >= 7][:5]
+        for raw, name in sample:
+            got = resolve(raw, rows)
+            chk("live lookup %s.. -> a name stored for those digits" % digits(raw)[-4:],
+                got in by_digits[digits(raw)], str(got)[:24])
+        if sample:
+            chk("repeat lookup is deterministic",
+                resolve(sample[0][0], rows) == resolve(sample[0][0], rows))
+        # Negative arm on live data: a reserved-fiction number must miss
+        # (a matcher that matches everything is not a matcher).
+        chk("fiction number +79990000000 misses on live data",
+            resolve("+79990000000", rows) is None)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    print("mesh-contact-name: %s" % ("PASS" if ok else "FAIL"))
+    return 0 if ok else 1
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("number", nargs="?", help="phone number to resolve")
+    ap.add_argument("--refresh", action="store_true",
+                    help="force a fresh pull from the phone")
+    ap.add_argument("--status", action="store_true",
+                    help="cache age + row counts, no pull")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--test", action="store_true")
+    a = ap.parse_args()
+
+    if a.test:
+        return selftest()
+
+    if a.status:
+        age = cache_age()
+        info = {"cached": age is not None,
+                "age_s": round(age, 1) if age is not None else None}
+        if age is not None:
+            try:
+                rows = pairs(CACHE / CDB)
+                info["phone_rows"] = len(rows)
+                info["named"] = len(set(n for _, n in rows))
+            except Exception as e:
+                info["error"] = str(e)[:120]
+        print(json.dumps(info, ensure_ascii=False) if a.json
+              else ("contact-name: " + (json.dumps(info, ensure_ascii=False)
+                                        if age is None else
+                                        "cached %.0fs old, %s phone rows / %s names"
+                                        % (age, info.get("phone_rows", "?"),
+                                           info.get("named", "?")))))
+        return 0
+
+    try:
+        dbpath, fresh = local_db(a.refresh)
+    except Absent as e:
+        print("mesh-contact-name: n/a — %s" % e, file=sys.stderr)
+        return 2
+    try:
+        rows = pairs(dbpath)
+    except sqlite3.OperationalError as e:
+        print("mesh-contact-name: cannot read db (%s)" % e, file=sys.stderr)
+        return 1
+    if a.refresh and a.number is None:
+        print("mesh-contact-name: cache refreshed (%d phone rows, pull=%s)"
+              % (len(rows), "fresh" if fresh else "cached"))
+        return 0
+    if not a.number:
+        print("mesh-contact-name: no number given", file=sys.stderr)
+        return 1
+    name = resolve(a.number, rows)
+    if name is None:
+        return 1
+    if a.json:
+        print(json.dumps({"number": a.number, "name": name}, ensure_ascii=False))
+    else:
+        print(name)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
