@@ -1,0 +1,630 @@
+#!/usr/bin/env bash
+# mesh-tiny-fleet — architectural drift detector via generative comparison.
+#
+# The core idea: train two tiny models (M₁, M₂) on different codebase snapshots,
+# then prompt both with the same incomplete input. The difference IS the drift.
+#
+# In practice we use ollama Modelfiles with version-specific system prompts +
+# few-shot examples (since we can't pip-install torch on every node). The
+# structural drift is measured via:
+#   1. Generative comparison: same prompt → M₁ vs M₂ outputs → embedding distance
+#   2. Statistical comparison: n-gram frequency shift, vocabulary drift, pattern evolution
+#
+# Usage:
+#   mesh-tiny-fleet extract              # extract snapshots + build training data
+#   mesh-tiny-fleet train                # create ollama models from training data
+#   mesh-tiny-fleet compare [prompt]     # run comparison on a prompt
+#   mesh-tiny-fleet drift                # full drift analysis
+#   mesh-tiny-fleet --test               # smoke test
+#
+# Env:
+#   TINY_FLEET_V1   git ref for v1 (default: commit at ~June 15 2026)
+#   TINY_FLEET_V2   git ref for v2 (default: HEAD)
+#   TINY_FLEET_DIR  working directory (default: ~/.mesh/tiny-fleet)
+#   TINY_FLEET_BASE base model for fine-tuning (default: smollm2:135m)
+
+set -euo pipefail
+
+DIR="${TINY_FLEET_DIR:-$HOME/.mesh/tiny-fleet}"
+V1="${TINY_FLEET_V1:-54758160}"
+V2="${TINY_FLEET_V2:-HEAD}"
+BASE="${TINY_FLEET_BASE:-smollm2:135m}"
+LOG="$DIR/drift.log"
+
+mkdir -p "$DIR"/{v1,v2,training,results}
+
+ts() { date -u '+%Y-%m-%dT%H:%M:%SZ'; }
+
+# ── extract: pull snapshots + build training data ────────────────────────────
+
+cmd_extract() {
+    echo "$(ts) tiny-fleet: extracting v1=$V1 v2=$V2"
+
+    # Extract both snapshots
+    for ref in v1 v2; do
+        if [ "$ref" = v1 ]; then real_ref="$V1"; else real_ref="$V2"; fi
+        git archive "$real_ref" | tar -C "$DIR/$ref" --strip-components=0 -xf - 2>/dev/null
+        # Flatten — git archive may create a directory inside
+        local inner
+        inner=$(ls "$DIR/$ref/" | head -1)
+        if [ -d "$DIR/$ref/$inner" ] && [ "$inner" != "scripts" ] && [ "$inner" != "docs" ]; then
+            shopt -s dotglob
+            mv "$DIR/$ref/$inner"/* "$DIR/$ref/" 2>/dev/null || true
+            rmdir "$DIR/$ref/$inner" 2>/dev/null || true
+            shopt -u dotglob
+        fi
+    done
+
+    local n1 n2
+    n1=$(find "$DIR/v1" -type f -name '*.sh' -o -name '*.py' -o -name '*.md' 2>/dev/null | wc -l)
+    n2=$(find "$DIR/v2" -type f -name '*.sh' -o -name '*.py' -o -name '*.md' 2>/dev/null | wc -l)
+    echo "$(ts) tiny-fleet: v1=$n1 text files, v2=$n2 text files"
+
+    # Build training data: extract function signatures + context from each version
+    for ref in v1 v2; do
+        echo "$(ts) tiny-fleet: building training data for $ref"
+        _build_training "$ref"
+    done
+
+    echo "$(ts) tiny-fleet: extraction complete → $DIR/training/"
+}
+
+_build_training() {
+    local ref="$1"
+    local out="$DIR/training/${ref}_prompts.jsonl"
+    > "$out"
+
+    # Extract bash function signatures with first few lines of body
+    find "$DIR/$ref" -type f \( -name '*.sh' -o -name '*.bash' \) | while read -r f; do
+        local rel="${f#$DIR/$ref/}"
+        # Extract function definitions with context
+        awk -v file="$rel" '
+        /^[a-zA-Z_][a-zA-Z0-9_]*\s*\(\)\s*\{/ || /^function\s+[a-zA-Z_]/ {
+            if (name != "" && body != "") {
+                gsub(/"/, "\\\"", body)
+                printf "{\"file\":\"%s\",\"type\":\"function\",\"name\":\"%s\",\"prompt\":\"%s\",\"completion\":\"%s\"}\n", file, name, prompt, body
+            }
+            name = $0
+            sub(/\(\)\s*\{.*/, "", name)
+            sub(/^function\s+/, "", name)
+            prompt = "// Function: " name " in " file "\n# Complete this function:\n" $0 "\n"
+            body = ""
+            count = 0
+            next
+        }
+        name != "" && count < 8 {
+            body = body $0 "\n"
+            count++
+        }
+        ' "$f" >> "$out"
+    done
+
+    # Extract Python function signatures
+    find "$DIR/$ref" -type f -name '*.py' | while read -r f; do
+        local rel="${f#$DIR/$ref/}"
+        awk -v file="$rel" '
+        /^def [a-zA-Z_]/ || /^class [A-zA-Z]/ {
+            if (name != "" && body != "") {
+                gsub(/"/, "\\\"", body)
+                printf "{\"file\":\"%s\",\"type\":\"function\",\"name\":\"%s\",\"prompt\":\"%s\",\"completion\":\"%s\"}\n", file, name, prompt, body
+            }
+            name = $0
+            sub(/\(.*/, "", name)
+            sub(/^def\s+/, "", name)
+            sub(/^class\s+/, "", name)
+            prompt = "# " name " in " file "\n# Complete this definition:\n" $0 "\n"
+            body = ""
+            count = 0
+            next
+        }
+        name != "" && count < 8 {
+            body = body $0 "\n"
+            count++
+        }
+        ' "$f" >> "$out"
+    done
+
+    # Extract markdown section headers as "structural prompts"
+    find "$DIR/$ref" -type f -name '*.md' | while read -r f; do
+        local rel="${f#$DIR/$ref/}"
+        awk -v file="$rel" '
+        /^## / {
+            if (title != "" && content != "") {
+                gsub(/"/, "\\\"", content)
+                printf "{\"file\":\"%s\",\"type\":\"section\",\"name\":\"%s\",\"prompt\":\"# Document: %s\n## %s\n\",\"completion\":\"%s\"}\n", file, title, file, title, content
+            }
+            title = $0
+            sub(/^##\s+/, "", title)
+            content = ""
+            count = 0
+            next
+        }
+        title != "" && count < 6 {
+            content = content $0 "\n"
+            count++
+        }
+        ' "$f" >> "$out"
+    done
+
+    local count
+    count=$(wc -l < "$out" 2>/dev/null || echo 0)
+    echo "$(ts) tiny-fleet: $ref → $count training examples in $out"
+}
+
+# ── train: create ollama Modelfile-backed models ────────────────────────────
+
+cmd_train() {
+    echo "$(ts) tiny-fleet: training models (Modelfile approach)"
+
+    for ref in v1 v2; do
+        local model="tiny-fleet-${ref}"
+        local training="$DIR/training/${ref}_prompts.jsonl"
+        local modelfile="$DIR/training/Modelfile.${ref}"
+
+        if [ ! -f "$training" ]; then
+            echo "$(ts) tiny-fleet: no training data for $ref — run 'extract' first"
+            return 1
+        fi
+
+        # Build system prompt from the version's vocabulary
+        local vocab
+        vocab=$(_extract_vocabulary "$ref")
+
+        # Build few-shot examples from the training data (top 10 by file importance)
+        local examples
+        examples=$(_extract_fewshot "$ref" 10)
+
+        cat > "$modelfile" <<MODelfile
+FROM $BASE
+
+SYSTEM """You are a code completion model trained on the lte-workstation codebase snapshot.
+
+Version vocabulary (key concepts this version knows):
+$vocab
+
+When completing code, use the patterns, naming conventions, and abstractions
+that are natural to this version of the codebase."""
+
+$examples
+MODelfile
+
+        echo "$(ts) tiny-fleet: creating model $model from $BASE"
+        ollama create "$model" -f "$modelfile" 2>&1 | tail -3
+        echo "$(ts) tiny-fleet: model $model created"
+    done
+}
+
+_extract_vocabulary() {
+    local ref="$1"
+    # Extract unique identifiers (function names, tool names) from the version
+    {
+        find "$DIR/$ref" -type f \( -name '*.sh' -o -name '*.py' \) -exec grep -h '^[a-zA-Z_][a-zA-Z0-9_]*()' {} \; 2>/dev/null | head -50
+        find "$DIR/$ref" -type f \( -name '*.sh' -o -name '*.py' \) -exec grep -ho 'mesh-[a-z-]*' {} \; 2>/dev/null | sort -u | head -30
+    } | sort -u | head -40 | tr '\n' ', '
+}
+
+_extract_fewshot() {
+    local ref="$1" count="${2:-10}"
+    local training="$DIR/training/${ref}_prompts.jsonl"
+    # Pick diverse examples (one per file if possible)
+    python3 -c "
+import json, sys
+seen = set()
+examples = []
+for line in open('$training'):
+    try:
+        d = json.loads(line)
+        f = d.get('file','')
+        if f not in seen and len(examples) < $count:
+            seen.add(f)
+            examples.append(d)
+    except: pass
+for i, e in enumerate(examples):
+    print(f'\"\"\"Example {i+1}: {e[\"name\"]} from {e[\"file\"]}\"\"\"')
+    print(e['prompt'])
+    print(e['completion'])
+    print()
+" 2>/dev/null
+}
+
+# ── compare: same prompt → both models → measure divergence ──────────────────
+
+cmd_compare() {
+    local prompt="${1:-}"
+    if [ -z "$prompt" ]; then
+        # Default comparison prompts that probe architectural understanding
+        prompt='#!/bin/bash
+# Function that monitors mesh node health
+# Complete this function:'
+    fi
+
+    echo "$(ts) tiny-fleet: comparing outputs"
+    echo "Prompt: $prompt"
+    echo "---"
+
+    local out_v1 out_v2
+    out_v1=$(ollama run tiny-fleet-v1 "$prompt" 2>/dev/null || echo "MODEL_UNAVAILABLE")
+    out_v2=$(ollama run tiny-fleet-v2 "$prompt" 2>/dev/null || echo "MODEL_UNAVAILABLE")
+
+    echo "M₁ (v1) output:"
+    echo "$out_v1"
+    echo "---"
+    echo "M₂ (v2) output:"
+    echo "$out_v2"
+    echo "---"
+
+    # Measure structural similarity
+    _compare_outputs "$out_v1" "$out_v2"
+
+    # Save results
+    local result_file="$DIR/results/compare_$(date +%s).json"
+    python3 -c "
+import json
+result = {
+    'prompt': '''$prompt''',
+    'm1_output': '''$out_v1''',
+    'm2_output': '''$out_v2''',
+}
+json.dump(result, open('$result_file', 'w'), indent=2)
+print('Results saved to $result_file')
+"
+}
+
+_compare_outputs() {
+    local o1="$1" o2="$2"
+
+    python3 -c "
+import sys, re, math
+from collections import Counter
+
+o1 = sys.argv[1]
+o2 = sys.argv[2]
+
+# Tokenize (simple whitespace + punctuation split)
+def tokenize(s):
+    return re.findall(r'\w+|[^\w\s]', s.lower())
+
+t1 = tokenize(o1)
+t2 = tokenize(o2)
+
+# Jaccard similarity
+s1, s2 = set(t1), set(t2)
+jaccard = len(s1 & s2) / max(len(s1 | s2), 1)
+
+# N-gram overlap (bigrams)
+def bigrams(tokens):
+    return set(zip(tokens, tokens[1:]))
+
+bg1, bg2 = bigrams(t1), bigrams(t2)
+bigram_overlap = len(bg1 & bg2) / max(len(bg1 | bg2), 1)
+
+# Vocabulary shift
+c1, c2 = Counter(t1), Counter(t2)
+all_words = set(c1) | set(c2)
+if all_words:
+    # Cosine similarity of term frequency vectors
+    dot = sum(c1.get(w,0) * c2.get(w,0) for w in all_words)
+    mag1 = math.sqrt(sum(v**2 for v in c1.values())) or 1
+    mag2 = math.sqrt(sum(v**2 for v in c2.values())) or 1
+    cosine = dot / (mag1 * mag2)
+else:
+    cosine = 0
+
+# Unique to each version
+v1_only = s1 - s2
+v2_only = s2 - s1
+
+print(f'Jaccard similarity:      {jaccard:.3f}')
+print(f'Bigram overlap:          {bigram_overlap:.3f}')
+print(f'Cosine similarity:       {cosine:.3f}')
+print(f'Tokens M₁: {len(t1)}  M₂: {len(t2)}')
+if v1_only:
+    print(f'Only in M₁: {\", \".join(sorted(v1_only)[:10])}')
+if v2_only:
+    print(f'Only in M₂: {\", \".join(sorted(v2_only)[:10])}')
+" "$o1" "$o2"
+}
+
+# ── drift: full architectural drift analysis ────────────────────────────────
+
+cmd_drift() {
+    echo "$(ts) tiny-fleet: full drift analysis"
+    echo "═══════════════════════════════════════════════════"
+
+    # 1. Structural drift: file counts, naming patterns
+    echo ""
+    echo "━━━ STRUCTURAL DRIFT ━━━"
+    _structural_drift
+
+    # 2. Vocabulary drift: what words/patterns appeared or disappeared
+    echo ""
+    echo "━━━ VOCABULARY DRIFT ━━━"
+    _vocabulary_drift
+
+    # 3. Pattern drift: how code patterns evolved
+    echo ""
+    echo "━━━ PATTERN DRIFT ━━━"
+    _pattern_drift
+
+    # 4. Generative drift: same prompts → different completions
+    echo ""
+    echo "━━━ GENERATIVE DRIFT ━━━"
+    _generative_drift
+
+    echo ""
+    echo "$(ts) tiny-fleet: drift analysis complete → $LOG"
+}
+
+_structural_drift() {
+    python3 << 'PYEOF'
+import os, json
+from collections import Counter
+
+def scan(root):
+    exts = Counter()
+    sizes = []
+    shebangs = Counter()
+    for dirpath, _, files in os.walk(root):
+        for f in files:
+            fp = os.path.join(dirpath, f)
+            ext = os.path.splitext(f)[1]
+            exts[ext] += 1
+            try:
+                sizes.append(os.path.getsize(fp))
+                with open(fp, 'r', errors='ignore') as fh:
+                    first = fh.readline().strip()
+                    if first.startswith('#!'):
+                        shebangs[first.split()[-1] if ' ' in first else first] += 1
+            except: pass
+    return exts, sizes, shebangs
+
+v1_exts, v1_sizes, v1_shebangs = scan('/tmp/tiny-fleet/v1')
+v2_exts, v2_sizes, v2_shebangs = scan('/tmp/tiny-fleet/v2')
+
+print(f"  Files: {sum(v1_exts.values())} → {sum(v2_exts.values())} ({sum(v2_exts.values())/max(sum(v1_exts.values()),1):.1f}x)")
+print(f"  Total size: {sum(v1_sizes)/1024:.0f}KB → {sum(v2_sizes)/1024:.0f}KB")
+print(f"  Avg file size: {sum(v1_sizes)/max(len(v1_sizes),1)/1024:.1f}KB → {sum(v2_sizes)/max(len(v2_sizes),1)/1024:.1f}KB")
+
+# Extension drift
+all_exts = set(v1_exts) | set(v2_exts)
+new_exts = [(e, v2_exts.get(e,0)) for e in all_exts if v1_exts.get(e,0) == 0 and v2_exts.get(e,0) > 0]
+gone_exts = [(e, v1_exts.get(e,0)) for e in all_exts if v2_exts.get(e,0) == 0 and v1_exts.get(e,0) > 0]
+if new_exts:
+    print(f"  New file types: {', '.join(f'{e}({n})' for e,n in sorted(new_exts, key=lambda x:-x[1])[:5])}")
+if gone_exts:
+    print(f"  Gone file types: {', '.join(f'{e}({n})' for e,n in sorted(gone_exts, key=lambda x:-x[1])[:5])}")
+
+# Shebang drift
+print(f"  Shell interpreters: {dict(v1_shebangs)} → {dict(v2_shebangs)}")
+PYEOF
+}
+
+_vocabulary_drift() {
+    python3 << 'PYEOF'
+import re, os
+from collections import Counter
+
+def extract_vocab(root):
+    words = Counter()
+    for dirpath, _, files in os.walk(root):
+        for f in files:
+            fp = os.path.join(dirpath, f)
+            try:
+                text = open(fp, 'r', errors='ignore').read()
+                # Extract identifiers
+                words.update(re.findall(r'[a-zA-Z_][a-zA-Z0-9_]{2,}', text))
+                # Extract mesh-* tool names
+                words.update(re.findall(r'mesh-[a-z-]+', text))
+            except: pass
+    return words
+
+v1_words = extract_vocab('/tmp/tiny-fleet/v1')
+v2_words = extract_vocab('/tmp/tiny-fleet/v2')
+
+# New vocabulary (in v2 but not v1, above frequency threshold)
+new_vocab = {w: c for w, c in v2_words.items() if w not in v1_words and c >= 3}
+gone_vocab = {w: c for w, c in v1_words.items() if w not in v2_words and c >= 3}
+
+print(f"  Total vocabulary: {len(v1_words)} → {len(v2_words)} ({len(v2_words)/max(len(v1_words),1):.1f}x)")
+print(f"  New terms (freq≥3): {len(new_vocab)}")
+if new_vocab:
+    top_new = sorted(new_vocab.items(), key=lambda x: -x[1])[:15]
+    print(f"    Top new: {', '.join(f'{w}({c})' for w,c in top_new)}")
+print(f"  Gone terms (freq≥3): {len(gone_vocab)}")
+if gone_vocab:
+    top_gone = sorted(gone_vocab.items(), key=lambda x: -x[1])[:10]
+    print(f"    Top gone: {', '.join(f'{w}({c})' for w,c in top_gone)}")
+
+# Concept drift: what concepts grew most
+shared = {w: (v1_words.get(w,0), v2_words.get(w,0)) for w in set(v1_words) & set(v2_words) if v1_words.get(w,0) >= 3 and v2_words.get(w,0) >= 3}
+growth = [(w, v2/max(v1,1)) for w, (v1, v2) in shared.items()]
+growth.sort(key=lambda x: -x[1])
+print(f"  Fastest growing concepts:")
+for w, ratio in growth[:10]:
+    print(f"    {w}: {shared[w][0]} → {shared[w][1]} ({ratio:.1f}x)")
+PYEOF
+}
+
+_pattern_drift() {
+    python3 << 'PYEOF'
+import re, os
+
+def extract_patterns(root):
+    patterns = {
+        'shebangs': [],
+        'function_defs': [],
+        'class_defs': [],
+        'error_handling': [],
+        'logging': [],
+        'state_files': [],
+    }
+    for dirpath, _, files in os.walk(root):
+        for f in files:
+            fp = os.path.join(dirpath, f)
+            try:
+                text = open(fp, 'r', errors='ignore').read()
+                lines = text.split('\n')
+                for i, line in enumerate(lines):
+                    if i == 0 and line.startswith('#!'):
+                        patterns['shebangs'].append(line.strip())
+                    if re.match(r'^[a-zA-Z_]\w*\s*\(\)', line):
+                        patterns['function_defs'].append(line.strip())
+                    if re.match(r'^def\s+\w+', line) or re.match(r'^class\s+\w+', line):
+                        patterns['class_defs'].append(line.strip())
+                    if 'trap ' in line or 'set -e' in line or 'set -euo' in line:
+                        patterns['error_handling'].append(line.strip())
+                    if 'echo.*>>' in line or 'tee -a' in line or '>> "$LOG"' in line:
+                        patterns['logging'].append(line.strip())
+                    if '.state' in line or '-state' in f:
+                        patterns['state_files'].append(f)
+            except: pass
+    return {k: len(v) for k, v in patterns.items()}
+
+v1 = extract_patterns('/tmp/tiny-fleet/v1')
+v2 = extract_patterns('/tmp/tiny-fleet/v2')
+
+print(f"  Pattern changes:")
+for k in v1:
+    delta = v2.get(k,0) - v1.get(k,0)
+    pct = (v2.get(k,0) / max(v1.get(k,1),1)) * 100 - 100
+    arrow = "↑" if delta > 0 else "↓" if delta < 0 else "="
+    print(f"    {k}: {v1.get(k,0)} → {v2.get(k,0)} ({arrow}{abs(delta)}, {pct:+.0f}%)")
+
+# Key architectural patterns
+print(f"\n  Key architectural signals:")
+print(f"    mesh-* tool references: ", end="")
+v1_mesh = sum(1 for _ in open('/dev/null'))  # placeholder
+# Count actual mesh- references
+import subprocess
+v1_count = subprocess.run(['grep', '-r', '-c', 'mesh-', '/tmp/tiny-fleet/v1/'], capture_output=True, text=True, errors='ignore')
+v2_count = subprocess.run(['grep', '-r', '-c', 'mesh-', '/tmp/tiny-fleet/v2/'], capture_output=True, text=True, errors='ignore')
+v1_total = sum(int(l.split(':')[-1]) for l in v1_count.stdout.split('\n') if l and ':' in l)
+v2_total = sum(int(l.split(':')[-1]) for l in v2_count.stdout.split('\n') if l and ':' in l)
+print(f"{v1_total} → {v2_total} ({v2_total/max(v1_total,1):.1f}x)")
+PYEOF
+}
+
+_generative_drift() {
+    echo "  Running generative comparison on 5 architectural prompts..."
+
+    local prompts=(
+        '#!/bin/bash
+# Function that monitors mesh node health and reports to the fleet
+# Complete this function:'
+
+        '#!/bin/bash
+# Function that detects a new device on the LAN
+# Complete this function:'
+
+        '#!/bin/bash
+# Reflex that runs every 5 minutes to check sensor freshness
+# Complete this function:'
+
+        '#!/bin/bash
+# Function that posts a health verdict to the mesh board
+# Complete this function:'
+
+        '#!/bin/bash
+# Function that coordinates with other agents via tmux
+# Complete this function:'
+    )
+
+    local descriptions=(
+        "node health monitoring"
+        "LAN device detection"
+        "sensor freshness reflex"
+        "board health posting"
+        "agent coordination"
+    )
+
+    for i in "${!prompts[@]}"; do
+        echo ""
+        echo "  Prompt $((i+1)): ${descriptions[$i]}"
+        echo "  ─────────────────────────────────"
+
+        local p="${prompts[$i]}"
+        local o1 o2
+
+        o1=$(ollama run tiny-fleet-v1 "$p" --verbose 2>/dev/null | tail -20 || echo "MODEL_UNAVAILABLE")
+        o2=$(ollama run tiny-fleet-v2 "$p" --verbose 2>/dev/null | tail -20 || echo "MODEL_UNAVAILABLE")
+
+        # Quick similarity check
+        python3 -c "
+import re, sys, math
+from collections import Counter
+
+o1, o2 = sys.argv[1], sys.argv[2]
+t1 = set(re.findall(r'\w+', o1.lower()))
+t2 = set(re.findall(r'\w+', o2.lower()))
+jaccard = len(t1 & t2) / max(len(t1 | t2), 1)
+
+# Check for key concepts
+v2_concepts = {'mesh-', 'fleet', 'board', 'reflex', 'cadence', 'ssh', 'tailscale', 'drift', 'coverage', 'stale', 'taint'}
+v1_concepts = {'basic', 'simple', 'check', 'status', 'monitor'}
+
+m1_v2hits = len(t1 & v2_concepts)
+m2_v2hits = len(t2 & v2_concepts)
+
+print(f'    Jaccard: {jaccard:.3f}')
+print(f'    M₁ uses v2-concepts: {m1_v2hits}/10')
+print(f'    M₂ uses v2-concepts: {m2_v2hits}/10')
+print(f'    M₁ preview: {o1[:120]}...')
+print(f'    M₂ preview: {o2[:120]}...')
+" "$o1" "$o2"
+    done
+}
+
+# ── test ────────────────────────────────────────────────────────────────────
+
+cmd_test() {
+    echo "tiny-fleet: smoke test"
+
+    # Check ollama is available
+    command -v ollama >/dev/null 2>&1 || { echo "FAIL: ollama not found"; exit 1; }
+    ollama list >/dev/null 2>&1 || { echo "FAIL: ollama list failed"; exit 1; }
+
+    # Check base model exists
+    ollama list 2>/dev/null | grep -q "$BASE" || { echo "FAIL: base model $BASE not found"; exit 1; }
+
+    # Check git repo
+    git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo "FAIL: not in a git repo"; exit 1; }
+
+    # Quick extract test
+    local test_dir="/tmp/tiny-fleet-test-$$"
+    mkdir -p "$test_dir"
+    git archive HEAD | tar -C "$test_dir" -xf - 2>/dev/null
+    local count
+    count=$(find "$test_dir" -type f | wc -l)
+    rm -rf "$test_dir"
+
+    [ "$count" -gt 10 ] || { echo "FAIL: extract produced only $count files"; exit 1; }
+
+    echo "tiny-fleet: smoke test OK (base=$BASE, files=$count)"
+}
+
+# ── main ────────────────────────────────────────────────────────────────────
+
+case "${1:-help}" in
+    extract)  cmd_extract ;;
+    train)    cmd_train ;;
+    compare)  shift; cmd_compare "$*" ;;
+    drift)    cmd_drift ;;
+    --test)   cmd_test ;;
+    help|*)
+        echo "mesh-tiny-fleet — architectural drift via generative comparison"
+        echo ""
+        echo "Usage: mesh-tiny-fleet <command> [args]"
+        echo ""
+        echo "Commands:"
+        echo "  extract              Extract v1/v2 snapshots + build training data"
+        echo "  train                Create ollama models from training data"
+        echo "  compare [prompt]     Compare M₁ vs M₂ on a prompt"
+        echo "  drift                Full drift analysis (structural + vocabulary + generative)"
+        echo "  --test               Smoke test"
+        echo ""
+        echo "Env:"
+        echo "  TINY_FLEET_V1=$V1"
+        echo "  TINY_FLEET_V2=$V2"
+        echo "  TINY_FLEET_BASE=$BASE"
+        ;;
+esac
