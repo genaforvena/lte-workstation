@@ -13,16 +13,29 @@ The project's README makes a claim I liked: that LLM readers *never recover the 
 that they generate from structure and bias, and that every reading is a projection. It is the most
 interesting sentence in the repository and nobody had ever checked it.
 
-So we checked it. And the first result looked like the README was wrong: independent readings of
-the same encoded message agreed with each other **four times above chance**, with non-overlapping
-confidence intervals. Something was clearly getting through.
+So we checked it. And the honest version of the result is stronger than the first
+version I published here: independent readings of the same encoded message agree with each
+other far above chance — and they agree with each other **no more than readings of a
+different message do**. Across four runs, the treatment arm has never once beaten its own
+prior control. That is the whole post in one sentence.
 
-Then we ran a second message, and the effect **reversed**.
+> **Correction, 2026-08-30.** The first version of this piece said the second message
+> showed the opposite ordering of the first — treatment ahead in run one, prior control
+> ahead in run two. That
+> framing was wrong, and the error was mine: the first run's intervals overlap
+> ([0.153, 0.198] against [0.100, 0.162]), so there was never an effect there for run two
+> to answer.
+> The two replication runs (equal arms, 20/20, zero misses) both overlap too. What survives
+> is cleaner and harder than the first telling: one arm that has never once beaten its own
+> prior
+> control. The conclusion stands; the evidence under it is now the replicated one. Details
+> in "Way two", "A third way a floor lies", and the per-slot replication below.
 
-This post is about why that reversal is the most useful thing in the experiment, and about the two
+This post is about why that comparison is the most useful thing in the experiment, and about
+the three
 different ways a baseline can lie to you when you are measuring whether models agree. If you run
 self-consistency, majority-vote ensembles, LLM-as-judge panels, or any "ask it five times and see
-if it converges" pipeline, both of those failure modes are already in your numbers.
+if it converges" pipeline, all three of those failure modes are already in your numbers.
 
 ## The measurement
 
@@ -77,43 +90,56 @@ says so in the saved artifact when it has to fall back.
 
 ## Way two that a floor lies: it is measuring the wrong competitor
 
-Here is the first message's result, positional agreement, bootstrap CIs:
+Here are all four runs, positional agreement, bootstrap CIs, arm sizes shown because an
+agreement number with no n is not a measurement:
 
 ```
-message: "The night is long and the city keeps its silence"
-
+OLD message 1 (n=15/12/20, 105/66/190 pairs):
 A treatment      0.175   CI [0.153, 0.198]
 B prior-control  0.129   CI [0.100, 0.162]
-C random basis   0.044   CI [0.035, 0.053]
-```
+C random basis   0.044   CI [0.035, 0.053]   (alphabet: 134 words)
 
-Treatment is four times the chance floor and the intervals do not touch. If you had built this
-with two arms — treatment against random — you would stop here, write "independent readers converge
-far above chance on the encoded message," and you would have a real, reproducible, correctly
-computed number that means nothing like what you think it means.
-
-Because arm B is *also* miles above the floor, and arm B is reading a **different message**.
-
-Fifteen valid readings in arm A there, twelve in B, twenty in the model-free arm C; 105, 66 and
-190 pairs. Then the second run:
-
-```
-message: "Rain fell across the empty market and nobody counted the hours"
-
+OLD message 2 (n=20/15/20, 190/105/190 pairs):
 A treatment      0.115   CI [0.099, 0.132]
 B prior-control  0.160   CI [0.140, 0.181]
-C random basis   0.047   CI [0.039, 0.056]
+C random basis   0.047   CI [0.039, 0.056]   (alphabet: 129 words)
+
+NEW message 1 (n=20/20/20, 190 pairs each, zero misses):
+A treatment      0.112   CI [0.096, 0.127]
+B prior-control  0.099   CI [0.084, 0.115]
+C random basis   0.023   CI [0.017, 0.030]   (alphabet: 303 words)
+
+NEW message 2 (n=20/20/20, 190 pairs each, zero misses):
+A treatment      0.129   CI [0.109, 0.150]
+B prior-control  0.122   CI [0.107, 0.137]
+C random basis   0.017   CI [0.011, 0.022]   (alphabet: 337 words)
 ```
 
-Twenty valid readings in A, fifteen in B, twenty in C. The prior control is now **above** the
-treatment, and their intervals do not overlap in that
-direction either (A tops out at 0.132, B starts at 0.140). Readings of a length sequence that was
-never anybody's message agree with each other *more* than readings of the real one.
+Read the intervals, not the point estimates. The first version of this post called OLD
+message 1 an effect — 0.175 over 0.129 — and OLD message 2 the opposite. That was wrong:
+OLD message 1's intervals **overlap** ([0.153, 0.198] against [0.100, 0.162]), and neither
+of us checked the intersection before publishing. There was never an A-ahead leg for run
+two to answer. Across all four runs the treatment arm is **never** separated from the prior
+control, and the only separated comparison in the whole set goes the other way (OLD
+message 2, B above A, disjoint). Both replication runs have equal arms (20/20, zero
+compliance misses) where both old ones did not (15v12, 20v15) — not claimed as the cause
+of the old separation, only noted that the separation does not survive equal arms.
 
-Both arms are far above the chance floor in both runs. The ordering between them flips. That is
-what "the convergence is the prior" looks like when you finally have an arm that can show it: the
-distance from random is large and stable, the distance from *each other* is noise, and no amount of
+So this is not "message 1 shows an effect, message 2 answers it." It is one arm that has
+never once beaten its own prior control — a cleaner and harder version of exactly the
+claim this post makes. Both arms sit far above the chance floor in every run. The distance
+from random is large and stable, the distance from *each other* is noise, and no amount of
 precision on the random floor would ever have told you.
+
+## A third way a floor lies: it moves with a draw you did not fix
+
+Arm C is not comparable across runs. The floor is a function of the alphabet drawn that
+run — 134 words then, 303 now for message 1; 129 then, 337 now for message 2 — and it
+halved between the draws: 0.044/0.047 then, 0.023/0.017 now. So "treatment is 4x the
+floor" (old) and "treatment is 7.7x the floor" (new) are not the same measurement getting
+stronger; they are two different floors. Never quote the ratio without its alphabet size.
+The run prints which source the alphabet came from and how many words it holds, and the
+saved artifact carries both, for exactly this reason.
 
 The general form, and it is not about this art project at all:
 
@@ -161,28 +187,53 @@ content words, the treatment arm is a hair above chance and the control arm is s
 
 The convergence is English's function-word skeleton. It was never the channel.
 
+That per-slot figure replicates hard in the direction used here. NEW message 2, slot 0:
+B prior-control **0.637** vs A treatment **0.274** vs C random **0.016** — the arm reading
+a *different* message agrees at slot 0 more than twice as often as the arm reading the
+real one. Content words (>=5 letters) in the same run sit at A 0.037 vs B 0.059 vs
+C 0.012. Readers converge on "The" and are equally wrong everywhere else.
+
 ## Convergence and correctness are different questions, so ask them separately
 
 An arm can converge beautifully and be uniformly wrong, so recovery gets its own measurement: each
-reading is compared to the true original, and to eight **decoys carrying the same length profile**.
-A reading no closer to the truth than to a matched decoy has recovered nothing, however convergent
-its arm is.
+reading is compared to the true original — and the comparison that decides is against **arm
+B**, real readings of a *different* length sequence by the same model under the same framing.
+Length-matched decoys and arm C are scored too, as chance floors for context. They are not
+the test.
+
+> **Correction, 2026-08-30.** The first version of this section compared readings to the
+> true original against length-matched *decoys* (message 1: 0.210 vs 0.216; message 2:
+> 0.138 vs 0.168) and concluded "no closer to the truth than to a decoy." That is an
+> A-vs-chance comparison, not A-vs-prior: measured on the same runs, the decoy floor is
+> 0.153 and the model-free arm C is 0.159 — the same number — while the prior-control arm
+> sits at 0.220. This post's own thesis is that a noise floor cannot separate a signal
+> from your own prior, and the recovery paragraph beside it used a noise floor. Right
+> conclusion, wrong comparison — the weakest way to be right. The numbers below are
+> recomputed from the stored readings under the prior floor (n=20/arm, no new model calls).
 
 ```
-                    vs TRUE original      vs matched DECOY
-message 1                  0.210                 0.216
-message 2                  0.138                 0.168
+recovery, cosine similarity (higher = closer), same runs:
+message 1:  A (vs true) 0.240 / B_prior 0.220 / C 0.159
+            A minus B_prior  +0.020  CI [-0.045, +0.084]  (includes 0)
+message 2:  A (vs true) 0.112 / B_prior 0.124 / C 0.116
+            A minus B_prior  -0.012  CI [-0.052, +0.027]  (includes 0)
 ```
 
-Cosine similarity, so higher is closer. In both runs the readings are, if anything, slightly closer
-to a random decoy than to the sentence that was actually encoded. The README's claim survives its
-first contact with a measurement: readers do not recover the message. They converge hard, and they
+Both include 0 — conclusion unchanged, evidence now the right shape. And there is a
+stronger paragraph here than the one first published: under the old decoy floor the two
+messages *disagreed* (message 1 read as recovery, message 2 did not), which invites
+quoting whichever suits. Under the prior floor both say the same thing. The wrong floor
+made the two runs contradict each other.
+
+Cosine similarity, so higher is closer. In both runs the readings are indistinguishable
+from the prior arm's distance to the truth. The README's claim survives its first contact
+with a measurement: readers do not recover the message. They converge hard, and they
 are all equally wrong.
 
-Two honest notes on those numbers. The intervals overlap in both runs — heavily in message 1, and
-still overlapping in message 2 ([0.111, 0.163] against [0.146, 0.190]) — so the right reading is
-"indistinguishable," not "decoys win." And the embedding metric barely
-moved across every arm in either experiment. Run one: C 0.239, A 0.252, B 0.268. Run two: C 0.286,
+Two honest notes on those numbers. Both A-minus-prior intervals include 0
+([-0.045, +0.084] and [-0.052, +0.027]) — so the right reading is
+"indistinguishable," not "the prior wins." And the embedding metric barely
+moved across every arm in the two runs that had an embedding backend. Run one: C 0.239, A 0.252, B 0.268. Run two: C 0.286,
 A 0.293, B 0.273 — where the **model-free** arm outscores the prior control. A spread of three
 hundredths across arms that the positional metric separates by a factor of four, and the arm with
 no model in it landing in the middle, is what a metric with no discriminative power looks like. A sentence-embedding
@@ -201,14 +252,22 @@ the old code to completion and wrote pre-edit output with a post-edit timestamp.
 is a **key missing from one file**, which is the weakest possible signal and looks exactly like a
 run that had nothing to report.
 
-That matters because the second run is the one that reverses the headline. I am confident the arm
+That matters because the second run is the one the first version of this post built its
+headline on. I am confident the arm
 arithmetic was unchanged — the edit added an output block — but I cannot *prove* it from the
-artifact, and the fix is one line: stamp the commit hash, a dirty bit and the script's own hash
-into every result file at write time. A result file that cannot name the instrument that produced
-it is a measurement you have to take on trust, and the whole point of writing the numbers to disk
-was not having to.
+artifact, and the fix is not what this section first prescribed. The original text here said:
+stamp the commit hash, a dirty bit and the script's own hash into every result file at write
+time. That remedy is **refuted** — drilled, not argued: a run launched at one commit and
+committed to another mid-flight makes a write-time stamp record the commit that never ran,
+confidently wrong where a missing key is at least honestly silent. The actual fix, now in
+the harness: the stamp is taken **twice**, at import and at write, and their disagreement
+is a named field (`at_start` is what produced the numbers; `changed_mid_run` asserts a
+mid-run edit instead of leaving it to be inferred from an absence). A result file that
+cannot name the instrument that produced it is a measurement you have to take on trust,
+and the whole point of writing the numbers to disk was not having to.
 
-Treat the reversal as a strong signal rather than a settled fact for that reason. It is two
+No opposite-ordering claim is made anywhere in this piece any more, so treat the four runs above as
+replicated evidence rather than a settled fact for a different reason: it is two
 messages, one reader pool, one embedding model.
 
 ## What to take away
@@ -216,21 +275,29 @@ messages, one reader pool, one embedding model.
 - **A floor estimated from a handful of samples rises toward the thing it is measuring**, and it
   fails toward "no effect" — the direction where nobody investigates. If your baseline is built by
   pooling from your own small sample, count the sample and say the count out loud in the output.
+- **A floor drawn fresh each run is a different floor.** The chance arm halved between draws here
+  (0.044/0.047 at 134/129 words, 0.023/0.017 at 303/337). Quote the ratio with its alphabet
+  size or do not quote it.
 - **Add a prior-control arm.** Not more noise: a real run on a real different input. It is the only
   arm that separates "the model is responding to my input" from "the model does this to everything."
   It costs one more arm and it is the arm that decides.
 - **Convergence is not correctness**, and they need separate measurements with separate baselines.
-  Length-matched decoys are cheap and they turn "we recovered the message" into a testable claim.
-- **Stamp your artifacts with the version of the code that wrote them.** Otherwise your replication
+  A noise floor (decoys, model-free arm) answers "fluent English or word salad," never "recovered
+  the message" — that question belongs to the prior arm, and the wrong floor made these two runs
+  contradict each other.
+- **Stamp your artifacts with the version of the code that wrote them — twice, at start and at
+  write.** A write-time stamp alone records the commit that was not running when the tree moved
+  mid-run. Otherwise your replication
   and your original are two experiments wearing one name.
 
 The encoding project is [genaforvena/hidden_language_of_silence](https://github.com/genaforvena/hidden_language_of_silence);
-its README is where the claim being tested comes from. The measurement harness is committed but
-**not yet pushed to that repo**, so the numbers above are, for now, the artifact — which is also why
-every arm size, interval and per-slot figure is printed here rather than linked. The readers were a
+its README is where the claim being tested comes from. The measurement harness is pushed:
+[measure/](https://github.com/genaforvena/hidden_language_of_silence/tree/main/measure) carries
+the four result files (`result-msg1.json`, `result-msg2.json`, `result-msg1-stamped.json`,
+`result-msg2-stamped.json`), the recovery recompute, and its own README — every figure above
+is recomputable from the stored readings without spending another token. The readers were a
 small hosted-inference pool, the embeddings were `all-minilm` running locally, and every individual
-reading is written into the JSON alongside the aggregates so the whole thing can be recomputed
-without spending another token on the models.
+reading is written into the JSON alongside the aggregates.
 
 If you want the shortest possible version to take into your own eval harness: **add the arm that
 runs your pipeline on a different input, and see how much of your agreement survives it.**
