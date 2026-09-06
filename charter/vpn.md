@@ -2,7 +2,7 @@
 
 goal: держать egress и туннели живыми, не подрубая канал, которым их чинят
 
-Engine: opencode. Data pane: `mesh-dash vpn` — server health, the end-to-end tunnel, who is
+Engine: codex (gpt-5.6-luna). Data pane: `mesh-dash vpn` — server health, the end-to-end tunnel, who is
 connected, and the `[vpn-*]` verdicts, all rendered from CACHED reflex artifacts rather than live
 probes.
 

@@ -2,7 +2,7 @@
 
 goal: вести приватный канал Розалии, не смешивая его ни с одним другим
 
-Engine: the node's configured `MESH_TGROZ_CMD` (opencode here). Data pane: `mesh-dash tg-roz` —
+Engine: codex (gpt-5.6-luna), via `MESH_TGROZ_CMD`. Data pane: `mesh-dash tg-roz` —
 the `roz-in.log` conversation plus poller and send health. Routing is `mesh-roz-channel`, fed
 against `ROZ_CHAT_ID` in `~/.mesh/nodes`.
 

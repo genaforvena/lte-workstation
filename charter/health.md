@@ -2,7 +2,7 @@
 
 goal: держать ноду и флот здоровыми: каждый алярм — либо починен, либо назван как известная слепота
 
-Engine: opencode. Dash role: `check`. Its data pane carries fleet health, so the mind acts from
+Engine: codex (gpt-5.6-luna). Dash role: `check`. Its data pane carries fleet health, so the mind acts from
 the pane rather than re-probing each turn.
 
 Tools of the duty: `mesh-card [--refresh]` · `mesh-health`/`mesh-hw-health`/`mesh-egress-health` ·

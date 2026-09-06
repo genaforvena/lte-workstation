@@ -13,7 +13,7 @@ contradicted each other 60s apart. The board itself never lived in the `chat` wi
 rendezvous is `~/.mesh/chat.log`, not a pane), so the merge cost nothing but the second observer;
 `witness` tails the board now.
 
-Engine: opencode. Data pane: self-measurement + the board tail.
+Engine: codex (gpt-5.6-luna). Data pane: self-measurement + the board tail.
 
 Owed by this window: an aged `[task]`/`[taking]`/`[verify]` on the board is a LEAKED PROMISE and
 chasing it is witness work — `mesh-promises --balance` is the detector, not a report someone else

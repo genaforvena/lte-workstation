@@ -2,7 +2,7 @@
 
 goal: держать сенсориум честным: каждый датчик отдаёт живой артефакт либо признаётся слепым
 
-Engine: opencode. This window owns the perception lane: the sensors themselves, their `--test`
+Engine: codex (gpt-5.6-luna). This window owns the perception lane: the sensors themselves, their `--test`
 gates, and the fused state derived from them.
 
 **Perception is re-observed live, never stored** — it decays on reboot by design.
