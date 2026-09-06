@@ -30,8 +30,18 @@ The node-specific context is `CLAUDE.local.md` when present. Do not commit eithe
 
 ## Context, compaction, and handoffs
 
-Codex may compact a long session automatically. Compaction is an internal context operation and does
-not restore mesh work-state. The durable mesh handoff is still required at task boundaries, before
+Every completed work turn ends in an artifact and a textual handoff, then a context reset.
+The top pane is algorithmic: its meaningful changes and board claim dispatch wake the mind.
+Creation and restoration use the same charter, handoff, and current observations. A reset alone
+is not new work and must not generate a restore-only LLM turn. Read the prior result before acting;
+never repeat a completed claim just because the session is fresh. In the final response cite the
+artifact, verification performed, unresolved obligations, and the exact next action if any.
+Codex SessionStart restores text; its completion callback persists the final response and handoff,
+records one TURN in the hledger input tape, and clears once the pane is idle. The five-minute
+snapshot remains crash recovery. Multi-tool work belongs inside one turn; do not clear mid-tool.
+
+Codex may compact a long turn automatically; this is not the mesh turn boundary. Native SessionStart
+hooks reload textual mesh state after creation, clear, resume, or compaction. A handoff is required before
 leaving a session, and before an intentional context reset:
 
 ```bash
@@ -40,10 +50,10 @@ mesh-handoff <window> "<done> + <next> + <key paths/files/vars>"
 
 This writes `~/.mesh/handoff/<window>.md` and posts one `[handoff]` board line. The existing
 `mesh-handoff --snapshot` reflex is the crash safety net. Use `mesh-clear <window>` for the mesh’s
-gated clear procedure when a pane reset is needed; do not assume Claude’s `/clear` or `/loop`
-semantics exist in Codex. Cron/reflexes remain the liveness guarantee across an engine restart.
+gated clear procedure for an intentional reset. Native completion owns normal end-of-turn resets.
+Cron/reflexes remain the liveness guarantee across an engine restart.
 
-At the start of a Codex session, restore the charter and handoff before acting:
+SessionStart loads the charter and handoff automatically. If that context is absent, restore it before acting:
 
 ```bash
 mesh-codex-context

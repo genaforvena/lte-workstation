@@ -1,0 +1,222 @@
+#!/usr/bin/env python3
+"""Codex lifecycle: textual birth, durable turn receipt, handoff, quiet reset.
+
+orphan-ok: SessionStart hook + notify callback; --drain retries pending resets.
+"""
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import time
+
+ROOT = Path(os.environ.get("MESH_DIR", str(Path.home() / ".mesh")))
+STATE = ROOT / "codex-lifecycle"
+
+
+def run(*args, **kwargs):
+    return subprocess.run(args, text=True, capture_output=True, timeout=40, **kwargs)
+
+
+def window():
+    pane = os.environ.get("TMUX_PANE")
+    if not pane:
+        return ""
+    result = run("tmux", "display-message", "-p", "-t", pane, "#{window_name}")
+    name = result.stdout.strip() if result.returncode == 0 else ""
+    return name if re.fullmatch(r"[A-Za-z0-9_.-]+", name) else ""
+
+
+def save(path, value):
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(value, ensure_ascii=False) + "\n")
+    tmp.replace(path)
+
+
+def birth(win, session):
+    STATE.mkdir(parents=True, exist_ok=True)
+    env = dict(os.environ, MESH_HANDOFF_TEST_WINDOW=win, MESH_WHO=win + "@" + os.uname().nodename)
+    result = run("mesh-handoff", "--restore", env=env)
+    if result.returncode:
+        raise RuntimeError(result.stderr)
+    (STATE / (win + ".native")).write_text(str(time.time()))
+    (STATE / (win + ".thread")).write_text(session)
+    print(result.stdout, end="")
+
+
+def receipt(win, event):
+    if event.get("type") != "agent-turn-complete":
+        return None
+    thread, turn = event.get("thread-id"), event.get("turn-id")
+    if not thread or not turn:
+        raise ValueError("completion lacks thread-id or turn-id; refusing an ambiguous receipt")
+    key = hashlib.sha256((str(thread) + ":" + str(turn)).encode()).hexdigest()
+    directory = STATE / win
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / (key + ".json")
+    if path.exists():
+        return path
+    event.update(window=win, received_at=time.time(), status="pending")
+    save(path, event)
+    return path
+
+
+def is_root(win, event):
+    identity = STATE / (win + ".thread")
+    return identity.exists() and event.get("thread-id") == identity.read_text()
+
+
+def close(path):
+    event = json.loads(path.read_text())
+    if event["status"] in ("cleared", "excluded"):
+        return
+    win = event["window"]
+    # Persist the engine's actual final response, not an LLM-generated reconstruction.
+    artifact = path.with_suffix(".md")
+    if not artifact.exists():
+        artifact.write_text("# Turn result: " + win + "\n\n" +
+                            str(event.get("last-assistant-message") or "No final response recorded.") + "\n")
+    panes = run("tmux", "list-panes", "-t", os.uname().nodename + ":" + win,
+                "-F", "#{pane_top} #{pane_id}").stdout.splitlines()
+    pane = max(panes, key=lambda s: int(s.split()[0])).split()[1]
+    env = dict(os.environ, MESH_WHO=win + "@" + os.uname().nodename,
+               TMUX_PANE=pane, MESH_CODEX_WINDOW=win, MESH_CODEX_NATIVE_HOOKS="1")
+    if not event.get("handoff"):
+        prior = path.with_suffix(".prior.md")
+        current = ROOT / "handoff" / (win + ".md")
+        if current.exists() and not prior.exists():
+            prior.write_text(current.read_text())
+        note = ("Completed Codex turn; result artifact: " + str(artifact) +
+                ". Previous work-state: " + str(prior) +
+                ". Read the result and verify its cited artifacts; claims are not verification. "
+                "On the next source change or dispatch, read the live top pane and open obligations. "
+                "Do not redo completed work merely because context was reset.")
+        result = run("mesh-handoff", win, note, env=env)
+        if result.returncode:
+            raise RuntimeError(result.stderr)
+        event["handoff"] = True
+        save(path, event)
+    if not event.get("counted"):
+        # The sampler excludes native-hook windows; this receipt is their sole TURN writer.
+        with (ROOT / "spend.log").open("a+") as log:
+            fcntl.flock(log, fcntl.LOCK_EX)
+            log.seek(0)
+            if f"event:{path.stem}" not in log.read():
+                stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                log.write(f"{stamp} turn {win} codex openai paid unknown event:{path.stem}\n")
+        event["counted"] = True
+        save(path, event)
+    state = run("mesh-mind-state", win).stdout.split("\t", 1)[0].strip()
+    if state != "IDLE":
+        return  # durable pending receipt; never interrupt a newer working turn
+    before = run("tmux", "capture-pane", "-p", "-t", pane).stdout
+    result = run("mesh-clear", win, env=env)
+    if result.returncode:
+        event["error"] = result.stderr or result.stdout
+        save(path, event)
+        return
+    for _ in range(30):
+        after = run("tmux", "capture-pane", "-p", "-t", pane).stdout
+        if (after != before and "Ask Codex to do anything" in after
+                and not re.search(r"^[•◦]|^[›❯] /clear", after, re.M)):
+            break
+        time.sleep(0.2)
+    else:
+        event["error"] = "clear sent but fresh empty composer not observed"
+        save(path, event)
+        return
+    event.update(status="cleared", cleared_at=time.time())
+    save(path, event)
+    (ROOT / (".compact-" + win)).write_text(str(int(time.time())))
+
+
+def main():
+    STATE.mkdir(parents=True, exist_ok=True)
+    if sys.argv[1:] == ["--test"]:
+        selftest()
+        return
+    if len(sys.argv) == 3 and sys.argv[1] == "--ready":
+        pending = (STATE / (sys.argv[2] + ".restarting")).exists() or any(json.loads(p.read_text()).get("status") not in ("cleared", "excluded")
+                      for p in (STATE / sys.argv[2]).glob("*.json"))
+        sys.exit(3 if pending else 0)
+    if sys.argv[1:] == ["--start"]:
+        win = window()
+        event = json.load(sys.stdin)
+        if win and event.get("session_id"):
+            birth(win, event["session_id"])
+        return
+    if sys.argv[1:] == ["--drain"]:
+        time.sleep(1)  # allow the completion callback to return to the TUI
+        with (STATE / ".lock").open("w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            for path in sorted(STATE.glob("*/*.json"),
+                               key=lambda p: json.loads(p.read_text())["received_at"]):
+                try:
+                    close(path)
+                except Exception as exc:
+                    print(str(path) + ": " + str(exc), file=sys.stderr)
+        return
+    win = window()
+    if not win:
+        return  # non-mesh sessions/subagents do not own panes
+    event = json.loads(sys.argv[-1])
+    if not is_root(win, event):
+        return  # title-generation and other auxiliary threads inherit tmux but own no mind turn
+    with (STATE / ".lock").open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        path = receipt(win, event)
+    if path:
+        with (STATE / "worker.log").open("a") as log:
+            subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--drain"],
+                             stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                             start_new_session=True)
+
+
+def selftest():
+    import tempfile
+    global ROOT, STATE, run
+    with tempfile.TemporaryDirectory() as td:
+        ROOT = Path(td)
+        STATE = ROOT / "codex-lifecycle"
+        STATE.mkdir()
+        calls = []
+        screen = ["• Finished work\n› Ask Codex to do anything"]
+        state = ["WORKING"]
+        def fake(*args, **kwargs):
+            calls.append(args)
+            out = ""
+            if args[0] == "mesh-mind-state": out = state[0] + "\tfixture"
+            if args[:2] == ("tmux", "list-panes"): out = "0 %1\n20 %2"
+            if args[:2] == ("tmux", "capture-pane"): out = screen[0]
+            if args[0] == "mesh-clear": screen[0] = "new chat\n› Ask Codex to do anything"
+            return subprocess.CompletedProcess(args, 0, out, "")
+        run = fake
+        event = {"type":"agent-turn-complete", "thread-id":"thread", "turn-id":"turn",
+                 "last-assistant-message":"artifact: /fixture/result; verified test passed"}
+        assert not is_root("w", event)
+        (STATE / "w.thread").write_text("thread")
+        assert is_root("w", event)
+        assert not is_root("w", dict(event, **{"thread-id":"title-generator"}))
+        path = receipt("w", event)
+        assert receipt("w", dict(event)) == path
+        assert receipt("w", {"type":"other"}) is None
+        close(path)
+        assert json.loads(path.read_text())["status"] == "pending"
+        assert not any(c[0] == "mesh-clear" for c in calls)
+        assert "artifact: /fixture/result" in path.with_suffix(".md").read_text()
+        state[0] = "IDLE"
+        close(path)
+        assert json.loads(path.read_text())["status"] == "cleared"
+        close(path)
+        assert len((ROOT / "spend.log").read_text().splitlines()) == 1
+        assert sum(c[0] == "mesh-clear" for c in calls) == 1
+        assert next(i for i,c in enumerate(calls) if c[0] == "mesh-handoff") < next(i for i,c in enumerate(calls) if c[0] == "mesh-clear")
+        assert not any(c[0] in ("codex", "ollama", "mesh-tell") for c in calls)
+        print("lifecycle-test: ok (durable artifact, handoff before clear, busy deferral, idempotent turn count, quiet reset)")
+
+
+if __name__ == "__main__":
+    main()

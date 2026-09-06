@@ -337,6 +337,17 @@ Full protocol + the 2026-06-07 worked example: `docs/coordination.md`.
 
 ## End-of-session protocol (mandatory)
 
+**Current operator clarification (2026-09-06): fresh context after EVERY completed work turn.**
+The algorithmic top pane runs without an LLM; a meaningful pane change or claim dispatch wakes a mind.
+The mind takes a bounded action, externalizes the result and verification evidence in an artifact and
+textual handoff, then clears. Creation and restoration read the same external texts. A clear itself
+must not generate another LLM turn. Unfinished obligations remain external and can be dispatched again.
+For Codex, `.codex/hooks.json` restores at SessionStart and `mesh-codex-lifecycle` handles the root
+completion event, handoff, TURN accounting, and reset. Native-hook windows bypass the older
+`mesh-mind-compact` poll so two drivers cannot reset the same completed turn. See
+`docs/codex-migration.md` for wiring and the tested rollout. This supersedes the older guidance below
+to inject a next task unconditionally before going idle; new work comes from observed change or dispatch.
+
 At the end of every work session — before going idle — always:
 
 1. **Check if your own mind window is idle**:
