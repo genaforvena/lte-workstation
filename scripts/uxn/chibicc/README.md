@@ -21,7 +21,7 @@ uxnasm tmp.tal tmp.rom
 uxnemu tmp.rom
 ```
 
-The `-O1` or `-O` flag enables the optimization pass. If the flag is omitted, this is equivalent to `-O0` (no optimization).
+The `-O1` or `-O` flag enables the standard optimization pass. `-O2` additionally runs a small deterministic genetic superoptimizer over safe peephole-pass schedules. If the flag is omitted, this is equivalent to `-O0` (no optimization).
 
 There's a convenient script that just runs the above commands: `./run.sh examples/day3.c` (compile + uxnasm + uxnemu).
 

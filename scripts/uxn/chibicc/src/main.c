@@ -1,6 +1,7 @@
 #include "chibi.h"
 
 int total_alloc = 0;
+int optimize_level = 0;
 
 int fsize(FILE *fp) {
   long previous = ftell(fp);
@@ -37,8 +38,13 @@ int main(int argc, char **argv) {
   for (int i = 1; i < argc; i++) {
     if (!strcmp("-O", argv[i]) || !strcmp("-O1", argv[i])) {
       do_opt = true;
+      optimize_level = 1;
+    } else if (!strcmp("-O2", argv[i])) {
+      do_opt = true;
+      optimize_level = 2;
     } else if (!strcmp("-O0", argv[i])) {
       do_opt = false;
+      optimize_level = 0;
     } else if (!strcmp("-nostartfiles", argv[i])) {
       emit_start = false;
     } else if (!strcmp("-h", argv[i])) {
@@ -48,6 +54,7 @@ int main(int argc, char **argv) {
         "  -h             Print this help\n"
         "  -O             Same as -O1\n"
         "  -O1            Apply simple optimizations\n"
+        "  -O2            Apply genetic superoptimization\n"
         "  -O0            Apply no optimizations (default)\n"
         "  -nostartfiles  Disable output of the default startup prelude\n"
         "\n"

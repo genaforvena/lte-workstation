@@ -3,8 +3,11 @@
 Extracted from CLAUDE.md (2026-06-19) to keep the committed skeleton lean — the prose catalog had grown past Claude's CLAUDE.md size limit. `mesh-tools` is the live, self-updating index; this file is the human-readable prose detail. Source of truth for the code is the genome (`scripts/`), deployed to `~/.local/bin/`; `mesh-sync-tools` flags drift.
 
 **Coordinate / drive:** `mesh-tell` (drive an agent's pane; `--peek` to look) · `mesh-watch`
-(wait on a pane: `--until` / `--change`) · `mesh-chat` (the board/room) · `mesh-board-id` (stable `{#id}` link tokens for `[task]` lines —
-`mint`/`resolve`/`trace`/`check`; a claim carrying the id survives a task re-file, healing the
+(wait on a pane: `--until` / `--change`) · `mesh-chat` (the board/room) · `mesh-board-query` (read-only
+ATProto-shaped queries over envelope fields and ` ; key:value` metadata tails — `AND`/`OR`, contains,
+JSON, count) · `mesh-board-id` (stable `{#id}` link tokens for `[task]` lines —
+`mint`/`resolve`/`trace`/`markdown`/`check`; `markdown` renders a durable `[label](#id)` link to
+the newest task incarnation; a claim carrying the id survives a task re-file, healing the
 stillborn-re-file slug break; on-demand, read-only on the board) · `mesh-minds` (live
 capability probe) · `mesh-trace` (shared append-only trace) · `mesh-textin` (operator drives any
 mind by TEXT over any channel: `@<win> cmd`; wakes the steward on plain msgs).

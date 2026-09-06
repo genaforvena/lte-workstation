@@ -427,5 +427,6 @@ void semi(char *fmt, ...);
 void bar(unsigned short n);
 
 void optimize(Instruction *prog);
+extern int optimize_level;
 void output(Instruction *prog);
 void proof_of_concept(void);
