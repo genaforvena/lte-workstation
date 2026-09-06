@@ -434,11 +434,145 @@ static bool optimize_pass(Instruction *prog, int stage) {
   return changed;
 }
 
+static int instruction_count(Instruction *prog) {
+  int count = 0;
+  for (; prog->opcode; prog = prog->next)
+    count++;
+  return count;
+}
+
+static Instruction *clone_program(Instruction *prog) {
+  Instruction *head = NULL;
+  Instruction **tail = &head;
+
+  for (; ; prog = prog->next) {
+    Instruction *copy = calloc(1, sizeof(Instruction));
+    *copy = *prog;
+    *tail = copy;
+    tail = &copy->next;
+    if (!prog->opcode)
+      break;
+  }
+  return head;
+}
+
+static void free_program(Instruction *prog) {
+  while (prog) {
+    Instruction *next = prog->next;
+    free(prog);
+    prog = next;
+  }
+}
+
+static void replace_program(Instruction *dst, Instruction *src) {
+  Instruction *old_tail = dst->next;
+  dst->next = NULL;
+  free_program(old_tail);
+
+  *dst = *src;
+  dst->next = NULL;
+  Instruction **tail = &dst->next;
+  for (Instruction *node = src->next; node; node = node->next) {
+    Instruction *copy = calloc(1, sizeof(Instruction));
+    *copy = *node;
+    copy->next = NULL;
+    *tail = copy;
+    tail = &copy->next;
+  }
+}
+
+static unsigned genetic_random(unsigned *state) {
+  *state = *state * 1664525u + 1013904223u;
+  return *state;
+}
+
+static void run_schedule(Instruction *prog, unsigned char *genes, int gene_count) {
+  for (int i = 0; i < gene_count; i++) {
+    int passes = 0;
+    while (optimize_pass(prog, genes[i]) && passes++ < 32)
+      ;
+  }
+}
+
+/* Search pass orderings while keeping the existing peephole rules as the
+ * only mutations. This makes -O2 a small, deterministic superoptimizer: the
+ * population can discover a shorter ordering, but cannot invent an unsafe
+ * rewrite. */
+static void genetic_superoptimize(Instruction *prog) {
+  enum { POPULATION = 10, GENERATIONS = 6, GENES = 12, ELITE = 2 };
+  unsigned char population[POPULATION][GENES];
+  unsigned char next[POPULATION][GENES];
+  unsigned seed = (unsigned)instruction_count(prog) ^ 0x9e3779b9u;
+  Instruction *best_program = clone_program(prog);
+  int best_score = instruction_count(best_program);
+  run_schedule(best_program, (unsigned char[]){0, 1}, 2);
+  best_score = instruction_count(best_program);
+
+  for (int i = 0; i < POPULATION; i++) {
+    for (int j = 0; j < GENES; j++)
+      population[i][j] = (unsigned char)(genetic_random(&seed) & 1);
+    if (i == 0) {
+      for (int j = 0; j < GENES / 2; j++) population[i][j] = 0;
+      for (int j = GENES / 2; j < GENES; j++) population[i][j] = 1;
+    } else if (i == 1) {
+      for (int j = 0; j < GENES; j++) population[i][j] = (unsigned char)(j & 1);
+    }
+  }
+
+  for (int generation = 0; generation < GENERATIONS; generation++) {
+    int scores[POPULATION];
+    for (int i = 0; i < POPULATION; i++) {
+      Instruction *candidate = clone_program(prog);
+      run_schedule(candidate, population[i], GENES);
+      scores[i] = instruction_count(candidate);
+      if (scores[i] < best_score) {
+        free_program(best_program);
+        best_program = candidate;
+        best_score = scores[i];
+      } else {
+        free_program(candidate);
+      }
+    }
+    int elite[ELITE] = {0, 0};
+    for (int i = 1; i < POPULATION; i++) {
+      if (scores[i] < scores[elite[0]]) {
+        elite[1] = elite[0];
+        elite[0] = i;
+      } else if (elite[0] == elite[1] || scores[i] < scores[elite[1]]) {
+        elite[1] = i;
+      }
+    }
+
+    memcpy(next[0], population[elite[0]], GENES);
+    memcpy(next[1], population[elite[1]], GENES);
+    for (int i = ELITE; i < POPULATION; i++) {
+      int split = (int)(genetic_random(&seed) % GENES);
+      int parent = (int)(genetic_random(&seed) & 1);
+      for (int j = 0; j < GENES; j++) {
+        next[i][j] = population[elite[parent]][j];
+        if (j >= split) next[i][j] = population[elite[parent ^ 1]][j];
+        if ((genetic_random(&seed) % 7) == 0)
+          next[i][j] ^= 1;
+      }
+    }
+    memcpy(population, next, sizeof(population));
+  }
+
+  if (best_program) {
+    replace_program(prog, best_program);
+    free(best_program);
+  }
+}
+
 void optimize(Instruction *prog) {
-  while (optimize_pass(prog, 0))
-    ;
-  while (optimize_pass(prog, 1))
-    ;
+  if (optimize_level >= 2) {
+    genetic_superoptimize(prog);
+  } else {
+    while (optimize_pass(prog, 0))
+      ;
+    while (optimize_pass(prog, 1))
+      ;
+  }
 }
 
 void output_one(Instruction *ins) {

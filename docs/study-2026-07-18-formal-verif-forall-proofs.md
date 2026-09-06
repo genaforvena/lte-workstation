@@ -1,8 +1,18 @@
 # Study finding — "parse GitHub repository links for potential Forall proofs" (formal verification)
 
 **Source:** auto idea-queue task from the `study 'formal verification'` brief (2026-07-16T08:23:01Z).
-**Verdict:** DECLINED as a build — recorded as a negative finding instead. No tree feature added.
+**Verdict:** Historically declined as a build; reopened by the 2026-09-06 idea-queue task and
+implemented as a small, non-networking parser in `scripts/mesh-study-bridge`.
 **Date:** 2026-07-18 · owner: genome
+
+## Reopened implementation (2026-09-06)
+
+The study bridge now extracts canonical, deduplicated `https://github.com/OWNER/REPO` identities
+from harvested item links. Issue/tree/commit suffixes and `.git` are removed, malformed profile-like
+links are ignored, and the resulting candidates are supplied to the worker prompt as potential
+Forall (∀) proof repositories. The worker is told to seek actual Lean/Coq/Agda/Dafny/Isabelle/TLA+
+artifacts rather than infer a proof from a link alone. This keeps the feature small and read-only;
+it does not clone or claim to verify external repositories.
 
 ## The ask, read literally
 
