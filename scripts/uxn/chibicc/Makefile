@@ -23,6 +23,9 @@ test: chibicc #extern.o
 	./chibicc -O1 tmp-tests.c > tmp-tests-O1.tal
 	uxnasm tmp-tests-O1.tal tmp-tests-O1.rom
 	uxncli tmp-tests-O1.rom
+	./chibicc -O2 tmp-tests.c > tmp-tests-O2.tal
+	uxnasm tmp-tests-O2.tal tmp-tests-O2.rom
+	uxncli tmp-tests-O2.rom
 
 #test-gen2: chibicc-gen2 extern.o
 #	./chibicc-gen2 tests > tmp.s
