@@ -2,7 +2,7 @@
 
 goal: довести агента-кандидата до оплачиваемой работы
 
-Engine: claude. Mission and the honesty rules in full: `~/.mesh/hire-mission.md`.
+Engine: codex. Mission and the honesty rules in full: `~/.mesh/hire-mission.md`.
 
 **The subject of the hire is the mesh itself**, not the operator. Reach the end of a funnel and
 obtain a real offer, or an accepted paid task, or a paid bounty, for work the mesh performs. A

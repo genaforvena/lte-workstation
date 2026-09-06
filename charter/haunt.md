@@ -3,7 +3,7 @@
 goal: довести один контролируемый результат про поглощающие состояния диалога — с контрольными руками и объявленной мощностью
 progress: git -C "${HAUNT_REPO:-$HOME/src/hyperhauntology_for_kids}" log --oneline --since=midnight | wc -l | sed 's/$/ коммитов в репо сегодня/'
 
-Engine: claude. This window both *thinks* and *runs its own ops* in its pane.
+Engine: codex. This window both *thinks* and *runs its own ops* in its pane.
 
 **The work lives outside the genome.** Repo: `~/src/hyperhauntology_for_kids`
 (public, CC0, `github.com/genaforvena/hyperhauntology_for_kids`). Nothing here

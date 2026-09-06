@@ -2,7 +2,7 @@
 
 goal: публиковать то, что мы реально измерили — черновик, который не вышел, не существует
 
-Engine: claude. Data pane: `mesh-pub-dash`, a two-half surface — LEFT the local novelties and
+Engine: codex. Data pane: `mesh-pub-dash`, a two-half surface — LEFT the local novelties and
 genome literature reviews there is something to write about, RIGHT the external comments and
 reactions on what we already published (HN / Reddit / dev.to). Publishing target is dev.to via
 `mesh-devto-publish`; the key lives in `~/.mesh/devto.env` and never in the genome.

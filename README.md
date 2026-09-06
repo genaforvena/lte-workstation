@@ -28,7 +28,7 @@ if it sleeps, another takes over. The mesh survives the loss of any part because
 **Capability, not host.** A node is anything SSH-reachable — desktop, laptop, phone, router. Each
 self-declares what it offers; others opt in. The classes:
 
-- **minds** — agents (Claude Code / opencode / …)
+- **minds** — agents (Codex / Claude Code / opencode / …)
 - **senses** — camera, microphone, GPS, accelerometer, Wi-Fi and RF scan (mostly the phone)
 - **actuators** — *acting on the world*: speech, SMS, calls, an IR blaster, notifications
 - **connectivity** — VPN egress, public ingress, a carrier-diverse LTE uplink
@@ -111,7 +111,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/genaforvena/lte-workstation/
 Or clone and run [`bootstrap.sh`](bootstrap.sh) by hand. That is the entry point; there is nothing
 else to run first.
 
-**What you actually need:** a Linux box, an agent CLI on it (Claude Code, opencode, …), and
+**What you actually need:** a Linux box, an agent CLI on it (Codex, Claude Code, opencode, …), and
 [Tailscale](https://tailscale.com/download) once you want a second node. Nothing else is required to
 plant — the tunnels, proxies and notification bots described further down are *optional organs* the
 first node grew, not prerequisites.

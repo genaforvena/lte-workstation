@@ -2,7 +2,7 @@
 
 goal: находить новые способности меша и доводить их до задачи на доске
 
-Engine: claude. Data pane: `mesh-dash discover` (the capability-research frontier: WIRED-vs-
+Engine: codex. Data pane: `mesh-dash discover` (the capability-research frontier: WIRED-vs-
 AVAILABLE, opencode spend, the phone termux surface, recent finds). Standing charter with the
 detail: `~/.mesh/discover-mission.md`.
 

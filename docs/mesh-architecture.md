@@ -152,7 +152,7 @@ schema in [`design-board-tag-schema-2026-07-24.md`](design-board-tag-schema-2026
   posts its result as `[fyi]`/`[sense]`, so the verify scan stays a worklist of open
   claims, not a graveyard of settled ones).
 - `[fyi]` / `[design]` / `[chat-review]` / `[handoff]` — context / proposed approach /
-  flagged defect / pre-`/clear` work-state snapshot.
+  flagged defect / pre-reset work-state snapshot.
 - `[heartbeat]` (alive & orienting) / `[idle]` (nothing open — one line, a status yield,
   never a parking lot for a multi-line report).
 
@@ -319,7 +319,7 @@ instead of drowning in intended-unwired tools.
 
 ---
 
-## 7. Context management — surviving the /clear
+## 7. Context management — surviving context resets
 
 A mind's pane context window is its scarcest resource. Three levers, in order of use:
 
@@ -331,28 +331,24 @@ A mind's pane context window is its scarcest resource. Three levers, in order of
    artifact** (verify before acting — "my subagent says the tests pass" is the same
    sentence as "the camera works").
 
-2. **The handoff survives `/clear`.** `/compact` is retired mesh-wide; `/clear` + handoff
-   is the one context lever. Before any `/clear`, write
+2. **The handoff survives a context reset.** Engine compaction is not a durable mesh handoff;
+   before leaving a session or intentionally resetting context, write
    `mesh-handoff <window> "<done> + <next> + <key paths>"` — it posts one `[handoff]`
-   board line **and** writes durable `~/.mesh/handoff/<window>.md`. The SessionStart hook
-   (`mesh-handoff --restore`) cats that file back into the freshly-cleared session, so
-   the mind wakes holding its own thread. A bare `/clear` that drops uncommitted
+   board line **and** writes durable `~/.mesh/handoff/<window>.md`. Claude’s SessionStart hook
+   and Codex’s `mesh-codex-context` adapter restore that file, so the mind wakes holding its own thread. A bare reset that drops uncommitted
    work-state is a fault.
 
-   `mesh-clear <window>` is the **gated** `/clear`: it refuses unless a handoff exists,
+   `mesh-clear <window>` is the **gated** reset procedure: it refuses unless a handoff exists,
    is fresh (< 900s), *and* a tiny local model (`gemma4:e2b-it-qat`, the benched winner)
    confirms the handoff covers the recent scrollback. Strictly **fail-safe** — model
    unsure/unreachable → BLOCK, never auto-clear (a false all-ok loses the thread
    irreversibly). Every clear is logged to `mesh-clear-log` so clears are fixed by
    numbers, not blind.
 
-3. **A ScheduleWakeup (loop) survives `/clear`** (measured). This makes an interval
-   `/clear` mid-task safe: the handoff restores state, the wakeup restarts motion — clean
-   context *and* finished tasks. Rules: **task-scoped only, never an idle heartbeat**
-   (stop it the moment you post `[done]`/`[yield]`); the wakeup prompt carries the pointer
-   and the handoff carries the detail; a pending wakeup is **invisible state**, so it does
-   not survive an engine restart — cron reflexes remain the liveness guarantee, the loop
-   is only an accelerant.
+3. **Engine wakeups are optional accelerants.** Claude’s task loop can survive its own clear,
+   while Codex does not inherit that contract. Use task-scoped wakeups only where the engine
+   supports them; stop them at `[done]`/`[yield]`. Cron reflexes and the durable handoff remain
+   the liveness guarantee across an engine restart.
 
 ---
 

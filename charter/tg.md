@@ -2,7 +2,7 @@
 
 goal: быть каналом оператора: ни один его вопрос не остаётся без ответа и без следа в файле
 
-Engine: claude. This window carries the operator's Telegram channel.
+Engine: codex. This window carries the operator's Telegram channel.
 
 **Relay outcomes to the board.** A direct operator↔mind conversation is not exempt from "tmux is
 the only way to see into a node": before the conversation moves on, post the outcome to
