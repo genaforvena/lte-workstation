@@ -188,6 +188,56 @@ smoke_test() {
     return 0
 }
 
+# --- just-in-time worker compilation ---------------------------------------------------------
+# The model is the expensive part of inference, but the fallback worker also used to parse and
+# compile its request builder on every retry.  That is small in absolute terms and still paid at
+# the worst possible moment: after the primary transport failed.  Compile the exact worker source
+# once, keyed by its source hash, and load the resulting bytecode on later calls.  This is a cache
+# of executable code, not a claim that the model itself is warm; model residency remains owned by
+# ollama and is separately observable.
+JIT_CACHE_DIR="${MESH_LOCAL_MIND_JIT_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/mesh-local-mind}"
+JIT_WORKER_SOURCE='import json,sys
+def main():
+    model,prompt,think=sys.argv[1:]
+    d={"model":model,"prompt":prompt,"stream":False}
+    if think == "false":
+        d["think"]=False
+    print(json.dumps(d))
+if __name__ == "__main__":
+    main()
+'
+JIT_WORKER_HASH="$(printf '%s' "$JIT_WORKER_SOURCE" | sha256sum | awk '{print $1}')"
+JIT_WORKER_PYC="$JIT_CACHE_DIR/worker-$JIT_WORKER_HASH.pyc"
+
+jit_prepare() {
+    [ -s "$JIT_WORKER_PYC" ] && return 0
+    mkdir -p "$JIT_CACHE_DIR" || return 1
+    local src="$JIT_CACHE_DIR/worker-$JIT_WORKER_HASH.py"
+    local tmp_src="$src.$$" tmp_pyc="$JIT_WORKER_PYC.$$"
+    # Atomic source + bytecode publication: a failed/interrupted compile never becomes the
+    # apparently-ready fallback artifact another invocation would load.
+    printf '%s' "$JIT_WORKER_SOURCE" > "$tmp_src" || return 1
+    mv -f "$tmp_src" "$src" || return 1
+    python3 - "$src" "$tmp_pyc" <<'PYEOF'
+import py_compile, sys
+py_compile.compile(sys.argv[1], cfile=sys.argv[2], doraise=True)
+PYEOF
+    mv -f "$tmp_pyc" "$JIT_WORKER_PYC" || return 1
+    rm -f "$src"
+    [ -s "$JIT_WORKER_PYC" ]
+}
+
+jit_worker() {
+    jit_prepare || return 1
+    python3 - "$JIT_WORKER_PYC" "$@" <<'PYEOF'
+import importlib.machinery, sys
+loader = importlib.machinery.SourcelessFileLoader("mesh_local_mind_jit_worker", sys.argv[1])
+module = loader.load_module()
+sys.argv = [sys.argv[1], *sys.argv[2:]]
+module.main()
+PYEOF
+}
+
 # no-think contract gate: drive the REAL tool end-to-end at a recording stub server (no ollama
 # needed — runs on every node) and assert the payload the tool actually sends. Three legs:
 # --no-think → "think": false present · unflagged → NO think key (legacy payload untouched) ·
@@ -195,6 +245,8 @@ smoke_test() {
 nothink_gate() {
     local td rec port pid out leg
     td="$(mktemp -d)" || { echo "smoke-test: FAIL (no-think: mktemp)"; return 1; }
+    JIT_CACHE_DIR="$td/jit"
+    JIT_WORKER_PYC="$JIT_CACHE_DIR/worker-$JIT_WORKER_HASH.pyc"
     rec="$td/payloads"
     python3 - "$rec" >"$td/port" 2>/dev/null <<'PYEOF' &
 import json, sys
@@ -223,7 +275,7 @@ PYEOF
     _leg() { # $1=leg-name $2=expected-think(json: false|absent) then argv... ; env prepared by caller
         local name="$1" want="$2"; shift 2
         : >"$rec"
-        out="$(env -u MESH_LOCAL_MIND_MODEL -u MESH_LOCAL_MIND_THINK OLLAMA_URL="http://127.0.0.1:$port" "$@" 2>/dev/null)"
+        out="$(env -u MESH_LOCAL_MIND_MODEL -u MESH_LOCAL_MIND_THINK MESH_LOCAL_MIND_JIT_CACHE="$JIT_CACHE_DIR" OLLAMA_URL="http://127.0.0.1:$port" "$@" 2>/dev/null)"
         [ "$out" = "stub-ok" ] || { echo "smoke-test: FAIL (no-think/$name: expected stub-ok, got '$out')"; return 1; }
         python3 - "$rec" "$want" <<'PYEOF2' 2>"$td/assert-err" || { echo "smoke-test: FAIL (no-think/$name: $(tail -1 "$td/assert-err"))"; return 1; }
 import json, sys
@@ -244,8 +296,12 @@ PYEOF2
     [ "$rc" -eq 0 ] && { _leg legacy absent "$0" --model stub:1b 'ping'  || rc=1; }
     [ "$rc" -eq 0 ] && { _leg env    false  env MESH_LOCAL_MIND_THINK=false "$0" --model stub:1b 'ping' || rc=1; }
     kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+    [ -s "$JIT_WORKER_PYC" ] || { echo "smoke-test: FAIL (jit: no compiled worker artifact)"; rm -rf "$td"; return 1; }
+    first_hash="$JIT_WORKER_HASH"
+    jit_prepare || { echo "smoke-test: FAIL (jit: cached worker could not be reused)"; rm -rf "$td"; return 1; }
+    [ "$first_hash" = "$JIT_WORKER_HASH" ] || { echo "smoke-test: FAIL (jit: worker hash changed between calls)"; rm -rf "$td"; return 1; }
     rm -rf "$td"
-    [ "$rc" -eq 0 ] && echo "smoke-test: ok (no-think contract: flag/env set think:false, legacy payload untouched)"
+    [ "$rc" -eq 0 ] && echo "smoke-test: ok (no-think contract + JIT worker cache: flag/env set think:false, legacy payload untouched; compiled=$JIT_WORKER_HASH)"
     return "$rc"
 }
 
@@ -285,15 +341,12 @@ fi
 # ONE payload builder for BOTH transports (HTTP + SSH) — the think rule asserted here is asserted
 # everywhere (a rule asserted at one call site is not asserted).
 build_payload() { # $1=model $2=prompt → request JSON on stdout, honoring THINK_MODE
-    python3 -c "
-import json, sys
-d = {'model': sys.argv[1], 'prompt': sys.argv[2], 'stream': False}
-if sys.argv[3] == 'false':
-    d['think'] = False
-print(json.dumps(d))
-" "$1" "$2" "${THINK_MODE:-}"
+    jit_worker "$1" "$2" "${THINK_MODE:-}"
 }
 
+# Compile before any server/model probe. If the primary worker is unavailable, the fallback's
+# request code is already loadable and does not add a first-use compile pause to the recovery path.
+jit_prepare || die "cannot prepare compiled inference worker in $JIT_CACHE_DIR"
 ensure_server
 
 # SSH transport: reach the remote mind's LOCALHOST ollama API over authenticated SSH (the API is
