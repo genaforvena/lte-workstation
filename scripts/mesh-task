@@ -1,0 +1,309 @@
+#!/usr/bin/env python3
+# orphan-ok: on-demand task-chain coordinator; invoked by minds and board dispatch, not a cron reflex
+"""mesh-task: durable ordered task chains with explicit inter-mind hand-off.
+
+The board is the rendezvous, while this small JSON artifact is the chain's source of
+truth. A step cannot be completed without an existing artifact; completing it opens
+exactly one successor and writes the successor's handoff before posting its task.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+
+ROOT = Path(os.environ.get("MESH_DIR", str(Path.home() / ".mesh")))
+CHAINS = Path(os.environ.get("MESH_TASK_DIR", str(ROOT / "task-chains")))
+ACTOR = os.environ.get("MESH_TASK_ACTOR", os.environ.get("MESH_WHO", "mesh-task"))
+SAFE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,119}$")
+
+
+def die(message: str, code: int = 2) -> None:
+    print(f"mesh-task: {message}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def check_name(value: str, label: str) -> str:
+    if not SAFE.fullmatch(value) or value.startswith("-"):
+        die(f"invalid {label} '{value}' (use letters, numbers, '.', '_', '/', '-')")
+    return value
+
+
+def path_for(chain: str) -> Path:
+    check_name(chain, "chain")
+    return CHAINS / (chain.replace("/", "__") + ".json")
+
+
+def now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def emit(marker: str, body: str) -> bool:
+    command = os.environ.get("MESH_TASK_CHAT_CMD", "mesh-chat")
+    try:
+        return subprocess.run([command, f"[{marker}] {body}"], check=False,
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+    except OSError:
+        # The durable chain artifact remains authoritative when the board helper is absent.
+        return False
+
+
+def save(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent), text=True)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+        os.replace(tmp, path)
+    finally:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+
+
+def load(chain: str) -> tuple[Path, dict]:
+    path = path_for(chain)
+    try:
+        return path, json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        die(f"chain '{chain}' does not exist (create it from a TSV plan first)")
+    except json.JSONDecodeError as exc:
+        die(f"chain artifact is corrupt: {path}: {exc}", 1)
+
+
+def step_for(data: dict, ref: str) -> tuple[int, dict]:
+    for index, step in enumerate(data["steps"]):
+        if ref in (str(index + 1), step["slug"], step["id"]):
+            return index, step
+    die(f"step '{ref}' is not in chain '{data['chain']}'")
+
+
+def post_task(data: dict, index: int) -> bool:
+    step = data["steps"][index]
+    return emit("task", f"{step['id']} → owner: mesh-task/{step['owner']} — {step['description']}")
+
+
+def handoff(data: dict, index: int, completed: dict) -> bool:
+    step = data["steps"][index]
+    text = (f"chain {data['chain']} advanced: {completed['id']} completed with artifact "
+            f"{completed['artifact']}; next is {step['id']} for mind {step['owner']}. "
+            f"Run: mesh-task take {data['chain']} {step['slug']}; verify the artifact before acting.")
+    command = os.environ.get("MESH_TASK_HANDOFF_CMD", "mesh-handoff")
+    try:
+        result = subprocess.run([command, step["owner"], text], check=False,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        return False
+    if result.returncode != 0:
+        return False
+    return emit("handoff", f"{data['chain']}: {completed['id']} → {step['id']} ({step['owner']})")
+
+
+def dispatch(path: Path, data: dict) -> None:
+    """Deliver the current successor, retaining a loud retryable failure on disk."""
+    index = data["current"]
+    if index == 0:
+        ok = post_task(data, index)
+    else:
+        ok = handoff(data, index, data["steps"][index - 1]) and post_task(data, index)
+    if ok:
+        data.pop("dispatch_error", None)
+        data["dispatch"] = "sent"
+        save(path, data)
+        return
+    data["dispatch"] = "failed"
+    data["dispatch_error"] = f"{now()}: handoff or board task post failed; run mesh-task dispatch {data['chain']}"
+    save(path, data)
+    emit("yield", f"{data['chain']}: successor {data['steps'][index]['id']} was NOT dispatched — {data['dispatch_error']}")
+    die(data["dispatch_error"], 1)
+
+
+def create(chain: str, plan: str) -> None:
+    check_name(chain, "chain")
+    path = path_for(chain)
+    if path.exists():
+        die(f"chain '{chain}' already exists; refusing to overwrite")
+    rows = []
+    for lineno, raw in enumerate(Path(plan).read_text(encoding="utf-8").splitlines(), 1):
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        fields = raw.split("\t", 2)
+        if len(fields) != 3:
+            die(f"plan line {lineno} must be owner<TAB>step-slug<TAB>description")
+        owner, slug, description = (x.strip() for x in fields)
+        check_name(owner, f"owner on line {lineno}")
+        check_name(slug, f"step on line {lineno}")
+        if not description:
+            die(f"plan line {lineno} has an empty description")
+        if any(s["slug"] == slug for s in rows):
+            die(f"plan repeats step slug '{slug}'")
+        rows.append({"id": f"{chain}/{slug}", "owner": owner, "slug": slug,
+                     "description": description, "status": "open"})
+    if not rows:
+        die("plan has no steps")
+    data = {"version": 1, "chain": chain, "created": now(), "status": "open",
+            "current": 0, "steps": rows}
+    save(path, data)
+    dispatch(path, data)
+    print(f"created {chain}: {len(rows)} step(s) → {path}")
+
+
+def take(chain: str, ref: str) -> None:
+    path, data = load(chain)
+    index, step = step_for(data, ref)
+    if index != data["current"]:
+        die(f"step {step['id']} is not the current step (current: {data['steps'][data['current']]['id']})")
+    if step["status"] == "active":
+        print(f"already active {step['id']}")
+        return
+    if step["status"] != "open" or data["status"] not in ("open", "active"):
+        die(f"step {step['id']} is {step['status']}; it is not claimable")
+    step["status"] = "active"
+    step["started"] = now()
+    data["status"] = "active"
+    save(path, data)
+    emit("taking", f"{ACTOR}: {step['id']} — {step['description']}")
+    print(f"claimed {step['id']}")
+
+
+def done(chain: str, ref: str, artifact: str, result: str) -> None:
+    path, data = load(chain)
+    index, step = step_for(data, ref)
+    if index != data["current"] or step["status"] != "active":
+        die(f"step {step['id']} is not active; take it before settling")
+    artifact_path = Path(artifact).expanduser()
+    if not artifact_path.exists():
+        die(f"artifact does not exist: {artifact} (a claim is not complete without evidence)")
+    step.update(status="done", finished=now(), artifact=str(artifact_path), result=result or "verified")
+    next_index = index + 1
+    if next_index >= len(data["steps"]):
+        data["status"] = "complete"
+        data["current"] = index
+    else:
+        data["current"] = next_index
+        data["status"] = "open"
+        data["steps"][next_index]["status"] = "open"
+        data["dispatch"] = "pending"
+    save(path, data)
+    emit("done", f"{step['id']}: artifact={artifact_path} — {step['result']}")
+    if data["status"] == "complete":
+        print(f"complete {chain}: final artifact {artifact_path}")
+        return
+    dispatch(path, data)
+    print(f"settled {step['id']}; handed off {data['steps'][next_index]['id']} to {data['steps'][next_index]['owner']}")
+
+
+def block(chain: str, ref: str, reason: str) -> None:
+    path, data = load(chain)
+    index, step = step_for(data, ref)
+    if index != data["current"] or step["status"] != "active":
+        die(f"step {step['id']} is not active; take it before blocking")
+    step.update(status="blocked", blocked=now(), reason=reason)
+    data["status"] = "blocked"
+    save(path, data)
+    emit("yield", f"{step['id']}: blocked — {reason}")
+    print(f"blocked {step['id']}")
+
+
+def unblock(chain: str, ref: str) -> None:
+    path, data = load(chain)
+    index, step = step_for(data, ref)
+    if index != data["current"] or step["status"] != "blocked" or data["status"] != "blocked":
+        die(f"step {step['id']} is not the blocked current step")
+    step["status"] = "open"
+    step.pop("blocked", None); step.pop("reason", None)
+    data["status"] = "open"
+    save(path, data)
+    post_task(data, index)
+    print(f"reopened {step['id']}")
+
+
+def retry_dispatch(chain: str) -> None:
+    path, data = load(chain)
+    if data["status"] not in ("open", "active") or data["steps"][data["current"]]["status"] != "open":
+        die(f"chain '{chain}' has no open current step to dispatch")
+    dispatch(path, data)
+    print(f"dispatched {data['steps'][data['current']]['id']}")
+
+
+def status(chain: str) -> None:
+    _, data = load(chain)
+    print(f"{data['chain']} [{data['status']}] ({data['current'] + 1}/{len(data['steps'])})")
+    for n, step in enumerate(data["steps"], 1):
+        print(f"  {n}. {step['id']} [{step['status']}] owner={step['owner']}" +
+              (f" artifact={step['artifact']}" if "artifact" in step else ""))
+    if data.get("dispatch") in ("pending", "failed"):
+        print(f"  dispatch={data['dispatch']} {data.get('dispatch_error', '')}")
+
+
+def test() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td); fake = root / "bin"; fake.mkdir()
+        board = root / "board.log"; handoffs = root / "handoffs"; fake_h = fake / "handoff"
+        fake_chat = fake / "chat"; fake_h.write_text("#!/bin/sh\n[ \"${MESH_TASK_HANDOFF_FAIL:-0}\" = 1 ] && exit 1\nprintf '%s\\n' \"$1\" >> \"$MESH_TASK_HANDOFF_LOG\"\n")
+        fake_chat.write_text("#!/bin/sh\nprintf '%s\\n' \"$1\" >> \"$MESH_TASK_CHAT_LOG\"\n")
+        fake_h.chmod(0o755); fake_chat.chmod(0o755)
+        plan = root / "plan.tsv"; plan.write_text("alpha\tinspect\tinspect source\nbeta\tverify\tverify result\ngamma\tclose\tclose chain\n")
+        artifact = root / "artifact.md"; artifact.write_text("verified artifact\n")
+        env = os.environ.copy(); env.update({"MESH_DIR": str(root / "mesh"), "MESH_TASK_DIR": str(root / "mesh" / "chains"),
+            "MESH_TASK_CHAT_CMD": str(fake_chat), "MESH_TASK_HANDOFF_CMD": str(fake_h),
+            "MESH_TASK_CHAT_LOG": str(board), "MESH_TASK_HANDOFF_LOG": str(handoffs)})
+        def run(*args: str, expect: int = 0):
+            got = subprocess.run([sys.executable, __file__, *args], env=env, text=True,
+                                 capture_output=True)
+            if got.returncode != expect:
+                die(f"self-test command {' '.join(args)} rc={got.returncode}: {got.stderr.strip()}", 1)
+            return got
+        run("create", "demo", str(plan)); run("take", "demo", "inspect")
+        bad = run("done", "demo", "inspect", str(root / "missing"), expect=2)
+        if "artifact does not exist" not in bad.stderr: die("self-test missing-artifact guard failed", 1)
+        env["MESH_TASK_HANDOFF_FAIL"] = "1"
+        failed = run("done", "demo", "inspect", str(artifact), "source checked", expect=1)
+        if "handoff or board task post failed" not in failed.stderr: die("self-test dispatch failure was not loud", 1)
+        state = json.loads((root / "mesh/chains/demo.json").read_text())
+        if state["dispatch"] != "failed" or state["steps"][1]["status"] != "open": die("self-test did not retain failed dispatch", 1)
+        env.pop("MESH_TASK_HANDOFF_FAIL")
+        run("dispatch", "demo")
+        state = json.loads((root / "mesh/chains/demo.json").read_text())
+        if state["dispatch"] != "sent": die("self-test did not retry successor dispatch", 1)
+        if "demo/verify" not in board.read_text() or "beta" not in handoffs.read_text(): die("self-test handoff/board missing", 1)
+        run("take", "demo", "verify"); run("block", "demo", "verify", "needs operator input")
+        run("unblock", "demo", "verify"); run("take", "demo", "verify"); run("done", "demo", "verify", str(artifact))
+        state = json.loads((root / "mesh/chains/demo.json").read_text())
+        if state["current"] != 2 or state["dispatch"] != "sent": die("self-test second handoff missing", 1)
+        run("take", "demo", "close"); run("done", "demo", "close", str(artifact))
+        final = run("status", "demo")
+        if "demo [complete]" not in final.stdout: die("self-test chain did not complete", 1)
+    print("mesh-task: smoke-test ok (ordered steps, artifact gate, failed-dispatch retry, two successor handoffs, block/reopen, final completion)")
+
+
+def main(argv: list[str]) -> None:
+    if not argv or argv[0] in ("-h", "--help"):
+        print("usage: mesh-task create <chain> <plan.tsv> | take <chain> <step> | done <chain> <step> <artifact> [result]")
+        print("       mesh-task block <chain> <step> <reason> | unblock <chain> <step> | dispatch <chain> | status <chain> | --test")
+        return
+    if argv[0] == "--test": test(); return
+    command = argv[0]
+    try:
+        if command == "create" and len(argv) == 3: create(*argv[1:])
+        elif command == "take" and len(argv) == 3: take(*argv[1:])
+        elif command == "done" and len(argv) >= 4: done(argv[1], argv[2], argv[3], " ".join(argv[4:]))
+        elif command == "block" and len(argv) >= 4: block(argv[1], argv[2], " ".join(argv[3:]))
+        elif command == "unblock" and len(argv) == 3: unblock(*argv[1:])
+        elif command == "dispatch" and len(argv) == 2: retry_dispatch(*argv[1:])
+        elif command == "status" and len(argv) == 2: status(argv[1])
+        else: die("invalid arguments (use --help)")
+    except (OSError, ValueError) as exc:
+        die(str(exc), 1)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
