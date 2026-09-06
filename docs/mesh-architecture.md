@@ -111,6 +111,12 @@ from the pane alone, never re-fetching the same context. Extend `mesh-dash <role
 own the role's live surface; throttle expensive reads so the refresh loop stays cheap.
 Hot-reload a data pane with `tmux respawn-pane -k -t <sess>:<win>.0` (never C-c it).
 
+Every data renderer also prints an always-visible `pane live` footer: this is the top pane's
+liveness-as-lease, advancing while the renderer runs and freezing when it dies. `mesh-consume-all`
+discovers the live two-pane data/mind windows, and `mesh-pane-consume` wakes the bottom mind only
+when the normalized top-pane meaning changes (subject to prediction, refractory, and idle gates);
+the source remains ephemeral and the mind reads the full top pane after the wake.
+
 The current channel set (planted by `mesh-restore`, 2026-06-17 re-org — collapsed from
 the old 10+ window sprawl):
 
