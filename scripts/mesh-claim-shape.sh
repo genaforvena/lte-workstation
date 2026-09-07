@@ -154,7 +154,10 @@ _claim_id_of_uncached(){
   # lines fall through to derivation unchanged (docs/design-hledger-coordination-2026-07-24.md
   # Direction 1: "prefer the explicit tag, fall back to derivation"). The tag regex requires no space
   # after the colon, so prose "the task: do X" never matches — only the machine tag "task:<slug>".
-  tag="$(printf '%s' "$1" | grep -oE 'task:[A-Za-z0-9][A-Za-z0-9/._-]*' | head -1)"
+  # Board ids are Unicode-capable; the no-space boundary keeps prose "task: do"
+  # out while allowing Cyrillic (and other non-ASCII) task slugs to close ledger
+  # obligations and dispatch claims.
+  tag="$(printf '%s' "$1" | grep -oE 'task:[^[:space:],;()]+' | head -1)"
   [ -n "$tag" ] && { tag="${tag#task:}"; tag="${tag##*/}"; printf '%s' "$tag"; return; }
   # URL STRIP FIRST (claim-id-url-path-outranks-the-real-slug): before ANY derivation scan sees the
   # body, blank out http(s) URLs — their path segments are the ns/slug shape the whole-body widen
