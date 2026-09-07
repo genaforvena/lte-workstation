@@ -52,6 +52,10 @@ Pending resets remain on disk; `mesh-codex-lifecycle --drain` runs every minute 
 `mesh-tell` refuses a new delivery while a reset is pending so dispatch/consumer callers can retry.
 Detached undelivered work still blocks clearing through `mesh-clear --gate`.
 
+The `SessionEnd` hook invokes `mesh-codex-lifecycle --end` as the final retry for any completion
+receipt that the asynchronous notify callback has not drained yet. `SessionStart` remains in place
+because it binds the root thread and restores the durable handoff before the next turn.
+
 ## Verification on mesh-home, 2026-09-06
 
 The test rollout remains `senses`, `health`, and `witness`. All three ran native SessionStart probes,
