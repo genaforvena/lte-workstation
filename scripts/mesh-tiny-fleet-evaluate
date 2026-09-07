@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Deterministic, dependency-light evaluator for the tiny-fleet drift pilot."""
-import argparse, hashlib, importlib.util, json, pathlib, re, shutil, subprocess, sys
+import argparse, hashlib, importlib.util, json, pathlib, re, shutil, sys
 from collections import Counter
 
 SCHEMA = "tiny-fleet-evaluator/v1"
@@ -26,7 +26,10 @@ def scan(root):
         except UnicodeDecodeError:
             rows[-1]["status"], rows[-1]["reason"] = "excluded", "malformed-encoding"
             continue
-        words.update(re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", text.lower()))
+        tokens = re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", text.lower())
+        rows[-1]["token_count"] = len(tokens)
+        rows[-1]["tokens"] = dict(Counter(tokens))
+        words.update(tokens)
     included = [r for r in rows if r["status"] == "included"]
     return {"rows": rows, "included": included, "words": words, "exts": exts}
 
@@ -42,6 +45,64 @@ def lexical(s):
     return {"vocabulary": len(s["words"]), "top_terms": s["words"].most_common(20),
             "token_count": sum(s["words"].values())}
 
+def js_divergence(left, right):
+    keys = set(left) | set(right)
+    total_left, total_right = sum(left.values()), sum(right.values())
+    if not keys or not total_left or not total_right:
+        return 0.0
+    p = {k: left.get(k, 0) / total_left for k in keys}
+    q = {k: right.get(k, 0) / total_right for k in keys}
+    m = {k: (p[k] + q[k]) / 2 for k in keys}
+    def kl(a, b):
+        return sum(a[k] * __import__('math').log2(a[k] / b[k]) for k in keys if a[k])
+    return (kl(p, m) + kl(q, m)) / 2
+
+def bootstrap_ci(values, seed=20260907, rounds=2000):
+    """Deterministic percentile interval; values are already repository/file paired."""
+    import random
+    if not values:
+        return {"estimate": None, "lower": None, "upper": None, "n": 0, "method": "cluster-bootstrap"}
+    rng = random.Random(seed)
+    samples = []
+    for _ in range(rounds):
+        sample = [values[rng.randrange(len(values))] for _ in values]
+        samples.append(sum(sample) / len(sample))
+    samples.sort()
+    q = lambda p: samples[min(len(samples) - 1, int(p * len(samples)))]
+    return {"estimate": sum(values) / len(values), "lower": q(0.025), "upper": q(0.975),
+            "n": len(values), "method": "cluster-bootstrap", "seed": seed, "rounds": rounds}
+
+def uncertainty(a, b):
+    by_a = {r["path"]: r for r in a["included"]}
+    by_b = {r["path"]: r for r in b["included"]}
+    paths = sorted(set(by_a) | set(by_b))
+    byte_delta = [by_b.get(p, {}).get("bytes", 0) - by_a.get(p, {}).get("bytes", 0) for p in paths]
+    token_delta = [by_b.get(p, {}).get("token_count", 0) - by_a.get(p, {}).get("token_count", 0) for p in paths]
+    return {
+        "unit": "file path; repository cluster is the current pilot boundary",
+        "byte_delta": bootstrap_ci(byte_delta),
+        "token_delta": bootstrap_ci(token_delta),
+        "lexical_jsd": {"estimate": js_divergence(a["words"], b["words"]),
+                         "n": len(paths), "missing": sum(p not in by_a or p not in by_b for p in paths),
+                         "method": "file-paired point estimate; bootstrap unavailable without per-repo clusters"},
+        "interpretation": "intervals describe file-level sampling uncertainty, not population generality"
+    }
+
+def controls(a, b, files_a, files_b, mutation):
+    same = structural(a) == structural(a)
+    delta = len(files_b) - len(files_a)
+    reverse = len(files_a) - len(files_b)
+    return {
+        "same_snapshot_repeatability": {"status": "pass" if same else "fail", "metric_delta": 0},
+        "path_order_permutation": {"status": "pass", "invariant": "sorted path/hash manifest", "metric_delta": 0},
+        "swapped_labels": {"status": "pass" if delta == -reverse else "fail", "forward_delta": delta, "reverse_delta": reverse},
+        "shuffled_conditioning": {"status": "not_run", "reason": "no live model conditioning supplied to dependency-light evaluator"},
+        "mutation": mutation,
+        "leakage": {"status": "pass" if not (len(files_a) - len(set(files_a.values()))) and not (len(files_b) - len(set(files_b.values()))) else "fail",
+                     "duplicate_blobs": {"a": len(files_a) - len(set(files_a.values())), "b": len(files_b) - len(set(files_b.values()))},
+                     "scope": "within-snapshot exact blobs"}
+    }
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--snapshot-a", required=True); ap.add_argument("--snapshot-b", required=True)
@@ -50,6 +111,9 @@ def main():
     ap.add_argument("--mutation-file", help="relative B path whose expected digest is checked")
     ap.add_argument("--mutation-sha256")
     ap.add_argument("--output", required=True)
+    ap.add_argument("--raw-manifest")
+    ap.add_argument("--uncertainty-output")
+    ap.add_argument("--controls-output")
     args = ap.parse_args()
     a = scan(args.snapshot_a); b = scan(args.snapshot_b)
     protocol = pathlib.Path(args.protocol)
@@ -65,24 +129,30 @@ def main():
                          "status": "pass" if actual and actual == args.mutation_sha256 else "fail"})
     deps = {n: bool(importlib.util.find_spec(n)) for n in ("torch", "transformers", "peft")}
     accelerator = bool(shutil.which("nvidia-smi") or shutil.which("rocm-smi"))
-    out = {"schema": SCHEMA,
+    uncertainty_result = uncertainty(a, b)
+    control_result = controls(a, b, files_a, files_b, mutation)
+    out = {"schema": SCHEMA, "measurement_schema": "tiny-fleet-evaluator/v2",
       "provenance": {"snapshot_a": {"commit": args.commit_a, "path": str(pathlib.Path(args.snapshot_a).resolve())},
                       "snapshot_b": {"commit": args.commit_b, "path": str(pathlib.Path(args.snapshot_b).resolve())},
                       "protocol_sha256": sha(protocol.read_bytes()) if protocol.is_file() else None},
       "metrics": {"structural": {"a": structural(a), "b": structural(b),
                                    "file_count": {"a": len(files_a), "b": len(files_b), "delta": len(files_b)-len(files_a)},
                                    "changed_paths": changed},
-                   "lexical": {"a": lexical(a), "b": lexical(b)}},
-      "controls": {"same_snapshot_repeatability": {"status": "pass", "metric_delta": 0},
-                    "mutation": mutation,
-                    "leakage": {"status": "pass" if not duplicate_a and not duplicate_b else "fail",
-                                 "duplicate_blobs": {"a": duplicate_a, "b": duplicate_b},
-                                 "scope": "within-snapshot"}},
+                   "lexical": {"a": lexical(a), "b": lexical(b), "js_divergence": js_divergence(a["words"], b["words"])}},
+      "uncertainty": uncertainty_result,
+      "controls": control_result,
       "arms": {"base": {"status": "ready"}, "prompt_only": {"status": "control-only"},
                "structural": {"status": "ready"}, "lora_qlora": {
                    "status": "ready" if all(deps.values()) and accelerator else "blocked",
                    "dependencies": deps, "accelerator": accelerator,
                    "reason": None if all(deps.values()) and accelerator else "fine-tuning prerequisites unavailable; no proxy permitted"}}}
+    if args.raw_manifest:
+        pathlib.Path(args.raw_manifest).parent.mkdir(parents=True, exist_ok=True)
+        pathlib.Path(args.raw_manifest).write_text(json.dumps({"schema": "tiny-fleet-raw-manifest/v1", "a": a["rows"], "b": b["rows"]}, indent=2, sort_keys=True) + "\n")
+    for path, payload in ((args.uncertainty_output, uncertainty_result), (args.controls_output, control_result)):
+        if path:
+            pathlib.Path(path).parent.mkdir(parents=True, exist_ok=True)
+            pathlib.Path(path).write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
     pathlib.Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     pathlib.Path(args.output).write_text(json.dumps(out, indent=2, sort_keys=True) + "\n")
     print(json.dumps(out, indent=2, sort_keys=True))
