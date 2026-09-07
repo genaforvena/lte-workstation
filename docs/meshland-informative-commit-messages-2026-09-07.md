@@ -54,12 +54,8 @@ is path-limited to the gated set and landed + deployed by mesh-land.
   `commit body does not name the landed path in its scope/result evidence`.
 - Green: `scripts/mesh-land --test` → `smoke-test: ok` (exit 0).
 - Syntax: `bash -n scripts/mesh-land` → exit 0.
-- Exact source hashes: HEAD blob before change `f265864f37669b09d8f931f2c390cc6b02fcbb86`;
-  working-tree blob after change `f91b8154851200806e8f22516d97b4bb141be500`;
-  working-tree SHA-256 `9306cfb82f4cd1670fbdee8a3962c1e7cf30c7f0a3e4df69638895f934f2b7f4`.
-- Deployed copy remains unchanged pending the normal MeshLand landing gate: SHA-256
-  `a115eadb9dd1eb6c14e0222fdca02728b46eecec3ffab247eda25131a067267a`.
-- No after-landing commit hash exists yet: this work is intentionally left uncommitted so the
-  normal `mesh-land --apply` / push gates can create it without hand-editing history.
-
-The implementation and this artifact remain subject to the normal MeshLand commit/push gate.
+- Exact source/deployed SHA-256 after landing: `9306cfb82f4cd1670fbdee8a3962c1e7cf30c7f0a3e4df69638895f934f2b7f4`.
+- The implementation and artifact landed through the normal MeshLand commit/push gate in
+  `75d8167f468f1696d352e12bb7496b519bc4331a`; `origin/main` matches HEAD.
+- That commit also carried the pre-existing study artifact
+  `docs/study-self-healing-systems-hold-retirement-20260907.md`.
