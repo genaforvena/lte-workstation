@@ -59,3 +59,21 @@ is path-limited to the gated set and landed + deployed by mesh-land.
   `75d8167f468f1696d352e12bb7496b519bc4331a`; `origin/main` matches HEAD.
 - That commit also carried the pre-existing study artifact
   `docs/study-self-healing-systems-hold-retirement-20260907.md`.
+
+## Scope correction — every MeshLand commit
+
+The first implementation enforced section labels but still permitted the latest subject shape:
+
+```text
+mesh-land: land 1 settled stream fix(es): <path>
+```
+
+That was still too opaque in `git log`: the subject did not say what changed, and the body reused
+the same generic landing rationale. The contract now requires every generated MeshLand subject to
+use `land N changed: <path-and-diff-summary>`, marks deleted paths with `-path: removed`, and
+rejects the old generic subject/context pair. The throwaway-repository regression asserts the
+subject names the concrete changed path and that the removal fixture names deleted paths too.
+
+The normal gate for this correction is `scripts/mesh-land --test`, `bash -n scripts/mesh-land`,
+then `mesh-land --apply` and `mesh-land --push`; the resulting landing commit and source SHA-256
+are recorded below after the gate completes.
