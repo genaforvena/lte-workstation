@@ -101,6 +101,8 @@ Every claimed capability must produce a real artifact. Not "the camera works." A
 JPEG on disk. Not "audio recorded." A playable `.m4a`. Not "node online." A `tailscale status`
 entry with `Online: true`.
 
+- **Every completed Tiny Fleet update is committed and pushed to the repository; a failed push stays explicitly open until verified.** [[tiny-fleet-updates-must-land-in-the-repository]]
+
 **Each rule below is one line and stands on its own; the case that earned it lives whole in
 `memory/`.** Follow a `[[link]]` only when you need the measurement — the rule is the instruction,
 the case is the evidence, and mixing them is what made this section a wall nobody re-read.
