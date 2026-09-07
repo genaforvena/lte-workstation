@@ -12,4 +12,6 @@ grep -q 'divergent charter preserved' <<<"$out"
 grep -q 'run row written' <<<"$out"
 grep -q 'PASS' <<<"$out"
 grep -q 'reflex-cadence:' "$root/scripts/mesh-charter-watch"
+cron_out="$(env -i HOME="$HOME" PATH=/usr/bin:/bin "$root/scripts/mesh-charter-watch" --test 2>&1)"
+grep -q 'PASS' <<<"$cron_out"
 echo 'test-mesh-charter-watch: PASS'
