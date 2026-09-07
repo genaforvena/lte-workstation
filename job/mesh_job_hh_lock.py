@@ -37,23 +37,24 @@ def hh_driver_lock(path, wait=0.0, mode="job"):
         while True:
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                os.ftruncate(fd, 0)
-                os.write(fd, ("pid=%d mode=%s since=%s\n" % (
-                    os.getpid(), mode,
-                    time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))).encode())
-                os.fsync(fd)
-                yield True, ""
-                return
             except OSError:
                 if time.monotonic() - start >= wait:
                     yield False, "замок %s занят — держит: %s" % (path, _holder(fd))
                     return
                 time.sleep(min(0.25, wait - (time.monotonic() - start)))
+                continue
+            os.ftruncate(fd, 0)
+            os.write(fd, ("pid=%d mode=%s since=%s\n" % (
+                os.getpid(), mode,
+                time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))).encode())
+            os.fsync(fd)
+            yield True, ""
+            return
     finally:
         # chatwatch uses this shared marker as its cheap cross-process stand-down signal.
         # A reply process has released the flock at this point but must not leave a fresh
         # mtime that makes chatwatch stand down for another 15 minutes.
-        if mode == "reply" and path.name == ".apply.lock":
+        if mode in ("reply", "confirm") and path.name == ".apply.lock":
             old = time.time() - 901
             try:
                 os.utime(path, (old, old))
