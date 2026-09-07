@@ -17,6 +17,11 @@ import time
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
+# Cron invokes this module with a minimal PATH. Resolve sibling organs exactly as the other job
+# reflexes do, otherwise a missing `mesh-hh-drive` raises inside the lock context and can obscure
+# the real failure with a generator cleanup error.
+os.environ["PATH"] = os.path.expanduser("~/.local/bin") + os.pathsep + os.environ.get("PATH", "/usr/bin:/bin")
+
 MSK = ZoneInfo("Europe/Moscow")
 HOME = Path.home()
 JOB = HOME / ".mesh" / "job"
@@ -45,9 +50,23 @@ PARTICIPANTS = re.compile(
 PLACE = re.compile(r"(?:офис|адрес|место встречи|локация)\s*[:\-]\s*([^\n]+)", re.I)
 
 
-def negotiation_rejected(thread_text):
-    """Detect HH's current negotiation status in the top of the rendered chat page."""
-    return bool(re.search(r"\bRejection\b|\bОтказ\b|отклонено", (thread_text or "")[:1400], re.I))
+def thread_segment(thread_text, row=None):
+    """Limit parsing to the active vacancy, not unrelated chats in HH's rendered sidebar."""
+    text = thread_text or ""
+    if row:
+        title = row.get("vacancy", "")
+        pos = text.find(title) if title else -1
+        if pos >= 0:
+            # HH's `/chat/<id>` render still includes the sidebar. The active preview and an
+            # employer's immediate reply fit in this bounded window; farther rejection labels are
+            # other chats and must not cancel this proposed appointment.
+            return text[pos:pos + 700]
+    return text[-5000:]
+
+
+def negotiation_rejected(thread_text, row=None):
+    """Detect rejection for this vacancy, never a sidebar row from another chat."""
+    return bool(re.search(r"\bRejection\b|\bОтказ\b|отклонено", thread_segment(thread_text, row), re.I))
 
 
 def _year_for(row):
@@ -87,7 +106,7 @@ def _clean(value):
 
 def extract_confirmation(thread_text, row):
     """Return durable confirmation fields, or None for an incomplete/non-confirmation thread."""
-    text = (thread_text or "")[-5000:]
+    text = thread_segment(thread_text, row)
     if not CONFIRM_MARKERS.search(text):
         return None
     dt = _confirmed_slot(text, row)
@@ -157,7 +176,7 @@ def _js(expr, marker, wait=30):
     return None
 
 
-def read_thread(chat):
+def read_thread(chat, row=None):
     if _drive(["--alive"]).returncode != 0:
         return None
     _drive(["--send", "goto https://hh.ru/chat/%s" % chat])
@@ -207,6 +226,8 @@ def selftest():
     assert extract_confirmation("Подтверждаем вт 08.09 в 12:00 МСК. Ссылку пришлём позже.", row) is None
     assert not current_proposed({"state": "proposed", "start_utc": "2020-01-01T09:00Z"})
     assert negotiation_rejected("Backend-разработчик 15:55 ИНКОМСИСТЕМ Rejection")
+    row2 = {"vacancy": "Lead Go Engineer", "company": "Valletta"}
+    assert not negotiation_rejected("Lead Go Engineer Спасибо!\n" + ("x" * 700) + "Other chat Rejection", row2)
     print("mesh-job-confirm: ok")
 
 
@@ -231,8 +252,8 @@ def main(argv=None):
                 subprocess.run([CAL, "--cancel", row["id"]], capture_output=True, text=True)
                 continue
             chat = row["channel"].split()[-1]
-            thread = read_thread(chat) or ""
-            if negotiation_rejected(thread):
+            thread = read_thread(chat, row) or ""
+            if negotiation_rejected(thread, row):
                 subprocess.run([CAL, "--cancel", row["id"]], capture_output=True, text=True)
                 continue
             confirmation = extract_confirmation(thread, row)
