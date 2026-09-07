@@ -77,3 +77,13 @@ subject names the concrete changed path and that the removal fixture names delet
 The normal gate for this correction is `scripts/mesh-land --test`, `bash -n scripts/mesh-land`,
 then `mesh-land --apply` and `mesh-land --push`; the resulting landing commit and source SHA-256
 are recorded below after the gate completes.
+
+## Correction verification
+
+- Red-first target: the previous generator's generic `land N settled stream fix(es)` subject and
+  boilerplate `Why/context` now fail `commit_message_informative`.
+- Green: `scripts/mesh-land --test` → `smoke-test: ok` (exit 0); `bash -n scripts/mesh-land` → exit 0.
+- Normal landing: `mesh-land --apply` committed and pushed `143dce65edd69665b72fb24002b7accb86f05a5c`;
+  `mesh-land --push` then reported `nothing settled+clean to land` (exit 0).
+- `HEAD=origin/main=143dce65edd69665b72fb24002b7accb86f05a5c`.
+- Source and deployed `scripts/mesh-land` SHA-256: `0fde7fb6188a3be8fcfc4a7f6340240c30a1bca1230f39f41523ef72ac209852`.
