@@ -81,6 +81,11 @@ mesh-job-states --check W  назвать среди W необъявленны�
 
 ## Входящие: разбор и РАЗРЯДКА — это два инструмента, а не один
 
+`mesh-job-cal` is the calendar boundary for the interview loop. A `proposed` slot is only an
+offer; finalization with `--confirm ID` requires `--participants`, exactly one of `--link` or
+`--place`, and `--source`. Incomplete records are rejected, so the interview counter and Telegram
+agenda cannot claim an appointment without durable evidence.
+
 `mesh-job-mail` читает почту и классифицирует каждое письмо на `act` / `info` / `noise`.
 `mesh-job-act` — ПОТРЕБИТЕЛЬ его `act`-строк, и он появился потому, что до 2026-08-29 такого
 потребителя не было вообще: строка `job-mail` встречалась во всём геноме ровно в одном файле — в
