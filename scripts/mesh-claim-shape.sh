@@ -157,7 +157,7 @@ _claim_id_of_uncached(){
   # Board ids are Unicode-capable; the no-space boundary keeps prose "task: do"
   # out while allowing Cyrillic (and other non-ASCII) task slugs to close ledger
   # obligations and dispatch claims.
-  tag="$(printf '%s' "$1" | grep -oE 'task:[^[:space:],;()]+' | head -1)"
+  tag="$(printf '%s' "$1" | grep -oE 'task:[^[:space:],:;()]+' | head -1)"
   # An explicit task tag is already the minted account number. Preserve the complete key,
   # including its namespace, so task/dispatch/claim/claim-done/done all join on one exact id.
   # Untagged legacy claims still use the derivation fallback below and therefore remain UNKNOWN-safe.
