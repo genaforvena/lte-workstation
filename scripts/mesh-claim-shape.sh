@@ -162,6 +162,10 @@ _claim_id_of_uncached(){
   # including its namespace, so task/dispatch/claim/claim-done/done all join on one exact id.
   # Untagged legacy claims still use the derivation fallback below and therefore remain UNKNOWN-safe.
   [ -n "$tag" ] && { printf '%s' "${tag#task:}"; return; }
+  # Unit 2: untagged legacy prose has no authoritative account number. Refuse inference rather
+  # than falsely closing or reopening a sibling task.
+  printf '%s' UNKNOWN
+  return
   # URL STRIP FIRST (claim-id-url-path-outranks-the-real-slug): before ANY derivation scan sees the
   # body, blank out http(s) URLs — their path segments are the ns/slug shape the whole-body widen
   # below prefers, so a pasted link silently re-keys the close. Deliberately AFTER the task: tag
