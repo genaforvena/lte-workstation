@@ -158,7 +158,10 @@ _claim_id_of_uncached(){
   # out while allowing Cyrillic (and other non-ASCII) task slugs to close ledger
   # obligations and dispatch claims.
   tag="$(printf '%s' "$1" | grep -oE 'task:[^[:space:],;()]+' | head -1)"
-  [ -n "$tag" ] && { tag="${tag#task:}"; tag="${tag##*/}"; printf '%s' "$tag"; return; }
+  # An explicit task tag is already the minted account number. Preserve the complete key,
+  # including its namespace, so task/dispatch/claim/claim-done/done all join on one exact id.
+  # Untagged legacy claims still use the derivation fallback below and therefore remain UNKNOWN-safe.
+  [ -n "$tag" ] && { printf '%s' "${tag#task:}"; return; }
   # URL STRIP FIRST (claim-id-url-path-outranks-the-real-slug): before ANY derivation scan sees the
   # body, blank out http(s) URLs — their path segments are the ns/slug shape the whole-body widen
   # below prefers, so a pasted link silently re-keys the close. Deliberately AFTER the task: tag
