@@ -5,7 +5,9 @@ or missing records explicit. The writer must append before updating its cache.
 """
 from __future__ import annotations
 
+import base64
 import json
+import plistlib
 import re
 import fcntl
 import hashlib
@@ -51,8 +53,7 @@ def replay_source(path: Path) -> dict[str, object]:
                 line = raw_line.rstrip(b'\n')
                 match = EVENT_BYTES.match(line)
                 if match:
-                    record = json.loads(match.group(1).decode('utf-8'))
-                    validate(record)
+                    decode(match.group(1))
             except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError, KeyError):
                 errors += 1
                 continue
@@ -91,6 +92,9 @@ def validate(record: dict) -> None:
         if step['status'] == 'ignored' and (not isinstance(step.get('ignored_reason'), str)
                                            or not step['ignored_reason'].strip()):
             raise ReplayError('ignored task-state step has no reason')
+        if step['status'] == 'rejected' and (not isinstance(step.get('rejected_reason'), str)
+                                            or not step['rejected_reason'].strip()):
+            raise ReplayError('rejected task-state step has no reason')
         owner = step.get('owner')
         if owner is not None and (not isinstance(owner, str) or not owner.strip()):
             raise ReplayError('invalid task-state owner')
@@ -101,7 +105,26 @@ def validate(record: dict) -> None:
 def encode(data: dict, revision: int) -> str:
     record = {'schema': 1, 'revision': revision, 'data': data}
     validate(record)
-    return MARKER + json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
+    binary = plistlib.dumps(record, fmt=plistlib.FMT_BINARY, sort_keys=True)
+    payload = base64.urlsafe_b64encode(binary).decode('ascii').rstrip('=')
+    return MARKER + 'plist64:' + payload
+
+
+def decode(payload: str | bytes) -> dict:
+    """Decode current plist64 records and legacy JSON records."""
+    if isinstance(payload, bytes):
+        payload = payload.decode('utf-8')
+    if payload.startswith('plist64:'):
+        encoded = payload.removeprefix('plist64:')
+        encoded += '=' * (-len(encoded) % 4)
+        try:
+            record = plistlib.loads(base64.urlsafe_b64decode(encoded.encode('ascii')))
+        except (ValueError, TypeError, plistlib.InvalidFileException) as exc:
+            raise ReplayError(f'invalid plist64 task-state payload: {exc}') from exc
+    else:
+        record = json.loads(payload)
+    validate(record)
+    return record
 
 
 def canonical_ask_records(records: dict) -> dict[str, dict]:
@@ -135,10 +158,10 @@ def canonical_ask_records(records: dict) -> dict[str, dict]:
         else:
             continue
         step = data['steps'][data['current']]
-        terminal = data.get('status') in ('complete', 'ignored') or step.get('status') in ('done', 'ignored')
-        closed = step.get('finished') if step.get('status') == 'done' else step.get('ignored')
+        terminal = data.get('status') in ('complete', 'ignored', 'rejected') or step.get('status') in ('done', 'ignored', 'rejected')
+        closed = step.get('finished') if step.get('status') == 'done' else step.get('rejected') or step.get('ignored')
         if terminal and not closed:
-            closed = data.get('finished') or data.get('ignored')
+            closed = data.get('finished') or data.get('rejected') or data.get('ignored')
         candidate = {
             'id': aid,
             'ts': iso,
@@ -146,7 +169,7 @@ def canonical_ask_records(records: dict) -> dict[str, dict]:
             'text': step.get('description', ''),
             'closed': terminal,
             'closed_ts': closed,
-            'disposition': 'IGNORED' if step.get('status') == 'ignored' or data.get('status') == 'ignored' else 'DONE',
+            'disposition': 'REJECTED' if step.get('status') in ('ignored', 'rejected') or data.get('status') in ('ignored', 'rejected') else 'DONE',
         }
         prior = projected.get(aid)
         if prior is None or (not prior['closed'] and candidate['closed']):
@@ -207,7 +230,7 @@ def ledger_projection(records: dict, events: list) -> list:
         data = record['data']
         for index, step in enumerate(data['steps']):
             status = step['status']
-            if index > data['current'] or status in ('retired', 'cancelled', 'ignored'):
+            if index > data['current'] or status in ('retired', 'cancelled', 'ignored', 'rejected'):
                 continue
             owner = step.get('owner') or '-'
             body = f"{step['id']}: {step.get('description', '')} ; task:{step['id']}, owner:{owner}"
@@ -232,8 +255,7 @@ def replay(path: Path) -> dict[str, dict]:
             try:
                 if not line.endswith(b'\n'):
                     raise ReplayError('incomplete task-state line')
-                record = json.loads(match.group(1).decode('utf-8'))
-                validate(record)
+                record = decode(match.group(1))
                 chain = record['data']['chain']
                 revision = record['revision']
                 revisions = records.setdefault(chain, {})
@@ -253,8 +275,7 @@ def replay(path: Path) -> dict[str, dict]:
 
 def append(root: Path, who: str, payload: str) -> None:
     """The mesh-chat structured append path: exact bytes, locked and durable."""
-    record = json.loads(payload)
-    validate(record)
+    record = decode(payload)
     if not who or any(c.isspace() for c in who):
         raise ReplayError('invalid task-state author')
     root.mkdir(parents=True, exist_ok=True)
@@ -268,11 +289,17 @@ def append(root: Path, who: str, payload: str) -> None:
         expected = previous['revision'] + 1 if previous else 1
         if record['revision'] != expected:
             raise ReplayError(f'task-state revision conflict: expected {expected}')
-        line = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()) + '  ' + who + '  ::  ' + encode(record['data'], record['revision']) + '\n'
+        prefix = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()) + '  ' + who + '  ::  '
+        # Keep the established plaintext secret check even though the durable wire
+        # format is opaque. The JSON representation exists only in this pipe; it is
+        # never appended to chat.log.
+        scrub_input = prefix + MARKER + json.dumps(
+            record, ensure_ascii=False, sort_keys=True, separators=(',', ':')) + '\n'
         scrub = subprocess.run([sys.executable, str(Path(__file__).with_name('mesh-log-scrub'))],
-                               input=line, text=True, capture_output=True, check=False)
-        if scrub.returncode or scrub.stdout != line:
+                               input=scrub_input, text=True, capture_output=True, check=False)
+        if scrub.returncode or scrub.stdout != scrub_input:
             raise ReplayError('task-state rejected: log scrub would alter structured data')
+        line = prefix + encode(record['data'], record['revision']) + '\n'
         with path.open('a', encoding='utf-8') as output:
             output.write(line)
             output.flush()
@@ -282,7 +309,7 @@ def append(root: Path, who: str, payload: str) -> None:
 if __name__ == '__main__':
     try:
         if len(sys.argv) != 5 or sys.argv[1] != 'append':
-            raise ReplayError('usage: mesh_task_log.py append <mesh-dir> <author> <json>')
+            raise ReplayError('usage: mesh_task_log.py append <mesh-dir> <author> <task-state-payload>')
         append(Path(sys.argv[2]), sys.argv[3], sys.argv[4])
     except (OSError, ValueError) as exc:
         print(f'mesh-task-log: {exc}', file=sys.stderr)
