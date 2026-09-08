@@ -66,3 +66,23 @@ tests passed, and the two design/audit documents were added. The follow-up was
 pushed to `origin/main`; a fresh fetch confirmed `HEAD == origin/main`, with no
 tracked or staged changes. The unrelated untracked worktree artifacts remain
 untouched.
+
+## Witness verification and isolation repair at 05:48Z
+
+An exact archive of `1d9281c7` at `/tmp/task-dispatch-clean.0XHurh` passed all
+13 Python and 9 shell focused scripts. Shell tests were run with an isolated
+HOME to keep their output away from the live mesh.
+
+The live pane exposed a separate test-isolation bug: `mesh-promises` hardcoded
+its mesh directory to HOME/.mesh, ignoring MESH_DIR. A custom-input feed fixture
+therefore overwrote the live promise summary with two fixture tasks, even though
+live JSON still contained real tasks. `tests/test-mesh-promises-isolation.py`
+reproduced this against a sentinel under a fake HOME (red), then passed after the
+one-line MESH_DIR fix. Addressed-task, retirement, and full promises smoke passed.
+No task source records were lost. A live feed restored 50 open / 1010 kept and
+the hledger integrity check passed.
+
+This newly discovered fix is not covered by the prior landing closure. Separate
+owner task `task:task-text-isolation-landing` was filed to genome at 05:48:07Z for
+the source line, regression, scoped commit/push and clean-commit verification.
+The overall goal remains open until that final fix is durable and verified.
