@@ -46,6 +46,9 @@ def validate(record: dict) -> None:
         seen.add(step['id'])
         if not step.get('status'):
             raise ReplayError('missing task-state status')
+        if step['status'] == 'ignored' and (not isinstance(step.get('ignored_reason'), str)
+                                           or not step['ignored_reason'].strip()):
+            raise ReplayError('ignored task-state step has no reason')
         owner = step.get('owner')
         if owner is not None and (not isinstance(owner, str) or not owner.strip()):
             raise ReplayError('invalid task-state owner')
@@ -112,7 +115,7 @@ def ledger_projection(records: dict, events: list) -> list:
         data = record['data']
         for index, step in enumerate(data['steps']):
             status = step['status']
-            if index > data['current'] or status in ('retired', 'cancelled'):
+            if index > data['current'] or status in ('retired', 'cancelled', 'ignored'):
                 continue
             owner = step.get('owner') or '-'
             body = f"{step['id']}: {step.get('description', '')} ; task:{step['id']}, owner:{owner}"

@@ -77,6 +77,13 @@ class ReplayTests(unittest.TestCase):
         with self.assertRaises(log.ReplayError):
             log.encode(self.data, 3)
 
+    def test_ignored_task_requires_a_nonempty_reason(self):
+        self.data['status'] = self.data['steps'][0]['status'] = 'ignored'
+        with self.assertRaises(log.ReplayError):
+            log.encode(self.data, 1)
+        self.data['steps'][0]['ignored_reason'] = 'superseded by an operator decision'
+        self.assertIn('ignored_reason', log.encode(self.data, 1))
+
     def test_append_is_durable_replayable_and_duplicate_safe(self):
         payload = log.encode(self.data, 1).removeprefix(log.MARKER)
         log.append(self.path.parent, 'alpha@node', payload)
