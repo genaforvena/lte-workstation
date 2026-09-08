@@ -69,7 +69,7 @@ rl_is_walled(){
   # (operator FP 2026-06-15: discover/sense recovered after their 2:20pm reset but the old "hit your
   # session limit" banner sat in scrollback above the live idle footer → falsely RATE-LIMITED + shed.)
   printf '%s\n' "$txt" | grep -vE '^[[:space:]]*$' | tail -4 \
-    | grep -qE '⏵⏵ auto mode on|\? for shortcuts[^$]*agents|Use /skills to list|Ask anything|ctrl\+p commands|esc to interrupt|…[[:space:]]*\([0-9]|ing\.\.\.[[:space:]]*\([0-9]' && return 1
+    | grep -qE '⏵⏵ auto mode on|\? for shortcuts[^$]*agents|Use /skills to list|Ask (anything|Codex to do anything)|ctrl\+p commands|gpt-[0-9a-zA-Z.-]+[[:space:]]+(mini|low|medium|max|ultra|pro|nano)[[:space:]]*·[[:space:]]*~/|esc to interrupt|…[[:space:]]*\([0-9]|ing\.\.\.[[:space:]]*\([0-9]' && return 1
   printf '%s\n' "$txt" | grep -vE '^[[:space:]]*[❯›]' | grep -qiE "$MESH_STRONG_RL_RE" && return 0
   printf '%s\n' "$txt" | grep -vE '^[[:space:]]*[❯›]' \
     | awk -v m="$MESH_RL_BANNER_MAXLEN" 'length($0)<=m' | grep -qiE "$MESH_RL_RE" && return 0
