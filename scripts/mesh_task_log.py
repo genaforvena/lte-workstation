@@ -25,6 +25,7 @@ EVENT = re.compile(r'^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\s+\S+\s+::\s+\[(task-state
 EVENT_BYTES = re.compile(EVENT.pattern.encode('ascii'))
 ASK_KEY = re.compile(r'^(?:ask:)?(\d{8}T?\d{6}Z)$', re.IGNORECASE)
 ASK_ISO = re.compile(r'^(?:ask:)?(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ)$', re.IGNORECASE)
+ORIGIN_FIELDS = ('kind', 'source', 'hypothesis', 'question', 'acceptance', 'feedback')
 
 
 class ReplayError(ValueError):
@@ -78,6 +79,11 @@ def validate(record: dict) -> None:
         raise ReplayError('invalid task-state revision')
     if not isinstance(data, dict) or not isinstance(data.get('chain'), str) or not data['chain']:
         raise ReplayError('missing task-state chain')
+    origin = data.get('origin')
+    if origin is not None and (not isinstance(origin, dict) or any(
+            not isinstance(origin.get(field), str) or not origin[field].strip()
+            for field in ORIGIN_FIELDS)):
+        raise ReplayError('origin envelope requires all six nonempty fields')
     steps = data.get('steps')
     current = data.get('current')
     if not isinstance(steps, list) or not steps or type(current) is not int or not 0 <= current < len(steps):
