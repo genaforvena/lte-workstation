@@ -18,8 +18,10 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-MARKER = '[task-state] '
-EVENT = re.compile(r'^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\s+\S+\s+::\s+\[task-state\] (.*)$')
+MARKER = '[task-ledger] '
+LEGACY_MARKER = '[task-state] '
+READABLE_HEADER = re.compile(r'^v1 r=([1-9][0-9]*)$')
+EVENT = re.compile(r'^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\s+\S+\s+::\s+\[(task-state|task-ledger)\] (.*)$')
 EVENT_BYTES = re.compile(EVENT.pattern.encode('ascii'))
 ASK_KEY = re.compile(r'^(?:ask:)?(\d{8}T?\d{6}Z)$', re.IGNORECASE)
 ASK_ISO = re.compile(r'^(?:ask:)?(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ)$', re.IGNORECASE)
@@ -53,7 +55,7 @@ def replay_source(path: Path) -> dict[str, object]:
                 line = raw_line.rstrip(b'\n')
                 match = EVENT_BYTES.match(line)
                 if match:
-                    decode(match.group(1))
+                    decode(match.group(2))
             except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError, KeyError):
                 errors += 1
                 continue
@@ -102,18 +104,190 @@ def validate(record: dict) -> None:
             raise ReplayError('started task has no assigned owner')
 
 
-def encode(data: dict, revision: int) -> str:
+def _escape(value: str) -> str:
+    out = []
+    for char in value:
+        code = ord(char)
+        if char in ('%', '|', '\n', '\r') or code < 0x20 or code == 0x7f:
+            out.append(f'%{code:02X}')
+        else:
+            out.append(char)
+    return ''.join(out)
+
+
+def _unescape(value: str) -> str:
+    out = []
+    index = 0
+    while index < len(value):
+        if value[index] != '%':
+            out.append(value[index])
+            index += 1
+            continue
+        if index + 2 >= len(value) or not re.fullmatch(r'[0-9A-F]{2}', value[index + 1:index + 3]):
+            raise ReplayError('malformed readable percent escape')
+        code = int(value[index + 1:index + 3], 16)
+        if code not in (0x25, 0x7c, 0x0a, 0x0d) and not (code < 0x20 or code == 0x7f):
+            raise ReplayError('readable escape is not a grammar-breaking byte')
+        out.append(chr(code))
+        index += 3
+    return ''.join(out)
+
+
+def _pointer_key(value: str) -> str:
+    return value.replace('~', '~0').replace('/', '~1')
+
+
+def _pointer_unkey(value: str) -> str:
+    out = []
+    index = 0
+    while index < len(value):
+        if value[index] != '~':
+            out.append(value[index])
+            index += 1
+        elif value[index:index + 2] == '~0':
+            out.append('~')
+            index += 2
+        elif value[index:index + 2] == '~1':
+            out.append('/')
+            index += 2
+        else:
+            raise ReplayError('malformed readable JSON pointer escape')
+    return ''.join(out)
+
+
+def _typed(value: object) -> str:
+    if isinstance(value, str):
+        return 's:' + _escape(value)
+    if value is None:
+        return 'n:null'
+    if type(value) is bool:
+        return 'b:' + ('true' if value else 'false')
+    if type(value) is int:
+        return 'i:' + str(value)
+    raise ReplayError('readable ledger supports only string, integer, boolean, and null leaves')
+
+
+def _flatten(value: object, path: str = '') -> list[tuple[str, str]]:
+    if isinstance(value, dict):
+        if not value:
+            raise ReplayError('readable ledger cannot encode an empty object')
+        result = []
+        for key in sorted(value):
+            if not isinstance(key, str):
+                raise ReplayError('readable ledger object key is not a string')
+            result.extend(_flatten(value[key], path + '/' + _pointer_key(key)))
+        return result
+    if isinstance(value, list):
+        if not value:
+            raise ReplayError('readable ledger cannot encode an empty list')
+        result = []
+        for index, item in enumerate(value):
+            result.extend(_flatten(item, path + '/' + str(index)))
+        return result
+    if not path:
+        raise ReplayError('readable ledger root must be an object')
+    return [(path, _typed(value))]
+
+
+def encode_readable(data: dict, revision: int) -> str:
     record = {'schema': 1, 'revision': revision, 'data': data}
     validate(record)
-    binary = plistlib.dumps(record, fmt=plistlib.FMT_BINARY, sort_keys=True)
-    payload = base64.urlsafe_b64encode(binary).decode('ascii').rstrip('=')
-    return MARKER + 'plist64:' + payload
+    return MARKER + f'v1 r={revision} | ' + ' | '.join(
+        f'{path}={typed}' for path, typed in _flatten(data))
+
+
+def _parse_typed(value: str) -> object:
+    if len(value) < 2 or value[1] != ':':
+        raise ReplayError('malformed readable typed value')
+    kind, raw = value[0], value[2:]
+    if kind == 's':
+        return _unescape(raw)
+    if kind == 'n' and raw == 'null':
+        return None
+    if kind == 'b' and raw in ('true', 'false'):
+        return raw == 'true'
+    if kind == 'i' and re.fullmatch(r'-?(?:0|[1-9][0-9]*)', raw):
+        return int(raw)
+    raise ReplayError('invalid readable typed value')
+
+
+def _container(next_part: str) -> object:
+    return [] if re.fullmatch(r'(?:0|[1-9][0-9]*)', next_part) else {}
+
+
+def _insert(root: dict, parts: list[str], value: object) -> None:
+    current: object = root
+    for index, part in enumerate(parts):
+        last = index == len(parts) - 1
+        if isinstance(current, dict):
+            if not part:
+                raise ReplayError('empty readable pointer segment')
+            if last:
+                if part in current:
+                    raise ReplayError('duplicate readable ledger path')
+                current[part] = value
+                return
+            if part not in current:
+                current[part] = _container(parts[index + 1])
+            current = current[part]
+        elif isinstance(current, list):
+            if not re.fullmatch(r'(?:0|[1-9][0-9]*)', part):
+                raise ReplayError('readable list member is not a decimal index')
+            position = int(part)
+            if position > len(current):
+                raise ReplayError('sparse readable list')
+            if position == len(current):
+                current.append(value if last else _container(parts[index + 1]))
+                if last:
+                    return
+                current = current[position]
+                continue
+            if last:
+                if current[position] is not None:
+                    raise ReplayError('duplicate readable ledger path')
+                current[position] = value
+                return
+            current = current[position]
+        else:
+            raise ReplayError('readable scalar/list shape conflict')
+
+
+def decode_readable(payload: str) -> dict:
+    fields = payload.split(' | ')
+    header = READABLE_HEADER.fullmatch(fields[0]) if fields else None
+    if not header or len(fields) < 2:
+        raise ReplayError('invalid readable ledger header')
+    revision = int(header.group(1))
+    data: dict = {}
+    seen_paths = set()
+    for clause in fields[1:]:
+        if '=' not in clause:
+            raise ReplayError('malformed readable ledger field')
+        pointer, typed = clause.split('=', 1)
+        if not pointer.startswith('/'):
+            raise ReplayError('readable ledger path is not rooted')
+        parts = [_pointer_unkey(part) for part in pointer[1:].split('/')]
+        if any(part == '' for part in parts):
+            raise ReplayError('empty readable ledger path')
+        if pointer in seen_paths:
+            raise ReplayError('duplicate readable ledger path')
+        seen_paths.add(pointer)
+        _insert(data, parts, _parse_typed(typed))
+    record = {'schema': 1, 'revision': revision, 'data': data}
+    validate(record)
+    return record
+
+
+def encode(data: dict, revision: int) -> str:
+    return encode_readable(data, revision)
 
 
 def decode(payload: str | bytes) -> dict:
-    """Decode current plist64 records and legacy JSON records."""
+    """Decode readable v1 records and historical JSON/plist64 records."""
     if isinstance(payload, bytes):
         payload = payload.decode('utf-8')
+    if payload.startswith('v1 '):
+        return decode_readable(payload)
     if payload.startswith('plist64:'):
         encoded = payload.removeprefix('plist64:')
         encoded += '=' * (-len(encoded) % 4)
@@ -255,7 +429,7 @@ def replay(path: Path) -> dict[str, dict]:
             try:
                 if not line.endswith(b'\n'):
                     raise ReplayError('incomplete task-state line')
-                record = decode(match.group(1))
+                record = decode(match.group(2))
                 chain = record['data']['chain']
                 revision = record['revision']
                 revisions = records.setdefault(chain, {})
@@ -290,16 +464,11 @@ def append(root: Path, who: str, payload: str) -> None:
         if record['revision'] != expected:
             raise ReplayError(f'task-state revision conflict: expected {expected}')
         prefix = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()) + '  ' + who + '  ::  '
-        # Keep the established plaintext secret check even though the durable wire
-        # format is opaque. The JSON representation exists only in this pipe; it is
-        # never appended to chat.log.
-        scrub_input = prefix + MARKER + json.dumps(
-            record, ensure_ascii=False, sort_keys=True, separators=(',', ':')) + '\n'
+        line = prefix + encode_readable(record['data'], record['revision']) + '\n'
         scrub = subprocess.run([sys.executable, str(Path(__file__).with_name('mesh-log-scrub'))],
-                               input=scrub_input, text=True, capture_output=True, check=False)
-        if scrub.returncode or scrub.stdout != scrub_input:
-            raise ReplayError('task-state rejected: log scrub would alter structured data')
-        line = prefix + encode(record['data'], record['revision']) + '\n'
+                               input=line, text=True, capture_output=True, check=False)
+        if scrub.returncode or scrub.stdout != line:
+            raise ReplayError('task-ledger rejected: log scrub would alter structured data')
         with path.open('a', encoding='utf-8') as output:
             output.write(line)
             output.flush()
