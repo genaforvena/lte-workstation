@@ -19,6 +19,9 @@ floor=27 [ ]  inflight=0 [~]  done=1833
 ```
 
 The queue is therefore visible to the floor gate again; no aged handoff remains hidden in `[~]`.
+After the sweep, the normal producer/reflex cadence picked up three new ideas; the current live
+census is `floor=24 [ ]`, `inflight=3 [~]`, `done=1833`. Those three are fresh post-sweep work, not
+the aged handoffs reconciled above.
 
 ## Regression and reflex proof
 
