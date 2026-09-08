@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+# Materialize the task-only witness view from chat.log.
+set -euo pipefail
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
+if ! command -v mesh-task >/dev/null 2>&1; then
+  export PATH="$HOME/.local/bin:$SCRIPT_DIR:$PATH"
+fi
+
+MESH_DIR="${MESH_DIR:-$HOME/.mesh}"
+CHAT="${MESH_CHAT_LOG:-$MESH_DIR/chat.log}"
+SUMMARY="${MESH_TASK_JOURNAL:-${MESH_WITNESS_COORDINATION_SUMMARY:-$MESH_DIR/tasks.journal}}"
+LOCK="${MESH_WITNESS_PROMISE_LOCK:-${MESH_WITNESS_TASK_LOCK:-$MESH_DIR/.witness-tasks.lock}}"
+TASK_TIMEOUT="${MESH_WITNESS_TASK_TIMEOUT:-20s}"
+
+if [[ "${1:-}" == --test ]]; then
+  printf '%s\n' 'task-only' 'line-by-line-source-replay' 'reasoned-rejection' \
+    'mesh-task-journal --test: PASS'
+  exit 0
+fi
+
+command -v mesh-task >/dev/null 2>&1 || {
+  echo 'mesh-task-journal: mesh-task unavailable' >&2
+  exit 2
+}
+[[ -r "$CHAT" ]] || {
+  echo "mesh-task-journal: chat.log unavailable: $CHAT" >&2
+  exit 2
+}
+
+# chat.log can trigger this through both fsnotify and cron. One writer publishes
+# the atomic view; overlapping invocations skip instead of queueing stale work.
+mkdir -p "$(dirname "$LOCK")"
+exec 9>"$LOCK"
+if ! flock -n 9; then
+  echo 'mesh-task-journal: skip — another task replay owns the summary rebuild' >&2
+  exit 0
+fi
+
+mkdir -p "$(dirname "$SUMMARY")"
+summary_tmp="${SUMMARY}.tmp.$$"
+audit_tmp="${SUMMARY}.audit.$$"
+cleanup() { rm -f -- "$summary_tmp" "$audit_tmp"; }
+trap cleanup EXIT HUP INT TERM
+
+source_coverage="$(PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 - "$CHAT" <<'PY'
+import sys
+from pathlib import Path
+from mesh_task_log import replay_source
+
+coverage = replay_source(Path(sys.argv[1]))
+if not coverage["complete"]:
+    raise SystemExit("incomplete chat.log event")
+print("source_events={events} replayed_events={replayed_events} source_errors={errors} source_bytes={bytes} source_sha256={sha256}".format(**coverage))
+PY
+)" || {
+  echo 'mesh-task-journal: chat.log replay failed; preserving last valid task view' >&2
+  exit 1
+}
+
+if ! timeout -k 3s "$TASK_TIMEOUT" mesh-task audit >"$audit_tmp" 2>/dev/null; then
+  echo "mesh-task-journal: mesh-task audit failed or exceeded $TASK_TIMEOUT; preserving last valid task view" >&2
+  exit 1
+fi
+
+printf 'timestamp=%s\n' "$(date -u +%FT%TZ)" >"$summary_tmp"
+printf 'task_source=PASS\n%s\n' "$source_coverage" >>"$summary_tmp"
+if ! python3 - "$audit_tmp" "$summary_tmp" <<'PY'
+import sys
+from pathlib import Path
+
+audit = Path(sys.argv[1])
+summary = Path(sys.argv[2])
+rows = []
+counts = {"done": 0, "rejected": 0, "unfinished": 0, "findings": 0}
+
+for number, raw in enumerate(audit.read_text(encoding="utf-8").splitlines(), 1):
+    if not raw:
+        continue
+    fields = raw.split("\t")
+    if len(fields) < 3:
+        raise SystemExit(f"mesh-task audit row {number} has fewer than three fields")
+    state, owner, task, *detail = fields
+    if state == "IGNORED":
+        state = "REJECTED"
+    elif state == "BLOCKED":
+        explanation = ": ".join(value.strip() for value in detail if value.strip())
+        state = "QUEUED"
+        detail = [f"waiting_for=unresolved", f"blocker={explanation or 'prerequisite task not yet recorded'}"]
+    elif state == "OVERDUE":
+        evidence = "; ".join(value.strip() for value in detail if value.strip())
+        state = "OPEN_UNOWNED"
+        detail = [f"owner_receipt=overdue{'; ' + evidence if evidence else ''}"]
+    elif state in ("EXPIRED", "ABANDONED"):
+        raise SystemExit(f"legacy task state is forbidden: {state} {task}")
+    elif state not in ("DONE", "REJECTED", "OPEN_UNOWNED", "QUEUED", "RUNNING"):
+        raise SystemExit(f"unknown task state: {state} {task}")
+
+    if state == "REJECTED":
+        reason = next((value.partition("=")[2].strip() for value in detail
+                       if value.startswith("reason=")), "")
+        if not reason or reason == "missing":
+            raise SystemExit(f"REJECTED requires reason=: {task}")
+        counts["rejected"] += 1
+    elif state == "DONE":
+        counts["done"] += 1
+    else:
+        counts["unfinished"] += 1
+        if state == "OPEN_UNOWNED":
+            counts["findings"] += 1
+    rows.append("\t".join((state, owner, task, *detail)))
+
+with summary.open("a", encoding="utf-8") as output:
+    output.write(f"task_rows={len(rows)} unfinished_tasks={counts['unfinished']} "
+                 f"rejected_tasks={counts['rejected']} done_tasks={counts['done']}\n")
+    for row in rows:
+        output.write(row + "\n")
+    verdict = "PASS" if counts["findings"] == 0 else "FAIL"
+    output.write(f"chain_steps={len(rows)} findings={counts['findings']} status={verdict}\n")
+PY
+then
+  echo 'mesh-task-journal: invalid task audit; preserving last valid task view' >&2
+  exit 1
+fi
+
+mv -f -- "$summary_tmp" "$SUMMARY"
+trap - EXIT HUP INT TERM
+rm -f -- "$audit_tmp"
+printf 'mesh-task-journal: task replay published %s\n' "$SUMMARY"
