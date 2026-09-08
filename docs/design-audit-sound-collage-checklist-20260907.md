@@ -50,3 +50,35 @@ discharge the live-tick or per-step checklist obligations.
 - Source/deployed script drift remains zero (`52cdb2a4…` on both).
 - No mutation-red artifact, sandbox dry-run artifact, or checklist-linked fresh settled MP3/ledger
   was produced. The task remains BLOCKED.
+
+## Fresh owner audit (2026-09-08 05:58Z)
+
+The task is still live in `~/.mesh/task-chains/design-audit-task-sweep-20260907.json`:
+status `blocked`, owner `tg`, current step `plans-sound-collage`. It was resumed for this audit
+and remains dependency-blocked. The instruction is correct and does not describe an already-
+resolved capability.
+
+Current-code check: `scripts/mesh-sound-reflex` has no `valid_source`, `cut_window`, or
+`collage_build` implementation, and its picker still contains the score-based single-record
+path. The plan's 39 checkboxes remain unchecked. Therefore the random-collage refactor is not
+landed and this audit cannot honestly close the task.
+
+Fresh verification receipts:
+
+- Source and deployed SHA-256 match at
+  `52cdb2a49fe7660efea9ec08e5643c260f37b77beb99ed5212860d70a1a1614f`; `mesh-sound-reflex
+  --status` returned `rc=0`.
+- The live `--test` attempt returned `rc=2` with `smoke-test: n/a`: the live reflex held
+  `~/.mesh/records.log.reflex.lock`, so the sandbox honesty gate correctly refused attribution.
+- Cron wiring is present at `~/.mesh/reflexes.cron:155` (`*/10`, load-gated
+  `mesh-sound-reflex`). This proves wiring, not collage behavior.
+- A fresh owner render exists at
+  `/home/mesh-home/.mesh/records/20260908-055541-ext-b2250100.mp3`, SHA-256
+  `38b45f60b9fc3c42b9837cc5e5d653866bfab0f7ff5e8e0adbfef1fe11848335`, ffprobe
+  `134.347755s/44.1kHz/stereo`, and full ffmpeg decode returned `rc=0`; it is an `ext` record,
+  not evidence of a settled sound-reflex collage. `.sound-reflex-tick` and
+  `sound-reflex.log` remain stale at `2026-09-08 00:50:10Z`.
+
+Disposition: BLOCKED. Required successor work is explicit: implement/reconcile the six plan
+tasks, capture mutation-red and sandbox dry-run receipts, then obtain a fresh reflex-owned
+settled ledger row and owner-linked MP3 before re-auditing.
