@@ -82,3 +82,34 @@ Fresh verification receipts:
 Disposition: BLOCKED. Required successor work is explicit: implement/reconcile the six plan
 tasks, capture mutation-red and sandbox dry-run receipts, then obtain a fresh reflex-owned
 settled ledger row and owner-linked MP3 before re-auditing.
+
+## Owner re-audit after 20:23Z expiry (2026-09-08 06:48Z)
+
+The dispatched task is still live and the instruction is still correct: the plan remains an
+unlanded random-collage refactor, not a stale request. `scripts/mesh-sound-reflex` still has no
+`valid_source`, `cut_window`, or `collage_build` symbol; the plan's 39 unchecked checkboxes remain.
+The current picker therefore cannot be claimed as collage behavior.
+
+Current verification receipts:
+
+- `bash -n scripts/mesh-sound-reflex scripts/mesh-sound-progress scripts/mesh-soundscape`:
+  `rc=0`.
+- Source/deployed parity is PASS: the `mesh-sound-reflex` pair hashes
+  `52cdb2a49fe7660efea9ec08e5643c260f37b77beb99ed5212860d70a1a1614f`; the corresponding
+  `mesh-soundscape` pair also matches (`0ee39c79060566861b740b1f635d1ab7501be7df8a14e76de94aadd135528a9a`).
+- `mesh-sound-reflex --status` returned `rc=0`; live ledger was 2,119 lines / 762 pending.
+- Wiring is present at `/home/mesh-home/.mesh/reflexes.cron:155` (`*/10`, load-gated
+  `mesh-sound-reflex`), and soundscape at line 115. This proves wiring only.
+- A real reflex tick is fresh at `2026-09-08 06:10:19Z`; the sound logs also advanced at 06:10Z.
+- The newest MP3 is `/home/mesh-home/.mesh/bg/sound/grind-48b225e4-1788847818.mp3`,
+  SHA-256 `949601c865650a0d96a644c8df6bc5fc9c40bb15845cbb0f71ae7b679ac4b0b3`, 2,732,453 bytes,
+  `136.594286s`; `ffprobe` passed and full `ffmpeg` decode returned `rc=0`. Its adjacent
+  log row identifies it as `Re-pick #1 ... [drop]`, not a collage result.
+- A bounded live `bash scripts/mesh-sound-reflex --test` attempt did not reach its final result
+  within 60s (`timeout`), so no test PASS is claimed from this run. Earlier artifacted `rc=0`
+  smoke-test evidence remains historical; it does not supply the missing mutation-red or
+  sandbox-dry-run receipts.
+
+Disposition remains BLOCKED. Explicit successor requeue: implement/reconcile plan Tasks 1–6,
+capture mutation-red plus sandbox dry-run and settled ledger receipts, then rerun this checklist
+against a collage-owned MP3. The fresh re-pick must not be misclassified as collage completion.
