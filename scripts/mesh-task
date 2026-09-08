@@ -21,7 +21,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from mesh_task_log import replay as replay_task_log, encode as encode_task_state
+from mesh_task_log import replay as replay_task_log, encode as encode_task_state, decode as decode_task_state
 from mesh_task_log import eligibility
 
 
@@ -217,7 +217,7 @@ def save(path: Path, data: dict) -> None:
                                     text=True, capture_output=True, check=False)
             if result.returncode:
                 die(f"task-state append failed; cache not changed: {result.stderr.strip()}", 1)
-            records[data["chain"]] = json.loads(payload)
+            records[data["chain"]] = decode_task_state(payload)
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent), text=True)
     try:
@@ -278,6 +278,43 @@ def post_task(data: dict, index: int) -> bool:
                 f"{metadata_suffix(data, step)}"
                 f" Run: mesh-task take {data['chain']} {step['slug']};"
                 f" task:{step['id']}, ask:{data.get('ask') or '-'}{owner_tag}, status:open")
+
+
+def post_autoland_task(data: dict, completed: dict) -> bool:
+    """Ask the genome to land the work represented by a completed ledger step.
+
+    This is deliberately a board task, not a second task-chain transition: the
+    completed chain remains authoritative, while the genome gets an actionable
+    landing request with enough provenance to write a useful commit message.
+    Generated landing requests are excluded so settling one cannot create an
+    endless auto-land → done → auto-land loop.
+    """
+    task_id = completed["id"]
+    if task_id.startswith("autoland/") or completed.get("slug", "").startswith("autoland-"):
+        return True
+    result = completed.get("result") or completed.get("description") or "completed ledger work"
+    scope = metadata_suffix(data, completed).strip() or "scope=repository work described by the task"
+    suggested = f"Implement {task_id}: {result}"
+    suggested_quoted = json.dumps(suggested, ensure_ascii=False)
+    body = (f"autoland/{task_id} → owner: genome — land completed ledger work. "
+            f"Suggested commit subject: {suggested_quoted}; "
+            f"Why/context: {completed.get('description', 'completed ledger task')}; "
+            f"Scope: {scope}; "
+            f"Verification: Artifact: {completed['artifact']} "
+            f"artifact-sha256:{completed['artifact_sha256']}; "
+            f"task:autoland/{task_id}, owner:genome, status:open")
+    return emit("task", body)
+
+
+def ensure_autoland_task(path: Path, data: dict, completed: dict) -> bool:
+    """Post and durably record the landing request, retrying incomplete receipts."""
+    if completed.get("autoland_task_posted"):
+        return True
+    if not post_autoland_task(data, completed):
+        return False
+    completed["autoland_task_posted"] = now()
+    save(path, data)
+    return True
 
 
 def handoff(data: dict, index: int, completed: dict) -> bool:
@@ -381,6 +418,8 @@ def take(chain: str, ref: str) -> None:
             die("set MESH_TASK_ACTOR to the mind claiming this unassigned task")
         step["owner"] = candidate
     require_owner(step)
+    if step.get("waiting_for"):
+        die(f"step {step['id']} is waiting for {step['waiting_for']}; it is not claimable")
     if step["status"] == "active":
         print(f"already active {step['id']}")
         return
@@ -408,6 +447,9 @@ def done(chain: str, ref: str, artifact: str, result: str) -> None:
     artifact_path = Path(artifact).expanduser().resolve()
     if step["status"] == "done":
         if step.get("artifact") == str(artifact_path) and step.get("artifact_sha256") == artifact_digest(artifact_path):
+            if not ensure_autoland_task(path, data, step):
+                emit("yield", f"{step['id']}: completed, but genome auto-land task was not posted; retry the landing request")
+                print(f"mesh-task: WARNING: genome auto-land task was not posted for {step['id']}", file=sys.stderr)
             print(f"already done {step['id']} (same artifact)"); return
         die(f"step {step['id']} is already done with a different artifact")
     if index != data["current"] or step["status"] != "active":
@@ -430,7 +472,11 @@ def done(chain: str, ref: str, artifact: str, result: str) -> None:
                  f"{metadata_suffix(data, step)}"
                  f" ; task:{step['id']}, ask:{data.get('ask') or '-'}, owner:{step['owner']}, artifact-sha256:{step['artifact_sha256']}, status:done")
     save(path, data)
+    if not ensure_autoland_task(path, data, step):
+        emit("yield", f"{step['id']}: completed, but genome auto-land task was not posted; retry the landing request")
+        print(f"mesh-task: WARNING: genome auto-land task was not posted for {step['id']}", file=sys.stderr)
     update_context(step["owner"], data["chain"], step, remove=True)
+    release_waiters(step["id"])
     if data["status"] == "complete":
         print(f"complete {chain}: final artifact {artifact_path}")
         return
@@ -481,6 +527,50 @@ def unblock(chain: str, ref: str, event: str) -> None:
     print(f"resumed {step['id']}")
 
 
+def wait_for(chain: str, ref: str, prerequisite: str) -> None:
+    """Return blocked work to the queue behind one exact prerequisite task."""
+    check_name(prerequisite, "prerequisite task")
+    path, data = load(chain)
+    index, step = step_for(data, ref)
+    require_owner(step)
+    if index != data["current"] or step["status"] != "blocked":
+        die(f"step {step['id']} is not the blocked current step")
+    if prerequisite == step["id"]:
+        die("a task cannot wait for itself")
+    matches = [candidate for _, other in chain_states() for candidate in other["steps"]
+               if candidate["id"] == prerequisite]
+    if len(matches) != 1:
+        die(f"prerequisite task '{prerequisite}' was not found exactly once")
+    step.update(status="open", waiting_for=prerequisite, queued_at=now())
+    for key in ("blocked", "blocker_type", "needs", "retry", "lease_until"):
+        step.pop(key, None)
+    data["status"] = "open"
+    data["dispatch"] = "waiting"
+    require_emit("queued", f"{step['id']}: waiting_for={prerequisite}; original task returned to queue"
+                 f" ; task:{step['id']}, owner:{step['owner']}, status:open")
+    save(path, data)
+    update_context(step["owner"], data["chain"], step, remove=True)
+    if matches[0].get("status") == "done":
+        release_waiters(prerequisite)
+    else:
+        print(f"queued {step['id']} waiting for {prerequisite}")
+
+
+def release_waiters(completed_task: str) -> None:
+    """Dispatch queued originals whose exact prerequisite has just completed."""
+    for waiting_path, waiting_data in list(chain_states()):
+        waiting_step = waiting_data["steps"][waiting_data["current"]]
+        if waiting_step.get("status") != "open" or waiting_step.get("waiting_for") != completed_task:
+            continue
+        waiting_step.pop("waiting_for", None)
+        waiting_step["released_by"] = completed_task
+        waiting_data["dispatch"] = "pending"
+        require_emit("resume", f"{waiting_step['id']}: prerequisite DONE {completed_task}; returned task is dispatchable"
+                     f" ; task:{waiting_step['id']}, owner:{waiting_step['owner']}, status:open")
+        save(waiting_path, waiting_data)
+        dispatch(waiting_path, waiting_data)
+
+
 def retry_dispatch(chain: str) -> None:
     path, data = load(chain)
     if data["status"] not in ("open", "active") or data["steps"][data["current"]]["status"] != "open":
@@ -501,7 +591,7 @@ def reschedule(path: Path, data: dict) -> None:
     if state == "open":
         require_emit("yield", f"{step['id']}: unclaimed dispatch re-scheduled to exact owner {step['owner']}")
     else:
-        die(f"step {step['id']} is {state}; an active task never expires — explicitly block, ignore, or complete it")
+        die(f"step {step['id']} is {state}; an active task never expires — explicitly reject or complete it")
     step["rescheduled_at"] = now()
     step["reschedule_until"] = future()
     data["status"] = "open"
@@ -513,22 +603,27 @@ def reschedule(path: Path, data: dict) -> None:
     print(f"re-scheduled {step['id']} to {step['owner']}")
 
 
-def ignore(chain: str, ref: str, reason: str) -> None:
-    """Close the current task explicitly when it is deliberately not being done."""
+def reject(chain: str, ref: str, reason: str) -> None:
+    """Close current active or blocked work with an explicit explanation."""
     if not reason.strip():
-        die("ignore reason is required")
+        die("reject reason is required")
     path, data = load(chain)
     index, step = step_for(data, ref)
     require_owner(step)
-    if index != data["current"] or step["status"] != "active":
-        die(f"step {step['id']} is not active; take it before ignoring")
-    step.update(status="ignored", ignored=now(), ignored_reason=reason.strip())
-    data["status"] = "ignored"
-    require_emit("ignored", f"{step['id']}: reason={step['ignored_reason']}"
-                 f" ; task:{step['id']}, ask:{data.get('ask') or '-'}, owner:{step['owner']}, status:ignored")
+    if index != data["current"] or step["status"] not in ("active", "blocked"):
+        die(f"step {step['id']} is not active or blocked; take it before rejecting")
+    step.update(status="rejected", rejected=now(), rejected_reason=reason.strip())
+    data["status"] = "rejected"
+    require_emit("rejected", f"{step['id']}: reason={step['rejected_reason']}"
+                 f" ; task:{step['id']}, ask:{data.get('ask') or '-'}, owner:{step['owner']}, status:rejected")
     save(path, data)
     update_context(step["owner"], data["chain"], step, remove=True)
-    print(f"ignored {step['id']}: {step['ignored_reason']}")
+    print(f"rejected {step['id']}: {step['rejected_reason']}")
+
+
+def ignore(chain: str, ref: str, reason: str) -> None:
+    """Backward-compatible spelling; new records use REJECTED."""
+    reject(chain, ref, reason)
 
 
 def reschedule_chain(chain: str) -> None:
@@ -576,35 +671,69 @@ def live_owners() -> set[str]:
 
 
 def audit() -> None:
-    live = live_owners(); current = time.time()
+    live = live_owners(); current = time.time(); rows = []
     for path, data in chain_states():
-        if data.get("status") not in ("open", "active", "blocked", "complete", "ignored"): continue
+        if data.get("status") not in ("open", "active", "blocked", "complete", "ignored", "rejected"): continue
         current_index = data["current"]
         for index, step in enumerate(data["steps"]):
             state = step.get("status")
+            incident = 0 if re.search(r"(?:^|\s)priority:incident\s*$", step.get("description", ""), re.I) else 1
+            stamp = step.get("dispatched_at") or step.get("queued_at") or data.get("created", "")
+            terminal_key = (4, incident, stamp, data["chain"], index)
             if state == "done":
-                print(f"DONE\t{step['owner']}\t{step['id']}\t"
-                      f"artifact={step.get('artifact', 'missing')}")
+                rows.append((terminal_key, f"DONE\t{step['owner']}\t{step['id']}\t"
+                             f"artifact={step.get('artifact', 'missing')}"))
                 continue
             if state == "ignored":
-                print(f"IGNORED\t{step.get('owner') or '-'}\t{step['id']}\t"
-                      f"reason={step.get('ignored_reason', 'missing')}")
+                rows.append((terminal_key, f"IGNORED\t{step.get('owner') or '-'}\t{step['id']}\t"
+                             f"reason={step.get('ignored_reason', 'missing')}"))
+                continue
+            if state == "rejected":
+                rows.append((terminal_key, f"REJECTED\t{step.get('owner') or '-'}\t{step['id']}\t"
+                             f"reason={step.get('rejected_reason', 'missing')}"))
                 continue
             if state == "open":
+                bucket = 0 if index == current_index else 3
+                if step.get("waiting_for"):
+                    rows.append(((2, incident, stamp, data["chain"], index),
+                                 f"QUEUED\t{step['owner']}\t{step['id']}\twaiting_for={step['waiting_for']} dispatch=waiting"))
+                    continue
                 queued_until = max(epoch_iso(step.get("reschedule_until", "")),
                                    epoch_iso(step.get("dispatch_until", "")))
                 verdict = "QUEUED" if index != current_index or queued_until >= current else "OPEN_UNOWNED"
-                print(f"{verdict}\t{step['owner']}\t{step['id']}\t"
-                      f"current={data['steps'][current_index]['id']} dispatch={data.get('dispatch','unknown')}")
+                rows.append(((bucket, incident, stamp, data["chain"], index),
+                             f"{verdict}\t{step['owner']}\t{step['id']}\t"
+                             f"current={data['steps'][current_index]['id']} dispatch={data.get('dispatch','unknown')}"))
                 continue
             if index != current_index:
                 continue
             if state == "blocked":
-                print(f"BLOCKED\t{step['owner']}\t{step['id']}\t{step.get('blocker_type','unknown')}\t{step.get('retry','unspecified')}")
+                rows.append(((2, incident, stamp, data["chain"], index),
+                             f"BLOCKED\t{step['owner']}\t{step['id']}\t{step.get('blocker_type','unknown')}\t{step.get('retry','unspecified')}"))
                 continue
             lease = epoch_iso(step.get("lease_until", "1970-01-01T00:00:00Z"))
             verdict = "RUNNING" if lease >= current else "OVERDUE"
-            print(f"{verdict}\t{step['owner']}\t{step['id']}\tlease={step.get('lease_until','missing')}")
+            rows.append(((1, incident, stamp, data["chain"], index),
+                         f"{verdict}\t{step['owner']}\t{step['id']}\tlease={step.get('lease_until','missing')}"))
+    for _, row in sorted(rows):
+        print(row)
+
+
+def dispatch_queue() -> None:
+    """Emit exactly the current claimable tasks in dispatch priority/FIFO order."""
+    rows = []
+    for _, data in chain_states():
+        if data.get("status") != "open":
+            continue
+        step = data["steps"][data["current"]]
+        if step.get("status") != "open" or step.get("waiting_for"):
+            continue
+        incident = bool(re.search(r"(?:^|\s)priority:incident\s*$", step.get("description", ""), re.I))
+        stamp = step.get("dispatched_at") or step.get("queued_at") or data.get("created", "")
+        rows.append((0 if incident else 1, stamp, data["chain"], step))
+    for incident_rank, _, _, step in sorted(rows, key=lambda row: row[:3]):
+        print(f"{step.get('owner') or '-'}\t{step['id']}\t"
+              f"{'incident' if incident_rank == 0 else 'normal'}\t{step.get('description', '')}")
 
 
 def epoch_iso(value: str) -> float:
@@ -715,8 +844,9 @@ def main(argv: list[str]) -> None:
     if not argv or argv[0] in ("-h", "--help"):
         print("usage: mesh-task create <chain> <plan.tsv> [ask-key] | take <chain> <step> | done <chain> <step> <artifact> [result]")
         print("       mesh-task progress <chain> <step> <artifact> <next-action> <next-update> | block <chain> <step> <type> <needs> <retry>")
-        print("       mesh-task ignore <chain> <step> <reason> | resume <chain> <step> <event> | dispatch <chain> | reschedule <chain> | reschedule-task <task> | status <chain> | reconcile <owner> | --test")
+        print("       mesh-task reject <chain> <step> <reason> | wait-for <chain> <step> <prerequisite-task> | resume <chain> <step> <event> | dispatch <chain> | reschedule <chain> | reschedule-task <task> | status <chain> | reconcile <owner> | --test")
         print("       mesh-task replay --json  (read structured task-state records from chat.log)")
+        print("       mesh-task queue --dispatch  (task-ledger dispatch order as owner<TAB>task<TAB>priority<TAB>description)")
         print("       mesh-task import | rebuild  (import existing chains; rebuild disposable caches)")
         print("       mesh-task check <dispatch|resume|pending> <task-id> <owner>  (0 eligible, 2 refused, 3 untracked, 1 unreadable)")
         return
@@ -737,7 +867,10 @@ def main(argv: list[str]) -> None:
         except (OSError, ValueError) as exc:
             die(str(exc), 1)
         return
-    mutating = {"create", "take", "done", "ignore", "progress", "block", "resume", "dispatch",
+    if command == "queue" and argv[1:] == ["--dispatch"]:
+        dispatch_queue()
+        return
+    mutating = {"create", "take", "done", "reject", "ignore", "progress", "block", "wait-for", "resume", "dispatch",
                 "reschedule", "reschedule-task", "reconcile", "import", "rebuild"}
     # Observers must remain able to see the last committed state while a board
     # helper is slow or unavailable.  Only transitions need to serialize their
@@ -751,8 +884,10 @@ def main(argv: list[str]) -> None:
             elif command == "take" and len(argv) == 3: take(*argv[1:])
             elif command == "done" and len(argv) >= 4: done(argv[1], argv[2], argv[3], " ".join(argv[4:]))
             elif command == "ignore" and len(argv) >= 3: ignore(argv[1], argv[2], " ".join(argv[3:]))
+            elif command == "reject" and len(argv) >= 3: reject(argv[1], argv[2], " ".join(argv[3:]))
             elif command == "progress" and len(argv) == 6: progress(*argv[1:])
             elif command == "block" and len(argv) == 6: block(*argv[1:])
+            elif command == "wait-for" and len(argv) == 4: wait_for(*argv[1:])
             elif command == "resume" and len(argv) == 4: unblock(*argv[1:])
             elif command == "dispatch" and len(argv) == 2: retry_dispatch(*argv[1:])
             elif command == "reschedule" and len(argv) == 2: reschedule_chain(argv[1])
