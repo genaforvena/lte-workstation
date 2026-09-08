@@ -80,10 +80,10 @@ def validate(record: dict) -> None:
     if not isinstance(data, dict) or not isinstance(data.get('chain'), str) or not data['chain']:
         raise ReplayError('missing task-state chain')
     origin = data.get('origin')
-    if origin is not None and (not isinstance(origin, dict) or any(
+    if origin is not None and (not isinstance(origin, dict) or set(origin) != set(ORIGIN_FIELDS) or any(
             not isinstance(origin.get(field), str) or not origin[field].strip()
             for field in ORIGIN_FIELDS)):
-        raise ReplayError('origin envelope requires all six nonempty fields')
+        raise ReplayError('origin envelope requires exactly six nonempty fields')
     steps = data.get('steps')
     current = data.get('current')
     if not isinstance(steps, list) or not steps or type(current) is not int or not 0 <= current < len(steps):
@@ -466,6 +466,17 @@ def append(root: Path, who: str, payload: str) -> None:
         previous = states.get(record['data']['chain'])
         if previous == record:
             return
+        origin = record['data'].get('origin') or {}
+        source = origin.get('source')
+        if source:
+            for existing_chain, existing_record in states.items():
+                if existing_chain == record['data']['chain']:
+                    continue
+                existing_origin = existing_record['data'].get('origin') or {}
+                if existing_origin.get('source') == source:
+                    status = existing_record['data'].get('status', 'unknown')
+                    raise ReplayError(
+                        f"origin.source '{source}' already exists in chain '{existing_chain}' (status: {status})")
         expected = previous['revision'] + 1 if previous else 1
         if record['revision'] != expected:
             raise ReplayError(f'task-state revision conflict: expected {expected}')
