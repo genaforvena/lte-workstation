@@ -441,6 +441,28 @@ static int instruction_count(Instruction *prog) {
   return count;
 }
 
+typedef struct {
+  int instructions;
+  int literal_bytes;
+} GeneticScore;
+
+static GeneticScore genetic_score(Instruction *prog) {
+  GeneticScore score = {0, 0};
+  for (; prog->opcode; prog = prog->next) {
+    score.instructions++;
+    if (prog->opcode == LIT2)
+      score.literal_bytes += 2;
+    else if (prog->opcode == LIT)
+      score.literal_bytes++;
+  }
+  return score;
+}
+
+static bool genetic_score_less(GeneticScore a, GeneticScore b) {
+  return a.instructions < b.instructions ||
+         (a.instructions == b.instructions && a.literal_bytes < b.literal_bytes);
+}
+
 static Instruction *clone_program(Instruction *prog) {
   Instruction *head = NULL;
   Instruction **tail = &head;
@@ -504,9 +526,8 @@ static void genetic_superoptimize(Instruction *prog) {
   unsigned char next[POPULATION][GENES];
   unsigned seed = (unsigned)instruction_count(prog) ^ 0x9e3779b9u;
   Instruction *best_program = clone_program(prog);
-  int best_score = instruction_count(best_program);
   run_schedule(best_program, (unsigned char[]){0, 1}, 2);
-  best_score = instruction_count(best_program);
+  GeneticScore best_score = genetic_score(best_program);
 
   for (int i = 0; i < POPULATION; i++) {
     for (int j = 0; j < GENES; j++)
@@ -520,12 +541,12 @@ static void genetic_superoptimize(Instruction *prog) {
   }
 
   for (int generation = 0; generation < GENERATIONS; generation++) {
-    int scores[POPULATION];
+    GeneticScore scores[POPULATION];
     for (int i = 0; i < POPULATION; i++) {
       Instruction *candidate = clone_program(prog);
       run_schedule(candidate, population[i], GENES);
-      scores[i] = instruction_count(candidate);
-      if (scores[i] < best_score) {
+      scores[i] = genetic_score(candidate);
+      if (genetic_score_less(scores[i], best_score)) {
         free_program(best_program);
         best_program = candidate;
         best_score = scores[i];
@@ -535,10 +556,10 @@ static void genetic_superoptimize(Instruction *prog) {
     }
     int elite[ELITE] = {0, 0};
     for (int i = 1; i < POPULATION; i++) {
-      if (scores[i] < scores[elite[0]]) {
+      if (genetic_score_less(scores[i], scores[elite[0]])) {
         elite[1] = elite[0];
         elite[0] = i;
-      } else if (elite[0] == elite[1] || scores[i] < scores[elite[1]]) {
+      } else if (elite[0] == elite[1] || genetic_score_less(scores[i], scores[elite[1]])) {
         elite[1] = i;
       }
     }
