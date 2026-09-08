@@ -375,7 +375,11 @@ def eligibility(records: dict, task: str, mode: str, owner: str) -> int:
     data, index, step = matches[0]
     if index != data['current'] or data.get('status') not in ('open', 'active'):
         return 2
-    if mode != 'pending' and step.get('owner') and owner != step['owner']:
+    canonical_owner = step.get('owner')
+    if canonical_owner:
+        canonical_owner = canonical_owner.rsplit('/', 1)[-1]
+    requested_owner = owner.rsplit('/', 1)[-1]
+    if mode != 'pending' and canonical_owner and requested_owner != canonical_owner:
         return 2
     expected = ('open',) if mode in ('dispatch', 'pending') else ('active', 'running', 'claimed')
     return 0 if step['status'] in expected else 2
