@@ -121,6 +121,31 @@ def main():
         assert [step['priority'] for step in priority_record['steps']] == [100, 95, 90]
         assert '[priority]' in board.read_text()
         assert 'v1 r=' in log.read_text().split('[task-ledger]')[-1]
+
+        # Design tags are chain metadata copied onto every step for new plans,
+        # and an annotation transition is the only allowed way to add them to
+        # an existing canonical chain.
+        tagged_plan = tmp / 'tagged.tsv'; tagged_plan.write_text(
+            '#tags=design,autopoiesis\n'
+            '#design_artifact=/tmp/design.md\n'
+            'alpha\tone\t100\tfirst\n'
+            'beta\ttwo\t95\tsecond\n')
+        run('create', 'tagged-chain', str(tagged_plan))
+        tagged = module.replay(log)['tagged-chain']['data']
+        assert all(step['tags'] == 'design,autopoiesis' and
+                   step['design_artifact'] == '/tmp/design.md'
+                   for step in tagged['steps'])
+
+        for slug in ('one', 'two', 'three'):
+            run('annotate', 'priority-chain', slug, 'design,autopoiesis',
+                '/tmp/design.md', MESH_TASK_ACTOR='witness')
+        annotated = module.replay(log)['priority-chain']['data']
+        assert all(step['tags'] == 'design,autopoiesis' and
+                   step['design_artifact'] == '/tmp/design.md'
+                   for step in annotated['steps'])
+        status = run('status', 'priority-chain').stdout
+        assert status.count('tags=design,autopoiesis') == 3
+        assert '/tmp/design.md' in run('queue', '--dispatch').stdout
     print('PASS: origin envelope, refusal, duplicate status, legacy replay, and cache rebuild')
 
 
