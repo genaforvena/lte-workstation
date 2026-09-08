@@ -1,6 +1,6 @@
 # Mesh tooling — full annotated catalog
 
-Extracted from CLAUDE.md (2026-06-19) to keep the committed skeleton lean — the prose catalog had grown past Claude's CLAUDE.md size limit. `mesh-tools` is the live, self-updating index; this file is the human-readable prose detail. Source of truth for the code is the genome (`scripts/`), deployed to `~/.local/bin/`; `mesh-sync-tools` flags drift.
+Extracted from CLAUDE.md (2026-06-19) to keep the committed skeleton lean — the prose catalog had grown past Claude's CLAUDE.md size limit. `mesh-tools` is the live, self-updating index; this file is the human-readable prose detail. Source of truth for the code is the genome (`scripts/`); `~/.local/bin/mesh-*` entries link to it, and `mesh-sync-tools` flags copies or wrong links as drift.
 
 **Coordinate / drive:** `mesh-tell` (drive an agent's pane; `--peek` to look) · `mesh-watch`
 (wait on a pane: `--until` / `--change`) · `mesh-chat` (the board/room) · `mesh-board-query` (read-only
@@ -77,7 +77,7 @@ auto-revert; refuses without an authorized_keys; `--check` is read-only) · `mes
 hourly reflex line — relaunches every registered pull that is neither done nor running, until the
 command exits 0; closes the transient-`systemd-run`-dies-at-reboot trap).
 
-Source of truth is the genome (`scripts/`), deployed to `~/.local/bin/`; `mesh-sync-tools` flags drift.
+Source of truth is the genome (`scripts/`); `~/.local/bin/mesh-*` entries link to it, and `mesh-sync-tools` flags copies or wrong links as drift.
 
 **On-demand canon** (genome-lean audit 2026-06-11 — unwired by design, each earns its place;
 anything in `scripts/` that is neither wired (cron/systemd/mesh-restore/called-by-tool/supervise

@@ -410,7 +410,7 @@ into the mind channels, operator 2026-06-17 "every window is data/mind"). Drive 
 blocking on interactive confirmation by sending to its window:
 
 ```bash
-mesh-tell genome "git pull && cp scripts/mesh-* ~/.local/bin/ && chmod +x ~/.local/bin/mesh-*"  # an op for the genome mind
+mesh-tell genome "git pull --ff-only && scripts/mesh-sync-tools --apply"  # an op for the genome mind
 mesh-tell --node user@<peer-ip> genome "mesh-chat 'hello'"      # remote op
 mesh-tell <your-window> "your next prompt here"                  # self-continuation
 mesh-tell --peek <window>                                        # read the pane output after it lands
@@ -617,7 +617,8 @@ its own reachability on it — `mesh-card --refresh` flags violations. See `docs
 
 ## Mesh tooling (`~/.local/bin/`)
 
-Source of truth is the genome (`scripts/`), deployed to `~/.local/bin/`; `mesh-sync-tools` flags drift.
+Source of truth is the genome (`scripts/`); `~/.local/bin/mesh-*` entries are symlinks to it, and
+`mesh-sync-tools` treats every copied or wrongly targeted entry as drift and repairs it with `--apply`.
 **The full annotated catalog lives in `docs/mesh-tooling.md`; `mesh-tools` is the live, self-updating
 index** (grouped · `<category>` · `--search <term>` · `--counts`). The categories below name only the
 load-bearing tools — run `mesh-tools <category>` for the rest and the full contracts.

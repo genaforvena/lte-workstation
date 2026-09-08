@@ -82,7 +82,10 @@ mkdir -p ~/.local/bin ~/.mesh/knowledge
 if [ -d "$REPO_DIR/scripts" ]; then
   for f in "$REPO_DIR"/scripts/*; do
     b="$(basename "$f")"; case "$b" in *.service|*.timer|*.bak*) continue;; esac
-    install -m755 "$f" ~/.local/bin/ 2>/dev/null && echo "  $b"
+    # Keep one executable object: local commands point at the checked-out genome.
+    # A copied deployment creates a second mutable version that can silently drift.
+    rm -f -- "$HOME/.local/bin/$b" 2>/dev/null
+    ln -s -- "$f" "$HOME/.local/bin/$b" 2>/dev/null && echo "  $b -> $f"
   done
 fi
 # seed the node registry from the template so topology-driven tools have a file to read + you a

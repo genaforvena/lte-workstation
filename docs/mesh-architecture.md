@@ -489,7 +489,7 @@ Two production lanes plus a meta-layer:
   self-derived), `mesh-fitness` (is what they produce sound?), `mesh-autowire` (do
   products integrate?), watched by `mesh-reflex-health` (do the lanes fire at all?).
 
-The genome (`scripts/`) is the **source of truth**, deployed to `~/.local/bin/`;
+The genome (`scripts/`) is the **source of truth**, linked from `~/.local/bin/` so there is only one mutable version;
 `mesh-sync-tools` flags drift. Landing is `mesh-land` (settles a fix, gated), and the
 unconditional push cadence (§6) is what actually gets the genome onto origin. See
 [`docs/self-organization.md`](self-organization.md), [`genome-audit.md`](genome-audit.md),

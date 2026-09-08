@@ -49,8 +49,8 @@ plant this genome, this is the operating model you inherit.
   Writes to a peer go through its mind window (the target channel's bottom pane) so the action lands
   in shared scrollback — never blind side-channel ssh. The `shell` window was folded into the mind
   channels (2026-06-17 re-org): each channel is data-on-top + mind-on-bottom.
-- **The genome is the source of truth.** Hand-deployed `~/.local/bin` copies drift and bite silently;
-  `mesh-sync-tools` surfaces drift, deploys come from `scripts/`.
+- **The genome is the source of truth.** `~/.local/bin/mesh-*` links directly to `scripts/`;
+  `mesh-sync-tools` treats a copied or wrongly targeted executable as drift and restores the link.
 
 ## Discipline that makes it safe
 
