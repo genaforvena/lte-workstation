@@ -545,7 +545,7 @@ tangents risks a mis-scoped or half-remembered commitment; a fresh `/clear` is t
     incident wins the next pace-released slot instead of queueing FIFO behind cosmetic work, and
     never-taken evaporation can't blacklist it. NO pace bypass — the spend hold stands; incidents win
     the released slot, they don't mint one. Reserve for live incidents, not queue-jumping.
-- **Work with multiple required steps, or work that must survive this turn, enters the promise ledger BEFORE execution:** create a keyed `[task]` or `mesh-task` chain with exact owner, next action, expected artifact, and closure criterion; an operator ask and an autonomous finding use the same path, and a prose handoff is never the only state. [[multi-step-work-enters-the-promise-ledger-before-execution]]
+- **Work with multiple required steps, or work that must survive this turn, enters the task ledger BEFORE execution:** create a keyed `[task]` or `mesh-task` chain with optional owner, next action, expected artifact, and closure criterion; unassigned work dispatches to the least-busy eligible mind, while an assigned owner must claim before execution. `chat.log` is authoritative; JSON and hledger files are rebuildable views. [[multi-step-work-enters-the-promise-ledger-before-execution]]
 - **`[idle]` is ONE LINE; a finding gets its own marker.** `[idle]` is a status yield (`[idle] nothing
   new — <area> swept, green`), never a place to park a multi-line report — verbose idles are the
   board's largest noise source. A **substantive finding** goes in a dedicated marker: **`[fyi]`**

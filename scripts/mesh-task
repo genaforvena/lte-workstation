@@ -2,8 +2,8 @@
 # orphan-ok: on-demand task-chain coordinator; invoked by minds and board dispatch, not a cron reflex
 """mesh-task: durable ordered task chains with explicit inter-mind hand-off.
 
-The board is the rendezvous, while this small JSON artifact is the chain's source of
-truth. A step cannot be completed without an existing artifact; completing it opens
+Task-state records in chat.log are authoritative; JSON files are derived caches.
+Completion requires an artifact and opens
 exactly one successor and writes the successor's handoff before posting its task.
 """
 from __future__ import annotations
@@ -21,12 +21,32 @@ import tempfile
 import time
 from pathlib import Path
 
+from mesh_task_log import replay as replay_task_log, encode as encode_task_state
+from mesh_task_log import eligibility
+
 
 ROOT = Path(os.environ.get("MESH_DIR", str(Path.home() / ".mesh")))
 CHAINS = Path(os.environ.get("MESH_TASK_DIR", str(ROOT / "task-chains")))
 ACTOR = os.environ.get("MESH_TASK_ACTOR", os.environ.get("MESH_WHO", "mesh-task"))
 LEASE_SECONDS = int(os.environ.get("MESH_TASK_LEASE_SECONDS", "1800"))
 SAFE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,119}$")
+TASK_METADATA_KEYS = ("repository", "scope", "artifact_root", "revision", "next_command")
+_records = None
+
+
+def task_records(allow_missing: bool = False) -> dict:
+    global _records
+    if _records is None:
+        log = ROOT / "chat.log"
+        _records = {} if allow_missing and not log.exists() else replay_task_log(log)
+    return _records
+
+
+def chain_states():
+    """Read canonical chains exclusively from the append-only text log."""
+    records = task_records()
+    for chain, record in sorted(records.items()):
+        yield path_for(chain), json.loads(json.dumps(record["data"]))
 
 
 def die(message: str, code: int = 2) -> None:
@@ -49,100 +69,99 @@ def context_path(owner: str) -> Path:
     return ROOT / "task-context" / (owner.replace("/", "__") + ".json")
 
 
-def update_context(owner: str, chain: str, step: dict, remove: bool = False) -> None:
-    path = context_path(owner)
+def task_metadata(data: dict, step: dict) -> dict:
+    metadata = dict(data.get("task_context") or {})
+    metadata.update({key: step[key] for key in TASK_METADATA_KEYS if step.get(key) is not None})
+    return {key: value for key, value in metadata.items() if value not in (None, "")}
+
+
+def metadata_suffix(data: dict, step: dict) -> str:
+    metadata = task_metadata(data, step)
+    labels = (("repository", "repository"), ("scope", "scope"),
+              ("artifact_root", "artifact-root"), ("revision", "revision"),
+              ("next_command", "next-command"))
+    return "".join(f" {label}={metadata[key]}" for key, label in labels if key in metadata)
+
+
+def validate_artifact_scope(data: dict, step: dict, artifact_path: Path) -> None:
+    metadata = task_metadata(data, step)
+    root = metadata.get("artifact_root") or metadata.get("repository")
+    if not root:
+        return
+    expected = Path(root).expanduser().resolve()
     try:
-        contexts = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        contexts = []
-    except json.JSONDecodeError:
-        die(f"task context is corrupt: {path}", 1)
-    if isinstance(contexts, dict):
-        contexts = [contexts]
-    if not isinstance(contexts, list):
-        die(f"task context is not a list: {path}", 1)
-    key = (chain, step["slug"])
-    found = False
-    updated = []
-    for context in contexts:
-        if (context.get("chain"), context.get("step")) == key:
-            found = True
-            if remove:
-                context = dict(context, status="done", finished=now())
-        updated.append(context)
-    contexts = updated
-    if not remove:
-        contexts = [c for c in contexts if c.get("chain") != chain]
-        contexts.append({"chain": chain, "step": step["slug"], "task": step["id"],
-                         "owner": owner, "status": step.get("status", "active"),
-                         "started": step.get("started", now()), "lease_until": step.get("lease_until"),
-                         "last_progress": step.get("last_progress"), "artifact": step.get("progress_artifact"),
-                         "next_action": step.get("next_action"), "next_update": step.get("next_update")})
-    elif not found:
-        contexts.append({"chain": chain, "step": step["slug"], "task": step["id"],
-                         "owner": owner, "status": "done", "finished": now()})
-    if contexts:
-        save(path, contexts)
-    elif path.exists():
-        path.unlink()
+        artifact_path.relative_to(expected)
+    except ValueError:
+        die(f"artifact {artifact_path} is outside expected repository {expected}")
+
+
+def update_context(owner: str, chain: str, step: dict, remove: bool = False) -> None:
+    if owner:
+        reconcile_context(owner)
 
 
 def active_contexts(owner: str, excluding: str = "") -> list[dict]:
-    """Return this owner's active durable contexts, rejecting malformed state loudly."""
-    path = context_path(owner)
-    try:
-        contexts = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return []
-    except json.JSONDecodeError:
-        die(f"task context is corrupt: {path}", 1)
-    if isinstance(contexts, dict):
-        contexts = [contexts]
-    if not isinstance(contexts, list):
-        die(f"task context is not a list: {path}", 1)
-    return [context for context in contexts
-            if context.get("status") in ("active", "claimed")
-            and context.get("task") != excluding]
+    """Derive active ownership from chain records, not disposable context caches."""
+    return [{"task": step["id"], "owner": owner, "status": step["status"]}
+            for _, data in chain_states() for step in data["steps"]
+            if step.get("owner") == owner and step.get("status") in ("active", "claimed")
+            and step.get("id") != excluding]
 
 
 def reconcile_context(owner: str) -> int:
-    """Rebuild live task pointers from their canonical chain state.
-
-    This is recovery for contexts written before a transition was interrupted;
-    it deliberately keeps completed-turn entries but never revives a stale
-    active claim from the context cache.
-    """
+    """Rebuild owner pointers, including completed turns, without reading caches."""
     path = context_path(owner)
-    try:
-        existing = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        existing = []
-    except json.JSONDecodeError:
-        die(f"task context is corrupt: {path}", 1)
-    if isinstance(existing, dict):
-        existing = [existing]
-    if not isinstance(existing, list):
-        die(f"task context is not a list: {path}", 1)
-    contexts = [row for row in existing if row.get("status") == "done"]
-    for chain_path in sorted(CHAINS.glob("*.json")):
-        try:
-            data = json.loads(chain_path.read_text(encoding="utf-8"))
-            step = data["steps"][data["current"]]
-        except (OSError, ValueError, KeyError, IndexError, json.JSONDecodeError):
-            continue
-        if step.get("owner") != owner or step.get("status") not in ("active", "blocked"):
-            continue
-        contexts.append({"chain": data["chain"], "step": step["slug"], "task": step["id"],
+    contexts = []
+    for _, data in chain_states():
+        for step in data["steps"]:
+            if step.get("owner") != owner or step.get("status") not in ("active", "blocked", "done", "claimed"):
+                continue
+            context = {"chain": data["chain"], "step": step["slug"], "task": step["id"],
                          "owner": owner, "status": step["status"],
-                         "started": step.get("started"), "lease_until": step.get("lease_until"),
-                         "last_progress": step.get("last_progress"), "artifact": step.get("progress_artifact"),
+                         "started": step.get("started"), "finished": step.get("finished"),
+                         "lease_until": step.get("lease_until"),
+                         "last_progress": step.get("last_progress"), "artifact": step.get("artifact") or step.get("progress_artifact"),
                          "next_action": step.get("next_action"), "next_update": step.get("next_update"),
-                         "retry": step.get("retry")})
+                         "retry": step.get("retry")}
+            context.update(task_metadata(data, step))
+            contexts.append(context)
     if contexts:
         save(path, contexts)
     elif path.exists():
         path.unlink()
     return len(contexts)
+
+
+def import_chains() -> None:
+    """Explicit one-time import. Existing log records always win over caches."""
+    pending = []
+    records = task_records()
+    for path in sorted(CHAINS.glob("*.json")):
+        data = json.loads(path.read_text(encoding="utf-8"))
+        encode_task_state(data, 1)  # Validate all inputs before the first append.
+        if path != path_for(data["chain"]):
+            die(f"chain filename does not match identity: {path}")
+        if data["chain"] not in records:
+            pending.append((path, data))
+    for path, data in pending:
+        save(path, data)
+    verified = replay_task_log(ROOT / "chat.log") if records else {}
+    for _, data in pending:
+        if verified[data["chain"]]["data"] != data:
+            die(f"import verification mismatch: {data['chain']}", 1)
+    print(f"imported={len(pending)} verified={len(verified)} source={ROOT / 'chat.log'}")
+
+
+def rebuild() -> None:
+    """Materialize disposable caches solely from the text log."""
+    records = replay_task_log(ROOT / "chat.log")
+    owners = set()
+    for chain, record in sorted(records.items()):
+        save(path_for(chain), record["data"])
+        owners.update(step["owner"] for step in record["data"]["steps"] if step.get("owner"))
+    for owner in sorted(owners):
+        reconcile_context(owner)
+    print(f"rebuilt={len(records)} owners={len(owners)} source={ROOT / 'chat.log'}")
 
 
 def now() -> str:
@@ -185,6 +204,20 @@ def require_emit(marker: str, body: str) -> None:
 
 
 def save(path: Path, data: dict) -> None:
+    # Contexts are disposable pointers. Chain states must reach chat.log first.
+    if isinstance(data, dict) and "chain" in data and "steps" in data and path.parent == CHAINS:
+        records = task_records()
+        previous = records.get(data["chain"])
+        if previous is None or previous["data"] != data:
+            revision = previous["revision"] + 1 if previous else 1
+            payload = encode_task_state(data, revision).removeprefix("[task-state] ")
+            command = str(Path(__file__).resolve().with_name("mesh-chat"))
+            result = subprocess.run([command, "--task-state", payload],
+                                    env=dict(os.environ, MESH_DIR=str(ROOT)),
+                                    text=True, capture_output=True, check=False)
+            if result.returncode:
+                die(f"task-state append failed; cache not changed: {result.stderr.strip()}", 1)
+            records[data["chain"]] = json.loads(payload)
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent), text=True)
     try:
@@ -220,12 +253,10 @@ def coordinator_lock():
 
 def load(chain: str) -> tuple[Path, dict]:
     path = path_for(chain)
-    try:
-        return path, json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        die(f"chain '{chain}' does not exist (create it from a TSV plan first)")
-    except json.JSONDecodeError as exc:
-        die(f"chain artifact is corrupt: {path}: {exc}", 1)
+    record = task_records().get(chain)
+    if record is not None:
+        return path, json.loads(json.dumps(record["data"]))
+    die(f"chain '{chain}' is absent from chat.log (create it, or explicitly import existing chains)")
 
 
 def step_for(data: dict, ref: str) -> tuple[int, dict]:
@@ -241,15 +272,22 @@ def post_task(data: dict, index: int) -> bool:
     # bare-window grammar so non-code owners (for example haunt) are routed
     # directly; mesh-task/<window> is the slash-form code route and redirects
     # non-code windows to a code-capable worker.
-    return emit("task", f"{step['id']} → owner: {step['owner']} — {step['description']}"
+    assignment = f" → owner: {step['owner']}" if step.get("owner") else ""
+    owner_tag = f", owner:{step['owner']}" if step.get("owner") else ""
+    return emit("task", f"{step['id']}{assignment} — {step['description']}"
+                f"{metadata_suffix(data, step)}"
                 f" Run: mesh-task take {data['chain']} {step['slug']};"
-                f" task:{step['id']}, ask:{data.get('ask') or '-'}, owner:{step['owner']}, status:open")
+                f" task:{step['id']}, ask:{data.get('ask') or '-'}{owner_tag}, status:open")
 
 
 def handoff(data: dict, index: int, completed: dict) -> bool:
     step = data["steps"][index]
+    if not step.get("owner"):
+        return emit("handoff", f"{data['chain']}: {completed['id']} completed with artifact "
+                    f"{completed['artifact']}; successor task:{step['id']} awaits assignment")
     text = (f"chain {data['chain']} advanced: {completed['id']} completed with artifact "
             f"{completed['artifact']}; next is {step['id']} for mind {step['owner']}. "
+            f"Expected scope:{metadata_suffix(data, step)} "
             f"Run: mesh-task take {data['chain']} {step['slug']}; verify the artifact before acting.")
     command = os.environ.get("MESH_TASK_HANDOFF_CMD", "mesh-handoff")
     try:
@@ -289,30 +327,43 @@ def dispatch(path: Path, data: dict) -> None:
 def create(chain: str, plan: str, ask: str = "") -> None:
     check_name(chain, "chain")
     path = path_for(chain)
-    if path.exists():
+    if path.exists() or chain in task_records():
         die(f"chain '{chain}' already exists; refusing to overwrite")
     rows = []
+    metadata = {}
     for lineno, raw in enumerate(Path(plan).read_text(encoding="utf-8").splitlines(), 1):
-        if not raw.strip() or raw.lstrip().startswith("#"):
+        stripped = raw.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("#"):
+            header = stripped[1:].strip()
+            key, separator, value = header.partition("=")
+            if separator and key.strip() in TASK_METADATA_KEYS:
+                metadata[key.strip()] = value.strip()
             continue
         fields = raw.split("\t", 2)
         if len(fields) != 3:
             die(f"plan line {lineno} must be owner<TAB>step-slug<TAB>description")
         owner, slug, description = (x.strip() for x in fields)
-        check_name(owner, f"owner on line {lineno}")
+        if owner and owner != "-":
+            check_name(owner, f"owner on line {lineno}")
+        else:
+            owner = None
         check_name(slug, f"step on line {lineno}")
         if not description:
             die(f"plan line {lineno} has an empty description")
         if any(s["slug"] == slug for s in rows):
             die(f"plan repeats step slug '{slug}'")
         rows.append({"id": f"{chain}/{slug}", "owner": owner, "slug": slug,
-                     "description": description, "status": "open"})
+                     "description": description, "status": "open", **metadata})
     if not rows:
         die("plan has no steps")
     if ask.startswith("ask:"): ask = ask[4:]
     if ask: check_name(ask, "ask")
     data = {"version": 2, "chain": chain, "ask": ask or None, "created": now(), "status": "open",
             "current": 0, "steps": rows}
+    if metadata:
+        data["task_context"] = metadata
     save(path, data)
     dispatch(path, data)
     print(f"created {chain}: {len(rows)} step(s) → {path}")
@@ -323,6 +374,12 @@ def take(chain: str, ref: str) -> None:
     index, step = step_for(data, ref)
     if index != data["current"]:
         die(f"step {step['id']} is not the current step (current: {data['steps'][data['current']]['id']})")
+    if not step.get("owner"):
+        candidate = actor()
+        check_name(candidate, "claiming mind")
+        if candidate == "mesh-task":
+            die("set MESH_TASK_ACTOR to the mind claiming this unassigned task")
+        step["owner"] = candidate
     require_owner(step)
     if step["status"] == "active":
         print(f"already active {step['id']}")
@@ -337,6 +394,7 @@ def take(chain: str, ref: str) -> None:
     step["started"] = now(); step["lease_until"] = future(); step["last_progress"] = step["started"]
     data["status"] = "active"
     require_emit("taking", f"{step['id']}: {ACTOR} — {step['description']}"
+                 f"{metadata_suffix(data, step)}"
                  f" ; task:{step['id']}, ask:{data.get('ask') or '-'}, owner:{step['owner']}, lease:{step['lease_until']}, status:claimed")
     save(path, data)
     update_context(step["owner"], data["chain"], step)
@@ -356,6 +414,7 @@ def done(chain: str, ref: str, artifact: str, result: str) -> None:
         die(f"step {step['id']} is not active; take it before settling")
     if not artifact_path.exists():
         die(f"artifact does not exist: {artifact} (a claim is not complete without evidence)")
+    validate_artifact_scope(data, step, artifact_path)
     step.update(status="done", finished=now(), artifact=str(artifact_path),
                 artifact_sha256=artifact_digest(artifact_path), result=result or "verified")
     next_index = index + 1
@@ -368,6 +427,7 @@ def done(chain: str, ref: str, artifact: str, result: str) -> None:
         data["steps"][next_index]["status"] = "open"
         data["dispatch"] = "pending"
     require_emit("done", f"{step['id']}: artifact={artifact_path} — {step['result']}"
+                 f"{metadata_suffix(data, step)}"
                  f" ; task:{step['id']}, ask:{data.get('ask') or '-'}, owner:{step['owner']}, artifact-sha256:{step['artifact_sha256']}, status:done")
     save(path, data)
     update_context(step["owner"], data["chain"], step, remove=True)
@@ -383,9 +443,11 @@ def progress(chain: str, ref: str, artifact: str, next_action: str, deadline: st
     if index != data["current"] or step["status"] != "active": die(f"step {step['id']} is not active")
     artifact_path = Path(artifact).expanduser().resolve()
     if not artifact_path.exists(): die(f"progress artifact does not exist: {artifact}")
+    validate_artifact_scope(data, step, artifact_path)
     step.update(last_progress=now(), lease_until=future(), progress_artifact=str(artifact_path),
                 next_action=next_action, next_update=deadline)
-    require_emit("progress", f"{step['id']}: artifact={artifact_path} next={next_action} update={deadline} lease={step['lease_until']} ; task:{step['id']}, ask:{data.get('ask') or '-'}")
+    require_emit("progress", f"{step['id']}: artifact={artifact_path} next={next_action} update={deadline} lease={step['lease_until']}"
+                 f"{metadata_suffix(data, step)} ; task:{step['id']}, ask:{data.get('ask') or '-'}")
     save(path, data); update_context(step["owner"], data["chain"], step)
     print(f"renewed {step['id']} until {step['lease_until']}")
 
@@ -470,11 +532,7 @@ def reschedule_chain(chain: str) -> None:
 
 def reschedule_task(task: str) -> None:
     """Recover a current task by its durable task id, for periodic witnesses."""
-    for path in sorted(CHAINS.glob("*.json")):
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
+    for path, data in chain_states():
         index = data.get("current")
         steps = data.get("steps", [])
         if isinstance(index, int) and 0 <= index < len(steps) and steps[index].get("id") == task:
@@ -513,9 +571,7 @@ def live_owners() -> set[str]:
 
 def audit() -> None:
     live = live_owners(); current = time.time()
-    for path in sorted(CHAINS.glob("*.json")):
-        try: data = json.loads(path.read_text())
-        except (OSError, json.JSONDecodeError): continue
+    for path, data in chain_states():
         if data.get("status") not in ("open", "active", "blocked", "complete"): continue
         current_index = data["current"]
         for index, step in enumerate(data["steps"]):
@@ -625,9 +681,9 @@ def test() -> None:
         state = json.loads((root / "mesh/chains/demo.json").read_text())
         if state["current"] != 2 or state["dispatch"] != "sent": die("self-test second handoff missing", 1)
         env["MESH_TASK_ACTOR"] = "gamma"
+        env["MESH_TASK_LEASE_SECONDS"] = "-1"
         run("take", "demo", "close")
-        state_path = root / "mesh/chains/demo.json"; state = json.loads(state_path.read_text())
-        state["steps"][2]["lease_until"] = "2000-01-01T00:00:00Z"; save_test = json.dumps(state, indent=2) + "\n"; state_path.write_text(save_test)
+        env.pop("MESH_TASK_LEASE_SECONDS")
         env["MESH_TASK_LIVE_OWNERS"] = "gamma"
         if "EXPIRED\tgamma\tdemo/close" not in run("audit").stdout: die("self-test expired-live classification failed", 1)
         env["MESH_TASK_LIVE_OWNERS"] = ""
@@ -650,17 +706,37 @@ def main(argv: list[str]) -> None:
         print("usage: mesh-task create <chain> <plan.tsv> [ask-key] | take <chain> <step> | done <chain> <step> <artifact> [result]")
         print("       mesh-task progress <chain> <step> <artifact> <next-action> <next-update> | block <chain> <step> <type> <needs> <retry>")
         print("       mesh-task resume <chain> <step> <event> | dispatch <chain> | reschedule <chain> | reschedule-task <task> | status <chain> | reconcile <owner> | --test")
+        print("       mesh-task replay --json  (read structured task-state records from chat.log)")
+        print("       mesh-task import | rebuild  (import existing chains; rebuild disposable caches)")
+        print("       mesh-task check <dispatch|resume|pending> <task-id> <owner>  (0 eligible, 2 refused, 3 untracked, 1 unreadable)")
         return
     if argv[0] == "--test": test(); return
     command = argv[0]
+    if command == "check" and len(argv) == 4:
+        try:
+            records = replay_task_log(Path(os.environ.get("MESH_CHAT_LOG", str(ROOT / "chat.log"))))
+            raise SystemExit(eligibility(records, argv[2], argv[1], argv[3]))
+        except (OSError, ValueError) as exc:
+            die(str(exc), 1)
+    if command == "replay" and argv[1:] == ["--json"]:
+        try:
+            records = replay_task_log(Path(os.environ.get("MESH_CHAT_LOG", str(ROOT / "chat.log"))))
+            if not records:
+                die("chat.log has no structured task-state records; chain recovery is not yet available", 2)
+            print(json.dumps(records, ensure_ascii=False, sort_keys=True))
+        except (OSError, ValueError) as exc:
+            die(str(exc), 1)
+        return
     mutating = {"create", "take", "done", "progress", "block", "resume", "dispatch",
-                "reschedule", "reschedule-task", "reconcile"}
+                "reschedule", "reschedule-task", "reconcile", "import", "rebuild"}
     # Observers must remain able to see the last committed state while a board
     # helper is slow or unavailable.  Only transitions need to serialize their
     # receipt-before-save interval.
     lock = coordinator_lock() if command in mutating else contextlib.nullcontext()
     with lock:
         try:
+            if command in ("create", "import"):
+                task_records(allow_missing=True)
             if command == "create" and len(argv) in (3, 4): create(*argv[1:])
             elif command == "take" and len(argv) == 3: take(*argv[1:])
             elif command == "done" and len(argv) >= 4: done(argv[1], argv[2], argv[3], " ".join(argv[4:]))
@@ -673,6 +749,8 @@ def main(argv: list[str]) -> None:
             elif command == "status" and len(argv) == 2: status(argv[1])
             elif command == "reconcile" and len(argv) == 2: reconcile(argv[1])
             elif command == "audit" and len(argv) == 1: audit()
+            elif command == "import" and len(argv) == 1: import_chains()
+            elif command == "rebuild" and len(argv) == 1: rebuild()
             else: die("invalid arguments (use --help)")
         except (OSError, ValueError) as exc:
             die(str(exc), 1)
