@@ -1,0 +1,153 @@
+#!/usr/bin/env python3
+# reflex-cadence: * * * * *
+"""Turn new, actionable health warnings in chat.log into health-owned tasks.
+
+The source log remains authoritative.  The checkpoint is only a retryable cursor:
+it advances past a warning after ``mesh-task create`` has successfully committed a
+task-state record, and is written atomically after each source line.
+"""
+
+from __future__ import annotations
+
+import fcntl
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+
+MESH = Path(os.environ.get("MESH_DIR", str(Path.home() / ".mesh")))
+CHAT = Path(os.environ.get("MESH_CHAT_LOG", str(MESH / "chat.log")))
+STATE = Path(os.environ.get("MESH_HEALTH_WARNING_TASK_STATE", str(MESH / ".health-warning-tasks.state")))
+TASK_CMD = os.environ.get("MESH_HEALTH_WARNING_TASK_CMD", str(Path.home() / ".local/bin/mesh-task"))
+OWNER = os.environ.get("MESH_HEALTH_WARNING_TASK_OWNER", "health")
+
+LINE_RE = re.compile(
+    rb"^(?P<stamp>\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ)\s+(?P<sender>\S+)\s+::\s+(?P<body>.*)$"
+)
+WARNING_WORD = re.compile(r"\b(?:dead|lost|fail(?:ed|ure)?|warn(?:ing)?|unknown|degraded|stale|offline|timeout|gap)\b", re.I)
+HEALTH_SOURCE = re.compile(r"(?:^|[/_.-])(?:health|watch|sense|doctor|fleet|reflex)(?:@|[/_.-]|$)", re.I)
+
+
+def atomic_write(path: Path, value: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent, text=True)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, sort_keys=True, indent=2)
+            handle.write("\n")
+        os.replace(tmp, path)
+    finally:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+
+
+def load_state() -> dict:
+    try:
+        value = json.loads(STATE.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        value = {}
+    if not isinstance(value, dict) or not isinstance(value.get("created"), dict):
+        value = {}
+    value.setdefault("offset", 0)
+    value.setdefault("created", {})
+    if not isinstance(value["offset"], int) or value["offset"] < 0:
+        value["offset"] = 0
+    return value
+
+
+def warning_key(sender: str, body: str) -> str | None:
+    # mesh-task writes its own [task] and [task-state] records while this cursor
+    # is open.  Their descriptions may quote the original warning marker; they
+    # are ledger output, never new health observations.
+    if re.match(r"\[(?:task|task-state)\]", body, re.I):
+        return None
+    if re.search(r"room\s+sense\s+(?:still\s+)?lost:", body, re.I):
+        # Held restatements contain a changing age; they belong to the same incident.
+        stable = re.sub(r"\bfor\s+\d+\s*[smhd]\b", "for AGE", body, flags=re.I)
+        stable = re.sub(r"\s+\(mesh-room-sense-loss[^)]*\)", "", stable, flags=re.I)
+        return "room-sense:" + re.sub(r"\s+", " ", stable).strip().lower()
+    if re.search(r"\[(?:health-warning|alarm|warning)\]", body, re.I):
+        return "tagged:" + re.sub(r"\s+", " ", body).strip().lower()
+    if HEALTH_SOURCE.search(sender) and re.search(r"\[(?:check|fyi|warn|warning)\]", body, re.I) and WARNING_WORD.search(body):
+        return "health-source:" + re.sub(r"\s+", " ", body).strip().lower()
+    return None
+
+
+def task_chain(key: str) -> str:
+    return "health-warning/" + hashlib.sha256(key.encode("utf-8")).hexdigest()[:20]
+
+
+def create_task(chain: str, description: str) -> None:
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", prefix="health-warning-", suffix=".tsv", delete=False) as handle:
+        plan = Path(handle.name)
+        handle.write(f"{OWNER}\ttriage\t{description}\n")
+    try:
+        env = dict(os.environ, MESH_TASK_ACTOR=OWNER, MESH_WHO=OWNER)
+        result = subprocess.run([TASK_CMD, "create", chain, str(plan)], env=env,
+                                text=True, capture_output=True, check=False)
+        if result.returncode:
+            detail = (result.stderr or result.stdout).strip().replace("\n", " ")
+            raise RuntimeError(f"mesh-task create failed ({result.returncode}): {detail}")
+    finally:
+        plan.unlink(missing_ok=True)
+
+
+def run() -> int:
+    if not CHAT.is_file():
+        print(f"mesh-health-warning-task: chat.log unavailable: {CHAT}", file=sys.stderr)
+        return 2
+    lock = STATE.with_name(STATE.name + ".lock")
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    with lock.open("a+") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        state = load_state()
+        size = CHAT.stat().st_size
+        if state["offset"] > size:
+            state["offset"] = 0
+        with CHAT.open("rb") as source:
+            source.seek(state["offset"])
+            while True:
+                start = source.tell()
+                raw = source.readline()
+                if not raw:
+                    break
+                end = source.tell()
+                match = LINE_RE.match(raw.rstrip(b"\n"))
+                if not match:
+                    state["offset"] = end
+                    atomic_write(STATE, state)
+                    continue
+                stamp = match.group("stamp").decode("ascii")
+                sender = match.group("sender").decode("utf-8", "replace")
+                body = match.group("body").decode("utf-8", "replace")
+                key = warning_key(sender, body)
+                if key is not None and key not in state["created"]:
+                    chain = task_chain(key)
+                    description = f"Investigate health warning from {sender} at {stamp}: {re.sub(r'\\s+', ' ', body).strip()}"
+                    # Do not advance the cursor until the durable task-state append succeeds.
+                    create_task(chain, description[:900])
+                    state["created"][key] = {"chain": chain, "source": stamp, "sender": sender}
+                state["offset"] = end
+                atomic_write(STATE, state)
+    return 0
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--test":
+        assert warning_key("mesh-home/mesh-room-sense-loss@mesh-home", "[fyi] room sense STILL lost: EYES DEAD for 2d")
+        assert warning_key("health@mesh-home", "[health-warning] mesh-egress-health UNKNOWN")
+        assert warning_key("health", "[task] quoted [health-warning] text") is None
+        print("mesh-health-warning-task --test: PASS (warning filters, task-output exclusion, fingerprinting)")
+        raise SystemExit(0)
+    try:
+        raise SystemExit(run())
+    except RuntimeError as exc:
+        print(f"mesh-health-warning-task: {exc}", file=sys.stderr)
+        raise SystemExit(1)
