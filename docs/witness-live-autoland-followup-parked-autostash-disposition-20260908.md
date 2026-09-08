@@ -45,3 +45,16 @@ remain addressable and therefore recoverable for a later, explicit review.
 
 The stale autostash refusal path is therefore no longer needed for these two parked refs,
 while the contents remain durably retained under `refs/wip`.
+
+## Fallback recheck
+
+Rechecked 2026-09-08T17:28Z for the ownerless fallback task
+`witness-live-unattended-followup-20260908-generic-20260908/repair-parked-autostash-generic`.
+The live phaedra read again found no `autostash` entries, retained the June 16 manual WIP
+stash, retained both anchored commits, and showed the same unrelated dirty paths plus `log`.
+The active cron line is `3-59/15 * * * * $HOME/.local/bin/mesh-land --autoland >>
+$HOME/.mesh/land.log 2>&1`; the two deployed `mesh-land` copies still share SHA-256
+`7f133405e0ba716225963ebb90b1ecc22a81ea6347b380c879189af5f443308a`. The live script still
+contains the stale-autostash refusal and incident-routing guard. A remote
+`mesh-land --test` was bounded at 35 seconds with no completion output, so test completion
+remains unresolved; no success is claimed from it.
