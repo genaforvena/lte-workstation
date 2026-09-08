@@ -31,11 +31,10 @@ ledger bypass was used.
 
 ## Verification
 
-- `python3 tests/test-mesh-task-owner-normalization.py` — PASS.
 - `python3 -m unittest tests/test-mesh-task-log.py tests/test-mesh-task-import.py tests/test-mesh-task-no-expiry.py tests/test-mesh-task-optional-owner.py` — PASS.
 - `bash tests/test-mesh-task-source-coverage.sh` — PASS.
 - `bash tests/test-mesh-task-dispatch-receipt.sh` — PASS.
 - `bash tests/test-mesh-task-restart-continuity.sh` — PASS.
-- `mesh-task --test` — PASS.
+- `mesh-task --test` — PASS, including the slash-owner create/check/take/done regression.
 - `git diff --check` — PASS.
 - Live `mesh-task status witness-live-unattended-followup-owner-correction-20260908` — `[rejected]`, step owner `genome`.
