@@ -113,3 +113,32 @@ Current verification receipts:
 Disposition remains BLOCKED. Explicit successor requeue: implement/reconcile plan Tasks 1–6,
 capture mutation-red plus sandbox dry-run and settled ledger receipts, then rerun this checklist
 against a collage-owned MP3. The fresh re-pick must not be misclassified as collage completion.
+
+## Re-created successor implementation/audit (2026-09-08 11:07Z)
+
+Live-state check: `recreated-rejected-20260908-08/plans-sound-collage` is `open`, owner `tg`,
+dispatch `sent`, so this requeue was live and correctly specified. The source and deployed script
+are byte-identical at SHA-256
+`961cf126db158bbc3ea74a5fac00612333e2e09c8f1c45e10bfc0b3533b5ea20`.
+
+| plan task | current disposition | evidence |
+|---|---|---|
+| 1 `valid_source` | DONE | helper implemented; silence fixture passes and empty fixture fails in section 16 |
+| 2 `cut_window` | DONE | random bounded cut helper and varying-cut fixture in section 16 |
+| 3 `collage_build` | DONE | validity-filtered random subset, shuffled concat, silent-source fixture in section 16 |
+| 4 `launch_grind` | DONE | current detached launcher reused; collage feed invokes the existing queue/render-cap contract |
+| 5 collage `tick` path | DONE | no-drop blocks route through `collage_tick`; isolated ledger settled `aa` as `skip:not-selected(random collage)` and silent `bb` as `grinding` |
+| 6 recipe/verdict/deploy | PARTIAL | full source and deployed `--test` both `rc=0`, `smoke-test: ok`; cron remains load-gated `*/10`; no fresh live collage-owned MP3 was created in this audit |
+
+Verification receipts:
+
+- source full test: `rc=0`, output SHA-256 `a9bff65c24a30d8ff27f12e202761b847dc672cd43ad516d49d84832c736af4`;
+- deployed full test: same `rc=0` and output SHA-256;
+- isolated sandbox ledger proved score-independent selection and silence admission; no pending row remained;
+- `bash -n scripts/mesh-sound-reflex`: `rc=0`;
+- live wiring remains `/home/mesh-home/.mesh/reflexes.cron:155`, `*/10`, load-gated.
+
+Remaining audit gap: mutation-red receipts and a fresh reflex-owned settled MP3/params-log collage
+receipt were not claimed. The implementation is landed and verified in source/deployed smoke tests,
+but the checklist remains `PARTIAL` rather than falsely green until a quiet-window live tick supplies
+those artifacts.
