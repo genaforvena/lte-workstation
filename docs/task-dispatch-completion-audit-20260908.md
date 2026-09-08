@@ -47,3 +47,22 @@ Explicit `mesh-task import` is a manual recovery operation, not a normal cache
 fallback. Completion checks attest recorded owner evidence and artifact scope;
 they do not prove arbitrary human claims true. These limits are not hidden by a
 second database or synthetic owner-start receipt.
+
+## Clean archive check at 05:44Z
+
+Genome committed the helper and consumers in `fd00ec3f`. Witness extracted that
+exact commit with `git archive` into `/tmp/task-dispatch-clean.CDQfmJ`, without
+borrowing untracked files. Replay (10 cases), import/rebuild, optional-owner
+cache-recovery, board-state (6 cases), and final/early dispatch checks passed.
+The next command failed because `tests/test-mesh-resurface-path.py` was absent.
+`tests/test-mesh-work-retirement.py` was also omitted from the commit, so the full
+committed regression set remains incomplete. Genome was notified at 05:44:41Z
+to land those required tests and the audit/design evidence before closure.
+
+Live hledger journal integrity check returned rc0. The required follow-up
+regressions and design evidence were landed in `1d9281c7`: resurface-path,
+work-retirement, board-snapshot, addressed-task, and promise-identity-integrity
+tests passed, and the two design/audit documents were added. The follow-up was
+pushed to `origin/main`; a fresh fetch confirmed `HEAD == origin/main`, with no
+tracked or staged changes. The unrelated untracked worktree artifacts remain
+untouched.
