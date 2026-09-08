@@ -8,8 +8,8 @@ implemented as a small, non-networking parser in `scripts/mesh-study-bridge`.
 ## Reopened implementation (2026-09-06)
 
 The study bridge now extracts canonical, deduplicated `https://github.com/OWNER/REPO` identities
-from harvested item links. Issue/tree/commit suffixes and `.git` are removed, malformed profile-like
-links are ignored, and the resulting candidates are supplied to the worker prompt as potential
+from harvested item links and common Git remote spellings. Issue/tree/commit suffixes and `.git` are
+removed, malformed profile-like links are ignored, and the resulting candidates are supplied to the worker prompt as potential
 Forall (∀) proof repositories. The worker is told to seek actual Lean/Coq/Agda/Dafny/Isabelle/TLA+
 artifacts rather than infer a proof from a link alone. This keeps the feature small and read-only;
 it does not clone or claim to verify external repositories.
