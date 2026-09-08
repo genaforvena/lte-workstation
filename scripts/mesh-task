@@ -85,6 +85,64 @@ def update_context(owner: str, chain: str, step: dict, remove: bool = False) -> 
         path.unlink()
 
 
+def active_contexts(owner: str, excluding: str = "") -> list[dict]:
+    """Return this owner's active durable contexts, rejecting malformed state loudly."""
+    path = context_path(owner)
+    try:
+        contexts = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return []
+    except json.JSONDecodeError:
+        die(f"task context is corrupt: {path}", 1)
+    if isinstance(contexts, dict):
+        contexts = [contexts]
+    if not isinstance(contexts, list):
+        die(f"task context is not a list: {path}", 1)
+    return [context for context in contexts
+            if context.get("status") in ("active", "claimed")
+            and context.get("task") != excluding]
+
+
+def reconcile_context(owner: str) -> int:
+    """Rebuild live task pointers from their canonical chain state.
+
+    This is recovery for contexts written before a transition was interrupted;
+    it deliberately keeps completed-turn entries but never revives a stale
+    active claim from the context cache.
+    """
+    path = context_path(owner)
+    try:
+        existing = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        existing = []
+    except json.JSONDecodeError:
+        die(f"task context is corrupt: {path}", 1)
+    if isinstance(existing, dict):
+        existing = [existing]
+    if not isinstance(existing, list):
+        die(f"task context is not a list: {path}", 1)
+    contexts = [row for row in existing if row.get("status") == "done"]
+    for chain_path in sorted(CHAINS.glob("*.json")):
+        try:
+            data = json.loads(chain_path.read_text(encoding="utf-8"))
+            step = data["steps"][data["current"]]
+        except (OSError, ValueError, KeyError, IndexError, json.JSONDecodeError):
+            continue
+        if step.get("owner") != owner or step.get("status") not in ("active", "blocked"):
+            continue
+        contexts.append({"chain": data["chain"], "step": step["slug"], "task": step["id"],
+                         "owner": owner, "status": step["status"],
+                         "started": step.get("started"), "lease_until": step.get("lease_until"),
+                         "last_progress": step.get("last_progress"), "artifact": step.get("progress_artifact"),
+                         "next_action": step.get("next_action"), "next_update": step.get("next_update"),
+                         "retry": step.get("retry")})
+    if contexts:
+        save(path, contexts)
+    elif path.exists():
+        path.unlink()
+    return len(contexts)
+
+
 def now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
@@ -163,7 +221,8 @@ def post_task(data: dict, index: int) -> bool:
     # directly; mesh-task/<window> is the slash-form code route and redirects
     # non-code windows to a code-capable worker.
     return emit("task", f"{step['id']} → owner: {step['owner']} — {step['description']}"
-                f" ; task:{step['id']}, ask:{data.get('ask') or '-'}, owner:{step['owner']}, status:open")
+                f" Run: mesh-task take {data['chain']} {step['slug']};"
+                f" task:{step['id']}, ask:{data.get('ask') or '-'}, owner:{step['owner']}, status:open")
 
 
 def handoff(data: dict, index: int, completed: dict) -> bool:
@@ -192,6 +251,11 @@ def dispatch(path: Path, data: dict) -> None:
     if ok:
         data.pop("dispatch_error", None)
         data["dispatch"] = "sent"
+        # A delivered task is queued for its exact owner, not unowned work.  If
+        # the owner does not take it before this receipt window expires, audit
+        # turns it into a recovery candidate and witness re-dispatches it.
+        data["steps"][index]["dispatched_at"] = now()
+        data["steps"][index]["dispatch_until"] = future()
         save(path, data)
         return
     data["dispatch"] = "failed"
@@ -244,6 +308,10 @@ def take(chain: str, ref: str) -> None:
         return
     if step["status"] != "open" or data["status"] not in ("open", "active"):
         die(f"step {step['id']} is {step['status']}; it is not claimable")
+    active = active_contexts(step["owner"], step["id"])
+    if active:
+        die(f"owner {step['owner']} already has active task {active[0].get('task', 'unknown')}; "
+            "settle or type-block it before taking another")
     step["status"] = "active"
     step["started"] = now(); step["lease_until"] = future(); step["last_progress"] = step["started"]
     data["status"] = "active"
@@ -313,6 +381,7 @@ def block(chain: str, ref: str, reason_type: str, needs: str, retry: str) -> Non
     data["status"] = "blocked"
     require_emit("blocked", f"{step['id']}: reason={reason_type} needs={needs} retry={retry} ; task:{step['id']}, ask:{data.get('ask') or '-'}")
     save(path, data)
+    update_context(step["owner"], data["chain"], step)
     print(f"blocked {step['id']}")
 
 
@@ -339,6 +408,60 @@ def retry_dispatch(chain: str) -> None:
     print(f"dispatched {data['steps'][data['current']]['id']}")
 
 
+def reschedule(path: Path, data: dict) -> None:
+    """Return an unstarted or expired current step to its owner's exact queue.
+
+    This is deliberately a coordinator recovery transition, not an owner action:
+    a lease that has actually expired cannot be allowed to become a terminal
+    unclaimed state.  A still-live lease remains exclusively owned.
+    """
+    if data.get("status") not in ("open", "active"):
+        die(f"chain '{data['chain']}' is {data.get('status', 'unknown')}; it cannot be re-scheduled")
+    index = data["current"]
+    step = data["steps"][index]
+    state = step.get("status")
+    if state == "active":
+        if epoch_iso(step.get("lease_until", "")) >= time.time():
+            die(f"step {step['id']} has a live claim until {step.get('lease_until')}; it cannot be re-scheduled")
+        require_emit("yield", f"{step['id']}: expired active claim re-scheduled to exact owner {step['owner']}")
+        for field in ("started", "lease_until", "last_progress", "progress_artifact", "next_action", "next_update"):
+            step.pop(field, None)
+    elif state == "open":
+        require_emit("yield", f"{step['id']}: unclaimed dispatch re-scheduled to exact owner {step['owner']}")
+    else:
+        die(f"step {step['id']} is {state}; it cannot be re-scheduled")
+    step["status"] = "open"
+    step["rescheduled_at"] = now()
+    step["reschedule_until"] = future()
+    data["status"] = "open"
+    # A repeated delivery is intentional after a missed receipt; do not let the
+    # ordinary dispatch guard mistake it for duplicate completion work.
+    data["dispatch"] = "pending"
+    update_context(step["owner"], data["chain"], step)
+    dispatch(path, data)
+    print(f"re-scheduled {step['id']} to {step['owner']}")
+
+
+def reschedule_chain(chain: str) -> None:
+    path, data = load(chain)
+    reschedule(path, data)
+
+
+def reschedule_task(task: str) -> None:
+    """Recover a current task by its durable task id, for periodic witnesses."""
+    for path in sorted(CHAINS.glob("*.json")):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        index = data.get("current")
+        steps = data.get("steps", [])
+        if isinstance(index, int) and 0 <= index < len(steps) and steps[index].get("id") == task:
+            reschedule(path, data)
+            return
+    die(f"current task '{task}' was not found")
+
+
 def status(chain: str) -> None:
     _, data = load(chain)
     print(f"{data['chain']} [{data['status']}] ({data['current'] + 1}/{len(data['steps'])})")
@@ -349,6 +472,14 @@ def status(chain: str) -> None:
               (f" artifact={step['artifact']}" if "artifact" in step else ""))
     if data.get("dispatch") in ("pending", "failed"):
         print(f"  dispatch={data['dispatch']} {data.get('dispatch_error', '')}")
+
+
+def reconcile(owner: str) -> None:
+    check_name(owner, "owner")
+    if actor() != owner:
+        die(f"exact owner required: context owner={owner} actor={actor()}")
+    count = reconcile_context(owner)
+    print(f"reconciled task context for {owner}: {count} canonical pointer(s)")
 
 
 def live_owners() -> set[str]:
@@ -373,7 +504,9 @@ def audit() -> None:
                       f"artifact={step.get('artifact', 'missing')}")
                 continue
             if state == "open":
-                verdict = "OPEN_UNOWNED" if index == current_index else "QUEUED"
+                queued_until = max(epoch_iso(step.get("reschedule_until", "")),
+                                   epoch_iso(step.get("dispatch_until", "")))
+                verdict = "QUEUED" if index != current_index or queued_until >= current else "OPEN_UNOWNED"
                 print(f"{verdict}\t{step['owner']}\t{step['id']}\t"
                       f"current={data['steps'][current_index]['id']} dispatch={data.get('dispatch','unknown')}")
                 continue
@@ -438,9 +571,30 @@ def test() -> None:
         if "exact owner required" not in wrong.stderr: die("self-test wrong-owner claim was accepted", 1)
         env["MESH_TASK_ACTOR"] = "beta"
         run("take", "demo", "verify")
+        # An owner may have one current active task.  A second dispatched
+        # chain remains a queue item until the current task is settled or
+        # visibly blocked; dispatch is never a claim receipt.
+        second_plan = root / "second.tsv"; second_plan.write_text("beta\twork\tsecond owner task\n")
+        run("create", "second", str(second_plan))
+        concurrent = run("take", "second", "work", expect=2)
+        if "already has active task" not in concurrent.stderr:
+            die("self-test allowed a second active task for one owner", 1)
         run("progress", "demo", "verify", str(artifact), "await review", "2026-09-08T00:00:00Z")
         run("progress", "demo", "verify", str(artifact), "finish review", "2026-09-08T01:00:00Z")
         run("block", "demo", "verify", "operator-input", "csv-path", "event:csv-arrives")
+        beta_context = root / "mesh/task-context/beta.json"
+        context_data = json.loads(beta_context.read_text())
+        if not any(row.get("task") == "demo/verify" and row.get("status") == "blocked" for row in context_data):
+            die("self-test typed block did not update durable task context", 1)
+        run("take", "second", "work")
+        run("block", "second", "work", "operator-input", "csv-path", "event:csv-arrives")
+        # Recovery reconciles pre-fix context rows from canonical chain state;
+        # an interrupted older writer may have left a claimed row stale.
+        beta_context.write_text('[{"chain":"demo","step":"verify","task":"demo/verify","owner":"beta","status":"active"}]\n')
+        run("reconcile", "beta")
+        context_data = json.loads(beta_context.read_text())
+        if not any(row.get("task") == "demo/verify" and row.get("status") == "blocked" for row in context_data):
+            die("self-test reconcile did not recover blocked canonical context", 1)
         blocked_dispatch = run("dispatch", "demo", expect=2)
         if "no open current step" not in blocked_dispatch.stderr: die("self-test blocked work redispatched", 1)
         blocked_audit = run("audit")
@@ -474,7 +628,7 @@ def main(argv: list[str]) -> None:
     if not argv or argv[0] in ("-h", "--help"):
         print("usage: mesh-task create <chain> <plan.tsv> [ask-key] | take <chain> <step> | done <chain> <step> <artifact> [result]")
         print("       mesh-task progress <chain> <step> <artifact> <next-action> <next-update> | block <chain> <step> <type> <needs> <retry>")
-        print("       mesh-task resume <chain> <step> <event> | dispatch <chain> | status <chain> | --test")
+        print("       mesh-task resume <chain> <step> <event> | dispatch <chain> | reschedule <chain> | reschedule-task <task> | status <chain> | reconcile <owner> | --test")
         return
     if argv[0] == "--test": test(); return
     command = argv[0]
@@ -486,7 +640,10 @@ def main(argv: list[str]) -> None:
         elif command == "block" and len(argv) == 6: block(*argv[1:])
         elif command == "resume" and len(argv) == 4: unblock(*argv[1:])
         elif command == "dispatch" and len(argv) == 2: retry_dispatch(*argv[1:])
+        elif command == "reschedule" and len(argv) == 2: reschedule_chain(argv[1])
+        elif command == "reschedule-task" and len(argv) == 2: reschedule_task(argv[1])
         elif command == "status" and len(argv) == 2: status(argv[1])
+        elif command == "reconcile" and len(argv) == 2: reconcile(argv[1])
         elif command == "audit" and len(argv) == 1: audit()
         else: die("invalid arguments (use --help)")
     except (OSError, ValueError) as exc:
