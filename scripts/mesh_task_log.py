@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import re
 import fcntl
+import hashlib
 import os
 import subprocess
 import sys
@@ -18,10 +19,51 @@ from pathlib import Path
 MARKER = '[task-state] '
 EVENT = re.compile(r'^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\s+\S+\s+::\s+\[task-state\] (.*)$')
 EVENT_BYTES = re.compile(EVENT.pattern.encode('ascii'))
+ASK_KEY = re.compile(r'^(?:ask:)?(\d{8}T?\d{6}Z)$', re.IGNORECASE)
+ASK_ISO = re.compile(r'^(?:ask:)?(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ)$', re.IGNORECASE)
 
 
 class ReplayError(ValueError):
     pass
+
+
+def replay_source(path: Path) -> dict[str, object]:
+    """Consume every chat.log record line-by-line and return tamper-evident coverage.
+
+    Ordinary prose and invalid UTF-8 are source events, but are not task entities.
+    Malformed structured task-state records are counted as source errors and do not
+    stop later records from being consumed. They must be accounted for without
+    being interpreted as promises, claims, or holds in the task view.
+    """
+    events = 0
+    errors = 0
+    total_bytes = 0
+    complete = True
+    digest = hashlib.sha256()
+    with path.open('rb') as source:
+        for raw_line in source:
+            events += 1
+            total_bytes += len(raw_line)
+            digest.update(raw_line)
+            if not raw_line.endswith(b'\n'):
+                complete = False
+            try:
+                line = raw_line.rstrip(b'\n')
+                match = EVENT_BYTES.match(line)
+                if match:
+                    record = json.loads(match.group(1).decode('utf-8'))
+                    validate(record)
+            except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError, KeyError):
+                errors += 1
+                continue
+    return {
+        "events": events,
+        "replayed_events": events,
+        "errors": errors,
+        "bytes": total_bytes,
+        "sha256": digest.hexdigest(),
+        "complete": complete,
+    }
 
 
 def validate(record: dict) -> None:
@@ -60,6 +102,56 @@ def encode(data: dict, revision: int) -> str:
     record = {'schema': 1, 'revision': revision, 'data': data}
     validate(record)
     return MARKER + json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
+
+
+def canonical_ask_records(records: dict) -> dict[str, dict]:
+    """Project task-owned asks from committed state, keyed by the ask arrival id.
+
+    ``mesh-promises`` historically replayed the voice inbox and board citations as
+    an independent ASK commodity.  A task state's ``ask`` field is now the durable
+    identity; this projection lets the accounting view use the task's explicit
+    ``done``/``ignored`` terminal state without inventing a second closure path.
+    Non-timestamp ask keys (for example human campaign labels) remain ordinary task
+    metadata until they acquire a dedicated source record.
+    """
+    projected: dict[str, dict] = {}
+    for record in records.values():
+        data = record['data']
+        raw = data.get('ask')
+        if not isinstance(raw, str):
+            continue
+        value = raw.strip()
+        iso_match = ASK_ISO.fullmatch(value)
+        match = ASK_KEY.fullmatch(value)
+        if iso_match:
+            aid = re.sub(r'[-:]', '', iso_match.group(1)).upper()
+            iso = iso_match.group(1).upper()
+        elif match:
+            aid = match.group(1).upper()
+            if len(aid) == 16:  # compact YYYYMMDDTHHMMSSZ
+                iso = f'{aid[:4]}-{aid[4:6]}-{aid[6:8]}T{aid[9:11]}:{aid[11:13]}:{aid[13:15]}Z'
+            else:  # compact YYYYMMDDHHMMSSZ
+                iso = f'{aid[:4]}-{aid[4:6]}-{aid[6:8]}T{aid[8:10]}:{aid[10:12]}:{aid[12:14]}Z'
+        else:
+            continue
+        step = data['steps'][data['current']]
+        terminal = data.get('status') in ('complete', 'ignored') or step.get('status') in ('done', 'ignored')
+        closed = step.get('finished') if step.get('status') == 'done' else step.get('ignored')
+        if terminal and not closed:
+            closed = data.get('finished') or data.get('ignored')
+        candidate = {
+            'id': aid,
+            'ts': iso,
+            'kind': 'TASK',
+            'text': step.get('description', ''),
+            'closed': terminal,
+            'closed_ts': closed,
+            'disposition': 'IGNORED' if step.get('status') == 'ignored' or data.get('status') == 'ignored' else 'DONE',
+        }
+        prior = projected.get(aid)
+        if prior is None or (not prior['closed'] and candidate['closed']):
+            projected[aid] = candidate
+    return projected
 
 
 def eligibility(records: dict, task: str, mode: str, owner: str) -> int:
