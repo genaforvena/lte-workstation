@@ -22,6 +22,33 @@ def install_hh_lock_signal_handlers():
         signal.signal(sig, lambda signum, _frame: sys.exit(128 + signum))
 
 
+def lock_holder(path):
+    """Return the live holder record, or ``""`` when no process holds *path*.
+
+    A marker's mtime is history, not ownership: it can be old while its flock is
+    live, and fresh after its owner exited.  Readers use this probe before the
+    legacy marker-age fallback during the migration from older writers.
+    """
+    path = Path(path)
+    # A read-side probe must not mint the legacy marker: callers use its
+    # absence to mean that no writer has announced itself.
+    if not path.exists():
+        return ""
+    try:
+        fd = os.open(str(path), os.O_RDWR)
+    except OSError:
+        return ""
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return _holder(fd)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return ""
+    finally:
+        os.close(fd)
+
+
 @contextmanager
 def hh_driver_lock(path, wait=0.0, mode="job"):
     """Yield (acquired, reason), holding the lock for the context lifetime."""
@@ -54,7 +81,7 @@ def hh_driver_lock(path, wait=0.0, mode="job"):
         # chatwatch uses this shared marker as its cheap cross-process stand-down signal.
         # A reply process has released the flock at this point but must not leave a fresh
         # mtime that makes chatwatch stand down for another 15 minutes.
-        if mode in ("reply", "confirm") and path.name == ".apply.lock":
+        if mode in ("reply", "confirm", "chatwatch") and path.name == ".apply.lock":
             old = time.time() - 901
             try:
                 os.utime(path, (old, old))
