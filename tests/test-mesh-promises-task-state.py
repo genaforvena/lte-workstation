@@ -11,7 +11,8 @@ sys.path.insert(0, str(root / 'scripts'))
 from mesh_task_log import encode
 with tempfile.TemporaryDirectory() as td:
     path = Path(td) / 'chat.log'
-    env = dict(os.environ, MESH_DIR=td, MESH_CHAT_LOG=str(path), MESH_ASK_VOICE_IN='/nonexistent',
+    voice = Path(td) / 'voice-in.log'
+    env = dict(os.environ, MESH_DIR=td, MESH_CHAT_LOG=str(path), MESH_ASK_VOICE_IN=str(voice),
                MESH_ASK_TG_SENT='/nonexistent', MESH_PROMISE_ROSTER='alpha beta', MESH_PROMISE_RETIRE_H='0')
     data = dict(chain='plan', current=0, status='open', created='2026-09-08T00:00:00Z', steps=[
         dict(id='plan/work', slug='work', owner='alpha', status='open', description='produce evidence'),
@@ -30,8 +31,9 @@ with tempfile.TemporaryDirectory() as td:
     assert len(result['open']) == 1 and not result['holds'], result
     data['status'] = data['steps'][0]['status'] = 'active'
     data['steps'][0]['started'] = '2026-09-08T00:00:01Z'
-    result = query(task + done)
-    assert len(result['open']) == 1 and len(result['holds']) == 1, result
+    verify = '2026-09-08T00:00:02Z beta@n :: [verify] plan/work: independently check ; task:plan/work, owner:beta\n'
+    result = query(task + verify + done)
+    assert len(result['open']) == 1 and len(result['holds']) == 1 and not result['claims'], result
     data['status'] = data['steps'][0]['status'] = 'blocked'
     result = query(task + taking)
     assert len(result['open']) == 1 and not result['holds'], result
@@ -48,4 +50,16 @@ with tempfile.TemporaryDirectory() as td:
     assert [row['slug'] for row in result['open']] == ['independent'], result
     assert len(result['holds']) == 1, result
     assert len(result['claims']) == 1, result
+
+    # A canonical task owns its ask episode too. A stale voice-in row must not
+    # reopen an ask after committed task state says done.
+    ask_stamp = '2026-09-08T00:00:05Z'
+    voice.write_text(f'{ask_stamp}  VOICE  canonical ask\n')
+    data = dict(chain='ask-plan', ask=ask_stamp, current=0, status='complete',
+                created=ask_stamp, steps=[dict(
+                    id='ask-plan/work', slug='work', owner='alpha', status='done',
+                    description='canonical ask', finished='2026-09-08T00:00:06Z',
+                    artifact='/evidence', artifact_sha256='b'*64)])
+    result = query('')
+    assert not result['asks'], result
 print('PASS: committed task state wins provisional receipts; blocked/future steps hold no worker; completed work stays closed')

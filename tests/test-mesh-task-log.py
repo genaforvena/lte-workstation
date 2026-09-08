@@ -1,5 +1,6 @@
 import copy
 import importlib.util
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -32,6 +33,47 @@ class ReplayTests(unittest.TestCase):
 
     def event(self, data, rev):
         return '2026-09-08T00:00:00Z  alpha@node  ::  ' + log.encode(data, rev) + '\n'
+
+    def legacy_event(self, data, rev):
+        record = {'schema': 1, 'revision': rev, 'data': data}
+        return ('2026-09-08T00:00:00Z  alpha@node  ::  [task-state] '
+                + json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(',', ':')) + '\n')
+
+    def test_new_encoding_is_not_json_and_mixed_history_replays(self):
+        encoded = log.encode(self.data, 1)
+        self.assertTrue(encoded.startswith('[task-ledger] v1 r=1 | '))
+        self.assertIn('/chain=s:plan', encoded)
+        self.assertIn('/steps/0/description=s:first', encoded)
+        self.assertNotIn('plist64:', encoded)
+        self.assertNotIn('{"schema"', encoded)
+
+        started = copy.deepcopy(self.data)
+        started['status'] = started['steps'][0]['status'] = 'active'
+        self.path.write_text(self.legacy_event(self.data, 1) + self.event(started, 2))
+        self.assertEqual(log.replay(self.path)['plan']['data'], started)
+
+    def test_readable_round_trip_escapes_typed_values_and_unicode(self):
+        data = copy.deepcopy(self.data)
+        data['steps'][0]['description'] = 'Юникод % | pipe\nline\rreturn'
+        data['steps'][0]['nullable'] = None
+        data['steps'][0]['enabled'] = True
+        data['steps'][0]['count'] = 7
+        encoded = log.encode(data, 4)
+        self.assertIn('%25', encoded)
+        self.assertIn('%7C', encoded)
+        self.assertIn('%0A', encoded)
+        self.assertIn('%0D', encoded)
+        self.assertEqual(log.decode(encoded.removeprefix(log.MARKER))['data'], data)
+
+    def test_malformed_readable_payloads_are_refused(self):
+        good = log.encode(self.data, 1).removeprefix(log.MARKER)
+        for bad in (good.replace('/chain=s:plan', '/chain=s:one | /chain=s:two', 1),
+                    good.replace('/chain=s:plan', '/steps/9/status=s:open', 1),
+                    good.replace('/chain=s:plan', '/chain=x:%ZZ', 1),
+                    good.replace('/chain=s:plan', '/chain=i:3', 1)):
+            with self.subTest(bad=bad):
+                with self.assertRaises(log.ReplayError):
+                    log.decode(bad)
 
     def test_rebuild_with_future_steps_and_duplicate_reordered_delivery(self):
         started = copy.deepcopy(self.data)
@@ -82,12 +124,17 @@ class ReplayTests(unittest.TestCase):
         with self.assertRaises(log.ReplayError):
             log.encode(self.data, 1)
         self.data['steps'][0]['ignored_reason'] = 'superseded by an operator decision'
-        self.assertIn('ignored_reason', log.encode(self.data, 1))
+        encoded = log.encode(self.data, 1).removeprefix(log.MARKER)
+        self.assertEqual(log.decode(encoded)['data']['steps'][0]['ignored_reason'],
+                         'superseded by an operator decision')
 
     def test_append_is_durable_replayable_and_duplicate_safe(self):
         payload = log.encode(self.data, 1).removeprefix(log.MARKER)
         log.append(self.path.parent, 'alpha@node', payload)
         before = self.path.read_bytes()
+        self.assertIn(b'[task-ledger] v1 r=1 | ', before)
+        self.assertNotIn(b'[task-state]', before)
+        self.assertNotIn(b'plist64:', before)
         self.assertEqual(log.replay(self.path)['plan']['data'], self.data)
         log.append(self.path.parent, 'alpha@node', payload)
         self.assertEqual(self.path.read_bytes(), before)
