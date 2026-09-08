@@ -1,0 +1,212 @@
+#!/usr/bin/env python3
+"""Reproducible private job-market snapshot; current endpoints are not conversions.
+
+Usage: mesh-job-market-analysis [--daily|--weekly|--json|--test]
+
+# reflex-cadence: 13 5 * * *
+# reflex-state: $HOME/.mesh/job/market-analysis/runs.tsv
+# max-runtime: 120
+"""
+import argparse
+import csv
+import datetime as dt
+import hashlib
+import json
+import os
+import pathlib
+import re
+import sys
+import tempfile
+
+VERSION = "market-analysis-v1"
+HOME = pathlib.Path(os.path.expanduser("~"))
+JOB = pathlib.Path(os.environ.get("MESH_JOB_DIR", HOME / ".mesh/job"))
+BOARD = pathlib.Path(os.environ.get("MESH_JOB_BOARD", HOME / ".mesh/job-board.tsv"))
+MAIL = pathlib.Path(os.environ.get("MESH_JOB_MAIL_LOG", HOME / ".mesh/job-mail.log"))
+OUT = pathlib.Path(os.environ.get("MESH_JOB_ANALYSIS_DIR", JOB / "market-analysis"))
+
+
+def iso_now():
+    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def digest(path):
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for block in iter(lambda: f.read(131072), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def read_tsv(path, header=True):
+    with path.open(encoding="utf-8") as f:
+        if header:
+            rows = list(csv.DictReader(f, delimiter="\t"))
+            if rows and next(iter(rows[0])).startswith("# "):
+                old = next(iter(rows[0])); new = old[2:]
+                for row in rows:
+                    row[new] = row.pop(old)
+            return rows
+        return list(csv.reader(f, delimiter="\t"))
+
+
+def source(link):
+    if "hh.ru/" in link: return "hh"
+    if "ashbyhq.com/" in link: return "ashby"
+    if "linkedin.com/" in link: return "linkedin_guest"
+    if "getmatch.ru/" in link: return "getmatch"
+    if "greenhouse" in link: return "greenhouse"
+    return "employer_or_other"
+
+
+def domain(row):
+    text = (row.get("role", "") + " " + row.get("note", "")).lower()
+    title = row.get("role", "").lower()
+    rules = [
+        ("adtech_rtb", r"\b(adtech|rtb|dsp|programmatic|bidder|vpaid|vast)\b|рекламн.{0,12}(платформ|технолог)"),
+        ("ai_llm_infra", r"\b(llm|ai[- /]?infra|agentic|machine learning|ml[ -]?platform|mlops)\b|искусственн.{0,8}интеллект|машинн.{0,8}обучен"),
+        ("platform_infra", r"\b(platform|infrastructure|infra|devops|sre|kubernetes|k8s|cloud|terraform)\b|платформ|инфраструктур"),
+        ("highload_backend", r"\b(high.?load|distributed|golang|go|scala|backend)\b|бэкенд|бекенд|распредел|высоконагруж"),
+    ]
+    for label, pattern in rules:
+        if re.search(pattern, text, re.I): return label
+    if re.search(r"\b(head|lead|manager|director|vp|cto)\b|руковод|тимлид|начальник", title, re.I):
+        return "generic_management"
+    return "other_unknown"
+
+
+def seniority(title):
+    t = title.lower()
+    for label, pattern in [
+        ("director_plus", r"\b(vp|vice president|director|cto|chief)\b|директор"),
+        ("head_manager", r"\bhead\b|руководител|начальник"),
+        ("lead", r"\b(team.?lead|tech.?lead|lead)\b|тимлид|ведущ"),
+        ("staff_principal", r"\b(principal|staff|architect)\b|архитектор"),
+        ("senior", r"\bsenior\b|старш"),
+        ("junior", r"\b(junior|intern)\b|стаж|младш|начинающ"),
+        ("manager_ambiguous", r"\bmanager\b|менеджер"),
+    ]:
+        if re.search(pattern, t, re.I): return label
+    return "unspecified"
+
+
+def counter(rows, fn):
+    out = {}
+    for row in rows:
+        key = fn(row)
+        out[key] = out.get(key, 0) + 1
+    return dict(sorted(out.items(), key=lambda x: (-x[1], x[0])))
+
+
+def semantic(rows):
+    terms = {
+        "go_golang": r"\b(?:go|golang)\b", "ai_llm_ml": r"\b(?:ai|llm|ml)\b|machine learning|машинн.{0,8}обучен|искусственн.{0,8}интеллект",
+        "platform_infra_cloud": r"platform|infra|cloud|платформ|инфраструктур|облак", "backend": r"backend|back-end|бэкенд|бекенд",
+        "product": r"\bproduct\b|продукт", "data": r"\bdata\b|данн", "security": r"security|безопасност",
+        "architecture": r"architect|архитект", "devops_sre": r"\bdevops\b|\bsre\b", "adtech_rtb_dsp": r"adtech|\brtb\b|\bdsp\b|рекламн",
+    }
+    return {k: sum(bool(re.search(p, r.get("role", ""), re.I)) for r in rows) for k, p in terms.items()}
+
+
+def build(mode):
+    required = [BOARD, JOB / "sent-log.tsv", JOB / "schedule.tsv", JOB / "questions.tsv", JOB / "chatwatch-state.json", MAIL]
+    for path in required:
+        if not path.is_file(): raise ValueError("missing input: %s" % path)
+    board = read_tsv(BOARD)
+    expected = {"date", "company", "role", "link", "state", "note", "reason"}
+    if not board or not expected.issubset(board[0]): raise ValueError("board schema missing columns")
+    links = [r["link"] for r in board]
+    if not all(links) or len(set(links)) != len(links): raise ValueError("board role links are blank or duplicated")
+    sent = read_tsv(JOB / "sent-log.tsv", False)
+    sent_ids = {r[1] for r in sent if len(r) >= 2}
+    by_hh = {}
+    for row in board:
+        m = re.search(r"hh\.ru/vacancy/(\d+)", row["link"])
+        if m: by_hh[m.group(1)] = row
+    joined = [by_hh[x] for x in sent_ids if x in by_hh]
+    schedule = read_tsv(JOB / "schedule.tsv")
+    confirmed = sum(r.get("state") == "confirmed" and bool(r.get("participants") or r.get("contact")) and bool(r.get("link") or r.get("place") or r.get("channel")) and bool(r.get("source") or r.get("note")) for r in schedule)
+    questions = [r for r in read_tsv(JOB / "questions.tsv") if r.get("origin", "").startswith("hh:")]
+    with (JOB / "chatwatch-state.json").open(encoding="utf-8") as f: chats = json.load(f)
+    if not isinstance(chats, dict): raise ValueError("chatwatch state is not an object")
+    previews = [v.get("preview", "") for v in chats.values() if isinstance(v, dict)]
+    unknown_previews = sum(not re.search(r"Vacancy application|Отклик на вакансию\s*$|\b(Draft|Черновик)\s*:", p) for p in previews)
+    mail_rows = read_tsv(MAIL, False)
+    unique_mail = {r[1]: r for r in mail_rows if len(r) >= 8}
+    inputs = {}
+    for key, path in zip(("board", "sent_log", "schedule", "questions", "chatwatch_state", "mail_log"), required):
+        inputs[key] = {"path": str(path), "sha256": digest(path), "mtime": dt.datetime.fromtimestamp(path.stat().st_mtime, dt.timezone.utc).isoformat().replace("+00:00", "Z")}
+    inputs["board"]["rows"] = len(board)
+    return {
+        "observed_at": iso_now(), "parser_version": VERSION, "mode": mode,
+        "claim": "Board states are current endpoints, not historical conversions.",
+        "inputs": inputs,
+        "identity": {"unique_links": len(set(links)), "duplicate_links": len(links)-len(set(links))},
+        "supply": {"domain": counter(board, domain), "seniority": counter(board, lambda r: seniority(r["role"])), "source": counter(board, lambda r: source(r["link"])), "title_semantics": semantic(board)},
+        "submissions": {"logged": len(sent_ids), "joined": len(joined), "unjoined": len(sent_ids)-len(joined), "current_endpoints": counter(joined, lambda r: r["state"]), "domain": counter(joined, domain)},
+        "calendar": {"rows": len(schedule), "confirmed": confirmed},
+        "chat": {"questions": len(questions), "question_vacancies": len({r["origin"] for r in questions}), "state_rows": len(chats), "previews_unknown_author": unknown_previews, "unique_mail_messages": len(unique_mail)},
+    }
+
+
+def markdown(data):
+    return "\n".join([
+        "# Job-market snapshot %s" % data["observed_at"], "",
+        "This report treats board states as **current endpoints, not historical conversions**.", "",
+        "- Captured roles: %d unique links" % data["identity"]["unique_links"],
+        "- Durable submissions: %d logged; %d joined" % (data["submissions"]["logged"], data["submissions"]["joined"]),
+        "- Confirmed calendar interviews: %d" % data["calendar"]["confirmed"],
+        "- hh questionnaire evidence: %d questions across %d vacancies" % (data["chat"]["questions"], data["chat"]["question_vacancies"]),
+        "- hh chat previews with unknown authorship: %d" % data["chat"]["previews_unknown_author"], "",
+        "Current submission endpoints: `%s`" % json.dumps(data["submissions"]["current_endpoints"], ensure_ascii=False, sort_keys=True),
+        "", "Domain supply: `%s`" % json.dumps(data["supply"]["domain"], ensure_ascii=False, sort_keys=True), "",
+        "Input hashes, mtimes, parser version, and full aggregates are in `latest.json`.", "",
+    ])
+
+
+def atomic_write(path, text):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f: f.write(text)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp): os.unlink(tmp)
+
+
+def ledger(status, mode, run_id, detail):
+    OUT.mkdir(parents=True, exist_ok=True)
+    with (OUT / "runs.tsv").open("a", encoding="utf-8") as f:
+        f.write("%s\t%s\t%s\t%s\t%s\n" % (iso_now(), status, mode, run_id, detail.replace("\t", " ").replace("\n", " ")))
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    g = ap.add_mutually_exclusive_group()
+    g.add_argument("--daily", action="store_true"); g.add_argument("--weekly", action="store_true")
+    g.add_argument("--json", action="store_true"); g.add_argument("--test", action="store_true")
+    a = ap.parse_args(); mode = "weekly" if a.weekly else "daily"
+    run_id = iso_now().replace(":", "").replace("-", "")
+    try:
+        data = build(mode)
+        if a.test:
+            print("mesh-job-market-analysis --test: ok (real inputs readable; %d roles, %d sent joins)" % (data["identity"]["unique_links"], data["submissions"]["joined"]))
+            return 0
+        if a.json:
+            print(json.dumps(data, ensure_ascii=False, indent=2)); return 0
+        payload = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+        run_path = OUT / "runs" / (run_id + ".json")
+        atomic_write(run_path, payload)
+        atomic_write(OUT / "latest.json", payload)
+        atomic_write(OUT / "latest.md", markdown(data))
+        ledger("success", mode, run_id, "roles=%d sent=%d confirmed=%d" % (len(read_tsv(BOARD)), data["submissions"]["joined"], data["calendar"]["confirmed"]))
+        print(OUT / "latest.md")
+        return 0
+    except Exception as exc:
+        if not a.test: ledger("failure", mode, run_id, "%s: %s" % (type(exc).__name__, exc))
+        print("mesh-job-market-analysis: %s" % exc, file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
