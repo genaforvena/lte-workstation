@@ -48,6 +48,8 @@ sed -i '$d' "$td/board.tsv"
 env MESH_JOB_BOARD="$td/board.tsv" MESH_JOB_DIR="$td/job" MESH_JOB_MAIL_LOG="$td/mail.log" \
   MESH_JOB_ANALYSIS_DIR="$td/out" "$weekly" >/dev/null
 jq -e '.mode == "weekly"' "$td/out/latest.json" >/dev/null
+test "$(find "$td/out/runs" -type f -name '*-daily.json' | wc -l)" -ge 1
+test "$(find "$td/out/runs" -type f -name '*-weekly.json' | wc -l)" -ge 1
 env MESH_JOB_BOARD="$td/board.tsv" MESH_JOB_DIR="$td/job" MESH_JOB_MAIL_LOG="$td/mail.log" \
   MESH_JOB_ANALYSIS_DIR="$td/out" "$weekly" --test >/dev/null
 
