@@ -86,3 +86,19 @@ This newly discovered fix is not covered by the prior landing closure. Separate
 owner task `task:task-text-isolation-landing` was filed to genome at 05:48:07Z for
 the source line, regression, scoped commit/push and clean-commit verification.
 The overall goal remains open until that final fix is durable and verified.
+
+## Temporary dispatch pace override — 2026-09-08 05:55Z
+
+The operator requested that existing dispatcher pacing limits be suppressed.
+`MESH_DISPATCH_NO_PACE=1` is now set node-locally in restore.env. It bypasses
+only mesh-dispatch's final mesh-pace gate and its read-only pace probe; other
+paced lanes retain their normal limits. `test-mesh-dispatch-no-pace.py` first
+failed against the old gate, then passed for both paths. The installed dispatcher
+now resolves to source, with rollback copy at
+`~/.mesh/dispatch-deploy-backup.hEIs5a/mesh-dispatch`.
+
+This did not create an artificial worker: live staffing had health and pub as
+the only generic eligible windows, but both reported UNKNOWN, hence zero idle
+workers. The post-override pass reached owner-routing but no eligible idle target,
+so absence of a new dispatch is capacity-state evidence, not a remaining pace
+hold. The source/test must land with the open genome isolation task.
