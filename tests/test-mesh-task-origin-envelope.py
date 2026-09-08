@@ -102,6 +102,25 @@ def main():
         assert f"origin.source 'race:1' already exists in chain '{winner_name}' (status: open)" in loser.stderr
         replay = module.replay(log)
         assert sum(r['data'].get('origin', {}).get('source') == 'race:1' for r in replay.values()) == 1
+
+        # Priority is a canonical transition, not a cache edit: an owner may
+        # reprioritize its own step and the explicit coordinator may reprioritize
+        # any step, including future owners' steps.
+        priority_plan = tmp / 'priority.tsv'; priority_plan.write_text(
+            '\n'.join(f'{owner}\t{slug}\t{value}\t{slug} work'
+                      for owner, slug, value in (
+                          ('alpha', 'one', 0), ('beta', 'two', 0), ('gamma', 'three', 0))) + '\n')
+        run('create', 'priority-chain', str(priority_plan))
+        refused = run('reprioritize', 'priority-chain', 'one', '100', code=2,
+                      MESH_TASK_ACTOR='beta')
+        assert 'exact owner or coordinator required' in refused.stderr
+        run('reprioritize', 'priority-chain', 'one', '100', MESH_TASK_ACTOR='alpha')
+        run('reprioritize', 'priority-chain', 'two', '95', MESH_TASK_ACTOR='witness')
+        run('reprioritize', 'priority-chain', 'three', '90', MESH_TASK_ACTOR='witness')
+        priority_record = module.replay(log)['priority-chain']['data']
+        assert [step['priority'] for step in priority_record['steps']] == [100, 95, 90]
+        assert '[priority]' in board.read_text()
+        assert 'v1 r=' in log.read_text().split('[task-ledger]')[-1]
     print('PASS: origin envelope, refusal, duplicate status, legacy replay, and cache rebuild')
 
 
