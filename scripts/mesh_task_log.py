@@ -58,6 +58,14 @@ def validate_transition(previous: dict, candidate: dict) -> None:
                          or previous_step.get('status') in TERMINAL_STEP_STATUSES)
     candidate_terminal = (candidate_data.get('status') in TERMINAL_CHAIN_STATUSES
                           or candidate_step.get('status') in TERMINAL_STEP_STATUSES)
+    successor_recovery = (
+        previous_terminal
+        and candidate_data['current'] > previous_data['current']
+        and candidate_step.get('recovery_artifact')
+        and candidate_step.get('recovery_artifact_sha256')
+    )
+    if successor_recovery:
+        return
     if previous_terminal and not candidate_terminal:
         raise ReplayError('terminal task-state regression')
     if previous_terminal and _terminal_snapshot(previous) != _terminal_snapshot(candidate):
