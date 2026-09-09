@@ -163,6 +163,78 @@ def main() -> None:
         state = json.loads((mesh / "warning-tasks.state").read_text())
         assert state["created"][partial_key]["chain"] == partial_chain
 
+    # A recovered cursor must not replay an unbounded burst while Health has
+    # one running triage and one sent/open queued triage already occupying the
+    # admission bound.  The exact first source event remains unread until a
+    # slot frees, then only that event is admitted.
+    with tempfile.TemporaryDirectory() as raw:
+        td = Path(raw)
+        mesh = td / "mesh"
+        bindir = td / "bin"
+        mesh.mkdir()
+        bindir.mkdir()
+        task_cmd = bindir / "mesh-task"
+        task_cmd.write_text(
+            "#!/bin/sh\n"
+            "if [ \"$1\" = replay ] && [ \"$2\" = --json ]; then cat \"$REPLAY_FILE\"; exit 0; fi\n"
+            "printf '%s\\n' \"$@\" >> \"$TASK_CALLS\"\n"
+            "if [ \"$1\" = create ]; then\n"
+            "  chain=\"$2\"; shift 2; plan=\"$1\"; cat \"$plan\" >> \"$TASK_PLANS\"\n"
+            "  if [ \"$(grep -c '^create$' \"$TASK_CALLS\")\" -eq 1 ]; then\n"
+            "    printf '{\"%s\":{\"data\":{\"chain\":\"%s\",\"status\":\"open\",\"current\":0,\"dispatch\":\"sent\",\"steps\":[{\"status\":\"open\",\"owner\":\"health\"}]}}}\\n' \"$chain\" \"$chain\" > \"$REPLAY_FILE\"\n"
+            "  fi\n"
+            "fi\n"
+        )
+        task_cmd.chmod(0o755)
+        calls = td / "calls"
+        plans = td / "plans"
+        replay = td / "replay.json"
+        os.environ["TASK_CALLS"] = str(calls)
+        os.environ["TASK_PLANS"] = str(plans)
+        os.environ["REPLAY_FILE"] = str(replay)
+        os.environ.pop("EXISTING_CHAIN", None)
+        os.environ.pop("EXISTING_CHAIN_JSON", None)
+        os.environ.pop("PARTIAL_CREATE", None)
+        os.environ.pop("DISPATCH_SUCCESS_JSON", None)
+        chat = mesh / "chat.log"
+        warnings = [
+            f"2026-09-08T11:00:0{i}Z health@mesh-home :: [health-warning] replay warning {i} UNKNOWN\n"
+            for i in range(3)
+        ]
+        chat.write_text("".join(warnings))
+
+        def chain_for(index: int) -> str:
+            body = f"[health-warning] replay warning {index} UNKNOWN"
+            key = "tagged:" + body.lower()
+            return "health-warning/" + hashlib.sha256(key.encode()).hexdigest()[:20]
+
+        occupied = {
+            "health-warning/running": {"data": {
+                "chain": "health-warning/running", "status": "open", "current": 0,
+                "dispatch": "sent", "steps": [{"status": "active", "owner": "health"}]},
+            },
+            "health-warning/queued": {"data": {
+                "chain": "health-warning/queued", "status": "open", "current": 0,
+                "dispatch": "sent", "steps": [{"status": "open", "owner": "health"}]},
+            },
+        }
+        replay.write_text(json.dumps(occupied))
+        blocked = run_watcher(mesh, task_cmd)
+        assert blocked.returncode == 0, blocked.stderr
+        assert not calls.exists() or calls.read_text() == "", calls.read_text() if calls.exists() else ""
+        state = json.loads((mesh / "warning-tasks.state").read_text())
+        assert state["offset"] == 0, state
+
+        replay.write_text("{}")
+        admitted = run_watcher(mesh, task_cmd)
+        assert admitted.returncode == 0, admitted.stderr
+        call_lines = calls.read_text().splitlines()
+        assert call_lines[:2] == ["create", chain_for(0)], call_lines
+        assert call_lines.count("create") == 1, call_lines
+        assert "replay warning 0" in plans.read_text()
+        state = json.loads((mesh / "warning-tasks.state").read_text())
+        assert state["offset"] == len(warnings[0].encode()), state
+
 
 if __name__ == "__main__":
     main()
