@@ -32,6 +32,38 @@ class ReplayError(ValueError):
     pass
 
 
+TERMINAL_STEP_STATUSES = {'done', 'ignored', 'rejected'}
+TERMINAL_CHAIN_STATUSES = {'complete', 'ignored', 'rejected'}
+TERMINAL_RECEIPT_FIELDS = ('artifact', 'artifact_sha256', 'finished', 'rejected', 'ignored')
+
+
+def _terminal_snapshot(record: dict) -> tuple:
+    data = record['data']
+    step = data['steps'][data['current']]
+    return (
+        data.get('status'),
+        step.get('id'),
+        step.get('status'),
+        tuple((field, data.get(field), step.get(field)) for field in TERMINAL_RECEIPT_FIELDS),
+    )
+
+
+def validate_transition(previous: dict, candidate: dict) -> None:
+    """Reject regressions and mutations after a task reaches a terminal state."""
+    previous_data = previous['data']
+    previous_step = previous_data['steps'][previous_data['current']]
+    candidate_data = candidate['data']
+    candidate_step = candidate_data['steps'][candidate_data['current']]
+    previous_terminal = (previous_data.get('status') in TERMINAL_CHAIN_STATUSES
+                         or previous_step.get('status') in TERMINAL_STEP_STATUSES)
+    candidate_terminal = (candidate_data.get('status') in TERMINAL_CHAIN_STATUSES
+                          or candidate_step.get('status') in TERMINAL_STEP_STATUSES)
+    if previous_terminal and not candidate_terminal:
+        raise ReplayError('terminal task-state regression')
+    if previous_terminal and _terminal_snapshot(previous) != _terminal_snapshot(candidate):
+        raise ReplayError('terminal task-state mutation')
+
+
 def replay_source(path: Path) -> dict[str, object]:
     """Consume every chat.log record line-by-line and return tamper-evident coverage.
 
@@ -453,7 +485,20 @@ def replay(path: Path) -> dict[str, dict]:
         ordered = sorted(revisions)
         if ordered != list(range(1, ordered[-1] + 1)):
             raise ReplayError(f'missing task-state revision for {chain}')
-        latest[chain] = revisions[ordered[-1]]
+        canonical = revisions[ordered[0]]
+        for revision in ordered[1:]:
+            candidate = revisions[revision]
+            try:
+                validate_transition(canonical, candidate)
+            except ReplayError as exc:
+                if str(exc) not in ('terminal task-state regression', 'terminal task-state mutation'):
+                    raise
+                # Historical chat is append-only. A bad postterminal record is
+                # quarantined, not rewritten, so unrelated chains remain usable
+                # and a later identical terminal receipt can restore the view.
+                continue
+            canonical = candidate
+        latest[chain] = canonical
     return latest
 
 
@@ -484,6 +529,8 @@ def append(root: Path, who: str, payload: str) -> None:
         expected = previous['revision'] + 1 if previous else 1
         if record['revision'] != expected:
             raise ReplayError(f'task-state revision conflict: expected {expected}')
+        if previous:
+            validate_transition(previous, record)
         prefix = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()) + '  ' + who + '  ::  '
         line = prefix + encode_readable(record['data'], record['revision']) + '\n'
         scrub = subprocess.run([sys.executable, str(Path(__file__).with_name('mesh-log-scrub'))],
