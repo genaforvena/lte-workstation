@@ -39,4 +39,22 @@ Observed verification:
 | isolated r1 DONE → r2 BLOCKED rebuild fixture | PASS; cache bytes preserved |
 | fresh append DONE → BLOCKED fixture | PASS; append rejected and bytes preserved |
 
-The deployed verification and source/deployed SHA-256 pairs are recorded after landing below.
+## Witness correction: successor recovery
+
+The first validator revision was too strict: it quarantined TinyFleet's legitimate transition
+from revision 7 (`REJECTED`, current `verify-ticket-extraction`) to revision 8 (`BLOCKED`, current
+`support-routing`) even though that successor carried `recovery_artifact` and
+`recovery_artifact_sha256`. The validator now permits that explicit artifact-backed advance to a
+different successor step, while still freezing mutations/regressions of the same terminal step.
+
+After correction, deployed replay returned TinyFleet revision 47 at
+`verify-redaction-assistance` (`open`/`open`); it no longer froze at r7. The live chain advanced
+during verification, so this is a current observation rather than a fixed expected revision.
+
+Final source/deployed parity:
+
+- `mesh_task_log.py`: `8dc0c39d9b2fd590368c4a00aa716cb77ea844c18debca306acfbdb417996788`
+- `mesh-task`: `2ad95bdd55de1932ac0c74e3ebc915e484e663561d8b1c0b1cabc49792dcf669`
+
+Final verification: `test-mesh-task-log.py` 20 tests PASS; `test-mesh-task-no-expiry.py` 12
+tests PASS; deployed `mesh-task --test` PASS; deployed live replay PASS.
