@@ -82,6 +82,145 @@ class ReplayTests(unittest.TestCase):
         self.path.write_text(second + first + second)
         self.assertEqual(log.replay(self.path)['plan']['data'], started)
 
+    def test_transition_rejects_done_step_replaced_by_blocked_revision(self):
+        done = copy.deepcopy(self.data)
+        done['status'] = done['steps'][0]['status'] = 'complete'
+        done['steps'][0].update(finished='2026-09-09T19:06:35Z', artifact='/receipt.md',
+                                artifact_sha256='abc123')
+        blocked = copy.deepcopy(done)
+        blocked['status'] = blocked['steps'][0]['status'] = 'blocked'
+        blocked['steps'][0].pop('finished')
+        blocked['steps'][0].pop('artifact')
+        blocked['steps'][0].pop('artifact_sha256')
+        with self.assertRaisesRegex(log.ReplayError, 'terminal task-state regression'):
+            log.validate_transition({'data': done}, {'data': blocked})
+
+    def test_replay_quarantines_historical_regression_and_keeps_restored_done(self):
+        done = copy.deepcopy(self.data)
+        done['status'] = done['steps'][0]['status'] = 'complete'
+        done['steps'][0].update(finished='2026-09-09T19:06:35Z', artifact='/receipt.md',
+                                artifact_sha256='abc123')
+        blocked = copy.deepcopy(done)
+        blocked['status'] = blocked['steps'][0]['status'] = 'blocked'
+        blocked['steps'][0].pop('finished')
+        blocked['steps'][0].pop('artifact')
+        blocked['steps'][0].pop('artifact_sha256')
+        self.path.write_text(self.event(done, 1) + self.event(blocked, 2) + self.event(done, 3))
+        self.assertEqual(log.replay(self.path)['plan']['data'], done)
+
+    def test_live_history_r15_r16_r17_quarantine_does_not_block_unrelated_append(self):
+        open_state = copy.deepcopy(self.data)
+        done = copy.deepcopy(open_state)
+        done['status'] = done['steps'][0]['status'] = 'complete'
+        done['steps'][0].update(finished='2026-09-09T19:06:35Z', artifact='/receipt.md',
+                                artifact_sha256='abc123')
+        blocked = copy.deepcopy(done)
+        blocked['status'] = blocked['steps'][0]['status'] = 'blocked'
+        blocked['steps'][0].pop('finished')
+        blocked['steps'][0].pop('artifact')
+        blocked['steps'][0].pop('artifact_sha256')
+        history = ''.join(self.event(open_state, revision) for revision in range(1, 15))
+        history += self.event(done, 15) + self.event(blocked, 16) + self.event(done, 17)
+        self.path.write_text(history)
+        self.assertEqual(log.replay(self.path)['plan']['revision'], 17)
+        unrelated = copy.deepcopy(open_state)
+        unrelated['chain'] = 'unrelated'
+        unrelated['steps'][0]['id'] = 'unrelated/first'
+        unrelated['steps'][1]['id'] = 'unrelated/check'
+        log.append(self.path.parent, 'alpha@node', log.encode(unrelated, 1).removeprefix(log.MARKER))
+        self.assertEqual(log.replay(self.path)['unrelated']['data'], unrelated)
+
+    def test_replay_allows_artifact_backed_recovery_to_a_different_successor_step(self):
+        rejected = copy.deepcopy(self.data)
+        rejected['status'] = rejected['steps'][0]['status'] = 'rejected'
+        rejected['steps'][0]['rejected'] = '2026-09-09T18:17:53Z'
+        rejected['steps'][0]['rejected_reason'] = 'dependency was not independently verified'
+        recovery = copy.deepcopy(rejected)
+        recovery['current'] = 1
+        recovery['status'] = recovery['steps'][1]['status'] = 'blocked'
+        recovery['steps'][1].update(
+            recovery_action='hold', recovery_artifact='/tmp/recovery.md',
+            recovery_artifact_sha256='abc123', recovered_from=rejected['steps'][0]['id'])
+        released = copy.deepcopy(recovery)
+        released['status'] = released['steps'][1]['status'] = 'open'
+        self.path.write_text(self.event(rejected, 1) + self.event(recovery, 2) + self.event(released, 3))
+        self.assertEqual(log.replay(self.path)['plan']['data'], released)
+
+    def test_replay_rejects_recovery_from_done_step(self):
+        done = copy.deepcopy(self.data)
+        done['status'] = done['steps'][0]['status'] = 'complete'
+        done['steps'][0].update(finished='2026-09-09T19:06:35Z', artifact='/receipt.md',
+                                artifact_sha256='abc123')
+        recovery = copy.deepcopy(done)
+        recovery['current'] = 1
+        recovery['status'] = recovery['steps'][1]['status'] = 'blocked'
+        recovery['steps'][1].update(
+            recovery_action='hold', recovery_artifact='/tmp/recovery.md',
+            recovery_artifact_sha256='abc123', recovered_from=done['steps'][0]['id'])
+        self.path.write_text(self.event(done, 1) + self.event(recovery, 2))
+        self.assertEqual(log.replay(self.path)['plan']['data'], done)
+
+    def test_replay_quarantines_recovery_that_changes_rejected_predecessor(self):
+        rejected = copy.deepcopy(self.data)
+        rejected['status'] = rejected['steps'][0]['status'] = 'rejected'
+        rejected['steps'][0]['rejected'] = '2026-09-09T18:17:53Z'
+        rejected['steps'][0]['rejected_reason'] = 'dependency was not independently verified'
+        recovery = copy.deepcopy(rejected)
+        recovery['current'] = 1
+        recovery['status'] = recovery['steps'][1]['status'] = 'blocked'
+        recovery['steps'][0]['rejected_reason'] = 'changed receipt'
+        recovery['steps'][1].update(
+            recovery_action='hold', recovery_artifact='/tmp/recovery.md',
+            recovery_artifact_sha256='abc123', recovered_from=rejected['steps'][0]['id'])
+        self.path.write_text(self.event(rejected, 1) + self.event(recovery, 2))
+        self.assertEqual(log.replay(self.path)['plan']['data'], rejected)
+
+    def test_append_refuses_post_done_block_without_writing_bytes(self):
+        done = copy.deepcopy(self.data)
+        done['status'] = done['steps'][0]['status'] = 'complete'
+        done['steps'][0].update(finished='2026-09-09T19:06:35Z', artifact='/receipt.md',
+                                artifact_sha256='abc123')
+        blocked = copy.deepcopy(done)
+        blocked['status'] = blocked['steps'][0]['status'] = 'blocked'
+        blocked['steps'][0].pop('finished')
+        blocked['steps'][0].pop('artifact')
+        blocked['steps'][0].pop('artifact_sha256')
+        log.append(self.path.parent, 'alpha@node', log.encode(done, 1).removeprefix(log.MARKER))
+        before = self.path.read_bytes()
+        with self.assertRaisesRegex(log.ReplayError, 'terminal task-state regression'):
+            log.append(self.path.parent, 'alpha@node', log.encode(blocked, 2).removeprefix(log.MARKER))
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_append_rejects_fresh_regression_but_allows_unrelated_chain(self):
+        done = copy.deepcopy(self.data)
+        done['status'] = done['steps'][0]['status'] = 'complete'
+        done['steps'][0].update(finished='2026-09-09T19:06:35Z', artifact='/receipt.md',
+                                artifact_sha256='abc123')
+        blocked = copy.deepcopy(done)
+        blocked['status'] = blocked['steps'][0]['status'] = 'blocked'
+        blocked['steps'][0].pop('finished')
+        blocked['steps'][0].pop('artifact')
+        blocked['steps'][0].pop('artifact_sha256')
+        log.append(self.path.parent, 'alpha@node', log.encode(done, 1).removeprefix(log.MARKER))
+        with self.assertRaisesRegex(log.ReplayError, 'terminal task-state regression'):
+            log.append(self.path.parent, 'alpha@node', log.encode(blocked, 2).removeprefix(log.MARKER))
+        other = copy.deepcopy(self.data)
+        other['chain'] = 'other'
+        other['steps'][0]['id'] = 'other/first'
+        other['steps'][1]['id'] = 'other/check'
+        log.append(self.path.parent, 'alpha@node', log.encode(other, 1).removeprefix(log.MARKER))
+        self.assertEqual(log.replay(self.path)['other']['data'], other)
+
+    def test_replay_rejects_terminal_receipt_mutation(self):
+        done = copy.deepcopy(self.data)
+        done['status'] = done['steps'][0]['status'] = 'complete'
+        done['steps'][0].update(finished='2026-09-09T19:06:35Z', artifact='/receipt.md',
+                                artifact_sha256='abc123')
+        mutated = copy.deepcopy(done)
+        mutated['steps'][0]['artifact_sha256'] = 'different'
+        self.path.write_text(self.event(done, 1) + self.event(mutated, 2))
+        self.assertEqual(log.replay(self.path)['plan']['data'], done)
+
     def test_gap_conflict_and_truncation_refused(self):
         first = self.event(self.data, 1)
         changed = copy.deepcopy(self.data)
