@@ -60,7 +60,7 @@ def validate_transition(previous: dict, candidate: dict) -> None:
                           or candidate_step.get('status') in TERMINAL_STEP_STATUSES)
     successor_recovery = (
         previous_step.get('status') == 'rejected'
-        and candidate_data['current'] > previous_data['current']
+        and candidate_data['current'] == previous_data['current'] + 1
         and candidate_step.get('recovery_action')
         and candidate_step.get('recovery_artifact')
         and candidate_step.get('recovery_artifact_sha256')
