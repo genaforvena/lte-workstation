@@ -6,7 +6,6 @@ import tempfile
 import unittest
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
 TASK = ROOT / "scripts" / "mesh-task"
 
@@ -17,9 +16,13 @@ class TaskNoExpiryTests(unittest.TestCase):
         root = Path(self.tmp.name)
         fake = root / "bin"
         fake.mkdir()
+        chat_log = root / "chat-events.log"
         for name in ("chat", "handoff"):
             tool = fake / name
-            tool.write_text("#!/bin/sh\nexit 0\n")
+            if name == "chat":
+                tool.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$*\" >> {chat_log}\nexit 0\n")
+            else:
+                tool.write_text("#!/bin/sh\nexit 0\n")
             tool.chmod(0o755)
         self.env = os.environ | {
             "MESH_DIR": str(root / "mesh"),
@@ -27,6 +30,7 @@ class TaskNoExpiryTests(unittest.TestCase):
             "MESH_TASK_CHAT_CMD": str(fake / "chat"),
             "MESH_TASK_HANDOFF_CMD": str(fake / "handoff"),
             "MESH_TASK_ACTOR": "alpha",
+            "MESH_TASK_CHAT_EVENTS": str(chat_log),
         }
         plan = root / "plan.tsv"
         plan.write_text("alpha\tinspect\tinspect the durable state\n")
@@ -52,6 +56,20 @@ class TaskNoExpiryTests(unittest.TestCase):
         self.assertIn("explicitly reject or complete", rejected.stderr)
         self.assertIn("no-expiry [active]", self.command("status", "no-expiry").stdout)
 
+    def test_expired_health_warning_dispatch_is_held_but_genuine_open_is_preserved(self):
+        root = Path(self.tmp.name)
+        health_plan = root / "health-warning.tsv"
+        health_plan.write_text("health\ttriage\thistorical bounded health warning\n")
+        genuine_plan = root / "genuine.tsv"
+        genuine_plan.write_text("alpha\tinspect\tgenuine open work\n")
+        self.env["MESH_TASK_LEASE_SECONDS"] = "-1"
+        self.command("create", "health-warning/expired", str(health_plan))
+        self.command("create", "genuine-open", str(genuine_plan))
+        self.env.pop("MESH_TASK_LEASE_SECONDS")
+        audit = self.command("audit").stdout
+        self.assertIn("HELD_EXPIRED\thealth\thealth-warning/expired/triage\tretry=next fresh health warning", audit)
+        self.assertIn("OPEN_UNOWNED\talpha\tgenuine-open/inspect", audit)
+
     def test_reject_requires_a_reason_and_is_the_only_non_done_terminal_path(self):
         rejected = self.command("reject", "no-expiry", "inspect", expect=2)
         self.assertIn("reject reason", rejected.stderr)
@@ -65,6 +83,51 @@ class TaskNoExpiryTests(unittest.TestCase):
         self.command("reject", "no-expiry", "inspect", "dependency will not be supplied")
         audit = self.command("audit").stdout
         self.assertIn("REJECTED\talpha\tno-expiry/inspect\treason=dependency will not be supplied", audit)
+
+    def test_blocked_task_is_visible_but_absent_from_dispatch_queue(self):
+        self.command("block", "no-expiry", "inspect", "dependency", "missing input", "after input")
+        audit = self.command("audit").stdout
+        self.assertIn("BLOCKED\talpha\tno-expiry/inspect\tdependency\tafter input", audit)
+        queue = self.command("queue", "--dispatch").stdout
+        self.assertFalse(any(line.split("\t", 2)[1] == "no-expiry/inspect"
+                             for line in queue.splitlines()))
+
+    def test_block_materializes_one_deduplicated_owner_unblock_task(self):
+        self.command("block", "no-expiry", "inspect", "dependency", "missing input", "after input")
+        other_plan = Path(self.tmp.name) / "other.tsv"
+        other_plan.write_text("alpha\tinspect\tinspect the same missing input\n")
+        self.command("create", "other", str(other_plan))
+        self.command("take", "other", "inspect")
+        self.command("block", "other", "inspect", "dependency", "missing input", "after input")
+
+        records = __import__("json").loads(self.command("replay", "--json").stdout)
+        unblock = [record["data"] for record in records.values()
+                   if record["data"].get("unblock_for") == "alpha|dependency|missing input|after input"]
+        self.assertEqual(len(unblock), 1, records)
+        self.assertEqual(unblock[0]["steps"][0]["owner"], "alpha")
+        self.assertEqual(unblock[0]["steps"][0]["status"], "open")
+        self.assertIn("no-expiry/inspect", unblock[0]["steps"][0]["description"])
+
+    def test_unblock_sweep_is_idempotent_for_existing_auto_task(self):
+        self.command("block", "no-expiry", "inspect", "dependency", "missing input", "after input")
+        sweep = self.command("unblock-sweep", "alpha")
+        self.assertIn("unblock-sweep owner=alpha created=0", sweep.stdout)
+
+    def test_operator_input_stays_parked_without_owner_resolver(self):
+        self.command("block", "no-expiry", "inspect", "operator-input", "csv-path", "event:csv-arrives")
+        records = __import__("json").loads(self.command("replay", "--json").stdout)
+        self.assertFalse(any(record["data"].get("unblock_for") for record in records.values()), records)
+        events = Path(self.env["MESH_TASK_CHAT_EVENTS"]).read_text()
+        self.assertIn("event:csv-arrives", events)
+        self.assertIn("parked", events)
+
+    def test_external_event_stays_parked_without_owner_resolver(self):
+        self.command("block", "no-expiry", "inspect", "external-event", "upstream webhook", "event:webhook")
+        records = __import__("json").loads(self.command("replay", "--json").stdout)
+        self.assertFalse(any(record["data"].get("unblock_for") for record in records.values()), records)
+        events = Path(self.env["MESH_TASK_CHAT_EVENTS"]).read_text()
+        self.assertIn("event:webhook", events)
+        self.assertIn("parked", events)
 
     def test_blocked_task_waits_in_queue_for_exact_prerequisite_then_redispatches(self):
         root = Path(self.tmp.name)

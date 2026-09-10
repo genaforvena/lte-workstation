@@ -1,5 +1,6 @@
 import copy
 import importlib.util
+from importlib.machinery import SourceFileLoader
 import json
 import tempfile
 import unittest
@@ -8,6 +9,10 @@ from pathlib import Path
 spec = importlib.util.spec_from_file_location('task_log', Path(__file__).resolve().parents[1] / 'scripts/mesh_task_log.py')
 log = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(log)
+scrub_path = Path(__file__).resolve().parents[1] / 'scripts/mesh-log-scrub'
+scrub_spec = importlib.util.spec_from_loader('log_scrub', SourceFileLoader('log_scrub', str(scrub_path)))
+scrub = importlib.util.module_from_spec(scrub_spec)
+scrub_spec.loader.exec_module(scrub)
 
 
 class ReplayTests(unittest.TestCase):
@@ -146,6 +151,57 @@ class ReplayTests(unittest.TestCase):
         self.path.write_text(self.event(rejected, 1) + self.event(recovery, 2) + self.event(released, 3))
         self.assertEqual(log.replay(self.path)['plan']['data'], released)
 
+    def test_tinyfleet_rejected_a02v_recovers_and_reaches_done(self):
+        data = dict(chain='tinyfleet-applications-20260908', current=0, status='open', steps=[
+            dict(id='tinyfleet-applications-20260908/verify-ticket-extraction',
+                 slug='verify-ticket-extraction', owner='vpn', status='open'),
+            dict(id='tinyfleet-applications-20260908/support-routing',
+                 slug='support-routing', owner='haunt', status='open'),
+        ])
+        rejected = copy.deepcopy(data)
+        rejected['status'] = rejected['steps'][0]['status'] = 'rejected'
+        rejected['steps'][0].update(
+            rejected='2026-09-09T18:17:53Z',
+            rejected_reason='A02-V environment prerequisite was not independently verified')
+        recovery = copy.deepcopy(rejected)
+        recovery['current'] = 1
+        recovery['status'] = recovery['steps'][1]['status'] = 'blocked'
+        recovery['steps'][1].update(
+            recovery_action='hold', recovery_artifact='/tiny-fleet/A02-verification.md',
+            recovery_artifact_sha256='a02-recovery-sha256',
+            recovered_from=rejected['steps'][0]['id'])
+        released = copy.deepcopy(recovery)
+        released['status'] = released['steps'][1]['status'] = 'open'
+        done = copy.deepcopy(released)
+        done['status'] = done['steps'][1]['status'] = 'complete'
+        done['steps'][1].update(
+            finished='2026-09-09T19:04:07Z', artifact='/tiny-fleet/A06-implementation.md',
+            artifact_sha256='a06-implementation-sha256')
+        history = ''.join(self.event(data, revision) for revision in range(1, 7))
+        history += ''.join(self.event(record, revision) for revision, record in enumerate(
+            (rejected, recovery, released, done), 7))
+        self.path.write_text(history)
+        result = log.replay(self.path)['tinyfleet-applications-20260908']
+        self.assertEqual(result['revision'], 10)
+        self.assertEqual(result['data']['current'], 1)
+        self.assertEqual(result['data']['steps'][1]['id'],
+                         'tinyfleet-applications-20260908/support-routing')
+        self.assertEqual(result['data']['steps'][1]['status'], 'complete')
+
+    def test_recovery_cannot_skip_a_successor_step(self):
+        rejected = copy.deepcopy(self.data)
+        rejected['status'] = rejected['steps'][0]['status'] = 'rejected'
+        rejected['steps'][0]['rejected_reason'] = 'dependency was not independently verified'
+        skipped = copy.deepcopy(rejected)
+        skipped['current'] = 2
+        skipped['steps'].append(dict(id='plan/finish', slug='finish', owner='gamma', status='blocked'))
+        skipped['status'] = skipped['steps'][2]['status'] = 'blocked'
+        skipped['steps'][2].update(
+            recovery_action='hold', recovery_artifact='/tmp/recovery.md',
+            recovery_artifact_sha256='abc123', recovered_from=rejected['steps'][0]['id'])
+        with self.assertRaisesRegex(log.ReplayError, 'terminal task-state'):
+            log.validate_transition({'data': rejected}, {'data': skipped})
+
     def test_replay_rejects_recovery_from_done_step(self):
         done = copy.deepcopy(self.data)
         done['status'] = done['steps'][0]['status'] = 'complete'
@@ -190,6 +246,25 @@ class ReplayTests(unittest.TestCase):
         with self.assertRaisesRegex(log.ReplayError, 'terminal task-state regression'):
             log.append(self.path.parent, 'alpha@node', log.encode(blocked, 2).removeprefix(log.MARKER))
         self.assertEqual(self.path.read_bytes(), before)
+
+    def test_owner_rejection_with_malformed_sha_receipt_survives_scrub_and_appends(self):
+        active = copy.deepcopy(self.data)
+        active['status'] = active['steps'][0]['status'] = 'active'
+        log.append(self.path.parent, 'vpn@node', log.encode(active, 1).removeprefix(log.MARKER))
+        rejected = copy.deepcopy(active)
+        rejected['status'] = rejected['steps'][0]['status'] = 'rejected'
+        digest = 'a' * 63
+        rejected['steps'][0].update(
+            rejected='2026-09-09T19:41:00Z',
+            rejected_reason=f'raw SHA-256 in receipt is malformed: {digest}')
+        encoded = log.encode(rejected, 2).removeprefix(log.MARKER)
+        self.assertIn(digest, scrub.sanitize(encoded))
+        self.assertNotIn(digest, scrub.sanitize(f'ordinary prose {digest}'))
+        log.append(self.path.parent, 'vpn@node', encoded)
+        result = log.replay(self.path)['plan']
+        self.assertEqual(result['data']['status'], 'rejected')
+        self.assertEqual(result['data']['steps'][0]['rejected_reason'],
+                         f'raw SHA-256 in receipt is malformed: {digest}')
 
     def test_append_rejects_fresh_regression_but_allows_unrelated_chain(self):
         done = copy.deepcopy(self.data)
