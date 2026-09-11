@@ -18,7 +18,7 @@ Implemented and deployed the successor correction for `live-driver-process-ident
 ## Deployment and live restoration
 
 `mesh-sync-tools --apply` completed; source and `~/.local/bin/mesh-consume-all` have identical
-SHA-256 `c2266ca6e0483073a0288e941ae1d25b884e8552d51fdcd9528aa31ffc76e19a`.
+SHA-256 `31d7a6be9e0429417d7cd39a90f901a9abea5a6e6cf7cb779379b36d571165f5`.
 
 After one plain deployed supervisor pass, the live exact-tuple audit found exactly one current
 process for each of the 15 eligible channels: genome, tg, senses, health, pub, discover, sound,
