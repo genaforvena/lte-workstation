@@ -1,0 +1,131 @@
+#!/usr/bin/env python3
+"""Capture one command as a byte-preserving, paged local observation receipt."""
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+from pathlib import Path
+import shlex
+import signal
+import subprocess
+import sys
+import time
+import uuid
+
+
+def now():
+    return dt.datetime.now(dt.timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def sha(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def atomic_write(path, data):
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_bytes(data)
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--store", required=True, type=Path)
+    ap.add_argument("--retain", type=int, default=32)
+    ap.add_argument("--page-bytes", type=int, default=65536)
+    ap.add_argument("--timeout", type=float, default=None)
+    ap.add_argument("--max-bytes", type=int, default=None,
+                    help="mark overflow when a stream exceeds this advisory bound; bytes are retained")
+    ap.add_argument("--label", default="observation")
+    ap.add_argument("command", nargs=argparse.REMAINDER)
+    args = ap.parse_args()
+    if args.command[:1] == ["--"]:
+        args.command = args.command[1:]
+    if not args.command:
+        ap.error("a command is required after --")
+    if args.retain < 1 or args.page_bytes < 1 or (args.max_bytes is not None and args.max_bytes < 1):
+        ap.error("retain, page-bytes, and max-bytes must be positive")
+
+    args.store.mkdir(parents=True, exist_ok=True)
+    ident = f"{dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    started = now()
+    timed_out = False
+    try:
+        proc = subprocess.Popen(args.command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                start_new_session=True)
+        try:
+            stdout, stderr = proc.communicate(timeout=args.timeout)
+            rc = proc.returncode
+        except subprocess.TimeoutExpired as exc:
+            timed_out = True
+            os.killpg(proc.pid, signal.SIGKILL)
+            stdout, stderr = proc.communicate()
+            rc = 124
+    except OSError as exc:
+        stdout, stderr, rc = b"", str(exc).encode(), 127
+    ended = now()
+
+    streams = {}
+    pages = []
+    for name, data in (("stdout", stdout), ("stderr", stderr)):
+        stream_name = f"{ident}.{name}"
+        atomic_write(args.store / stream_name, data)
+        chunks = [data[i:i + args.page_bytes] for i in range(0, len(data), args.page_bytes)]
+        if not chunks:
+            chunks = [b""]
+        for index, chunk in enumerate(chunks):
+            page_name = f"{ident}.{name}.p{index:05d}"
+            atomic_write(args.store / page_name, chunk)
+            pages.append({"stream": name, "index": index, "start": index * args.page_bytes,
+                          "end": index * args.page_bytes + len(chunk), "bytes": len(chunk),
+                          "path": page_name, "sha256": sha(chunk)})
+        overflow = args.max_bytes is not None and len(data) > args.max_bytes
+        streams[name] = {"path": stream_name, "bytes": len(data), "sha256": sha(data),
+                         "pages": len(chunks)}
+        streams[name]["overflow"] = overflow
+
+    status = "timeout" if timed_out else ("ok" if rc == 0 else "command-failed")
+    receipt = {
+        "handle": ident, "label": args.label, "command": args.command,
+        "command_display": shlex.join(args.command), "started_at": started, "ended_at": ended,
+        "rc": rc, "status": status, "failure": "timeout" if timed_out else (None if rc == 0 else "command-rc"),
+        "truncation": {"stdout": timed_out, "stderr": timed_out},
+        "overflow": {name: meta["overflow"] for name, meta in streams.items()},
+        "streams": streams, "pages": pages,
+        "retention": {"keep": args.retain, "pruned": [], "boundary": None},
+    }
+    receipt_path = args.store / f"{ident}.json"
+    atomic_write(receipt_path, (json.dumps(receipt, sort_keys=True, indent=2) + "\n").encode())
+
+    receipts = sorted(args.store.glob("*.json"), key=lambda p: p.name)
+    old = receipts[:-args.retain]
+    pruned = []
+    for old_receipt in old:
+        try:
+            old_data = json.loads(old_receipt.read_text())
+            names = [old_receipt.name]
+            names += [meta["path"] for meta in old_data.get("streams", {}).values()]
+            names += [page["path"] for page in old_data.get("pages", [])]
+            for name in names:
+                target = args.store / name
+                if target.exists():
+                    target.unlink()
+            pruned.append(old_receipt.name)
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"mesh-observation-handle: retention failure for {old_receipt}: {exc}", file=sys.stderr)
+    receipt["retention"]["pruned"] = pruned
+    receipt["retention"]["boundary"] = receipts[-min(args.retain, len(receipts))].name if receipts else None
+    atomic_write(receipt_path, (json.dumps(receipt, sort_keys=True, indent=2) + "\n").encode())
+    print(json.dumps(receipt, sort_keys=True))
+    return rc
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except BrokenPipeError:
+        raise SystemExit(74)
