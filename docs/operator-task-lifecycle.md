@@ -21,6 +21,14 @@ and owner context. `audit` distinguishes a live owner's `EXPIRED` lease from an 
 `ABANDONED` lease. Closure requires a file, stores its SHA-256, repeats the task and ask keys on the
 board, and is idempotent only for the same path and digest.
 
+Dependency blocks automatically materialize one `unblock/<owner>/<digest>/resolve` task. When its
+owner closes that resolver with an artifact-backed result containing the exact tokens
+`unblock=cleared event=<edge>`, `mesh-task done` resumes the one matching blocked parent and records
+the edge as `resume_event`; this is the recurring lifecycle path, not a witness-only repair. A
+resolver result without `unblock=cleared` is terminal evidence that the parent must remain blocked.
+The `mesh-task-unblock-sweep` reflex runs every five minutes to backfill missing resolver tasks; it
+never impersonates an owner or resumes a parent without the owner's cleared result.
+
 Case mapping:
 
 - adint device export: block with `operator-input`, name the CSV/path in `needs`, and resume on its
