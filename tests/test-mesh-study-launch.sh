@@ -28,4 +28,6 @@ grep -Fq -- '--gpu-wait-s' "$td/capture"
 grep -Fq '60' "$td/capture"
 grep -Fq -- '--gpu-min-free-mb' "$td/capture"
 grep -Fq '2048' "$td/capture"
+grep -Fq '"operator_required": false' "$td/study/runs/fleet-study-v1/autonomy-decision.json"
+grep -Fq '"registration_sha256":' "$td/study/runs/fleet-study-v1/autonomy-decision.json"
 echo 'study-launch-test: ok (frozen registration, bounded VRAM retry, durable heavy queue invocation)'
