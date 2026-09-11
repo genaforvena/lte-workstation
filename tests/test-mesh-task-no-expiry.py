@@ -113,6 +113,38 @@ class TaskNoExpiryTests(unittest.TestCase):
         sweep = self.command("unblock-sweep", "alpha")
         self.assertIn("unblock-sweep owner=alpha created=0", sweep.stdout)
 
+    def test_completed_resolver_resumes_parent_only_when_owner_marks_blocker_cleared(self):
+        self.command("block", "no-expiry", "inspect", "dependency", "missing input", "after input")
+        records = __import__("json").loads(self.command("replay", "--json").stdout)
+        resolver = next(record["data"] for record in records.values()
+                        if record["data"].get("unblock_for") ==
+                        "alpha|dependency|missing input|after input")
+        resolver_chain = resolver["chain"]
+        self.command("take", resolver_chain, "resolve")
+        artifact = Path(self.tmp.name) / "cleared.md"
+        artifact.write_text("missing input is now available\n")
+        settled = self.command("done", resolver_chain, "resolve", str(artifact),
+                               "unblock=cleared event=dependency-arrived")
+        self.assertIn("complete " + resolver_chain, settled.stdout)
+        parent = self.command("status", "no-expiry").stdout
+        self.assertIn("no-expiry [active]", parent)
+        self.assertIn('"resume_event": "dependency-arrived"', self.command("replay", "--json").stdout)
+
+    def test_completed_resolver_without_cleared_marker_leaves_parent_blocked(self):
+        self.command("block", "no-expiry", "inspect", "dependency", "missing input", "after input")
+        records = __import__("json").loads(self.command("replay", "--json").stdout)
+        resolver = next(record["data"] for record in records.values()
+                        if record["data"].get("unblock_for") ==
+                        "alpha|dependency|missing input|after input")
+        resolver_chain = resolver["chain"]
+        self.command("take", resolver_chain, "resolve")
+        artifact = Path(self.tmp.name) / "still-blocked.md"
+        artifact.write_text("the dependency is still absent\n")
+        self.command("done", resolver_chain, "resolve", str(artifact),
+                     "unblock=blocked reason=dependency-still-absent")
+        parent = self.command("status", "no-expiry").stdout
+        self.assertIn("no-expiry [blocked]", parent)
+
     def test_operator_input_stays_parked_without_owner_resolver(self):
         self.command("block", "no-expiry", "inspect", "operator-input", "csv-path", "event:csv-arrives")
         records = __import__("json").loads(self.command("replay", "--json").stdout)
