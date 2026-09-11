@@ -2,6 +2,7 @@
 # mesh-heavy-run — the ONE admission-controlled entry point for a MEMORY-HEAVY job.
 #
 #   mesh-heavy-run <budget-mb> -- <cmd> [args...]     # run <cmd> niced + serialized + admission-gated
+#   mesh-heavy-run --drain                         # retry queued jobs when resources recover
 #   mesh-heavy-run --test
 #
 # WHY (chat-review/heavy-job-admission, 2026-07-05): mesh-whisper-run solved ONE heavy binary
@@ -12,8 +13,8 @@
 #   (b) holds a SHARED flock so heavy jobs serialize instead of stacking RAM, and
 #   (c) PRE-FLIGHT gates admission: the declared budget must fit in MemAvailable+SwapFree AND the node
 #       must not already be under resource-guard NODE-PRESSURE. If it can't be admitted it DEFERS
-#       (polls) then REFUSES with EX_TEMPFAIL (75) — the caller decides to skip or retry — rather than
-#       launching into a swap-exhaustion OOM.
+#       (polls) then REFUSES with EX_TEMPFAIL (75) — the invocation is durably queued for a later
+#       drain, rather than treating temporary scarcity as impossible or launching into an OOM.
 # The NODE-PRESSURE verdict is REUSED from mesh-resource-guard (its --status prints "NODE-PRESSURE:"
 # when hot) — the classifier/thresholds are NOT forked here, only consulted.
 #
@@ -28,6 +29,11 @@ ADMIT_WAIT="${MESH_HEAVY_ADMIT_WAIT:-120}"   # sec to poll for admission (mem/pr
 ADMIT_STEP="${MESH_HEAVY_ADMIT_STEP:-5}"     # poll interval while deferring
 FORCE="${MESH_HEAVY_FORCE:-0}"               # 1 = bypass the admission gate (still niced + serialized)
 MEMINFO="${MESH_HEAVY_MEMINFO:-/proc/meminfo}"
+QUEUE_DIR="${MESH_HEAVY_QUEUE_DIR:-$MESH/heavy-queue}"
+QUEUE_LOCK="${MESH_HEAVY_QUEUE_LOCK:-$MESH/.heavy-queue.lock}"
+QUEUE_MAX_FAILURES="${MESH_HEAVY_QUEUE_MAX_FAILURES:-3}"
+GPU_MIN_FREE_MB="${MESH_HEAVY_GPU_MIN_FREE_MB:-0}"
+GPU_SMI="${MESH_HEAVY_GPU_SMI:-nvidia-smi}"
 # read-only node-pressure probe; overridable so --test can inject a hot/clear verdict without real load
 NODEPRESSURE_CMD="${MESH_HEAVY_NODEPRESSURE_CMD:-mesh-resource-guard --status}"
 
@@ -62,6 +68,14 @@ node_clear() {
   local out
   out="$($NODEPRESSURE_CMD 2>/dev/null)" || out=""
   printf '%s\n' "$out" | grep -qE '^NODE-(PRESSURE|ACCELERATING):' && return 1
+  if [ "$GPU_MIN_FREE_MB" -gt 0 ] 2>/dev/null; then
+    local free
+    free="$($GPU_SMI --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d '[:space:]')"
+    case "$free" in
+      ''|*[!0-9]*) echo "mesh-heavy-run: GPU headroom unknown (smi=$GPU_SMI); deferring" >&2; return 1 ;;
+      *) [ "$free" -ge "$GPU_MIN_FREE_MB" ] || { echo "mesh-heavy-run: GPU headroom ${free}MB < required ${GPU_MIN_FREE_MB}MB; deferring" >&2; return 1; } ;;
+    esac
+  fi
   return 0
 }
 # admitted when the declared budget fits headroom AND the node is not already pressured
@@ -86,6 +100,65 @@ admit_gate() { # $1 = budget MB
     sleep "$ADMIT_STEP"; waited=$((waited + ADMIT_STEP))
   done
   return 0
+}
+
+queue_job() { # $1=budget, remaining argv; atomic + content-addressed deduplication
+  local budget="$1"; shift
+  local key tmp job; mkdir -p "$QUEUE_DIR" 2>/dev/null || return 0
+  key="$(printf '%s\n' "$PWD" "$budget" "$@" | sha256sum | cut -c1-32)"
+  job="$QUEUE_DIR/$key.job"
+  [ -e "$job" ] && { echo "mesh-heavy-run: already queued $job" >&2; return 0; }
+  tmp="$QUEUE_DIR/.${key}.$$.$RANDOM.tmp"
+  {
+    printf 'budget=%q\ncwd=%q\ngpu_min_free_mb=%q\ngpu_smi=%q\nqueued_at=%q\nheadroom_mb=%q\n' \
+      "$budget" "$PWD" "$GPU_MIN_FREE_MB" "$GPU_SMI" "$(date -u +%FT%TZ)" "$(read_headroom_mb)"
+    printf 'argv=('; printf ' %q' "$@"; printf ')\n'
+  } > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 0; }
+  mv -n "$tmp" "$job" 2>/dev/null || rm -f "$tmp"
+  echo "mesh-heavy-run: deferred and queued for resource recovery: $job" >&2
+}
+
+drain_queue() {
+  mkdir -p "$QUEUE_DIR" 2>/dev/null || { echo "mesh-heavy-run: cannot create queue $QUEUE_DIR" >&2; return 1; }
+  exec 8>"$QUEUE_LOCK" 2>/dev/null || { echo "mesh-heavy-run: cannot lock queue" >&2; return 1; }
+  flock -n 8 2>/dev/null || { echo "mesh-heavy-run: queue drain already active"; return 0; }
+  local job run rc budget cwd gpu_min_free_mb gpu_smi failures; local n=0
+  while IFS= read -r job; do
+    [ -r "$job" ] || continue
+    run="${job%.job}.running"
+    mv "$job" "$run" 2>/dev/null || continue
+    unset budget cwd gpu_min_free_mb gpu_smi argv
+    # Queue files are created by this script and contain shell-quoted argv only.
+    # shellcheck disable=SC1090
+    . "$run"
+    if [ -z "${budget:-}" ] || [ -z "${cwd:-}" ] || ! [ -d "$cwd" ] || [ "${#argv[@]}" -lt 1 ]; then
+      printf '# quarantined_at=%s reason=malformed-or-missing-cwd\n' "$(date -u +%FT%TZ)" >> "$run"
+      mv "$run" "${run%.running}.invalid" 2>/dev/null || true
+      echo "mesh-heavy-run: quarantined malformed queued job: $run" >&2
+      continue
+    fi
+    echo "mesh-heavy-run: retrying queued job budget=${budget} headroom=$(read_headroom_mb)MB: $run"
+    ( cd "$cwd" && MESH_HEAVY_QUEUE_DISABLED=1 MESH_HEAVY_GPU_MIN_FREE_MB="${gpu_min_free_mb:-0}" \
+      MESH_HEAVY_GPU_SMI="${gpu_smi:-nvidia-smi}" "$0" "$budget" -- "${argv[@]}" ); rc=$?
+    if [ "$rc" = 0 ]; then
+      rm -f "$run"; n=$((n+1)); echo "mesh-heavy-run: drained queued job"
+    else
+      failures="$(grep -c '^# last_attempt=' "$run" 2>/dev/null || true)"
+      printf '# last_attempt=%s rc=%s headroom_mb=%s\n' "$(date -u +%FT%TZ)" "$rc" "$(read_headroom_mb)" >> "$run"
+      if [ "$rc" = "$EX_TEMPFAIL" ]; then
+        mv "$run" "${run%.running}.job" 2>/dev/null || true
+        echo "mesh-heavy-run: still resource-deferred; retained queued job" >&2
+      elif [ "$failures" -ge "$QUEUE_MAX_FAILURES" ]; then
+        printf '# quarantined_at=%s reason=non-resource-failure rc=%s\n' "$(date -u +%FT%TZ)" "$rc" >> "$run"
+        mv "$run" "${run%.running}.failed" 2>/dev/null || true
+        echo "mesh-heavy-run: quarantined queued job after $((failures+1)) non-resource failures: $run" >&2
+      else
+        mv "$run" "${run%.running}.job" 2>/dev/null || true
+        echo "mesh-heavy-run: queued job retained after rc=$rc" >&2
+      fi
+    fi
+  done < <(find "$QUEUE_DIR" -maxdepth 1 -type f -name '*.job' -print 2>/dev/null | sort)
+  echo "mesh-heavy-run: drained=$n queued_remaining=$(find "$QUEUE_DIR" -maxdepth 1 -type f -name '*.job' 2>/dev/null | wc -l)"
 }
 
 nice_prefix() {
@@ -189,6 +262,10 @@ mem_cap_available() {
 # cgroup vs ulimit-fallback assertions; a caller may use it to decide whether to trust the cap.
 [ "${1:-}" = --capcheck ] && { mem_cap_available; exit $?; }
 
+if [ "${1:-}" = --drain ]; then
+  drain_queue; exit $?
+fi
+
 # --admit <budget-mb>: run ONLY the admission gate (defer-poll then refuse), no serialization/exec.
 # For heavy callers that keep their OWN serialization lock but delegate the memory/pressure decision
 # to this single source of truth (mesh-whisper-run's whisper-gate fold, chat-review/whisper-run-fold-heavy-gate).
@@ -236,6 +313,37 @@ if [ "${1:-}" = --test ]; then
   env $_base MESH_HEAVY_MEMINFO="$_tight" MESH_HEAVY_NODEPRESSURE_CMD="$_clear" "$0" 2000 -- touch "$_marker" >/dev/null 2>&1
   { [ "$?" = "$EX_TEMPFAIL" ] && [ ! -e "$_marker" ]; } \
     || { echo "smoke-test: FAIL (over-budget must refuse EX_TEMPFAIL 75 and NOT run the command)"; exit 1; }
+
+  # 3a) TRANSIENT RESOURCE QUEUE: refusal must leave a durable retry, and drain must run it after
+  #    capacity returns. This is the resource contract: busy now is not impossible.
+  _q="$_td/queue"; _qmarker="$_td/queued-ran"; rm -rf "$_q"; rm -f "$_qmarker"
+  env $_base MESH_HEAVY_QUEUE_DIR="$_q" MESH_HEAVY_MEMINFO="$_tight" MESH_HEAVY_NODEPRESSURE_CMD="$_clear" \
+    "$0" 2000 -- touch "$_qmarker" >/dev/null 2>&1
+  { [ "$?" = "$EX_TEMPFAIL" ] && [ "$(find "$_q" -type f -name '*.job' 2>/dev/null | wc -l)" -eq 1 ] && grep -q '^cwd=' "$(find "$_q" -type f -name '*.job' -print -quit)" && [ ! -e "$_qmarker" ]; } \
+    || { echo "smoke-test: FAIL (transient refusal was not durably queued)"; exit 1; }
+  env $_base MESH_HEAVY_QUEUE_DIR="$_q" MESH_HEAVY_MEMINFO="$_ample" MESH_HEAVY_NODEPRESSURE_CMD="$_clear" \
+    "$0" --drain >/dev/null 2>&1
+  { [ "$?" = 0 ] && [ -e "$_qmarker" ] && [ "$(find "$_q" -type f -name '*.job' 2>/dev/null | wc -l)" -eq 0 ]; } \
+    || { echo "smoke-test: FAIL (queued job was not drained after capacity returned)"; exit 1; }
+  printf 'budget=500\nargv=( true )\n' > "$_q/malformed.job"
+  env $_base MESH_HEAVY_QUEUE_DIR="$_q" MESH_HEAVY_MEMINFO="$_ample" MESH_HEAVY_NODEPRESSURE_CMD="$_clear" \
+    "$0" --drain >/dev/null 2>&1
+  [ "$(find "$_q" -type f -name '*.invalid' 2>/dev/null | wc -l)" -eq 1 ] \
+    || { echo "smoke-test: FAIL (malformed queue entry was not quarantined)"; exit 1; }
+
+  # 3c) GPU RESOURCE QUEUE: a declared GPU-free requirement defers while the device is busy and
+  #    drains once free memory returns; the queue persists the GPU probe settings.
+  _gpu_marker="$_td/gpu-ran"; _gpu_smi="$_td/nvidia-smi"; rm -f "$_gpu_marker"
+  printf '#!/bin/sh\nprintf 100\n' > "$_gpu_smi"; chmod +x "$_gpu_smi"
+  env $_base MESH_HEAVY_QUEUE_DIR="$_q" MESH_HEAVY_MEMINFO="$_ample" MESH_HEAVY_NODEPRESSURE_CMD="$_clear" \
+    MESH_HEAVY_GPU_MIN_FREE_MB=200 MESH_HEAVY_GPU_SMI="$_gpu_smi" "$0" 500 -- touch "$_gpu_marker" >/dev/null 2>&1
+  { [ "$?" = "$EX_TEMPFAIL" ] && [ "$(find "$_q" -type f -name '*.job' 2>/dev/null | wc -l)" -eq 1 ] && [ ! -e "$_gpu_marker" ]; } \
+    || { echo "smoke-test: FAIL (busy GPU requirement was not queued)"; exit 1; }
+  printf '#!/bin/sh\nprintf 300\n' > "$_gpu_smi"
+  env $_base MESH_HEAVY_QUEUE_DIR="$_q" MESH_HEAVY_MEMINFO="$_ample" MESH_HEAVY_NODEPRESSURE_CMD="$_clear" \
+    "$0" --drain >/dev/null 2>&1
+  { [ "$?" = 0 ] && [ -e "$_gpu_marker" ]; } \
+    || { echo "smoke-test: FAIL (GPU-queued job was not drained after GPU recovery)"; exit 1; }
 
   # 3b) BUDGET GATE — ADMIT: budget 2000MB <= 9.7GB ample headroom, node clear → runs.
   rm -f "$_marker"
@@ -394,8 +502,14 @@ case "$budget" in ''|*[!0-9]*) echo "usage: mesh-heavy-run <budget-mb> -- <cmd> 
 shift 2
 [ "$#" -ge 1 ] || { echo "usage: mesh-heavy-run <budget-mb> -- <cmd> [args...]" >&2; exit "$EX_USAGE"; }
 
-# ---- admission: defer-poll then refuse (unless forced) — single source of truth ----
-admit_gate "$budget" || exit "$?"
+# ---- admission: defer-poll then queue/refuse (unless forced) — single source of truth ----
+admit_gate "$budget"; rc=$?
+if [ "$rc" -ne 0 ]; then
+  if [ "$rc" = "$EX_TEMPFAIL" ] && [ "${MESH_HEAVY_QUEUE_DISABLED:-0}" != 1 ]; then
+    queue_job "$budget" "$@"
+  fi
+  exit "$rc"
+fi
 
 # ---- serialize + renice, then run under a per-job memory ceiling ----
 nice_prefix
