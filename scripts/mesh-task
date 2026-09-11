@@ -35,7 +35,6 @@ SAFE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,119}$")
 TASK_METADATA_KEYS = ("repository", "scope", "artifact_root", "revision", "next_command",
                       "tags", "design_artifact")
 DEFAULT_PRIORITY = 0
-PARKED_BLOCKER_TYPES = {"operator-input", "external-event"}
 _records = None
 
 
@@ -630,12 +629,11 @@ def block(chain: str, ref: str, reason_type: str, needs: str, retry: str) -> Non
         die("blocked reason must be one of operator-input, external-event, dependency, capability, safety")
     if index != data["current"] or step["status"] != "active":
         die(f"step {step['id']} is not active; take it before blocking")
-    step.update(status="blocked", blocked=now(), blocker_type=reason_type, needs=needs, retry=retry)
+    epoch = int(step.get("block_epoch", 0)) + 1
+    step.update(status="blocked", blocked=now(), block_epoch=epoch, parent_chain=data["chain"],
+                blocker_type=reason_type, needs=needs, retry=retry)
     data["status"] = "blocked"
     require_emit("blocked", f"{step['id']}: reason={reason_type} needs={needs} retry={retry} ; task:{step['id']}, ask:{data.get('ask') or '-'}")
-    if reason_type in PARKED_BLOCKER_TYPES:
-        require_emit("fyi", f"{step['id']}: blocker={reason_type} remains parked; "
-                     f"awaiting event={retry}; no owner resolver dispatched")
     save(path, data)
     update_context(step["owner"], data["chain"], step)
     unblock_chain = ensure_unblock_task(data, step)
@@ -652,6 +650,8 @@ def unblock(chain: str, ref: str, event: str) -> None:
         die(f"step {step['id']} is not the blocked current step")
     require_owner(step)
     step.update(status="active", resumed=now(), resume_event=event, lease_until=future(), last_progress=now())
+    for key in ("blocked", "parent_chain", "blocker_type", "needs", "retry"):
+        step.pop(key, None)
     data["status"] = "active"
     require_emit("resume", f"{step['id']}: event={event} lease={step['lease_until']} ; task:{step['id']}, ask:{data.get('ask') or '-'}")
     save(path, data); update_context(step["owner"], data["chain"], step)
@@ -702,10 +702,21 @@ def release_waiters(completed_task: str) -> None:
         dispatch(waiting_path, waiting_data)
 
 
-def unblock_identity(owner: str, step: dict) -> str:
-    """Return the stable identity of one unresolved blocker for one owner."""
-    return "|".join((owner, step.get("blocker_type", "unknown"),
-                      step.get("needs", ""), step.get("retry", "")))
+def unblock_identity(owner: str, step: dict, parent_chain: str = "") -> str:
+    """Return the exact parent/blocker epoch identity.
+
+    The blocked timestamp is deliberately part of the key: two parents with
+    identical prose, and two blocker epochs on one parent, are different
+    obligations. This also makes old resolver records unable to mask a new
+    blocked epoch.
+    """
+    raw = "|".join((owner, step.get("parent_chain", "") or parent_chain, step.get("id", ""),
+                     str(step.get("block_epoch", "")), step.get("blocked", ""),
+                     step.get("blocker_type", "unknown"), step.get("needs", ""),
+                     step.get("retry", "")))
+    # Keep the ledger key short enough for mesh-log-scrub while retaining the
+    # full identity in resolver metadata below.
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
 
 
 def cleared_unblock_event(data: dict, step: dict) -> str | None:
@@ -735,7 +746,8 @@ def resume_cleared_parent(data: dict, step: dict) -> None:
             continue
         parent = steps[index]
         if (candidate.get("status") == "blocked" and parent.get("status") == "blocked"
-                and unblock_identity(parent.get("owner"), parent) == identity):
+                and unblock_identity(parent.get("owner"), parent, candidate.get("chain", "")) == identity
+                and data.get("unblock_parent") == candidate.get("chain")):
             parents.append((candidate["chain"], parent["id"]))
     if len(parents) != 1:
         emit("yield", f"{step['id']}: unblock=cleared but expected one blocked parent, found {len(parents)}")
@@ -745,19 +757,11 @@ def resume_cleared_parent(data: dict, step: dict) -> None:
 
 
 def ensure_unblock_task(data: dict, step: dict) -> str | None:
-    """Materialize one owner task that can resolve a blocked prerequisite.
-
-    Blocking is not a terminal state, but neither is it an actionable queue item.
-    The old behavior left the owner with only a dead-end [blocked] record and
-    relied on a human/witness to invent the prerequisite task.  Keep that
-    prerequisite creation deterministic and idempotent so repeated observations
-    cannot create a dispatch loop.
-    """
+    """Materialize one exact-owner task for every blocked parent epoch."""
     owner = step.get("owner")
-    if (not owner or data.get("chain", "").startswith("unblock/") or
-            step.get("blocker_type") in PARKED_BLOCKER_TYPES):
+    if not owner or data.get("chain", "").startswith("unblock/"):
         return None
-    identity = unblock_identity(owner, step)
+    identity = unblock_identity(owner, step, data.get("chain", ""))
     existing = [other for _, candidate in chain_states()
                 if candidate.get("unblock_for") == identity
                 for other in [candidate]]
@@ -771,12 +775,17 @@ def ensure_unblock_task(data: dict, step: dict) -> str | None:
                    f"reason={step.get('blocker_type', 'unknown')}; "
                    f"needs={step.get('needs', 'unspecified')}; "
                    f"retry={step.get('retry', 'unspecified')}. "
-                   f"Produce an artifact-backed result, then resume the original task "
-                   f"only if the prerequisite is actually satisfied.")
+                   f"Diagnose the blocker and create or implement the narrowest safe in-scope "
+                   f"prerequisite/fix first. Park or reject only with evidence that the required "
+                   f"authority or external state is irreducible. Produce an artifact-backed result, "
+                   f"then resume the original task only if the prerequisite is actually satisfied.")
     unblock_data = {
         "version": 2, "chain": chain, "ask": None, "created": now(),
         "status": "open", "current": 0, "dispatch": "pending",
         "unblock_for": identity,
+        "unblock_parent": data.get("chain", ""),
+        "unblock_step": step.get("id", ""),
+        "unblock_epoch": step.get("block_epoch", ""),
         "steps": [{"id": f"{chain}/resolve", "owner": owner, "slug": "resolve",
                     "description": description, "priority": 90, "status": "open"}],
     }
@@ -786,22 +795,23 @@ def ensure_unblock_task(data: dict, step: dict) -> str | None:
     return chain
 
 
-def unblock_sweep(owner: str) -> None:
-    """Backfill unblock tasks for blocked rows created before auto-materialization."""
-    check_name(owner, "owner")
+def unblock_sweep(owner: str | None = None) -> None:
+    """Backfill exact resolvers for all blocked owners, or one owner."""
+    if owner:
+        check_name(owner, "owner")
     created = []
     before = set(task_records())
     for _, data in list(chain_states()):
         if data.get("chain", "").startswith("unblock/"):
             continue
         for step in data.get("steps", []):
-            if step.get("owner") == owner and step.get("status") == "blocked":
+            if (not owner or step.get("owner") == owner) and step.get("status") == "blocked":
                 chain = ensure_unblock_task(data, step)
                 if chain and chain not in before and chain not in created:
                     created.append(chain)
     for chain in created:
         print(f"unblock-task {chain}")
-    print(f"unblock-sweep owner={owner} created={len(created)}")
+    print(f"unblock-sweep owner={owner or 'all'} created={len(created)}")
 
 
 def retry_dispatch(chain: str) -> None:
@@ -945,7 +955,8 @@ def status(chain: str) -> None:
               f" priority={priority_label(step)}" +
               (f" tags={step['tags']} design_artifact={step['design_artifact']}" if step.get("tags") or step.get("design_artifact") else "") +
               (f" lease={step['lease_until']}" if "lease_until" in step else "") +
-              (f" blocker={step['blocker_type']} retry={step['retry']}" if "blocker_type" in step else "") +
+              (f" blocker={step['blocker_type']} retry={step['retry']}"
+               if step.get("status") == "blocked" and "blocker_type" in step else "") +
               (f" artifact={step['artifact']}" if "artifact" in step else ""))
     if data.get("dispatch") in ("pending", "failed"):
         print(f"  dispatch={data['dispatch']} {data.get('dispatch_error', '')}")
@@ -1256,6 +1267,7 @@ def main(argv: list[str]) -> None:
             elif command == "reschedule" and len(argv) == 2: reschedule_chain(argv[1])
             elif command == "reschedule-task" and len(argv) == 2: reschedule_task(argv[1])
             elif command == "recover" and len(argv) >= 5: recover(argv[1], argv[2], argv[3], argv[4], " ".join(argv[5:]))
+            elif command == "unblock-sweep" and len(argv) == 1: unblock_sweep()
             elif command == "unblock-sweep" and len(argv) == 2: unblock_sweep(argv[1])
             elif command == "status" and len(argv) == 2: status(argv[1])
             elif command == "reconcile" and len(argv) == 2: reconcile(argv[1])
