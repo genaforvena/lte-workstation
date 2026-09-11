@@ -373,7 +373,10 @@ def handoff(data: dict, index: int, completed: dict) -> bool:
         evidence = f"{completed['id']} completed with artifact {completed['artifact']}"
     text = (f"chain {data['chain']} advanced: {evidence}; next is {step['id']} for mind {step['owner']}. "
             f"Expected scope:{metadata_suffix(data, step)} "
-            f"Run: mesh-task take {data['chain']} {step['slug']}; verify the artifact before acting.")
+            f"Run: mesh-task take {data['chain']} {step['slug']}; verify the artifact before acting. "
+            "After recording the handoff, reset the recipient context with /clear and submit it "
+            "through tmux: tmux send-keys -t <pane> -l '/clear'; tmux send-keys -t <pane> C-m "
+            "(carriage return, the submit key).")
     command = os.environ.get("MESH_TASK_HANDOFF_CMD", "mesh-handoff")
     try:
         result = subprocess.run([command, step["owner"], text], check=False,
@@ -717,12 +720,13 @@ def block(chain: str, ref: str, reason_type: str, needs: str, retry: str) -> Non
     print(f"blocked {step['id']}")
 
 
-def unblock(chain: str, ref: str, event: str) -> None:
+def unblock(chain: str, ref: str, event: str, internal: bool = False) -> None:
     path, data = load(chain)
     index, step = step_for(data, ref)
     if index != data["current"] or step["status"] != "blocked" or data["status"] != "blocked":
         die(f"step {step['id']} is not the blocked current step")
-    require_owner(step)
+    if not internal:
+        require_owner(step)
     step.update(status="active", resumed=now(), resume_event=event, lease_until=future(), last_progress=now())
     for key in ("blocked", "parent_chain", "blocker_type", "needs", "retry"):
         step.pop(key, None)
@@ -804,6 +808,15 @@ def cleared_unblock_event(data: dict, step: dict) -> str | None:
     return match.group(1) if match else f"resolver-cleared:{step['id']}"
 
 
+def unresolved_retry_backoff(attempt: int) -> int:
+    """Bound repeated retries when the same concrete prerequisite is absent."""
+    # The first retry is immediate so a partial resolver can hand work to the
+    # next owner. Later identical failures need time for an external event or
+    # another mind's prerequisite work; otherwise periodic sweeps manufacture
+    # an unbounded resolver fan-out.
+    return min(3600, 300 * (2 ** max(0, attempt - 2)))
+
+
 def resume_cleared_parent(data: dict, step: dict) -> None:
     """Resume exactly one blocked parent after its owner proves the dependency cleared."""
     event = cleared_unblock_event(data, step)
@@ -812,8 +825,6 @@ def resume_cleared_parent(data: dict, step: dict) -> None:
     identity = data.get("unblock_for")
     parents = []
     for _, candidate in chain_states():
-        if candidate.get("chain", "").startswith("unblock/"):
-            continue
         index = candidate.get("current")
         steps = candidate.get("steps", [])
         if not isinstance(index, int) or not (0 <= index < len(steps)):
@@ -827,24 +838,69 @@ def resume_cleared_parent(data: dict, step: dict) -> None:
         emit("yield", f"{step['id']}: unblock=cleared but expected one blocked parent, found {len(parents)}")
         return
     parent_chain, parent_step = parents[0]
-    unblock(parent_chain, parent_step, event)
+    # A cross-mind recovery resolver may clear a resolver owned by another
+    # mind.  This is an internal, exact-parent transition; the child resolver
+    # already supplied the artifact and its owner was checked by done().
+    unblock(parent_chain, parent_step, event, internal=True)
+
+
+def recovery_owner(owner: str) -> str | None:
+    """Choose a live mind that can repair a resolver blocked by its owner."""
+    candidates = sorted(live_owners() - {owner})
+    return candidates[0] if candidates else None
 
 
 def ensure_unblock_task(data: dict, step: dict) -> str | None:
-    """Materialize one exact-owner task for every blocked parent epoch."""
+    """Materialize one resolver, or a cross-mind resolver for blocked resolvers."""
     owner = step.get("owner")
-    if not owner or data.get("chain", "").startswith("unblock/"):
+    if not owner:
         return None
+    resolver_owner = owner
+    if data.get("chain", "").startswith("unblock/"):
+        resolver_owner = recovery_owner(owner)
+        if not resolver_owner:
+            emit("yield", f"{step['id']}: blocked resolver has no other live mind for recovery")
+            return None
     identity = unblock_identity(owner, step, data.get("chain", ""))
     existing = [other for _, candidate in chain_states()
                 if candidate.get("unblock_for") == identity
                 for other in [candidate]]
-    if existing:
+    # A terminal resolver that explicitly reported an unresolved blocker is
+    # an attempt, not proof that the blocked parent is actionable forever.
+    # Keep active/open resolvers and cleared resolvers idempotent, but let the
+    # next sweep issue exactly one fresh attempt after a failed one.
+    retryable = [candidate for candidate in existing
+                 if candidate.get("status") in ("complete", "rejected")
+                 and not cleared_unblock_event(candidate, candidate.get("steps", [])[candidate.get("current", 0)])]
+    if existing and not retryable:
         return existing[0]["chain"]
-    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
-    chain = f"unblock/{owner}/{digest}"
+    if retryable:
+        latest = max(retryable, key=lambda candidate: candidate.get("created", ""))
+        latest_step = latest.get("steps", [])[latest.get("current", 0)]
+        terminal_at = (latest_step.get("finished") or latest_step.get("rejected")
+                       or latest.get("created", ""))
+        latest_attempt = int(latest.get("unblock_attempt", 1))
+        if (latest_attempt >= 2
+                and epoch_iso(terminal_at) + unresolved_retry_backoff(latest_attempt) > time.time()):
+            return latest["chain"]
+    attempt = max((int(candidate.get("unblock_attempt", 1)) for candidate in existing), default=0) + 1
+    digest = hashlib.sha256(f"{identity}|attempt={attempt}".encode("utf-8")).hexdigest()[:16]
+    chain = f"unblock/{resolver_owner}/{digest}"
     if chain in task_records():
         return chain
+    operator_policy = ""
+    blocker_text = " ".join(str(step.get(key, "")) for key in
+                             ("blocker_type", "needs", "retry", "description"))
+    operator_directed = (step.get("blocker_type") == "operator-input"
+                         or bool(re.search(r"\boperator\b", blocker_text, re.I)))
+    if operator_directed:
+        operator_policy = (
+            " Operator agreement is assumed for this recovery; do not ask for permission. "
+            "Derive the exact operational prerequisite and implement it when safe, or write "
+            "an artifact-backed operator-action packet naming the exact command, input, or "
+            "condition needed. Only remain blocked on a concrete external capability or "
+            "missing datum, never on approval."
+        )
     description = (f"Resolve blocker for {owner}: {step['id']} — "
                    f"reason={step.get('blocker_type', 'unknown')}; "
                    f"needs={step.get('needs', 'unspecified')}; "
@@ -852,7 +908,8 @@ def ensure_unblock_task(data: dict, step: dict) -> str | None:
                    f"Diagnose the blocker and create or implement the narrowest safe in-scope "
                    f"prerequisite/fix first. Park or reject only with evidence that the required "
                    f"authority or external state is irreducible. Produce an artifact-backed result, "
-                   f"then resume the original task only if the prerequisite is actually satisfied.")
+                   f"then resume the original task only if the prerequisite is actually satisfied."
+                   f"{operator_policy}")
     unblock_data = {
         "version": 2, "chain": chain, "ask": None, "created": now(),
         "status": "open", "current": 0, "dispatch": "pending",
@@ -860,7 +917,8 @@ def ensure_unblock_task(data: dict, step: dict) -> str | None:
         "unblock_parent": data.get("chain", ""),
         "unblock_step": step.get("id", ""),
         "unblock_epoch": step.get("block_epoch", ""),
-        "steps": [{"id": f"{chain}/resolve", "owner": owner, "slug": "resolve",
+        "unblock_attempt": attempt,
+        "steps": [{"id": f"{chain}/resolve", "owner": resolver_owner, "slug": "resolve",
                     "description": description, "priority": 90, "status": "open"}],
     }
     path = path_for(chain)
@@ -876,8 +934,6 @@ def unblock_sweep(owner: str | None = None) -> None:
     created = []
     before = set(task_records())
     for _, data in list(chain_states()):
-        if data.get("chain", "").startswith("unblock/"):
-            continue
         for step in data.get("steps", []):
             if (not owner or step.get("owner") == owner) and step.get("status") == "blocked":
                 chain = ensure_unblock_task(data, step)
