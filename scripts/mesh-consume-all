@@ -65,11 +65,24 @@ channel_entries(){
   done < <(channel_windows)
 }
 
-# pid of the LOOP driver for channel $1 (anchored on "--interval" so a transient `--once` kick is NOT
+# pid(s) of LOOP drivers for channel $1 (anchored on "--interval" so a transient `--once` kick is NOT
 # mistaken for the persistent driver, and so this tool's own argv never self-matches).
-driver_pid(){ pgrep -f "mesh-pane-consume $1 --interval" 2>/dev/null | head -1; }
+driver_pids(){ pgrep -f "mesh-pane-consume $1 --interval" 2>/dev/null || true; }
+driver_pid(){ driver_pids "$1" | head -1; }
 
-# driver_state <desired-int> <desired-dst> <running-argv-or-empty> -> ABSENT|OK|STALE. Pure/testable.
+# Derive identity from the deployed executable and stamp it before exec. This is durable against
+# future edits because nobody needs to remember to bump a hand-maintained version string.
+deployed_driver_sha(){
+  local bin; bin="$(command -v mesh-pane-consume 2>/dev/null || true)"
+  [ -n "$bin" ] || return 1
+  sha256sum "$bin" | awk '{print $1}'
+}
+driver_loaded_sha(){
+  tr '\0' '\n' < "/proc/$1/environ" 2>/dev/null | sed -n 's/^MESH_PANE_CONSUME_LOADED_SHA=//p' | head -1
+}
+
+# driver_state <desired-int> <desired-dst> <running-argv-or-empty> [loaded-sha] [deployed-sha]
+# -> ABSENT|OK|STALE. Pure/testable. SHA args are optional for compatibility with old fixtures.
 # driver_pid anchors only on "<ch> --interval", so it is BLIND to BOTH the interval VALUE and --deliver:
 # a driver started with now-stale args satisfies the liveness check forever and never respawns with the
 # new flags (chat-review/consume-driver-pgrep-blind-to-deliver-arg — vpn>health reverted to plain vpn,
@@ -78,11 +91,13 @@ driver_pid(){ pgrep -f "mesh-pane-consume $1 --interval" 2>/dev/null | head -1; 
 # drift-detection). So compare the DESIRED (interval, dst) — dst empty = self-delivery, no --deliver —
 # against what is actually on the running argv; any mismatch is STALE and forces kill+respawn in ensure_one.
 driver_state(){
-  local wint="${1:-}" wdst="${2:-}" argv="${3:-}" hint="" hdst=""
+  local wint="${1:-}" wdst="${2:-}" argv="${3:-}" loaded="${4:-}" wanted="${5:-}" hint="" hdst=""
   [ -n "$argv" ] || { echo ABSENT; return; }
   case " $argv " in *" --interval "*) hint="${argv##*--interval }"; hint="${hint%% *}" ;; esac
   case " $argv " in *" --deliver "*)  hdst="${argv##*--deliver }";  hdst="${hdst%% *}" ;; esac
-  { [ "$hint" = "$wint" ] && [ "$hdst" = "$wdst" ]; } && echo OK || echo STALE
+  if [ "$hint" = "$wint" ] && [ "$hdst" = "$wdst" ] && {
+    [ -z "$wanted" ] || [ "$loaded" = "$wanted" ]
+  }; then echo OK; else echo STALE; fi
 }
 
 # split_entry — parse one CHANS entry into E_SRC/E_DST/E_INT. Two forms (window-set-consolidation
@@ -97,19 +112,25 @@ split_entry(){ # $1=entry -> sets E_SRC E_DST E_INT
 }
 
 ensure_one(){ # $1=channel $2=interval [$3=deliver-to] -> start the driver if absent
-  local ch="$1" int="$2" dst="${3:-}" pid
+  local ch="$1" int="$2" dst="${3:-}" pid p state loaded wanted kept=""
   tmux list-windows -t "$S" -F '#{window_name}' 2>/dev/null | grep -qx "$ch" || {
     echo "$(ts) $ch: window absent — skip (will retry next pass)" >> "$LOG"; return 0; }
-  pid="$(driver_pid "$ch")"
-  if [ -n "$pid" ]; then
-    case "$(driver_state "$int" "$dst" "$(ps -o args= -p "$pid" 2>/dev/null)")" in
-      OK)    return 0 ;;                                      # already running with the RIGHT destination
-      STALE) kill "$pid" 2>/dev/null                          # destination drifted (restore.env changed) —
-             echo "$(ts) $ch: RESPAWN driver (deliver drift → '${dst:-<self>}', killed stale pid $pid)" >> "$LOG" ;;
-    esac                                                      # fall through to respawn with the new flags
-  fi
-  setsid bash -c "exec mesh-pane-consume '$ch' --interval '$int'${dst:+ --deliver '$dst'}" >/dev/null 2>&1 &
-  echo "$(ts) $ch: STARTED driver (interval ${int}s${dst:+, delivers to $dst})" >> "$LOG"
+  wanted="$(deployed_driver_sha 2>/dev/null || true)"
+  [ -n "$wanted" ] || { echo "$(ts) $ch: cannot determine deployed driver SHA — skip" >> "$LOG"; return 1; }
+  while IFS= read -r pid; do
+    [ -n "$pid" ] || continue
+    loaded="$(driver_loaded_sha "$pid")"
+    state="$(driver_state "$int" "$dst" "$(ps -o args= -p "$pid" 2>/dev/null)" "$loaded" "$wanted")"
+    if [ "$state" = OK ] && [ -z "$kept" ]; then
+      kept="$pid"
+    else
+      kill "$pid" 2>/dev/null || true
+      echo "$(ts) $ch: RESPAWN driver (SHA/argv drift or duplicate; pid $pid loaded '${loaded:-<none>}', wanted '$wanted')" >> "$LOG"
+    fi
+  done < <(driver_pids "$ch")
+  [ -n "$kept" ] && return 0
+  setsid env "MESH_PANE_CONSUME_LOADED_SHA=$wanted" bash -c "exec mesh-pane-consume '$ch' --interval '$int'${dst:+ --deliver '$dst'}" >/dev/null 2>&1 &
+  echo "$(ts) $ch: STARTED driver (SHA $wanted, interval ${int}s${dst:+, delivers to $dst})" >> "$LOG"
 }
 
 kick_one(){ # $1=channel [$2=deliver-to] -> immediate one-shot read-wake (the spawn-moment signal)
@@ -146,6 +167,12 @@ if [ "${1:-}" = --test ]; then
   # interval drift ALONE is STALE too (the sibling blindness this closes):
   [ "$(driver_state 14400 '' 'mesh-pane-consume vpn --interval 7200')" = STALE ]                      || { echo "smoke-test: FAIL (driver_state: interval drift not STALE)"; exit 1; }
   [ "$(driver_state 7200 health '')" = ABSENT ]                                                       || { echo "smoke-test: FAIL (driver_state: no driver not ABSENT)"; exit 1; }
+  # Same argv is insufficient: loaded executable SHA must match the deployed SHA.
+  [ "$(driver_state 7200 '' 'mesh-pane-consume vpn --interval 7200' 'sha-live' 'sha-live')" = OK ] || { echo "smoke-test: FAIL (same argv+SHA not OK)"; exit 1; }
+  [ "$(driver_state 7200 '' 'mesh-pane-consume vpn --interval 7200' 'sha-old' 'sha-live')" = STALE ] || { echo "smoke-test: FAIL (same argv+different SHA not STALE)"; exit 1; }
+  [ "$(driver_state 7200 '' 'mesh-pane-consume vpn --interval 7200' '' 'sha-live')" = STALE ] || { echo "smoke-test: FAIL (missing loaded SHA not STALE)"; exit 1; }
+  grep -q 'MESH_PANE_CONSUME_LOADED_SHA=' "$src" || { echo "smoke-test: FAIL (spawn does not stamp loaded SHA)"; exit 1; }
+  grep -q 'sha256sum' "$src" || { echo "smoke-test: FAIL (wanted SHA is not content-derived)"; exit 1; }
   echo "smoke-test: ok (live two-pane data/mind discovery; conditional top→bottom diff feed; spawn-moment --kick; driver_state drift→respawn)"; exit 0
 fi
 
