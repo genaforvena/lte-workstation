@@ -17,6 +17,7 @@ import re
 import subprocess
 import sys
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -31,6 +32,15 @@ LINE_RE = re.compile(
 )
 WARNING_WORD = re.compile(r"\b(?:dead|lost|fail(?:ed|ure)?|warn(?:ing)?|unknown|degraded|stale|offline|timeout|gap)\b", re.I)
 HEALTH_SOURCE = re.compile(r"(?:^|[/_.-])(?:health|watch|sense|doctor|fleet|reflex)(?:@|[/_.-]|$)", re.I)
+# Explicit error/alarm markers are actionable regardless of which producer wrote them. Plain prose
+# mentioning a failed test is not enough: it is often a historical task description, not a live fault.
+ERROR_MARKER = re.compile(
+    r"\[(?:error|failure|failed|delivery-failed|pane-frozen|mind-wedged|mind-stranded|mind-holding|"
+    r"scheduler-dead|health-fail|organ-down|alarm|"
+    r"path-udp-blocked|node-down|lan-down|vpn-down|tv-down|watchdog-dead|stt-offload-fail|"
+    r"swap-drain-unreachable|audit-diverge|unreachable(?::[^]]+)?)\]",
+    re.I,
+)
 
 
 def atomic_write(path: Path, value: dict) -> None:
@@ -66,8 +76,13 @@ def warning_key(sender: str, body: str) -> str | None:
     # mesh-task writes its own [task] and [task-state] records while this cursor
     # is open.  Their descriptions may quote the original warning marker; they
     # are ledger output, never new health observations.
-    if re.match(r"\[(?:task|task-state|task-ledger)\]", body, re.I):
+    # Ledger transitions may quote the original error in their description/result. They are
+    # already task evidence, never a second health incident; admitting them creates self-referential
+    # chains and can wedge the cursor on a terminal-task regression.
+    if re.match(r"\[(?:task|task-state|task-ledger|taking|done|progress|blocked|rejected|handoff)\]", body, re.I):
         return None
+    if ERROR_MARKER.search(body):
+        return "error:" + re.sub(r"\s+", " ", body).strip().lower()
     if re.search(r"room\s+sense\s+(?:still\s+)?lost:", body, re.I):
         # Held restatements contain a changing age; they belong to the same incident.
         stable = re.sub(r"\bfor\s+\d+\s*[smhd]\b", "for AGE", body, flags=re.I)
@@ -82,6 +97,26 @@ def warning_key(sender: str, body: str) -> str | None:
 
 def task_chain(key: str) -> str:
     return "health-warning/" + hashlib.sha256(key.encode("utf-8")).hexdigest()[:20]
+
+
+def dispatch_is_live(step: dict, now: datetime | None = None) -> bool:
+    """Return whether an open sent dispatch still consumes the queue slot.
+
+    Expired health-warning dispatches are already classified as HELD_EXPIRED by the
+    ledger and are waiting for a fresh source warning.  Counting them as live here
+    permanently backpressures the source cursor behind historical incidents.
+    """
+    until = step.get("dispatch_until")
+    if not until:
+        return True
+    try:
+        expiry = datetime.fromisoformat(str(until).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return True
+    current = now or datetime.now(timezone.utc)
+    if expiry.tzinfo is None:
+        expiry = expiry.replace(tzinfo=timezone.utc)
+    return expiry > current
 
 
 def create_task(chain: str, description: str) -> None:
@@ -128,7 +163,7 @@ def durable_chain_disposition(chain: str) -> str | None:
         return None
 
 
-def health_warning_admission_available() -> bool:
+def health_warning_admission_available(urgent: bool = False) -> bool:
     """Keep one running triage and one sent/open triage in flight for Health."""
     env = dict(os.environ, MESH_DIR=str(MESH))
     result = subprocess.run([TASK_CMD, "replay", "--json"], env=env,
@@ -155,8 +190,14 @@ def health_warning_admission_available() -> bool:
             continue
         if step.get("status") in ("active", "claimed"):
             running += 1
-        elif step.get("status") == "open" and data.get("dispatch") == "sent":
+        elif (step.get("status") == "open" and data.get("dispatch") == "sent"
+              and dispatch_is_live(step)):
             queued += 1
+    # Explicit errors have priority over ordinary queued prose: one urgent error may
+    # enter while one ordinary warning is queued, but never exceed two active/claimed
+    # Health slots. This keeps current faults from waiting behind historical reports.
+    if urgent:
+        return running < 2
     # A new chain enters the queued bucket, so that bucket must be empty;
     # the separate running slot may remain occupied.
     return running < 2 and queued < 1
@@ -169,6 +210,50 @@ def retry_dispatch(chain: str) -> None:
     if result.returncode:
         detail = (result.stderr or result.stdout).strip().replace("\n", " ")
         raise RuntimeError(f"mesh-task dispatch failed ({result.returncode}): {detail}")
+
+
+def create_or_recover_urgent(chain: str, description: str) -> None:
+    """Create an urgent chain, recovering a durable chain whose dispatch failed."""
+    try:
+        create_task(chain, description)
+        return
+    except RuntimeError:
+        disposition = durable_chain_disposition(chain)
+        if disposition == "retry-dispatch":
+            retry_dispatch(chain)
+            disposition = durable_chain_disposition(chain)
+        if disposition in ("sent", "terminal"):
+            return
+        raise
+
+
+def pending_error(source, state: dict) -> tuple[int, str, str, str, str] | None:
+    """Find the next unrecorded explicit error without moving the main cursor.
+
+    Health prose is deliberately backpressured, but explicit errors must not sit behind
+    days of historical check chatter.  We admit one error per available Health slot and
+    leave the byte cursor in place; ``created`` makes the next pass skip that same line
+    and continue the priority sweep.  Once the error tail is exhausted, normal source
+    order resumes.
+    """
+    source.seek(state["offset"])
+    candidate = None
+    while True:
+        start = source.tell()
+        raw = source.readline()
+        if not raw:
+            return candidate
+        end = source.tell()
+        match = LINE_RE.match(raw.rstrip(b"\n"))
+        if not match:
+            continue
+        stamp = match.group("stamp").decode("ascii")
+        sender = match.group("sender").decode("utf-8", "replace")
+        body = match.group("body").decode("utf-8", "replace")
+        key = warning_key(sender, body)
+        if key is None or not key.startswith("error:") or key in state["created"]:
+            continue
+        candidate = (end, stamp, sender, body, key)
 
 
 def run() -> int:
@@ -184,6 +269,24 @@ def run() -> int:
         if state["offset"] > size:
             state["offset"] = 0
         with CHAT.open("rb") as source:
+            try:
+                error_batch = max(1, int(os.environ.get("MESH_HEALTH_ERROR_BATCH", "5")))
+            except ValueError:
+                error_batch = 5
+            urgent = pending_error(source, state)
+            admitted_errors = 0
+            if urgent is not None and health_warning_admission_available(urgent=True):
+                while urgent is not None and admitted_errors < error_batch:
+                    end, stamp, sender, body, key = urgent
+                    chain = task_chain(key)
+                    description = f"Investigate health error from {sender} at {stamp}: {re.sub(r'\\s+', ' ', body).strip()}"
+                    create_or_recover_urgent(chain, description[:900])
+                    state["created"][key] = {"chain": chain, "source": stamp, "sender": sender}
+                    atomic_write(STATE, state)
+                    admitted_errors += 1
+                    urgent = pending_error(source, state)
+            if admitted_errors:
+                return 0
             source.seek(state["offset"])
             while True:
                 start = source.tell()
@@ -232,7 +335,17 @@ if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "--test":
         assert warning_key("mesh-home/mesh-room-sense-loss@mesh-home", "[fyi] room sense STILL lost: EYES DEAD for 2d")
         assert warning_key("health@mesh-home", "[health-warning] mesh-egress-health UNKNOWN")
+        assert warning_key("mesh-chat-deliver@mesh-home", "[@witness] [delivery-failed] target:health reason=age-expiry")
+        assert warning_key("pane-watch@mesh-home", "[pane-frozen] mesh-home:witness.0")
+        assert warning_key("watchdog@mesh-home", "[node-down] Redmi")
+        assert warning_key("mesh-route@mesh-home", "[path-udp-blocked] route=wifi")
+        assert warning_key("mind-state@mesh-home", "[mind-wedged] mesh-home:health input stuck")
+        assert warning_key("mesh-audit-reflex@mesh-home", "[audit-diverge] S3* mesh-audit found a divergence")
+        assert dispatch_is_live({"dispatch_until": "2099-01-01T00:00:00Z"}, datetime(2026, 1, 1, tzinfo=timezone.utc))
+        assert not dispatch_is_live({"dispatch_until": "2025-01-01T00:00:00Z"}, datetime(2026, 1, 1, tzinfo=timezone.utc))
+        assert warning_key("watchdog@mesh-home", "[expected-down] Redmi") is None
         assert warning_key("health", "[task] quoted [health-warning] text") is None
+        assert warning_key("health", "[taking] health-warning/x/triage: [delivery-failed] quoted result") is None
         print("mesh-health-warning-task --test: PASS (warning filters, task-output exclusion, fingerprinting)")
         raise SystemExit(0)
     try:
