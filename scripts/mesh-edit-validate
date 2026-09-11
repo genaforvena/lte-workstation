@@ -1,0 +1,158 @@
+#!/usr/bin/env python3
+"""Apply one explicit replacement, validate the resulting file, and write a receipt."""
+import argparse
+import base64
+import datetime as dt
+import difflib
+import hashlib
+import json
+import os
+from pathlib import Path
+import shlex
+import subprocess
+import sys
+import tempfile
+
+
+def now():
+    return dt.datetime.now(dt.timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def sha(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def write_atomic(path, data, mode=None):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, raw = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if mode is not None:
+            os.chmod(raw, mode)
+        os.replace(raw, path)
+    finally:
+        if os.path.exists(raw):
+            os.unlink(raw)
+
+
+def receipt_write(path, receipt):
+    write_atomic(path, (json.dumps(receipt, sort_keys=True, indent=2) + "\n").encode())
+
+
+def recover(path):
+    receipt_path = Path(path)
+    receipt = json.loads(receipt_path.read_text())
+    if "edit" not in receipt or "before_b64" not in receipt["edit"]:
+        raise ValueError("receipt has no recoverable original")
+    target = Path(receipt["edit"]["file"])
+    current = target.read_bytes()
+    expected = receipt["edit"]["after_sha256"]
+    if sha(current) != expected:
+        raise ValueError(f"refusing recovery: current file hash is not {expected}")
+    original = base64.b64decode(receipt["edit"]["before_b64"])
+    write_atomic(target, original, target.stat().st_mode & 0o777)
+    receipt["recovery"] = {"action": "mesh-edit-validate --recover", "file": str(target),
+                            "status": "restored", "restored_sha256": sha(original), "at": now()}
+    receipt_write(receipt_path, receipt)
+    print(json.dumps(receipt, sort_keys=True))
+
+
+def self_test():
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        target = root / "target"
+        receipt = root / "receipt.json"
+        target.write_bytes(b"old\n")
+        cmd = [sys.executable, str(Path(__file__).resolve()), "--file", str(target),
+               "--replace", "old", "new", "--receipt", str(receipt), "--validator", sys.executable,
+               "--", "-c", "import pathlib,sys; sys.exit(pathlib.Path(sys.argv[1]).read_text() != 'new\\n')",
+               "{file}"]
+        if subprocess.run(cmd, capture_output=True).returncode != 0:
+            raise RuntimeError("pass self-test failed")
+        target.write_bytes(b"old\n")
+        cmd[cmd.index("new")] = "bad"
+        if subprocess.run(cmd, capture_output=True).returncode != 1:
+            raise RuntimeError("forced-failure self-test failed")
+    print("mesh-edit-validate: PASS (edit, validation, failure receipt)")
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--test", action="store_true")
+    ap.add_argument("--recover", type=Path)
+    ap.add_argument("--file", type=Path)
+    ap.add_argument("--replace", nargs=2, metavar=("OLD", "NEW"))
+    ap.add_argument("--receipt", type=Path)
+    ap.add_argument("--validator", nargs="+")
+    ap.add_argument("command", nargs=argparse.REMAINDER)
+    args = ap.parse_args()
+    if args.test:
+        return self_test()
+    if args.recover:
+        if any((args.file, args.replace, args.receipt, args.validator, args.command)):
+            ap.error("--recover cannot be combined with edit options")
+        recover(args.recover)
+        return 0
+    if not args.file or not args.replace or not args.receipt or not args.validator:
+        ap.error("--file, --replace, --receipt, and --validator are required")
+    remainder = args.command[1:] if args.command[:1] == ["--"] else args.command
+    command = args.validator + remainder
+    if "{file}" not in command:
+        ap.error("validator must contain the {file} placeholder")
+    args.file = args.file.resolve()
+    try:
+        before = args.file.read_bytes()
+        mode = args.file.stat().st_mode & 0o777
+    except OSError as exc:
+        ap.error(str(exc))
+    old, new = (value.encode() for value in args.replace)
+    replacements = before.count(old)
+    if replacements == 0:
+        ap.error("old text was not found; no edit or receipt was written")
+    after = before.replace(old, new)
+    diff = "".join(difflib.unified_diff(
+        before.decode("utf-8", "surrogateescape").splitlines(keepends=True),
+        after.decode("utf-8", "surrogateescape").splitlines(keepends=True),
+        fromfile=str(args.file) + " (before)", tofile=str(args.file) + " (after)"))
+    command = [str(args.file) if part == "{file}" else part for part in command]
+    receipt = {"schema": "mesh-edit-validation/v1", "success": False, "status": "pending",
+               "started_at": now(), "edit": {"file": str(args.file), "old": args.replace[0],
+               "new": args.replace[1], "replacements": replacements, "before_sha256": sha(before),
+               "after_sha256": sha(after), "diff": diff, "before_b64": base64.b64encode(before).decode()},
+               "validator": {"command": command, "command_display": shlex.join(command)}}
+    write_atomic(args.file, after, mode)
+    receipt_write(args.receipt, receipt)
+    try:
+        run = subprocess.run(command, capture_output=True, check=False)
+        receipt["validator"].update({"rc": run.returncode, "stdout": run.stdout.decode("utf-8", "replace"),
+                                     "stderr": run.stderr.decode("utf-8", "replace"),
+                                     "stdout_sha256": sha(run.stdout), "stderr_sha256": sha(run.stderr)})
+        if run.returncode == 0:
+            receipt["status"] = "validated"
+            receipt["success"] = True
+            receipt["recovery"] = {"action": "mesh-edit-validate --recover", "file": str(args.file),
+                                    "status": "available"}
+            receipt_write(args.receipt, receipt)
+            print(json.dumps(receipt, sort_keys=True))
+            return 0
+        receipt["status"] = "validation-failed"
+        receipt["recovery"] = {"action": "mesh-edit-validate --recover", "file": str(args.file),
+                                "status": "available", "reason": "restore before validator retry"}
+    except OSError as exc:
+        receipt["status"] = "validator-unavailable"
+        receipt["validator"]["error"] = str(exc)
+    receipt_write(args.receipt, receipt)
+    print(json.dumps(receipt, sort_keys=True))
+    return 1
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f"mesh-edit-validate: {exc}", file=sys.stderr)
+        raise SystemExit(2)
