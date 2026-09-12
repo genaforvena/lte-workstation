@@ -1,14 +1,35 @@
-# mesh-mind-recycle — clear-after-every-stop driver (fresh context per turn)
+# mesh-mind-recycle — clear-policy design and measurement (current status: shadow-only)
 
 **Date:** 2026-07-18
-**Status:** design (approved for planning) · **rev 2026-07-18** — measurement redesign (canary
-meter primary, §Measuring) + Huntley/Ralph reconciliation (Stop-hook trigger, meter-before-trigger
-sequencing, §Prior art). Operator-driven over TG.
+**Status:** design · **rev 2026-09-12** — policy and lifecycle reconciliation; Claude Stop hook remains
+shadow-only, and the live trigger is unresolved. Operator-driven over TG.
 **Owner:** genome
+
+## Current policy reconciliation (2026-09-12)
+
+The 2026-07-18 every-stop proposal below is a hypothesis, not current authorization to clear on
+every stop. Keep `mesh-mind-recycle --hook` shadow-only. The current evidence cannot choose
+every-stop versus task-boundary clearing:
+
+| Surface | Current evidence | What it establishes |
+|---|---|---|
+| Claude Stop | `/home/mesh-home/.claude/settings.json` runs `mesh-stop-check` followed by `mesh-mind-recycle --hook`. The hook rejects re-entrant events and pins its `_once` call to `LIVE=0`, even if the parent exports `MESH_RECYCLE_LIVE=1`. | The Stop event path is wired for shadow observations. It does not clear or inject, and it does not distinguish completed from unfinished work. |
+| Codex lifecycle | `.codex/hooks.json` wires SessionStart/SessionEnd to `mesh-codex-lifecycle`; `config.toml` also wires its completion notification. The lifecycle persists a turn artifact and handoff, checks for a matching board receipt, then calls `mesh-clear`. Its pre-handoff gate accepts an active task with a `[taking]` or `[progress]` receipt, so an unfinished Codex turn can also reach the clear. | Codex has its own completion/reset path, not the Claude Stop hook. The current path conflicts with `CLAUDE.md`'s task-boundary-only rule; resolve that implementation mismatch before using Codex behavior to support a shared trigger. A Codex SessionEnd/reset is not a Claude Stop sample or proof that every-stop clearing is safe. |
+| Clear safety | `mesh-clear` writes an extractive snapshot before `/clear`. It refuses if the snapshot cannot be written or the pane is unresolved, and its deterministic backstop blocks detached work in `running` or `done-undelivered`; it reaps only a dead/reused PID past the grace period. | The gate protects handoff persistence and detached delivery. It does not judge handoff coverage and does not classify a stop as done or unfinished. |
+| Canary meter | `mesh-clear-loss --report`: `N=12`, `COST_ALL=+0.42`; each of `budget`, `naming`, `schema`, and `units` has only 3 cases. `naming` and `schema` each show `+1.00`; this is task-type, not stop-outcome, evidence. | The positive aggregate is a warning signal, not a policy comparison. The sample has no done/unfinished arm. |
+| Clear log | At inspection there were 10,736 valid rows and one malformed line. No field records `done`, `unfinished`, or task outcome; 7,894 valid rows have `engine="?"`. Most rows are clears from `mesh-clear` or `compact-reflex`, not labelled Stop-hook observations. | Historical clear counts cannot be retroactively divided into done and unfinished cohorts or reliably attributed to an engine. |
+
+**Decision rule:** do not promote the every-stop trigger from the aggregate canary score. Future policy evidence must be prospective and stratified by engine and actual task outcome: `done` requires a matching completed task receipt before the stop; `unfinished` requires an open/active task at the stop. Missing or ambiguous labels are excluded from both cohorts. Compare paired recycled/control loss for each cohort over at least seven consecutive days, and report sample counts and uncertainty. A live trigger remains ineligible until the unfinished cohort's one-sided 95% upper confidence bound is within an explicit loss budget. No such budget is currently specified, so the current evidence cannot graduate any automatic live trigger. The mesh-wide task-boundary rule remains governing doctrine; the Codex lifecycle mismatch above must be resolved before selecting a shared policy.
+
+These lifecycle and safety facts supersede conflicting trigger, coverage-gate, and sequencing claims in
+the original proposal below. That proposal is retained as design history; its `mesh-clear --auto` and
+coverage-classifier flow is not the current implementation.
+
+## Original design proposal (2026-07-18; historical, not authorization for live clearing)
+
 **Decision (2026-07-18):** do NOT adopt the ralph plugin wholesale (it accumulates context, is
-bounded-project shaped); DO steal its Stop-hook trigger; keep our handoff+SessionStart-restore as
-the freshness mechanism; **build `mesh-clear-loss` (canary meter) FIRST**, run a week in pure
-shadow, let the number settle every-stop vs clear-at-done before shipping the driver.
+bounded-project shaped); DO consider its Stop-hook trigger; keep our handoff+SessionStart-restore
+as the freshness mechanism; build `mesh-clear-loss` first and measure before selecting a live driver.
 
 ## Problem
 
