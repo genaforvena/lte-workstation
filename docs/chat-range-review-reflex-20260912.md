@@ -34,5 +34,18 @@ tasks routed to responsible owners for actionable findings.
 - `python3 tests/test-mesh-chat-range-review.py` — PASS.
 - `python3 scripts/mesh-chat-range-review --test` — PASS.
 - `python3 -m py_compile scripts/mesh-chat-range-review` — PASS.
-- Deployment and live cadence wiring are recorded below after the installed reflex
-  has passed the autowire and firing checks.
+- Commits: `2eb82b5` adds the reflex, test, and design record; `92fda1f` adds an
+  unconditional run row, including when no batch is due.
+- `~/.local/bin/mesh-chat-range-review` resolves to the committed source, and both
+  copies have SHA-256 `214d5dfe7bf9d694e2cbdd01610abe972d757449326ae24c8ed18f930d185f30`.
+- `mesh-autowire --check` passed its real `--test` gate and offered the one-minute
+  reflex; `mesh-autowire` installed it at `* * * * *` in both
+  `~/.mesh/reflexes.cron` and the live crontab.
+- `mesh-reflexes --check` reports `dispatch OK` and all desired reflexes present.
+  The live `~/.mesh/chat-range-review.log` contains cron run rows at 10:25 and
+  10:26 UTC (`posted=0`), proving the scheduled command fires before a batch is due.
+- First live initialization anchored all three cursors at physical line 55,691;
+  at the firing check the source had 55,700 lines and no review task was emitted.
+  This confirms historical backlog was not replayed. The implementation is tracked
+  by task chain `witness-chat-range-review-automation-20260912`, whose DONE receipt
+  cites this artifact.
