@@ -49,6 +49,41 @@ bash -n scripts/mesh-bt-link scripts/integrations/mesh-bt-link \
   PASS
 ```
 
+Post-land parity check: `cmp scripts/mesh-bt-link ~/.local/bin/mesh-bt-link` passed;
+`scripts/mesh-manifest --check` passed with 1203 complete rows and no duplicate installed
+basenames. The parity rows report `scripts/mesh-bt-link` as `same` and the nested implementation as
+non-deployed. The deployed `~/.local/bin/mesh-bt-link --test` returned the same honest exit 2 because
+the controller remains absent. `HEAD == origin/main` after landing.
+
+The body-motion slice landed as `a228cb01`, `c1f3d7e3`, `047230ef`, `4f9a98ab`, and `af5c0495`;
+the Bluetooth slice landed as `3b871827`, `f9d1dee2`, `50363d99`, `ecef458e`, and `52dfbed8`.
+Each change went through path-limited `mesh-land` commits; the commit-subject scan found no
+task-specific suggested subject in `~/.mesh/chat.log`.
+
+## Local camera family slice
+
+The `mesh-camera` adapter now lives at `scripts/integrations/mesh-camera`; its original executable
+basename remains as the compatibility shim. Runtime classification follows its local contract:
+it captures one still from this node's `/dev/video0`, trying the bundled/system ffmpeg path and then
+fswebcam. It is separate from `mesh-imac-cam`, whose implementation captures from a remote iMac.
+
+The caller census found references at `mesh-doctor`, `mesh-object-id`, `mesh-card`,
+`mesh-capture-inuse`, `mesh-chaos-doctor`, `mesh-imac-cam`, `mesh-see`, `mesh-hear`, and
+`mesh-organ`; all continue using the old basename. No cadence, service, or cron entry was found, so
+this on-demand capture adds no recurring camera load.
+
+```text
+scripts/mesh-camera --test
+  PASS: real one-frame capture created a non-empty JPEG and its 0xffd8 signature was checked
+bash tests/test-mesh-camera-integration-slice.sh
+  PASS: manifest ownership and compatibility path plus a real capture (or an explicit BUSY result)
+bash -n scripts/mesh-camera scripts/integrations/mesh-camera \
+  tests/test-mesh-camera-integration-slice.sh
+  PASS
+scripts/mesh-manifest --check
+  PASS: 1204 complete rows; no duplicate installed basenames
+```
+
 Verification:
 
 ```text
