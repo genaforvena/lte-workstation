@@ -80,13 +80,9 @@ else log "clone the genome"; git clone -q "$REPO_URL" "$REPO_DIR" && echo "  clo
 log "install the body -> ~/.local/bin"
 mkdir -p ~/.local/bin ~/.mesh/knowledge
 if [ -d "$REPO_DIR/scripts" ]; then
-  for f in "$REPO_DIR"/scripts/*; do
-    b="$(basename "$f")"; case "$b" in *.service|*.timer|*.bak*) continue;; esac
-    # Keep one executable object: local commands point at the checked-out genome.
-    # A copied deployment creates a second mutable version that can silently drift.
-    rm -f -- "$HOME/.local/bin/$b" 2>/dev/null
-    ln -s -- "$f" "$HOME/.local/bin/$b" 2>/dev/null && echo "  $b -> $f"
-  done
+  MESH_REPO="$REPO_DIR" MESH_BIN="$HOME/.local/bin" \
+    "$REPO_DIR/scripts/mesh-manifest-install" tools \
+    || { echo "  ! manifest tool installation failed" >&2; exit 1; }
 fi
 # seed the node registry from the template so topology-driven tools have a file to read + you a
 # file to fill (the genome hardcodes NO IPs — your topology lives here). Empty = single-node, fine.
