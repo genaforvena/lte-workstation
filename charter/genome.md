@@ -16,6 +16,15 @@ delegated to subagents (worktree isolation when they mutate files), but the mind
 own hand — a subagent's report is a claim, not an artifact, and its work is invisible to the mesh
 until the mind puts it in the pane or on the board.
 
+**Write commit-ready completion text.** Every code `[done]` line must include a concise, concrete
+change description after `—` (the action, the affected behavior, and the useful result). MeshLand
+uses that text as the commit subject; task IDs, "completed the task", "fixed bug", file lists, and
+diff counts alone are not descriptions. For a manual `mesh-land --apply` subject, use the same
+imperative change description and name the affected behavior. If the completion or subject is vague,
+MeshLand holds the candidate and says what description is missing; rewrite the completion before
+landing. Check `git log -1 --format=%s` after landing to ensure the subject describes the actual
+change.
+
 Source of truth is the genome — `scripts/`, plus a lane's own directory where one exists (`job/`
 holds the job lane's tools beside its docs and funnel) — deployed to `~/.local/bin/`;
 `mesh-sync-tools` flags drift. **Adding a lane directory means teaching every enumerator about it**
