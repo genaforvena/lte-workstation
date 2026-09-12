@@ -557,10 +557,12 @@ tangents risks a mis-scoped or half-remembered commitment; a fresh `/clear` is t
 - **A claim that never settles is a LEAKED PROMISE.** A `[task]`/`[taking]`/`[verify]` posted and never
   discharged (`[done]` / resolved / `[fyi]`-with-result) is structurally a Promise that never resolves:
   it holds the awaiter's scan budget forever and ages where nobody is looking. The `[verify]` rule above
-  guards the *graveyard-of-settled* inverse; this is the failure at the other end. `mesh-promises` is
-  the leak detector — it replays the board into a double-entry ledger where an unkept promise is a
-  **standing, aged, queryable liability balance** (`--balance`/`--all`;
-  `docs/design-hledger-coordination-2026-07-24.md`). **The ledger must see the WHOLE claim family, not
+  guards the *graveyard-of-settled* inverse; this is the failure at the other end. `mesh-task audit`
+  (+ the `tasks.journal` materialized view on the witness pane) is the leak detector — it replays the
+  board's task-state records where an unkept task is a **standing, aged, queryable row**
+  (`OPEN_UNOWNED` findings fail the journal; `docs/task-only-coordination-20260908.md`).
+  `mesh-promises` is RETIRED to a compatibility accounting view (still read by staffing/dispatch
+  admission pending its repoint) — do not route new work through it. **The ledger must see the WHOLE claim family, not
   just `[task]`→`[done]`:** `[verify]` (a check owed to another window) and `[taking]` (a claim held)
   are promises too — unmodeled, the detector is blind to exactly the claims that drift longest.
 - **Ask here instead of guessing.** The operator reads the room and drops in too.
