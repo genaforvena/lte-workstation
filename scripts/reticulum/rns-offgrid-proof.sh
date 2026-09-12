@@ -22,10 +22,8 @@
 #   rns-offgrid-proof.sh --test       # gate: the plain proof (exit 2 if peer unreachable)
 #
 # Config (env or ~/.mesh/rns-offgrid.env):
-#   RNS_OG_PEER      ssh target for control-plane setup   (e.g. ilya@100.107.198.111)
-#   RNS_OG_LOCAL_LAN local LAN IP the TCP server binds     (e.g. 192.168.8.225)
-#   RNS_OG_GW        default gateway, for --blackout restore(e.g. 192.168.8.1)
-#   RNS_OG_WIFI      local uplink NIC, for --blackout       (e.g. wlxbcec43434a22)
+#   RNS_OG_PEER      required SSH target for control-plane setup
+#   RNS_OG_LOCAL_LAN optional local LAN IP the TCP server binds (otherwise detected)
 #   RNS_OG_PORT      TCP-over-LAN port (default 4343)
 #   RNS_OG_PY        local rns venv python  (default ~/.venv-rns/bin/python)
 #   RNS_OG_PEER_PY   peer  rns venv python  (default ~/.venv-rns/bin/python)
@@ -34,14 +32,17 @@
 set -uo pipefail
 
 [ -f "$HOME/.mesh/rns-offgrid.env" ] && . "$HOME/.mesh/rns-offgrid.env"
-PEER="${RNS_OG_PEER:-ilya@100.107.198.111}"
+na(){ echo "n/a: $*" >&2; exit 2; }
+fail(){ echo "FAIL: $*" >&2; exit 1; }
+
+PEER="${RNS_OG_PEER:-}"
+[ -n "$PEER" ] || na "peer not configured (set RNS_OG_PEER in the environment or ~/.mesh/rns-offgrid.env)"
 # LOCAL_LAN default: AUTO-DETECT this host's RFC1918 (non-Tailscale-CGNAT) LAN IP.
-# A hardcoded IP rots the moment DHCP reassigns it — that drift (192.168.8.225→.224)
-# is what made this proof die with a silent EADDRNOTAVAIL rc=255.
+# A hardcoded IP rots when DHCP reassigns it, and a failed bind can die with a silent
+# EADDRNOTAVAIL rc=255.
 # BUT "first global RFC1918" is WRONG on a node with overlays: this host carries
-# wg-mesh 10.66.66.16/32, docker0 172.17.0.1/16 AND wifi 192.168.8.224/24, and a bare
-# `head -1` picked the wg /32 — a POINT-TO-POINT host route the peer cannot dial
-# (the proof then died `Connection refused` dialing 10.66.66.16, NOT honest n/a).
+# tunnel /32 addresses, container bridges AND a wifi LAN, and a bare `head -1` can
+# pick a point-to-point host address the peer cannot dial.
 # The LAN the peer shares is the one behind the DEFAULT ROUTE (the real uplink NIC),
 # never a /32 overlay or a docker bridge. Prefer the default-route dev's RFC1918 IP;
 # fall back to first-global-RFC1918-on-a-NON-/32-iface (drops overlays generically).
@@ -61,8 +62,6 @@ autodetect_lan(){
     | awk '$4 !~ /\/32$/ {print $4}' | cut -d/ -f1 | _rfc1918 | head -1
 }
 LOCAL_LAN="${RNS_OG_LOCAL_LAN:-$(autodetect_lan)}"
-GW="${RNS_OG_GW:-192.168.8.1}"
-WIFI="${RNS_OG_WIFI:-wlxbcec43434a22}"
 PORT="${RNS_OG_PORT:-4343}"
 PY="${RNS_OG_PY:-$HOME/.venv-rns/bin/python}"
 PEER_PY="${RNS_OG_PEER_PY:-\$HOME/.venv-rns/bin/python}"
@@ -79,9 +78,6 @@ ts(){ date -u +%H:%M:%SZ; }
 # ("passes once then fails"). Persist the pid to a file the parent trap can read.
 cleanup(){ [ -f "$PIDF" ] && kill "$(cat "$PIDF" 2>/dev/null)" 2>/dev/null; rm -f "$PIDF"; }
 trap cleanup EXIT
-
-na(){ echo "n/a: $*" >&2; exit 2; }
-fail(){ echo "FAIL: $*" >&2; exit 1; }
 
 [ -x "$PY" ] || na "no local rns venv at $PY"
 [ -f "$PROOF" ] || na "proof lib missing at $PROOF"
@@ -142,6 +138,32 @@ run_client(){ # $1=hash ; runs on peer over LAN, echoes its output
   $SSH "$PEER" "$PEER_PY /tmp/rns-link-proof.py client --configdir ~/.mesh/rns-offgrid/client --hashhex $1 2>&1"
 }
 
+default_route(){
+  local routes
+  routes="$(ip -4 route show default 2>/dev/null)" || return 1
+  awk '
+    /^default([[:space:]]|$)/ {
+      gateway = device = metric = ""
+      for (i = 1; i <= NF; i++) {
+        if ($i == "via" && i < NF) gateway = $(i + 1)
+        if ($i == "dev" && i < NF) device = $(i + 1)
+        if ($i == "metric" && i < NF) metric = $(i + 1)
+      }
+      if (gateway == "" || device == "") { invalid = 1; next }
+      if (metric == "") metric = 0
+      if (metric !~ /^[0-9]+$/) next
+      if (best == "" || metric < best) {
+        best = metric
+        count = 1
+        result = gateway " " device " " metric
+      } else if (metric == best) {
+        count++
+      }
+    }
+    END { if (invalid || best == "" || count != 1) exit 1; print result }
+  ' <<< "$routes"
+}
+
 plain_proof(){
   setup
   local hash out
@@ -154,11 +176,14 @@ plain_proof(){
 
 blackout_proof(){
   sudo -n true 2>/dev/null || na "--blackout needs NOPASSWD sudo on this node"
+  local route route_gw route_dev route_metric
+  route="$(default_route)" || na "--blackout needs one unambiguous IPv4 default route with gateway and device"
+  read -r route_gw route_dev route_metric <<< "$route"
   setup
   local hash; hash="$(start_server)"
   local mh="$WORK/blackout.mhproof"; : > "$mh"
   # deadman: unconditional restore in 120s
-  ( sleep 120; sudo ip route replace default via "$GW" dev "$WIFI" metric 600; sudo tailscale up ) &
+  ( sleep 120; sudo ip route replace default via "$route_gw" dev "$route_dev" metric "$route_metric"; sudo tailscale up ) &
   local dm=$!
   # pre-stage peer client to fire at ~T+14 (over control-plane, BEFORE blackout)
   $SSH "$PEER" "nohup sh -c 'sleep 14; { echo START:\$(date -u +%H:%M:%SZ); $PEER_PY /tmp/rns-link-proof.py client --configdir ~/.mesh/rns-offgrid/client --hashhex $hash; echo rc=\$?; echo END:\$(date -u +%H:%M:%SZ); } > /tmp/offgrid-blackout.result 2>&1' >/dev/null 2>&1 &"
@@ -166,14 +191,25 @@ blackout_proof(){
   echo "[$(ts)] BLACKOUT: drop default route + tailscale down" | tee -a "$mh"
   sudo ip route del default 2>&1 | tee -a "$mh"
   sudo tailscale down 2>&1 | tee -a "$mh"
-  if ping -c1 -W3 8.8.8.8 >/dev/null 2>&1; then echo "[$(ts)] WARN 8.8.8.8 still UP — uplink not fully cut" | tee -a "$mh"
-  else echo "[$(ts)] 8.8.8.8 unreachable — internet DOWN (route: $(ip route get 8.8.8.8 2>&1|head -1))" | tee -a "$mh"; fi
+  if ip -4 route show default 2>/dev/null | grep -q .; then
+    echo "[$(ts)] WARN default route remains — uplink not fully cut" | tee -a "$mh"
+  else
+    echo "[$(ts)] default route absent — internet uplink DOWN" | tee -a "$mh"
+  fi
   ping -c1 -W3 "${PEER##*@}" >/dev/null 2>&1 || true
   sleep 20
   echo "[$(ts)] RESTORE: default route + tailscale up" | tee -a "$mh"
-  sudo ip route replace default via "$GW" dev "$WIFI" metric 600 2>&1 | tee -a "$mh"
+  sudo ip route replace default via "$route_gw" dev "$route_dev" metric "$route_metric" 2>&1 | tee -a "$mh"
   sudo tailscale up 2>&1 | tee -a "$mh"
-  for _ in $(seq 1 20); do ping -c1 -W2 8.8.8.8 >/dev/null 2>&1 && { echo "[$(ts)] internet RESTORED"; break; }; sleep 1; done | tee -a "$mh"
+  for _ in $(seq 1 20); do
+    ip -4 route show default 2>/dev/null | grep -Fq "default via $route_gw dev $route_dev" && {
+      echo "[$(ts)] default route RESTORED via $route_gw dev $route_dev metric $route_metric"
+      break
+    }
+    sleep 1
+  done | tee -a "$mh"
+  ip -4 route show default 2>/dev/null | grep -Fq "default via $route_gw dev $route_dev" \
+    || fail "default route not restored via $route_gw dev $route_dev"
   kill "$dm" 2>/dev/null
   sleep 2
   echo "=== peer client result (ran during blackout) ==="
