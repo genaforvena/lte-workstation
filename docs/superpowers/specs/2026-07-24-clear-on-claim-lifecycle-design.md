@@ -1,5 +1,12 @@
 # mesh-mind-compact: clear on claim START too, not just finish — design (2026-07-24)
 
+> **Status (audited 2026-09-12): historical proposal, not the live contract.** The implementation
+> deliberately uses a single explicit task-boundary trigger after a unit closes; it does not implement
+> `clear_has_claim_start`, `hold-leak`, or `turn-ceiling`. See
+> [`docs/design-audit-clear-on-claim-20260912.md`](../../design-audit-clear-on-claim-20260912.md)
+> for source parity and the remaining first-claim question. Do not read the proposal below as a
+> description of shipped behavior.
+
 Operator direction: "/clear of context should be tied to claims/finishing tasks — /clear is both
 present for starting and finishing task" + "remove all crons there too." Scope: `mesh-mind-compact`
 (the `/clear` sender, `scripts/mesh-mind-compact`). Small, focused addendum — reuses the exact
