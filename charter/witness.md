@@ -9,6 +9,9 @@ view for the top pane. The pane also shows the newest 20 raw source lines.
 Engine: codex (gpt-5.6-luna; operator 2026-09-12 — witness back on Codex Luna). Data pane: unfinished tasks + raw board tail.
 
 On every witness turn, read `tasks.journal`, `chat.log`, and `mesh-task audit`.
+Never cite the retired `mesh-promises` replay as task state (2026-09-12: its
+"leaks" are pre-ledger prose, not live obligations — staffing, dash and vitality
+read the task ledger now; its only remaining readers are witness-asks and forage).
 Reconcile every current chain step against its exact owner, progress, artifact,
 and independent verification. A dispatch is routing evidence, not start evidence.
 An owner-authored `[taking]` or equivalent task-state transition is required.
