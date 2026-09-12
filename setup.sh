@@ -100,20 +100,19 @@ info "ngrok authorized"
 # ── Install scripts ───────────────────────────────────────────────────────────
 section "Installing scripts"
 mkdir -p "$HOME/.local/bin"
+"$SCRIPT_DIR/scripts/mesh-manifest-install" legacy-bin ngrok-notify.sh bore-mtg.sh
 for script in ngrok-notify.sh bore-mtg.sh; do
-    cp "$SCRIPT_DIR/scripts/$script" "$HOME/.local/bin/$script"
-    chmod +x "$HOME/.local/bin/$script"
     info "Installed ~/.local/bin/$script"
 done
 
 # ── Systemd services ──────────────────────────────────────────────────────────
 section "Installing systemd services"
 mkdir -p "$HOME/.config/systemd/user"
-cp "$SCRIPT_DIR/scripts/ngrok.service" "$HOME/.config/systemd/user/ngrok.service"
+"$SCRIPT_DIR/scripts/mesh-manifest-install" units ngrok.service
 info "Installed ngrok.service"
 
 if [[ "$SNI_DOMAIN" != "none" && -n "$SNI_DOMAIN" ]]; then
-    cp "$SCRIPT_DIR/scripts/bore-mtg.service" "$HOME/.config/systemd/user/bore-mtg.service"
+    "$SCRIPT_DIR/scripts/mesh-manifest-install" units bore-mtg.service
     info "Installed bore-mtg.service"
 
     mkdir -p "$HOME/.config/mtg"
