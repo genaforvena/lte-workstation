@@ -288,6 +288,58 @@ the compatibility shim and empty integration directory, revert the one path-clas
 in `scripts/mesh-manifest`, and remove the focused test. Then run
 `scripts/mesh-manifest --check` and the restored tool's `--test` from outside the repository.
 
-Next: land and verify the remote iMac camera pair, then audit remaining isolated phone/network
-adapters with real-read gates. Confirm deployed parity, caller resolution, artifact freshness and
-coverage, and cadence before closing the task. No whole-task completion is claimed here.
+## Note 3 ADB sensor family slice
+
+The motion, proximity, orientation, and ambient implementations moved from the top level into
+`scripts/integrations/`. Their bytes match the four original top-level sources at starting HEAD
+`7487565d`, so the move preserves their implementation. Each former top-level basename is now an
+executable compatibility shim to the nested source, with its original cadence and arguments. These
+four tools share the Note 3 ADB device/protocol family, but remain separate sensors and keep their
+distinct schedules. The battery adapter remains the separately completed Note 3 battery slice above.
+
+The caller census found downstream references through the original basenames, including
+`mesh-note3-desk`, `mesh-note3-thermal`, `mesh-note3-magevent`, `mesh-stress`, and
+`mesh-ambient-level`. No caller or scheduled command was rewritten. The live
+`~/.mesh/reflexes.cron` has exactly one entry for each adapter: motion `4-59/5` with `--edge`, prox
+`3-59/5` with `--edge`, orient `0-59/5` with `--edge`, and ambient `7-59/10` without `--edge`.
+No matching systemd timer/service was found; the migration adds no cadence.
+
+The real-read gates passed serially on the Note 3:
+
+```text
+mesh-note3-motion --test
+  PASS: LIVE adb read -120,335,16991; unrailed and carrying gravity
+mesh-note3-prox --test
+  PASS: LIVE adb read raw=8
+mesh-note3-orient --test
+  PASS: LIVE adb read 191.647,13.3566,-85.5458,24679866715269 -> TILTED
+mesh-note3-ambient --test
+  PASS: LIVE Note3 env 992.4hPa, 22.0958C, 53.1126% RH, dewpoint 12.1C
+tests/test-mesh-note3-sensor-family-integration-slice.sh
+  PASS: manifest ownership, compatibility paths, preserved cadence headers, serial real-read gates
+  Also passes when invoked from /tmp.
+scripts/mesh-manifest --check
+  PASS: 1212 complete rows; no duplicate installed basenames
+```
+
+At 18:13 UTC, the production state artifacts were fresh: motion 18:09, prox 18:13, orient 18:12,
+and ambient 18:07. The ambient artifact is under its declared 2400-second freshness bound; each
+scheduled edge sensor remains under its 10-minute doctor horizon. The focused integration test
+first failed against the prior layout, then passed through the compatibility paths after the shim
+change. Shell syntax checks passed for all four shims, implementations, and the test driver.
+
+Rollback is an inverse path move of the four implementations back to their old top-level paths,
+restoring their prior file contents there, then removing the four shims and focused slice test. The
+existing cron lines need no edit because they still resolve the old paths. Re-run the real-read gates
+and `scripts/mesh-manifest --check` after rollback.
+
+Post-land verification on 2026-09-12: `tests/test-mesh-note3-sensor-family-integration-slice.sh`
+passed after all four wrappers were landed. Its serial installed `--test` gates passed with live
+motion `312,175,17183`, proximity raw `9`, orientation `162.526,-41.5158,-62.1756 -> TILTED`, and
+ambient `992.284hPa, 23.327C, 54.0237%`. `mesh-manifest --check` passed with 1212 rows and no
+duplicate installed basenames; `mesh-sync-tools --test` passed inventory, nested ownership, shim
+basename, and cleanup checks. SHA-256 hashes of each repository shim and installed shim match.
+Wrapper commits: `f324b698` (motion), `904e713c` (ambient), `9005f21c` (orientation), and
+`18ccf5a1` (proximity). Nested source commits: `cb098f48`, `31983160`, `f9949a5f`, and `dc3b526e`
+respectively. The focused regression landed as `f4472fbc`; only this receipt remains to be landed
+before closing the slice.
