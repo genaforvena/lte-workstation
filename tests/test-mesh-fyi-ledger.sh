@@ -56,10 +56,33 @@ grep -q 'age=.* STALE' "$TMP/stale.out"
 
 # A malformed complete FYI row fails loudly instead of disappearing from counts.
 printf '2026-09-12T01:03:00Z  path-watch@node-a  ::  [fyi broken row\n' > "$TMP/bad.log"
-if MESH_CHAT_LOG="$TMP/bad.log" MESH_FYI_DIR="$TMP/fyi" "$ROOT/scripts/mesh-fyi-ledger" --build > /dev/null 2>&1; then
+if MESH_CHAT_LOG="$TMP/bad.log" MESH_FYI_DIR="$TMP/fyi" "$ROOT/scripts/mesh-fyi-ledger" --build > /dev/null 2>"$TMP/bad.err"; then
   echo 'malformed FYI row unexpectedly passed' >&2
   exit 1
 fi
+grep -q '^mesh-fyi-ledger: line 1: malformed FYI marker$' "$TMP/bad.err"
+
+# Two concurrent board appends once interleaved their prefixes. Preserve the valid later event,
+# but publish the irrecoverable prefix as partial coverage instead of making every future rebuild fail.
+printf '%s\n' '2026-08-23T17:20:06Z  tg-in2026-08-22T18:30:08Z  tg-inbound@phaedra  ::  [fyi] tg-inbound NOEAR on phaedra: no poller {#recovered-event}' > "$TMP/interleaved.log"
+MESH_CHAT_LOG="$TMP/interleaved.log" MESH_FYI_DIR="$TMP/fyi" "$ROOT/scripts/mesh-fyi-ledger" --build > "$TMP/recovered.out"
+grep -q 'events=1 unique=1 repeats=0 linked=0 partial=yes' "$TMP/recovered.out"
+grep -q 'coverage=partial' "$TMP/fyi/manifest"
+grep -q 'parse_gaps=1' "$TMP/fyi/manifest"
+grep -q 'NOEAR on phaedra' "$TMP/fyi/fyi.journal"
+
+# A complete FYI event embedded in a historical non-FYI strand row is recoverable,
+# but the containing physical line remains an explicit coverage gap.
+printf '%s\n' \
+  '2026-08-30T18:17:17Z  land@phaedra  ::  [strand] 14 candidate(s) HELD as a REPLAYED OLD TREE, not a stream edit: mesh-load(rollback) 2026-08-22T19:40:06Z  tg-inbound@phaedra  ::  [fyi] tg-inbound NOEAR on phaedra: no poller {#embedded-event}' \
+  '2026-08-28T02:40:31Z  sync-tools@phaedra  ::  [drift-skip-local] parse issue archived as (1717 c2026-08-22T19:40:06Z  tg-inbound@phaedra  ::  [fyi] tg-inbound NOEAR on phaedra: no poller {#embedded-event}' > "$TMP/embedded.log"
+MESH_CHAT_LOG="$TMP/embedded.log" MESH_FYI_DIR="$TMP/fyi" "$ROOT/scripts/mesh-fyi-ledger" --build > "$TMP/embedded.out"
+grep -q 'events=2 unique=1 repeats=1 linked=0 partial=yes' "$TMP/embedded.out"
+grep -q '^coverage=partial$' "$TMP/fyi/manifest"
+grep -q '^parse_gaps=2$' "$TMP/fyi/manifest"
+grep -q '^parse_gap_lines=1,2$' "$TMP/fyi/manifest"
+grep -q '^journal_transactions=1$' "$TMP/fyi/manifest"
+grep -q 'NOEAR on phaedra' "$TMP/fyi/fyi.journal"
 
 # A board thread reference can repeat across distinct messages; the event hashes stay distinct.
 cat > "$TMP/collision.log" <<'EOF'
