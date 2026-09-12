@@ -12,4 +12,4 @@ Verified the two exact open autoland claims from `~/.mesh/chat.log` lines 56085 
 
 The second receipt was mirrored byte-for-byte from the original `task-receipts/` artifact because the root task-receipts lane is not included by `mesh-land`; both the original and mirror have the listed hash. `git show origin/main:<path> | sha256sum` confirmed each remote copy. `origin/main` was `9a2b87618d3a375cc472756f86980865528dd2f0` after both landings.
 
-Next: post owner-authored `[done]` evidence for both exact autoland keys, then close this witness task step with this artifact.
+At 2026-09-12T12:11:51Z and 12:11:52Z, `genome@mesh-home` posted owner-authored `[done]` lines for the two exact keys. The lines cite the verified remote paths, landing commits, and hashes. This closes the requested exact claims.
