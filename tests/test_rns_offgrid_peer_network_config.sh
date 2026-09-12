@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# orphan-ok: fixture-only regression test; not a deployable mesh tool.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
