@@ -35,6 +35,14 @@ MESH_MANIFEST_FIXTURE_ROWS="$rows" mesh_manifest_tool_paths "$repo" > "$tmp/tool
 grep -qx 'scripts/mesh-compat' "$tmp/tools"
 grep -qx 'scripts/sub/mesh-nested' "$tmp/tools"
 ! grep -qx 'scripts/sub/mesh-compat' "$tmp/tools"
+MESH_MANIFEST_FIXTURE_ROWS="$rows" mesh_manifest_install_sources "$repo" > "$tmp/install-sources"
+grep -qx $'scripts/mesh-compat\tmesh-compat' "$tmp/install-sources"
+grep -qx $'scripts/sub/mesh-nested\tmesh-nested' "$tmp/install-sources"
+! grep -q 'scripts/sub/mesh-compat' "$tmp/install-sources"
+MESH_MANIFEST_FIXTURE_ROWS="$rows" mesh_manifest_source_paths "$repo" > "$tmp/source-paths"
+grep -qx 'scripts/README.md' "$tmp/source-paths"
+grep -qx 'scripts/sub/mesh-worker.service' "$tmp/source-paths"
+! grep -qx 'tests/not-a-source' "$tmp/source-paths"
 MESH_MANIFEST_FIXTURE_ROWS="$rows" mesh_manifest_unit_paths "$repo" > "$tmp/units"
 grep -qx 'scripts/sub/mesh-worker.service' "$tmp/units"
 MESH_MANIFEST_FIXTURE_ROWS="$rows" mesh_manifest_orphan_paths "$repo" > "$tmp/orphans"
@@ -50,6 +58,16 @@ if MESH_MANIFEST_FIXTURE_ROWS="$tmp/unknown.tsv" mesh_manifest_tool_paths "$repo
 fi
 [ ! -s "$tmp/unknown.out" ]
 grep -q 'unknown kind' "$tmp/unknown.err"
+if MESH_MANIFEST_FIXTURE_ROWS="$tmp/unknown.tsv" mesh_manifest_install_sources "$repo" > "$tmp/unknown-installs.out" 2>"$tmp/unknown-installs.err"; then
+  echo 'install candidate reader accepted an unknown classification' >&2
+  exit 1
+fi
+[ ! -s "$tmp/unknown-installs.out" ]
+if MESH_MANIFEST_FIXTURE_ROWS="$tmp/unknown.tsv" mesh_manifest_source_paths "$repo" > "$tmp/unknown-paths.out" 2>"$tmp/unknown-paths.err"; then
+  echo 'coverage reader accepted an unknown classification' >&2
+  exit 1
+fi
+[ ! -s "$tmp/unknown-paths.out" ]
 
 cat > "$tmp/duplicate.tsv" <<'EOF'
 # mesh-manifest v1
