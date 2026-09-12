@@ -164,7 +164,16 @@ the comment there is updated so a future reader doesn't misdiagnose.
 ## Cadence
 
 - `mesh-records` — `*/2 * * * *` (must beat the audio-buffer's prune).
-- `mesh-sound-reflex` — `*/5 * * * *` (edge-triggered on ledger change; renders are bg).
+- `mesh-sound-reflex` — `*/10 * * * *` (edge-triggered on ledger change; renders are bg).
+
+The 10-minute cadence is the approved live contract: commit `4fe555866` (2026-07-20,
+"sound-reflex */10") records the operator-approved move from `*/5`. The grind can outlast
+multiple 5-minute slots (an 11.8-second note3 input once took about 14 minutes to render and
+wedged 2–3 slots); the producer runs detached, but its lock still suppresses overlapping ticks.
+The script's gap/coverage arithmetic therefore uses the declared 600-second slot. The live
+`mesh-load-gate --quiet-hours` may skip a slot, which stretches observed intervals and must be
+represented as reduced coverage rather than silently treated as a run. `mesh-records` remains at
+2 minutes so it archives before the audio buffer prunes.
 
 Both self-wire via `# reflex-cadence:` + `mesh-autowire` after a passing `--test`.
 
