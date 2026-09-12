@@ -1,0 +1,227 @@
+#!/usr/bin/env python3
+# orphan-ok: on-demand instrument for an unsurveyed joint pattern; no consumer or calibrated
+#   schedule exists yet. It pairs package-energy and CPU-idle residency in the same live window.
+"""mesh-idle-power — paired RAPL package watts and CPU deep-idle residency.
+
+This is an instrument, not a verdict: it asks whether package energy and deep CPU residency
+show joint structure in the same interval. Neither axis alone answers whether the package is
+using energy while the cores rest. It emits both axes, their shared window, and CPU coverage;
+there are no thresholds or invented fallback values. A missing axis exits 2.
+
+  mesh-idle-power          one aligned live sample
+  mesh-idle-power --json   machine-readable sample
+  mesh-idle-power --test   fixture assertions + real RAPL and cpuidle read
+"""
+
+import glob
+import json
+import math
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+RAPL = os.environ.get("MESH_IDLE_POWER_RAPL", "/sys/class/powercap/intel-rapl:0/energy_uj")
+CPUROOT = os.environ.get("MESH_IDLE_POWER_CPUROOT", "/sys/devices/system/cpu")
+ONLINE_PATH = os.environ.get("MESH_IDLE_POWER_ONLINE", "/sys/devices/system/cpu/online")
+DEEP_IDX = int(os.environ.get("MESH_IDLE_POWER_DEEP_IDX", "2"))
+WINDOW_S = float(os.environ.get("MESH_IDLE_POWER_WINDOW_S", "1.0"))
+
+
+def read_rapl(path):
+    """Return a numeric microjoule counter; use the established noninteractive root read if needed."""
+    try:
+        raw = Path(path).read_text().strip()
+    except PermissionError:
+        try:
+            p = subprocess.run(["sudo", "-n", "cat", path], text=True,
+                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                               timeout=3, check=False)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if p.returncode != 0:
+            return None
+        raw = p.stdout.strip()
+    except OSError:
+        return None
+    return int(raw) if re.fullmatch(r"[0-9]+", raw) else None
+
+
+def parse_cpu_list(raw):
+    cpus = set()
+    for part in raw.strip().split(","):
+        if not part:
+            return None
+        m = re.fullmatch(r"([0-9]+)(?:-([0-9]+))?", part)
+        if not m:
+            return None
+        lo, hi = int(m.group(1)), int(m.group(2) or m.group(1))
+        if hi < lo:
+            return None
+        cpus.update(range(lo, hi + 1))
+    return cpus or None
+
+
+def cpuidle_snapshot(root, online_path):
+    """Map CPU id to indexed idle-time counters; incomplete CPUs invalidate the axis."""
+    try:
+        online = parse_cpu_list(Path(online_path).read_text())
+    except OSError:
+        return None
+    if online is None:
+        return None
+    cpus = {}
+    paths = sorted(glob.glob(os.path.join(root, "cpu[0-9]*", "cpuidle")))
+    for base in paths:
+        m = re.search(r"cpu([0-9]+)$", os.path.dirname(base))
+        if not m:
+            continue
+        vals = {}
+        states = sorted(glob.glob(os.path.join(base, "state[0-9]*")))
+        for state in states:
+            sm = re.search(r"state([0-9]+)$", state)
+            if not sm:
+                continue
+            try:
+                raw = Path(state, "time").read_text().strip()
+            except OSError:
+                continue
+            if re.fullmatch(r"[0-9]+", raw):
+                vals[int(sm.group(1))] = int(raw)
+        if not vals:
+            return None
+        cpus[int(m.group(1))] = vals
+    return cpus if cpus and set(cpus) == online else None
+
+
+def derive(e0, e1, c0, c1, elapsed_us):
+    if e0 is None or e1 is None or c0 is None or c1 is None or set(c0) != set(c1):
+        return None
+    if elapsed_us <= 0 or e1 <= e0:
+        return None
+    all_idle_us = 0
+    deep_idle_us = 0
+    for cpu in c0:
+        if set(c0[cpu]) != set(c1[cpu]):
+            return None
+        for idx in c0[cpu]:
+            delta = c1[cpu][idx] - c0[cpu][idx]
+            if delta < 0:
+                return None
+            all_idle_us += delta
+            if idx >= DEEP_IDX:
+                deep_idle_us += delta
+    ncpu = len(c0)
+    watts = (e1 - e0) / elapsed_us
+    cpu_time_us = elapsed_us * ncpu
+    return {
+        "package_watts": round(watts, 3),
+        "cpu_idle_pct": round(100.0 * all_idle_us / cpu_time_us, 2),
+        "cpu_deep_idle_pct": round(100.0 * deep_idle_us / cpu_time_us, 2),
+        "deep_share_of_idle_pct": (round(100.0 * deep_idle_us / all_idle_us, 2)
+                                   if all_idle_us else None),
+        "window_ms": round(elapsed_us / 1000.0, 1),
+        "cpu_coverage": f"{ncpu}/{ncpu}",
+        "deep_state_index_min": DEEP_IDX,
+        "source": "RAPL package energy + cpuidle state*/time",
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+
+
+def measure(rapl_path, cpu_root, window_s):
+    e0 = read_rapl(rapl_path)
+    c0 = cpuidle_snapshot(cpu_root, ONLINE_PATH)
+    if e0 is None or c0 is None:
+        return None
+    t0 = time.monotonic_ns()
+    time.sleep(window_s)
+    t1 = time.monotonic_ns()
+    e1 = read_rapl(rapl_path)
+    c1 = cpuidle_snapshot(cpu_root, ONLINE_PATH)
+    elapsed_us = (t1 - t0) / 1000.0
+    # RAPL is a package-wide counter; the cpulist requires every online CPU, so coverage is the
+    # overlap of the global energy read and the complete online-core residency population.
+    return derive(e0, e1, c0, c1, elapsed_us)
+
+
+def fixture_test():
+    # The pair's math is deliberately unclassified: fixtures verify the axes and coverage math,
+    # while the live gate below proves that both hardware organs produce a shared-window sample.
+    with __import__("tempfile").TemporaryDirectory(prefix="mesh-idle-power-test-") as td:
+        cpuroot = Path(td, "cpu")
+        online = Path(td, "online")
+        online.write_text("0-1\n")
+        before = {}
+        after = {}
+        for cpu, vals, inc in ((0, (100_000, 200_000, 300_000), (100_000, 100_000, 100_000)),
+                               (1, (200_000, 300_000, 500_000), (200_000, 100_000, 100_000))):
+            before[cpu] = {}
+            after[cpu] = {}
+            for idx, val in enumerate(vals):
+                d = cpuroot / f"cpu{cpu}" / "cpuidle" / f"state{idx}"
+                d.mkdir(parents=True, exist_ok=True)
+                (d / "time").write_text(f"{val}\n")
+                before[cpu][idx] = val
+                after[cpu][idx] = val + inc[idx]
+        snap = cpuidle_snapshot(str(cpuroot), str(online))
+        if snap != before:
+            raise AssertionError(f"cpuidle fixture parse failed: {snap}")
+        if cpuidle_snapshot(str(Path(td, "missing")), str(online)) is not None:
+            raise AssertionError("missing cpuidle fixture must stay unknown")
+        online.write_text("0-2\n")
+        if cpuidle_snapshot(str(cpuroot), str(online)) is not None:
+            raise AssertionError("partial online-CPU coverage must stay unknown")
+        online.write_text("0-1\n")
+        (Path(td, "rapl")).write_text("12345\n")
+        if read_rapl(str(Path(td, "rapl"))) != 12345:
+            raise AssertionError("RAPL counter fixture parse failed")
+        (Path(td, "rapl")).write_text("not-a-counter\n")
+        if read_rapl(str(Path(td, "rapl"))) is not None:
+            raise AssertionError("malformed RAPL counter must stay unknown")
+        calc = derive(100, 5_000_100, before, after, 1_000_000)
+        expected = (5.0, 35.0, 10.0, 28.57)
+        got = (calc["package_watts"], calc["cpu_idle_pct"], calc["cpu_deep_idle_pct"],
+               calc["deep_share_of_idle_pct"])
+        if got != expected or calc["cpu_coverage"] != "2/2":
+            raise AssertionError(f"paired delta/coverage math failed: {got}, {calc['cpu_coverage']}")
+        if derive(100, 100, before, after, 1_000_000) is not None:
+            raise AssertionError("a non-advancing energy counter must stay unknown")
+        if derive(200, 100, before, after, 1_000_000) is not None:
+            raise AssertionError("a reset energy counter must stay unknown")
+    live = measure(RAPL, CPUROOT, WINDOW_S)
+    if live is None or not math.isfinite(live["package_watts"]) or live["package_watts"] <= 0:
+        print("mesh-idle-power --test: n/a — no positive live RAPL delta with complete cpuidle read",
+              file=sys.stderr)
+        return 2
+    if not (0 <= live["cpu_idle_pct"] <= 100 and 0 <= live["cpu_deep_idle_pct"] <= 100):
+        print(f"mesh-idle-power --test: FAIL — invalid live percentages: {live}", file=sys.stderr)
+        return 1
+    print("mesh-idle-power --test: PASS (fixture parsing/math + real aligned hardware read: "
+          + json.dumps(live, separators=(",", ":")) + ")")
+    return 0
+
+
+def main(argv):
+    if argv == ["--test"]:
+        return fixture_test()
+    if argv not in ([], ["--json"]):
+        print("usage: mesh-idle-power [--json|--test]", file=sys.stderr)
+        return 1
+    reading = measure(RAPL, CPUROOT, WINDOW_S)
+    if reading is None:
+        print("mesh-idle-power: UNREACHABLE — package-energy or complete cpuidle interval unavailable",
+              file=sys.stderr)
+        return 2
+    if argv == ["--json"]:
+        print(json.dumps(reading, separators=(",", ":")))
+    else:
+        print("[idle-power] package={package_watts}W cpu_idle={cpu_idle_pct}% "
+              "cpu_deep_idle={cpu_deep_idle_pct}% deep_of_idle={deep_share_of_idle_pct}% "
+              "window={window_ms}ms cpu_coverage={cpu_coverage}".format(**reading))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
