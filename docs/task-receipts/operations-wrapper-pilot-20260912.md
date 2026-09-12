@@ -11,7 +11,9 @@ implementation remains visible as a non-deployed tool owned by the same compatib
 
 The caller census found one live runtime caller at `~/.mesh/reflexes.cron:297` (`11,41 * * * *`
 invoking `~/.local/bin/mesh-model-pin`) and one source comment in `scripts/mesh-mind-state`. The
-installed path is a symlink to the source shim. The cron entry and cadence were not changed.
+cron entry and cadence were not changed. `mesh-land` deploys this node's command as a regular file
+copy, so the shim supports both symlink-to-source installs and regular copies: it first tries the
+resolved shim directory, then the checkout from `MESH_REPO`, `MESH_GENOME`, or `~/lte-workstation`.
 
 Verification passed:
 
@@ -26,11 +28,11 @@ manifest rows for the pilot
   scripts/mesh-model-pin: operations/tool/install, cadence header
   scripts/operations/mesh-model-pin: operations/tool/none, same compatibility owner
 cmp scripts/mesh-model-pin ~/.local/bin/mesh-model-pin
-  pass; deployed symlink target is the source shim
+  pass; the deployed regular file is byte-identical to the source shim
 (cd /tmp && /home/mesh-home/lte-workstation/scripts/mesh-model-pin --test)
   pass; 15/16 live panes carried a readable engine argv, ledger byte-count unchanged
 (cd /tmp && /home/mesh-home/.local/bin/mesh-model-pin --test)
-  pass with the same live-read result; proves the installed symlink reaches the nested implementation
+  pass with the same live-read result; proves the deployed regular copy resolves the nested source
 scripts/mesh-doctor --test
   pass; manifest inventory checked (Python SyntaxWarnings from embedded test code only)
 scripts/mesh-sync-tools --test
@@ -49,12 +51,16 @@ temporary inverse-move rehearsal
   restored implementation bytes matched the moved source
 ```
 
-Landing: `mesh-land` landed the original implementation at `d9cf26fe`, then landed the top-level
-shim at `1db25387`. Both revisions are on `origin/main` (`HEAD == origin/main` at verification).
-After deployment, the installed path still resolves to `scripts/mesh-model-pin`, and `cmp` confirms
-the deployed shim is byte-identical to the source shim.
+The first post-deploy test exposed that a regular installed copy could not find the nested source;
+the shim failed closed with exit 127. The fallback above corrected that, and the final deployed-copy
+test passed.
+
+Landing: `mesh-land` landed the original implementation at `d9cf26fe`, the top-level shim at
+`1db25387`, the deployed-copy fallback at `d15598dc`, and this receipt at `72e6bf98`. The follow-up
+receipt correction is being landed separately. The code revisions are on `origin/main`; after the
+final shim update, `HEAD == origin/main`, and `cmp` confirms deployed/source byte identity.
 
 Rollback: remove the top-level shim, move `scripts/operations/mesh-model-pin` back to
 `scripts/mesh-model-pin`, remove the empty `scripts/operations/` directory, then run
 `scripts/mesh-manifest --check` and `scripts/mesh-model-pin --test` from `/tmp`. The inverse move was
-rehearsed in an isolated temporary repository; no live cron, service, or deployed file was changed.
+rehearsed in an isolated temporary repository and made no live cron, service, or deployed-file changes.
