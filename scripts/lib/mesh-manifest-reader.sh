@@ -7,7 +7,7 @@ mesh_manifest_rows(){ # <repo> → validated TSV rows without the two header lin
     echo "mesh-manifest-reader: missing repository: $1" >&2
     return 1
   }
-  manifest="$repo/scripts/mesh-manifest"
+  manifest="${MESH_MANIFEST_TOOL:-$repo/scripts/mesh-manifest}"
   [ -x "$manifest" ] || {
     echo "mesh-manifest-reader: required checked manifest is not executable: $manifest" >&2
     return 1
@@ -74,6 +74,14 @@ mesh_manifest_rows(){ # <repo> → validated TSV rows without the two header lin
 
 mesh_manifest_tool_paths(){ # <repo> → source paths of installable tools
   mesh_manifest_rows "$1" | awk -F '\t' '$4 == "tool" && $5 == "install" { print $1 }'
+}
+
+mesh_manifest_install_sources(){ # <repo> → source_path<TAB>installed_basename for installable tools
+  mesh_manifest_rows "$1" | awk -F '\t' '$4 == "tool" && $5 == "install" { print $1 "\t" $2 }'
+}
+
+mesh_manifest_source_paths(){ # <repo> → every classified path under scripts/ and job/
+  mesh_manifest_rows "$1" | awk -F '\t' '{ print $1 }'
 }
 
 mesh_manifest_unit_paths(){ # <repo> → source paths of systemd units
