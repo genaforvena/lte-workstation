@@ -120,6 +120,46 @@ scripts/mesh-manifest --check
   PASS: 1205 complete rows; no duplicate installed basenames
 ```
 
+Post-land Open-Meteo parity: `cmp scripts/mesh-weather ~/.local/bin/mesh-weather` passed;
+manifest parity reports the shim `same` and the nested implementation non-deployed. The deployed
+`~/.local/bin/mesh-weather --test` again parsed a live response. Weather commits: `4ae1a689`,
+`b5a25357`, `aad04267`, `c2096108`, and `ce49b2de`.
+
+## Phone Wi-Fi protocol family slice
+
+The `mesh-wifi-link` implementation now lives at `scripts/integrations/mesh-wifi-link`; its shim
+retains the old command path and the observer-probe, cadence, args, state, and blind-marker headers.
+Its runtime contract is a Termux Wi-Fi connection-info read over SSH to the phone, not a local `iw`
+read. The source comment on the shim states this actual protocol. Existing callers remain on the
+legacy basename; the census found references across doctor, link/traffic senses, Wi-Fi fusion,
+phone AP, operator-state, and simulation tools.
+
+The single live reflex remains `~/.mesh/reflexes.cron:227` (`2-59/5 * * * *`, `--edge`); no second
+cadence was added. The focused migration test runs the tool's real-read gate and accepts exit 0 only
+with numeric link fields, or exit 2 only with an explicit `n/a`. This node's actual result is
+unavailable: the phone did not provide `termux-wifi-connectioninfo`, so there is no current Wi-Fi
+reading. The honest offline artifact is `~/.mesh/.wifi-link-offline`, freshly touched at
+2026-09-12 17:35:56 UTC; `.wifi-link.state` remains the older `GOOD` sample from 2026-09-03, and
+must not be presented as current coverage.
+
+```text
+scripts/mesh-wifi-link --test
+  exit 2: smoke-test n/a; phone/Termux Wi-Fi source unavailable
+bash tests/test-mesh-wifi-link-integration-slice.sh
+  PASS: manifest ownership/cadence declaration and honest real-read result through the shim
+bash -n scripts/mesh-wifi-link scripts/integrations/mesh-wifi-link \
+  tests/test-mesh-wifi-link-integration-slice.sh
+  PASS
+scripts/mesh-manifest --check
+  PASS: 1206 complete rows; no duplicate installed basenames
+```
+
+The local `mesh-wifi-quality` tool is not folded into this family: its current `--test` says
+`FAIL (no wireless iface)`, so its local-adapter result needs separate diagnosis. `mesh-phone-sensors`
+also remains in place because its current `--test` checks command presence/reachability rather than
+asserting a real sensor read; it needs a real-read gate before it can meet this task's verification
+contract.
+
 Verification:
 
 ```text
