@@ -56,9 +56,10 @@ the shim failed closed with exit 127. The fallback above corrected that, and the
 test passed.
 
 Landing: `mesh-land` landed the original implementation at `d9cf26fe`, the top-level shim at
-`1db25387`, the deployed-copy fallback at `d15598dc`, and this receipt at `72e6bf98`. The follow-up
-receipt correction is being landed separately. The code revisions are on `origin/main`; after the
-final shim update, `HEAD == origin/main`, and `cmp` confirms deployed/source byte identity.
+`1db25387`, and the deployed-copy fallback at `d15598dc`. The receipt was first landed at `72e6bf98`
+and corrected in a later `mesh-land` commit after the deployed-copy test exposed the path mismatch.
+The code revisions and final receipt are on `origin/main`; after the final shim update,
+`HEAD == origin/main`, and `cmp` confirms deployed/source byte identity.
 
 Rollback: remove the top-level shim, move `scripts/operations/mesh-model-pin` back to
 `scripts/mesh-model-pin`, remove the empty `scripts/operations/` directory, then run
