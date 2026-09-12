@@ -22,8 +22,10 @@ git -C "$tmp/work" config user.name 'mesh-land test'
 git -C "$tmp/work" config user.email 'mesh-land-test@example.invalid'
 git -C "$tmp/work" remote add origin "$tmp/origin.git"
 git -C "$tmp/work" config remote.origin.fetch '+refs/heads/*:refs/remotes/origin/*'
+mkdir -p "$tmp/work/scripts" "$tmp/work/job"
 printf '# seed\n' > "$tmp/work/README.md"
-git -C "$tmp/work" add README.md
+printf 'fixture\n' > "$tmp/work/scripts/manifest-fixture.asset"
+git -C "$tmp/work" add README.md scripts/manifest-fixture.asset
 git -C "$tmp/work" commit -qm seed
 git -C "$tmp/work" push -q -u origin master
 git -C "$tmp/work" fetch -q origin master
@@ -36,6 +38,7 @@ HOME="$tmp/home" PATH="$tmp/bin:/usr/bin:/bin" \
 MESH_REPO="$tmp/work" MESH_DIR="$tmp/mesh" \
 MESH_LAND_CHAT_LOG="$tmp/chat.log" MESH_LAND_BRANCH=master \
 MESH_LAND_PATHS="$receipt" MESH_LAND_SETTLE=0 \
+MESH_MANIFEST_READER="$root/scripts/lib/mesh-manifest-reader.sh" MESH_MANIFEST_TOOL="$root/scripts/mesh-manifest" \
 bash "$root/scripts/mesh-land" --apply 'Land receipt on master'
 
 local_head="$(git -C "$tmp/work" rev-parse HEAD)"
