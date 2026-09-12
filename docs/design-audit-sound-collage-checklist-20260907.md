@@ -142,3 +142,41 @@ Remaining audit gap: mutation-red receipts and a fresh reflex-owned settled MP3/
 receipt were not claimed. The implementation is landed and verified in source/deployed smoke tests,
 but the checklist remains `PARTIAL` rather than falsely green until a quiet-window live tick supplies
 those artifacts.
+
+## Six-task reconciliation (2026-09-12 00:14Z)
+
+Current owner audit and resolver receipt: `docs/task-receipts/unblock-tg-d5d46783d677c68e-resolve-20260912.md`.
+The old blocker text about absent helpers was stale: all three helpers and the production collage
+path are in the current source. This pass completed the missing live-artifact gate, so all six plan
+tasks now have current evidence:
+
+| plan task | disposition | current evidence |
+|---|---|---|
+| 1 `valid_source` | DONE | validity helper and silence/empty/corrupt fixtures pass; mutation-red receipt in `unblock-tg-d7120dfa529d79f6-resolve-20260911.md` |
+| 2 `cut_window` | DONE | randomized bounded cuts and varying-cut fixture pass; fixed-window mutant dies in the same receipt |
+| 3 `collage_build` | DONE | random valid-source subset, shuffled feed, and multi-part fixture pass; single-part mutant dies in the same receipt |
+| 4 `launch_grind` | DONE | detached launcher is exercised by the sandbox tick receipt and the fresh live render below |
+| 5 collage `tick` path | DONE | isolated ledger settles selected/non-selected rows; live params name `src=collage/083ad98e` and its input parts |
+| 6 recipe/verdict/deploy | DONE | source/deployed hashes match; `--test` passes; load-gated `*/10` wiring exists; fresh reflex-owned MP3 is decoded and ledger-settled below |
+
+Fresh live evidence from this audit:
+
+- A bounded one-shot `mesh-sound-reflex` tick returned `rc=0`. `room-music-params.log` records
+  `2026-09-12T00:08:50Z ... src=collage/083ad98e parts=083ad98e,223db7ed,4b5f916a cuts=0:8,6:12,6:8`.
+- The source record `ear 083ad98e` settled to
+  `ground:l120_w5_ss0.25_s0.25_c100-8000_m-poly_k3_n8_st2+3_2026_09_12_0008.mp3`; the other
+  collage members settled as `blended:083ad98e`.
+- The output is `/home/mesh-home/grainneukeln/output/l120_w5_ss0.25_s0.25_c100-8000_m-poly_k3_n8_st2+3_2026_09_12_0008.mp3`, 4,482,656 bytes, SHA-256
+  `391880bd1c4097557ef4a137a5dae0ef15f9a035c16a38787dedda101641aae3`, duration 112.039184s.
+  `ffprobe` reported that duration and size; full `ffmpeg -f null -` decode returned `rc=0`.
+- Fresh `timeout 150s bash scripts/mesh-sound-reflex --test` returned `rc=0`, `smoke-test: ok`.
+- `scripts/mesh-sound-reflex` and `~/.local/bin/mesh-sound-reflex` both hash to
+  `030160982a5f9324b68a9677c728e32a0d6ddc27b5afae004dcdb8361324ce44`; the load-gated `*/10`
+  reflex entry is present in `~/.mesh/reflexes.cron`.
+
+Disposition: the sound-collage dependency is satisfied; the parent audit can resume from this
+checklist. No production source change was needed in this resolver turn.
+
+The exact owner `tg` resumed `design-audit-task-sweep-20260907/plans-sound-collage` with event
+`collage-live-mp3-20260912` after the resolver receipt was completed. The six-task audit is settled
+against this artifact; the parent chain may continue to its next step.
