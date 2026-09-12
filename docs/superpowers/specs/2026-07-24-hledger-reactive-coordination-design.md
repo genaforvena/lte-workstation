@@ -1,5 +1,13 @@
 # hledger-centered reactive coordination — design (2026-07-24)
 
+> **Status (audited 2026-09-12): superseded as the coordination architecture.** The later decision
+> makes task-state events in `chat.log` authoritative and uses `mesh-task` for lifecycle and dispatch;
+> hledger remains an accounting/materialized view. The proposed `mesh-board-journal` and
+> `mesh-board-reactor` path is not the live dispatcher. See
+> [`docs/design-audit-hledger-reactive-coordination-20260912.md`](../../design-audit-hledger-reactive-coordination-20260912.md)
+> for current board, journal, dispatch, witness, and cadence evidence. Preserve this document as
+> design history, not as an implementation checklist.
+
 Operator direction (tg design session, 2026-07-24): put **hledger at the center of mesh
 coordination**, replace mind-call crons with reactive board-event reflexes, define roles as a
 chart of accounts, and make `chat.log` a proper hledger journal source. Supersedes the direction
