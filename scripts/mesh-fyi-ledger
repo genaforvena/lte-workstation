@@ -1,0 +1,296 @@
+#!/usr/bin/env python3
+# reflex-cadence: */10 * * * *
+# reflex-args: --build
+"""Rebuild an isolated, count-only FYI hledger view from the append-only board."""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import os
+import re
+import shlex
+import subprocess
+import sys
+import tempfile
+import time
+from collections import defaultdict
+from datetime import datetime
+from pathlib import Path
+
+
+LINE = re.compile(
+    r"^(?P<ts>\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ)\s+"
+    r"(?P<author>[^\s]+)\s+::\s+(?P<body>.*)$"
+)
+EVENT_ID = re.compile(r"\s+\{#(?P<id>[A-Za-z0-9._:-]+)\}\s*$")
+TASK_TAG = re.compile(r"(?:^|[,;\s])task:([A-Za-z0-9._/-]+)(?=$|[,;\s])")
+PRODUCER_TAG = re.compile(r"(?:^|[,;\s])producer:([A-Za-z0-9._/-]+)(?=$|[,;\s])")
+FYI_MARKER = re.compile(r"::\s*\[fyi(?:\]|\b)", re.IGNORECASE)
+
+
+def fail(message: str, code: int = 2) -> "NoReturn":
+    print(f"mesh-fyi-ledger: {message}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def safe_account(value: str) -> str:
+    value = re.sub(r"[^A-Za-z0-9_-]+", "-", value).strip("-").lower()
+    return value or "unknown"
+
+
+def parse_source(path: Path) -> tuple[list[dict[str, str]], dict[str, str]]:
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        fail(f"cannot read source {path}: {exc}")
+    complete = raw.endswith(b"\n") or not raw
+    # Older board prose can contain unrelated encoding damage. Preserve the byte-level source
+    # hash and tolerate that damage outside FYI events; an FYI row itself must remain decodable.
+    text = raw.decode("utf-8", errors="replace")
+
+    rows: list[dict[str, str]] = []
+    errors: list[str] = []
+    identities: dict[str, tuple[str, str, str, str]] = {}
+    lines = text.splitlines()
+    for number, line in enumerate(lines, 1):
+        if not FYI_MARKER.search(line):
+            continue
+        if "\ufffd" in line:
+            errors.append(f"line {number}: FYI row contains invalid UTF-8")
+            continue
+        match = LINE.match(line)
+        if not match:
+            errors.append(f"line {number}: malformed FYI row")
+            continue
+        body = match.group("body")
+        if not body.startswith("[fyi]"):
+            errors.append(f"line {number}: malformed FYI marker")
+            continue
+        ts = match.group("ts")
+        try:
+            datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ")
+        except ValueError:
+            errors.append(f"line {number}: malformed timestamp")
+            continue
+        id_match = EVENT_ID.search(body)
+        source_ref = id_match.group("id") if id_match else ""
+        # The trailing board marker may identify a shared thread rather than this individual
+        # message. Hash the complete raw line for event identity; retain that marker separately.
+        event_id = hashlib.sha256(line.encode("utf-8")).hexdigest()
+        if id_match:
+            body = body[: id_match.start()]
+        author = match.group("author").split("@", 1)[0]
+        text_body = body[len("[fyi]") :].strip()
+        # Only comment metadata after the first semicolon is a task association. A prose mention, even
+        # one beginning with the literal task:, is not allowed to become a ledger tag.
+        metadata = body.split(";", 1)[1] if ";" in body else ""
+        task_match = TASK_TAG.search(metadata)
+        task = task_match.group(1) if task_match else ""
+        producer_match = PRODUCER_TAG.search(metadata)
+        producer = safe_account(producer_match.group(1) if producer_match else author)
+        recurrence_text = body.split(";", 1)[0][len("[fyi]") :]
+        recurrence_text = re.sub(r"\btask:[A-Za-z0-9._/-]+", "", recurrence_text, flags=re.I)
+        recurrence = " ".join(re.findall(r"[a-z0-9]+", recurrence_text.lower()))
+        signature = (ts, producer, text_body, task)
+        if event_id in identities and identities[event_id] != signature:
+            errors.append(f"line {number}: event identity collision for {event_id}")
+            continue
+        identities[event_id] = signature
+        rows.append({
+            "ts": ts,
+            "producer": producer,
+            "event_id": event_id,
+            "source_ref": source_ref,
+            "body": text_body,
+            "task": task,
+            "recurrence": recurrence or "(empty)",
+        })
+    if errors:
+        fail("; ".join(errors[:5]) + (f"; and {len(errors)-5} more" if len(errors) > 5 else ""))
+    # An unterminated trailing record is excluded from the materialized count and marked partial.
+    if not complete and lines and FYI_MARKER.search(lines[-1]):
+        rows = [r for r in rows if r["event_id"] != "line-" + hashlib.sha256(lines[-1].encode()).hexdigest()]
+    cutoff = ""
+    for line in reversed(lines):
+        match = LINE.match(line)
+        if match:
+            cutoff = match.group("ts")
+            break
+    manifest = {
+        "source_cutoff": cutoff or "UNKNOWN",
+        "source_sha256": hashlib.sha256(raw).hexdigest(),
+        "source_bytes": str(len(raw)),
+        "coverage": "complete" if complete else "partial",
+        "source_lines": str(len(lines)),
+        "replay_count": str(len(rows)),
+        "unique_event_ids": str(len({r["event_id"] for r in rows})),
+        "partial_tail": "no" if complete else "yes",
+    }
+    return rows, manifest
+
+
+def write_atomic(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as out:
+            out.write(content)
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(temp_name, path)
+    except Exception:
+        try:
+            os.unlink(temp_name)
+        except OSError:
+            pass
+        raise
+
+
+def witness_lines(rows: list[dict[str, str]], task_journal: Path) -> list[str]:
+    by_id: dict[str, dict[str, str]] = {}
+    for row in rows:
+        by_id.setdefault(row["event_id"], row)
+    rows = list(by_id.values())
+    grouped: dict[tuple[str, str], list[dict[str, str]]] = defaultdict(list)
+    for row in rows:
+        grouped[(row["producer"], row["recurrence"])].append(row)
+    recurring = [(key, group) for key, group in grouped.items() if len(group) > 1]
+    statuses = task_dispositions(task_journal)
+    rendered = ["FYI recurrence: none in replayed source window"] if not recurring else []
+    for (producer, event), group in sorted(recurring, key=lambda item: (-len(item[1]), item[0]))[:4]:
+        tasks = sorted({r["task"] for r in group if r["task"]})
+        linked = ",".join(f"task:{t} disposition={statuses.get(t, 'UNKNOWN')}" for t in tasks) or "task:none"
+        rendered.append(f"{producer} {event} count={len(group)} {linked}")
+    by_task: dict[str, set[str]] = defaultdict(set)
+    for row in rows:
+        if row["task"]:
+            by_task[row["task"]].add(row["event_id"])
+    repeated_tasks = [(task, len(ids)) for task, ids in by_task.items() if len(ids) > 1]
+    if repeated_tasks:
+        for task, count in sorted(repeated_tasks, key=lambda item: (-item[1], item[0]))[:4]:
+            rendered.append(f"linked-task task:{task} fyi_events={count} disposition={statuses.get(task, 'UNKNOWN')}")
+    else:
+        rendered.append("linked-task recurrence: none (no explicit task tag repeats)")
+    return rendered
+
+
+def build(rows: list[dict[str, str]], manifest: dict[str, str], outdir: Path) -> tuple[int, int]:
+    lines = ["; Rebuilt count-only FYI view; source of truth remains chat.log.", "commodity FYI", ""]
+    by_id: dict[str, dict[str, str]] = {}
+    for row in rows:
+        by_id.setdefault(row["event_id"], row)
+    unique_rows = list(by_id.values())
+    for row in unique_rows:
+        day = row["ts"][:10]
+        description = " ".join(row["body"].split()).replace("\n", " ")
+        if len(description) > 500:
+            description = description[:497] + "..."
+        tags = [f"event_id:{row['event_id']}", f"producer:{row['producer']}"]
+        if row["source_ref"]:
+            tags.append(f"source_ref:{safe_account(row['source_ref'])}")
+        if row["task"]:
+            tags.append(f"task:{row['task']}")
+        lines.append(f"{day} * FYI {row['producer']} {shlex.quote(description)}")
+        lines.append("    events:fyi:" + row["producer"] + "  1 FYI")
+        lines.append("    equity:fyi  -1 FYI  ; " + " ".join(tags))
+        lines.append("")
+    journal = "\n".join(lines)
+    write_atomic(outdir / "fyi.journal", journal)
+    manifest["events"] = str(len(rows))
+    manifest["journal_unique_events"] = str(len(unique_rows))
+    manifest["repeat_event_ids"] = str(len(rows) - len(unique_rows))
+    write_atomic(outdir / "manifest", "".join(f"{k}={v}\n" for k, v in manifest.items()))
+    hledger = os.environ.get("HLEDGER", "hledger")
+    try:
+        check = subprocess.run([hledger, "-f", str(outdir / "fyi.journal"), "check"],
+                               text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                               check=False, timeout=20)
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        fail(f"hledger check unavailable: {exc}")
+    if check.returncode:
+        fail("hledger rejected generated FYI journal: " + check.stdout.strip())
+    try:
+        printed = subprocess.run([hledger, "-f", str(outdir / "fyi.journal"), "print"],
+                                 text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                 check=False, timeout=20)
+    except subprocess.TimeoutExpired as exc:
+        fail(f"hledger replay timed out: {exc}")
+    if printed.returncode:
+        fail("hledger replay failed: " + printed.stdout.strip())
+    journal_count = len(re.findall(r"(?m)^\d{4}-\d\d-\d\d \*", printed.stdout))
+    event_count = len(re.findall(r"; event_id:", journal))
+    manifest["journal_transactions"] = str(journal_count)
+    manifest["identity_postings"] = str(event_count)
+    manifest["replay_parity"] = "pass" if journal_count == len(unique_rows) == event_count else "fail"
+    if manifest["replay_parity"] != "pass":
+        fail(f"independent replay mismatch: unique_source={len(unique_rows)} identities={event_count} hledger={journal_count}")
+    write_atomic(outdir / "manifest", "".join(f"{k}={v}\n" for k, v in manifest.items()))
+    task_journal = Path(os.environ.get("MESH_TASK_JOURNAL", str(Path.home() / ".mesh/tasks.journal")))
+    write_atomic(outdir / "witness.txt", "\n".join(witness_lines(rows, task_journal)) + "\n")
+    return len(rows), len(unique_rows)
+
+
+def task_dispositions(path: Path) -> dict[str, str]:
+    statuses: dict[str, str] = {}
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return statuses
+    terminal = {"DONE", "REJECTED", "BLOCKED", "HELD_REJECTED", "HELD_EXPIRED", "OPEN_UNOWNED", "QUEUED", "RUNNING"}
+    for line in lines:
+        fields = line.split("\t")
+        if len(fields) < 3 or fields[0] not in terminal:
+            continue
+        task_id = fields[2].split()[0]
+        slug = task_id.rsplit("/", 1)[-1]
+        statuses[slug] = fields[0]
+        statuses[task_id] = fields[0]
+    return statuses
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--build", action="store_true", help="rebuild the independent FYI journal")
+    mode.add_argument("--witness", action="store_true", help="replay recurring events and explicitly linked task dispositions")
+    mode.add_argument("--dash", action="store_true", help="render a bounded witness summary from the current materialization")
+    mode.add_argument("--test", action="store_true", help="run the focused FYI-ledger test")
+    args = parser.parse_args()
+    if args.test:
+        root = Path(__file__).resolve().parent.parent
+        return subprocess.run(["bash", str(root / "tests/test-mesh-fyi-ledger.sh")], check=False).returncode
+    outdir = Path(os.environ.get("MESH_FYI_DIR", str(Path.home() / ".mesh/fyi")))
+    if args.dash:
+        # Dashboard reads only the bounded materialization; it does not rescan chat.log.
+        manifest_path = outdir / "manifest"
+        try:
+            fields = dict(line.split("=", 1) for line in manifest_path.read_text(encoding="utf-8").splitlines() if "=" in line)
+            age = max(0, int(time.time() - manifest_path.stat().st_mtime))
+        except (OSError, ValueError):
+            print("FYI view: UNAVAILABLE (missing or malformed materialization)")
+            return 0
+        coverage = fields.get("coverage", "unknown")
+        freshness = " STALE" if age > 900 else ""
+        print(f"FYI view: events={fields.get('events', 'UNKNOWN')} coverage={coverage} replay={fields.get('replay_parity', 'UNKNOWN')} age={age}s{freshness} source_cutoff={fields.get('source_cutoff', 'UNKNOWN')}")
+        try:
+            print((outdir / "witness.txt").read_text(encoding="utf-8"), end="")
+        except OSError:
+            print("FYI witness: UNAVAILABLE (no materialized recurrence query)")
+        return 0
+    source = Path(os.environ.get("MESH_CHAT_LOG", str(Path.home() / ".mesh/chat.log")))
+    rows, manifest = parse_source(source)
+    if args.build:
+        total, unique = build(rows, manifest, outdir)
+        repeats = total - unique
+        unique_rows = {r["event_id"]: r for r in rows}.values()
+        print(f"mesh-fyi-ledger: events={total} unique={unique} repeats={repeats} linked={sum(bool(r['task']) for r in unique_rows)} partial={'yes' if manifest['coverage'] == 'partial' else 'no'} source_cutoff={manifest['source_cutoff']} source_sha256={manifest['source_sha256']}")
+        return 0
+    if args.witness:
+        for line in witness_lines(rows, Path(os.environ.get("MESH_TASK_JOURNAL", str(Path.home() / ".mesh/tasks.journal")))):
+            print(line)
+        return 0
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
