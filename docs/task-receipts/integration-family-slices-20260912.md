@@ -90,6 +90,36 @@ reports the shim as deployed `same` and the nested source as non-deployed. The d
 explicit pass state when another process holds the real device. The pre-move test had produced and
 validated a real JPEG frame. Camera commits: `6410ecde`, `3f543e88`, `6ecf044f`, and `c2f2b737`.
 
+## Open-Meteo external-service family slice
+
+The `mesh-weather` client now lives at `scripts/integrations/mesh-weather`, with the existing
+top-level command retained as the installable shim and its `23 * * * *` cadence declaration kept
+there. Runtime classification is an external forecast API adapter: it fetches hourly Open-Meteo
+temperatures using only city-level coordinates from gitignored `~/.mesh/weather.env`. The config
+file and coordinates remain outside the repository. The downstream `mesh-therm-watch` and
+`mesh-climate` consumers keep their old command path.
+
+The live cadence census found exactly one existing entry at `~/.mesh/reflexes.cron:128`; no second
+cron or service schedule was found. The task test passed its parser, thermal flag/edge, blind, and
+unseeded fixtures, then parsed a live response for the already-seeded coordinates:
+
+```text
+bash tests/test-mesh-weather-integration-slice.sh
+  PASS: destination/domain/owner, shim dispatch, fixture behavior, and live fetch parse
+env -u MESH_WEATHER_SRC MESH_STATE_DIR=/tmp/mesh-weather-slice.O4LxXe \
+  MESH_WEATHER_ENV=/home/mesh-home/.mesh/weather.env \
+  MESH_WEATHER_TAPE=/tmp/mesh-weather-slice.O4LxXe/weather.log MESH_WEATHER_CHAT=0 \
+  scripts/mesh-weather
+  PASS: real fetch artifact at /tmp/mesh-weather-slice.O4LxXe/.weather-state, mtime
+  2026-09-12 17:31:58 UTC, `now_c=16.4 today_max_c=17.1 peak_hour=15 thermal_day=0`
+  Chat output was disabled and all state/tape writes were confined to the temporary directory.
+bash -n scripts/mesh-weather scripts/integrations/mesh-weather \
+  tests/test-mesh-weather-integration-slice.sh
+  PASS
+scripts/mesh-manifest --check
+  PASS: 1205 complete rows; no duplicate installed basenames
+```
+
 Verification:
 
 ```text
