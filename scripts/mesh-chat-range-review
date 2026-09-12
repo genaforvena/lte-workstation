@@ -1,0 +1,241 @@
+#!/usr/bin/env python3
+# reflex-cadence: * * * * *
+"""Create exact, owner-routed witness reviews for independent chat.log ranges.
+
+Each tier owns a physical-line cursor and counts source messages in fixed-size batches.
+The reflex's own generated chains are excluded from every tier so its task posts do not
+recursively trigger more reviews.  A batch stays pending until mesh-task replay confirms
+that its exact witness task was dispatched.
+"""
+
+from __future__ import annotations
+
+import fcntl
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+
+MESH = Path(os.environ.get("MESH_DIR", str(Path.home() / ".mesh")))
+CHAT = Path(os.environ.get("MESH_CHAT_REVIEW_CHAT_LOG", str(MESH / "chat.log")))
+STATE = Path(os.environ.get("MESH_CHAT_REVIEW_STATE", str(MESH / ".chat-range-review.state")))
+TASK_CMD = os.environ.get("MESH_CHAT_REVIEW_TASK_CMD", str(Path.home() / ".local/bin/mesh-task"))
+OWNER = "witness"
+CHAIN_PREFIX = "witness-chat-range-review-"
+TIERS = (("near", 50), ("medium", 250), ("deep", 1000))
+MESSAGE_RE = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\s+\S+\s+::\s+(?P<body>.*)$")
+
+
+def atomic_write(path: Path, value: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent, text=True)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, sort_keys=True, indent=2)
+            handle.write("\n")
+        os.replace(tmp, path)
+    finally:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+
+
+def load_state() -> dict:
+    try:
+        state = json.loads(STATE.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"invalid cursor state {STATE}: {exc}") from exc
+    if not isinstance(state, dict) or state.get("version") != 1 or not isinstance(state.get("tiers"), dict):
+        raise RuntimeError(f"invalid cursor state shape: {STATE}")
+    for name, _size in TIERS:
+        tier = state["tiers"].get(name)
+        if not isinstance(tier, dict) or not isinstance(tier.get("cursor"), int):
+            raise RuntimeError(f"missing or invalid {name} cursor in {STATE}")
+        pending = tier.get("pending")
+        if pending is not None and not isinstance(pending, dict):
+            raise RuntimeError(f"invalid pending {name} range in {STATE}")
+    return state
+
+
+def is_source_message(raw: str) -> bool:
+    """Count board messages, not machine ledger rows or this reflex's own posts."""
+    match = MESSAGE_RE.match(raw)
+    if not match:
+        return False
+    body = match.group("body")
+    if body.startswith(("[task-state]", "[task-ledger]")):
+        return False
+    return CHAIN_PREFIX not in raw
+
+
+def next_batch(lines: list[str], cursor: int, size: int) -> dict | None:
+    """Return the next exact batch after a 1-based physical line cursor."""
+    first = last = count = None
+    for line_number, raw in enumerate(lines[cursor:], start=cursor + 1):
+        if not is_source_message(raw):
+            continue
+        if first is None:
+            first = line_number
+        last = line_number
+        count = (count or 0) + 1
+        if count == size:
+            return {"start_line": first, "end_line": last, "count": size}
+    return None
+
+
+def chain_for(tier: str, batch: dict) -> str:
+    return f"{CHAIN_PREFIX}{tier}-{batch['start_line']}-{batch['end_line']}"
+
+
+def description_for(tier: str, size: int, batch: dict, chain: str) -> str:
+    ranges = {
+        "near": "Check current task ownership, progress, artifacts, and independent verification; flag concrete issues and propose actionable fixes.",
+        "medium": "Look for repeated coordination failures and improvement opportunities; verify exact owners, progress, artifacts, and independent checks before recommending changes.",
+        "deep": "Review systemic patterns across the range, test whether board and task-ledger behavior agree, and propose concrete improvements or corrective owner-routed tasks.",
+    }
+    return (
+        f"Analyze exactly {size} source messages in ~/.mesh/chat.log physical lines "
+        f"{batch['start_line']}-{batch['end_line']}; exactly {size} source messages. "
+        f"Ignore structural [task-state]/[task-ledger] rows and this reflex's own records carrying {CHAIN_PREFIX}; "
+        f"count only board messages in that physical range. {ranges[tier]} "
+        f"For every issue, cite source line(s), exact task/owner, progress, artifact, and independent verification. "
+        f"Suggest concrete improvements and fixes; create or update exact tasks routed to their responsible owners. "
+        f"Write an evidence-backed receipt to docs/chat-range-reviews/{chain}.md."
+    )
+
+
+def task_records() -> dict:
+    result = subprocess.run([TASK_CMD, "replay", "--json"], env=dict(os.environ, MESH_DIR=str(MESH)),
+                            text=True, capture_output=True, check=False)
+    if result.returncode:
+        detail = (result.stderr or result.stdout).strip().replace("\n", " ")
+        raise RuntimeError(f"mesh-task replay failed ({result.returncode}): {detail}")
+    try:
+        records = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"mesh-task replay returned invalid JSON: {exc}") from exc
+    if not isinstance(records, dict):
+        raise RuntimeError("mesh-task replay returned a non-object")
+    return records
+
+
+def run_task(chain: str, description: str) -> None:
+    env = dict(os.environ, MESH_DIR=str(MESH), MESH_TASK_ACTOR=OWNER, MESH_WHO=OWNER)
+    records = task_records()
+    record = records.get(chain)
+    if record is None:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", prefix="chat-range-review-", suffix=".tsv", delete=False) as handle:
+            plan = Path(handle.name)
+            handle.write(f"{OWNER}\treview\t5\t{description}\n")
+        try:
+            result = subprocess.run([TASK_CMD, "create", chain, str(plan)], env=env,
+                                    text=True, capture_output=True, check=False)
+            if result.returncode:
+                detail = (result.stderr or result.stdout).strip().replace("\n", " ")
+                # A concurrent reflex may have committed the deterministic chain after replay.
+                records = task_records()
+                record = records.get(chain)
+                if record is None:
+                    raise RuntimeError(f"mesh-task create failed ({result.returncode}): {detail}")
+        finally:
+            plan.unlink(missing_ok=True)
+
+    if record is None:
+        records = task_records()
+        record = records.get(chain)
+    if not isinstance(record, dict) or not isinstance(record.get("data"), dict):
+        raise RuntimeError(f"mesh-task replay cannot verify {chain}")
+    data = record["data"]
+    steps = data.get("steps")
+    if not isinstance(steps, list) or not steps or steps[0].get("owner") != OWNER:
+        raise RuntimeError(f"{chain} is not an exact {OWNER}-owned task")
+    if description.split(".")[0] not in str(steps[0].get("description", "")):
+        raise RuntimeError(f"{chain} description does not match the pending source range")
+    if data.get("status") == "complete":
+        return
+    if data.get("dispatch") != "sent":
+        result = subprocess.run([TASK_CMD, "dispatch", chain], env=env,
+                                text=True, capture_output=True, check=False)
+        if result.returncode:
+            detail = (result.stderr or result.stdout).strip().replace("\n", " ")
+            raise RuntimeError(f"mesh-task dispatch failed ({result.returncode}): {detail}")
+    confirmed = task_records().get(chain, {}).get("data", {})
+    if confirmed.get("status") != "complete" and confirmed.get("dispatch") != "sent":
+        raise RuntimeError(f"mesh-task did not durably mark {chain} dispatched")
+
+
+def run() -> int:
+    if not CHAT.is_file():
+        raise RuntimeError(f"chat.log unavailable: {CHAT}")
+    lock = STATE.with_name(STATE.name + ".lock")
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    with lock.open("a+") as lock_handle:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        lines = CHAT.read_text(encoding="utf-8", errors="replace").splitlines()
+        state = load_state()
+        if not state:
+            atomic_write(STATE, {"version": 1, "tiers": {
+                name: {"cursor": len(lines), "pending": None} for name, _size in TIERS
+            }})
+            print(f"mesh-chat-range-review: initialized at chat.log line {len(lines)}; historical messages left untouched")
+            return 0
+        if any(tier["cursor"] > len(lines) for tier in state["tiers"].values()):
+            raise RuntimeError("chat.log shrank behind a saved cursor; refusing to replay or skip history")
+
+        for tier_name, size in TIERS:
+            tier = state["tiers"][tier_name]
+            pending = tier.get("pending")
+            if pending is None:
+                batch = next_batch(lines, tier["cursor"], size)
+                if batch is None:
+                    continue
+                chain = chain_for(tier_name, batch)
+                pending = {**batch, "chain": chain}
+                tier["pending"] = pending
+                atomic_write(STATE, state)  # durable claim before task creation/dispatch
+            chain = pending.get("chain")
+            expected_chain = chain_for(tier_name, pending)
+            if chain != expected_chain:
+                raise RuntimeError(f"pending {tier_name} chain does not match its saved range")
+            description = description_for(tier_name, size, pending, chain)
+            run_task(chain, description)
+            tier["cursor"] = pending["end_line"]
+            tier["pending"] = None
+            atomic_write(STATE, state)
+            print(f"mesh-chat-range-review: dispatched {chain} lines={pending['start_line']}-{pending['end_line']} messages={size}")
+    return 0
+
+
+def self_test() -> int:
+    sample = [f"2026-09-12T00:00:00Z mind :: board line {i}" for i in range(1, 8)]
+    sample.insert(2, f"2026-09-12T00:00:00Z mind :: [task-state] {CHAIN_PREFIX}near-1-2")
+    batch = next_batch(sample, 0, 5)
+    assert batch == {"start_line": 1, "end_line": 6, "count": 5}, batch
+    assert next_batch(sample, 6, 3) is None
+    assert dict(TIERS) == {"near": 50, "medium": 250, "deep": 1000}
+    assert chain_for("medium", {"start_line": 6, "end_line": 255}) == f"{CHAIN_PREFIX}medium-6-255"
+    prompt = description_for("near", 50, {"start_line": 1, "end_line": 50}, "sample")
+    assert "Suggest concrete improvements and fixes" in prompt
+    assert "create or update exact tasks" in prompt
+    print("mesh-chat-range-review --test: PASS (50/250/1000 source ranges, ledger/self-post exclusion, deterministic chain)")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        if len(sys.argv) == 2 and sys.argv[1] == "--test":
+            raise SystemExit(self_test())
+        if len(sys.argv) != 1:
+            print("usage: mesh-chat-range-review [--test]", file=sys.stderr)
+            raise SystemExit(2)
+        raise SystemExit(run())
+    except RuntimeError as exc:
+        print(f"mesh-chat-range-review: {exc}", file=sys.stderr)
+        raise SystemExit(1)
