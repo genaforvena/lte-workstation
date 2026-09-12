@@ -84,6 +84,12 @@ scripts/mesh-manifest --check
   PASS: 1204 complete rows; no duplicate installed basenames
 ```
 
+Post-land camera parity: `cmp scripts/mesh-camera ~/.local/bin/mesh-camera` passed; the manifest
+reports the shim as deployed `same` and the nested source as non-deployed. The deployed
+`~/.local/bin/mesh-camera --test` returned 0 with `camera present but BUSY`, which is the tool's
+explicit pass state when another process holds the real device. The pre-move test had produced and
+validated a real JPEG frame. Camera commits: `6410ecde`, `3f543e88`, `6ecf044f`, and `c2f2b737`.
+
 Verification:
 
 ```text
