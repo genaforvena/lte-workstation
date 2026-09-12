@@ -193,6 +193,11 @@ scripts/mesh-manifest --check
   PASS: 1207 complete rows; no duplicate installed basenames
 ```
 
+Post-land Note 3 parity: `cmp scripts/mesh-note3-battery ~/.local/bin/mesh-note3-battery` passed;
+manifest parity reports the shim `same` and nested source non-deployed. The deployed test again
+passed with a live ADB battery read, and the single `--edge` cron line remained unchanged. Note 3
+commits: `62fa542f`, `86983f53`, `201e94e0`, and `18c406e8`.
+
 Verification:
 
 ```text
