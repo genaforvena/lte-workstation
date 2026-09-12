@@ -228,8 +228,17 @@ scripts/mesh-manifest --check
 
 The caller census keeps `mesh-imac-cam-watch` on the old public basename. The existing iMac watcher
 service remains unchanged. The source path `.m` is a runtime companion to the nested implementation;
-mesh-land's asset-pair rules must keep it paired with the executable during landing. Post-land
-compatibility/deployed test and parity are still pending.
+mesh-land's asset-pair rules kept the source pair together. Post-land parity reports the public shim
+`same` at `~/.local/bin/mesh-imac-cam`, with both nested implementation/helper correctly
+non-deployed. The deployed compatibility command reran the same settle-core and honest unreachable
+gate. Commits: `9a49272a`, `53ac3aeb`, `d319129f`, `fb436379`, `a653595a`, and `9b423af0`.
+
+`scripts/mesh-land --test` passed after a one-line fixture correction made its synthetic untracked
+lane tool executable before asking the real manifest enumerator to classify it. The scoped quiet
+`mesh-land --check` returned 1 because the selected migration files were settled candidates, as its
+documented contract specifies. The landing printed a stale old-path `pathspec` warning while
+processing the helper rename; the final tree has no old helper path, the new pair is in the manifest,
+and `HEAD == origin/main` after the landing.
 
 Remaining phone-tool disposition: `mesh-wifi-quality --test` reports no local wireless interface,
 and `mesh-phone-sensors --test` does not assert a real sensor read, so neither has been moved. The
