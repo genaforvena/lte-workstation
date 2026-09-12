@@ -1,0 +1,68 @@
+# Integration-family migration progress — 2026-09-12
+
+Task: `tg-scripts-layout-migration-20260912/integration-family-slices` (owner: genome).
+
+This is the first isolated family slice, not completion of the task. The phone body-motion sensor
+implementation now lives at `scripts/integrations/mesh-body-motion`; the original executable path is
+retained as a compatibility shim. The manifest classifies the nested implementation as
+`integrations/tool/none`, and the shim as the sole installable `mesh-body-motion` entry. The
+manifest domain classifier now recognizes the `scripts/integrations/` destination directly.
+
+Runtime contract: `mesh-body-motion` is a read-only phone sensor adapter. It obtains a fused sensor
+sample over SSH/Termux and publishes the same state artifact and confidence/freshness vocabulary.
+Its test explicitly preserves the honest unavailable result (exit 2) when the phone or
+`termux-sensor` cannot be reached. The separate `mesh-body-context` tool is downstream fusion, not
+a device/protocol adapter, so it remains in the top-level operations inventory.
+
+The caller census found references across the phone/body fusion and presentation tools; those
+callers continue resolving the old basename. No caller or scheduled command was rewritten. The
+existing header cadence and the single live entry at
+`~/.mesh/reflexes.cron:219` (`7-59/10 * * * *`) remain unchanged; no second cadence was added.
+
+Verification:
+
+```text
+bash tests/test-mesh-integration-family-slice.sh
+  PASS: manifest classification; source shim and regular deployed-copy fallback resolve to the
+  nested implementation and return a fresh fixture state without phone access
+bash tests/test-mesh-manifest.sh
+  PASS: inventory fixture matrix and duplicate installed-basename guard
+scripts/mesh-manifest --check
+  PASS: 1202 complete rows; no duplicate installed basenames
+bash tests/test-mesh-manifest-consumers.sh
+  PASS: both consumer --test paths outside the repository
+scripts/mesh-sync-tools --test
+scripts/mesh-doctor --test
+scripts/mesh-autowire --test
+scripts/mesh-land --test
+scripts/mesh-vitality --test
+  PASS (mesh-doctor emitted existing Python SyntaxWarnings; no test failure)
+bash tests/test-mesh-body-motion-test-real-read.sh
+bash tests/test-mesh-body-motion-status-freshness
+  PASS: two-sample read gate and state freshness behavior
+bash -n scripts/mesh-body-motion scripts/integrations/mesh-body-motion \
+  tests/test-mesh-integration-family-slice.sh
+  PASS
+scripts/mesh-body-motion --test
+  classifier and simulation-isolation checks PASS; real sensor arm returned exit 2 after SSH
+  timeout to 100.103.99.16:8022; the sensor is unavailable, not reported as healthy
+~/.mesh/.body-motion-state
+  current contents `|OFFLINE||||`, mtime 2026-09-12 17:00:23 UTC; fresh OFFLINE marker, no current
+  hardware coverage claim
+runtime cadence census
+  exactly one matching reflexes.cron entry; no matching systemd or /etc/cron entry
+```
+
+The first concurrent source/deployed `--test` run raced over the shared `*-simulate` fixtures and
+produced one false isolation failure. A serialized rerun passed. The same test command must not be
+run concurrently for this tool.
+
+Rollback: move `scripts/integrations/mesh-body-motion` back to `scripts/mesh-body-motion`, remove
+the compatibility shim and empty integration directory, revert the one path-classification branch
+in `scripts/mesh-manifest`, and remove the focused test. Then run
+`scripts/mesh-manifest --check` and the restored tool's `--test` from outside the repository.
+
+Next: finish the remaining isolated phone, network, camera, and external adapter families; classify
+ambiguous watch/platform tools by actual runtime contract; verify each sensor's real artifact and
+freshness/coverage, caller resolution, manifest inventory, deployed parity, and cadence before
+closing the task. No whole-task completion is claimed here.
