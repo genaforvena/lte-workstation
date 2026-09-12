@@ -1,6 +1,6 @@
 # Sound pane records disposition — 2026-09-07
 
-## Status
+## Status (as audited 2026-09-08)
 
 `REJECTED FOR CLOSURE` with owner `tg`; the audit produced the requested
 receipts, but the live reflex cadence still contradicts the governing design.
@@ -64,9 +64,34 @@ Do not treat the otherwise valid receipts above as proof of conformance.
 - No persistent playable recording/MP3/WAV was found under `/home/mesh-home/.mesh`
   or `/tmp`, so no valid recording hash exists yet.
 
-## Current disposition
+## Disposition at audit time (2026-09-08)
 
 `REJECTED FOR CLOSURE`: the requested evidence classes now exist, but closing
 the task would claim a design-compliant reflex while the live wiring remains
 `*/10` and the design says `*/5`. Exact next action: owner/board must choose
 the cadence contract, then rerun wiring verification and settle the ledger row.
+
+## Resolution (2026-09-12)
+
+The cadence contract is resolved from the existing operator-approved implementation
+change, rather than changing the live schedule. Commit `4fe555866` (2026-07-20,
+"window-set-consolidation: ... sound-reflex */10") records the operator-approved
+move from `*/5` to `*/10`. The script declares `*/10`, its coverage-slot constant
+is 600 seconds, and live cron runs `mesh-sound-reflex` at `*/10` behind
+`mesh-load-gate --quiet-hours sound-reflex 11`. The governing design now documents
+that contract. A 14-minute render previously wedged multiple `*/5` ticks while
+holding the lane lock, and the load gate may stretch the interval further; coverage
+remains based on actual evaluations and missed intervals are not claimed as samples.
+
+| Requirement | Outcome | Evidence |
+|---|---|---|
+| Resolve design/live cadence conflict | DONE | Governing cadence section; approved change `4fe555866`; source declaration and live cron both `*/10` |
+| Exercise the records archivist | DONE | `scripts/mesh-records --test` rc 0; measured and archived a real 14-second WAV |
+| Exercise the sound reflex | DONE | `scripts/mesh-sound-reflex --test` rc 0 |
+| Verify source and deployed wiring | DONE | `mesh-records` SHA-256 `593e6c111d7cf4f3f12d844a46ed4a914718808c1219eae4a697ab565743315a`; `mesh-sound-reflex` SHA-256 `030160982a5f9324b68a9677c728e32a0d6ddc27b5afae004dcdb8361324ce44`; scripts resolve to deployed paths; cron lines 142/144 are `*/2` and `*/10` |
+| Verify a fresh quiet-window reflex output and provenance | DONE | `unblock-tg-bc9722e64e8166d4-resolve-20260912.md`: playable MP3 SHA-256 `5864126586e816ead1ffd519b4747bfd3c1187a9e4fd7f1dc73f0119a1982ed5`, full decode rc 0, matching records and params ledger rows |
+| Settle this audit in the task ledger | PENDING | Close the active owner task with `mesh-task done` after this receipt is finalized |
+
+No live cron or sound-producing state was changed in this resolution. After the final
+task-ledger settlement, replace the last `PENDING` outcome with its settled row ID and
+record the resulting receipt hash.
