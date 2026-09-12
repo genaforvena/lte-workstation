@@ -127,7 +127,7 @@ the old 10+ window sprawl):
 | `tg` | claude | operator Telegram comms |
 | `senses` | opencode | keep + develop the senses |
 | `health` | opencode | node/fleet health |
-| `witness` | opencode | self-measurement **AND** board/room coordination (chat merged in 2026-07-24) |
+| `witness` | codex (gpt-5.6-luna) | self-measurement **AND** board/room coordination (chat merged in 2026-07-24) |
 
 `witness` carries **two duty classes**: on the TAPE (top) it is read-only and never
 writes a measurement; on the BOARD (bottom) it *acts* — files `[task]` from chat-review,
