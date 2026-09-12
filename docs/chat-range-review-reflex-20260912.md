@@ -46,6 +46,6 @@ tasks routed to responsible owners for actionable findings.
   10:26 UTC (`posted=0`), proving the scheduled command fires before a batch is due.
 - First live initialization anchored all three cursors at physical line 55,691;
   at the firing check the source had 55,700 lines and no review task was emitted.
-  This confirms historical backlog was not replayed. The implementation is tracked
-  by task chain `witness-chat-range-review-automation-20260912`, whose DONE receipt
-  cites this artifact.
+  This confirms historical backlog was not replayed. The task chain
+  `witness-chat-range-review-automation-20260912/implement-and-wire` is currently
+  claimed by witness and closes with this artifact.
