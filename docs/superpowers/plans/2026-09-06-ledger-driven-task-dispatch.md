@@ -1,5 +1,12 @@
 # Ledger-Driven Task Dispatch Implementation Plan
 
+> **Status: SUPERSEDED for dispatch authority.** The 2026-09-08 tasks-only coordination decision
+> makes structured task-state events in `chat.log` the lifecycle and dispatch authority; hledger
+> promises remain a materialized accounting view and are not a separately dispatchable queue. See
+> `docs/task-only-coordination-20260908.md` and the audit at
+> `docs/design-audit-ledger-driven-task-dispatch-20260912.md`. Retain this plan as historical design
+> evidence; do not implement its hledger-first dispatch path without a new operator decision.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make hledger-backed promise liabilities the dispatch queue, including ordered multi-step chains, while retaining the board as the event and human-readable coordination surface.
