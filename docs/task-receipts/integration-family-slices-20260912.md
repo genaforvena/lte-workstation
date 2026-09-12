@@ -166,6 +166,33 @@ also remains in place because its current `--test` checks command presence/reach
 asserting a real sensor read; it needs a real-read gate before it can meet this task's verification
 contract.
 
+## Note 3 ADB battery family slice
+
+The `mesh-note3-battery` implementation now lives at `scripts/integrations/mesh-note3-battery`,
+with its installable compatibility shim retaining the original basename, `5-59/10 * * * *`
+cadence, and `--edge` args. Runtime classification is a local ADB protocol adapter for the
+authorized Samsung Galaxy Note 3; it reads `dumpsys battery`. It remains distinct from the Redmi
+phone's Termux-over-SSH body sensors and this node's sysfs battery senses.
+
+The only runtime schedule found is the existing `~/.mesh/reflexes.cron:330` entry with that same
+cadence and `--edge`; no source command caller, second cron, or service was found. The focused test
+passed fixtures and a real ADB battery read. A separate one-shot JSON read produced a current
+sample at 2026-09-12T17:44:52Z: level `100/100`, temperature `26.7°C`, power source `USB`. The
+device serial is omitted from this receipt. That one-shot did not write the change-detection state
+or board.
+
+```text
+bash tests/test-mesh-note3-battery-integration-slice.sh
+  PASS: manifest ownership, cadence header, fixtures, and real ADB read through the shim
+rtk scripts/mesh-note3-battery --json | parse fields
+  PASS: current read timestamped 2026-09-12T17:44:52Z
+bash -n scripts/mesh-note3-battery scripts/integrations/mesh-note3-battery \
+  tests/test-mesh-note3-battery-integration-slice.sh
+  PASS
+scripts/mesh-manifest --check
+  PASS: 1207 complete rows; no duplicate installed basenames
+```
+
 Verification:
 
 ```text
