@@ -73,3 +73,30 @@ literally true. Triaged:
 Verdict: the genome de-personalization HOLDS for its real goal (zero secret values; a stranger plants
 cleanly). The doc's *historical* findings are accurate; only its "zero hits = clean" drift-test was
 stale and is corrected above. No code change made under this doc-drift task.
+
+## 2026-09-12 re-check (current repository state)
+
+The historical bootstrap finding remains resolved: `bootstrap.sh` leaves `PEER` empty unless the
+operator supplies an argument or `MESH_PEER`, and `nodes.example` documents the node-local registry
+read by `mesh-peer-addr`. The broad username/hostname scan still returns hits, but includes device
+class labels, node-identity adapters, test fixtures, and historical evidence; a raw match count is
+not a defect verdict. A targeted credential-value scan found no private-key block or token-shaped
+assignment in executable source (one prose draft mentions redaction examples).
+
+Two current runtime defaults warrant repair tasks because they send a fresh clone toward this
+operator's endpoints:
+
+- `scripts/mesh-travels` still sets `PHAEDRA = "root@100.94.116.17"` and fixes the remote log path.
+  This was previously noted as optional hardening; it remains unconfigurable. Repair task:
+  `genome-depersonalization-repair-20260912/mesh-travels-peer-config`.
+- `scripts/reticulum/rns-offgrid-proof.sh` still defaults its peer to `ilya@100.107.198.111`, its
+  gateway to `192.168.8.1`, and its blackout interface to `wlxbcec43434a22`, despite documenting
+  environment configuration. Repair task:
+  `genome-depersonalization-repair-20260912/rns-offgrid-peer-network-config`.
+
+The inventory and task-ledger evidence are in
+`docs/design-audit-genome-20260912.md`; both repair rows are registered in
+`docs/plans/2026-09-12-genome-depersonalization-repair.tsv`. No runtime code was changed during this
+audit. The downstream `final-design-spec-verification` row still needs wait-for edges to these two
+repair tasks when it becomes the blocked current step; the ledger rejected early edits because it is
+not yet current.
