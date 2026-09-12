@@ -117,6 +117,23 @@ class ChatRangeReviewTests(unittest.TestCase):
             self.assertEqual(batch["start_line"], 1)
             self.assertEqual(batch["end_line"], size + (1 if size > 100 else 0))
 
+    def test_near_task_defines_source_predicate_and_excludes_malformed_rows(self) -> None:
+        lines = []
+        for index in range(50):
+            lines.append(f"2026-09-12T00:00:{index % 60:02d}Z mind :: message-{index}")
+            if index < 10:
+                lines.append(f"malformed row {index}")
+
+        batch = review.next_batch(lines, 0, 50)
+        self.assertEqual(batch, {"start_line": 1, "end_line": 60, "count": 50})
+
+        description = review.description_for(
+            "near", 50, batch, review.chain_for("near", batch)
+        )
+        self.assertIn("MESSAGE_RE", description)
+        self.assertIn("is_source_message", description)
+        self.assertIn("Malformed rows that do not match MESSAGE_RE are excluded", description)
+
     def test_idle_tick_emits_a_run_row(self) -> None:
         self.add_messages(2)
         first = io.StringIO()
