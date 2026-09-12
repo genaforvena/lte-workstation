@@ -14,31 +14,44 @@ plan are ordered; later tasks must not claim completion until the preceding arti
    and the device-lane blocker.
 2. Repair or explicitly disposition the receiver blocker, then run the real receiver gate and its
    red-before-green mutation.
-3. Artifacts: dated baseline note, source SHA-256 manifest, append-only device-observations JSONL,
-   receiver corpus, and mutation report.
+3. Artifacts: dated baseline note, receiver corpus and mutation report, plus either the source
+   SHA-256 manifest and append-only device-observations JSONL **or** an explicit
+   `BLOCKED_OPERATOR_EXPORT` artifact naming the missing complete PCAPdroid CSV, reachable host,
+   and device label. Do not fabricate an empty device artifact.
 4. Verify: existing offline tests plus a fresh receiver run; the deliberate bad mutation fails and
-   the restored implementation passes without writing outside the declared output tree.
+   the restored implementation passes without writing outside the declared output tree. A missing
+   operator export is a terminal block for the device lane, not a failure to finish this task's
+   receiver work.
 
 ### `self-adint-expansion/passive-oracle-persistence`
 
 1. Establish the passive baseline and schema contract, then assess active-oracle eligibility
-   without treating an unavailable oracle as a success.
-2. Run the signed treatment/control persistence schedule, retaining failed/refused runs and
-   measuring persistence only within the supported claim boundary.
-3. Artifacts: passive ledger, schema/egress report, oracle verdict and independence note, signed
-   schedule, event/run rows, and persistence report.
-4. Verify: schema/checksum validation, refusal-path test, replay of one control cell, and a
-   before/after comparison showing no fabricated active result.
+   without treating an unavailable oracle as a success. Preserve the passive-only refusal/replay
+   evidence when eligibility is absent.
+2. An active treatment/control persistence run is a separate gated successor. Do not start it until
+   a measured payload gate and independent return-vantage assessment exist and the operator gives
+   an exact go for that intervention.
+3. Artifacts for this passive task: passive ledger/source reference, schema/egress report, oracle
+   verdict, passive-only schedule/events/runs, checksum manifest, and explicit active-run block
+   where eligibility is absent. Active event/run rows and a persistence estimate are not required
+   and must not be fabricated to close the passive task.
+4. Verify: schema/checksum validation, refusal-path test, replay of one passive control cell, and a
+   check that the refused active path wrote no active result.
 
 ### `self-adint-expansion/operator-gated-release`
 
 1. Keep operator-gated branches in a separate question/decision ledger; do not silently execute
-   them.
+   them. Include seat onboarding/agreement/payment, outbound DSAR letters/mailbox, and GAID reset
+   as separate rows with their exact per-step decision gate; absence of an operator decision is a
+   block, not permission.
 2. Package the reproducibility bundle, redacted guide, letter evidence blocks, baseline hash,
    reset instructions, and handoff note.
-3. Artifacts: decision ledger, evidence blocks, reproducible bundle, manifest, and handoff note.
+3. Artifacts: complete decision ledger (including the outbound-letter branch), evidence blocks,
+   reproducible bundle, manifest, and handoff note.
 4. Verify: clean-tree/reproduction check, checksum match, reset-to-baseline check, and explicit
-   witness disposition for every unfinished or refused branch.
+   witness disposition for every unfinished or refused branch. Packaging and read-only preparation
+   may proceed; no onboarding, agreement, payment, mail, active study, or reset may proceed without
+   its own satisfied gate.
 
 ## Tiny-fleet (`docs/plans/2026-09-07-tiny-fleet-expansion.md`) — owner `genome`
 
