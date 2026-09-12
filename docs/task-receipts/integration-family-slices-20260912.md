@@ -139,7 +139,7 @@ cadence was added. The focused migration test runs the tool's real-read gate and
 with numeric link fields, or exit 2 only with an explicit `n/a`. This node's actual result is
 unavailable: the phone did not provide `termux-wifi-connectioninfo`, so there is no current Wi-Fi
 reading. The honest offline artifact is `~/.mesh/.wifi-link-offline`, freshly touched at
-2026-09-12 17:35:56 UTC; `.wifi-link.state` remains the older `GOOD` sample from 2026-09-03, and
+2026-09-12 17:40:23 UTC; `.wifi-link.state` remains the older `GOOD` sample from 2026-09-03, and
 must not be presented as current coverage.
 
 ```text
@@ -153,6 +153,12 @@ bash -n scripts/mesh-wifi-link scripts/integrations/mesh-wifi-link \
 scripts/mesh-manifest --check
   PASS: 1206 complete rows; no duplicate installed basenames
 ```
+
+Post-land Wi-Fi verification: `cmp scripts/mesh-wifi-link ~/.local/bin/mesh-wifi-link` passed;
+manifest parity marks the top-level shim `same` and the nested implementation non-deployed. The
+deployed `--test` and one deployed normal read both returned exit 2; the latter refreshed the honest
+OFFLINE marker at 17:40:23 UTC. The older `GOOD` sample was left untouched. Wi-Fi commits:
+`2ea204e4`, `762c6047`, `ca5fee73`, `f79e3a69`, and `4aea2ba2`.
 
 The local `mesh-wifi-quality` tool is not folded into this family: its current `--test` says
 `FAIL (no wireless iface)`, so its local-adapter result needs separate diagnosis. `mesh-phone-sensors`
