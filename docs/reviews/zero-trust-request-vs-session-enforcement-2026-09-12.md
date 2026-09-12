@@ -44,6 +44,29 @@ own work. A generic router-wide kill path should be considered only with a concr
 operator requirement; the present evidence establishes the boundary, not the need for that broader
 actuator.
 
+## Current organ check (2026-09-12 12:31Z)
+
+The live manifest exposed capabilities on mesh-home and phaedra; the other declared hosts were
+offline or unreachable during this check. Neither reachable node had executable files in
+`~/.mesh/caps` carrying a `# cap-allow:` policy. Direct `mesh-organ --scope` checks reported
+`cap-allow=<unrestricted>` for `dlna-tv@mesh-home` and `dlna-tv@phaedra`, and for the local
+camera, mic, UVC-metadata, display-link, and TV capabilities. There is therefore no active scoped
+policy whose revocation can currently be claimed to terminate an organ session.
+
+One concrete persistent process does exist: `mesh-organ dlna-tv` resolves to `mesh-tv-dlna`, which
+starts a detached Range HTTP server on port 8099 (`start_new_session=True`, `serve_forever()`) and
+reuses it to preserve playback across video switches. The router's wait-and-record wrapper cannot
+own or terminate that detached child. The tool's `stop` verb sends a DLNA playback command; it is not
+a server-session revocation contract. No such server process was running during this check.
+`mesh-uvc-metadata`, by contrast, performs bounded retries and exits after one capture.
+
+Decision: `mesh-tv-dlna` is the concrete candidate if its capability is later given a restrictive
+allow-list or an operator states that policy changes must end active playback. Neither condition is
+present now: its live scope is unrestricted and no immediate-revocation requirement was found. I did
+not add a generic router kill path or alter playback. If that policy is introduced, define the TV
+organ's own session identity/owner, policy re-read boundary, and stop behavior for the detached
+server and active streams before calling it revocation.
+
 ## Feed status
 
 `mesh-study` was attempted on 2026-09-12, but its pulls failed with `OAuth session expired and
