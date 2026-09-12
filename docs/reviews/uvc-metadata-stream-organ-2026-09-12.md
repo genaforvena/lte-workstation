@@ -31,7 +31,16 @@ Verification on 2026-09-12:
   SHA-256 `a4192e74993d6252c77d4801e55545a6d68f5ec55ee57d837cbf08e83ca167d0`) and
   `/home/mesh-home/.mesh/uvc-metadata/latest.jsonl` (171 records).
 - Parsing the supplied discovery sample returned 267 JSONL records.
+- After landing, the installed copy passed its real-device `--test` at 6,556 bytes / 298 records.
+  `mesh-organ --where uvc-metadata` resolved locally, and `mesh-organ uvc-metadata` captured 6,204
+  bytes / 282 records through the router. An isolated `mesh-organ-keepalive --status` card containing
+  only `uvc-metadata` reported `mesh-home:uvc-metadata — LIVE`. The existing ten-minute cron line
+  remains singular.
+- The latest routed capture is `/home/mesh-home/.mesh/uvc-metadata/latest.bin` (6,204 bytes,
+  SHA-256 `32b7efedc8d0d84370ebf5fe60dc5c5cba28bf9323e118072d8c02c66eea7413`) with a paired
+  282-record `latest.jsonl`.
 
 The first deployment inspection found `~/.local/bin/mesh-uvc-metadata` was an older independent copy
-without the retry or parser changes. This organ landing must deploy the reviewed source to that path;
-the post-land verification checks the installed copy and its existing cron/keepalive wiring.
+without the retry or parser changes. `mesh-land` deployed the reviewed version; its SHA-256 now
+matches `scripts/mesh-uvc-metadata`. The commits were pushed to `origin/main`, and the remote ref was
+verified equal to the local landed head.
