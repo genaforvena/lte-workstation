@@ -362,6 +362,8 @@ At the end of every work session — before going idle — always:
 
 This is the reflexive heartbeat. Every agent on every node follows it.
 
+**Every live, staffed idle mind gets a recurring `mesh-pane-consume` self-pick wake at the `mesh-pace`-governed cadence; it takes exact-owner queued work first, then may create one bounded independent charter task when no eligible task or active claim exists, preserving dependency and duplicate checks; communication/human lanes stay excluded and `[idle]` requires evidence no safe work remains.** [[idle-minds-self-pick-eligible-owned-work]]
+
 **PRE-CLEAR step (mandatory before any `/clear`).** `/compact` is RETIRED mesh-wide (operator
 2026-07-18 "везде только clear") — `/clear` + handoff is the ONE context lever, and every clear is
 logged so they're fixed by numbers, not blind. `mesh-tell` keeps the *next prompt* alive, but a
