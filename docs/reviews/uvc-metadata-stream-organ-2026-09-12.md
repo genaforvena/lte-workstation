@@ -36,9 +36,10 @@ Verification on 2026-09-12:
   bytes / 282 records through the router. An isolated `mesh-organ-keepalive --status` card containing
   only `uvc-metadata` reported `mesh-home:uvc-metadata — LIVE`. The existing ten-minute cron line
   remains singular.
-- The latest routed capture is `/home/mesh-home/.mesh/uvc-metadata/latest.bin` (6,204 bytes,
-  SHA-256 `32b7efedc8d0d84370ebf5fe60dc5c5cba28bf9323e118072d8c02c66eea7413`) with a paired
-  282-record `latest.jsonl`.
+- A routed capture at 12:00:02 UTC produced 6,204 bytes (SHA-256
+  `32b7efedc8d0d84370ebf5fe60dc5c5cba28bf9323e118072d8c02c66eea7413`) at the rolling
+  `latest.bin` path with a paired 282-record `latest.jsonl`. Later live probes replace these rolling
+  paths by design.
 
 The first deployment inspection found `~/.local/bin/mesh-uvc-metadata` was an older independent copy
 without the retry or parser changes. `mesh-land` deployed the reviewed version; its SHA-256 now
