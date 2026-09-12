@@ -5,10 +5,12 @@ from __future__ import annotations
 
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -114,6 +116,18 @@ class ChatRangeReviewTests(unittest.TestCase):
             self.assertEqual(batch["count"], size)
             self.assertEqual(batch["start_line"], 1)
             self.assertEqual(batch["end_line"], size + (1 if size > 100 else 0))
+
+    def test_idle_tick_emits_a_run_row(self) -> None:
+        self.add_messages(2)
+        first = io.StringIO()
+        with redirect_stdout(first):
+            self.run_reflex()
+        self.assertIn("initialized at chat.log line 2", first.getvalue())
+
+        second = io.StringIO()
+        with redirect_stdout(second):
+            self.run_reflex()
+        self.assertIn("run source_lines=2 posted=0", second.getvalue())
 
     def test_dispatch_failure_retries_the_same_range_without_duplicate_chain(self) -> None:
         self.add_messages(50)
