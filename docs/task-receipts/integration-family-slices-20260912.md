@@ -19,6 +19,36 @@ callers continue resolving the old basename. No caller or scheduled command was 
 existing header cadence and the single live entry at
 `~/.mesh/reflexes.cron:219` (`7-59/10 * * * *`) remain unchanged; no second cadence was added.
 
+## Bluetooth controller family slice
+
+The local BlueZ connected-peripherals sense now lives at
+`scripts/integrations/mesh-bt-link`, with its old executable path retained as a compatibility shim.
+The manifest recognizes `mesh-bt-*` as integrations by basename and inventories the nested
+implementation as non-deploying under the shim's compatibility owner. Runtime classification is
+based on its actual contract: it reads this node's powered local Bluetooth controller and its
+connected peripherals; it does not scan nearby BLE advertisers or inspect a roaming phone.
+
+Caller and cadence census: source references remain at `mesh-audio-path`, `mesh-chaos`, and
+`mesh-bt-census`; no caller path changed. The single live schedule remains
+`~/.mesh/reflexes.cron:139` (`*/9 * * * *`, `--edge`), with cadence, args, and doctor-artifact
+declarations preserved on the shim. No duplicate schedule was introduced.
+
+```text
+scripts/mesh-bt-link
+  exit 2: OFFLINE|no bluetooth controller / bluetoothd down
+~/.mesh/.bt-link-state
+  mtime 2026-09-12 17:18:37 UTC; contents OFFLINE|no bluetooth controller / bluetoothd down
+  fresh unavailable-state artifact; current controller coverage is unavailable, not zero devices
+scripts/mesh-bt-link --test
+  exit 2: BT sensor unreachable; classifier/offline gate verified, live enumeration skipped
+bash tests/test-mesh-bt-link-integration-slice.sh
+  PASS: destination/domain/ownership and the shim's actual --test outcome (0 with a live-read
+  artifact or 2 with an explicit unavailable result)
+bash -n scripts/mesh-bt-link scripts/integrations/mesh-bt-link \
+  tests/test-mesh-bt-link-integration-slice.sh
+  PASS
+```
+
 Verification:
 
 ```text
