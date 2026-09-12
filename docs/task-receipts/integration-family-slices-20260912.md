@@ -198,6 +198,44 @@ manifest parity reports the shim `same` and nested source non-deployed. The depl
 passed with a live ADB battery read, and the single `--edge` cron line remained unchanged. Note 3
 commits: `62fa542f`, `86983f53`, `201e94e0`, and `18c406e8`.
 
+## Remote iMac camera protocol slice
+
+The one-shot `mesh-imac-cam` SSH/SCP adapter now lives at
+`scripts/integrations/mesh-imac-cam`; its Objective-C capture helper moved with it to
+`scripts/integrations/mesh-imac-cam.m`, and the original executable basename remains the installable
+compatibility shim. The adapter checks remote camera consent, deploys/compiles the paired helper when
+needed, and returns a settled JPEG. Its existing `--test` compiles and runs the portable settle-core
+cases before attempting an actual consented camera read.
+
+Runtime classification for the ambiguous watchers: `mesh-phone-watch` is a ten-minute ADB/Termux
+sshd repair and anchoring reflex (one existing cron at `~/.mesh/reflexes.cron:78`), not a phone
+measurement adapter. `mesh-cam-watch` and `mesh-imac-cam-watch` are continuous motion/classification
+loops owned by systemd services, not capture adapters. The one-shot `mesh-imac-cam` is the remote
+camera protocol adapter called by `mesh-imac-cam-watch`; it declares `orphan-ok` and has no cadence
+or duplicate service. The camera watcher's installed unit is currently inactive; its
+`.imac-cam-watch.state` and baseline are from 2026-07-24 and do not establish current camera coverage.
+
+```text
+tests/test-mesh-imac-cam-integration-slice.sh
+  PASS: nested tool/helper manifest ownership, on-demand cadence, shim dispatch, settle-core, and
+  real-read/unavailable result
+scripts/mesh-imac-cam --test
+  exit 2: portable settle-core passed all 8 cases; iMac unreachable at 192.168.8.214, so no live
+  frame was produced or claimed
+scripts/mesh-manifest --check
+  PASS: 1208 complete rows; no duplicate installed basenames
+```
+
+The caller census keeps `mesh-imac-cam-watch` on the old public basename. The existing iMac watcher
+service remains unchanged. The source path `.m` is a runtime companion to the nested implementation;
+mesh-land's asset-pair rules must keep it paired with the executable during landing. Post-land
+compatibility/deployed test and parity are still pending.
+
+Remaining phone-tool disposition: `mesh-wifi-quality --test` reports no local wireless interface,
+and `mesh-phone-sensors --test` does not assert a real sensor read, so neither has been moved. The
+already-landed Wi-Fi-link slice is the verified Termux Wi-Fi protocol adapter. Those exclusions keep
+unavailable or unverified inputs from appearing as healthy coverage.
+
 Verification:
 
 ```text
@@ -241,7 +279,6 @@ the compatibility shim and empty integration directory, revert the one path-clas
 in `scripts/mesh-manifest`, and remove the focused test. Then run
 `scripts/mesh-manifest --check` and the restored tool's `--test` from outside the repository.
 
-Next: finish the remaining isolated phone, network, camera, and external adapter families; classify
-ambiguous watch/platform tools by actual runtime contract; verify each sensor's real artifact and
-freshness/coverage, caller resolution, manifest inventory, deployed parity, and cadence before
-closing the task. No whole-task completion is claimed here.
+Next: land and verify the remote iMac camera pair, then audit remaining isolated phone/network
+adapters with real-read gates. Confirm deployed parity, caller resolution, artifact freshness and
+coverage, and cadence before closing the task. No whole-task completion is claimed here.
