@@ -29,6 +29,30 @@ resolver result without `unblock=cleared` is terminal evidence that the parent m
 The `mesh-task-unblock-sweep` reflex runs every five minutes to backfill missing resolver tasks; it
 never impersonates an owner or resumes a parent without the owner's cleared result.
 
+## Work the dependency frontier first
+
+At the start of a turn, read the complete `mesh-task queue --dispatch --owner <owner>` result. It is
+a candidate list, not an assignment: choose a runnable task using its context and the work it
+unlocks, and check eligibility before taking it. Prefer a runnable resolver or prerequisite before
+its dependent work; keep external-event/operator-input rows blocked until their exact condition is
+met. Runnable age advances in daily bands by default (the interval is configurable with
+`MESH_TASK_QUEUE_AGING_SECONDS`): older bands rank first, then incidents and `unblock/` resolvers,
+numeric priority, and FIFO. Redelivery retains the first `queued_at`; a task released from
+`waiting_for` starts aging when its prerequisite completes. `mesh-task audit` uses the same ordering
+as dispatch. Age is a fairness backstop, not a fixed assignment. If the queue is empty, run
+`mesh-task audit` and `mesh-task unblock-sweep`. An owner may use
+`mesh-task independent <chain> <step> <reason>` only after attesting that the later step can proceed
+without weakening that dependency. Treat age as a fairness signal when choosing, not as a reason to
+ignore what a task unblocks.
+
+An expired active lease is not an available queue slot: the one-active-task-per-owner guard will
+also suppress that owner's corrective task. The exact owner must settle the current claim first by
+recording artifact-backed progress with a real update deadline, or by blocking/rejecting it with a
+concrete reason. Witness routes and verifies this recovery but never impersonates the owner. Once
+the claim is settled, take the already-routed corrective task; do not create a duplicate. If there
+are no runnable candidates and no missing resolvers, preserve the explicit blockers and report the
+exact event needed to reopen the frontier instead of manufacturing work.
+
 Case mapping:
 
 - adint device export: block with `operator-input`, name the CSV/path in `needs`, and resume on its
