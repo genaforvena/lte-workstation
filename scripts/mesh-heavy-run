@@ -34,6 +34,10 @@ QUEUE_LOCK="${MESH_HEAVY_QUEUE_LOCK:-$MESH/.heavy-queue.lock}"
 QUEUE_MAX_FAILURES="${MESH_HEAVY_QUEUE_MAX_FAILURES:-3}"
 GPU_MIN_FREE_MB="${MESH_HEAVY_GPU_MIN_FREE_MB:-0}"
 GPU_SMI="${MESH_HEAVY_GPU_SMI:-nvidia-smi}"
+GPU_PREEMPT="${MESH_HEAVY_GPU_PREEMPT:-0}"
+GPU_LEASE_CMD="${MESH_HEAVY_GPU_LEASE_CMD:-mesh-gpu-lease}"
+GPU_LEASE_TTL="${MESH_HEAVY_GPU_LEASE_TTL:-2700}"
+GPU_LEASE_TOKEN=""
 # read-only node-pressure probe; overridable so --test can inject a hot/clear verdict without real load
 NODEPRESSURE_CMD="${MESH_HEAVY_NODEPRESSURE_CMD:-mesh-resource-guard --status}"
 
@@ -102,6 +106,41 @@ admit_gate() { # $1 = budget MB
   return 0
 }
 
+gpu_preemption_eligible() { # $1 = RAM budget MB; only when GPU alone blocks admission
+  [ "$GPU_PREEMPT" = 1 ] && [ "$FORCE" != 1 ] && [ "$GPU_MIN_FREE_MB" -gt 0 ] || return 1
+  local head free pressure
+  head="$(read_headroom_mb)"; head="${head:-0}"
+  [ "$head" -ge "$1" ] 2>/dev/null || return 1
+  pressure="$($NODEPRESSURE_CMD 2>/dev/null)" || pressure=""
+  printf '%s\n' "$pressure" | grep -qE '^NODE-(PRESSURE|ACCELERATING):' && return 1
+  free="$($GPU_SMI --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d '[:space:]')"
+  case "$free" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$free" -lt "$GPU_MIN_FREE_MB" ]
+}
+
+acquire_gpu_lease() {
+  local output rc
+  output="$("$GPU_LEASE_CMD" --acquire "$GPU_MIN_FREE_MB" --ttl "$GPU_LEASE_TTL" 2>&1)"; rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "mesh-heavy-run: GPU lease unavailable; retaining job for retry: $output" >&2
+    return "$EX_TEMPFAIL"
+  fi
+  GPU_LEASE_TOKEN="$(printf '%s\n' "$output" | sed -n 's/.*token=\([^ ]*\).*/\1/p' | head -1)"
+  [ -n "$GPU_LEASE_TOKEN" ] || {
+    echo "mesh-heavy-run: GPU lease reported success without a token; refusing to run" >&2
+    return "$EX_TEMPFAIL"
+  }
+  trap 'release_gpu_lease' EXIT
+  echo "mesh-heavy-run: GPU lease acquired token=$GPU_LEASE_TOKEN"
+}
+
+release_gpu_lease() {
+  [ -n "$GPU_LEASE_TOKEN" ] || return 0
+  "$GPU_LEASE_CMD" --release "$GPU_LEASE_TOKEN" || \
+    echo "mesh-heavy-run: GPU lease restore remains pending token=$GPU_LEASE_TOKEN; expiry sweep will retry" >&2
+  GPU_LEASE_TOKEN=""
+}
+
 queue_job() { # $1=budget, remaining argv; atomic + content-addressed deduplication
   local budget="$1"; shift
   local key tmp job; mkdir -p "$QUEUE_DIR" 2>/dev/null || return 0
@@ -110,8 +149,9 @@ queue_job() { # $1=budget, remaining argv; atomic + content-addressed deduplicat
   [ -e "$job" ] && { echo "mesh-heavy-run: already queued $job" >&2; return 0; }
   tmp="$QUEUE_DIR/.${key}.$$.$RANDOM.tmp"
   {
-    printf 'budget=%q\ncwd=%q\ngpu_min_free_mb=%q\ngpu_smi=%q\nqueued_at=%q\nheadroom_mb=%q\n' \
-      "$budget" "$PWD" "$GPU_MIN_FREE_MB" "$GPU_SMI" "$(date -u +%FT%TZ)" "$(read_headroom_mb)"
+    printf 'budget=%q\ncwd=%q\ngpu_min_free_mb=%q\ngpu_smi=%q\ngpu_preempt=%q\ngpu_lease_ttl=%q\nqueued_at=%q\nheadroom_mb=%q\n' \
+      "$budget" "$PWD" "$GPU_MIN_FREE_MB" "$GPU_SMI" "$GPU_PREEMPT" "$GPU_LEASE_TTL" \
+      "$(date -u +%FT%TZ)" "$(read_headroom_mb)"
     printf 'argv=('; printf ' %q' "$@"; printf ')\n'
   } > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 0; }
   mv -n "$tmp" "$job" 2>/dev/null || rm -f "$tmp"
@@ -122,12 +162,12 @@ drain_queue() {
   mkdir -p "$QUEUE_DIR" 2>/dev/null || { echo "mesh-heavy-run: cannot create queue $QUEUE_DIR" >&2; return 1; }
   exec 8>"$QUEUE_LOCK" 2>/dev/null || { echo "mesh-heavy-run: cannot lock queue" >&2; return 1; }
   flock -n 8 2>/dev/null || { echo "mesh-heavy-run: queue drain already active"; return 0; }
-  local job run rc budget cwd gpu_min_free_mb gpu_smi failures; local n=0
+  local job run rc budget cwd gpu_min_free_mb gpu_smi gpu_preempt gpu_lease_ttl failures; local n=0
   while IFS= read -r job; do
     [ -r "$job" ] || continue
     run="${job%.job}.running"
     mv "$job" "$run" 2>/dev/null || continue
-    unset budget cwd gpu_min_free_mb gpu_smi argv
+    unset budget cwd gpu_min_free_mb gpu_smi gpu_preempt gpu_lease_ttl argv
     # Queue files are created by this script and contain shell-quoted argv only.
     # shellcheck disable=SC1090
     . "$run"
@@ -139,7 +179,8 @@ drain_queue() {
     fi
     echo "mesh-heavy-run: retrying queued job budget=${budget} headroom=$(read_headroom_mb)MB: $run"
     ( cd "$cwd" && MESH_HEAVY_QUEUE_DISABLED=1 MESH_HEAVY_GPU_MIN_FREE_MB="${gpu_min_free_mb:-0}" \
-      MESH_HEAVY_GPU_SMI="${gpu_smi:-nvidia-smi}" "$0" "$budget" -- "${argv[@]}" ); rc=$?
+      MESH_HEAVY_GPU_SMI="${gpu_smi:-nvidia-smi}" MESH_HEAVY_GPU_PREEMPT="${gpu_preempt:-0}" \
+      MESH_HEAVY_GPU_LEASE_TTL="${gpu_lease_ttl:-2700}" "$0" "$budget" -- "${argv[@]}" ); rc=$?
     if [ "$rc" = 0 ]; then
       rm -f "$run"; n=$((n+1)); echo "mesh-heavy-run: drained queued job"
     else
@@ -345,6 +386,67 @@ if [ "${1:-}" = --test ]; then
   { [ "$?" = 0 ] && [ -e "$_gpu_marker" ]; } \
     || { echo "smoke-test: FAIL (GPU-queued job was not drained after GPU recovery)"; exit 1; }
 
+  # 3d) DECLARED GPU PREEMPTION: a managed lease must be acquired only for a GPU-only shortfall,
+  #     the job runs after measured headroom clears, and the exact lease is released on completion.
+  _lease_log="$_td/gpu-lease.log"; _lease_state="$_td/gpu-free"; _lease_cmd="$_td/gpu-lease"
+  _lease_smi="$_td/lease-smi"; _lease_marker="$_td/lease-ran"
+  printf '100\n' >"$_lease_state"; rm -f "$_lease_marker"
+  cat >"$_lease_cmd" <<'EOF'
+#!/bin/sh
+case "$1" in
+  --acquire) printf 'acquire %s %s\n' "$2" "$4" >>"$MESH_HEAVY_TEST_LEASE_LOG";
+    if [ ! -e "$MESH_HEAVY_TEST_LEASE_READY_FILE" ]; then echo 'lease unavailable' >&2; exit 75; fi
+    printf '300\n' >"$MESH_HEAVY_TEST_GPU_FREE"; echo 'GPU_LEASE token=test-token free_mb=300';;
+  --release) printf 'release %s\n' "$2" >>"$MESH_HEAVY_TEST_LEASE_LOG";;
+  *) exit 64;;
+esac
+EOF
+  cat >"$_lease_smi" <<'EOF'
+#!/bin/sh
+cat "$MESH_HEAVY_TEST_GPU_FREE"
+EOF
+  chmod +x "$_lease_cmd" "$_lease_smi"
+  touch "$_td/lease-ready"
+  env $_base MESH_HEAVY_MEMINFO="$_ample" MESH_HEAVY_NODEPRESSURE_CMD="$_clear" \
+    MESH_HEAVY_GPU_MIN_FREE_MB=200 MESH_HEAVY_GPU_SMI="$_lease_smi" \
+    MESH_HEAVY_GPU_PREEMPT=1 MESH_HEAVY_GPU_LEASE_CMD="$_lease_cmd" MESH_HEAVY_GPU_LEASE_TTL=2700 \
+    MESH_HEAVY_TEST_LEASE_LOG="$_lease_log" MESH_HEAVY_TEST_GPU_FREE="$_lease_state" \
+    MESH_HEAVY_TEST_LEASE_READY_FILE="$_td/lease-ready" \
+    "$0" 500 -- touch "$_lease_marker" >/dev/null 2>&1
+  { [ "$?" = 0 ] && [ -e "$_lease_marker" ] \
+      && [ "$(cat "$_lease_log")" = $'acquire 200 2700\nrelease test-token' ]; } \
+    || { echo "smoke-test: FAIL (GPU lease was not acquired and restored around the admitted job)"; exit 1; }
+
+  # 3e) QUEUED GPU PREEMPTION: persist the lease request and TTL across a refused acquire,
+  #     then use that same lease policy when the drain later retries the job.
+  _lease_queue="$_td/lease-queue"; _lease_queued_marker="$_td/lease-queued-ran"
+  rm -rf "$_lease_queue"; rm -f "$_lease_marker" "$_lease_queued_marker" "$_td/lease-ready"
+  printf '100\n' >"$_lease_state"
+  env $_base MESH_HEAVY_QUEUE_DIR="$_lease_queue" MESH_HEAVY_MEMINFO="$_ample" \
+    MESH_HEAVY_NODEPRESSURE_CMD="$_clear" MESH_HEAVY_GPU_MIN_FREE_MB=200 \
+    MESH_HEAVY_GPU_SMI="$_lease_smi" MESH_HEAVY_GPU_PREEMPT=1 \
+    MESH_HEAVY_GPU_LEASE_CMD="$_lease_cmd" MESH_HEAVY_GPU_LEASE_TTL=2700 \
+    MESH_HEAVY_TEST_LEASE_LOG="$_lease_log" MESH_HEAVY_TEST_GPU_FREE="$_lease_state" \
+    MESH_HEAVY_TEST_LEASE_READY_FILE="$_td/lease-ready" \
+    "$0" 500 -- touch "$_lease_queued_marker" >/dev/null 2>&1
+  _lease_queue_rc=$?
+  _queued_job="$(find "$_lease_queue" -maxdepth 1 -type f -name '*.job' -print -quit)"
+  { [ "$_lease_queue_rc" = "$EX_TEMPFAIL" ] && [ -n "$_queued_job" ] \
+      && grep -q '^gpu_preempt=1$' "$_queued_job" \
+      && grep -q '^gpu_lease_ttl=2700$' "$_queued_job" \
+      && [ ! -e "$_lease_queued_marker" ]; } \
+    || { echo "smoke-test: FAIL (unavailable GPU lease did not preserve its queued policy)"; exit 1; }
+  touch "$_td/lease-ready"
+  env $_base MESH_HEAVY_QUEUE_DIR="$_lease_queue" MESH_HEAVY_MEMINFO="$_ample" \
+    MESH_HEAVY_NODEPRESSURE_CMD="$_clear" MESH_HEAVY_TEST_LEASE_LOG="$_lease_log" \
+    MESH_HEAVY_TEST_GPU_FREE="$_lease_state" MESH_HEAVY_TEST_LEASE_READY_FILE="$_td/lease-ready" \
+    MESH_HEAVY_GPU_LEASE_CMD="$_lease_cmd" \
+    "$0" --drain >/dev/null 2>&1
+  { [ "$?" = 0 ] && [ -e "$_lease_queued_marker" ] \
+      && [ "$(grep -c '^acquire 200 2700$' "$_lease_log")" -eq 3 ] \
+      && [ "$(grep -c '^release test-token$' "$_lease_log")" -eq 2 ]; } \
+    || { echo "smoke-test: FAIL (queued GPU job did not retry with and release its lease)"; exit 1; }
+
   # 3b) BUDGET GATE — ADMIT: budget 2000MB <= 9.7GB ample headroom, node clear → runs.
   rm -f "$_marker"
   env $_base MESH_HEAVY_MEMINFO="$_ample" MESH_HEAVY_NODEPRESSURE_CMD="$_clear" "$0" 2000 -- touch "$_marker" >/dev/null 2>&1
@@ -503,6 +605,15 @@ shift 2
 [ "$#" -ge 1 ] || { echo "usage: mesh-heavy-run <budget-mb> -- <cmd> [args...]" >&2; exit "$EX_USAGE"; }
 
 # ---- admission: defer-poll then queue/refuse (unless forced) — single source of truth ----
+if gpu_preemption_eligible "$budget"; then
+  acquire_gpu_lease; rc=$?
+  if [ "$rc" -ne 0 ]; then
+    if [ "$rc" = "$EX_TEMPFAIL" ] && [ "${MESH_HEAVY_QUEUE_DISABLED:-0}" != 1 ]; then
+      queue_job "$budget" "$@"
+    fi
+    exit "$rc"
+  fi
+fi
 admit_gate "$budget"; rc=$?
 if [ "$rc" -ne 0 ]; then
   if [ "$rc" = "$EX_TEMPFAIL" ] && [ "${MESH_HEAVY_QUEUE_DISABLED:-0}" != 1 ]; then

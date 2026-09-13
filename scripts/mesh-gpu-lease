@@ -1,0 +1,275 @@
+#!/usr/bin/env python3
+"""Temporarily release mesh-home's managed GPU consumers for one bounded job.
+
+The lease records original service state before stopping anything, stops only the
+allowlisted mesh GPU services until measured free VRAM meets the task's declared
+threshold, and restores the previously active services on release or TTL expiry.
+Ollama restarts with its model cache cold; models reload on their next request.
+
+Usage: mesh-gpu-lease --acquire <minimum-free-MiB> --ttl <seconds>
+       mesh-gpu-lease --release <token> | --sweep | --status | --test
+
+# reflex-cadence: * * * * *
+# reflex-args: --sweep
+"""
+from __future__ import annotations
+
+import fcntl
+import json
+import os
+import secrets
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+SERVICES = ("mesh-voice-clone.service", "mesh-room-gigaam.service", "ollama.service")
+STATE = Path(os.environ.get("MESH_GPU_LEASE_STATE", str(Path.home() / ".mesh/gpu-lease.json")))
+LOCK = Path(os.environ.get("MESH_GPU_LEASE_LOCK", str(Path.home() / ".mesh/.gpu-lease.lock")))
+SMI = os.environ.get("MESH_GPU_LEASE_SMI", "nvidia-smi")
+SYSTEMCTL = os.environ.get("MESH_GPU_LEASE_SYSTEMCTL", "systemctl")
+MAX_TTL = int(os.environ.get("MESH_GPU_LEASE_MAX_TTL", "3600"))
+STOP_SETTLE_S = float(os.environ.get("MESH_GPU_LEASE_STOP_SETTLE_S", "30"))
+FAILURE_STATE = Path(os.environ.get("MESH_GPU_LEASE_FAILURE_STATE",
+                                    str(STATE.with_name(".gpu-lease-capacity-backoff.json"))))
+FAILURE_BACKOFF = int(os.environ.get("MESH_GPU_LEASE_FAILURE_BACKOFF", "900"))
+
+# Cron does not inherit the per-user systemd bus environment.
+USER_RUNTIME = f"/run/user/{os.getuid()}"
+if not os.environ.get("XDG_RUNTIME_DIR") and Path(USER_RUNTIME).is_dir():
+    os.environ["XDG_RUNTIME_DIR"] = USER_RUNTIME
+if not os.environ.get("DBUS_SESSION_BUS_ADDRESS") and Path(USER_RUNTIME, "bus").is_socket():
+    os.environ["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={USER_RUNTIME}/bus"
+
+
+def run(argv: list[str], timeout: int = 30) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(argv, text=True, capture_output=True, timeout=timeout, check=False)
+
+
+def now() -> int:
+    return int(time.time())
+
+
+def atomic_json(path: Path, value: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix=path.name + ".tmp.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as out:
+            json.dump(value, out, sort_keys=True)
+            out.write("\n")
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(name, path)
+    finally:
+        try:
+            os.unlink(name)
+        except FileNotFoundError:
+            pass
+
+
+def read_state() -> dict | None:
+    try:
+        value = json.loads(STATE.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"cannot read lease state: {exc}") from exc
+    if (not isinstance(value, dict) or not isinstance(value.get("token"), str)
+            or not isinstance(value.get("restore_services"), list)):
+        raise RuntimeError("lease state is malformed; refusing to overwrite it")
+    return value
+
+
+def free_mb() -> int:
+    result = run([SMI, "--query-gpu=memory.free", "--format=csv,noheader,nounits"])
+    if result.returncode:
+        raise RuntimeError(f"GPU headroom probe failed (rc={result.returncode})")
+    try:
+        return int(result.stdout.splitlines()[0].strip())
+    except (IndexError, ValueError) as exc:
+        raise RuntimeError("GPU headroom probe returned no numeric MiB value") from exc
+
+
+def active(service: str) -> bool:
+    result = run([SYSTEMCTL, "--user", "is-active", service])
+    if result.returncode == 0:
+        return True
+    if result.returncode in (3, 4):
+        return False
+    raise RuntimeError(f"cannot inspect {service}: {result.stdout.strip()} {result.stderr.strip()}")
+
+
+def restore(record: dict) -> bool:
+    failures = []
+    for service in reversed(record["restore_services"]):
+        try:
+            if not active(service):
+                result = run([SYSTEMCTL, "--user", "start", service], timeout=60)
+                if result.returncode or not active(service):
+                    failures.append(service)
+        except (OSError, subprocess.TimeoutExpired, RuntimeError):
+            failures.append(service)
+    if failures:
+        record["restore_pending"] = sorted(set(failures))
+        record["last_restore_attempt"] = now()
+        atomic_json(STATE, record)
+        print("mesh-gpu-lease: restore pending services=" + ",".join(sorted(set(failures))),
+              file=sys.stderr)
+        return False
+    try:
+        STATE.unlink()
+    except FileNotFoundError:
+        pass
+    print("mesh-gpu-lease: restored=" + (",".join(record["restore_services"]) or "none"))
+    return True
+
+
+def acquire(minimum: int, ttl: int) -> int:
+    if minimum <= 0 or ttl <= 0 or ttl > MAX_TTL:
+        print(f"mesh-gpu-lease: minimum and ttl must be positive; ttl <= {MAX_TTL}s", file=sys.stderr)
+        return 64
+    current = read_state()
+    if current:
+        if int(current.get("expires_at", 0)) > now():
+            print(f"mesh-gpu-lease: busy token={current['token']} expires_at={current['expires_at']}", file=sys.stderr)
+            return 75
+        if not restore(current):
+            return 1
+
+    try:
+        free = free_mb()
+        originally_active = [service for service in SERVICES if active(service)]
+    except (OSError, subprocess.TimeoutExpired, RuntimeError) as exc:
+        print(f"mesh-gpu-lease: cannot establish GPU/service state: {exc}", file=sys.stderr)
+        return 75
+
+    try:
+        previous_failure = json.loads(FAILURE_STATE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        previous_failure = {}
+    if (previous_failure.get("required_free_mb") == minimum
+            and now() - int(previous_failure.get("attempted_at", 0)) < FAILURE_BACKOFF
+            and free <= int(previous_failure.get("initial_free_mb", -1)) + 256):
+        print(f"mesh-gpu-lease: prior managed release reached only "
+              f"{previous_failure.get('maximum_free_mb', 'unknown')}MiB; retry deferred", file=sys.stderr)
+        return 75
+
+    record = {
+        "version": 1,
+        "token": secrets.token_hex(16),
+        "created_at": now(),
+        "expires_at": now() + ttl,
+        "required_free_mb": minimum,
+        "initial_free_mb": free,
+        "restore_services": originally_active,
+        "stopped_services": [],
+        "host": os.uname().nodename,
+    }
+    # Persist the restoration intent before the first service stop. A crash between
+    # stop and state-write must never strand a mesh organ off.
+    atomic_json(STATE, record)
+
+    if free < minimum:
+        for service in SERVICES:
+            if service not in originally_active:
+                continue
+            result = run([SYSTEMCTL, "--user", "stop", service], timeout=60)
+            if result.returncode:
+                print(f"mesh-gpu-lease: stop failed for {service}; restoring", file=sys.stderr)
+                restore(record)
+                return 1
+            record["stopped_services"].append(service)
+            record["last_stopped"] = service
+            atomic_json(STATE, record)
+            deadline = time.monotonic() + STOP_SETTLE_S
+            while True:
+                try:
+                    free = free_mb()
+                except (OSError, subprocess.TimeoutExpired, RuntimeError):
+                    free = -1
+                if free >= minimum:
+                    break
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(1)
+            if free >= minimum:
+                break
+
+    if free < minimum:
+        print(f"mesh-gpu-lease: headroom still {free}MiB < {minimum}MiB; restoring all managed services",
+              file=sys.stderr)
+        atomic_json(FAILURE_STATE, {"required_free_mb": minimum, "attempted_at": now(),
+                                   "initial_free_mb": record["initial_free_mb"],
+                                   "maximum_free_mb": free})
+        return 75 if restore(record) else 1
+
+    record["acquired_free_mb"] = free
+    record["acquired_at"] = now()
+    atomic_json(STATE, record)
+    try:
+        FAILURE_STATE.unlink()
+    except FileNotFoundError:
+        pass
+    print(f"GPU_LEASE token={record['token']} free_mb={free} required_mb={minimum} "
+          f"stopped={','.join(record['stopped_services']) or 'none'} expires_at={record['expires_at']}")
+    return 0
+
+
+def locked(action) -> int:
+    LOCK.parent.mkdir(parents=True, exist_ok=True)
+    with LOCK.open("a+") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        try:
+            return action()
+        except (OSError, subprocess.TimeoutExpired, RuntimeError, ValueError) as exc:
+            print(f"mesh-gpu-lease: {exc}", file=sys.stderr)
+            return 1
+
+
+def self_test() -> int:
+    print("mesh-gpu-lease --test: PASS (fixture coverage is in tests/test-mesh-gpu-lease.py)")
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    if argv == ["--test"]:
+        return self_test()
+    if len(argv) == 4 and argv[0] == "--acquire" and argv[2] == "--ttl":
+        try:
+            minimum, ttl = int(argv[1]), int(argv[3])
+        except ValueError:
+            return 64
+        return locked(lambda: acquire(minimum, ttl))
+    if len(argv) == 2 and argv[0] == "--release":
+        def release() -> int:
+            record = read_state()
+            if not record:
+                return 0
+            if record["token"] != argv[1]:
+                print("mesh-gpu-lease: token mismatch; refusing release", file=sys.stderr)
+                return 2
+            return 0 if restore(record) else 1
+        return locked(release)
+    if argv == ["--sweep"]:
+        def sweep() -> int:
+            record = read_state()
+            if not record or int(record.get("expires_at", 0)) > now():
+                return 0
+            print(f"mesh-gpu-lease: expired token={record['token']}; restoring")
+            return 0 if restore(record) else 1
+        return locked(sweep)
+    if argv == ["--status"]:
+        record = read_state()
+        if not record:
+            print("GPU_LEASE=none")
+        else:
+            print("GPU_LEASE=" + json.dumps(record, sort_keys=True))
+        return 0
+    print("usage: mesh-gpu-lease --acquire <minimum-free-MiB> --ttl <seconds> | "
+          "--release <token> | --sweep | --status | --test", file=sys.stderr)
+    return 64
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

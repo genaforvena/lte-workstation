@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+"""Verify that task recovery leaves real self-pick work for idle mesh minds.
+
+Called by the scheduled mesh-task-unblock-sweep reflex after it materializes missing
+resolvers. Rebuilds the task journal from chat.log, reads the canonical audit and
+dispatch queue, and verifies exact-owner dispatch checks. When ownerless work exists,
+it checks that every idle mind sees and can claim it. It observes and reports; it
+never assigns a mind's choice or claims work itself.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HOME = Path.home()
+MESH = Path(os.environ.get("MESH_DIR", str(HOME / ".mesh"))).expanduser()
+JOURNAL = Path(os.environ.get("MESH_WITNESS_TASK_JOURNAL", str(MESH / "tasks.journal"))).expanduser()
+TAPE = Path(os.environ.get("MESH_WITNESS_AUTONOMY_TAPE", str(MESH / "witness-task-autonomy.log"))).expanduser()
+STATE = Path(os.environ.get("MESH_WITNESS_AUTONOMY_STATE", str(MESH / ".witness-task-autonomy.json"))).expanduser()
+TASK = os.environ.get("MESH_WITNESS_AUTONOMY_TASK", "mesh-task")
+JOURNAL_CMD = os.environ.get("MESH_WITNESS_AUTONOMY_JOURNAL_CMD", "mesh-task-journal")
+MIND_STATE = os.environ.get("MESH_WITNESS_AUTONOMY_MIND_STATE", "mesh-mind-state")
+CHAT = os.environ.get("MESH_WITNESS_AUTONOMY_CHAT", "mesh-chat")
+ALERT_SECONDS = int(os.environ.get("MESH_WITNESS_AUTONOMY_ALERT_SECONDS", "1800"))
+
+
+def command(argv: list[str], timeout: int = 60) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(argv, text=True, capture_output=True, timeout=timeout, check=False)
+
+
+def queue_rows(raw: str, label: str) -> list[tuple[str, str]]:
+    rows = []
+    for line_number, line in enumerate(raw.splitlines(), 1):
+        if not line:
+            continue
+        fields = line.split("\t", 2)
+        if len(fields) < 2 or not fields[1]:
+            raise ValueError(f"{label} row {line_number} is malformed")
+        rows.append((fields[0], fields[1]))
+    return rows
+
+
+def idle_minds(raw: str) -> list[str]:
+    result = []
+    for line in raw.splitlines():
+        fields = re.split(r"\s{2,}|\t", line.strip())
+        if len(fields) >= 2 and fields[0] not in ("WINDOW", "bash", "shell", "sh", "reflex") \
+                and fields[1].upper() == "IDLE":
+            result.append(fields[0])
+    return sorted(set(result))
+
+
+def source_ok() -> bool:
+    try:
+        head = JOURNAL.read_text(encoding="utf-8").splitlines()[:4]
+    except OSError:
+        return False
+    fields = " ".join(head)
+    return "task_source=PASS" in fields and bool(re.search(r"\bsource_errors=0\b", fields))
+
+
+def load_state() -> dict:
+    try:
+        value = json.loads(STATE.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(value: dict) -> None:
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    temporary = STATE.with_name(STATE.name + f".tmp.{os.getpid()}")
+    temporary.write_text(json.dumps(value, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(temporary, STATE)
+
+
+def report(errors: list[str], summary: str, now: int) -> str:
+    health = "FAIL" if errors else "PASS"
+    row = (f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(now))} RUN health={health} "
+           f"{summary} errors={';'.join(errors) if errors else 'none'}")
+    TAPE.parent.mkdir(parents=True, exist_ok=True)
+    with TAPE.open("a", encoding="utf-8") as output:
+        output.write(row + "\n")
+        output.flush()
+        os.fsync(output.fileno())
+
+    state = load_state()
+    if errors:
+        signature = ";".join(errors)
+        last_at = int(state.get("alert_at", 0))
+        if signature != state.get("alert_signature") or now - last_at >= ALERT_SECONDS:
+            posted = command([CHAT, f"[health-fail] witness-task-autonomy: {summary}; errors={signature}"], 15)
+            state["alert_signature"] = signature
+            if posted.returncode == 0:
+                state["alert_at"] = now
+            else:
+                row += f" alert=failed-rc-{posted.returncode}"
+    else:
+        state.pop("alert_signature", None)
+        state.pop("alert_at", None)
+    save_state(state)
+    print(row)
+    return health
+
+
+def run_once() -> int:
+    now = int(time.time())
+    errors: list[str] = []
+    rebuilt = command([JOURNAL_CMD], 90)
+    if rebuilt.returncode:
+        errors.append(f"journal-rc-{rebuilt.returncode}")
+    journal_pass = rebuilt.returncode == 0 and source_ok()
+    if not journal_pass:
+        errors.append("journal-source-not-PASS")
+
+    audit = command([TASK, "audit"])
+    queue = command([TASK, "queue", "--dispatch"])
+    minds = command([MIND_STATE, "--stats"])
+    for name, result in (("audit", audit), ("queue", queue), ("mind-state", minds)):
+        if result.returncode:
+            errors.append(f"{name}-rc-{result.returncode}")
+
+    candidates: list[tuple[str, str]] = []
+    idle: list[str] = []
+    checks = 0
+    ownerless_count = 0
+    blocked_count = 0
+    unfinished_count = 0
+    if not audit.returncode:
+        for number, line in enumerate(audit.stdout.splitlines(), 1):
+            if not line:
+                continue
+            fields = line.split("\t")
+            if len(fields) < 3:
+                errors.append(f"audit-row-{number}-malformed")
+                continue
+            if fields[0] == "BLOCKED":
+                blocked_count += 1
+            if fields[0] not in ("DONE", "REJECTED", "IGNORED"):
+                unfinished_count += 1
+    if not queue.returncode:
+        try:
+            candidates = queue_rows(queue.stdout, "global-queue")
+            ownerless_count = sum(owner == "-" for owner, _ in candidates)
+        except ValueError as exc:
+            errors.append(f"queue-parse:{exc}")
+    if not minds.returncode:
+        idle = idle_minds(minds.stdout)
+
+    # Check every concrete global candidate against its exact owner. This is a
+    # cheap contradiction guard: a listed candidate must not immediately fail
+    # the same eligibility boundary that take() will apply.
+    for owner, task_id in candidates:
+        if owner == "-":
+            continue
+        checked = command([TASK, "check", "dispatch", task_id, owner], 45)
+        checks += 1
+        if checked.returncode:
+            errors.append(f"check-{task_id}-for-{owner}-rc-{checked.returncode}")
+
+    # Ownerless tasks are a shared pool. Prove that every idle mind's normal
+    # owner-scoped self-pick prompt can see them; no idle mind is assigned one.
+    unowned_ids = {task_id for owner, task_id in candidates if owner == "-"}
+    visible = 0
+    if unowned_ids and idle:
+        for mind in idle:
+            scoped = command([TASK, "queue", "--dispatch", "--owner", mind], 60)
+            if scoped.returncode:
+                errors.append(f"owner-queue-{mind}-rc-{scoped.returncode}")
+                continue
+            try:
+                rows = queue_rows(scoped.stdout, f"owner-queue-{mind}")
+            except ValueError as exc:
+                errors.append(f"owner-queue-parse:{exc}")
+                continue
+            scoped_ids = {task_id for owner, task_id in rows if owner in ("-", mind)}
+            for task_id in sorted(unowned_ids - scoped_ids):
+                errors.append(f"unowned-{task_id}-invisible-to-idle-{mind}")
+            for task_id in sorted(unowned_ids & scoped_ids):
+                visible += 1
+                checked = command([TASK, "check", "dispatch", task_id, mind], 45)
+                checks += 1
+                if checked.returncode:
+                    errors.append(f"unowned-{task_id}-not-claimable-by-{mind}-rc-{checked.returncode}")
+
+    summary = (f"source={'PASS' if journal_pass else 'FAIL'} unfinished={unfinished_count} "
+               f"blocked={blocked_count} idle_minds={len(idle)} dispatchable={len(candidates)} "
+               f"ownerless={ownerless_count} ownerless_visible={visible} checks={checks}")
+    return 1 if report(errors, summary, now) == "FAIL" else 0
+
+
+def main(argv: list[str]) -> int:
+    if argv == ["--test"]:
+        print("mesh-witness-task-autonomy --test: PASS (fixture coverage is in tests/test-mesh-witness-task-autonomy.py)")
+        return 0
+    if argv not in ([], ["--once"]):
+        print("usage: mesh-witness-task-autonomy [--once|--test]", file=sys.stderr)
+        return 64
+    return run_once()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

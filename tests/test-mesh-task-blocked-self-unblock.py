@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 import sys
@@ -49,6 +50,15 @@ class BlockedSelfUnblockTests(unittest.TestCase):
         plan.write_text(f"{owner}\t{ref}\t{chain} work\n")
         self.command("create", chain, str(plan), actor=owner)
         self.command("take", chain, ref, actor=owner)
+
+    def test_created_tasks_require_prerequisite_recovery_before_rejection(self):
+        plan = Path(self.tmp.name) / "autonomous.tsv"
+        plan.write_text("alpha\tinspect\tDo the work\n")
+        self.command("create", "autonomous", str(plan), actor="alpha")
+        description = self.records()["autonomous"]["data"]["steps"][0]["description"]
+        self.assertIn("missing-prerequisite recovery:", description)
+        self.assertIn("reuse an exact active prerequisite task or create and link one", description)
+        self.assertIn("Reject only invalid, duplicate, out-of-scope, or unsafe work", description)
 
     def records(self):
         return json.loads(self.command("replay", "--json").stdout)
@@ -125,6 +135,38 @@ class BlockedSelfUnblockTests(unittest.TestCase):
         self.command("unblock-sweep", actor="witness")
         fresh = [r for r in self.resolvers() if r["chain"] != old["chain"]]
         self.assertEqual(len(fresh), 1)
+
+    def test_recent_missing_prerequisite_rejection_gets_one_owner_recovery_task(self):
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        parent = {"version": 2, "chain": "haunt-analysis", "ask": None,
+                  "created": stamp, "status": "rejected", "current": 0,
+                  "steps": [{"id": "haunt-analysis/compare", "owner": "alpha", "slug": "compare",
+                             "description": "Run comparison", "priority": 0, "status": "rejected",
+                             "rejected": stamp,
+                             "rejected_reason": "Rejected as premature: behavioral preflight missing; registration not approved"}]}
+        self.seed_ledger(parent)
+        self.command("unblock-sweep", actor="witness")
+        recovery = self.resolvers()
+        self.assertEqual(len(recovery), 1)
+        step = recovery[0]["steps"][0]
+        self.assertEqual(step["owner"], "alpha")
+        self.assertIn("rejected", step["description"].lower())
+        self.assertIn("find exact active work or create", step["description"].lower())
+        self.assertIn("implement", step["description"].lower())
+        self.assertIn("create a fresh exact-owner task", step["description"].lower())
+        self.assertIn("do not use mesh-task recover on the rejected step", step["description"].lower())
+        self.command("unblock-sweep", actor="witness")
+        self.assertEqual(len(self.resolvers()), 1)
+
+    def test_old_or_non_prerequisite_rejection_does_not_spawn_recovery(self):
+        old = {"version": 2, "chain": "old-rejection", "ask": None,
+               "created": "2026-09-01T00:00:00Z", "status": "rejected", "current": 0,
+               "steps": [{"id": "old-rejection/step", "owner": "alpha", "slug": "step",
+                          "description": "Run", "priority": 0, "status": "rejected",
+                          "rejected": "2026-09-01T00:00:00Z", "rejected_reason": "duplicate"}]}
+        self.seed_ledger(old)
+        self.command("unblock-sweep", actor="witness")
+        self.assertEqual(self.resolvers(), [])
 
     def test_legacy_terminal_row_does_not_render_stale_blocker_metadata(self):
         terminal = {"version": 2, "chain": "legacy-terminal", "ask": None,
