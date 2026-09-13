@@ -146,6 +146,11 @@ def validate(record: dict) -> None:
         if step['status'] == 'rejected' and (not isinstance(step.get('rejected_reason'), str)
                                             or not step['rejected_reason'].strip()):
             raise ReplayError('rejected task-state step has no reason')
+        if 'independent_reason' in step and (not isinstance(step.get('independent_reason'), str)
+                                             or not step['independent_reason'].strip()):
+            raise ReplayError('independent task-state step has no owner reason')
+        if 'independent_at' in step and 'independent_reason' not in step:
+            raise ReplayError('independent task-state step has no reason')
         owner = step.get('owner')
         if owner is not None and (not isinstance(owner, str) or not owner.strip()):
             raise ReplayError('invalid task-state owner')
@@ -416,7 +421,12 @@ def eligibility(records: dict, task: str, mode: str, owner: str) -> int:
     if len(matches) != 1:
         raise ReplayError(f'ambiguous task identity: {task}')
     data, index, step = matches[0]
-    if index != data['current'] or data.get('status') not in ('open', 'active'):
+    independent = independent_ready(data, index, step)
+    if index != data['current'] and not independent:
+        return 2
+    if data.get('status') not in ('open', 'active') and not independent:
+        return 2
+    if step.get('waiting_for'):
         return 2
     canonical_owner = step.get('owner')
     if canonical_owner:
@@ -426,6 +436,25 @@ def eligibility(records: dict, task: str, mode: str, owner: str) -> int:
         return 2
     expected = ('open',) if mode in ('dispatch', 'pending') else ('active', 'running', 'claimed')
     return 0 if step['status'] in expected else 2
+
+
+def independent_ready(data: dict, index: int, step: dict) -> bool:
+    """An owner-attested later step is ready only behind a blocked chain head.
+
+    A recorded reason is the deliberate opt-in that distinguishes real
+    independent work from ordinary ordered successors. Explicit wait-for gates
+    always win.
+    """
+    current = data.get('current')
+    steps = data.get('steps', [])
+    if (not isinstance(current, int) or not 0 <= current < len(steps)
+            or data.get('status') not in ('active', 'blocked')
+            or index <= current or step.get('status') != 'open'
+            or step.get('waiting_for')
+            or not isinstance(step.get('independent_reason'), str)
+            or not step['independent_reason'].strip()):
+        return False
+    return steps[current].get('status') == 'blocked'
 
 
 def ledger_projection(records: dict, events: list) -> list:
