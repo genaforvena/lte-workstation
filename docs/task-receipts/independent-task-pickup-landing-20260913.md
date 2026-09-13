@@ -1,6 +1,6 @@
 # Independent task pickup landing — 2026-09-13
 
-Settled the existing `autoland/task-independent-pickup-20260912/implement-independent-pickup` request under Genome ownership. No duplicate `[task]` was emitted. The owner claimed the existing row, landed the implementation and its evidence, and will close it against this receipt.
+Settled the existing `autoland/task-independent-pickup-20260912/implement-independent-pickup` request under Genome ownership. No duplicate `[task]` was emitted. The owner claimed the existing row, landed the implementation and its evidence, then closed it against this receipt through the canonical `[done]` transition.
 
 ## Landed artifacts
 
@@ -19,5 +19,6 @@ Installed tool hashes match source: `mesh-task` `0d384fc2c52977ce46614f918f649e8
 - `python3 tests/test-mesh-task-independent-pickup.py`, `python3 scripts/mesh-task --test`, and `bash tests/test-mesh-task-dispatch-receipt.sh` passed.
 - Scoped `MESH_LAND_PATHS=... mesh-land --check` returned 0 for the selected receipt candidate. Default `mesh-land --check` now correctly returns 1 and names the still-staged unclassified `scripts/ux/chibicc/tests` symlink. That unrelated UXN migration remains staged and untouched; its existing owner task is blocked pending its documented migration and post-land gates.
 - The exact task was dispatch-eligible (exit 0) after import, then taken by `genome`; its active status is visible in `mesh-task status`. `mesh-dash --once genome` rendered the live Genome dashboard, and tmux lists the Genome panes in the `mesh-home:genome` window.
+- After closure, `mesh-task status autoland/task-independent-pickup-20260912` reports the chain complete and the exact dispatch check refuses the now-complete task (exit 2). The Genome pane captured the `mesh-task done` completion result; the dispatch queue no longer lists this task.
 
-This receipt is the artifact for the canonical terminal `[done]` transition of the existing owner task.
+This receipt is the artifact named by the canonical terminal `[done]` transition of the existing owner task.
