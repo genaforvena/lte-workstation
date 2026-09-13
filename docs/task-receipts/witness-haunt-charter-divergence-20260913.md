@@ -47,6 +47,11 @@ alerts.
 - Fresh live run at `2026-09-13T16:42:10Z`: `healthy repaired=0 blocked=0 skipped=15 staffing_rc=0`.
   The live divergence state now has zero rows; the final log records haunt and wake as
   `active-charter-authoritative`.
+- Post-commit live recheck at `2026-09-13T16:43:48Z` recorded `blocked=0 repaired=0 skipped=15`,
+  with haunt, hire, and wake still classified `active-charter-authoritative`; the divergence state
+  remained empty. The overall invocation exited 1 because `mesh-staffing` could not read its task
+  census (`mesh-task audit` timed out after 8 seconds, `staffing_rc=2`). This is a separate live
+  staffing limitation; the watcher-specific fixture and deployed `--test` both pass.
 - `rtk git diff --check` — PASS.
 
 No live charter was overwritten, no comparison or network substrate was changed, and the watcher
