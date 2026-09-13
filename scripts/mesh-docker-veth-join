@@ -1,0 +1,260 @@
+#!/usr/bin/env python3
+"""Bounded, read-only join of Docker network events to host veth sysfs rows."""
+import argparse
+import datetime as dt
+import json
+import os
+from pathlib import Path
+import selectors
+import subprocess
+import sys
+import time
+
+
+UNKNOWN = "UNKNOWN"
+TASK_LABELS = ("mesh.task.key", "mesh_task_key", "mesh-task-key", "mesh.task")
+
+
+def read_seqnum(path=Path("/sys/kernel/uevent_seqnum")):
+    try:
+        return int(Path(path).read_text().strip())
+    except (OSError, ValueError):
+        return UNKNOWN
+
+
+def _ifindices(netdir):
+    """Return (name, ifindex) for namespace interfaces other than loopback."""
+    rows = []
+    try:
+        entries = list(Path(netdir).iterdir())
+    except OSError:
+        return rows
+    for entry in entries:
+        if entry.name == "lo":
+            continue
+        try:
+            rows.append((entry.name, int((entry / "ifindex").read_text().strip())))
+        except (OSError, ValueError):
+            continue
+    return rows
+
+
+def _host_veths(host_net, peer_ifindex):
+    matches = []
+    try:
+        entries = list(Path(host_net).iterdir())
+    except OSError:
+        return matches
+    sysroot = Path(host_net).parent.parent
+    for entry in entries:
+        if entry.name == "lo":
+            continue
+        try:
+            if int((entry / "iflink").read_text().strip()) != peer_ifindex:
+                continue
+            devpath = "/" + str(entry.resolve().relative_to(sysroot.resolve()))
+            matches.append((entry.name, devpath))
+        except (OSError, ValueError):
+            continue
+    return matches
+
+
+def join_event(event, inspected, proc_root=Path("/proc"), host_net=Path("/sys/class/net")):
+    actor = event.get("Actor") or {}
+    attrs = actor.get("Attributes") or {}
+    container_id = attrs.get("container") or (
+        actor.get("ID") if event.get("Type") == "container" else UNKNOWN
+    )
+    network_name = attrs.get("name") or UNKNOWN
+    network_id = actor.get("ID") if event.get("Type") == "network" else None
+    timestamp_ns = event.get("timeNano")
+    if isinstance(timestamp_ns, int) and timestamp_ns > 0:
+        event_time = dt.datetime.fromtimestamp(timestamp_ns / 1_000_000_000, dt.timezone.utc).isoformat()
+    elif isinstance(event.get("time"), (int, float)):
+        event_time = dt.datetime.fromtimestamp(event["time"], dt.timezone.utc).isoformat()
+    else:
+        event_time = UNKNOWN
+    row = {
+        "event_type": event.get("Type", UNKNOWN),
+        "event_action": event.get("Action", UNKNOWN),
+        "event_time": event_time,
+        "event_time_unix_ns": timestamp_ns if isinstance(timestamp_ns, int) else (
+            int(event["time"] * 1_000_000_000) if isinstance(event.get("time"), (int, float)) else UNKNOWN
+        ),
+        "container_id": container_id,
+        "endpoint_network": network_name,
+        "endpoint_id": UNKNOWN,
+        "peer_ifindex": UNKNOWN,
+        "host_veth_name": UNKNOWN,
+        "host_veth_devpath": UNKNOWN,
+        "mesh_task_key": UNKNOWN,
+        "join_status": "unknown",
+    }
+    if not inspected:
+        row["inspect_status"] = "unavailable"
+        return row
+    row["inspect_status"] = "read"
+    labels = ((inspected.get("Config") or {}).get("Labels") or {})
+    for label in TASK_LABELS:
+        value = labels.get(label)
+        if value:
+            row["mesh_task_key"] = value
+            break
+
+    networks = ((inspected.get("NetworkSettings") or {}).get("Networks") or {})
+    endpoints = [
+        endpoint for name, endpoint in networks.items()
+        if (network_name == UNKNOWN or name == network_name)
+        and (not network_id or not endpoint.get("NetworkID") or endpoint.get("NetworkID") == network_id)
+    ]
+    if len(endpoints) == 1:
+        row["endpoint_id"] = endpoints[0].get("EndpointID") or UNKNOWN
+    pid = ((inspected.get("State") or {}).get("Pid") or 0)
+    if pid and len(networks) == 1 and len(endpoints) == 1:
+        peer_rows = _ifindices(Path(proc_root) / str(pid) / "root" / "sys" / "class" / "net")
+        host_matches = []
+        for _name, peer_ifindex in peer_rows:
+            for host_name, devpath in _host_veths(host_net, peer_ifindex):
+                host_matches.append((peer_ifindex, host_name, devpath))
+        if len(peer_rows) == 1 and len(host_matches) == 1:
+            peer_ifindex, host_name, devpath = host_matches[0]
+            row.update({
+                "peer_ifindex": peer_ifindex,
+                "host_veth_name": host_name,
+                "host_veth_devpath": devpath,
+                "join_status": "unique",
+            })
+        elif len(networks) > 1 or len(peer_rows) > 1 or len(host_matches) > 1:
+            row["join_status"] = "ambiguous"
+    elif len(networks) > 1:
+        row["join_status"] = "ambiguous"
+    return row
+
+
+def _docker_inspect(container_id, timeout=2.0):
+    if not container_id or container_id == UNKNOWN:
+        return None
+    try:
+        result = subprocess.run(
+            ["docker", "inspect", "--type", "container", container_id],
+            check=True, capture_output=True, text=True, timeout=timeout,
+        )
+        data = json.loads(result.stdout)
+        return data[0] if data else None
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+        return None
+
+
+def _capture(seconds, max_events):
+    started = time.time()
+    started_iso = dt.datetime.fromtimestamp(started, dt.timezone.utc).isoformat()
+    seq_start = read_seqnum()
+    cmd = ["docker", "events", "--since", str(int(started)), "--filter", "type=network", "--format", "{{json .}}"]
+    rows = []
+    errors = []
+    proc = None
+    deadline = time.monotonic() + seconds
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+        selector = selectors.DefaultSelector()
+        selector.register(proc.stdout, selectors.EVENT_READ)
+        inspected_cache = {}
+        while time.monotonic() < deadline and len(rows) < max_events:
+            remaining = max(0, deadline - time.monotonic())
+            ready = selector.select(remaining)
+            if not ready:
+                break
+            line = proc.stdout.readline()
+            if not line:
+                if proc.poll() is not None:
+                    break
+                continue
+            try:
+                event = json.loads(line)
+            except ValueError:
+                errors.append("docker events emitted malformed JSON")
+                continue
+            seq_before = read_seqnum()
+            actor = event.get("Actor") or {}
+            attrs = actor.get("Attributes") or {}
+            container_id = attrs.get("container") or UNKNOWN
+            inspected = inspected_cache.get(container_id)
+            if container_id not in inspected_cache:
+                inspected = _docker_inspect(container_id)
+                inspected_cache[container_id] = inspected
+            seq_after = read_seqnum()
+            row = join_event(event, inspected)
+            row.update({
+                "uevent_seqnum_baseline": seq_before,
+                "uevent_seqnum_after_inspect": seq_after,
+                "uevent_seqnum_delta_since_baseline": (
+                    seq_after - seq_before
+                    if isinstance(seq_after, int) and isinstance(seq_before, int)
+                    else UNKNOWN
+                ),
+                "seqnum_semantics": "global sequence bracket around Docker event processing; not causal attribution",
+            })
+            rows.append(row)
+        selector.close()
+    except OSError as exc:
+        errors.append(f"cannot start Docker event read: {exc}")
+    finally:
+        if proc is not None:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=1)
+    finished = time.time()
+    try:
+        docker_rc = proc.returncode if proc is not None else None
+    except Exception:
+        docker_rc = None
+    artifact = {
+        "record_type": "capture",
+        "observer": "mesh-docker-veth-join",
+        "read_only": True,
+        "started_at": started_iso,
+        "finished_at": dt.datetime.fromtimestamp(finished, dt.timezone.utc).isoformat(),
+        "requested_seconds": seconds,
+        "max_events": max_events,
+        "seqnum_baseline": seq_start,
+        "seqnum_final": read_seqnum(),
+        "docker_events_exit": docker_rc,
+        "event_count": len(rows),
+        "errors": errors,
+        "note": "A missing container inspect or non-unique endpoint/veth join remains UNKNOWN; per-event seqnum delta brackets processing but does not imply causality.",
+    }
+    return artifact, rows
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--seconds", type=int, default=10, help="bounded capture interval (1..300; default 10)")
+    parser.add_argument("--max-events", type=int, default=100, help="stop after this many events (1..1000)")
+    parser.add_argument("--output", type=Path, help="JSONL artifact path; defaults under MESH_DIR observations/")
+    args = parser.parse_args(argv)
+    if not 1 <= args.seconds <= 300 or not 1 <= args.max_events <= 1000:
+        parser.error("--seconds must be 1..300 and --max-events must be 1..1000")
+    output = args.output
+    if output is None:
+        mesh_dir = Path(os.environ.get("MESH_DIR", "/home/mesh-home/.mesh"))
+        output = mesh_dir / "observations" / f"mesh-docker-veth-join-{int(time.time())}.jsonl"
+    header, rows = _capture(args.seconds, args.max_events)
+    try:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        with output.open("x", encoding="utf-8") as stream:
+            stream.write(json.dumps(header, sort_keys=True) + "\n")
+            for row in rows:
+                stream.write(json.dumps(row, sort_keys=True) + "\n")
+    except OSError as exc:
+        print(f"mesh-docker-veth-join: cannot write artifact {output}: {exc}", file=sys.stderr)
+        return 1
+    print(f"artifact={output} events={len(rows)} errors={len(header['errors'])}")
+    return 1 if header["errors"] or header["docker_events_exit"] not in (0, None, -15, 143) else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
