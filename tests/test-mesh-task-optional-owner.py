@@ -29,15 +29,21 @@ with tempfile.TemporaryDirectory() as td:
     run('create', 'demo', str(plan))
     assert state()['steps'][0]['owner'] is None
     assert 'owner:' not in board.read_text()
+    assert 'demo/work' in run('queue', '--dispatch', '--owner', 'alpha').stdout
+    assert 'demo/work' in run('queue', '--dispatch', '--owner', 'beta').stdout
+    run('check', 'dispatch', 'demo/work', 'beta')
     run('take', 'demo', 'work', code=1, MESH_TASK_CHAT_CMD='/bin/false')
     assert state()['steps'][0]['owner'] is None
     run('take', 'demo', 'work')
     assert state()['steps'][0]['owner'] == 'alpha'
+    assert 'demo/work' not in run('queue', '--dispatch', '--owner', 'beta').stdout
+    run('check', 'dispatch', 'demo/work', 'beta', code=2)
     (tmp / 'mesh/chains/demo.json').unlink()
     (tmp / 'mesh/task-context/alpha.json').unlink()
     assert 'demo [active]' in run('status', 'demo').stdout
     assert 'demo/work' in run('audit').stdout
     run('create', 'second', str(plan))
+    assert 'second/work' not in run('queue', '--dispatch', '--owner', 'alpha').stdout
     busy = run('take', 'second', 'work', code=2)
     assert 'already has active task' in busy.stderr
     run('take', 'demo', 'work', code=2, MESH_TASK_ACTOR='beta')
