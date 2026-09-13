@@ -47,6 +47,7 @@ def run() -> None:
         watch.ALERT_SECONDS = 1800
         calls: list[list[str]] = []
         alerts: list[str] = []
+        recovery_wakes: list[list[str]] = []
         omit_bob_unowned = False
         audit = (
             "OPEN_UNOWNED\talice\towned/work\tdispatch=sent\n"
@@ -80,6 +81,8 @@ def run() -> None:
                     rc = 2
             elif argv == [watch.MIND_STATE, "--stats"]:
                 out = "WINDOW\tSTATE\nalice\tIDLE\nbob\tIDLE\nwitness\tWORKING\n"
+            elif argv[0] == watch.TELL:
+                recovery_wakes.append(argv)
             elif argv[0] == watch.CHAT:
                 alerts.append(" ".join(argv[1:]))
             else:
@@ -109,6 +112,8 @@ def run() -> None:
         stalled_tape = watch.TAPE.read_text(encoding="utf-8").splitlines()[-1]
         if "active-task-stalled-genome/landing-for-" not in stalled_tape:
             raise AssertionError(f"stalled active claim lacked exact task evidence: {stalled_tape}")
+        if len(recovery_wakes) != 1 or recovery_wakes[0][2] != "genome" or "genome/landing" not in recovery_wakes[0][-1]:
+            raise AssertionError(f"stalled active claim did not wake its exact owner: {recovery_wakes}")
         watch.time.time = original_time
         watch.STATE.write_text("{}\n", encoding="utf-8")
 
