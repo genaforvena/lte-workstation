@@ -482,6 +482,9 @@ def dispatch(path: Path, data: dict) -> None:
         # A delivered task is queued for its exact owner, not unowned work.  If
         # the owner does not take it before this receipt window expires, audit
         # turns it into a recovery candidate and witness re-dispatches it.
+        # Preserve its first eligible time across redeliveries so new arrivals
+        # cannot repeatedly reset an older task's place in the queue.
+        data["steps"][index].setdefault("queued_at", now())
         data["steps"][index]["dispatched_at"] = now()
         data["steps"][index]["dispatch_until"] = future()
         save(path, data)
@@ -939,6 +942,9 @@ def release_waiters(completed_task: str) -> None:
                 continue
             waiting_step.pop("waiting_for", None)
             waiting_step["released_by"] = completed_task
+            # Dependency time is not queue time. Aging starts when this task
+            # becomes runnable, not while it waits for its prerequisite.
+            waiting_step["queued_at"] = now()
             if index == waiting_data["current"]:
                 waiting_data["dispatch"] = "pending"
             require_emit("resume", f"{waiting_step['id']}: prerequisite DONE {completed_task}; returned task is dispatchable"
@@ -1352,6 +1358,14 @@ def live_owners() -> set[str]:
 
 def audit() -> None:
     live = live_owners(); current = time.time(); rows = []
+
+    def order_key(bucket: int, data: dict, index: int, step: dict, incident: int):
+        stamp = step.get("queued_at") or step.get("dispatched_at") or data.get("created", "")
+        resolver = data.get("chain", "").startswith("unblock/")
+        work_class = 0 if incident == 0 else (1 if resolver else 2)
+        return (bucket, -queue_age_bucket(stamp, current), work_class,
+                -priority_of(step), epoch_iso(stamp), data["chain"], index)
+
     for path, data in chain_states():
         if data.get("status") not in ("open", "active", "blocked", "complete", "ignored", "rejected"): continue
         current_index = data["current"]
@@ -1359,13 +1373,9 @@ def audit() -> None:
             state = step.get("status")
             incident = 0 if re.search(r"(?:^|\s)priority:incident\s*$", step.get("description", ""), re.I) else 1
             rank = -priority_of(step)
-            # Newest first within (bucket, incident, priority): negated epoch, so the
-            # most recently queued task sorts to the top of the ledger and is picked
-            # up first (operator 2026-09-12). Starvation is the known tradeoff: under
-            # continuous inflow an old low-priority row can wait indefinitely; that is
-            # visible in the audit tail rather than hidden, by design.
-            stamp = step.get("dispatched_at") or step.get("queued_at") or data.get("created", "")
-            terminal_key = (4, incident, rank, -epoch_iso(stamp), data["chain"], index)
+            # Age cohorts advance daily, so class and priority cannot bury older
+            # work forever; FIFO breaks any remaining tie within the cohort.
+            terminal_key = order_key(4, data, index, step, incident)
             if state == "done":
                 rows.append((terminal_key, f"DONE\t{step['owner']}\t{step['id']}\t"
                              f"artifact={step.get('artifact', 'missing')}"))
@@ -1380,14 +1390,14 @@ def audit() -> None:
                 continue
             if data.get("status") == "rejected" and index > current_index:
                 predecessor = data["steps"][current_index]["id"]
-                rows.append(((2, incident, rank, stamp, data["chain"], index),
+                rows.append((order_key(2, data, index, step, incident),
                              f"HELD_REJECTED\t{step.get('owner') or '-'}\t{step['id']}\t"
                              f"predecessor={predecessor} action=recover-{step.get('recovery_action', 'required')}"))
                 continue
             if state == "open":
                 bucket = 0 if index == current_index else 3
                 if step.get("waiting_for"):
-                    rows.append(((2, incident, rank, stamp, data["chain"], index),
+                    rows.append((order_key(2, data, index, step, incident),
                                  f"QUEUED\t{step['owner']}\t{step['id']}\twaiting_for={step['waiting_for']} dispatch=waiting"))
                     continue
                 queued_until = max(epoch_iso(step.get("reschedule_until", "")),
@@ -1395,14 +1405,14 @@ def audit() -> None:
                 if (data["chain"].startswith("health-warning/")
                         and data.get("dispatch") == "sent"
                         and queued_until < current):
-                    rows.append(((2, incident, rank, stamp, data["chain"], index),
+                    rows.append((order_key(2, data, index, step, incident),
                                  f"HELD_EXPIRED\t{step['owner']}\t{step['id']}\t"
                                  "retry=next fresh health warning"))
                     continue
                 independent = independent_ready(data, index, step)
                 verdict = ("READY_INDEPENDENT" if independent else
                            "QUEUED" if index != current_index or queued_until >= current else "OPEN_UNOWNED")
-                rows.append(((0 if independent else bucket, incident, rank, stamp, data["chain"], index),
+                rows.append((order_key(0 if independent else bucket, data, index, step, incident),
                              f"{verdict}\t{step['owner']}\t{step['id']}\t"
                              f"current={data['steps'][current_index]['id']} dispatch={step.get('independent_dispatch') if independent else data.get('dispatch','unknown')}"
                              f"{(' independent_reason=' + step['independent_reason']) if independent else ''}"))
@@ -1410,7 +1420,7 @@ def audit() -> None:
             if state == "blocked":
                 if index != current_index and not independent_marked(step):
                     continue
-                rows.append(((2, incident, rank, stamp, data["chain"], index),
+                rows.append((order_key(2, data, index, step, incident),
                              f"BLOCKED\t{step['owner']}\t{step['id']}\t{step.get('blocker_type','unknown')}\t{step.get('retry','unspecified')}"
                              f"{(' independent_reason=' + step['independent_reason']) if index != current_index and independent_marked(step) else ''}"))
                 continue
@@ -1418,7 +1428,7 @@ def audit() -> None:
                 continue
             lease = epoch_iso(step.get("lease_until", "1970-01-01T00:00:00Z"))
             verdict = "RUNNING" if lease >= current else "OVERDUE"
-            rows.append(((1, incident, rank, stamp, data["chain"], index),
+            rows.append((order_key(1, data, index, step, incident),
                          f"{verdict}\t{step['owner']}\t{step['id']}\tlease={step.get('lease_until','missing')}"
                          f"{(' independent_reason=' + step['independent_reason']) if index != current_index else ''}"))
     for _, row in sorted(rows):
@@ -1443,9 +1453,12 @@ def dispatch_queue(owner: str | None = None) -> None:
                     and active_tasks_for_owner(task_records(), step["owner"], step["id"])):
                 continue
             incident = bool(re.search(r"(?:^|\s)priority:incident\s*$", step.get("description", ""), re.I))
-            stamp = step.get("dispatched_at") or step.get("queued_at") or data.get("created", "")
-            rows.append((0 if incident else 1, -priority_of(step), -epoch_iso(stamp), data["chain"], step))
-    for incident_rank, _, _, _, step in sorted(rows, key=lambda row: row[:4]):
+            stamp = step.get("queued_at") or step.get("dispatched_at") or data.get("created", "")
+            resolver = data["chain"].startswith("unblock/")
+            work_class = 0 if incident else (1 if resolver else 2)
+            rows.append((-queue_age_bucket(stamp), work_class, -priority_of(step),
+                         epoch_iso(stamp), data["chain"], index, step))
+    for _, _, _, _, _, _, step in sorted(rows, key=lambda row: row[:6]):
         print(f"{step.get('owner') or '-'}\t{step['id']}\t"
               f"{priority_label(step)}\t{step.get('description', '')}"
               f" tags={step.get('tags', '-')} design_artifact={step.get('design_artifact', '-') }"
@@ -1455,6 +1468,16 @@ def dispatch_queue(owner: str | None = None) -> None:
 def epoch_iso(value: str) -> float:
     try: return calendar.timegm(time.strptime(value, "%Y-%m-%dT%H:%M:%SZ"))
     except ValueError: return 0
+
+
+def queue_age_bucket(stamp: str, current: float | None = None) -> int:
+    """Return full age intervals since a task became eligible for dispatch."""
+    try:
+        interval = max(1, int(os.environ.get("MESH_TASK_QUEUE_AGING_SECONDS", "86400")))
+    except ValueError:
+        interval = 86400
+    age = max(0, (time.time() if current is None else current) - epoch_iso(stamp))
+    return int(age // interval)
 
 
 def test() -> None:
