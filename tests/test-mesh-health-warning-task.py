@@ -155,6 +155,17 @@ def main() -> None:
         assert calls_before_retry[-3:-1] == ["create", partial_chain], calls_before_retry
         assert "dispatch" not in calls_before_retry[-3:], calls_before_retry
 
+        deferred_state = json.loads((mesh / "warning-tasks.state").read_text())
+        deferred_state["dispatch_retries"] = {partial_chain: {"until": 4102444800, "attempts": 1}}
+        (mesh / "warning-tasks.state").write_text(json.dumps(deferred_state))
+        deferred = run_watcher(mesh, task_cmd)
+        assert deferred.returncode == 0, deferred.stderr
+        assert (td / "calls").read_text().splitlines() == calls_before_retry, (
+            "failed dispatch retried before its durable retry window")
+        retry_state = json.loads((mesh / "warning-tasks.state").read_text())
+        assert retry_state["dispatch_retries"][partial_chain]["until"] == 4102444800, retry_state
+        retry_state["dispatch_retries"][partial_chain]["until"] = 0
+        (mesh / "warning-tasks.state").write_text(json.dumps(retry_state))
         retried = run_watcher(mesh, task_cmd)
         assert retried.returncode == 0, retried.stderr
         calls_after_retry = (td / "calls").read_text().splitlines()
