@@ -21,7 +21,7 @@ chat.write_text("".join(f"2026-09-13T17:00:{i:02d}Z  fixture  :: raw-line-{i:02d
 PY
 
 rendered="$(MESH_DIR="$mesh" MESH_TASK_JOURNAL="$mesh/tasks.journal" \
-  MESH_DASH_CHAT_LOG="$mesh/chat.log" MESH_DASH_PANE_ROWS=47 MESH_DASH_PANE_COLS=274 \
+  MESH_DASH_CHAT_LOG="$mesh/chat.log" MESH_DASH_PANE_ROWS=47 MESH_DASH_PANE_COLS=189 \
   "$ROOT/scripts/mesh-dash" --once witness 2>&1)"
 viewport="$(printf '%s\n' "$rendered" | tail -n 47)"
 
