@@ -8,7 +8,9 @@ rc=$?
 set -e
 [ "$rc" -eq 0 ] || { echo "$out" >&2; echo "test-mesh-charter-watch: FAIL (tool test rc=$rc)" >&2; exit 1; }
 grep -q 'missing charter repaired' <<<"$out"
-grep -q 'divergent charter preserved' <<<"$out"
+grep -q 'active charter override preserved' <<<"$out"
+grep -q 'stale divergence state cleared' <<<"$out"
+grep -q 'override changes ignored' <<<"$out"
 grep -q 'run row written' <<<"$out"
 grep -q 'PASS' <<<"$out"
 grep -q 'reflex-cadence:' "$root/scripts/mesh-charter-watch"
