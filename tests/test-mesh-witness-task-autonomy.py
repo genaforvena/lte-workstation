@@ -48,14 +48,18 @@ def run() -> None:
         calls: list[list[str]] = []
         alerts: list[str] = []
         recovery_wakes: list[list[str]] = []
+        dispatch_repairs: list[list[str]] = []
         omit_bob_unowned = False
         audit = (
             "OPEN_UNOWNED\talice\towned/work\tdispatch=sent\n"
+            "OPEN_UNOWNED\tcarol\tfailed/work\tdispatch=failed\n"
             "OPEN_UNOWNED\t-\tpool/work\tdispatch=sent\n"
             "RUNNING\tgenome\tgenome/landing\tlease=2030-01-01T00:00:00Z\n"
             "BLOCKED\thaunt\tchain/wait\tdependency\tretry=prerequisite\n"
         )
-        global_queue = "alice\towned/work\t0\tdescription\n-\tpool/work\t0\tdescription\n"
+        global_queue = ("alice\towned/work\t0\tdescription\n"
+                        "carol\tfailed/work\t0\tdescription\n"
+                        "-\tpool/work\t0\tdescription\n")
 
         def fake_command(argv: list[str], timeout: int = 60) -> subprocess.CompletedProcess[str]:
             nonlocal omit_bob_unowned
@@ -79,6 +83,8 @@ def run() -> None:
             elif argv[:2] == [watch.TASK, "check"]:
                 if argv[3] == "dispatch" and argv[4] == "missing":
                     rc = 2
+            elif argv[:2] == [watch.TASK, "reschedule-task"]:
+                dispatch_repairs.append(argv)
             elif argv == [watch.MIND_STATE, "--stats"]:
                 out = "WINDOW\tSTATE\nalice\tIDLE\nbob\tIDLE\nwitness\tWORKING\n"
             elif argv[0] == watch.TELL:
@@ -96,10 +102,13 @@ def run() -> None:
         if watch.run_once() != 0:
             raise AssertionError("healthy ownerless queue fixture failed")
         tape = watch.TAPE.read_text(encoding="utf-8")
-        for field in ("health=PASS", "source=PASS", "unfinished=4", "blocked=1",
-                      "idle_minds=2", "dispatchable=2", "ownerless=1", "ownerless_visible=2"):
+        for field in ("health=PASS", "source=PASS", "unfinished=5", "blocked=1",
+                      "idle_minds=2", "dispatchable=3", "ownerless=1", "ownerless_visible=2",
+                      "dispatch_repairs=1"):
             if field not in tape:
                 raise AssertionError(f"tape missing {field}: {tape}")
+        if dispatch_repairs != [[watch.TASK, "reschedule-task", "failed/work"]]:
+            raise AssertionError(f"failed exact-owner dispatch was not repaired: {dispatch_repairs}")
         for mind in ("alice", "bob"):
             if [watch.TASK, "queue", "--dispatch", "--owner", mind] not in calls:
                 raise AssertionError(f"ownerless work was not checked in {mind}'s queue")
