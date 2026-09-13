@@ -8,6 +8,7 @@ import json
 import os
 import subprocess
 import tempfile
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -20,6 +21,24 @@ SPEC.loader.exec_module(watch)
 
 
 def run() -> None:
+    # Exercise the real subprocess boundary before replacing commands with fixtures.
+    with tempfile.TemporaryDirectory(prefix="mesh-autonomy-missing-command-") as raw:
+        missing = str(Path(raw) / "absent-command")
+        result = subprocess.run(
+            [str(WATCH), "--once"], text=True, capture_output=True,
+            env={**os.environ, "MESH_DIR": raw,
+                 "MESH_WITNESS_AUTONOMY_JOURNAL_CMD": missing,
+                 "MESH_WITNESS_AUTONOMY_TASK": missing,
+                 "MESH_WITNESS_AUTONOMY_MIND_STATE": missing,
+                 "MESH_WITNESS_AUTONOMY_CHAT": missing}, check=False)
+        tape_path = Path(raw) / "witness-task-autonomy.log"
+        assert result.returncode == 1 and tape_path.exists(), (
+            "missing dependency must leave a failed RUN artifact", result.stderr)
+        assert "health=FAIL" in tape_path.read_text()
+        assert "journal-rc-127" in tape_path.read_text()
+        assert "alert=failed-rc-127" in tape_path.read_text()
+    timed = watch.command([sys.executable, "-c", "import time; time.sleep(10)"], timeout=0.05)
+    assert timed.returncode == 124, "a timed-out probe must become a reportable failure"
     with tempfile.TemporaryDirectory(prefix="mesh-witness-task-autonomy-") as raw:
         base = Path(raw)
         watch.JOURNAL = base / "tasks.journal"
@@ -106,6 +125,13 @@ def run() -> None:
             raise AssertionError(f"scheduled reflex failed: {result.stdout}{result.stderr}")
         if order.read_text(encoding="utf-8").splitlines() != ["sweep", "witness"]:
             raise AssertionError("the scheduled recovery sweep did not run before witness verification")
+        (home_bin / "mesh-task").write_text("#!/bin/sh\nexit 9\n", encoding="utf-8")
+        order.write_text("")
+        result = subprocess.run([str(WRAPPER), "--run"], env=env,
+                                text=True, capture_output=True, check=False)
+        assert result.returncode == 9, "failed sweep status must remain loud"
+        assert order.read_text().splitlines() == ["witness"], (
+            "failed recovery must still run witness observation")
     print("witness-task-autonomy: PASS (journal, audit, exact checks, idle self-pick, failure, wiring)")
 
 
