@@ -51,6 +51,7 @@ def run() -> None:
         audit = (
             "OPEN_UNOWNED\talice\towned/work\tdispatch=sent\n"
             "OPEN_UNOWNED\t-\tpool/work\tdispatch=sent\n"
+            "RUNNING\tgenome\tgenome/landing\tlease=2030-01-01T00:00:00Z\n"
             "BLOCKED\thaunt\tchain/wait\tdependency\tretry=prerequisite\n"
         )
         global_queue = "alice\towned/work\t0\tdescription\n-\tpool/work\t0\tdescription\n"
@@ -86,10 +87,13 @@ def run() -> None:
             return subprocess.CompletedProcess(argv, rc, out, "")
 
         watch.command = fake_command
+        original_time = watch.time.time
+        moment = [1_000]
+        watch.time.time = lambda: moment[0]
         if watch.run_once() != 0:
             raise AssertionError("healthy ownerless queue fixture failed")
         tape = watch.TAPE.read_text(encoding="utf-8")
-        for field in ("health=PASS", "source=PASS", "unfinished=3", "blocked=1",
+        for field in ("health=PASS", "source=PASS", "unfinished=4", "blocked=1",
                       "idle_minds=2", "dispatchable=2", "ownerless=1", "ownerless_visible=2"):
             if field not in tape:
                 raise AssertionError(f"tape missing {field}: {tape}")
@@ -98,6 +102,15 @@ def run() -> None:
                 raise AssertionError(f"ownerless work was not checked in {mind}'s queue")
             if [watch.TASK, "check", "dispatch", "pool/work", mind] not in calls:
                 raise AssertionError(f"ownerless work was not eligibility-checked by {mind}")
+
+        moment[0] += watch.ACTIVE_STALL_SECONDS + 1
+        if watch.run_once() != 1:
+            raise AssertionError("unchanged active claim was not reported as stalled")
+        stalled_tape = watch.TAPE.read_text(encoding="utf-8").splitlines()[-1]
+        if "active-task-stalled-genome/landing-for-" not in stalled_tape:
+            raise AssertionError(f"stalled active claim lacked exact task evidence: {stalled_tape}")
+        watch.time.time = original_time
+        watch.STATE.write_text("{}\n", encoding="utf-8")
 
         omit_bob_unowned = True
         if watch.run_once() != 1:
