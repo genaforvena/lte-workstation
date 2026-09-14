@@ -71,3 +71,19 @@ for i in 18 19; do
     || { echo "FAIL: newest raw chat line $i is outside the 80x11 viewport" >&2; exit 1; }
 done
 printf 'test-witness-pane-fit: PASS (compact 80x11 frame keeps counts, task sample, and raw tail)\n'
+
+small12="$(MESH_DIR="$mesh" MESH_TASK_JOURNAL="$mesh/tasks.journal" \
+  MESH_DASH_CHAT_LOG="$mesh/chat.log" MESH_DASH_PANE_ROWS=12 MESH_DASH_PANE_COLS=80 \
+  "$ROOT/scripts/mesh-dash" --once witness 2>&1)"
+small12_view="$(printf '%s\n' "$small12" | tail -n 11)" # one row stays under the live cursor
+printf '%s\n' "$small12_view" | grep -q 'WITNESS TASKS — structured unfinished work' \
+  || { echo 'FAIL: task heading is outside the 80x12 viewport' >&2; exit 1; }
+printf '%s\n' "$small12_view" | grep -qE 'materialized view: .* · source age=[0-9]+s · authority=' \
+  || { echo 'FAIL: labelled source age is outside the 80x12 viewport' >&2; exit 1; }
+printf '%s\n' "$small12_view" | grep -qE '^chat\.log: showing 2/20 raw lines \(unfiltered tail; compact\)$' \
+  || { echo 'FAIL: compact raw-tail coverage is absent at 80x12' >&2; exit 1; }
+for i in 18 19; do
+  printf '%s\n' "$small12_view" | grep -q "raw-line-$i" \
+    || { echo "FAIL: newest raw chat line $i is outside the 80x12 viewport" >&2; exit 1; }
+done
+printf 'test-witness-pane-fit: PASS (compact 80x12 frame survives the live cursor row)\n'
