@@ -69,7 +69,8 @@ fi
 # bounded task sample with its omission count, and the newest two unfiltered raw board lines.
 {
   printf '%s\n' 'WITNESS TASKS — structured unfinished work'
-  printf '%s\n' 'materialized view: /tmp/tasks.journal · source age=7s · authority=explicit task-state events'
+  printf 'materialized view: tasks · source age=1s · authority=explicit · mtime=%s\n' \
+    "$(stat -c %Y "$td/home/.mesh/tasks.journal")"
   printf '%s\n' 'tasks: 22 total · 22 unfinished · 0 rejected · 0 done'
   for n in 1 2; do
     printf 'QUEUED\tgenome\tfixture-chain/task-%02d\tdispatch=sent\n' "$n"
@@ -131,5 +132,20 @@ expect_issue "$td/short-tasks" 'only 19/20 unfinished task rows visible'
 
 sed '/raw-line-20/d' "$td/valid-pane" >"$td/short-tail"
 expect_issue "$td/short-tail" 'only 19/20 raw chat.log tail lines visible'
+
+# Ledger and board churn between the pane's render and the checker read must not invalidate a
+# truthful sample; the displayed task count and raw-tail denominator are from render time.
+sleep 1
+printf 'QUEUED\tgenome\tfixture-chain/task-23\tdispatch=sent\n' >>"$td/home/.mesh/tasks.journal"
+printf '2026-09-14T03:00:21Z  fixture@mesh-home  :: [fyi] appended after render\n' >>"$td/home/.mesh/chat.log"
+if out="$(check "$td/compact-pane" 11)"; then
+  printf '%s\n' "$out" | grep -qE '^  witness[[:space:]]+✓ ok$' || {
+    echo 'FAIL: append-only board churn invalidated a truthful compact pane' >&2; exit 1;
+  }
+else
+  echo 'FAIL: task-ledger churn invalidated a truthful compact pane' >&2
+  printf '%s\n' "$out" >&2
+  exit 1
+fi
 
 echo 'test-mesh-window-check-witness-pane: PASS (visible witness frame contract and failure diagnostics)'
