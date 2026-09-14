@@ -44,6 +44,7 @@ def run() -> None:
         watch.JOURNAL = base / "tasks.journal"
         watch.TAPE = base / "tape.log"
         watch.STATE = base / "state.json"
+        watch.FOLLOWTHROUGH = base / "followthrough.tsv"
         watch.ALERT_SECONDS = 1800
         calls: list[list[str]] = []
         alerts: list[str] = []
@@ -72,6 +73,19 @@ def run() -> None:
                     encoding="utf-8")
             elif argv[:2] == [watch.TASK, "audit"]:
                 out = audit
+            elif argv[:3] == [watch.TASK, "replay", "--json"]:
+                out = json.dumps({"fixture": {"data": {"steps": [
+                    {"id": "owned/work", "owner": "alice", "status": "open",
+                     "queued_at": "1970-01-01T00:15:00Z"},
+                    {"id": "failed/work", "owner": "carol", "status": "open",
+                     "queued_at": "1970-01-01T00:15:30Z"},
+                    {"id": "pool/work", "owner": None, "status": "open",
+                     "queued_at": "1970-01-01T00:16:00Z"},
+                    {"id": "genome/landing", "owner": "genome", "status": "active",
+                     "last_progress": "1970-01-01T00:15:00Z"},
+                    {"id": "chain/wait", "owner": "haunt", "status": "blocked",
+                     "blocked": "1970-01-01T00:14:00Z"},
+                ]}}})
             elif argv[:2] == [watch.TASK, "queue"] and argv[2:] == ["--dispatch"]:
                 out = global_queue
             elif argv[:2] == [watch.TASK, "queue"] and argv[2:4] == ["--dispatch", "--owner"]:
@@ -109,6 +123,15 @@ def run() -> None:
                 raise AssertionError(f"tape missing {field}: {tape}")
         if dispatch_repairs != [[watch.TASK, "reschedule-task", "failed/work"]]:
             raise AssertionError(f"failed exact-owner dispatch was not repaired: {dispatch_repairs}")
+        followthrough = watch.FOLLOWTHROUGH.read_text(encoding="utf-8")
+        for evidence in (
+                "observed_at\tstate\towner\ttask\tage_s\treason\tnext_action",
+                "\tBLOCKED\thaunt\tchain/wait\t160\tdependency retry=prerequisite\t",
+                "resolve blocker, then resume exact task",
+                "\tRUNNING\tgenome\tgenome/landing\t100\tlease=2030-01-01T00:00:00Z\t",
+                "record progress, completion, or concrete blocker"):
+            if evidence not in followthrough:
+                raise AssertionError(f"followthrough ledger missing {evidence!r}: {followthrough}")
         for mind in ("alice", "bob"):
             if [watch.TASK, "queue", "--dispatch", "--owner", mind] not in calls:
                 raise AssertionError(f"ownerless work was not checked in {mind}'s queue")
