@@ -11,7 +11,7 @@ Operator request: stop recurring autoland failures and ensure unfinished tasks r
 
 ## Changes
 
-- `mesh-land --check` now admits large enumerations directly to a bounded bulk path before parse/test/history work. It atomically writes every path with age, reason, and next action to `~/.mesh/mesh-land-backlog.tsv`, posts one deduplicated board task keyed by the artifact SHA-256, and exits nonzero.
+- `mesh-land --check` now admits large enumerations directly to a bounded bulk path before parse/test/history work. It atomically writes every path with age, reason, and next action to `~/.mesh/mesh-land-backlog.tsv`, posts one board task keyed by the stable path/reason/action set, reports the current artifact SHA-256, and exits nonzero.
 - Small checks have independent test and whole-classification budgets. Unclassified paths are retained with an explicit `classification unrun` reason.
 - `mesh-land --autoland` now takes a nonblocking process lock before enumeration. An overlap is refused with a precise `[health-fail]` board event.
 - Large autoland queues are processed as a rotating 40-path batch. The full ordered queue and next cursor are written before any test or commit, so a killed pass continues at the next slice instead of repeating the same prefix.
