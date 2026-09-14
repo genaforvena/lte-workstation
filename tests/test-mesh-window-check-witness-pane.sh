@@ -87,6 +87,15 @@ else
   printf '%s\n' "$out" >&2
   exit 1
 fi
+if out="$(check "$td/compact-pane" 12)"; then
+  printf '%s\n' "$out" | grep -qE '^  witness[[:space:]]+✓ ok$' || {
+    echo 'FAIL: compact 80x12 witness pane was not reported OK' >&2; exit 1;
+  }
+else
+  echo 'FAIL: compact 80x12 witness pane was reported as an issue' >&2
+  printf '%s\n' "$out" >&2
+  exit 1
+fi
 
 cp "$td/home/.mesh/tasks.journal" "$td/tasks-full"
 head -n 4 "$td/home/.mesh/tasks.journal" >"$td/home/.mesh/tasks.journal.small"
