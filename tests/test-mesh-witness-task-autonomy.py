@@ -248,7 +248,7 @@ def run() -> None:
                     else:
                         rc = 64
                 elif argv[:3] == [watch.TASK, "check", "dispatch"]:
-                    rc = 2
+                    rc = int(kind[-1]) if kind in ("rc1", "rc3") else 2
                     if kind in ("race", "owner-busy", "malformed", "unreadable"):
                         taken[0] = True  # The owner claims the row after the queue snapshot.
                 elif argv == [watch.MIND_STATE, "--stats"]:
@@ -287,6 +287,14 @@ def run() -> None:
     result, tape, _ = refusal_case("eligible-refusal")
     if result != 1 or "health=FAIL" not in tape or "reconcile-check-refusal-still-eligible" not in tape:
         raise AssertionError(f"refusal against a still-eligible ledger row was hidden: {tape}")
+
+    for rc in (1, 3):
+        result, tape, calls = refusal_case(f"rc{rc}")
+        exact_error = f"check-rc{rc}/work-for-health-rc-{rc}"
+        if result != 1 or "health=FAIL" not in tape or exact_error not in tape:
+            raise AssertionError(f"check exit {rc} was not kept failed: {tape}")
+        if calls.count([watch.TASK, "audit"]) != 1:
+            raise AssertionError(f"check exit {rc} incorrectly entered refusal reconciliation")
 
     result, tape, _ = refusal_case("malformed")
     if result != 1 or "health=FAIL" not in tape or "reconcile-replay-parse" not in tape:
