@@ -39,3 +39,35 @@ for i in $(seq -w 0 19); do
     || { echo "FAIL: raw chat line $i is outside the 47-row viewport" >&2; exit 1; }
 done
 printf 'test-witness-pane-fit: PASS (%s task rows and 20 raw lines visible together)\n' "$task_rows"
+
+# A vertically split tmux window can shrink the data pane to 11 rows. The compact viewport must
+# retain its identity, freshness, complete task count, a useful task sample, and newest raw source
+# lines in the visible frame, while saying what it omitted.
+small="$(MESH_DIR="$mesh" MESH_TASK_JOURNAL="$mesh/tasks.journal" \
+  MESH_DASH_CHAT_LOG="$mesh/chat.log" MESH_DASH_PANE_ROWS=11 MESH_DASH_PANE_COLS=80 \
+  "$ROOT/scripts/mesh-dash" --once witness 2>&1)"
+small_view="$(printf '%s\n' "$small" | tail -n 10)" # tmux leaves the eleventh row under the live cursor
+SMALL_VIEW="$small_view" python3 - <<'PY'
+import os
+lines = os.environ["SMALL_VIEW"].splitlines()
+if len(lines) > 11 or any(len(line.expandtabs(8)) > 80 for line in lines):
+    raise SystemExit(f"FAIL: compact frame exceeds 80x11 after terminal tab expansion ({len(lines)} lines)")
+PY
+printf '%s\n' "$small_view" | grep -q 'WITNESS TASKS — structured unfinished work' \
+  || { echo 'FAIL: task heading is outside the 80x11 viewport' >&2; exit 1; }
+printf '%s\n' "$small_view" | grep -qE 'materialized view: .* · source age=[0-9]+s · authority=' \
+  || { echo 'FAIL: labelled source age is outside the 80x11 viewport' >&2; exit 1; }
+printf '%s\n' "$small_view" | grep -q '25 unfinished' \
+  || { echo 'FAIL: exact unfinished task count is outside the 80x11 viewport' >&2; exit 1; }
+small_task_rows="$(printf '%s\n' "$small_view" | grep -cE '^(QUEUED|RUNNING|OPEN_UNOWNED|BLOCKED|HELD_REJECTED|HELD_EXPIRED)[[:space:]]' || true)"
+[ "$small_task_rows" -ge 2 ] \
+  || { echo "FAIL: only $small_task_rows task rows fit in the 80x11 viewport" >&2; exit 1; }
+printf '%s\n' "$small_view" | grep -qE 'more unfinished.*not shown' \
+  || { echo 'FAIL: compact task view does not disclose omitted unfinished rows' >&2; exit 1; }
+printf '%s\n' "$small_view" | grep -qE '^chat\.log: showing 2/20 raw lines \(unfiltered tail; compact\)$' \
+  || { echo 'FAIL: compact raw-tail coverage is absent or inaccurate' >&2; exit 1; }
+for i in 18 19; do
+  printf '%s\n' "$small_view" | grep -q "raw-line-$i" \
+    || { echo "FAIL: newest raw chat line $i is outside the 80x11 viewport" >&2; exit 1; }
+done
+printf 'test-witness-pane-fit: PASS (compact 80x11 frame keeps counts, task sample, and raw tail)\n'
