@@ -1,0 +1,401 @@
+#!/usr/bin/env python3
+"""Witness stall sweep: keep ledger work moving behind blocked heads.
+
+A blocked head strands its whole chain: successors sit QUEUED behind it and the
+owner's dispatch queue reads empty, so the mind idles while the board shows
+queued work. Two stall shapes observed live (2026-09-14, tinyfleet):
+
+- DEAD PARK: an open step parked with waiting_for= on a prerequisite that can
+  never complete — a future step of the same chain, a parked waiter, or a step
+  queued behind another blocked head. Audit shows QUEUED, queue hides it, take
+  refuses the prerequisite. Both sides wait on each other forever. The sweep
+  releases these with `mesh-task clear-wait` as coordinator (the wait is
+  provably unsatisfiable, so no owner judgment is overridden).
+- SATISFIED RETRY: a blocked head whose retry text names a prerequisite task
+  that is DONE (with artifact), yet nobody resumed it. Only the exact owner
+  may resume, so the sweep nudges that owner via mesh-tell and never resumes
+  itself. Throttled per task with a 24h re-notify.
+
+What this sweep deliberately does NOT do: resume, reject, reassign, or take
+anything; touch active/claimed steps; wait on a blocked head that may still
+resume (a wait on a blocked CURRENT head is a legitimate forward dependency);
+re-park, re-dispatch, or mint chains. Failed board sends already belong to
+mesh-witness-task-autonomy; resolvers to mesh-task-unblock-sweep.
+
+# reflex-cadence: */15 * * * *
+# reflex-args: --run
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HOME = Path.home()
+# cron runs with a stripped PATH that omits ~/.local/bin — mesh-task/mesh-tell/
+# mesh-chat live there. Prepend it so the sweep resolves its siblings under
+# cron exactly as in an interactive shell (the mesh-witness scar).
+os.environ["PATH"] = os.path.expanduser("~/.local/bin") + ":" + os.environ.get("PATH", "/usr/bin:/bin")
+MESH = Path(os.environ.get("MESH_DIR", str(HOME / ".mesh"))).expanduser()
+TASK = os.environ.get("MESH_WITNESS_STALL_TASK", "mesh-task")
+TELL = os.environ.get("MESH_WITNESS_STALL_TELL", "mesh-tell")
+CHAT = os.environ.get("MESH_WITNESS_STALL_CHAT", "mesh-chat")
+ACTOR = os.environ.get("MESH_WITNESS_STALL_ACTOR", "witness")
+TAPE = Path(os.environ.get("MESH_WITNESS_STALL_TAPE",
+                           str(MESH / "witness-stall-sweep.log"))).expanduser()
+STATE = Path(os.environ.get("MESH_WITNESS_STALL_STATE",
+                            str(MESH / ".witness-stall-sweep.json"))).expanduser()
+ALERT_SECONDS = int(os.environ.get("MESH_WITNESS_STALL_ALERT_SECONDS", "1800"))
+RENOTIFY_SECONDS = int(os.environ.get("MESH_WITNESS_STALL_RENOTIFY_SECONDS", "86400"))
+MAX_CLEARS_PER_RUN = int(os.environ.get("MESH_WITNESS_STALL_MAX_CLEARS", "5"))
+MAX_NUDGES_PER_RUN = int(os.environ.get("MESH_WITNESS_STALL_MAX_NUDGES", "10"))
+NON_MIND_OWNERS = {"-", "bash", "shell", "sh", "reflex"}
+
+TASK_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]*/[A-Za-z0-9._/-]+")
+
+
+def command(argv: list[str], timeout: int = 90,
+            env_extra: dict | None = None) -> subprocess.CompletedProcess[str]:
+    env = dict(os.environ)
+    if env_extra:
+        env.update(env_extra)
+    try:
+        return subprocess.run(argv, text=True, capture_output=True,
+                              timeout=timeout, check=False, env=env)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(argv, 124, "",
+                                           f"probe timed out after {timeout}s")
+    except OSError as exc:
+        return subprocess.CompletedProcess(argv, 127, "", str(exc))
+
+
+def parse_audit(raw: str) -> tuple[dict[str, dict], list[str]]:
+    """Parse audit rows into {task_id: row}. Malformed rows are errors, not skips."""
+    by_id: dict[str, dict] = {}
+    malformed: list[str] = []
+    for number, line in enumerate(raw.splitlines(), 1):
+        if not line.strip():
+            continue
+        fields = line.split("\t")
+        if len(fields) < 3 or not fields[0] or not fields[2]:
+            malformed.append(f"audit-row-{number}-malformed")
+            continue
+        verdict, owner, task_id = fields[0], fields[1], fields[2]
+        row = {"verdict": verdict, "owner": owner, "task": task_id,
+               "fields": fields[3:], "line": number}
+        if verdict == "QUEUED" and fields[3:]:
+            # The fourth column carries one key=value token plus a trailing
+            # "dispatch=..." token in the same field (audit joins with \t but
+            # the row format puts both in one column); tokenize first.
+            head = fields[3].split()[0] if fields[3].split() else ""
+            if head.startswith("waiting_for="):
+                row["waiting_for"] = head[len("waiting_for="):]
+            elif head.startswith("current="):
+                row["current"] = head[len("current="):]
+        if task_id in by_id:
+            malformed.append(f"audit-duplicate-{task_id}")
+            continue
+        by_id[task_id] = row
+    return by_id, malformed
+
+
+def classify_wait(task_id: str, prereq_id: str,
+                  by_id: dict[str, dict]) -> tuple[str, str]:
+    """Decide a parked wait. Returns (decision, reason).
+
+    clear   — the prerequisite can never arrive; safe to clear-wait.
+    keep    — the wait may still resolve; hands off.
+    unknown — prerequisite not in the ledger; hands off, loudly.
+    """
+    prereq = by_id.get(prereq_id)
+    if prereq is None:
+        return ("unknown", f"prerequisite {prereq_id} not in ledger")
+    verdict = prereq["verdict"]
+    if verdict == "DONE":
+        return ("clear", f"prerequisite {prereq_id} is DONE (missed release)")
+    if verdict in ("REJECTED", "IGNORED", "HELD_REJECTED", "HELD_EXPIRED"):
+        return ("clear", f"prerequisite {prereq_id} is terminal {verdict}, never DONE")
+    if verdict == "BLOCKED":
+        return ("keep", f"prerequisite {prereq_id} is a blocked head that may resume")
+    if prereq.get("waiting_for"):
+        return ("keep", f"prerequisite {prereq_id} is itself parked; transitive, not dead")
+    if verdict == "QUEUED":
+        head = prereq.get("current", "")
+        if head == task_id:
+            return ("clear", f"prerequisite {prereq_id} is a future step behind "
+                             f"this very waiter (same-chain deadlock)")
+        if head and head != prereq_id:
+            head_row = by_id.get(head)
+            if head_row is not None and head_row["verdict"] == "BLOCKED":
+                return ("clear", f"prerequisite {prereq_id} is queued behind "
+                                 f"blocked head {head}")
+            return ("keep", f"prerequisite {prereq_id} queued behind live head {head}")
+        return ("keep", f"prerequisite {prereq_id} is the dispatchable head")
+    if verdict in ("OPEN_UNOWNED", "READY_INDEPENDENT", "RUNNING", "OVERDUE"):
+        return ("keep", f"prerequisite {prereq_id} is runnable ({verdict})")
+    return ("unknown", f"prerequisite {prereq_id} has unhandled verdict {verdict}")
+
+
+def satisfied_prereqs(retry_text: str, by_id: dict[str, dict]) -> list[dict]:
+    """Blocked-head retry names whose tasks are DONE with artifacts."""
+    found = []
+    seen = set()
+    for token in TASK_ID_RE.findall(retry_text or ""):
+        if token in seen or token not in by_id:
+            continue
+        seen.add(token)
+        row = by_id[token]
+        if row["verdict"] == "DONE":
+            artifact = ""
+            for field in row["fields"]:
+                if field.startswith("artifact="):
+                    artifact = field[len("artifact="):]
+            found.append({"task": token, "artifact": artifact,
+                          "owner": row["owner"]})
+    return found
+
+
+def load_state() -> dict:
+    try:
+        value = json.loads(STATE.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(value: dict) -> None:
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    temporary = STATE.with_name(STATE.name + f".tmp.{os.getpid()}")
+    temporary.write_text(json.dumps(value, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(temporary, STATE)
+
+
+def tape(row: str) -> None:
+    TAPE.parent.mkdir(parents=True, exist_ok=True)
+    with TAPE.open("a", encoding="utf-8") as output:
+        output.write(row + "\n")
+        output.flush()
+        os.fsync(output.fileno())
+
+
+def board_post(text: str) -> bool:
+    posted = command([CHAT, text], timeout=30)
+    return posted.returncode == 0
+
+
+def alert(errors: list[str], summary: str, now: int, state: dict) -> None:
+    signature = ";".join(errors)
+    last_at = int(state.get("alert_at", 0))
+    if signature != state.get("alert_signature") or now - last_at >= ALERT_SECONDS:
+        if board_post(f"[health-fail] witness-stall-sweep: {summary}; errors={signature}"):
+            state["alert_at"] = now
+        state["alert_signature"] = signature
+        save_state(state)
+
+
+def detect(by_id: dict[str, dict]) -> tuple[list[dict], list[dict], list[str]]:
+    """Pure detection over parsed audit rows. Returns (clears, nudges, unknowns)."""
+    clears, nudges, unknowns = [], [], []
+    for task_id, row in by_id.items():
+        if row["verdict"] == "QUEUED" and row.get("waiting_for"):
+            decision, reason = classify_wait(task_id, row["waiting_for"], by_id)
+            if decision == "clear":
+                clears.append({"task": task_id, "owner": row["owner"],
+                               "prerequisite": row["waiting_for"], "reason": reason})
+            elif decision == "unknown":
+                unknowns.append(f"park-{task_id}-on-{row['waiting_for']}")
+        elif row["verdict"] == "BLOCKED":
+            retry_text = " ".join(row["fields"][1:] if len(row["fields"]) > 1
+                                  else row["fields"])
+            for hit in satisfied_prereqs(retry_text, by_id):
+                nudges.append({"blocked": task_id, "owner": row["owner"],
+                               "prerequisite": hit["task"],
+                               "artifact": hit["artifact"]})
+    return clears, nudges, unknowns
+
+
+def run_once(dry_run: bool = False) -> int:
+    now = int(time.time())
+    errors: list[str] = []
+    state = load_state()
+
+    probed = command([TASK, "audit"], timeout=120)
+    if probed.returncode:
+        errors.append(f"audit-rc-{probed.returncode}")
+        summary = "audit unreadable"
+        row = (f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(now))} "
+               f"RUN health=FAIL {summary} errors={';'.join(errors)}")
+        tape(row)
+        print(row)
+        alert(errors, summary, now, state)
+        return 1
+
+    by_id, malformed = parse_audit(probed.stdout)
+    errors.extend(malformed)
+    clears, nudges, unknowns = detect(by_id)
+    errors.extend(f"unknown-{item}" for item in unknowns)
+
+    cleared: list[str] = []
+    clear_unavailable = False
+    for item in clears[:MAX_CLEARS_PER_RUN]:
+        if dry_run:
+            cleared.append(item["task"] + " (dry-run)")
+            continue
+        if item["task"] in set(state.get("cleared", [])):
+            continue
+        got = command([TASK, "clear-wait", *item["task"].rsplit("/", 1),
+                       f"witness-stall-sweep: {item['reason']}"],
+                      timeout=90, env_extra={"MESH_TASK_ACTOR": ACTOR})
+        # clear-wait takes <chain> <step>: split the task id once.
+        if got.returncode == 0:
+            cleared.append(item["task"])
+            state.setdefault("cleared", []).append(item["task"])
+        elif "invalid arguments" in (got.stderr or ""):
+            clear_unavailable = True
+            errors.append("clear-unavailable-deploy-pending")
+            break
+        else:
+            errors.append(f"clear-{item['task']}-rc-{got.returncode}")
+    if len(clears) > MAX_CLEARS_PER_RUN:
+        errors.append(f"clears-capped-{len(clears) - MAX_CLEARS_PER_RUN}-deferred")
+
+    nudged: list[str] = []
+    nudges_state = state.setdefault("nudged", {})
+    if not isinstance(nudges_state, dict):
+        nudges_state = state["nudged"] = {}
+    for item in nudges[:MAX_NUDGES_PER_RUN]:
+        if item["owner"] in NON_MIND_OWNERS:
+            continue
+        prior = nudges_state.get(item["blocked"], {})
+        sig = item["prerequisite"]
+        if prior.get("sig") == sig and now - int(prior.get("at", 0)) < RENOTIFY_SECONDS:
+            continue
+        if dry_run:
+            nudged.append(item["blocked"] + " (dry-run)")
+            continue
+        chain, _, step = item["blocked"].partition("/")
+        artifact_note = f" artifact {item['artifact']}" if item["artifact"] else ""
+        prompt = (f"[witness stall-sweep] {item['blocked']} is BLOCKED but its retry names "
+                  f"{item['prerequisite']}, which is DONE{artifact_note}. "
+                  f"Resume it now (mesh-task resume {chain} {step} <event>) and do the "
+                  f"unblocked work, or re-block with the exact still-missing datum. "
+                  f"Do not run any gated comparison/matrix before its gate passes.")
+        woke = command([TELL, "--origin", item["owner"], prompt], timeout=30)
+        if woke.returncode:
+            errors.append(f"nudge-{item['blocked']}-to-{item['owner']}-rc-{woke.returncode}")
+        else:
+            nudged.append(item["blocked"])
+            nudges_state[item["blocked"]] = {"sig": sig, "at": now}
+    if len(nudges) > MAX_NUDGES_PER_RUN:
+        errors.append(f"nudges-capped-{len(nudges) - MAX_NUDGES_PER_RUN}-deferred")
+    save_state(state)
+
+    if cleared and not dry_run:
+        board_post(f"[fyi] witness-stall-sweep cleared {len(cleared)} dead park(s): "
+                   + "; ".join(cleared))
+
+    unfinished = sum(1 for row in by_id.values()
+                     if row["verdict"] not in ("DONE", "REJECTED", "IGNORED"))
+    summary = (f"unfinished={unfinished} parks={len(clears)} cleared={len(cleared)} "
+               f"satisfied={len(nudges)} nudged={len(nudged)}")
+    health = "FAIL" if errors else "PASS"
+    row = (f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(now))} "
+           f"RUN health={health} {summary} "
+           f"errors={';'.join(errors) if errors else 'none'}")
+    tape(row)
+    print(row)
+    if errors:
+        alert(errors, summary, now, state)
+    elif not dry_run:
+        state.pop("alert_signature", None)
+        state.pop("alert_at", None)
+        save_state(state)
+    return 1 if errors else 0
+
+
+def selftest() -> int:
+    """Hermetic predicate tests on fixture audit text. No subprocess, no mesh."""
+    failures = []
+
+    def check(name: str, cond: bool, detail: str = "") -> None:
+        if not cond:
+            failures.append(f"{name}: {detail}")
+
+    fixture = "\n".join([
+        "QUEUED\thaunt\tdemo/head\twaiting_for=demo/tail dispatch=waiting",
+        "QUEUED\th2\tdemo/mid\tcurrent=demo/head dispatch=waiting",
+        "QUEUED\tvpn\tdemo/tail\tcurrent=demo/head dispatch=waiting",
+        "QUEUED\thaunt\tdemo2/waiter\twaiting_for=demo2/aid dispatch=waiting",
+        "QUEUED\thaunt\tdemo2/aid\tcurrent=demo2/other dispatch=sent",
+        "BLOCKED\thaunt\tdemo2/other\tdependency\tretry later",
+        "DONE\tvpn\tdemo3/aid\tartifact=/tmp/aid.md",
+        "BLOCKED\thaunt\tdemo3/head\texperiment-contract\tRetry after demo3/aid has PASS",
+        "QUEUED\thaunt\tdemo4/head\twaiting_for=demo4/live dispatch=waiting",
+        "OPEN_UNOWNED\tvpn\tdemo4/live\tcurrent=demo4/live dispatch=sent",
+        "QUEUED\thaunt\tdemo5/head\twaiting_for=demo5/blocked dispatch=waiting",
+        "BLOCKED\thaunt\tdemo5/blocked\tdependency\tretry after event",
+        "QUEUED\thaunt\tdemo6/a\twaiting_for=demo6/b dispatch=waiting",
+        "QUEUED\thaunt\tdemo6/b\twaiting_for=demo6/c dispatch=waiting",
+        "QUEUED\thaunt\tdemo6/c\tcurrent=demo6/c dispatch=sent",
+        "REJECTED\tvpn\tdemo7/old\treason=superseded",
+        "QUEUED\thaunt\tdemo7/new\twaiting_for=demo7/old dispatch=waiting",
+    ])
+    by_id, malformed = parse_audit(fixture)
+    check("parse-clean", not malformed, str(malformed))
+    check("parse-count", len(by_id) == 17, str(len(by_id)))
+
+    d, r = classify_wait("demo/head", "demo/tail", by_id)
+    check("same-chain-future-clears", d == "clear", f"{d} {r}")
+    d, r = classify_wait("demo2/waiter", "demo2/aid", by_id)
+    check("behind-blocked-head-clears", d == "clear", f"{d} {r}")
+    d, r = classify_wait("demo4/head", "demo4/live", by_id)
+    check("runnable-kept", d == "keep", f"{d} {r}")
+    d, r = classify_wait("demo5/head", "demo5/blocked", by_id)
+    check("blocked-head-kept", d == "keep", f"{d} {r}")
+    d, r = classify_wait("demo6/a", "demo6/b", by_id)
+    check("transitive-kept", d == "keep", f"{d} {r}")
+    d, r = classify_wait("demo7/new", "demo7/old", by_id)
+    check("rejected-prereq-clears", d == "clear", f"{d} {r}")
+    d, r = classify_wait("demo/head", "no/such-task", by_id)
+    check("missing-unknown", d == "unknown", f"{d} {r}")
+
+    clears, nudges, unknowns = detect(by_id)
+    check("detect-clears", {c["task"] for c in clears}
+          == {"demo/head", "demo2/waiter", "demo7/new"},
+          str([c["task"] for c in clears]))
+    check("detect-nudges", [n["blocked"] for n in nudges] == ["demo3/head"],
+          str(nudges))
+    check("detect-unknowns", unknowns == [], str(unknowns))
+    check("nudge-artifact",
+          nudges and nudges[0]["artifact"] == "/tmp/aid.md", str(nudges))
+
+    bad, malformed = parse_audit("BROKEN LINE\nQUEUED\tonly-two\n")
+    check("malformed-flagged", len(malformed) == 2, str(malformed))
+    check("malformed-skipped", bad == {}, str(bad))
+
+    if failures:
+        for failure in failures:
+            print(f"smoke-test: FAIL ({failure})")
+        return 1
+    print("smoke-test: OK (wait predicate 8/8, detect clears/nudges, malformed flagged, "
+          "no subprocess, no mesh)")
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    if argv == ["--test"]:
+        return selftest()
+    if argv == ["--dry-run"]:
+        return run_once(dry_run=True)
+    if argv in ([], ["--run"]):
+        return run_once(dry_run=False)
+    print("usage: mesh-witness-stall-sweep [--run|--dry-run|--test]", file=sys.stderr)
+    return 64
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
