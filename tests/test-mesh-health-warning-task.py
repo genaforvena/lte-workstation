@@ -130,6 +130,22 @@ def main() -> None:
         state = json.loads((mesh / "warning-tasks.state").read_text())
         assert state["created"][complete_key]["chain"] == complete_chain
 
+        # A durably rejected historical chain is terminal too. Retrying
+        # create for the same deterministic identity wedges the source cursor.
+        rejected_body = "[health-warning] mesh-egress-health UNKNOWN after probe timeout (rejected retry)"
+        rejected_key = "tagged:" + rejected_body.lower()
+        rejected_chain = "health-warning/" + hashlib.sha256(rejected_key.encode()).hexdigest()[:20]
+        rejected = {"data": {"chain": rejected_chain, "status": "rejected", "current": 0,
+                             "steps": [{"status": "rejected", "rejected_reason": "duplicate"}]}}
+        os.environ["EXISTING_CHAIN_JSON"] = json.dumps({rejected_chain: rejected})
+        with chat.open("a") as handle:
+            handle.write("2026-09-08T10:07:30Z health@mesh-home :: " + rejected_body + "\n")
+        sixth = run_watcher(mesh, task_cmd)
+        assert sixth.returncode == 0, sixth.stderr
+        assert (td / "calls").read_text().count("create") == 2, (td / "calls").read_text()
+        state = json.loads((mesh / "warning-tasks.state").read_text())
+        assert state["created"][rejected_key]["chain"] == rejected_chain
+
         # mesh-task create persists an open chain before its dispatch side
         # effect. A retry must dispatch that exact chain, never invoke create
         # again, and only then advance the source cursor.
@@ -187,7 +203,7 @@ def main() -> None:
         task_cmd = bindir / "mesh-task"
         task_cmd.write_text(
             "#!/bin/sh\n"
-            "if [ \"$1\" = replay ] && [ \"$2\" = --json ]; then cat \"$REPLAY_FILE\"; exit 0; fi\n"
+            "if [ \"$1\" = replay ] && [ \"$2\" = --json ]; then printf 'replay\\n' >> \"$REPLAY_CALLS\"; cat \"$REPLAY_FILE\"; exit 0; fi\n"
             "printf '%s\\n' \"$@\" >> \"$TASK_CALLS\"\n"
             "if [ \"$1\" = create ]; then\n"
             "  chain=\"$2\"; shift 2; plan=\"$1\"; cat \"$plan\" >> \"$TASK_PLANS\"\n"
@@ -245,6 +261,100 @@ def main() -> None:
         assert "replay warning 0" in plans.read_text()
         state = json.loads((mesh / "warning-tasks.state").read_text())
         assert state["offset"] == len(warnings[0].encode()), state
+
+    # A changing age/counts on the same stalled-task warning must share one
+    # fingerprint, and a completed referenced task must not create a new triage.
+    with tempfile.TemporaryDirectory() as raw:
+        td = Path(raw)
+        mesh = td / "mesh"
+        bindir = td / "bin"
+        mesh.mkdir()
+        bindir.mkdir()
+        task_cmd = bindir / "mesh-task"
+        task_cmd.write_text(
+            "#!/bin/sh\n"
+            "if [ \"$1\" = replay ] && [ \"$2\" = --json ]; then printf 'replay\\n' >> \"$REPLAY_CALLS\"; cat \"$REPLAY_FILE\"; exit 0; fi\n"
+            "printf '%s\\n' \"$@\" >> \"$TASK_CALLS\"\n"
+        )
+        task_cmd.chmod(0o755)
+        os.environ["TASK_CALLS"] = str(td / "calls")
+        replay_calls = td / "replay-calls"
+        os.environ["REPLAY_CALLS"] = str(replay_calls)
+        completed = {"data": {"chain": "unblock/adint/9408d7f1f2f1225b",
+                              "status": "complete", "current": 0,
+                              "steps": [{"id": "unblock/adint/9408d7f1f2f1225b/resolve",
+                                         "status": "done"}]}}
+        replay = td / "replay.json"
+        replay.write_text(json.dumps({"unblock/adint/9408d7f1f2f1225b": completed}))
+        os.environ["REPLAY_FILE"] = str(replay)
+        chat = mesh / "chat.log"
+        warning = ("[health-fail] witness-task-autonomy: errors="
+                   "active-task-stalled-unblock/adint/9408d7f1f2f1225b/resolve-for-{age}s "
+                   "missing-prerequisite recovery; active={active}")
+        chat.write_text(
+            "2026-09-14T18:31:04Z mesh-home/mesh-witness-task-autono@mesh-home :: "
+            + warning.format(age=1885, active=4) + "\n"
+            + "2026-09-14T18:32:04Z mesh-home/mesh-witness-task-autono@mesh-home :: "
+            + warning.format(age=1945, active=5) + "\n")
+        first = run_watcher(mesh, task_cmd)
+        assert first.returncode == 0, first.stderr
+        assert not (td / "calls").exists(), "completed referenced task created a health triage"
+        assert replay_calls.read_text().count("replay") == 1, "one source scan replayed the full task ledger repeatedly"
+        state = json.loads((mesh / "warning-tasks.state").read_text())
+        assert state["suppressed"]["unblock/adint/9408d7f1f2f1225b/resolve"]["source"] == "2026-09-14T18:32:04Z"
+
+        # The same task remains one incident even when still active and its
+        # changing age/count fields produce a new source line.
+        replay.write_text("{}")
+        with chat.open("a") as handle:
+            handle.write("2026-09-14T18:33:04Z mesh-home/mesh-witness-task-autono@mesh-home :: "
+                         + warning.format(age=2005, active=6) + "\n")
+            handle.write("2026-09-14T18:34:04Z mesh-home/mesh-witness-task-autono@mesh-home :: "
+                         + warning.format(age=2065, active=7) + "\n")
+        second = run_watcher(mesh, task_cmd)
+        assert second.returncode == 0, second.stderr
+        assert (td / "calls").read_text().count("create") == 1
+
+    # An unresolved stalled-task health failure must use the urgent sweep even
+    # when older historical health prose precedes it in chat.log.
+    with tempfile.TemporaryDirectory() as raw:
+        td = Path(raw)
+        mesh = td / "mesh"
+        bindir = td / "bin"
+        mesh.mkdir()
+        bindir.mkdir()
+        task_cmd = bindir / "mesh-task"
+        task_cmd.write_text(
+            "#!/bin/sh\n"
+            "if [ \"$1\" = replay ] && [ \"$2\" = --json ]; then cat \"$REPLAY_FILE\"; exit 0; fi\n"
+            "printf '%s\\n' \"$@\" >> \"$TASK_CALLS\"\n"
+            "if [ \"$1\" = create ]; then shift 2; cat \"$1\" >> \"$TASK_PLANS\"; fi\n"
+        )
+        task_cmd.chmod(0o755)
+        calls = td / "calls"
+        plans = td / "plans"
+        replay = td / "replay.json"
+        replay.write_text("{}")
+        os.environ["TASK_CALLS"] = str(calls)
+        os.environ["TASK_PLANS"] = str(plans)
+        os.environ["REPLAY_FILE"] = str(replay)
+        chat = mesh / "chat.log"
+        chat.write_text(
+            "2026-09-14T18:20:00Z health@mesh-home :: [health-warning] "
+            "historical health prose from an older incident\n"
+            "2026-09-14T18:21:00Z witness@mesh-home :: [health-fail] "
+            "witness-task-autonomy: active-task-stalled-unblock/adint/fixture/resolve-for-1900s "
+            "still active after historical review\n"
+        )
+
+        urgent = run_watcher(mesh, task_cmd)
+        assert urgent.returncode == 0, urgent.stderr
+        assert calls.read_text().splitlines()[0] == "create", calls.read_text()
+        plan_lines = plans.read_text().splitlines()
+        assert len(plan_lines) == 1, plan_lines
+        assert "active-task-stalled-unblock/adint/fixture/resolve" in plan_lines[0], plan_lines
+        state = json.loads((mesh / "warning-tasks.state").read_text())
+        assert state["offset"] == 0, state
 
 
 if __name__ == "__main__":
