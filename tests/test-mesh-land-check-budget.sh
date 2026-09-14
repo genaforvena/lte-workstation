@@ -81,4 +81,19 @@ HOME="$td/home" PATH="$td/bin:$PATH" TEST_BOARD="$td/board" MESH_REPO="$td/repo"
 grep -Fq 'autoland batch=1/2 cursor=0 next=1' "$td/batch.out"
 [[ "$(cat "$td/cursor")" -eq 1 ]]
 [[ "$(wc -l < "$td/autoland.tsv")" -eq 3 ]]
+
+mkdir -p "$td/repo/docs/task-receipts"
+printf 'held semantic unit\n' > "$td/repo/docs/task-receipts/held.md"
+printf '#!/bin/sh\ntouch "$AUTOWIRE_CALLED"\nsleep 8\n' > "$td/bin/mesh-autowire"
+chmod +x "$td/bin/mesh-autowire"
+printf '2\n' > "$td/cursor"
+HOME="$td/home" PATH="$td/bin:$PATH" TEST_BOARD="$td/board" AUTOWIRE_CALLED="$td/autowire-called" \
+    MESH_REPO="$td/repo" MESH_MANIFEST_READER="$td/manifest-reader.sh" MESH_LAND_SETTLE=0 \
+    MESH_LAND_AUTOLAND_BATCH=1 MESH_LAND_AUTOLAND_CURSOR="$td/cursor" \
+    MESH_LAND_AUTOLAND_QUEUE="$td/autoland.tsv" MESH_LAND_RUN_LOCK="$td/run.lock" \
+    bash "$repo_root/scripts/mesh-land" --autoland > "$td/held.out" 2>&1 || true
+[[ ! -e "$td/autowire-called" ]] || {
+    echo 'FAIL: held-only batch ran deploy wiring despite landing zero units' >&2
+    exit 1
+}
 echo 'mesh-land-check-budget: PASS (large checks inventory once; autoland locks and rotates bounded batches)'
