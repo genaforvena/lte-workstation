@@ -40,6 +40,15 @@ elapsed=$(( $(date +%s) - start ))
 grep -Fq 'land-backlog/' "$td/board"
 [[ "$(wc -l < "$td/backlog.tsv")" -eq 3 ]]
 grep -Fq $'path\tage_s\treason\tnext_action' "$td/backlog.tsv"
+HOME="$td/home" PATH="$td/bin:$PATH" TEST_BOARD="$td/board" MESH_REPO="$td/repo" \
+    MESH_MANIFEST_READER="$td/manifest-reader.sh" MESH_LAND_SETTLE=0 \
+    MESH_LAND_CHECK_BULK_THRESHOLD=1 MESH_LAND_CHECK_BACKLOG="$td/backlog.tsv" \
+    MESH_LAND_CHECK_BACKLOG_STATE="$td/backlog.state" \
+    bash "$repo_root/scripts/mesh-land" --check > /dev/null 2>&1 || true
+[[ "$(grep -Fc 'land-backlog/' "$td/board")" -eq 1 ]] || {
+    echo 'FAIL: unchanged backlog posted a second task because observation time changed' >&2
+    exit 1
+}
 
 (
     exec 9> "$td/run.lock"
