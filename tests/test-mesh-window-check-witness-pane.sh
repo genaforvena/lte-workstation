@@ -127,6 +127,9 @@ expect_issue "$td/small-backlog-pane" 'missing unfinished task count'
 sed '/source age=/d' "$td/valid-pane" >"$td/no-age"
 expect_issue "$td/no-age" 'missing labelled source age'
 
+sed '/^WITNESS TASKS/d' "$td/valid-pane" >"$td/no-heading"
+expect_issue "$td/no-heading" 'missing witness task heading'
+
 sed '/fixture-chain\/task-20/d' "$td/valid-pane" >"$td/short-tasks"
 expect_issue "$td/short-tasks" 'only 19/20 unfinished task rows visible'
 
