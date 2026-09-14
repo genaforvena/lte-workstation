@@ -17,6 +17,8 @@ import sys
 import time
 from pathlib import Path
 
+from mesh_task_log import eligibility as task_eligibility
+
 HOME = Path.home()
 MESH = Path(os.environ.get("MESH_DIR", str(HOME / ".mesh"))).expanduser()
 JOURNAL = Path(os.environ.get("MESH_WITNESS_TASK_JOURNAL", str(MESH / "tasks.journal"))).expanduser()
@@ -44,13 +46,41 @@ def command(argv: list[str], timeout: int = 60) -> subprocess.CompletedProcess[s
 
 def queue_rows(raw: str, label: str) -> list[tuple[str, str]]:
     rows = []
+    seen = set()
     for line_number, line in enumerate(raw.splitlines(), 1):
         if not line:
             continue
-        fields = line.split("\t", 2)
-        if len(fields) < 2 or not fields[1]:
+        fields = line.split("\t")
+        if (len(fields) < 3 or not fields[0] or not fields[1]
+                or not re.fullmatch(r"-?\d+", fields[2])):
             raise ValueError(f"{label} row {line_number} is malformed")
-        rows.append((fields[0], fields[1]))
+        pair = (fields[0], fields[1])
+        if pair in seen:
+            raise ValueError(f"{label} row {line_number} duplicates {fields[0]}/{fields[1]}")
+        seen.add(pair)
+        rows.append(pair)
+    return rows
+
+
+def owner_key(owner: str) -> str:
+    return owner.rsplit("/", 1)[-1] if owner else ""
+
+
+def audit_index(raw: str) -> dict[str, tuple[str, str, list[str]]]:
+    rows = {}
+    states = {"DONE", "REJECTED", "IGNORED", "HELD_REJECTED", "HELD_EXPIRED",
+              "OPEN_UNOWNED", "QUEUED", "BLOCKED", "READY_INDEPENDENT", "RUNNING", "OVERDUE"}
+    for line_number, line in enumerate(raw.splitlines(), 1):
+        if not line:
+            continue
+        fields = line.split("\t")
+        if len(fields) < 3 or not fields[0] or not fields[1] or not fields[2]:
+            raise ValueError(f"audit row {line_number} is malformed")
+        if fields[0] not in states:
+            raise ValueError(f"audit row {line_number} has unknown state {fields[0]!r}")
+        if fields[2] in rows:
+            raise ValueError(f"audit row {line_number} duplicates task {fields[2]}")
+        rows[fields[2]] = (fields[0], fields[1], fields[3:])
     return rows
 
 
@@ -100,6 +130,134 @@ def step_index(raw: str) -> dict[str, dict]:
             if isinstance(step, dict) and isinstance(step.get("id"), str):
                 result[step["id"]] = step
     return result
+
+
+def canonical_steps(raw: str) -> tuple[dict, dict[str, tuple[dict, int, dict]]]:
+    """Validate a fresh mesh-task replay and retain each step's chain context."""
+    records = json.loads(raw)
+    if not isinstance(records, dict):
+        raise ValueError("task replay is not an object")
+    result: dict[str, tuple[dict, int, dict]] = {}
+    for chain, record in records.items():
+        if not isinstance(record, dict) or not isinstance(record.get("data"), dict):
+            raise ValueError(f"task replay record {chain!r} is malformed")
+        data = record["data"]
+        steps = data.get("steps")
+        current = data.get("current")
+        if (data.get("chain") != chain or not isinstance(data.get("status"), str)
+                or not isinstance(steps, list) or not steps or type(current) is not int
+                or not 0 <= current < len(steps)):
+            raise ValueError(f"task replay chain {chain!r} is malformed")
+        for index, step in enumerate(steps):
+            if (not isinstance(step, dict) or not isinstance(step.get("id"), str)
+                    or not step["id"] or not isinstance(step.get("status"), str)
+                    or (step.get("owner") is not None and not isinstance(step.get("owner"), str))):
+                raise ValueError(f"task replay step {chain}/{index} is malformed")
+            if step["id"] in result:
+                raise ValueError(f"task replay duplicates task {step['id']}")
+            result[step["id"]] = (data, index, step)
+    return records, result
+
+
+def reconcile_refused_check(task_id: str, owner: str) -> tuple[bool, dict[str, tuple[str, str]], str]:
+    """Accept check code 2 only when fresh canonical state explains lost eligibility."""
+    reads = (
+        ("audit", [TASK, "audit"]),
+        ("replay", [TASK, "replay", "--json"]),
+        ("global-queue", [TASK, "queue", "--dispatch"]),
+        ("owner-queue", [TASK, "queue", "--dispatch", "--owner", owner]),
+    )
+    outputs = {}
+    for name, argv in reads:
+        result = command(argv, 60)
+        if result.returncode:
+            return False, {}, f"{name}-rc-{result.returncode}"
+        outputs[name] = result.stdout
+    try:
+        records, steps = canonical_steps(outputs["replay"])
+    except (ValueError, TypeError, KeyError):
+        return False, {}, "replay-parse"
+    try:
+        audit = audit_index(outputs["audit"])
+    except (ValueError, TypeError, KeyError):
+        return False, {}, "audit-parse"
+    try:
+        global_queue = queue_rows(outputs["global-queue"], "reconcile-global-queue")
+        owner_queue = queue_rows(outputs["owner-queue"], "reconcile-owner-queue")
+    except (ValueError, TypeError, KeyError):
+        return False, {}, "queue-parse"
+
+    entry = steps.get(task_id)
+    if entry is None:
+        return False, {}, "task-missing-from-replay"
+    data, index, step = entry
+    audit_row = audit.get(task_id)
+    if audit_row is None:
+        return False, {}, "task-missing-from-audit"
+    audit_state, audit_owner, audit_details = audit_row
+    canonical_owner = step.get("owner") or "-"
+    if owner_key(audit_owner) != owner_key(canonical_owner):
+        return False, {}, "audit-owner-contradicts-replay"
+    owner_id = owner_key(owner)
+    if any(task == task_id and owner_key(row_owner) in ("-", owner_id)
+           for row_owner, task in owner_queue):
+        return False, {}, "still-in-owner-queue"
+    if any(task == task_id and row_owner != "-" and owner_key(row_owner) == owner_id
+           for row_owner, task in global_queue):
+        return False, {}, "still-in-global-queue"
+
+    try:
+        verdict = task_eligibility(records, task_id, "dispatch", owner)
+    except (ValueError, TypeError, KeyError, IndexError):
+        return False, {}, "replay-eligibility-parse"
+    if verdict not in (0, 2):
+        return False, {}, "task-untracked-after-refusal"
+
+    current_running: dict[str, tuple[str, str]] = {}
+    for current_id, (state, active_owner, details) in audit.items():
+        if state not in ("RUNNING", "OVERDUE"):
+            continue
+        current_entry = steps.get(current_id)
+        if current_entry is None:
+            return False, {}, "audit-running-task-missing-from-replay"
+        current_step = current_entry[2]
+        if (current_step.get("status") not in ("active", "claimed", "running")
+                or owner_key(current_step.get("owner") or "-") != owner_key(active_owner)):
+            return False, {}, "audit-running-task-contradicts-replay"
+        lease = next((field[6:] for field in details if field.startswith("lease=")), "")
+        if not lease:
+            return False, {}, "audit-running-lease-missing"
+        current_running[current_id] = (active_owner, lease)
+
+    status = step["status"]
+    active_states = ("active", "claimed", "running")
+    expected_audit = {
+        "done": {"DONE"}, "rejected": {"REJECTED"}, "ignored": {"IGNORED"},
+        "blocked": {"BLOCKED"},
+    }
+    if status in active_states:
+        if audit_state not in ("RUNNING", "OVERDUE") or task_id not in current_running:
+            return False, {}, "active-task-audit-contradiction"
+    elif status in expected_audit:
+        if audit_state not in expected_audit[status]:
+            return False, {}, "task-audit-contradiction"
+    elif status == "open":
+        if audit_state in ("RUNNING", "OVERDUE", "DONE", "REJECTED", "IGNORED"):
+            return False, {}, "open-task-audit-contradiction"
+        if verdict == 2 and owner_key(canonical_owner) == owner_id \
+                and audit_state in ("OPEN_UNOWNED", "READY_INDEPENDENT"):
+            return False, {}, "open-task-still-appears-eligible"
+    else:
+        return False, {}, "unknown-task-status"
+
+    active_for_owner = [current_id for current_id, (_, _, current_step) in steps.items()
+                        if owner_key(current_step.get("owner") or "") == owner_id
+                        and current_step.get("status") in ("active", "claimed")]
+    if verdict == 0 and not active_for_owner:
+        return False, {}, "check-refusal-still-eligible"
+    if any(current_id not in current_running for current_id in active_for_owner):
+        return False, {}, "active-owner-audit-contradiction"
+    return True, current_running, "eligibility-changed"
 
 
 def task_age(step: dict, now: int) -> str:
@@ -268,11 +426,8 @@ def run_once() -> int:
         next_observed[task_id] = {"owner": owner, "lease": lease, "first_seen": first_seen}
         if elapsed >= ACTIVE_STALL_SECONDS:
             errors.append(f"active-task-stalled-{task_id}-for-{elapsed}s")
-            # A claim remains owned until its owner settles it: silently stealing it
-            # would turn a slow task into duplicate work.  The recovery action is a
-            # bounded, durable re-invitation to that exact owner.  A fresh lease
-            # clears this record; an unchanged claim is retried on the same cadence
-            # as the visible health alert.
+            # A claim remains owned until its owner settles it; recovery is a
+            # bounded, durable re-invitation to that exact owner.
             recovery_at = int(prior.get("recovery_at", 0)) if isinstance(prior, dict) else 0
             if now - recovery_at >= ALERT_SECONDS:
                 prompt = (f"[witness active-claim recovery] {task_id} has had no structured "
@@ -304,16 +459,65 @@ def run_once() -> int:
     if not minds.returncode:
         idle = idle_minds(minds.stdout)
 
-    # Check every concrete global candidate against its exact owner. This is a
-    # cheap contradiction guard: a listed candidate must not immediately fail
-    # the same eligibility boundary that take() will apply.
+    def check_candidate(task_id: str, owner: str) -> None:
+        nonlocal checks, active_recovery_wakes
+        checked = command([TASK, "check", "dispatch", task_id, owner], 45)
+        checks += 1
+        if checked.returncode == 0:
+            return
+        if checked.returncode != 2:
+            errors.append(f"check-{task_id}-for-{owner}-rc-{checked.returncode}")
+            return
+        reconciled, current_running, reason = reconcile_refused_check(task_id, owner)
+        if not reconciled:
+            errors.append(f"check-{task_id}-for-{owner}-rc-2:reconcile-{reason}")
+            return
+        # A fresh canonical view supersedes the earlier audit snapshot. This
+        # also restores active rows omitted by a raced or stale first read.
+        running.clear()
+        running.update(current_running)
+        refreshed_observed = {}
+        for current_id, (current_owner, lease) in current_running.items():
+            prior = state["active_observed"].get(current_id, {})
+            if not isinstance(prior, dict) or prior.get("owner") != current_owner \
+                    or prior.get("lease") != lease:
+                prior = observed.get(current_id, {})
+            first_seen = (prior.get("first_seen", now)
+                          if isinstance(prior, dict) and prior.get("owner") == current_owner
+                          and prior.get("lease") == lease else now)
+            current = {"owner": current_owner, "lease": lease, "first_seen": first_seen}
+            if isinstance(prior, dict):
+                for key in ("recovery_at", "recovery_result"):
+                    if key in prior:
+                        current[key] = prior[key]
+            elapsed = max(0, now - int(first_seen))
+            if elapsed >= ACTIVE_STALL_SECONDS:
+                stalled = f"active-task-stalled-{current_id}-for-{elapsed}s"
+                if stalled not in errors:
+                    errors.append(stalled)
+                recovery_at = int(current.get("recovery_at", 0))
+                if now - recovery_at >= ALERT_SECONDS:
+                    prompt = (f"[witness active-claim recovery] {current_id} has had no structured "
+                              f"progress for {elapsed}s. Continue it now, or record its concrete block "
+                              f"and create/take the prerequisite that unblocks it; then update or settle "
+                              f"the exact task. Do not leave the claim silent.")
+                    woke = command([TELL, "--origin", current_owner, prompt], 30)
+                    current["recovery_at"] = now
+                    current["recovery_result"] = woke.returncode
+                    if woke.returncode:
+                        errors.append(f"active-task-recovery-{current_id}-to-{current_owner}-rc-{woke.returncode}")
+                    else:
+                        active_recovery_wakes += 1
+            refreshed_observed[current_id] = current
+        state["active_observed"] = refreshed_observed
+        save_state(state)
+
+    # Check every concrete global candidate against its exact owner. A refusal
+    # may race with a take(), so only code 2 gets a fresh canonical reconciliation.
     for owner, task_id in candidates:
         if owner == "-":
             continue
-        checked = command([TASK, "check", "dispatch", task_id, owner], 45)
-        checks += 1
-        if checked.returncode:
-            errors.append(f"check-{task_id}-for-{owner}-rc-{checked.returncode}")
+        check_candidate(task_id, owner)
 
     # Ownerless tasks are a shared pool. Prove that every idle mind's normal
     # owner-scoped self-pick prompt can see them; no idle mind is assigned one.
@@ -335,10 +539,7 @@ def run_once() -> int:
                 errors.append(f"unowned-{task_id}-invisible-to-idle-{mind}")
             for task_id in sorted(unowned_ids & scoped_ids):
                 visible += 1
-                checked = command([TASK, "check", "dispatch", task_id, mind], 45)
-                checks += 1
-                if checked.returncode:
-                    errors.append(f"unowned-{task_id}-not-claimable-by-{mind}-rc-{checked.returncode}")
+                check_candidate(task_id, mind)
 
     summary = (f"source={'PASS' if journal_pass else 'FAIL'} unfinished={unfinished_count} "
                f"blocked={blocked_count} idle_minds={len(idle)} dispatchable={len(candidates)} "
