@@ -9,11 +9,13 @@ import os
 import subprocess
 import tempfile
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 WATCH = ROOT / "scripts" / "mesh-witness-task-autonomy"
 WRAPPER = ROOT / "scripts" / "mesh-task-unblock-sweep"
+sys.path.insert(0, str(ROOT / "scripts"))
 SPEC = importlib.util.spec_from_loader("mesh_witness_task_autonomy", SourceFileLoader("mesh_witness_task_autonomy", str(WATCH)))
 watch = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
@@ -157,6 +159,142 @@ def run() -> None:
             raise AssertionError(f"failure tape lacks exact owner/task: {failure_tape}")
         if not alerts or "witness-task-autonomy" not in alerts[-1]:
             raise AssertionError("autonomy failure was not surfaced on the board")
+
+    def refusal_case(kind: str) -> tuple[int, str, list[list[str]]]:
+        with tempfile.TemporaryDirectory(prefix=f"mesh-witness-dispatch-refusal-{kind}-") as raw:
+            base = Path(raw)
+            watch.JOURNAL = base / "tasks.journal"
+            watch.TAPE = base / "tape.log"
+            watch.STATE = base / "state.json"
+            watch.FOLLOWTHROUGH = base / "followthrough.tsv"
+            calls: list[list[str]] = []
+            taken = [kind == "stale"]
+            task_id = f"{kind}/work"
+            prior_first_seen = int(time.time()) - 1700
+            if kind == "stale":
+                watch.STATE.write_text(json.dumps({"active_observed": {
+                    task_id: {"owner": "health", "lease": "2030-01-01T00:30:01Z",
+                              "first_seen": prior_first_seen}
+                }}), encoding="utf-8")
+
+            def step(status: str) -> dict[str, str]:
+                value = {"id": task_id, "owner": "health", "status": status,
+                         "queued_at": "2030-01-01T00:00:00Z"}
+                if status in ("active", "claimed"):
+                    value.update(started="2030-01-01T00:00:01Z",
+                                 lease_until="2030-01-01T00:30:01Z")
+                return value
+
+            def record(status: str) -> str:
+                steps = [step(status)]
+                if kind == "owner-busy" and taken[0]:
+                    steps.append({"id": f"{kind}/existing", "owner": "health", "status": "active",
+                                  "lease_until": "2030-01-01T00:30:01Z"})
+                return json.dumps({kind: {"data": {
+                    "chain": kind, "status": "active" if status == "active" else "open",
+                    "current": 0, "steps": steps}}})
+
+            def queue_row() -> str:
+                return f"health\t{task_id}\t0\tfixture task\n"
+
+            audit_open = f"OPEN_UNOWNED\thealth\t{task_id}\tdispatch=sent\n"
+            audit_active = f"RUNNING\thealth\t{task_id}\tlease=2030-01-01T00:30:01Z\n"
+            audit_owner_busy = (audit_open +
+                                f"RUNNING\thealth\t{kind}/existing\tlease=2030-01-01T00:30:01Z\n")
+            audit_reads = [0]
+            replay_reads = [0]
+            queue_reads = [0]
+
+            def refusal_command(argv: list[str], timeout: int = 60) -> subprocess.CompletedProcess[str]:
+                calls.append(argv)
+                out = ""
+                rc = 0
+                if argv[0] == watch.JOURNAL_CMD:
+                    watch.JOURNAL.write_text(
+                        "timestamp=now\ntask_source=PASS\nsource_events=1 source_errors=0\n",
+                        encoding="utf-8")
+                elif argv[:2] == [watch.TASK, "audit"]:
+                    audit_reads[0] += 1
+                    if kind == "unreadable" and taken[0] and audit_reads[0] > 1:
+                        rc = 1
+                    elif kind == "stale" and audit_reads[0] == 1:
+                        out = ""  # The first witness audit omitted the pre-existing active row.
+                    elif kind == "owner-busy" and taken[0]:
+                        out = audit_owner_busy
+                    elif taken[0]:
+                        out = audit_active
+                    else:
+                        out = audit_open
+                elif argv[:3] == [watch.TASK, "replay", "--json"]:
+                    replay_reads[0] += 1
+                    if kind == "malformed" and taken[0] and replay_reads[0] > 1:
+                        out = "{malformed current task snapshot"
+                    elif kind == "stale" and replay_reads[0] == 1:
+                        out = json.dumps({"unrelated": {"data": {
+                            "chain": "unrelated", "status": "open", "current": 0,
+                            "steps": [{"id": "unrelated/step", "owner": "witness", "status": "open"}]}}})
+                    else:
+                        current_status = "active" if taken[0] and kind != "owner-busy" else "open"
+                        out = record(current_status)
+                elif argv[:2] == [watch.TASK, "queue"]:
+                    queue_reads[0] += 1
+                    current = (taken[0] and kind in ("race", "stale", "owner-busy", "malformed")
+                               and not (kind == "stale" and queue_reads[0] == 1))
+                    current = current or (kind == "eligible-refusal" and queue_reads[0] > 1)
+                    if argv[2:] == ["--dispatch"]:
+                        out = "" if current else queue_row()
+                    elif argv[2:] == ["--dispatch", "--owner", "health"]:
+                        out = "" if current else queue_row()
+                    else:
+                        rc = 64
+                elif argv[:3] == [watch.TASK, "check", "dispatch"]:
+                    rc = 2
+                    if kind in ("race", "owner-busy", "malformed", "unreadable"):
+                        taken[0] = True  # The owner claims the row after the queue snapshot.
+                elif argv == [watch.MIND_STATE, "--stats"]:
+                    out = "WINDOW\tSTATE\nhealth\tWORKING\nwitness\tWORKING\n"
+                elif argv[:2] == [watch.TELL, "--origin"]:
+                    pass
+                elif argv[0] == watch.CHAT:
+                    pass
+                else:
+                    rc = 64
+                return subprocess.CompletedProcess(argv, rc, out, "")
+
+            watch.command = refusal_command
+            result = watch.run_once()
+            tape = watch.TAPE.read_text(encoding="utf-8").splitlines()[-1]
+            if kind == "stale":
+                refreshed = json.loads(watch.STATE.read_text(encoding="utf-8"))
+                actual_first_seen = refreshed["active_observed"]["stale/work"]["first_seen"]
+                if actual_first_seen != prior_first_seen:
+                    raise AssertionError("a stale audit reset the prior age of a newly recovered active task")
+            return result, tape, calls
+
+    for kind in ("race", "stale", "owner-busy"):
+        result, tape, calls = refusal_case(kind)
+        if result != 0 or "health=PASS" not in tape or "active=1" not in tape:
+            raise AssertionError(f"proven {kind} transition stayed failed or lost its active row: {tape}")
+        if "errors=none" not in tape or "check-" in tape:
+            raise AssertionError(f"proven {kind} transition retained a refusal error: {tape}")
+        if calls.count([watch.TASK, "replay", "--json"]) < 2:
+            raise AssertionError(f"{kind} refusal did not re-read canonical task records")
+
+    result, tape, _ = refusal_case("persistent")
+    if result != 1 or "health=FAIL" not in tape or "check-persistent/work-for-health-rc-2" not in tape:
+        raise AssertionError(f"persistent exact-owner refusal was hidden: {tape}")
+
+    result, tape, _ = refusal_case("eligible-refusal")
+    if result != 1 or "health=FAIL" not in tape or "reconcile-check-refusal-still-eligible" not in tape:
+        raise AssertionError(f"refusal against a still-eligible ledger row was hidden: {tape}")
+
+    result, tape, _ = refusal_case("malformed")
+    if result != 1 or "health=FAIL" not in tape or "reconcile-replay-parse" not in tape:
+        raise AssertionError(f"malformed post-refusal ledger was not kept loud: {tape}")
+
+    result, tape, _ = refusal_case("unreadable")
+    if result != 1 or "health=FAIL" not in tape or "reconcile-audit-rc-1" not in tape:
+        raise AssertionError(f"unreadable post-refusal audit was not kept loud: {tape}")
 
     with tempfile.TemporaryDirectory(prefix="mesh-unblock-reflex-wiring-") as raw:
         base = Path(raw)
