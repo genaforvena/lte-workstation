@@ -69,6 +69,7 @@ def load_state() -> dict:
     value.setdefault("offset", 0)
     value.setdefault("created", {})
     value.setdefault("dispatch_retries", {})
+    value.setdefault("suppressed", {})
     if not isinstance(value["offset"], int) or value["offset"] < 0:
         value["offset"] = 0
     if not isinstance(value["dispatch_retries"], dict):
@@ -85,6 +86,9 @@ def warning_key(sender: str, body: str) -> str | None:
     # chains and can wedge the cursor on a terminal-task regression.
     if re.match(r"\[(?:task|task-state|task-ledger|taking|done|progress|blocked|rejected|handoff)\]", body, re.I):
         return None
+    stalled = stalled_task_reference(body)
+    if stalled:
+        return "error-task:" + stalled
     if ERROR_MARKER.search(body):
         return "error:" + re.sub(r"\s+", " ", body).strip().lower()
     if re.search(r"room\s+sense\s+(?:still\s+)?lost:", body, re.I):
@@ -97,6 +101,44 @@ def warning_key(sender: str, body: str) -> str | None:
     if HEALTH_SOURCE.search(sender) and re.search(r"\[(?:check|fyi|warn|warning)\]", body, re.I) and WARNING_WORD.search(body):
         return "health-source:" + re.sub(r"\s+", " ", body).strip().lower()
     return None
+
+
+def stalled_task_reference(body: str) -> str | None:
+    """Return the stable task/step named by an autonomy stale-task warning."""
+    match = re.search(r"active-task-stalled-([^\s;]+?)-for-\d+s(?:\s|$)", body, re.I)
+    return match.group(1) if match else None
+
+
+def load_task_records() -> dict | None:
+    """Read ledger state for the current source scan; unreadable state stays unknown."""
+    env = dict(os.environ, MESH_DIR=str(MESH))
+    result = subprocess.run([TASK_CMD, "replay", "--json"], env=env,
+                            text=True, capture_output=True, check=False)
+    if result.returncode:
+        return None
+    try:
+        records = json.loads(result.stdout)
+        return records if isinstance(records, dict) else None
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def completed_stalled_task(body: str, records: dict | None) -> str | None:
+    """Fail open unless the warning's exact referenced task is durably complete."""
+    reference = stalled_task_reference(body)
+    if not records or not reference or "/" not in reference:
+        return None
+    chain = reference.rsplit("/", 1)[0]
+    try:
+        data = records[chain]["data"]
+        if data.get("chain") != chain or data.get("status") != "complete":
+            return None
+        for step in data.get("steps", []):
+            if step.get("id") == reference and step.get("status") == "done":
+                return reference
+        return None
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
 
 
 def task_chain(key: str) -> str:
@@ -156,6 +198,8 @@ def durable_chain_disposition(chain: str) -> str | None:
         if data.get("status") == "blocked" and step_status == "blocked":
             return "terminal"
         if data.get("status") == "complete" and step_status == "done":
+            return "terminal"
+        if data.get("status") == "rejected" and step_status == "rejected":
             return "terminal"
         if data.get("status") == "open" and step_status == "open":
             if data.get("dispatch") == "failed":
@@ -259,7 +303,7 @@ def create_or_recover_urgent(state: dict, chain: str, description: str) -> bool:
         raise
 
 
-def pending_error(source, state: dict) -> tuple[int, str, str, str, str] | None:
+def pending_error(source, state: dict, task_records) -> tuple[int, str, str, str, str] | None:
     """Find the next unrecorded explicit error without moving the main cursor.
 
     Health prose is deliberately backpressured, but explicit errors must not sit behind
@@ -282,8 +326,11 @@ def pending_error(source, state: dict) -> tuple[int, str, str, str, str] | None:
         stamp = match.group("stamp").decode("ascii")
         sender = match.group("sender").decode("utf-8", "replace")
         body = match.group("body").decode("utf-8", "replace")
+        if stalled_task_reference(body) and completed_stalled_task(body, task_records()):
+            continue
         key = warning_key(sender, body)
-        if key is None or not key.startswith("error:") or key in state["created"]:
+        if (key is None or not key.startswith(("error:", "error-task:"))
+                or key in state["created"]):
             continue
         candidate = (end, stamp, sender, body, key)
 
@@ -297,6 +344,16 @@ def run() -> int:
     with lock.open("a+") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         state = load_state()
+        ledger_records = None
+        ledger_loaded = False
+
+        def ledger_records_once():
+            nonlocal ledger_records, ledger_loaded
+            if not ledger_loaded:
+                ledger_records = load_task_records()
+                ledger_loaded = True
+            return ledger_records
+
         size = CHAT.stat().st_size
         if state["offset"] > size:
             state["offset"] = 0
@@ -305,7 +362,7 @@ def run() -> int:
                 error_batch = max(1, int(os.environ.get("MESH_HEALTH_ERROR_BATCH", "5")))
             except ValueError:
                 error_batch = 5
-            urgent = pending_error(source, state)
+            urgent = pending_error(source, state, ledger_records_once)
             admitted_errors = 0
             if urgent is not None and health_warning_admission_available(urgent=True):
                 while urgent is not None and admitted_errors < error_batch:
@@ -318,7 +375,7 @@ def run() -> int:
                     state["created"][key] = {"chain": chain, "source": stamp, "sender": sender}
                     atomic_write(STATE, state)
                     admitted_errors += 1
-                    urgent = pending_error(source, state)
+                    urgent = pending_error(source, state, ledger_records_once)
             if admitted_errors:
                 return 0
             source.seek(state["offset"])
@@ -336,6 +393,16 @@ def run() -> int:
                 stamp = match.group("stamp").decode("ascii")
                 sender = match.group("sender").decode("utf-8", "replace")
                 body = match.group("body").decode("utf-8", "replace")
+                completed = (completed_stalled_task(body, ledger_records_once())
+                             if stalled_task_reference(body) else None)
+                if completed:
+                    state["suppressed"][completed] = {
+                        "source": stamp,
+                        "reason": "referenced task is durably complete",
+                    }
+                    state["offset"] = end
+                    atomic_write(STATE, state)
+                    continue
                 key = warning_key(sender, body)
                 if key is not None and key not in state["created"]:
                     chain = task_chain(key)
