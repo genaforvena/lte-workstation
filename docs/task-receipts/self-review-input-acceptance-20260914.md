@@ -1,6 +1,6 @@
 # Self-review input acceptance audit — 2026-09-14
 
-Task: `self-review-routing-shadow-20260914/price-self-review-inputs`  
+Task: `self-review-routing-shadow-20260914/price-self-review-inputs`
 Owner: `genome`
 
 ## Source decision
