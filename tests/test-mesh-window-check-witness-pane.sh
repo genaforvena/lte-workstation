@@ -11,6 +11,9 @@ cat >"$td/bin/tmux" <<'EOF'
 case "$1" in
   list-windows) printf 'witness\n' ;;
   list-panes) printf '0\n' ;;
+  display-message)
+    case "$*" in *pane_height*) printf '%s\n' "${WINDOW_HEIGHT:-24}" ;; *) printf '0\n' ;; esac
+    ;;
   display) printf '0\n' ;;
   capture-pane) cat "$WINDOW_CAPTURE" ;;
   *) echo "unexpected tmux call: $*" >&2; exit 2 ;;
@@ -37,7 +40,7 @@ done >"$td/home/.mesh/chat.log"
 } >"$td/valid-pane"
 
 check() {
-  HOME="$td/home" PATH="$td/bin:$PATH" WINDOW_CAPTURE="$1" \
+  HOME="$td/home" PATH="$td/bin:$PATH" WINDOW_CAPTURE="$1" WINDOW_HEIGHT="${2:-24}" \
     "$ROOT/scripts/mesh-window-check"
 }
 
@@ -58,6 +61,29 @@ if out="$(check "$td/valid-pane")"; then
   }
 else
   echo 'FAIL: complete witness pane was reported as an issue' >&2
+  printf '%s\n' "$out" >&2
+  exit 1
+fi
+
+# At 80x11 the renderer publishes an honest compact contract: source age and exact counts, a
+# bounded task sample with its omission count, and the newest two unfiltered raw board lines.
+{
+  printf '%s\n' 'WITNESS TASKS — structured unfinished work'
+  printf '%s\n' 'materialized view: /tmp/tasks.journal · source age=7s · authority=explicit task-state events'
+  printf '%s\n' 'tasks: 22 total · 22 unfinished · 0 rejected · 0 done'
+  for n in 1 2; do
+    printf 'QUEUED\tgenome\tfixture-chain/task-%02d\tdispatch=sent\n' "$n"
+  done
+  printf '%s\n' '… +20 more unfinished (not shown; counts above)'
+  printf '%s\n' 'chat.log: showing 2/20 raw lines (unfiltered tail; compact)'
+  tail -n 2 "$td/home/.mesh/chat.log"
+} >"$td/compact-pane"
+if out="$(check "$td/compact-pane" 11)"; then
+  printf '%s\n' "$out" | grep -qE '^  witness[[:space:]]+✓ ok$' || {
+    echo 'FAIL: compact 80x11 witness pane was not reported OK' >&2; exit 1;
+  }
+else
+  echo 'FAIL: compact 80x11 witness pane was reported as an issue' >&2
   printf '%s\n' "$out" >&2
   exit 1
 fi
