@@ -24,6 +24,7 @@ board lines and the pane-live footer; it does not show the task view or source-a
 therefore raises the expected issue against the actual pane. This identifies a live layout failure;
 the checker change does not resize or rewrite the witness pane.
 
-The source and regression were still unlanded when this receipt was written. The remaining action is
-to land/deploy only `scripts/mesh-window-check`, this regression, and this receipt through MeshLand,
-then verify the deployed checker and commit subject.
+MeshLand committed and pushed the checker as `7e295125` (`Make mesh-window-check flag incomplete
+witness pane views`) and the regression as `365723ee` (`Add regression coverage for witness pane
+semantic requirements`). The deployed `~/.local/bin/mesh-window-check` matches the repository source
+byte-for-byte. Its live run exits 1 and reports the same expected witness-pane issue shown above.
