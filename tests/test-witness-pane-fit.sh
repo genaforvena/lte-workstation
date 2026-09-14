@@ -43,6 +43,7 @@ printf 'test-witness-pane-fit: PASS (%s task rows and 20 raw lines visible toget
 # A vertically split tmux window can shrink the data pane to 11 rows. The compact viewport must
 # retain its identity, freshness, complete task count, a useful task sample, and newest raw source
 # lines in the visible frame, while saying what it omitted.
+touch -d '45 seconds ago' "$mesh/tasks.journal" # exercise a two-digit age plus the 10-digit source mtime
 small="$(MESH_DIR="$mesh" MESH_TASK_JOURNAL="$mesh/tasks.journal" \
   MESH_DASH_CHAT_LOG="$mesh/chat.log" MESH_DASH_PANE_ROWS=11 MESH_DASH_PANE_COLS=80 \
   "$ROOT/scripts/mesh-dash" --once witness 2>&1)"
