@@ -1,0 +1,819 @@
+#!/usr/bin/env python3
+# orphan-ok: manual, read-only paired scorer; intentionally not wired to production dispatch
+"""Score explicitly shared, unowned task candidates beside their actual assignments.
+
+The scorer replays canonical task-state snapshots, uses only capability claims whose
+charter evidence predates the task's queue time, and writes a separate review artifact.
+It never assigns, reassigns, claims, posts, or otherwise changes task state.
+"""
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import re
+import sys
+import tempfile
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from mesh_task_log import ReplayError, decode, independent_ready, validate_transition  # noqa: E402
+
+
+EVENT = re.compile(rb"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ)\s+\S+\s+::\s+\[(?:task-state|task-ledger)\] (.*)$")
+MIND = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
+OWNER_DIRECTIVE = re.compile(r"(?:^|\W)(?:owner|owned\s+by)\s*[:=]\s*([\w./-]+)", re.I)
+TAG_SEPARATOR = re.compile(r"[,\s]+")
+TRIAL_DAYS = 14
+MIN_SAMPLE = 100
+STOP_DAYS = 30
+CONCENTRATION_REDUCTION = 0.20
+
+# A registry entry is usable only while its quoted claim remains in the live charter.
+# Keep capabilities narrow: absence or ambiguity means unknown, never inferred from
+# historical task counts.
+DEFAULT_CAPABILITIES = {
+    "repository-code": [
+        {"mind": "genome", "charter": "genome.md", "evidence": "Code work routes here."},
+    ],
+    "task-ledger-review": [
+        {"mind": "witness", "charter": "witness.md", "evidence": "The canonical source is"},
+    ],
+    "health-diagnostics": [
+        {"mind": "health", "charter": "health.md", "evidence": "Tools of the duty"},
+    ],
+    "perception-systems": [
+        {"mind": "senses", "charter": "senses.md", "evidence": "This window owns the perception lane"},
+    ],
+    "network-diagnostics": [
+        {"mind": "vpn", "charter": "vpn.md", "evidence": "DIAGNOSE READ-ONLY."},
+    ],
+}
+
+
+def parse_time(value: str) -> datetime:
+    return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+
+
+def iso(value: datetime) -> str:
+    return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def digest(raw: bytes | str) -> str:
+    if isinstance(raw, str):
+        raw = raw.encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def replay(path: Path, now: datetime) -> tuple[list[dict], dict]:
+    """Return ordered accepted snapshots using the task codec and canonical transition rules."""
+    events: list[dict] = []
+    chain_revisions: dict[str, dict[int, dict]] = {}
+    coverage = {"source": str(path), "lines": 0, "bytes": 0, "malformed_task_events": 0}
+    hasher = hashlib.sha256()
+    with path.open("rb") as source:
+        offset = 0
+        for line_number, raw in enumerate(source, 1):
+            coverage["lines"] += 1
+            coverage["bytes"] += len(raw)
+            hasher.update(raw)
+            match = EVENT.match(raw.rstrip(b"\r\n"))
+            if not match:
+                offset += len(raw)
+                continue
+            try:
+                if not raw.endswith(b"\n"):
+                    raise ReplayError("incomplete task-state line")
+                timestamp = parse_time(match.group(1).decode("ascii"))
+                if timestamp > now:
+                    offset += len(raw)
+                    continue
+                record = decode(match.group(2))
+                data = record["data"]
+                revisions = chain_revisions.setdefault(data["chain"], {})
+                prior_revision = revisions.get(record["revision"])
+                if prior_revision is not None and prior_revision != record:
+                    raise ReplayError(f"conflicting task-state revision {data['chain']}/{record['revision']}")
+                revisions[record["revision"]] = record
+                for index, step in enumerate(data["steps"]):
+                    runnable = (index == data["current"] and data.get("status") in ("open", "active")
+                                and step.get("status") == "open" and not step.get("waiting_for"))
+                    runnable = runnable or independent_ready(data, index, step)
+                    view = dict(step)
+                    view["_queue_runnable"] = runnable
+                    events.append({"timestamp": timestamp, "offset": offset, "chain": data["chain"],
+                                   "revision": record["revision"], "line_sha256": digest(raw), "step": view})
+            except (UnicodeDecodeError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+                coverage["malformed_task_events"] += 1
+                raise ReplayError(f"{path}:{line_number}: malformed task-state event: {exc}") from exc
+            offset += len(raw)
+    coverage["sha256"] = hasher.hexdigest()
+    coverage["source_device"] = path.stat().st_dev
+    coverage["source_inode"] = path.stat().st_ino
+    accepted: dict[str, set[int]] = {}
+    for chain, revisions in chain_revisions.items():
+        ordered = sorted(revisions)
+        if not ordered or ordered != list(range(1, ordered[-1] + 1)):
+            raise ReplayError(f"missing task-state revision for {chain}")
+        canonical = revisions[ordered[0]]
+        valid = {ordered[0]}
+        for revision in ordered[1:]:
+            candidate = revisions[revision]
+            try:
+                validate_transition(canonical, candidate)
+            except ReplayError as exc:
+                if str(exc) in ("terminal task-state regression", "terminal task-state mutation"):
+                    continue
+                raise
+            canonical = candidate
+            valid.add(revision)
+        accepted[chain] = valid
+    events = [event for event in events if event["revision"] in accepted.get(event["chain"], set())]
+    return events, coverage
+
+
+def load_registry(path: Path | None) -> dict:
+    if path is None:
+        return DEFAULT_CAPABILITIES
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict) or value.get("schema") != 1 or not isinstance(value.get("capabilities"), dict):
+        raise ValueError("capability registry must be schema 1 with a capabilities object")
+    return value["capabilities"]
+
+
+def charter_evidence(registry: dict, capability: str, charter_dir: Path, queued_at: datetime) -> dict:
+    """Validate exact charter claims and reject evidence newer than the queue timestamp."""
+    eligible: dict[str, dict] = {}
+    evidence: dict[str, dict] = {}
+    for entry in registry.get(capability, []):
+        mind = entry.get("mind", "")
+        rel = entry.get("charter", "")
+        phrase = entry.get("evidence", "")
+        if not MIND.fullmatch(mind) or not rel or not phrase:
+            continue
+        path = (charter_dir / rel).resolve()
+        try:
+            path.relative_to(charter_dir.resolve())
+            content = path.read_text(encoding="utf-8")
+            stat = path.stat()
+        except (OSError, UnicodeDecodeError, ValueError):
+            evidence[mind] = {"status": "unknown", "reason": "charter missing or unreadable",
+                              "charter": str(path)}
+            continue
+        modified = datetime.fromtimestamp(stat.st_mtime, timezone.utc).replace(microsecond=0)
+        base = {"charter": str(path), "charter_sha256": digest(content), "claim": phrase,
+                "charter_mtime": iso(modified)}
+        if phrase.casefold() not in content.casefold():
+            evidence[mind] = {"status": "unknown", "reason": "registry claim absent from charter", **base}
+        elif modified > queued_at:
+            evidence[mind] = {"status": "unknown", "reason": "charter evidence is newer than queue time", **base}
+        elif entry.get("protected_by_charter"):
+            protected_claim = str(entry["protected_by_charter"])
+            protected_base = {**base, "protected_claim": protected_claim}
+            if protected_claim.casefold() not in content.casefold():
+                evidence[mind] = {"status": "unknown", "reason": "protected charter claim absent", **protected_base}
+            else:
+                evidence[mind] = {"status": "protected", "reason": "charter reserves this mind from shared routing",
+                                  **protected_base}
+        else:
+            verified = {"status": "verified", **base}
+            eligible[mind] = verified
+            evidence[mind] = verified
+    return {"eligible": eligible, "evidence": evidence}
+
+
+def normalized_tags(step: dict) -> set[str]:
+    value = step.get("tags", "")
+    if isinstance(value, list):
+        return {str(tag).strip().lower() for tag in value if str(tag).strip()}
+    return {tag.lower() for tag in TAG_SEPARATOR.split(str(value)) if tag}
+
+
+def requirements(step: dict, registry: dict) -> list[str]:
+    explicit = step.get("required_capabilities")
+    if isinstance(explicit, list):
+        return sorted({str(item).strip().lower() for item in explicit if str(item).strip()})
+    tags = normalized_tags(step)
+    known = set(tags) & set(registry)
+    if known:
+        return sorted(known)
+    task_type = str(step.get("type", step.get("task_type", ""))).strip().lower()
+    if task_type in registry:
+        return [task_type]
+    description = str(step.get("description", "")).lower()
+    # Conservative vocabulary: only an explicit capability label can create a match.
+    labeled = re.search(r"(?:capability|requires?)\s*[:=]\s*([a-z][a-z0-9-]*)", description)
+    return [labeled.group(1)] if labeled and labeled.group(1) in registry else []
+
+
+def exclusion(step: dict, chain: str, registry: dict) -> tuple[str | None, list[str]]:
+    tags = normalized_tags(step)
+    description = str(step.get("description", ""))
+    fields = " ".join(str(step.get(key, "")) for key in ("type", "task_type", "owner", "exact_owner"))
+    if (chain.lower().startswith(("operator-", "operator/", "human-", "human/"))
+            or step.get("human_owned") is True or step.get("operator_owned") is True
+            or any(tag in tags for tag in {"human", "operator", "human-owned", "operator-owned"}) or re.search(
+            r"\b(?:operator|human)\s*(?:owned|owner)\b|\bowner\s*[:=]\s*(?:operator|human|tg-mind)\b",
+            description + " " + fields, re.I)):
+        return "human/operator", []
+    if (chain.lower().startswith("protected/") or step.get("protected") is True
+            or step.get("protected_reason") or "protected" in tags):
+        return "protected", []
+    if ("incident" in tags or str(step.get("priority", "")).lower() == "incident"
+            or "incident" in chain.lower()):
+        return "incident", []
+    if (chain.lower().startswith("unblock/") or step.get("waiting_for")
+            or step.get("blocker_type") == "dependency"
+            or step.get("_queue_runnable") is False
+            or tags.intersection({"dependency", "resolver", "unblock"})):
+        return "dependency-resolver", []
+    directed = step.get("owner") or step.get("exact_owner") or OWNER_DIRECTIVE.search(description)
+    if directed:
+        return "exact-owner", []
+    if "shared" not in tags and step.get("shared") is not True:
+        return "not-explicitly-shared", []
+    required = requirements(step, registry)
+    if not required or any(cap not in registry for cap in required):
+        return "unavailable-capability", required
+    return None, required
+
+
+def load_at_time(events: list[dict], queue_time: datetime) -> tuple[dict[str, dict], dict[str, datetime | None]]:
+    """Rebuild task state using only canonical snapshots timestamped at queue time or earlier."""
+    latest: dict[str, dict] = {}
+    last_assigned: dict[str, datetime | None] = {}
+    for event in events:
+        if event["timestamp"] > queue_time:
+            continue
+        step = event["step"]
+        task_id = step.get("id")
+        if not task_id:
+            continue
+        prior = latest.get(task_id)
+        if step.get("owner") and (not prior or prior.get("owner") != step.get("owner")):
+            last_assigned[step["owner"]] = event["timestamp"]
+        latest[task_id] = step
+    return latest, last_assigned
+
+
+def queue_load(latest: dict[str, dict], exclude_task_id: str) -> dict[str, dict]:
+    result: dict[str, dict] = {}
+    for task_id, step in latest.items():
+        if task_id == exclude_task_id:
+            continue
+        owner = step.get("owner")
+        if not owner or not MIND.fullmatch(str(owner)):
+            continue
+        row = result.setdefault(owner, {"active": 0, "queued_runnable": 0, "task_ids": []})
+        status = str(step.get("status", "")).lower()
+        if status in {"active", "claimed", "running"}:
+            row["active"] += 1
+            row["task_ids"].append(task_id)
+        elif (status == "open" and step.get("_queue_runnable", True)
+              and not step.get("waiting_for") and not step.get("blocked")):
+            row["queued_runnable"] += 1
+            row["task_ids"].append(task_id)
+    for row in result.values():
+        row["task_ids"].sort()
+    return result
+
+
+def artifact_outcome(step: dict) -> dict:
+    if step.get("status") != "done":
+        return {"evidence_backed": False, "status": "pending", "reason": "task is not done"}
+    if not str(step.get("result", "")).strip():
+        return {"evidence_backed": False, "status": "unknown", "reason": "done result missing"}
+    artifact = step.get("artifact")
+    if not artifact:
+        return {"evidence_backed": False, "status": "unknown", "reason": "artifact path missing"}
+    path = Path(str(artifact)).expanduser()
+    try:
+        content = path.read_bytes()
+    except OSError:
+        return {"evidence_backed": False, "status": "unknown", "reason": "artifact missing or unreadable",
+                "artifact": str(path)}
+    if not content.strip():
+        return {"evidence_backed": False, "status": "unknown", "reason": "artifact empty",
+                "artifact": str(path), "bytes": len(content)}
+    actual = digest(content)
+    expected = step.get("artifact_sha256")
+    if expected and expected != actual:
+        return {"evidence_backed": False, "status": "unknown", "reason": "artifact digest mismatch",
+                "artifact": str(path), "bytes": len(content), "actual_sha256": actual}
+    return {"evidence_backed": True, "status": "verified", "reason": "done result and readable artifact",
+            "artifact": str(path), "bytes": len(content), "actual_sha256": actual}
+
+
+def percentile(values: list[float], p: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    index = max(0, min(len(ordered) - 1, int((p * len(ordered) + 0.999999)) - 1))
+    return round(ordered[index], 3)
+
+
+def atomic_json(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix="." + path.name + ".", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as output:
+            json.dump(data, output, ensure_ascii=False, sort_keys=True, indent=2)
+            output.write("\n")
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def append_unique(path: Path, row: dict) -> bool:
+    """Append one version of an evidence row; an interrupted retry is deduplicated by row digest."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    row["row_sha256"] = digest(json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+    fingerprint = row["row_sha256"]
+    if path.exists():
+        with path.open("r", encoding="utf-8") as current:
+            for line in current:
+                try:
+                    if json.loads(line).get("row_sha256") == fingerprint:
+                        return False
+                except json.JSONDecodeError:
+                    continue
+    encoded = (json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        with os.fdopen(fd, "ab", closefd=False) as output:
+            output.write(encoded)
+            output.flush()
+            os.fsync(output.fileno())
+    finally:
+        os.close(fd)
+    return True
+
+
+def baseline_metrics(rows: list[dict]) -> dict:
+    groups: dict[str, list[dict]] = {}
+    for row in rows:
+        if row.get("actual_owner"):
+            key = ",".join(row.get("required_capabilities", [])) + "|" + ",".join(row.get("eligible_set", []))
+            groups.setdefault(key, []).append(row)
+    shares = []
+    group_metrics = {}
+    for key, items in groups.items():
+        counts: dict[str, int] = {}
+        for item in items:
+            counts[item["actual_owner"]] = counts.get(item["actual_owner"], 0) + 1
+        share = max(counts.values()) / len(items)
+        shares.append(share)
+        waits_for_group = [item["wait_seconds"] for item in items if item.get("wait_seconds") is not None]
+        outcomes_for_group = [item["outcome"]["evidence_backed"] for item in items
+                              if item.get("outcome", {}).get("status") != "pending"]
+        group_metrics[key] = {"eligible_tasks": len(items), "actual_owner_counts": counts,
+                              "max_owner_share": round(share, 6),
+                              "p95_wait_seconds": percentile(waits_for_group, 0.95),
+                              "evidence_backed_completion_rate": round(sum(bool(value) for value in outcomes_for_group)
+                                                                        / len(outcomes_for_group), 6)
+                              if outcomes_for_group else None}
+    waits = [row["wait_seconds"] for row in rows if row.get("wait_seconds") is not None]
+    outcomes = [row.get("outcome", {}).get("evidence_backed") for row in rows if row.get("outcome", {}).get("status") != "pending"]
+    return {"eligible_tasks": len(rows), "comparable_sets": group_metrics,
+            "max_owner_share": round(max(shares), 6) if shares else None,
+            "p50_wait_seconds": percentile(waits, 0.50), "p95_wait_seconds": percentile(waits, 0.95),
+            "evidence_backed_completion_rate": round(sum(bool(value) for value in outcomes) / len(outcomes), 6)
+            if outcomes else None}
+
+
+def find_baseline(events: list[dict], start: datetime, registry: dict, charter_dir: Path) -> list[dict]:
+    latest: dict[str, dict] = {}
+    baseline: list[dict] = []
+    for index, event in enumerate(events):
+        step = event["step"]
+        task_id = step.get("id", "")
+        prev = latest.get(task_id)
+        is_new = prev is None
+        latest[task_id] = step
+        queue_at = _step_time(step.get("queued_at")) or event["timestamp"]
+        if (not is_new or queue_at >= start or step.get("status") != "open" or step.get("owner")):
+            continue
+        reason, required = exclusion(step, event["chain"], registry)
+        if reason:
+            continue
+        evidence = {cap: charter_evidence(registry, cap, charter_dir, queue_at) for cap in required}
+        capability_qualified = (set.intersection(*(set(item["eligible"]) for item in evidence.values()))
+                                if evidence else set())
+        if len(capability_qualified) < 2:
+            continue
+        as_of, _ = load_at_time(events, queue_at)
+        task_load = queue_load(as_of, task_id)
+        eligible = {mind for mind in capability_qualified if task_load.get(mind, {}).get("active", 0) == 0}
+        if len(eligible) < 2:
+            continue
+        history = [candidate for candidate in events if candidate["step"].get("id") == task_id
+                   and candidate["timestamp"] < start]
+        final = history[-1]["step"] if history else step
+        assignment = next((candidate for candidate in history if candidate["step"].get("owner")), None)
+        if not assignment:
+            continue
+        started = _step_time(final.get("started"))
+        wait = max(0.0, (started - queue_at).total_seconds()) if started else None
+        load_snapshot = {mind: {"active": task_load.get(mind, {}).get("active", 0),
+                                "queued_runnable": task_load.get(mind, {}).get("queued_runnable", 0),
+                                "total": task_load.get(mind, {}).get("active", 0)
+                                         + task_load.get(mind, {}).get("queued_runnable", 0)}
+                        for mind in sorted(capability_qualified)}
+        baseline.append({"task_id": task_id, "required_capabilities": required,
+                         "queue_time": iso(queue_at),
+                         "queue_source": {"chat_log_offset": event["offset"],
+                                         "task_state_revision": event["revision"],
+                                         "line_sha256": event["line_sha256"]},
+                         "capability_evidence": {cap: evidence[cap]["evidence"] for cap in required},
+                         "eligible_set": sorted(eligible), "queue_time_load": load_snapshot,
+                         "actual_owner": assignment["step"]["owner"],
+                         "assigned_at": iso(assignment["timestamp"]),
+                         "assignment_source": {"chat_log_offset": assignment["offset"],
+                                               "task_state_revision": assignment["revision"],
+                                               "line_sha256": assignment["line_sha256"]},
+                         "wait_seconds": wait, "outcome": artifact_outcome(final)})
+    return baseline
+
+
+def _step_time(value) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return parse_time(value)
+    except ValueError:
+        return None
+
+
+def candidate_rows(events: list[dict], start: datetime, now: datetime, registry: dict,
+                   charter_dir: Path, baseline: dict) -> tuple[list[dict], dict, list[dict]]:
+    exclusions = {"exact-owner": 0, "incident": 0, "dependency-resolver": 0, "protected": 0,
+                  "human/operator": 0, "unavailable-capability": 0, "not-explicitly-shared": 0,
+                  "single-eligible": 0, "active-claim": 0}
+    first: dict[str, tuple[int, dict]] = {}
+    latest: dict[str, dict] = {}
+    seen: set[str] = set()
+    for index, event in enumerate(events):
+        step = event["step"]
+        task_id = step.get("id", "")
+        prior = latest.get(task_id)
+        if task_id and prior is None and step.get("status") == "open" and not step.get("owner"):
+            queue_at = _step_time(step.get("queued_at")) or event["timestamp"]
+            if start <= queue_at <= now and task_id not in seen:
+                first[task_id] = (index, event)
+                seen.add(task_id)
+        latest[task_id] = step
+    scored: list[dict] = []
+    excluded_candidates: list[dict] = []
+    candidates = sorted(first.items(), key=lambda pair: (
+        _step_time(pair[1][1]["step"].get("queued_at")) or pair[1][1]["timestamp"],
+        pair[0]))
+    for ordinal, (task_id, (index, event)) in enumerate(candidates, 1):
+        step = event["step"]
+        queue_at = _step_time(step.get("queued_at")) or event["timestamp"]
+        explicitly_shared = step.get("shared") is True or "shared" in normalized_tags(step)
+        reason, required = exclusion(step, event["chain"], registry)
+        if reason:
+            exclusions[reason] = exclusions.get(reason, 0) + 1
+            excluded_candidates.append({"task_id": task_id, "reason": reason,
+                                         "required_capabilities": required,
+                                         "explicitly_shared": explicitly_shared,
+                                         "queue_time": iso(queue_at)})
+            continue
+        evidence_rows = {
+            cap: charter_evidence(registry, cap, charter_dir, queue_at) if cap in registry else
+                 {"eligible": {}, "evidence": {"unknown": {"status": "unknown",
+                                                              "reason": "capability absent from registry"}}}
+            for cap in required
+        }
+        capability_qualified = (set.intersection(*(set(row["eligible"]) for row in evidence_rows.values()))
+                                if evidence_rows else set())
+        if any(not evidence_rows[cap]["eligible"] for cap in required):
+            exclusions["unavailable-capability"] += 1
+            all_evidence = {cap: evidence_rows.get(cap, {}).get("evidence", {}) for cap in required}
+            for cap in required:
+                if cap not in evidence_rows:
+                    all_evidence[cap] = {"unknown": {"status": "unknown",
+                                                       "reason": "capability absent from registry"}}
+            excluded_candidates.append({"task_id": task_id, "reason": "unavailable-capability",
+                                         "required_capabilities": required,
+                                         "explicitly_shared": explicitly_shared,
+                                         "capability_evidence": all_evidence,
+                                         "queue_time": iso(queue_at)})
+            continue
+        if len(capability_qualified) < 2:
+            exclusions["single-eligible"] += 1
+            excluded_candidates.append({"task_id": task_id, "reason": "single-eligible",
+                                         "required_capabilities": required,
+                                         "explicitly_shared": explicitly_shared,
+                                         "capability_qualified_set": sorted(capability_qualified),
+                                         "queue_time": iso(queue_at)})
+            continue
+        load, last_assignment = load_at_time(events, queue_at)
+        loads = queue_load(load, task_id)
+        qualified_load = {mind: {"active": loads.get(mind, {}).get("active", 0),
+                                 "queued_runnable": loads.get(mind, {}).get("queued_runnable", 0),
+                                 "total": loads.get(mind, {}).get("active", 0)
+                                          + loads.get(mind, {}).get("queued_runnable", 0),
+                                 "task_ids": loads.get(mind, {}).get("task_ids", [])}
+                          for mind in sorted(capability_qualified)}
+        active_excluded = sorted(mind for mind in capability_qualified if qualified_load[mind]["active"] > 0)
+        eligible = capability_qualified - set(active_excluded)
+        if len(eligible) < 2:
+            if active_excluded:
+                exclusions["active-claim"] += 1
+            else:
+                exclusions["single-eligible"] += 1
+            excluded_candidates.append({"task_id": task_id, "reason": "active-claim" if active_excluded else "single-eligible",
+                                         "required_capabilities": required,
+                                         "explicitly_shared": explicitly_shared,
+                                         "capability_qualified_set": sorted(capability_qualified),
+                                         "active_claim_excluded_minds": active_excluded,
+                                         "queue_time_load": qualified_load, "queue_time": iso(queue_at)})
+            continue
+        ordered = sorted(eligible, key=lambda mind: (qualified_load[mind]["total"],
+                         last_assignment.get(mind, datetime.min.replace(tzinfo=timezone.utc)) or
+                         datetime.min.replace(tzinfo=timezone.utc), mind))
+        recommendation = ordered[0]
+        history = [row for row in events if row["step"].get("id") == task_id
+                   and row["offset"] >= event["offset"] and row["timestamp"] <= now]
+        current = history[-1]["step"] if history else step
+        actual_owner = current.get("owner")
+        initial_assignment = next((row for row in history if row["step"].get("owner")), None)
+        dispatch_owner = initial_assignment["step"].get("owner") if initial_assignment else None
+        assigned_at = initial_assignment["timestamp"] if initial_assignment else None
+        status = str(current.get("status", "unknown")).lower()
+        started = _step_time(current.get("started"))
+        wait_seconds = max(0.0, (started - queue_at).total_seconds()) if started else None
+        if status == "rejected":
+            disposition = "refusal"
+        elif not dispatch_owner:
+            disposition = "unassigned"
+        elif dispatch_owner == recommendation:
+            disposition = "accepted"
+        else:
+            disposition = "override"
+        scored.append({
+            "schema": 1, "record_type": "candidate", "task_id": task_id,
+            "queue_time": iso(queue_at), "queue_source": {"chat_log_offset": event["offset"],
+                "task_state_revision": event["revision"], "line_timestamp": iso(event["timestamp"]),
+                "line_sha256": event["line_sha256"]},
+            "baseline": {"actual_owner": dispatch_owner, "assigned_at": iso(assigned_at) if assigned_at else None,
+                         "assignment_source": ({"chat_log_offset": initial_assignment["offset"],
+                                                "task_state_revision": initial_assignment["revision"],
+                                                "line_sha256": initial_assignment["line_sha256"]}
+                                               if initial_assignment else None),
+                         "source": "first canonical task-state owner assignment"},
+            "required_capabilities": required, "capability_evidence": {
+                cap: evidence_rows[cap]["evidence"] for cap in required},
+            "capability_qualified_set": sorted(capability_qualified),
+            "active_claim_excluded_minds": active_excluded,
+            "eligible_set": sorted(eligible), "queue_time_load": qualified_load,
+            "recommendation": recommendation, "actual_owner": dispatch_owner,
+            "current_owner": actual_owner,
+            "disagreement": bool(dispatch_owner and dispatch_owner != recommendation),
+            "assignment_disposition": disposition, "wait_seconds": wait_seconds,
+            "outcome": artifact_outcome(current),
+            "tie_break": {"candidate_queue_order": ordinal, "owner_order": ordered,
+                          "rule": "oldest queued candidate first; least active+queued runnable load; least-recent assignment; mind slug"},
+            "source_evidence": {"ledger_sha256": baseline.get("source_sha256"),
+                                "capability_registry_sha256": baseline.get("registry_sha256")},
+        })
+    return scored, exclusions, excluded_candidates
+
+
+def metrics(rows: list[dict]) -> dict:
+    groups: dict[str, list[dict]] = {}
+    for row in rows:
+        key = ",".join(row["required_capabilities"]) + "|" + ",".join(row["eligible_set"])
+        groups.setdefault(key, []).append(row)
+    group_metrics = {}
+    for key, items in sorted(groups.items()):
+        counts: dict[str, int] = {}
+        recommendations: dict[str, int] = {}
+        for item in items:
+            if item.get("actual_owner"):
+                counts[item["actual_owner"]] = counts.get(item["actual_owner"], 0) + 1
+            owner = item["recommendation"]
+            recommendations[owner] = recommendations.get(owner, 0) + 1
+        assigned_count = sum(counts.values())
+        actual_share = max(counts.values()) / assigned_count if assigned_count else None
+        shadow_share = max(recommendations.values()) / len(items) if recommendations else None
+        group_waits = [item["wait_seconds"] for item in items if item.get("wait_seconds") is not None]
+        group_outcomes = [item["outcome"]["evidence_backed"] for item in items
+                          if item.get("outcome", {}).get("status") != "pending"]
+        group_metrics[key] = {"eligible_tasks": len(items), "actual_owner_counts": counts,
+                              "assigned_tasks": assigned_count,
+                              "recommendation_counts": recommendations,
+                              "actual_max_owner_share": round(actual_share, 6) if actual_share is not None else None,
+                              "shadow_max_owner_share": round(shadow_share, 6) if shadow_share is not None else None,
+                              "p95_queue_to_start_seconds": percentile(group_waits, 0.95),
+                              "evidence_backed_completion_rate": round(sum(bool(value) for value in group_outcomes)
+                                                                        / len(group_outcomes), 6)
+                              if group_outcomes else None}
+    waits = [row["wait_seconds"] for row in rows if row.get("wait_seconds") is not None]
+    completed = [row["outcome"]["evidence_backed"] for row in rows
+                 if row.get("outcome", {}).get("status") != "pending"]
+    shares = [group["actual_max_owner_share"] for group in group_metrics.values()
+              if group["actual_max_owner_share"] is not None]
+    recommendation_shares = [group["shadow_max_owner_share"] for group in group_metrics.values()
+                             if group["shadow_max_owner_share"] is not None]
+    dispositions: dict[str, int] = {}
+    disagreements = 0
+    for row in rows:
+        disposition = row["assignment_disposition"]
+        dispositions[disposition] = dispositions.get(disposition, 0) + 1
+        disagreements += int(bool(row.get("disagreement")))
+    set_sizes: dict[str, int] = {}
+    for row in rows:
+        size = str(len(row["eligible_set"]))
+        set_sizes[size] = set_sizes.get(size, 0) + 1
+    return {"eligible_tasks": len(rows), "comparable_sets": group_metrics,
+            "max_actual_owner_share": round(max(shares), 6) if shares else None,
+            "max_recommendation_owner_share": round(max(recommendation_shares), 6)
+            if recommendation_shares else None,
+            "p50_queue_to_start_seconds": percentile(waits, 0.50),
+            "p95_queue_to_start_seconds": percentile(waits, 0.95),
+            "evidence_backed_completion_rate": round(sum(bool(value) for value in completed) / len(completed), 6)
+            if completed else None,
+            "assignment_dispositions": dispositions,
+            "assignment_disposition_rates": {key: round(value / len(rows), 6) for key, value in dispositions.items()}
+            if rows else {},
+            "recommendation_disagreements": {"count": disagreements,
+                                             "rate": round(disagreements / len(rows), 6) if rows else None},
+            "eligible_set_size_counts": set_sizes,
+            "capability_match_coverage": {"matched_recommendations": len(rows), "recommendations": len(rows),
+                                          "rate": 1.0 if rows else None}}
+
+
+def gate_comparison(baseline: dict, shadow: dict) -> dict:
+    old_groups = baseline.get("comparable_sets", {})
+    new_groups = shadow.get("comparable_sets", {})
+    common = sorted(set(old_groups) & set(new_groups))
+    old_shares = [old_groups[key]["max_owner_share"] for key in common]
+    new_shares = [new_groups[key]["shadow_max_owner_share"] for key in common]
+    old_max = max(old_shares) if old_shares else None
+    new_max = max(new_shares) if new_shares else None
+    reduction = round((old_max - new_max) / old_max, 6) if old_max and new_max is not None else None
+    old_waits = [old_groups[key].get("p95_wait_seconds") for key in common
+                 if old_groups[key].get("p95_wait_seconds") is not None]
+    new_waits = [new_groups[key].get("p95_queue_to_start_seconds") for key in common
+                 if new_groups[key].get("p95_queue_to_start_seconds") is not None]
+    old_rates = [old_groups[key].get("evidence_backed_completion_rate") for key in common
+                 if old_groups[key].get("evidence_backed_completion_rate") is not None]
+    new_rates = [new_groups[key].get("evidence_backed_completion_rate") for key in common
+                 if new_groups[key].get("evidence_backed_completion_rate") is not None]
+    wait_ok = None if not old_waits or not new_waits else max(new_waits) <= max(old_waits)
+    completion_ok = None if not old_rates or not new_rates else min(new_rates) >= min(old_rates)
+    return {"comparable_eligible_sets": common, "baseline_max_owner_share": old_max,
+            "shadow_max_recommendation_owner_share": new_max,
+            "owner_concentration_reduction": reduction,
+            "p95_wait_non_regression": wait_ok,
+            "evidence_backed_completion_non_regression": completion_ok}
+
+
+def run(args: argparse.Namespace) -> int:
+    started_clock = time.monotonic()
+    now = parse_time(args.now) if args.now else datetime.now(timezone.utc).replace(microsecond=0)
+    source = Path(args.chat_log).expanduser()
+    if not source.is_file():
+        raise FileNotFoundError(f"canonical task log is not readable: {source}")
+    charter_dir = Path(args.charter_dir).expanduser()
+    registry_path = Path(args.capability_registry).expanduser() if args.capability_registry else None
+    registry = load_registry(registry_path)
+    registry_hash = digest(json.dumps(registry, sort_keys=True, ensure_ascii=False))
+    events, coverage = replay(source, now)
+    state_dir = Path(args.state_dir).expanduser()
+    report_dir = Path(args.report_dir).expanduser()
+    state_path = state_dir / "routing-shadow.json"
+    lock_path = state_dir / "routing-shadow.lock"
+    report_path = report_dir / "routing-shadow.jsonl"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        state = json.loads(state_path.read_text(encoding="utf-8")) if state_path.exists() else None
+        if state is None:
+            historical_baseline = find_baseline(events, now, registry, charter_dir)
+            state = {"schema": 1, "started_at": iso(now), "source": str(source.resolve()),
+                     "baseline": {**baseline_metrics(historical_baseline), "per_task": historical_baseline,
+                                  "source_sha256": coverage["sha256"]},
+                     "baseline_task_ids": [row["task_id"] for row in historical_baseline],
+                     "registry_sha256": registry_hash, "reports": {}}
+        elif state.get("source") != str(source.resolve()):
+            raise ValueError("state is bound to a different canonical task log")
+        start = parse_time(state["started_at"])
+        if state.get("registry_sha256") != registry_hash:
+            raise ValueError("capability registry changed during the frozen shadow; start a new state directory")
+        metadata = {"source_sha256": coverage["sha256"], "registry_sha256": registry_hash}
+        candidates, excluded, excluded_rows = candidate_rows(events, start, now, registry, charter_dir, metadata)
+        shared_candidate_count = len(candidates) + sum(
+            int(bool(row.get("explicitly_shared"))) for row in excluded_rows)
+        score = metrics(candidates)
+        score["capability_match_coverage"] = {
+            "matched_recommendations": len(candidates), "explicit_shared_unowned_candidates": shared_candidate_count,
+            "rate": round(len(candidates) / shared_candidate_count, 6) if shared_candidate_count else None,
+        }
+        elapsed_days = max(0.0, (now - start).total_seconds() / 86400)
+        candidate_hashes = state.setdefault("reports", {})
+        wrote = 0
+        for row in candidates:
+            row_hash = digest(json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+            if candidate_hashes.get(row["task_id"]) != row_hash:
+                if append_unique(report_path, row):
+                    wrote += 1
+                candidate_hashes[row["task_id"]] = row_hash
+        sample_ready = elapsed_days >= TRIAL_DAYS and score["eligible_tasks"] >= MIN_SAMPLE
+        stopped_inconclusive = elapsed_days >= STOP_DAYS and score["eligible_tasks"] < MIN_SAMPLE
+        comparison = gate_comparison(state["baseline"], score)
+        verified_capabilities = all(
+            all(capability_evidence.get(row["recommendation"], {}).get("status") == "verified"
+                for capability_evidence in row["capability_evidence"].values())
+            for row in candidates
+        )
+        protected_owner_recommendations = sum(
+            1 for row in excluded_rows if row.get("reason") in {"protected", "exact-owner"}
+            and row.get("recommendation")
+        )
+        gates = {"verified_capability_for_every_recommendation": verified_capabilities,
+                 "zero_recommendations_for_protected_or_exact_owner_work": protected_owner_recommendations == 0,
+                 "p95_wait_non_regression": comparison["p95_wait_non_regression"],
+                 "evidence_backed_completion_non_regression": comparison["evidence_backed_completion_non_regression"],
+                 "owner_concentration_reduction_at_least_20_percent": (
+                     comparison["owner_concentration_reduction"] is not None and
+                     comparison["owner_concentration_reduction"] >= CONCENTRATION_REDUCTION)}
+        if stopped_inconclusive:
+            decision = "inconclusive"
+        elif not sample_ready:
+            decision = "collecting"
+        elif any(value is False for value in gates.values()):
+            decision = "fail"
+        elif all(value is True for value in gates.values()):
+            decision = "pass"
+        else:
+            decision = "inconclusive"
+        summary = {
+            "schema": 1, "record_type": "summary", "generated_at": iso(now),
+            "trial_started_at": state["started_at"], "elapsed_days": round(elapsed_days, 4),
+            "frozen_targets": {"minimum_days": TRIAL_DAYS, "minimum_shared_unowned_tasks": MIN_SAMPLE,
+                               "maximum_days_before_inconclusive_stop": STOP_DAYS,
+                               "minimum_owner_concentration_reduction": CONCENTRATION_REDUCTION,
+                               "production_routing_changed": False},
+            "baseline": state["baseline"], "shadow": score,
+            "paired_comparison": comparison,
+            "excluded": excluded, "excluded_candidates": excluded_rows,
+            "protected_or_exact_owner_recommendations": protected_owner_recommendations,
+            "source_coverage": coverage,
+            "decision": decision,
+            "frozen_gates": gates,
+            "processing_cost_ms": round((time.monotonic() - started_clock) * 1000, 3),
+        }
+        summary_hash = digest(json.dumps(summary, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+        if candidate_hashes.get("__summary__") != summary_hash:
+            if append_unique(report_path, summary):
+                wrote += 1
+            candidate_hashes["__summary__"] = summary_hash
+        state["last_run_at"] = iso(now)
+        state["last_source_sha256"] = coverage["sha256"]
+        atomic_json(state_path, state)
+        fcntl.flock(lock, fcntl.LOCK_UN)
+    print(f"routing shadow: candidates={len(candidates)} excluded={sum(excluded.values())} report_rows_written={wrote} decision={summary['decision']}")
+    return 0
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(description=__doc__)
+    mesh_dir = Path(os.environ.get("MESH_DIR", str(Path.home() / ".mesh"))).expanduser()
+    result.add_argument("--chat-log", default=str(mesh_dir / "chat.log"))
+    result.add_argument("--state-dir", default=str(mesh_dir / "self-review-routing-shadow"))
+    result.add_argument("--report-dir", default=str(mesh_dir / "self-review-routing-shadow" / "reports"))
+    repo_root = Path(os.environ.get("MESH_GENOME", str(Path.home() / "lte-workstation"))).expanduser()
+    charter_default = mesh_dir / "charter" if (mesh_dir / "charter").is_dir() else repo_root / "charter"
+    result.add_argument("--charter-dir", default=str(charter_default))
+    result.add_argument("--capability-registry", help="optional schema-1 JSON registry; default uses built-in charter-backed evidence")
+    result.add_argument("--now", help="UTC timestamp override for deterministic replay tests")
+    return result
+
+
+def main() -> int:
+    try:
+        return run(parser().parse_args())
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f"mesh-task-routing-shadow: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
