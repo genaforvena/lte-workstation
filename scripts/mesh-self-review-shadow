@@ -1,0 +1,358 @@
+#!/usr/bin/env python3
+# orphan-ok: on-demand, read-only self-review shadow; deliberately not runtime-wired
+"""Emit a bounded per-mind self-review report from canonical mesh evidence.
+
+The tool reads only task-ledger transitions, retained task artifacts, and
+timestamped board markers. It never reads engine transcripts or writes to chat.log.
+"""
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import re
+import sys
+import tempfile
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from mesh_task_log import decode  # noqa: E402
+
+
+ISO_LINE = re.compile(rb"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ)\s+(\S+)\s+::\s+\[(task-state|task-ledger)\] (.*)$")
+BOARD_LINE = re.compile(rb"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ)\s+(\S+)\s+::\s+\[([a-z][a-z0-9_-]*)\]\s+(.*)$")
+MIND = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
+MAX_AGE = timedelta(hours=6)
+MIN_INTERVAL = timedelta(hours=1)
+SOURCE_LIMIT = 50
+TRANSITION_LIMIT = 20
+
+
+def parse_time(value: str) -> datetime:
+    return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+
+
+def iso(value: datetime) -> str:
+    return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def digest(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def task_signature(step: dict) -> str:
+    return json.dumps(step, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+
+
+def source_records(chat_log: Path, mind: str, now: datetime) -> tuple[list[dict], dict]:
+    """Read task transitions and mind-attributable board markers from chat.log."""
+    rows: list[dict] = []
+    coverage = {"chat_log": str(chat_log), "bytes": 0, "lines": 0, "malformed_task_events": 0,
+                "excluded_routine_lines": 0, "excluded_own_output": 0}
+    prior_steps: dict[str, str] = {}
+    owned_task_ids: set[str] = set()
+    source_digest = hashlib.sha256()
+    with chat_log.open("rb") as source:
+        for offset, raw in _iter_lines_with_offsets(source):
+            source_digest.update(raw)
+            coverage["lines"] += 1
+            coverage["bytes"] = offset + len(raw)
+            line = raw.rstrip(b"\r\n")
+            event = ISO_LINE.match(line)
+            if event:
+                try:
+                    timestamp = parse_time(event.group(1).decode("ascii"))
+                except (UnicodeDecodeError, ValueError):
+                    coverage["malformed_task_events"] += 1
+                    continue
+                if timestamp > now:
+                    continue
+                try:
+                    record = decode(event.group(4))
+                except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError, KeyError):
+                    coverage["malformed_task_events"] += 1
+                    continue
+                data = record["data"]
+                for step in data["steps"]:
+                    task_id = step["id"]
+                    signature = task_signature(step)
+                    changed = prior_steps.get(task_id) != signature
+                    prior_steps[task_id] = signature
+                    if step.get("owner") == mind:
+                        owned_task_ids.add(task_id)
+                        if changed:
+                            rows.append({
+                                "timestamp": timestamp, "offset": offset, "kind": "task-transition",
+                                "task_id": task_id, "owner": mind,
+                                "revision": record["revision"], "status": step.get("status", "unknown"),
+                                "step": step, "line_sha256": digest(raw),
+                            })
+                continue
+
+            board = BOARD_LINE.match(line)
+            if not board:
+                continue
+            try:
+                timestamp = parse_time(board.group(1).decode("ascii"))
+                marker = board.group(3).decode("ascii").lower()
+                actor = board.group(2).decode("utf-8", errors="replace")
+                body = board.group(4).decode("utf-8", errors="replace")
+            except (UnicodeDecodeError, ValueError):
+                continue
+            if timestamp > now:
+                continue
+            if marker in {"handoff", "idle"}:
+                coverage["excluded_routine_lines"] += 1
+                continue
+            if "mesh-self-review-shadow" in body or "[self-review-shadow]" in body:
+                coverage["excluded_own_output"] += 1
+                continue
+            task_refs = sorted(task_id for task_id in owned_task_ids if task_id in body)
+            mind_authored = actor.startswith(mind + "@") or body.startswith(mind + ":")
+            if not mind_authored and not task_refs:
+                continue
+            rows.append({
+                "timestamp": timestamp, "offset": offset, "kind": "board-line",
+                "marker": marker, "actor": actor, "body": body, "task_ids": task_refs,
+                "line_sha256": digest(raw),
+            })
+    coverage["chat_log_sha256"] = source_digest.hexdigest()
+    stat = chat_log.stat()
+    coverage["source_device"] = stat.st_dev
+    coverage["source_inode"] = stat.st_ino
+    rows.sort(key=lambda row: (row["timestamp"], row["offset"]))
+    return rows, coverage
+
+
+def _iter_lines_with_offsets(source):
+    offset = 0
+    while True:
+        raw = source.readline()
+        if not raw:
+            break
+        yield offset, raw
+        offset += len(raw)
+
+
+def in_window(rows: list[dict], now: datetime) -> list[dict]:
+    threshold = now - MAX_AGE
+    return [row for row in rows if threshold <= row["timestamp"] <= now]
+
+
+def artifact_disposition(step: dict) -> dict:
+    task_id = step["id"]
+    artifact = step.get("artifact")
+    recorded_digest = step.get("artifact_sha256")
+    if step.get("status") != "done":
+        return {"task_id": task_id, "status": step.get("status", "unknown"),
+                "evidence": "not-terminal", "reason": "no terminal artifact assertion"}
+    if not artifact:
+        return {"task_id": task_id, "status": "done", "evidence": "unknown",
+                "reason": "artifact path missing"}
+    path = Path(artifact).expanduser()
+    try:
+        content = path.read_bytes()
+    except OSError:
+        return {"task_id": task_id, "status": "done", "evidence": "unknown",
+                "reason": "artifact missing or unreadable", "artifact": str(path)}
+    if not content.strip():
+        return {"task_id": task_id, "status": "done", "evidence": "unknown",
+                "reason": "artifact empty", "artifact": str(path), "bytes": len(content)}
+    actual = digest(content)
+    if recorded_digest and actual != recorded_digest:
+        return {"task_id": task_id, "status": "done", "evidence": "unknown",
+                "reason": "artifact digest mismatch", "artifact": str(path), "bytes": len(content),
+                "recorded_sha256": recorded_digest, "actual_sha256": actual}
+    return {"task_id": task_id, "status": "done", "evidence": "verified",
+            "reason": "artifact readable and digest matches" if recorded_digest else
+            "artifact readable; ledger has no digest", "artifact": str(path), "bytes": len(content),
+            "actual_sha256": actual}
+
+
+def atomic_json(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix="." + path.name + ".", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as output:
+            json.dump(data, output, ensure_ascii=False, sort_keys=True, indent=2)
+            output.write("\n")
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+        dirfd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(dirfd)
+        finally:
+            os.close(dirfd)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def append_report(path: Path, report: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    encoded = (json.dumps(report, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        with os.fdopen(fd, "ab", closefd=False) as output:
+            output.write(encoded)
+            output.flush()
+            os.fsync(output.fileno())
+    finally:
+        os.close(fd)
+
+
+def build_report(mind: str, rows: list[dict], coverage: dict, now: datetime,
+                 new_count: int, omitted_source_count: int, omitted_transition_count: int,
+                 processing_ms: float, previously_seen: set[str]) -> dict:
+    task_rows = [row for row in rows if row["kind"] == "task-transition"]
+    latest_steps: dict[str, dict] = {}
+    for row in task_rows:
+        latest_steps[row["task_id"]] = row["step"]
+    dispositions = [artifact_disposition(step) for step in latest_steps.values()]
+    refs: dict[str, int] = {}
+    evidence = []
+    for row in rows:
+        ref = f"{iso(row['timestamp'])} sha256:{row['line_sha256']}"
+        evidence.append(ref)
+        for task_id in row.get("task_ids", []):
+            refs[task_id] = refs.get(task_id, 0) + 1
+        if row.get("kind") == "task-transition":
+            refs[row["task_id"]] = refs.get(row["task_id"], 0) + 1
+    duplicate_matches = sorted(task_id for task_id, count in refs.items()
+                               if count > 1 or task_id in previously_seen)
+    missing = [{"task_id": item["task_id"], "reason": item["reason"]}
+               for item in dispositions if item["evidence"] == "unknown"]
+    return {
+        "schema": 1,
+        "mind": mind,
+        "generated_at": iso(now),
+        "source_coverage": {
+            **coverage,
+            "selected_source_records": len(rows),
+            "new_source_records": new_count,
+            "selected_task_transitions": len(task_rows),
+            "unique_task_ids": len(latest_steps),
+            "omitted_by_source_cap": omitted_source_count,
+            "omitted_by_transition_cap": omitted_transition_count,
+        },
+        "bounds": {"lookback_hours": 6, "source_records": len(rows),
+                   "max_source_records": SOURCE_LIMIT, "task_transitions": len(task_rows),
+                   "max_task_transitions": TRANSITION_LIMIT},
+        "task_dispositions": dispositions,
+        "duplicate_matches": duplicate_matches,
+        "missing_evidence": missing,
+        "processing_cost_ms": round(processing_ms, 3),
+        "recommendation": {
+            "type": "no-action",
+            "reason": "the bounded shadow found no basis for changing an existing task or proposing a new one; unknown evidence remains unknown",
+            "evidence": evidence or [f"{coverage['chat_log']}@{coverage['bytes']} sha256:{coverage['chat_log_sha256']}"],
+            "task_ids": sorted(latest_steps),
+        },
+    }
+
+
+def run(args: argparse.Namespace) -> int:
+    mind = args.mind
+    if not MIND.fullmatch(mind):
+        raise ValueError("mind must be a lowercase window slug")
+    chat_log = Path(args.chat_log).expanduser()
+    if not chat_log.is_file():
+        raise FileNotFoundError(f"chat log is not readable: {chat_log}")
+    now = parse_time(args.now) if args.now else datetime.now(timezone.utc).replace(microsecond=0)
+    state_dir = Path(args.state_dir).expanduser()
+    report_dir = Path(args.report_dir).expanduser()
+    state_path = state_dir / f"{mind}.json"
+    lock_path = state_dir / f"{mind}.lock"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    started = time.monotonic()
+    with lock_path.open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        state = json.loads(state_path.read_text()) if state_path.exists() else {
+            "schema": 1, "mind": mind, "source": str(chat_log.resolve()),
+            "last_offset": 0, "last_review_at": None, "review_count": 0,
+            "seen_recommendation_task_ids": [],
+        }
+        if state.get("mind") != mind or state.get("source") != str(chat_log.resolve()):
+            raise ValueError("cursor belongs to a different mind or source; use a separate state directory")
+        rows, coverage = source_records(chat_log, mind, now)
+        identity_changed = (
+            state.get("source_device") not in (None, coverage["source_device"])
+            or state.get("source_inode") not in (None, coverage["source_inode"])
+            or coverage["bytes"] < int(state.get("last_offset", 0))
+        )
+        if identity_changed:
+            state["last_offset"] = 0
+            coverage["cursor_reset"] = "source identity changed or append-only source shrank; prior cursor is no longer comparable"
+        state["source_device"] = coverage["source_device"]
+        state["source_inode"] = coverage["source_inode"]
+        eligible = in_window(rows, now)
+        previous_offset = int(state.get("last_offset", 0))
+        new_rows = [row for row in eligible if row["offset"] >= previous_offset]
+        last_review_text = state.get("last_review_at")
+        last_review = parse_time(last_review_text) if last_review_text else None
+        new_count = len(new_rows)
+        enough_sources = new_count >= SOURCE_LIMIT
+        six_hours = last_review is not None and now - last_review >= MAX_AGE
+        minimum_elapsed = last_review is None or now - last_review >= MIN_INTERVAL
+        if not minimum_elapsed or not (enough_sources or six_hours):
+            if not state_path.exists() or identity_changed:
+                atomic_json(state_path, state)
+            reason = "one-hour minimum interval" if not minimum_elapsed else "50 new source records or six-hour interval not reached"
+            print(f"not due: {mind}; {new_count} new attributable records; {reason}")
+            return 0
+
+        bounded = eligible[-SOURCE_LIMIT:]
+        transition_rows = [row for row in bounded if row["kind"] == "task-transition"]
+        omitted_transition_count = max(0, len(transition_rows) - TRANSITION_LIMIT)
+        bounded_transitions = transition_rows[-TRANSITION_LIMIT:]
+        transition_ids = {id(row) for row in bounded_transitions}
+        bounded = [row for row in bounded if row["kind"] != "task-transition" or id(row) in transition_ids]
+        bounded.sort(key=lambda row: (row["timestamp"], row["offset"]))
+        omitted_source_count = max(0, len(eligible) - SOURCE_LIMIT)
+        reviewed_task_ids = {row["task_id"] for row in bounded_transitions}
+        previously_seen = set(state.get("seen_recommendation_task_ids", []))
+        # Advance the durable high-water cursor before report creation. A crash after
+        # this point may omit one report, but cannot repeat its recommendation.
+        state["last_offset"] = coverage["bytes"]
+        state["last_review_at"] = iso(now)
+        state["review_count"] = int(state.get("review_count", 0)) + 1
+        state["last_report_at"] = iso(now)
+        state["seen_recommendation_task_ids"] = sorted(previously_seen | reviewed_task_ids)
+        atomic_json(state_path, state)
+
+        report = build_report(mind, bounded, coverage, now, new_count, omitted_source_count,
+                              omitted_transition_count, (time.monotonic() - started) * 1000,
+                              previously_seen)
+        report["report_id"] = f"{mind}-{now.strftime('%Y%m%dT%H%M%SZ')}-{state['review_count']:04d}"
+        report_path = report_dir / f"{report['report_id']}.jsonl"
+        append_report(report_path, report)
+        print(f"reviewed: {mind}; sources={len(bounded)} transitions={report['bounds']['task_transitions']} report={report_path}")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("mind", help="exact owner window to review")
+    mesh_dir = Path(os.environ.get("MESH_DIR", str(Path.home() / ".mesh")))
+    shadow_dir = mesh_dir / "self-review-shadow"
+    parser.add_argument("--chat-log", default=os.environ.get("MESH_CHAT_LOG", str(mesh_dir / "chat.log")))
+    parser.add_argument("--state-dir", default=str(shadow_dir / "state"))
+    parser.add_argument("--report-dir", default=str(shadow_dir / "reports"))
+    parser.add_argument("--now", help=argparse.SUPPRESS)
+    args = parser.parse_args()
+    try:
+        return run(args)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f"mesh-self-review-shadow: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
