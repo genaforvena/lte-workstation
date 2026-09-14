@@ -45,8 +45,8 @@ check() {
 }
 
 expect_issue() {
-  local pane="$1" expected="$2" out rc=0
-  out="$(check "$pane")" || rc=$?
+  local pane="$1" expected="$2" height="${3:-24}" out rc=0
+  out="$(check "$pane" "$height")" || rc=$?
   [ "$rc" -eq 1 ] || { echo "FAIL: incomplete pane exit=$rc, expected 1" >&2; exit 1; }
   printf '%s\n' "$out" | grep -Fq "witness pane $expected" || {
     echo "FAIL: missing witness-pane diagnostic '$expected'" >&2
@@ -65,8 +65,8 @@ else
   exit 1
 fi
 
-# At 80x11 the renderer publishes an honest compact contract: source age and exact counts, a
-# bounded task sample with its omission count, and the newest two unfiltered raw board lines.
+# Compact mode may label the output compact, but it still has to satisfy the 20-row witness
+# contract. The renderer's current 2+2 frame must therefore be refused by the checker.
 {
   printf '%s\n' 'WITNESS TASKS — structured unfinished work'
   printf 'materialized view: tasks · source age=1s · authority=explicit · mtime=%s\n' \
@@ -79,21 +79,51 @@ fi
   printf '%s\n' 'chat.log: showing 2/20 raw lines (unfiltered tail; compact)'
   tail -n 2 "$td/home/.mesh/chat.log"
 } >"$td/compact-pane"
-if out="$(check "$td/compact-pane" 11)"; then
+expect_issue "$td/compact-pane" 'only 2/20 compact unfinished task rows visible' 11
+
+# Even a compact frame with all 20 task rows cannot pass on a two-line raw tail.
+{
+  printf '%s\n' 'WITNESS TASKS — structured unfinished work'
+  printf 'materialized view: tasks · source age=1s · authority=explicit · mtime=%s\n' \
+    "$(stat -c %Y "$td/home/.mesh/tasks.journal")"
+  printf '%s\n' 'tasks: 22 total · 22 unfinished · 0 rejected · 0 done'
+  for n in $(seq -w 1 20); do
+    printf 'QUEUED\tgenome\tfixture-chain/task-%s\tdispatch=sent\n' "$n"
+  done
+  printf '%s\n' '… +2 more unfinished (not shown; counts above)'
+  printf '%s\n' 'chat.log: showing 20/20 raw lines (unfiltered tail; compact)'
+  tail -n 2 "$td/home/.mesh/chat.log"
+} >"$td/compact-short-chat-pane"
+expect_issue "$td/compact-short-chat-pane" 'only 2/20 raw chat.log tail lines visible' 11
+
+# A compact label does not exempt an otherwise complete 20+20 frame from validation.
+{
+  printf '%s\n' 'WITNESS TASKS — structured unfinished work'
+  printf 'materialized view: tasks · source age=1s · authority=explicit · mtime=%s\n' \
+    "$(stat -c %Y "$td/home/.mesh/tasks.journal")"
+  printf '%s\n' 'tasks: 22 total · 22 unfinished · 0 rejected · 0 done'
+  for n in $(seq -w 1 20); do
+    printf 'QUEUED\tgenome\tfixture-chain/task-%s\tdispatch=sent\n' "$n"
+  done
+  printf '%s\n' '… +2 more unfinished (not shown; counts above)'
+  printf '%s\n' 'chat.log: showing 20/20 raw lines (unfiltered tail; compact)'
+  cat "$td/home/.mesh/chat.log"
+} >"$td/compact-full-pane"
+if out="$(check "$td/compact-full-pane" 11)"; then
   printf '%s\n' "$out" | grep -qE '^  witness[[:space:]]+✓ ok$' || {
-    echo 'FAIL: compact 80x11 witness pane was not reported OK' >&2; exit 1;
+    echo 'FAIL: complete compact 20+20 witness frame was not reported OK' >&2; exit 1;
   }
 else
-  echo 'FAIL: compact 80x11 witness pane was reported as an issue' >&2
+  echo 'FAIL: complete compact 20+20 witness frame was reported as an issue' >&2
   printf '%s\n' "$out" >&2
   exit 1
 fi
-if out="$(check "$td/compact-pane" 12)"; then
+if out="$(check "$td/compact-full-pane" 12)"; then
   printf '%s\n' "$out" | grep -qE '^  witness[[:space:]]+✓ ok$' || {
-    echo 'FAIL: compact 80x12 witness pane was not reported OK' >&2; exit 1;
+    echo 'FAIL: complete compact 20+20 witness frame was not reported OK at 12 rows' >&2; exit 1;
   }
 else
-  echo 'FAIL: compact 80x12 witness pane was reported as an issue' >&2
+  echo 'FAIL: complete compact 20+20 witness frame was reported as an issue at 12 rows' >&2
   printf '%s\n' "$out" >&2
   exit 1
 fi
@@ -141,7 +171,7 @@ expect_issue "$td/short-tail" 'only 19/20 raw chat.log tail lines visible'
 sleep 1
 printf 'QUEUED\tgenome\tfixture-chain/task-23\tdispatch=sent\n' >>"$td/home/.mesh/tasks.journal"
 printf '2026-09-14T03:00:21Z  fixture@mesh-home  :: [fyi] appended after render\n' >>"$td/home/.mesh/chat.log"
-if out="$(check "$td/compact-pane" 11)"; then
+if out="$(check "$td/compact-full-pane" 11)"; then
   printf '%s\n' "$out" | grep -qE '^  witness[[:space:]]+✓ ok$' || {
     echo 'FAIL: append-only board churn invalidated a truthful compact pane' >&2; exit 1;
   }
