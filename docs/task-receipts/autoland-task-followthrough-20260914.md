@@ -15,6 +15,7 @@ Operator request: stop recurring autoland failures and ensure unfinished tasks r
 - Small checks have independent test and whole-classification budgets. Unclassified paths are retained with an explicit `classification unrun` reason.
 - `mesh-land --autoland` now takes a nonblocking process lock before enumeration. An overlap is refused with a precise `[health-fail]` board event.
 - Large autoland queues are processed as a rotating 40-path batch. The full ordered queue and next cursor are written before any test or commit, so a killed pass continues at the next slice instead of repeating the same prefix.
+- A held-only batch skips `mesh-autowire`; wiring runs only after at least one unit was committed and deployed.
 - `mesh-witness-task-autonomy` now atomically rewrites `~/.mesh/task-followthrough.tsv` on every scheduled sweep. Every unfinished audit row carries observation time, state, owner, task id, age, reason, and next action.
 
 ## Verification
