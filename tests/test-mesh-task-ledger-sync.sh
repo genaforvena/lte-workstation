@@ -33,7 +33,7 @@ PY
 env "${base_env[@]}" MESH_TASK_CHAT_CMD=/bin/true \
   python3 "$repo/scripts/mesh-task" take demo work >/dev/null
 if env "${base_env[@]}" MESH_TASK_CHAT_CMD=/bin/false \
-    python3 "$repo/scripts/mesh-task" done demo work "$td/artifact.md" verified \
+    python3 "$repo/scripts/mesh-task" done demo work "$repo/scripts/mesh-task" verified \
     >"$td/done.out" 2>"$td/done.err"; then
   echo 'FAIL: done succeeded although its ledger-visible [done] event was refused' >&2
   exit 1

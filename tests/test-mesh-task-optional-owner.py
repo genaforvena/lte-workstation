@@ -10,8 +10,7 @@ with tempfile.TemporaryDirectory() as td:
     tmp = Path(td)
     plan = tmp / 'plan.tsv'
     plan.write_text('-\twork\tproduce evidence\n\tcheck\tverify evidence\n')
-    artifact = tmp / 'evidence.txt'
-    artifact.write_text('result\n')
+    artifact = Path(__file__).resolve()
     board = tmp / 'board'
     writer = tmp / 'writer'
     writer.write_text('#!/bin/sh\nprintf "%s\\n" "$1" >> "$TEST_BOARD"\n')

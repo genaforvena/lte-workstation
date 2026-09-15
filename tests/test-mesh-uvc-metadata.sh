@@ -112,6 +112,43 @@ cmp -s "$tmp/runtime-parsed.jsonl" "${fake_out%.bin}.jsonl" || {
   echo 'uvc metadata runtime replaced the last parsed artifact after malformed input' >&2; exit 1;
 }
 
+# Runtime and --test invocations must serialize access to the same V4L2 endpoint.
+# The fake reader holds a tiny critical section; overlapping readers leave a marker.
+fake_mutex="$tmp/fake-reader-mutex"
+fake_overlap="$tmp/fake-reader-overlap"
+cat >"$fakebin/v4l2-ctl" <<'EOF'
+#!/bin/sh
+if ! mkdir "$FAKE_UVC_READER_MUTEX" 2>/dev/null; then
+  : >"$FAKE_UVC_READER_OVERLAP"
+else
+  trap 'rmdir "$FAKE_UVC_READER_MUTEX" 2>/dev/null || :' EXIT
+fi
+sleep 0.3
+for arg in "$@"; do
+  case "$arg" in --stream-to=*) dest=${arg#--stream-to=} ;; esac
+done
+python3 - "$dest" <<'PY'
+import struct, sys
+with open(sys.argv[1], 'wb') as stream:
+    stream.write(struct.pack('<QHBB', 987654322, 0x482, 12, 0x8d))
+    stream.write(bytes(range(10)))
+PY
+EOF
+chmod +x "$fakebin/v4l2-ctl"
+reader_env=(HOME="$fakehome" PATH="$fakebin:/usr/bin:/bin" FAKE_UVC_READER_MUTEX="$fake_mutex"
+  FAKE_UVC_READER_OVERLAP="$fake_overlap" MESH_UVC_METADATA_DEV="$fake_dev"
+  MESH_UVC_METADATA_OUT="$fake_out")
+env "${reader_env[@]}" "$tool" >"$tmp/concurrent-1.out" 2>&1 &
+reader_one=$!
+sleep 0.05
+env "${reader_env[@]}" "$tool" --test >"$tmp/concurrent-2.out" 2>&1 &
+reader_two=$!
+wait "$reader_one" || { cat "$tmp/concurrent-1.out" >&2; exit 1; }
+wait "$reader_two" || { cat "$tmp/concurrent-2.out" >&2; exit 1; }
+[ ! -e "$fake_overlap" ] || {
+  echo 'uvc metadata runtime allowed overlapping V4L2 readers for one endpoint' >&2; exit 1;
+}
+
 if [ -e /dev/video1 ]; then
   MESH_UVC_METADATA_TIMEOUT=2 MESH_UVC_METADATA_DEV=/dev/video1 "$tool" --test
 else

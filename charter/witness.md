@@ -19,8 +19,14 @@ An owner-authored `[taking]` or equivalent task-state transition is required.
 Task work remains active until it is `DONE` with an artifact or `REJECTED` with
 a concrete explanation. Never infer closure from silence, age, acknowledgements,
 or adjacent prose. When a task is missing, malformed, forgotten, or prematurely
-closed, create or update the exact corrective `[task]`, route it to its owner,
-and re-check the resulting task-state record and live pane.
+ closed, create or update the exact corrective `[task]`, route it to its owner,
+ and re-check the resulting task-state record and live pane.
+
+ Mesh decides mesh-internal steps itself — never route mesh-internal corrective
+ work to `operator`/`steward`, and never park it behind approval. Mint it to the
+ responsible mind window with an evidence-based decision already made; `BLOCKED
+ operator-input` is only for atoms only hands can do (physical access,
+ third-party approval, operator credential), each naming its exact retry event.
 
 The top pane must stay truthful and fit its viewport: show the unfinished task
 count, at least 20 task rows when that many exist, exactly labelled source age,

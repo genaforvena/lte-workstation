@@ -1,0 +1,637 @@
+#!/usr/bin/env bash
+# test-net-device — gate for the network device (0xd0): connect (step 1) + bind (step 2).
+#
+# THE LIVE LEGS ARE REAL TWO-NODE ROUND TRIPS, one in each direction (mesh-home <-> phaedra
+# over tailscale), not loopback stubs. A localhost round trip exercises the same three
+# syscalls and proves nothing about addressing, routing or the tailnet — it is the
+# drives-only-stubs trap in its purest form: every assert green, the capability never once
+# used. Localhost legs are here too, but only where the claim IS local (the accept
+# mechanism, the refusals); they are labelled as such and they are never the whole proof.
+# When the far node is unreachable the live legs exit 2 (honest n/a — a claim about the
+# NODE), never a fake pass.
+#
+# The device is an EMULATOR change, so leg A asserts the thing that could silently break
+# everything else: existing ROMs must be byte-identical after the rebuild. A .rom that
+# moved would mean the device leaked into the assembler or the ROMs got re-cut, and
+# byte-identity across nodes is the whole basis of the hop lane's hash-then-execute pin.
+set -u
+here="$(cd "$(dirname "$0")/../../uxn" && pwd)"
+cd "$here"
+rc=0
+tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+fail(){ echo "  FAIL: $*"; rc=1; }
+pass(){ echo "  PASS: $*"; }
+
+PEER_IP="${MESH_NET_TEST_PEER_IP:-100.94.116.17}"
+PEER_SSH="${MESH_NET_TEST_PEER:-root@$PEER_IP}"
+PORT="${MESH_NET_TEST_PORT:-47101}"
+BPORT="${MESH_NET_TEST_BIND_PORT:-47102}"
+SELF_IP="${MESH_NET_TEST_SELF_IP:-$(tailscale ip -4 2>/dev/null | head -1)}"
+
+./build.sh >/dev/null 2>&1 || { echo "net-device-test: n/a (toolchain will not build)"; exit 2; }
+[ -x bin/uxncli ] || { echo "net-device-test: n/a (no uxncli)"; exit 2; }
+
+# --- A. the emulator change did NOT move any ROM ----------------------------------------
+before="$(sha1sum ./*.rom 2>/dev/null | sort)"
+./build.sh --rom >/dev/null 2>&1 || fail "build.sh --rom failed"
+after="$(sha1sum ./*.rom 2>/dev/null | sort)"
+if [ "$before" = "$after" ]; then
+  pass "ROM byte-identity holds across the rebuild ($(printf '%s\n' "$after" | grep -c . ) roms)"
+else
+  fail "a .rom CHANGED across the rebuild — the device leaked into ROM bytes:"
+  diff <(printf '%s\n' "$before") <(printf '%s\n' "$after") | head -6
+fi
+
+# --- B. an existing ROM still answers identically under the new emulator -----------------
+# The device added cases to emu_dei/emu_deo; a mis-placed case would silently divert a
+# port an existing ROM uses. spearman is the densest DEI/DEO user in the tree.
+got="$(printf '5\n1\n1\n0\n1\n1\n' | ./bin/uxncli spearman.rom 2>/dev/null)"
+[ "$got" = "800" ] && pass "spearman.rom unaffected by the new device cases (800)" \
+                   || fail "spearman.rom answers '$got' under the new emulator, want 800"
+
+for r in net-echo net-listen; do
+  [ -f "$r.rom" ] || ./bin/uxnasm "$r.tal" "$r.rom" >/dev/null 2>&1
+  [ -f "$r.rom" ] || { echo "net-device-test: FAIL (no $r.rom)"; exit 1; }
+done
+
+# runrom <stdin…> → "<stdout>|<rc>" with stderr captured to $tmp/err
+runrom(){ local o r; o="$(printf '%b' "$1" | timeout 30 ./bin/uxncli net-echo.rom 2>"$tmp/err")"; r=$?; printf '%s|%s' "$o" "$r"; }
+
+# probe <tal-body> → assemble and run a throwaway ROM, stdout to stdout, stderr to $tmp/err2
+probe(){
+  printf '%s\n' "$1" > "$tmp/p.tal"
+  ./bin/uxnasm "$tmp/p.tal" "$tmp/p.rom" >/dev/null 2>&1 || { echo "ASMFAIL"; return; }
+  timeout 30 ./bin/uxncli "$tmp/p.rom" 2>"$tmp/err2"
+}
+# a probe that binds on the selected channel and prints the state digit it reads back
+bindprobe(){ # $1=channel-select-line  $2=address
+  probe "|0100
+    $1
+    ;addr #dd DEO2
+    #da DEI #30 ADD #18 DEO
+    #0a #18 DEO
+    #80 #0f DEO
+    BRK
+@addr \"$2 00"
+}
+
+# --- C. a refused connect is NA + LOUD, never a fabricated reply -------------------------
+# Port 1 on the loopback has nothing on it; this leg is about the REFUSAL path, which is
+# the one place a silent fallback would render "no link" as a plausible empty success.
+g="$(runrom 'tcp:127.0.0.1:1\nping\n')"
+if [ "$g" = "NA|2" ] && grep -q 'Connection refused' "$tmp/err"; then
+  pass "refused connect → NA rc2 + loud stderr"
+else
+  fail "refused connect → want 'NA|2' + loud, got '$g' err='$(head -1 "$tmp/err")'"
+fi
+
+# --- D. an unknown scheme is REFUSED, not silently defaulted to tcp ----------------------
+# Guessing the transport is exactly the fallback class that renders a failure as a success.
+g="$(runrom 'gopher:127.0.0.1:1\nping\n')"
+if [ "$g" = "NA|2" ] && grep -q 'unknown scheme' "$tmp/err"; then
+  pass "unknown scheme → refused by name, no silent tcp default"
+else
+  fail "unknown scheme → want refusal naming it, got '$g' err='$(head -1 "$tmp/err")'"
+fi
+
+# --- E. an address with no port is REFUSED ----------------------------------------------
+g="$(runrom 'tcp:127.0.0.1\nping\n')"
+if [ "$g" = "NA|2" ] && grep -q 'no port in address' "$tmp/err"; then
+  pass "address with no port → refused by name"
+else
+  fail "no-port address → want refusal, got '$g' err='$(head -1 "$tmp/err")'"
+fi
+
+# --- F. the connect DEADLINE is real, measured -------------------------------------------
+# 192.0.2.1 is RFC5737 TEST-NET-1: routed nowhere, so the handshake black-holes. Without
+# the non-blocking connect + select the kernel's SYN ladder sits there for minutes and a
+# wedged emulator reads green to everything watching it, because it never returns to say
+# otherwise. Asserted as WALL CLOCK — the only evidence that the deadline fired.
+t0=$(date +%s)
+g="$(UXN_NET_TIMEOUT=2 runrom 'tcp:192.0.2.1:9\nping\n')"
+t1=$(date +%s)
+el=$((t1 - t0))
+if [ "$g" = "NA|2" ] && [ "$el" -le 8 ]; then
+  pass "black-holed connect gave up in ${el}s under UXN_NET_TIMEOUT=2 (NA, not a hang)"
+else
+  fail "black-holed connect: want NA within ~2s, got '$g' after ${el}s"
+fi
+
+# --- G. IDENTIFY: a device-less emulator says so, instead of answering Disconnected -------
+# THE POINT OF THE PROBE. uxncli's emu_dei falls through to `return uxn.dev[addr]` on a page
+# no device owns — that reads 0, and net state 0 IS Disconnected, so "this build has no
+# network" and "the far node refused" arrive as the same byte. Measured on the Note3
+# (2026-07-24): the pre-net emulator and a genuine ECONNREFUSED both gave stdout NA rc 2,
+# byte-identical; only stderr differed, and the old binary is silent there.
+# The discriminator is the SAME ROM on TWO emulators — the real one and a net-BLIND stub
+# that is exactly emu_dei's fallthrough. Same input, two verdicts, or the probe is decorative.
+cat > "$tmp/netblind.c" <<'C'
+#include "../uxn.h"
+Uint8 net_dei(Uint8 addr) { (void)addr; return 0; }
+void net_deo(Uint8 addr) { (void)addr; }
+C
+mkdir -p "$tmp/devices" && cp src/uxn.h "$tmp/uxn.h" && cp "$tmp/netblind.c" "$tmp/devices/netblind.c"
+if ${CC:-cc} -std=c89 -O2 -DNDEBUG -o "$tmp/uxncli-netblind" \
+      src/uxncli.c src/uxn.c src/devices/system.c src/devices/console.c \
+      src/devices/file.c src/devices/datetime.c "$tmp/devices/netblind.c" \
+      -I src >/dev/null 2>&1; then
+  b="$(printf 'tcp:127.0.0.1:1\nping\n' | timeout 20 "$tmp/uxncli-netblind" net-echo.rom 2>/dev/null)|$?"
+  r="$(runrom 'tcp:127.0.0.1:1\nping\n')"
+  if [ "$b" = "NODEV|3" ] && [ "$r" = "NA|2" ]; then
+    pass "identify discriminates: net-blind build → NODEV rc3, real build + refusal → NA rc2"
+  else
+    fail "identify: want blind='NODEV|3' real='NA|2', got blind='$b' real='$r'"
+  fi
+  b="$(printf 'tcp:127.0.0.1:%s\n' "$BPORT" | timeout 20 "$tmp/uxncli-netblind" net-listen.rom 2>/dev/null)|$?"
+  [ "$b" = "NODEV|3" ] && pass "net-listen refuses a device-less emulator by name (NODEV rc3)" \
+                       || fail "net-listen on a net-blind build: want 'NODEV|3', got '$b'"
+else
+  fail "net-blind control build failed to compile — the identify leg did NOT run"
+fi
+
+# --- H. BIND puts a listener up, and the accept wait is REAL, measured --------------------
+# The state read on an inbound lane IS the accept, so with nobody calling it must come back
+# BOUND after one deadline — not Connected (there is no peer), not Disconnected (the
+# listener is fine), and not never (that is the wedge). Wall clock is the only evidence the
+# accept deadline exists at all.
+t0=$(date +%s)
+g="$(UXN_NET_TIMEOUT=1 bindprobe '#01 #df DEO' "tcp:127.0.0.1:$BPORT")"
+t1=$(date +%s); el=$((t1 - t0))
+if [ "$g" = "6" ] && [ "$el" -ge 1 ] && [ "$el" -le 6 ]; then
+  pass "bind → state 6 Bound, and an uncalled accept returned after ${el}s (deadline real)"
+else
+  fail "bind/accept: want state 6 within ~1s, got '$g' after ${el}s err='$(head -1 "$tmp/err2")'"
+fi
+
+# --- I. the any-address form must be WRITTEN OUT ------------------------------------------
+# '*' binds every interface, and it is a different security claim from one address. The
+# device accepts it only spelled out; there is no path where leaving the host off produces
+# it, because the convenient reading of "no host given" is the one that opens the node.
+g="$(UXN_NET_TIMEOUT=1 bindprobe '#01 #df DEO' "tcp:*:$((BPORT + 1))")"
+[ "$g" = "6" ] && pass "explicit any-address 'tcp:*:PORT' binds (state 6)" \
+               || fail "explicit any-address: want state 6, got '$g' err='$(head -1 "$tmp/err2")'"
+g="$(runrom "tcp:*:$BPORT\nping\n")"
+if [ "$g" = "NA|2" ] && grep -q "BIND address" "$tmp/err"; then
+  pass "'*' as a CONNECT target is refused by name (a bind address is not dialable)"
+else
+  fail "connect to '*': want refusal naming it, got '$g' err='$(head -1 "$tmp/err")'"
+fi
+
+# --- J. binding on channel 0 is refused, and NOTHING is left listening --------------------
+# Channel 0 is the outbound lane; a bind there would leave the state port answering for the
+# wrong endpoint — a TRUE answer to a question the ROM did not ask. Asserting only the
+# stderr line would assert a message; the artifact is that the port stays dead.
+g="$(bindprobe '( no channel selected — channel 0 )' "tcp:127.0.0.1:$((BPORT + 2))")"
+if [ "$g" = "0" ] && grep -q 'outbound lane' "$tmp/err2" \
+   && ! timeout 3 bash -c "exec 3<>/dev/tcp/127.0.0.1/$((BPORT + 2))" 2>/dev/null; then
+  pass "bind on channel 0 → refused by name AND the port is not listening"
+else
+  fail "bind on channel 0: want state 0 + refusal + dead port, got '$g' err='$(head -1 "$tmp/err2")'"
+fi
+
+# --- K. a bind that FAILS never reads as Bound --------------------------------------------
+# 203.0.113.1 is RFC5737 TEST-NET-3: not an address on this host, so bind(2) says
+# EADDRNOTAVAIL. The failure must leave the lane Unbound — the same rule as a failed
+# connect never reading as Connected.
+g="$(bindprobe '#01 #df DEO' "tcp:203.0.113.1:$BPORT")"
+if [ "$g" = "4" ] && grep -qi 'assign' "$tmp/err2"; then
+  pass "unassignable bind address → state 4 Unbound + loud (never a plausible Bound)"
+else
+  fail "failed bind: want state 4 + loud, got '$g' err='$(head -1 "$tmp/err2")'"
+fi
+
+# --- L. the ACCEPT/read/write mechanism, on loopback and labelled as such ------------------
+# This leg is local ON PURPOSE and claims only the mechanism: a caller is accepted, its
+# bytes are read, and the reply comes back TAGGED. The tag is what makes it an assertion
+# about the ROM rather than about the port — an echo server, a stray socat, or a client
+# reading its own buffer all produce the payload; only net-listen.rom produces 'uxn:'.
+# Addressing is claimed by leg N, over the tailnet, or by nothing.
+{ printf 'tcp:127.0.0.1:%s\n' "$BPORT" | UXN_NET_TIMEOUT=5 timeout 30 ./bin/uxncli net-listen.rom >/dev/null 2>"$tmp/err3"; } &
+sleep 1
+lg=""
+if exec 3<>"/dev/tcp/127.0.0.1/$BPORT" 2>/dev/null; then
+  printf 'hello-bind\n' >&3
+  lg="$(timeout 10 head -c 15 <&3)"
+  exec 3<&-
+fi
+wait
+if [ "$lg" = "uxn:hello-bind" ] && grep -q 'accepted' "$tmp/err3"; then
+  pass "local accept+read+write: caller got the TAGGED reply 'uxn:hello-bind' (mechanism only)"
+else
+  fail "local bind round trip: want 'uxn:hello-bind', got '$lg' err='$(head -1 "$tmp/err3")'"
+fi
+
+# ==========================================================================================
+# STEP 3 — the DATAGRAM lane. Same shape as above: the refusals first, then the deadline as a
+# measured wall clock, then the mechanism on loopback, then the real node boundary in leg N.
+# ==========================================================================================
+DPORT="${MESH_NET_TEST_DGRAM_PORT:-47110}"
+[ -f net-dgram.rom ] || ./bin/uxnasm net-dgram.tal net-dgram.rom >/dev/null 2>&1
+[ -f net-dgram.rom ] || { echo "net-device-test: FAIL (no net-dgram.rom)"; exit 1; }
+
+# --- O. a datagram listener refuses the any-address in EVERY spelling ----------------------
+# The rule differs from the stream lane's ON PURPOSE, and the difference is the whole security
+# story: a stream peer must complete a handshake this node can see, while a datagram sender is
+# already inside the ROM's read loop — and the ROM this lane exists for merges what it reads
+# into a ledger. uxn carries no crypto; the tailnet ACL is the entire authentication, and an
+# ACL means nothing if the socket is not on the tailnet address. Asserting the stderr line
+# alone would assert a MESSAGE — the artifact is that nothing is listening afterwards.
+g="$(UXN_NET_TIMEOUT=1 bindprobe '#01 #df DEO' "udp:*:$((DPORT + 1))")"
+free_after=1
+python3 -c "
+import socket,sys
+s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
+try: s.bind(('0.0.0.0',$((DPORT + 1))))
+except Exception: sys.exit(1)
+" 2>/dev/null || free_after=0
+if [ "$g" = "4" ] && grep -q "NAMED address" "$tmp/err2" && [ "$free_after" = 1 ]; then
+  pass "datagram bind on '*' → refused by name, state 4 Unbound, and the port stayed free"
+else
+  fail "datagram '*': want state 4 + named refusal + free port, got '$g' free=$free_after err='$(head -1 "$tmp/err2")'"
+fi
+
+# --- P. 0.0.0.0 and :: are the any-address WEARING A HOST'S NAME ---------------------------
+# This is the hole step 2 shipped with: net.c claimed '*' was the only way to ask for every
+# interface, while `tcp:0.0.0.0:port` walked through net_resolve as an ordinary named host and
+# opened all of them. The guard is made against the RESOLVED SOCKADDR, never the text, because
+# '*', 0.0.0.0, ::, 0 and an empty host are five spellings of one in_addr — and a matcher on
+# the spelling refuses the two forms somebody thought of and waves the rest through.
+g="$(UXN_NET_TIMEOUT=1 bindprobe '#01 #df DEO' "tcp:0.0.0.0:$((DPORT + 2))")"
+if [ "$g" = "4" ] && grep -q "IS the any-address" "$tmp/err2"; then
+  pass "stream bind on 0.0.0.0 → refused (the disguised any-address; a step-2 hole closed)"
+else
+  fail "stream 0.0.0.0: want state 4 + refusal, got '$g' err='$(head -1 "$tmp/err2")'"
+fi
+g="$(UXN_NET_TIMEOUT=1 bindprobe '#01 #df DEO' "udp:0.0.0.0:$((DPORT + 3))")"
+if [ "$g" = "4" ] && grep -q "IS the any-address" "$tmp/err2"; then
+  pass "datagram bind on 0.0.0.0 → refused (there is no any-address form on this lane at all)"
+else
+  fail "datagram 0.0.0.0: want state 4 + refusal, got '$g' err='$(head -1 "$tmp/err2")'"
+fi
+# The two spellings that prove the guard is on the SOCKADDR and not on the text: inet_aton
+# reads bare '0' and '0x0' as 0.0.0.0, and no pattern list anyone writes by hand contains
+# them. ('::' is not testable here — this URI grammar is colon-separated and cannot spell a
+# v6 literal at all, so a leg using it would pass on a parse error and assert nothing.)
+for w in 0 0x0; do
+  g="$(UXN_NET_TIMEOUT=1 bindprobe '#01 #df DEO' "udp:$w:$((DPORT + 4))")"
+  if [ "$g" = "4" ] && grep -q "IS the any-address" "$tmp/err2"; then
+    pass "datagram bind on '$w' → refused (inet_aton reads it as 0.0.0.0; the guard reads the sockaddr)"
+  else
+    fail "datagram '$w': want state 4 + any-address refusal, got '$g' err='$(head -1 "$tmp/err2")'"
+  fi
+done
+
+# --- Q. THE DATAGRAM DEADLINE BECOMES A STATE, measured in wall clock ----------------------
+# A bound datagram socket nobody is sending to must come back BOUND after one deadline — never
+# HasData (nothing arrived), never Unbound (the socket is fine), and never never. A listener
+# that cannot say "nobody sent" is indistinguishable from a hung emulator, and a hang reads
+# green to everything watching it precisely because it never returns to say otherwise. Wall
+# clock is the only evidence the deadline fired at all.
+t0=$(date +%s)
+g="$(UXN_NET_TIMEOUT=1 bindprobe '#01 #df DEO' "udp:127.0.0.1:$((DPORT + 5))")"
+t1=$(date +%s); el=$((t1 - t0))
+if [ "$g" = "6" ] && [ "$el" -ge 1 ] && [ "$el" -le 6 ]; then
+  pass "datagram bind → state 6 Bound, and a silent wire returned after ${el}s (deadline real)"
+else
+  fail "datagram deadline: want state 6 within ~1s, got '$g' after ${el}s err='$(head -1 "$tmp/err2")'"
+fi
+
+# --- R. an EMPTY datagram is not a close — the remote-unbind guard -------------------------
+# recv() returning 0 on a stream IS an orderly close, and the stream path correctly tears the
+# lane down for it. On a datagram socket 0 is a legal EMPTY PACKET, and reading it as a close
+# hands anything that can reach the port a one-packet teardown of our listener: a remote
+# unbind, spelled as an ordinary read. The assert is the state AFTER the read — 6, still up.
+( probe "|0100
+  #01 #df DEO
+  ;addr #dd DEO2
+  #da DEI POP
+  #0100 #d4 DEO2
+  ;buf #d6 DEO2
+  #da DEI #30 ADD #18 DEO
+  #0a #18 DEO
+  #80 #0f DEO
+  BRK
+@addr \"udp:127.0.0.1:$((DPORT + 6)) 00
+@buf \$200" > "$tmp/emptyout" ) &
+pp=$!
+sleep 1
+python3 -c "
+import socket
+socket.socket(socket.AF_INET,socket.SOCK_DGRAM).sendto(b'', ('127.0.0.1',$((DPORT + 6))))" 2>/dev/null
+wait $pp 2>/dev/null
+g="$(tr -d '\n' < "$tmp/emptyout")"
+if [ "$g" = "6" ] && grep -q 'empty datagram' "$tmp/err2"; then
+  pass "an empty datagram → length 0 AND the lane stays Bound (no remote teardown)"
+else
+  fail "empty datagram: want state 6 after the read + a loud note, got '$g' err='$(tr "\n" " " < "$tmp/err2" | head -c 120)'"
+fi
+
+# --- S. an OVERSIZED datagram is discarded loudly, never delivered short -------------------
+# The kernel truncates silently and the ROM cannot see the cut, so half a record arrives
+# looking exactly like a whole smaller one — the one shape a gossip receiver must never be
+# handed, because it will merge it. Read length 16 against a 300-byte packet.
+( probe "|0100
+  #01 #df DEO
+  ;addr #dd DEO2
+  #da DEI POP
+  #0010 #d4 DEO2
+  ;buf #d6 DEO2
+  #d5 DEI #30 ADD #18 DEO
+  #0a #18 DEO
+  #80 #0f DEO
+  BRK
+@addr \"udp:127.0.0.1:$((DPORT + 7)) 00
+@buf \$200" > "$tmp/truncout" ) &
+pp=$!
+sleep 1
+python3 -c "
+import socket
+socket.socket(socket.AF_INET,socket.SOCK_DGRAM).sendto(b'x'*300, ('127.0.0.1',$((DPORT + 7))))" 2>/dev/null
+wait $pp 2>/dev/null
+g="$(tr -d '\n' < "$tmp/truncout")"
+if [ "$g" = "0" ] && grep -q 'DISCARDED' "$tmp/err2"; then
+  pass "a 300-byte datagram into a 16-byte read → DISCARDED + loud, length 0 (never a short record)"
+else
+  fail "oversized datagram: want length 0 + 'DISCARDED', got '$g' err='$(tr "\n" " " < "$tmp/err2" | head -c 120)'"
+fi
+
+# --- T. a write with no recorded sender is refused, not aimed somewhere --------------------
+# The socket is unconnected by construction, so send(2) has no destination. Inventing one —
+# another lane's last peer, a broadcast — is the guess this device refuses everywhere else
+# too. Length 0 is the artifact; the stderr line only explains it.
+g="$(probe "|0100
+  #01 #df DEO
+  ;addr #dd DEO2
+  #0004 #d4 DEO2
+  ;msg #d8 DEO2
+  #d5 DEI #30 ADD #18 DEO
+  #0a #18 DEO
+  #80 #0f DEO
+  BRK
+@addr \"udp:127.0.0.1:$((DPORT + 8)) 00
+@msg \"ping" | tr -d '\n')"
+if [ "$g" = "0" ] && grep -q 'no datagram sender recorded' "$tmp/err2"; then
+  pass "write before any read on a datagram lane → refused by name, 0 bytes sent"
+else
+  fail "unaddressed datagram write: want 0 + refusal, got '$g' err='$(head -1 "$tmp/err2")'"
+fi
+
+# --- U. the HANDLE names the lane FAMILY, and accepts nothing to answer --------------------
+# 0x02xx datagram, 0x01xx accepted stream, 0 nothing attached. It is also the only read here
+# that touches no socket: net-dgram.tal uses it to catch a refused bind without spending a
+# wait on it, and sysfs-serve uses it to dodge the accept-eats-the-next-caller bug. So a
+# stream listener with nobody accepted must read 0 — not "bound", and not by accepting.
+g="$(UXN_NET_TIMEOUT=1 probe "|0100
+  #01 #df DEO
+  ;addr #dd DEO2
+  #db DEI #30 ADD #18 DEO
+  #dc DEI #30 ADD #18 DEO
+  #0a #18 DEO
+  #80 #0f DEO
+  BRK
+@addr \"udp:127.0.0.1:$((DPORT + 9)) 00" | tr -d '\n')"
+[ "$g" = "21" ] && pass "a bound datagram lane's handle is 0x0201 — family 02, channel 1" \
+                || fail "datagram handle: want '21' (0x02 then 0x01), got '$g'"
+g="$(UXN_NET_TIMEOUT=1 probe "|0100
+  #01 #df DEO
+  ;addr #dd DEO2
+  #db DEI #30 ADD #18 DEO
+  #dc DEI #30 ADD #18 DEO
+  #0a #18 DEO
+  #80 #0f DEO
+  BRK
+@addr \"tcp:127.0.0.1:$((DPORT + 10)) 00" | tr -d '\n')"
+[ "$g" = "00" ] && pass "a stream listener with nobody accepted reads handle 0 (no accept to say so)" \
+                || fail "stream handle before accept: want '00', got '$g'"
+
+# --- V. the datagram mechanism end to end, on loopback and labelled as such ----------------
+# Local ON PURPOSE, and it claims only the mechanism: a packet is received, its bytes are
+# read, and the reply goes back to the SENDER — an address the ROM never names, because the
+# device recorded it. The 'uxn:' tag is what makes this an assertion about the ROM rather
+# than about the port. Addressing is claimed by leg N over the tailnet, or by nothing.
+{ printf 'udp:127.0.0.1:%s\n' "$DPORT" | UXN_NET_TIMEOUT=5 timeout 30 ./bin/uxncli net-dgram.rom >/dev/null 2>"$tmp/err7"; } &
+sleep 1
+lg="$(timeout 15 python3 -c "
+import socket
+s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(10)
+s.sendto(b'hello-dgram', ('127.0.0.1',$DPORT))
+print(s.recvfrom(256)[0].decode(),end='')" 2>/dev/null)"
+wait
+if [ "$lg" = "uxn:hello-dgram" ] && grep -q 'bound (datagram)' "$tmp/err7"; then
+  pass "local datagram round trip: sender got the TAGGED reply 'uxn:hello-dgram' (mechanism only)"
+else
+  fail "local datagram round trip: want 'uxn:hello-dgram', got '$lg' err='$(head -1 "$tmp/err7")'"
+fi
+
+# --- M. RED-first on the SOURCE: each mutant must break a leg above ------------------------
+# A gate nobody has seen fail is not a gate. Every mutant is a plausible "simplification" —
+# dropping a refusal, dropping a timeout — and each is discriminated by exactly one leg
+# above. `sed -z` because the edits span lines; a line-wise pattern silently matches nothing
+# and the mutation reads green as a no-op, which is why that case FAILS loudly.
+mutant_red(){ # $1=sed-z script  $2=label  $3=command that must FAIL against the mutant
+  cp src/devices/net.c "$tmp/net.bak"
+  sed -z "$1" src/devices/net.c > "$tmp/net.mut" || { fail "$2: sed failed"; return; }
+  if cmp -s src/devices/net.c "$tmp/net.mut"; then
+    fail "$2: mutation was a no-op (pattern missed — this mutant is NOT being tested)"; return
+  fi
+  cp "$tmp/net.mut" src/devices/net.c
+  local built=1
+  ./build.sh >/dev/null 2>&1 || built=0
+  cp "$tmp/net.bak" src/devices/net.c
+  if [ "$built" = 0 ]; then fail "$2: mutant does not build"; ./build.sh >/dev/null 2>&1; return; fi
+  if eval "$3" >/dev/null 2>&1; then
+    fail "$2: the check STILL PASSES against the mutant — that leg does not discriminate it"
+  else
+    pass "RED against mutant: $2"
+  fi
+  ./build.sh >/dev/null 2>&1
+}
+# an unknown scheme silently defaulting to tcp — leg D is the only thing standing between
+# a typo'd scheme and a connection the ROM never asked for
+mutant_red 's|\t\t\tnet_fail("unknown scheme", scheme);\n\t\t\tfree(s);\n\t\t\treturn NET_REFUSED;|\t\t\thints.ai_socktype = SOCK_STREAM;|' \
+  "unknown scheme silently defaults to tcp" \
+  'printf "gopher:127.0.0.1:1\nping\n" | timeout 20 ./bin/uxncli net-echo.rom 2>&1 | grep -q "unknown scheme"'
+# the connect deadline removed: select with a NULL timeout waits forever, which is the
+# wedge that reads green because it never returns to say otherwise
+mutant_red 's|if(select(fd + 1, NULL, \&wf, NULL, \&tv) <= 0) {|if(select(fd + 1, NULL, \&wf, NULL, NULL) <= 0) {|' \
+  "connect deadline removed (select blocks forever)" \
+  'a=$(date +%s); UXN_NET_TIMEOUT=2 timeout 20 ./bin/uxncli net-echo.rom >/dev/null 2>&1 <<<"tcp:192.0.2.1:9
+ping"; b=$(date +%s); [ $((b-a)) -le 8 ]'
+# the ACCEPT deadline removed: a listening ROM that nobody calls never comes back, and a
+# listener that cannot say "nobody called" is indistinguishable from a hung emulator
+mutant_red 's|\tif(select(net_listen_fd + 1, \&rf, NULL, NULL, \&tv) <= 0)\n\t\treturn 0;|\tif(select(net_listen_fd + 1, \&rf, NULL, NULL, NULL) <= 0)\n\t\treturn 0;|' \
+  "accept deadline removed (an uncalled listener never returns)" \
+  "printf '|0100\n#01 #df DEO\n;addr #dd DEO2\n#da DEI #30 ADD #18 DEO\n#80 #0f DEO\nBRK\n@addr \"tcp:127.0.0.1:$((BPORT + 3)) 00\n' > $tmp/m.tal
+   ./bin/uxnasm $tmp/m.tal $tmp/m.rom >/dev/null 2>&1
+   [ \"\$(UXN_NET_TIMEOUT=1 timeout 8 ./bin/uxncli $tmp/m.rom 2>/dev/null)\" = 6 ]"
+# the channel-0 bind refusal removed: the listener would come up while the state port kept
+# answering for the outbound lane — leg J is the only thing that reads the port itself
+mutant_red 's|\tif(c == 0) {\n\t\tnet_fail("bind", "select an inbound channel on df first — channel 0 is the outbound lane");\n\t\treturn;\n\t}\n|\tif(c == 0)\n\t\tc = 1;\n|' \
+  "bind on channel 0 silently allowed" \
+  "printf '|0100\n;addr #dd DEO2\n#80 #0f DEO\nBRK\n@addr \"tcp:127.0.0.1:$((BPORT + 4)) 00\n' > $tmp/m2.tal
+   ./bin/uxnasm $tmp/m2.tal $tmp/m2.rom >/dev/null 2>&1
+   timeout 8 ./bin/uxncli $tmp/m2.rom 2>&1 | grep -q 'outbound lane'"
+
+# --- the step-3 mutants: each is a plausible "simplification" of the datagram lane ---------
+# The probe ROMs are cut ONCE, here, from the same bodies the legs above ran: a mutant check
+# that re-assembled would be testing uxnasm's output as well as the mutation, and the point
+# is to vary exactly one thing — the emulator's C.
+mkrom(){ printf '%s\n' "$2" > "$tmp/$1.tal"; ./bin/uxnasm "$tmp/$1.tal" "$tmp/$1.rom" >/dev/null 2>&1 \
+         || fail "mutant probe $1.rom failed to assemble — its mutant leg cannot run"; }
+mkrom o "|0100
+  #01 #df DEO
+  ;addr #dd DEO2
+  #da DEI #30 ADD #18 DEO
+  #80 #0f DEO
+  BRK
+@addr \"udp:*:$((DPORT + 11)) 00"
+mkrom p "|0100
+  #01 #df DEO
+  ;addr #dd DEO2
+  #da DEI #30 ADD #18 DEO
+  #80 #0f DEO
+  BRK
+@addr \"tcp:0.0.0.0:$((DPORT + 12)) 00"
+mkrom q "|0100
+  #01 #df DEO
+  ;addr #dd DEO2
+  #da DEI #30 ADD #18 DEO
+  #80 #0f DEO
+  BRK
+@addr \"udp:127.0.0.1:$((DPORT + 13)) 00"
+mkrom r "|0100
+  #01 #df DEO
+  ;addr #dd DEO2
+  #da DEI POP
+  #0100 #d4 DEO2
+  ;buf #d6 DEO2
+  #da DEI #30 ADD #18 DEO
+  #80 #0f DEO
+  BRK
+@addr \"udp:127.0.0.1:$((DPORT + 14)) 00
+@buf \$200"
+mkrom s "|0100
+  #01 #df DEO
+  ;addr #dd DEO2
+  #da DEI POP
+  #0010 #d4 DEO2
+  ;buf #d6 DEO2
+  #d5 DEI #30 ADD #18 DEO
+  #80 #0f DEO
+  BRK
+@addr \"udp:127.0.0.1:$((DPORT + 15)) 00
+@buf \$200"
+# send one datagram to $1 a second after $2 starts, and answer with what the ROM printed
+dgram_probe(){ # $1=port  $2=rom  $3=payload-expression
+  ( UXN_NET_TIMEOUT=2 timeout 25 ./bin/uxncli "$2" >"$tmp/mut-out" 2>/dev/null ) &
+  local bg=$!
+  sleep 1
+  python3 -c "
+import socket
+socket.socket(socket.AF_INET,socket.SOCK_DGRAM).sendto($3, ('127.0.0.1',$1))" 2>/dev/null
+  wait $bg 2>/dev/null
+  tr -dc '0-9' < "$tmp/mut-out"
+}
+
+# the datagram any-address refusal removed: 'udp:*:port' would come up on every interface,
+# which on a lane with no handshake means every host that can reach this node is already
+# inside the ROM's read loop. Leg O is the only thing that reads the state back.
+mutant_red 's|if(passive \&\& star \&\& hints.ai_socktype != SOCK_STREAM) {|if(0) {|' \
+  "datagram any-address refusal removed ('*' binds every interface)" \
+  "[ \"\$(UXN_NET_TIMEOUT=1 timeout 20 ./bin/uxncli $tmp/o.rom 2>/dev/null)\" = 4 ]"
+# the resolved-sockaddr check removed: 0.0.0.0, 0 and 0x0 go back to reaching bind(2) as
+# ordinary named hosts — exactly the hole step 2 shipped with, reopened.
+mutant_red 's|if(rv == 0 \&\& passive \&\& !star \&\& net_any_addr(\*res)) {|if(0) {|' \
+  "the resolved-sockaddr any-address check removed (0.0.0.0 binds again)" \
+  "[ \"\$(UXN_NET_TIMEOUT=1 timeout 20 ./bin/uxncli $tmp/p.rom 2>/dev/null)\" = 4 ]"
+# the datagram state deadline removed: a bound socket nobody sends to never comes back — the
+# wedge that reads green to every watcher precisely because it never returns to say otherwise.
+mutant_red 's|\tif(select(net_fd\[c\] + 1, \&rf, NULL, NULL, \&tv) <= 0)\n\t\treturn NET_STATE_BOUND;|\tif(select(net_fd[c] + 1, \&rf, NULL, NULL, NULL) <= 0)\n\t\treturn NET_STATE_BOUND;|' \
+  "datagram state deadline removed (a silent wire never returns)" \
+  "a=\$(date +%s); UXN_NET_TIMEOUT=1 timeout 12 ./bin/uxncli $tmp/q.rom >/dev/null 2>&1; b=\$(date +%s); [ \$((b-a)) -le 6 ]"
+# an empty datagram read as an orderly close: one zero-byte packet from anywhere on the wire
+# tears the listener down — a remote unbind wearing an ordinary read's clothes.
+mutant_red 's|\tif(n == 0)\n\t\tnet_fail("read", "empty datagram received[^;]*;\n|\tif(n == 0) {\n\t\tnet_drop(c);\n\t\treturn;\n\t}\n|' \
+  "an empty datagram treated as a close (a one-packet remote unbind)" \
+  "[ \"\$(dgram_probe $((DPORT + 14)) $tmp/r.rom \"b''\")\" = 6 ]"
+# a truncated datagram delivered short: the ROM reads a length its buffer never held, and half
+# a record parses as a whole smaller one — the one shape a gossip receiver must never merge.
+mutant_red 's|\tif((size_t)n > (size_t)len) {|\tif(0) {|' \
+  "an oversized datagram delivered instead of discarded" \
+  "[ \"\$(dgram_probe $((DPORT + 15)) $tmp/s.rom \"b'x'*300\")\" = 0 ]"
+
+# --- N. THE LIVE LEGS: real round trips over tailscale, one in each direction ---------------
+# Not localhost. Outbound: the peer uppercases what it receives, so an OK proves the far node
+# actually PROCESSED the bytes. Inbound: OUR uxncli is the listener and the peer dials it,
+# which is the half step 2 exists for — the far end of a hop needs no shell, only this ROM.
+if ! timeout 15 ssh -n -o StrictHostKeyChecking=no -o ConnectTimeout=8 -o BatchMode=yes "$PEER_SSH" true 2>/dev/null; then
+  echo "  n/a: peer $PEER_SSH unreachable — NEITHER live round trip ran (honest n/a, not a pass)"
+  [ "$rc" -eq 0 ] && { echo "net-device-test: n/a (local legs green, live legs need $PEER_SSH)"; exit 2; }
+  echo "net-device-test: FAIL"; exit 1
+fi
+timeout 70 ssh -n -o StrictHostKeyChecking=no -o BatchMode=yes "$PEER_SSH" \
+  "timeout 50 socat TCP-LISTEN:$PORT,bind=$PEER_IP,reuseaddr,fork SYSTEM:'tr a-z A-Z'" >/dev/null 2>&1 &
+lpid=$!
+timeout 12 bash -c "until (exec 3<>/dev/tcp/$PEER_IP/$PORT) 2>/dev/null; do :; done" 2>/dev/null
+g="$(runrom "tcp:$PEER_IP:$PORT\nping-uxn-net\n")"
+kill "$lpid" 2>/dev/null
+timeout 15 ssh -n -o StrictHostKeyChecking=no -o BatchMode=yes "$PEER_SSH" "pkill -f 'TCP-LISTEN:$PORT'" >/dev/null 2>&1
+if [ "$g" = "PING-UXN-NET|0" ]; then
+  pass "LIVE outbound $(hostname) -> $PEER_IP:$PORT: sent 'ping-uxn-net', far node answered 'PING-UXN-NET'"
+else
+  fail "live outbound round trip: want 'PING-UXN-NET|0', got '$g' err='$(head -1 "$tmp/err")'"
+fi
+
+# INBOUND: our ROM binds this node's TAILSCALE address — not loopback, so the peer's packets
+# traverse the tailnet exactly as a travelling ROM's would.
+if [ -z "$SELF_IP" ]; then
+  echo "  n/a: no tailscale address on this node — the INBOUND live leg did NOT run"
+  [ "$rc" -eq 0 ] && { echo "net-device-test: n/a (outbound live green, inbound needs a tailscale IP)"; exit 2; }
+  echo "net-device-test: FAIL"; exit 1
+fi
+{ printf 'tcp:%s:%s\n' "$SELF_IP" "$BPORT" | UXN_NET_TIMEOUT=20 timeout 60 ./bin/uxncli net-listen.rom >/dev/null 2>"$tmp/err4"; } &
+sleep 1
+pg="$(timeout 30 ssh -n -o StrictHostKeyChecking=no -o BatchMode=yes "$PEER_SSH" \
+  "exec 3<>/dev/tcp/$SELF_IP/$BPORT && printf 'ping-from-peer\n' >&3 && head -c 19 <&3" 2>/dev/null)"
+wait
+if [ "$pg" = "uxn:ping-from-peer" ]; then
+  pass "LIVE inbound $PEER_IP -> $SELF_IP:$BPORT: the peer dialed OUR net-listen.rom and got 'uxn:ping-from-peer'"
+else
+  fail "live inbound round trip: want 'uxn:ping-from-peer', got '$pg' err='$(head -1 "$tmp/err4")'"
+fi
+
+# --- the LIVE DATAGRAM legs: the step-3 claim, across a real node boundary -----------------
+# Everything above about loopback applies double here. A datagram round trip on 127.0.0.1
+# exercises the same three syscalls and proves nothing about ADDRESSING: no route is chosen,
+# no ACL is consulted, and the bind address that the whole security argument rests on is the
+# one address that can never be wrong. The tailnet is where the claim lives.
+timeout 70 ssh -n -o StrictHostKeyChecking=no -o BatchMode=yes "$PEER_SSH" \
+  "timeout 50 socat -T20 UDP-RECVFROM:$((PORT + 3)),bind=$PEER_IP,reuseaddr,fork SYSTEM:'tr a-z A-Z'" >/dev/null 2>&1 &
+lpid=$!
+sleep 2
+g="$(runrom "udp:$PEER_IP:$((PORT + 3))\nping-uxn-dgram\n")"
+kill "$lpid" 2>/dev/null
+timeout 15 ssh -n -o StrictHostKeyChecking=no -o BatchMode=yes "$PEER_SSH" "pkill -f 'UDP-RECVFROM:$((PORT + 3))'" >/dev/null 2>&1
+if [ "$g" = "PING-UXN-DGRAM|0" ]; then
+  pass "LIVE outbound datagram $(hostname) -> $PEER_IP:$((PORT + 3)): far node answered 'PING-UXN-DGRAM'"
+else
+  fail "live outbound datagram: want 'PING-UXN-DGRAM|0', got '$g' err='$(head -1 "$tmp/err")'"
+fi
+
+# INBOUND is the leg step 3 exists for: OUR uxncli holds the datagram socket on this node's
+# TAILSCALE address and the peer's packet traverses the tailnet to reach it — which is also
+# the only configuration in which "the ACL is the authentication" is a true sentence. The
+# 'uxn:' tag keeps it an assertion about the ROM and not about the port.
+{ printf 'udp:%s:%s\n' "$SELF_IP" "$((BPORT + 5))" | UXN_NET_TIMEOUT=20 timeout 60 ./bin/uxncli net-dgram.rom >/dev/null 2>"$tmp/err8"; } &
+sleep 1
+pg="$(timeout 30 ssh -n -o StrictHostKeyChecking=no -o BatchMode=yes "$PEER_SSH" \
+  "printf 'ping-from-peer\n' | timeout 20 socat -t 15 - UDP:$SELF_IP:$((BPORT + 5))" 2>/dev/null | tr -d '\n')"
+wait
+if [ "$pg" = "uxn:ping-from-peer" ]; then
+  pass "LIVE inbound datagram $PEER_IP -> $SELF_IP:$((BPORT + 5)): the peer's packet reached OUR net-dgram.rom, tagged reply returned"
+else
+  fail "live inbound datagram: want 'uxn:ping-from-peer', got '$pg' err='$(head -1 "$tmp/err8")'"
+fi
+
+[ "$rc" -eq 0 ] && echo "net-device-test: ok (ROM byte-identity + existing ROM unaffected + identify vs a net-blind build + connect refusals + measured connect/accept/datagram deadlines + bind refusals: channel-0, unassignable, dialing '*', datagram any-address in 4 spellings, 0.0.0.0 disguised as a host + empty-datagram non-teardown + oversized-datagram discard + unaddressed-write refusal + handle families + tagged local accept and local datagram + 9 source-mutants RED + REAL two-node round trips, stream AND datagram, BOTH directions)"
+exit "$rc"

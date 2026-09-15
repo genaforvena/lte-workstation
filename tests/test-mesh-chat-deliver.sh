@@ -47,7 +47,7 @@ printf '%s  vpn@test  ::  [@witness] distinct fact\n' "$now" >>"$MESH_CHAT_LOG"
 "$tool" --once witness
 [[ "$(wc -l <"$TEST_PUSHES")" -eq $((before + 1)) ]]
 spaced_id="$(sed -n 's/.*msg:\([0-9a-f]\{16\}\).*/\1/p' "$TEST_PUSHES" | tail -1)"
-printf '%s  witness@test  ::  [@vpn] [ack] ack: %s\n' "$now" "$spaced_id" >>"$MESH_CHAT_LOG"
+printf '%s  witness@test  ::  [@vpn] [ack] ack: msg:%s\n' "$now" "$spaced_id" >>"$MESH_CHAT_LOG"
 spaced_before="$(wc -l <"$TEST_PUSHES")"; "$tool" --once witness
 [[ "$(wc -l <"$TEST_PUSHES")" -eq "$spaced_before" ]]
 python3 - "$MESH_CHAT_DELIVER_LEDGER" <<'PY'

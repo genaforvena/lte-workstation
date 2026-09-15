@@ -92,7 +92,7 @@ class TaskNoExpiryTests(unittest.TestCase):
         self.assertFalse(any(line.split("\t", 2)[1] == "no-expiry/inspect"
                              for line in queue.splitlines()))
 
-    def test_block_materializes_one_deduplicated_owner_unblock_task(self):
+    def test_block_materializes_one_deduplicated_owner_unblock_task_per_epoch(self):
         self.command("block", "no-expiry", "inspect", "dependency", "missing input", "after input")
         other_plan = Path(self.tmp.name) / "other.tsv"
         other_plan.write_text("alpha\tinspect\tinspect the same missing input\n")
@@ -102,32 +102,66 @@ class TaskNoExpiryTests(unittest.TestCase):
 
         records = __import__("json").loads(self.command("replay", "--json").stdout)
         unblock = [record["data"] for record in records.values()
-                   if record["data"].get("unblock_for") == "alpha|dependency|missing input|after input"]
-        self.assertEqual(len(unblock), 1, records)
-        self.assertEqual(unblock[0]["steps"][0]["owner"], "alpha")
-        self.assertEqual(unblock[0]["steps"][0]["status"], "open")
-        self.assertIn("no-expiry/inspect", unblock[0]["steps"][0]["description"])
+                   if record["data"].get("unblock_for")]
+        self.assertEqual(len(unblock), 2, records)
+        self.assertEqual({record["unblock_parent"] for record in unblock}, {"no-expiry", "other"})
+        for resolver in unblock:
+            self.assertEqual(resolver["steps"][0]["owner"], "alpha")
+            self.assertEqual(resolver["steps"][0]["status"], "open")
+            self.assertIn(resolver["unblock_step"], resolver["steps"][0]["description"])
 
     def test_unblock_sweep_is_idempotent_for_existing_auto_task(self):
         self.command("block", "no-expiry", "inspect", "dependency", "missing input", "after input")
         sweep = self.command("unblock-sweep", "alpha")
         self.assertIn("unblock-sweep owner=alpha created=0", sweep.stdout)
 
-    def test_operator_input_stays_parked_without_owner_resolver(self):
+    def test_completed_resolver_resumes_parent_only_when_owner_marks_blocker_cleared(self):
+        self.command("block", "no-expiry", "inspect", "dependency", "missing input", "after input")
+        records = __import__("json").loads(self.command("replay", "--json").stdout)
+        resolver = next(record["data"] for record in records.values()
+                        if record["data"].get("unblock_parent") == "no-expiry"
+                        and record["data"].get("unblock_step") == "no-expiry/inspect")
+        resolver_chain = resolver["chain"]
+        self.command("take", resolver_chain, "resolve")
+        artifact = TASK
+        settled = self.command("done", resolver_chain, "resolve", str(artifact),
+                               "unblock=cleared event=dependency-arrived")
+        self.assertIn("complete " + resolver_chain, settled.stdout)
+        parent = self.command("status", "no-expiry").stdout
+        self.assertIn("no-expiry [active]", parent)
+        self.assertIn('"resume_event": "dependency-arrived"', self.command("replay", "--json").stdout)
+
+    def test_completed_resolver_without_cleared_marker_leaves_parent_blocked(self):
+        self.command("block", "no-expiry", "inspect", "dependency", "missing input", "after input")
+        records = __import__("json").loads(self.command("replay", "--json").stdout)
+        resolver = next(record["data"] for record in records.values()
+                        if record["data"].get("unblock_parent") == "no-expiry"
+                        and record["data"].get("unblock_step") == "no-expiry/inspect")
+        resolver_chain = resolver["chain"]
+        self.command("take", resolver_chain, "resolve")
+        artifact = TASK
+        self.command("done", resolver_chain, "resolve", str(artifact),
+                     "unblock=blocked reason=dependency-still-absent")
+        parent = self.command("status", "no-expiry").stdout
+        self.assertIn("no-expiry [blocked]", parent)
+
+    def test_operator_input_creates_owner_directed_resolver(self):
         self.command("block", "no-expiry", "inspect", "operator-input", "csv-path", "event:csv-arrives")
         records = __import__("json").loads(self.command("replay", "--json").stdout)
-        self.assertFalse(any(record["data"].get("unblock_for") for record in records.values()), records)
-        events = Path(self.env["MESH_TASK_CHAT_EVENTS"]).read_text()
-        self.assertIn("event:csv-arrives", events)
-        self.assertIn("parked", events)
+        resolver = next(record["data"] for record in records.values()
+                        if record["data"].get("unblock_parent") == "no-expiry")
+        self.assertEqual(resolver["steps"][0]["owner"], "alpha")
+        self.assertIn("operator-action packet", resolver["steps"][0]["description"])
+        self.assertIn("event:csv-arrives", resolver["steps"][0]["description"])
 
-    def test_external_event_stays_parked_without_owner_resolver(self):
+    def test_external_event_creates_owner_directed_resolver(self):
         self.command("block", "no-expiry", "inspect", "external-event", "upstream webhook", "event:webhook")
         records = __import__("json").loads(self.command("replay", "--json").stdout)
-        self.assertFalse(any(record["data"].get("unblock_for") for record in records.values()), records)
-        events = Path(self.env["MESH_TASK_CHAT_EVENTS"]).read_text()
-        self.assertIn("event:webhook", events)
-        self.assertIn("parked", events)
+        resolver = next(record["data"] for record in records.values()
+                        if record["data"].get("unblock_parent") == "no-expiry")
+        self.assertEqual(resolver["steps"][0]["owner"], "alpha")
+        self.assertIn("upstream webhook", resolver["steps"][0]["description"])
+        self.assertIn("event:webhook", resolver["steps"][0]["description"])
 
     def test_blocked_task_waits_in_queue_for_exact_prerequisite_then_redispatches(self):
         root = Path(self.tmp.name)
@@ -139,8 +173,7 @@ class TaskNoExpiryTests(unittest.TestCase):
         self.command("take", "prerequisite", "unblock")
         audit = self.command("audit").stdout
         self.assertIn("QUEUED\talpha\tno-expiry/inspect\twaiting_for=prerequisite/unblock", audit)
-        artifact = root / "prerequisite.md"
-        artifact.write_text("missing input produced\n")
+        artifact = TASK
         self.command("done", "prerequisite", "unblock", str(artifact))
         status = self.command("status", "no-expiry").stdout
         self.assertIn("no-expiry [open]", status)
@@ -183,6 +216,27 @@ class TaskNoExpiryTests(unittest.TestCase):
         self.command("create", "prioritized-default-high", str(high))
         queue = self.command("queue", "--dispatch").stdout.splitlines()
         self.assertTrue(queue[0].startswith("alpha\tprioritized-default-high/high\t90\t"), queue)
+
+    def test_coordinator_reassigns_unfinished_owner_and_unblock_identity(self):
+        root = Path(self.tmp.name)
+        plan = root / "operator.tsv"
+        plan.write_text("operator\tinspect\toperator-dependent work\n")
+        self.command("create", "operator-work", str(plan))
+        self.env["MESH_TASK_ACTOR"] = "operator"
+        self.command("take", "operator-work", "inspect")
+        self.command("block", "operator-work", "inspect", "operator-input", "phone reachability", "event:phone-online")
+        before = __import__("json").loads(self.command("replay", "--json").stdout)
+        old_identity = next(record["data"]["unblock_for"] for record in before.values()
+                            if record["data"].get("unblock_parent") == "operator-work")
+        self.env["MESH_TASK_ACTOR"] = "witness"
+        moved = self.command("reassign-owner", "operator", "beta", "operator window absent")
+        self.assertIn("reassigned owner=operator -> beta tasks=2", moved.stdout)
+        self.assertIn("owner=beta", self.command("status", "operator-work").stdout)
+        records = __import__("json").loads(self.command("replay", "--json").stdout)
+        resolver = next(record["data"] for record in records.values()
+                        if record["data"].get("unblock_parent") == "operator-work")
+        self.assertEqual(resolver["steps"][0]["owner"], "beta")
+        self.assertNotEqual(resolver["unblock_for"], old_identity)
 
 
 if __name__ == "__main__":

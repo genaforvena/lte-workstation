@@ -64,7 +64,8 @@ def main():
         assert "origin.source 'brief:42' already exists in chain 'origin' (status: open)" in err
         assert 'origin' in run('status', 'origin').stdout
         # Settle the first chain, then ensure the canonical settled chain is still a duplicate.
-        artifact = tmp / 'artifact'; artifact.write_text('evidence')
+        # Completion artifacts must outlive their temporary test state.
+        artifact = TASK
         run('take', 'origin', 'work')
         run('done', 'origin', 'work', str(artifact), 'verified')
         settled = run('create', 'settled-duplicate', str(duplicate), code=2).stderr

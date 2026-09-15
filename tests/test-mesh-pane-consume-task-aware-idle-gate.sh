@@ -9,7 +9,7 @@ trap 'rm -rf "$td"' EXIT
 cat >"$td/mesh-task" <<'EOF'
 #!/usr/bin/env bash
 case "$*" in
-  "queue --dispatch")
+  "queue --dispatch --owner genome")
     if [ "${MESH_TASK_CANDIDATE_OWNER:-}" = genome ]; then
       printf 'genome\tchain/step\t95\teligible exact-owner work\n'
     fi
@@ -37,6 +37,31 @@ printf '%s' "$message" | grep -Fq \
   echo "FAIL: wake did not surface the exact candidate with an owner-authored take: $message" >&2
   exit 1
 }
+
+ordinary_empty="$(PATH="$td:/usr/bin:/bin" HOME="$td/home" "$tool" --wake-message blocked)"
+if printf '%s' "$ordinary_empty" | grep -Fq 'create one canonical exact-owner task'; then
+  echo "FAIL: a routine telemetry wake must not bypass the recurring self-pick spend gate" >&2
+  exit 1
+fi
+fallback="$(PATH="$td:/usr/bin:/bin" HOME="$td/home" "$tool" --wake-message blocked --self-pick)"
+printf '%s' "$fallback" | grep -Fq 'Do not reject a blocked task' || {
+  echo "FAIL: no-candidate wake did not forbid rejection as an idle shortcut: $fallback" >&2
+  exit 1
+}
+printf '%s' "$fallback" | grep -Fq 'create one canonical exact-owner task' || {
+  echo "FAIL: no-candidate wake did not require bounded self-authored work: $fallback" >&2
+  exit 1
+}
+
+retry_due="$(PATH="$td:/usr/bin:/bin" HOME="$td/home" MESH_TASK_PICK_RETRY=900 \
+  "$tool" --task-retry-check 'genome eligible candidate' 100 1000)"
+[ "$retry_due" = due ] || { echo "FAIL: a still-eligible task must be re-offered after the retry interval, got: $retry_due" >&2; exit 1; }
+retry_early="$(PATH="$td:/usr/bin:/bin" HOME="$td/home" MESH_TASK_PICK_RETRY=900 \
+  "$tool" --task-retry-check 'genome eligible candidate' 500 1000 || true)"
+[ "$retry_early" = hold ] || { echo "FAIL: a task prompt retry must respect its interval, got: $retry_early" >&2; exit 1; }
+retry_empty="$(PATH="$td:/usr/bin:/bin" HOME="$td/home" MESH_TASK_PICK_RETRY=900 \
+  "$tool" --task-retry-check '' 0 10000 || true)"
+[ "$retry_empty" = hold ] || { echo "FAIL: no candidate must not cause recurring task prompts, got: $retry_empty" >&2; exit 1; }
 
 printf '^state=UP$\n^queue depth [0-9]+$\n' >> "$td/expect/genome"
 cp "$td/expect/genome" "$td/expect/blocked"

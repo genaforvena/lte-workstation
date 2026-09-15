@@ -30,6 +30,7 @@ grep -q 'source_ref:event-1' "$TMP/fyi/fyi.journal"
 # Independent replay reports recurrence and the explicit linked disposition.
 MESH_CHAT_LOG="$CHAT" MESH_FYI_DIR="$TMP/fyi" MESH_TASK_JOURNAL="$TMP/mesh/tasks.journal" "$ROOT/scripts/mesh-fyi-ledger" --witness > "$TMP/witness.out"
 grep -q 'path-watch.*route absent.*count=3.*task:route-repair disposition=DONE' "$TMP/witness.out"
+grep -q 'path-watch.*route absent.*latest=2026-09-12T01:02:00Z' "$TMP/witness.out"
 grep -q 'linked-task task:route-repair fyi_events=2 disposition=DONE' "$TMP/witness.out"
 grep -q 'source_sha256=' "$TMP/fyi/manifest"
 grep -q 'source_cutoff=' "$TMP/fyi/manifest"

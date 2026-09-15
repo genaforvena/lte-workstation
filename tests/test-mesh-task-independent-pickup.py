@@ -48,8 +48,7 @@ def main():
         plan.write_text("alpha\tinspect\tblocked prerequisite\n"
                         "beta\tverify\tindependent follow-up\n", encoding="utf-8")
         run("alpha", "create", "independent-smoke", str(plan))
-        artifact = root / "proof.md"
-        artifact.write_text("independent proof\n", encoding="utf-8")
+        artifact = TASK
 
         # An ordinary successor remains serial and cannot be dispatched or taken.
         assert run("beta", "check", "dispatch", "independent-smoke/verify", "beta", expect=2)

@@ -84,8 +84,8 @@ def main() -> None:
             for line in board.read_text(encoding="utf-8").splitlines()
         ), "missing-artifact attempt emitted a completion receipt"
 
-        artifact = root / "acceptance.md"
-        artifact.write_text("isolated synthetic acceptance evidence\n", encoding="utf-8")
+        # Keep the completion receipt durable after this isolated fixture is removed.
+        artifact = TASK
         run("done", chain, step, str(artifact), "accepted with artifact")
         state = json.loads(state_path.read_text(encoding="utf-8"))
         assert state["status"] == "complete" and state["ask"] == ask[4:]
