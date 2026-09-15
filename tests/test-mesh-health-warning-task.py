@@ -388,6 +388,41 @@ def main() -> None:
         state = json.loads((mesh / "warning-tasks.state").read_text())
         assert state["offset"] == 0, state
 
+    # Generic autonomy refusal reports retain their changing elapsed text for
+    # the task description, but the task/owner/reason fingerprint must remain
+    # stable so one live condition cannot create one triage chain per cadence.
+    with tempfile.TemporaryDirectory() as raw:
+        td = Path(raw)
+        mesh = td / "mesh"
+        bindir = td / "bin"
+        mesh.mkdir()
+        bindir.mkdir()
+        task_cmd = bindir / "mesh-task"
+        task_cmd.write_text(
+            "#!/bin/sh\n"
+            "if [ \"$1\" = replay ] && [ \"$2\" = --json ]; then printf '{}'; exit 0; fi\n"
+            "printf '%s\\n' \"$@\" >> \"$TASK_CALLS\"\n"
+            "if [ \"$1\" = create ]; then shift 2; cat \"$1\" >> \"$TASK_PLANS\"; fi\n"
+        )
+        task_cmd.chmod(0o755)
+        os.environ["TASK_CALLS"] = str(td / "calls")
+        os.environ["TASK_PLANS"] = str(td / "plans")
+        os.environ["REPLAY_FILE"] = str(td / "unused-replay")
+        body = ("[health-fail] witness-task-autonomy: source=PASS; errors="
+                "check-unblock/health/frontier/analyze-observation-for-health-rc-2:"
+                "reconcile-missing-prerequisite")
+        chat = mesh / "chat.log"
+        chat.write_text(
+            "2026-09-15T12:00:00Z witness@mesh-home :: " + body + " for=2709s\n"
+            "2026-09-15T12:01:00Z witness@mesh-home :: " + body + " for=3002s\n"
+        )
+        result = run_watcher(mesh, task_cmd)
+        assert result.returncode == 0, result.stderr
+        assert (td / "calls").read_text().splitlines().count("create") == 1
+        plan = (td / "plans").read_text()
+        assert "for=2709s" in plan, plan
+        assert "reconcile-missing-prerequisite" in plan, plan
+
 
 if __name__ == "__main__":
     main()
