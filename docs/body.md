@@ -20,7 +20,9 @@ on the Redmi 10, 2026-06-12 after the F-Droid reinstall: termux-api 0.59.1, 83 c
      orientation+light heuristics. The mesh's only body-activity sense — `mesh-location` knows *where*,
      `mesh-presence` knows *who's near*, neither knows if the body is moving or held. A parked body
      reading `CARRIED`/`HANDLED` = tamper/interaction. `--edge` emits only on a state change
-     (stream-feedable); `--raw` is the fused-sensor artifact; `--test` exit 2 = phone n/a.
+     (stream-feedable); `--raw` is the fused-sensor artifact. The report-only `accel_delta` is the
+     Euclidean change between the last two valid `bma420` vectors from one sensor read; it does not
+     affect classification. `--test` exit 2 = phone n/a.
     (Full sensor matrix: `knowledge/phone-sensor-inventory-2026-06-13.md`.)
   - **Wired sense organ** `mesh-light` — reads `tmd2755_l` once and classifies the room into 5 levels
     (`DARK` 0-2 lux / `DIM` / `MODERATE` / `LIT` / `BRIGHT`, with per-transition hysteresis to stop flapping)

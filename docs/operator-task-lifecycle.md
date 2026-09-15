@@ -45,6 +45,17 @@ as dispatch. Age is a fairness backstop, not a fixed assignment. If the queue is
 without weakening that dependency. Treat age as a fairness signal when choosing, not as a reason to
 ignore what a task unblocks.
 
+An open runnable step with no owner is a shared pool item, not an operator assignment request.
+Every idle mind can see it in its owner-scoped queue and choose it; the first successful `take`
+atomically records that mind as owner, after which the task is reserved. A queue result is therefore
+a set of claimable choices. `queued` means runnable work is awaiting a mind, while a successor
+behind `waiting_for` or a blocked chain head is not runnable and needs its prerequisite resolved.
+
+Internal design and planning choices belong to the mesh. Choose among alternatives from accepted
+task scope, repository evidence, protocol, and runtime constraints; record the rationale and
+alternatives in an artifact. Use `operator-input` only for a genuinely external authority or
+missing input, not to defer a machine-owned decision.
+
 An expired active lease is not an available queue slot: the one-active-task-per-owner guard will
 also suppress that owner's corrective task. The exact owner must settle the current claim first by
 recording artifact-backed progress with a real update deadline, or by blocking/rejecting it with a

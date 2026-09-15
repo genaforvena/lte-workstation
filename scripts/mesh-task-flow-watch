@@ -1,0 +1,252 @@
+#!/usr/bin/env python3
+"""Observe stalled task flow and re-notify an exact-owner stale-claim resolver.
+
+The reflex never changes or closes an active owner's task. It only re-schedules
+an already-open corrective task after verifying its exact target is still
+OVERDUE in the canonical task ledger.
+"""
+from __future__ import annotations
+
+import fcntl
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIR))
+from mesh_task_log import replay
+
+ROOT = Path(os.environ.get("MESH_TASK_FLOW_ROOT", str(SCRIPT_DIR.parent))).resolve()
+MESH = Path(os.environ.get("MESH_DIR", str(Path.home() / ".mesh"))).expanduser()
+CHAT = Path(os.environ.get("MESH_TASK_FLOW_CHAT_LOG", str(MESH / "chat.log"))).expanduser()
+TAPE = Path(os.environ.get("MESH_TASK_FLOW_TAPE", str(MESH / "task-flow-watch.log"))).expanduser()
+STATE = Path(os.environ.get("MESH_TASK_FLOW_STATE", str(MESH / "task-flow-watch.state.json"))).expanduser()
+LOCK = Path(os.environ.get("MESH_TASK_FLOW_LOCK", str(MESH / ".task-flow-watch.lock"))).expanduser()
+COMMIT_STALE = int(os.environ.get("MESH_TASK_FLOW_COMMIT_AGE", str(7 * 3600)))
+RENOTIFY_AGE = int(os.environ.get("MESH_TASK_FLOW_RENOTIFY_AGE", str(30 * 60)))
+ALERT_AGE = int(os.environ.get("MESH_TASK_FLOW_ALERT_AGE", str(3600)))
+
+
+def command(argv: list[str], timeout: int = 30) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(argv, text=True, capture_output=True, timeout=timeout, check=False)
+
+
+def parse_audit(raw: str) -> dict:
+    counts = {key: 0 for key in ("overdue", "running", "open_unowned", "queued", "blocked")}
+    overdue: dict[str, str] = {}
+    for number, line in enumerate(raw.splitlines(), 1):
+        if not line:
+            continue
+        fields = line.split("\t")
+        if len(fields) < 3:
+            raise ValueError(f"audit row {number} has fewer than three fields")
+        state, owner, task = fields[:3]
+        if state == "OVERDUE":
+            counts["overdue"] += 1
+            overdue[task] = owner
+        elif state == "RUNNING":
+            counts["running"] += 1
+        elif state == "OPEN_UNOWNED":
+            counts["open_unowned"] += 1
+        elif state == "QUEUED":
+            counts["queued"] += 1
+        elif state == "BLOCKED":
+            counts["blocked"] += 1
+    return {"counts": counts, "overdue": overdue}
+
+
+def recovery_candidate(chat_path: Path, overdue: dict[str, str], now: int) -> tuple[str | None, str]:
+    """Find one canonical open recovery task whose named target is still overdue."""
+    records = replay(chat_path)
+    candidates = []
+    marker = re.compile(r"Settle the overdue owner receipt for\s+(\S+)", re.IGNORECASE)
+    for record in records.values():
+        data = record["data"]
+        index = data.get("current")
+        steps = data.get("steps", [])
+        if (data.get("status") != "open" or not isinstance(index, int)
+                or not 0 <= index < len(steps) or data.get("dispatch") != "sent"):
+            continue
+        step = steps[index]
+        if step.get("status") != "open":
+            continue
+        match = marker.search(str(step.get("description", "")))
+        if not match:
+            continue
+        target = match.group(1).rstrip(".,;)")
+        owner = str(step.get("owner") or "")
+        if not owner or overdue.get(target) != owner:
+            continue
+        try:
+            last_dispatch = time.mktime(time.strptime(
+                step.get("dispatched_at", "1970-01-01T00:00:00Z"), "%Y-%m-%dT%H:%M:%SZ"))
+        except (TypeError, ValueError):
+            last_dispatch = 0
+        if now - int(last_dispatch) >= RENOTIFY_AGE:
+            candidates.append((int(last_dispatch), step["id"]))
+    if not candidates:
+        return None, "none"
+    candidates.sort()
+    return candidates[0][1], "due"
+
+
+def current_time() -> int:
+    override = os.environ.get("MESH_TASK_FLOW_NOW")
+    return int(override) if override else int(time.time())
+
+
+def load_state() -> dict:
+    try:
+        value = json.loads(STATE.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(value: dict) -> None:
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    temporary = STATE.with_name(STATE.name + f".tmp.{os.getpid()}")
+    temporary.write_text(json.dumps(value, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(temporary, STATE)
+
+
+def post_alert(message: str, signature: str, state: dict, now: int) -> str:
+    if (state.get("alert_signature") == signature
+            and now - int(state.get("alert_at", 0)) < ALERT_AGE):
+        return "held"
+    result = command(["mesh-chat", f"[health-fail] task-flow-watch: {message}"], timeout=15)
+    if result.returncode:
+        return f"failed-rc-{result.returncode}"
+    state["alert_signature"] = signature
+    state["alert_at"] = now
+    return "posted"
+
+
+def run_once() -> int:
+    now = current_time()
+    errors: list[str] = []
+    audit_result = command(["mesh-task", "audit"])
+    queue_result = command(["mesh-task", "queue", "--dispatch"])
+    if audit_result.returncode:
+        errors.append(f"audit-rc-{audit_result.returncode}")
+    if queue_result.returncode:
+        errors.append(f"queue-rc-{queue_result.returncode}")
+    audit = {"counts": {key: 0 for key in ("overdue", "running", "open_unowned", "queued", "blocked")},
+             "overdue": {}}
+    if not errors:
+        try:
+            audit = parse_audit(audit_result.stdout)
+        except ValueError as exc:
+            errors.append(f"audit-parse:{exc}")
+
+    try:
+        commit_result = command(["git", "-C", str(ROOT), "log", "-1", "--format=%ct"])
+        status_result = command(["git", "-C", str(ROOT), "status", "--porcelain=v1"])
+        if commit_result.returncode or status_result.returncode:
+            errors.append("git-read-failed")
+            commit_age = -1
+            dirty = -1
+        else:
+            commit_epoch = int(commit_result.stdout.strip())
+            commit_age = max(0, now - commit_epoch)
+            dirty = sum(bool(row.strip()) for row in status_result.stdout.splitlines())
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        errors.append("git-read-failed")
+        commit_age = -1
+        dirty = -1
+
+    try:
+        source_age = max(0, now - int(CHAT.stat().st_mtime))
+        recovery_id, recovery_state = recovery_candidate(CHAT, audit["overdue"], now)
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        errors.append(f"task-source-unreadable:{type(exc).__name__}")
+        source_age = -1
+        recovery_id, recovery_state = None, "unknown"
+
+    dispatchable = len([line for line in queue_result.stdout.splitlines() if line.strip()])
+    stalled = (not errors and dispatchable == 0 and audit["counts"]["overdue"] > 0
+               and commit_age >= COMMIT_STALE and dirty > 0)
+    repair = "none"
+    if stalled and recovery_id:
+        result = command(["mesh-task", "reschedule-task", recovery_id], timeout=30)
+        repair = "renotified" if result.returncode == 0 else f"failed-rc-{result.returncode}"
+        if result.returncode:
+            errors.append(f"recovery-reschedule-rc-{result.returncode}")
+    elif stalled:
+        repair = recovery_state
+
+    state = load_state()
+    alert = "none"
+    if stalled and repair != "renotified":
+        task_ids = ",".join(sorted(audit["overdue"]))
+        signature = f"stalled:{task_ids}:commit-age"
+        message = (f"dispatchable=0 overdue={audit['counts']['overdue']} tasks={task_ids} "
+                   f"commit_age_s={commit_age} dirty={dirty}; exact-owner recovery task unavailable "
+                   f"(repair={repair})")
+        alert = post_alert(message, signature, state, now)
+    elif stalled and repair == "renotified":
+        # The action outcome is the signal: a fresh exact-owner task was posted.
+        state.pop("alert_signature", None)
+        state.pop("alert_at", None)
+
+    health = "FAIL" if errors or (stalled and repair != "renotified") else (
+        "DEGRADED" if stalled else "PASS")
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
+    counts = audit["counts"]
+    row = (f"{stamp} RUN health={health} dispatchable={dispatchable} "
+           f"overdue={counts['overdue']} running={counts['running']} "
+           f"open_unowned={counts['open_unowned']} queued={counts['queued']} "
+           f"blocked={counts['blocked']} overdue_tasks={','.join(sorted(audit['overdue'])) or '-'} "
+           f"commit_age_s={commit_age} dirty={dirty} "
+           f"source_age_s={source_age} repair={repair} alert={alert} "
+           f"repair_task={recovery_id or '-'} "
+           f"errors={';'.join(errors) if errors else 'none'}")
+    TAPE.parent.mkdir(parents=True, exist_ok=True)
+    with TAPE.open("a", encoding="utf-8") as output:
+        output.write(row + "\n")
+        output.flush()
+        os.fsync(output.fileno())
+    save_state(state)
+    print(row)
+    return 1 if health == "FAIL" else 0
+
+
+def self_test() -> int:
+    sample = "\n".join((
+        "OVERDUE\tgenome\ttest-chain/blocked-work\tlease=2026-01-01T00:00:00Z",
+        "OPEN_UNOWNED\tgenome\ttest-chain/recovery\tdispatch=sent",
+        "QUEUED\thaunt\tother-chain/step\tcurrent=other-chain/step",
+    ))
+    parsed = parse_audit(sample)
+    assert parsed["counts"]["overdue"] == 1
+    assert parsed["counts"]["open_unowned"] == 1
+    assert parsed["counts"]["queued"] == 1
+    assert parsed["overdue"] == {"test-chain/blocked-work": "genome"}
+    print("mesh-task-flow-watch --test: PASS (audit classification; dry-run performs no tape or board writes)")
+    return 0
+
+
+def main() -> int:
+    if sys.argv[1:] == ["--test"]:
+        return self_test()
+    if sys.argv[1:] not in ([], ["--once"]):
+        print("usage: mesh-task-flow-watch [--once|--test]", file=sys.stderr)
+        return 2
+    LOCK.parent.mkdir(parents=True, exist_ok=True)
+    with LOCK.open("a+") as lock_file:
+        try:
+            fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("mesh-task-flow-watch: skipped — prior pass still running")
+            return 0
+        return run_once()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
