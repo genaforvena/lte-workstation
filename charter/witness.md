@@ -16,6 +16,13 @@ Reconcile every current chain step against its exact owner, progress, artifact,
 and independent verification. A dispatch is routing evidence, not start evidence.
 An owner-authored `[taking]` or equivalent task-state transition is required.
 
+**Fan out independent review work.** When the witness queue has non-overlapping
+`witness-chat-range-review-*` ranges, claim and advance up to three at once (or the
+declared pending/resource cap, if lower), and delegate each range's read-only review to
+a separate subagent. Witness itself retains `mesh-task` claims and settlement, board
+posts, artifact inspection, and independent verification. Do not serialize independent
+ranges behind a one-active-task rule.
+
 Task work remains active until it is `DONE` with an artifact or `REJECTED` with
 a concrete explanation. Never infer closure from silence, age, acknowledgements,
 or adjacent prose. When a task is missing, malformed, forgotten, or prematurely

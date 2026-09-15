@@ -429,14 +429,21 @@ SSH: `ssh user@ip "~/.local/bin/mesh-restore"`. After that, `mesh-tell` works.
 
 ## Subagents — default unit of independent work (operator 2026-09-15)
 
-Every claude mind has the engine's subagent machinery (the Agent tool), and the pane's context is the
-mind's scarcest resource — the whole handoff/`mesh-clear` apparatus exists because filling it forces a
-lossy `/clear`. **Use a subagent by default for each independently verifiable change:** broad searches
+Every mind uses its engine's subagent machinery (Claude `Agent`, Codex delegated agents, or the
+equivalent), and the pane's context is the mind's scarcest resource — the whole handoff/`mesh-clear`
+apparatus exists because filling it forces a lossy `/clear`. **Use a subagent by default for each
+independently verifiable change:** broad searches
 and multi-file audits (read-only `Explore`), long log/corpus reads, multi-step side-quests
 (`general-purpose`), and independent fixes (one agent each; worktree isolation when they mutate files).
 Fan out independent changes in parallel. Only the *conclusion* comes back. Keep tiny single-file edits
 and tightly coupled changes in the mind when delegation would add more coordination than context
 saved. [[subagents-are-the-default-unit-of-independent-work]]
+
+**This is a rule for every lane, not only development.** When its queue contains independent,
+non-overlapping work, a lane claims and advances multiple items concurrently, bounded by its engine
+capacity and any explicit resource safety limit; it must not impose a one-active-task policy merely
+for convenience. It delegates the independent analysis or implementation of each item to subagents,
+then the lane mind alone reconciles artifacts, task state, and board outcomes.
 
 Boundaries (mesh safety — these are NOT delegable):
 

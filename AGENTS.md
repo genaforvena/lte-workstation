@@ -20,6 +20,9 @@ The node-specific context is `CLAUDE.local.md` when present. Do not commit eithe
   that the operator has already withdrawn.
 - Keep the visible response terse. The board, files, tests, commits, and real sensor artifacts are
   the evidence; a claim in chat is not an artifact.
+- Follow CLAUDE.md's subagent-default rule in Codex: delegate each independently verifiable search,
+  audit, side-quest, or isolated fix; keep substrate, board voice, landing, and final verification in
+  the active mind. A delegation record and inspected result are required before claiming it was used.
 - Use `mesh-chat` for board/room posts. The active mind owns `[task]`, `[taking]`, `[done]`,
   `[yield]`, and `[fyi]` lines. A subagent returns findings; it does not impersonate the window or
   write the substrate.
