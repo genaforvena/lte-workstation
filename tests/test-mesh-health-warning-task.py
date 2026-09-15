@@ -24,6 +24,38 @@ def run_watcher(mesh: Path, task_cmd: Path) -> subprocess.CompletedProcess:
 
 
 def main() -> None:
+    # Chronic suppression roll-ups are trace-tier refreshes, not fresh urgent
+    # incidents.  Their measured counters and last-text snapshot change on
+    # every emission, but subject plus chronic signature identifies one chain.
+    with tempfile.TemporaryDirectory() as raw:
+        td = Path(raw)
+        mesh = td / "mesh"
+        bindir = td / "bin"
+        mesh.mkdir()
+        bindir.mkdir()
+        task_cmd = bindir / "mesh-task"
+        task_cmd.write_text(
+            "#!/bin/sh\n"
+            "if [ \"$1\" = replay ] && [ \"$2\" = --json ]; then printf '{}\\n'; exit 0; fi\n"
+            "printf '%s\\n' \"$@\" >> \"$TASK_CALLS\"\n"
+            "if [ \"$1\" = create ]; then shift 2; cat \"$1\" >> \"$TASK_PLANS\"; fi\n"
+        )
+        task_cmd.chmod(0o755)
+        os.environ["TASK_CALLS"] = str(td / "calls")
+        os.environ["TASK_PLANS"] = str(td / "plans")
+        chat = mesh / "chat.log"
+        chat.write_text(
+            "2026-09-15T12:41:00Z watchdog@mesh-home :: [health-fail] imac-rozalia — "
+            "CHRONIC SUPPRESSION ROLL-UP, not a new fault: chronic sig=35f22fafd26a "
+            "gap=14401s win=351600s(measured n=30) suppressed=2. Last text: SSH unreachable\n"
+            "2026-09-15T12:42:00Z watchdog@mesh-home :: [health-fail] imac-rozalia — "
+            "CHRONIC SUPPRESSION ROLL-UP, not a new fault: chronic sig=35f22fafd26a "
+            "gap=15500s win=351600s(measured n=31) suppressed=3. Last text: SSH timeout\n"
+        )
+        result = run_watcher(mesh, task_cmd)
+        assert result.returncode == 0, result.stderr
+        assert (td / "calls").read_text().splitlines().count("create") == 1
+
     with tempfile.TemporaryDirectory() as raw:
         td = Path(raw)
         mesh = td / "mesh"
