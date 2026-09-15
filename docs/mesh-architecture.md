@@ -329,13 +329,11 @@ instead of drowning in intended-unwired tools.
 
 A mind's pane context window is its scarcest resource. Three levers, in order of use:
 
-1. **Subagents spend context outside the pane.** Delegate heavy-context work (broad
-   searches, multi-file audits, long log reads, independent parallel fixes) to the Agent
-   tool — only the *conclusion* comes back. Boundaries: substrate stays in the mind's own
-   hands (a subagent is a second writer nobody can see); the board is the mind's voice
-   (subagents return findings, the mind posts); a subagent's report is a **claim, not an
-   artifact** (verify before acting — "my subagent says the tests pass" is the same
-   sentence as "the camera works").
+1. **Subagents are the default unit of independent work.** Delegate each independently
+   verifiable change to one Agent, fan out independent changes in parallel, and use worktree
+   isolation for mutation; only tiny edits or tightly coupled changes stay in the pane. The
+   mind retains substrate, board voice, landing, and final verification. A subagent's report is
+   a **claim, not an artifact** (verify the result itself before acting).
 
 2. **The handoff survives a context reset.** Engine compaction is not a durable mesh handoff;
    before leaving a session or intentionally resetting context, write
