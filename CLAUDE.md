@@ -427,15 +427,16 @@ operator is needed for routine ops.
 so `mesh-tell --node <peer> <window>` will fail. First-time deploy to a rebooted peer must go over raw
 SSH: `ssh user@ip "~/.local/bin/mesh-restore"`. After that, `mesh-tell` works.
 
-## Subagents — spend context outside the pane (operator 2026-07-21)
+## Subagents — default unit of independent work (operator 2026-09-15)
 
 Every claude mind has the engine's subagent machinery (the Agent tool), and the pane's context is the
 mind's scarcest resource — the whole handoff/`mesh-clear` apparatus exists because filling it forces a
-lossy `/clear`. **Delegate heavy-context work to subagents so those tokens never enter the pane:** broad
-searches and multi-file audits (read-only `Explore`), long log/corpus reads, multi-step side-quests
-(`general-purpose`), independent parallel fixes (one agent each; worktree isolation when they mutate
-files — still landed via `mesh-land`, never pushed by the agent). Only the *conclusion* comes back. A
-mind that greps twenty files in its own pane is spending its thread to do a subagent's job.
+lossy `/clear`. **Use a subagent by default for each independently verifiable change:** broad searches
+and multi-file audits (read-only `Explore`), long log/corpus reads, multi-step side-quests
+(`general-purpose`), and independent fixes (one agent each; worktree isolation when they mutate files).
+Fan out independent changes in parallel. Only the *conclusion* comes back. Keep tiny single-file edits
+and tightly coupled changes in the mind when delegation would add more coordination than context
+saved. [[subagents-are-the-default-unit-of-independent-work]]
 
 Boundaries (mesh safety — these are NOT delegable):
 
