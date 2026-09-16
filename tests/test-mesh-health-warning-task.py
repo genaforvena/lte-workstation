@@ -4,6 +4,7 @@
 import hashlib
 import json
 import os
+import runpy
 import subprocess
 import tempfile
 from pathlib import Path
@@ -24,6 +25,14 @@ def run_watcher(mesh: Path, task_cmd: Path) -> subprocess.CompletedProcess:
 
 
 def main() -> None:
+    watcher = runpy.run_path(str(SCRIPT))
+    warning_key = watcher["warning_key"]
+    assert warning_key("doctor@mesh-home", "[doctor] 2 FAIL, 1 WARN — audit gap")
+    assert warning_key("doctor@mesh-home", "[doctor] RECOVERED — 0 FAIL") is None
+    assert warning_key("clear-audit@mesh-home", "[clear-audit] FLAG orphaned audit")
+    assert warning_key("health@mesh-home", "[verify] health: lease audit FAILED")
+    assert warning_key("health@mesh-home", "[verify] health: lease audit clean") is None
+
     # Chronic suppression roll-ups are trace-tier refreshes, not fresh urgent
     # incidents.  Their measured counters and last-text snapshot change on
     # every emission, but subject plus chronic signature identifies one chain.
