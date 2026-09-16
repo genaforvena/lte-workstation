@@ -333,6 +333,88 @@ def artifact_digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def has_task_tag(step: dict, wanted: str) -> bool:
+    """Match one exact comma-separated task metadata tag."""
+    return wanted in {tag.strip() for tag in str(step.get("tags") or "").split(",") if tag.strip()}
+
+
+def audit_finding_manifest(artifact_path: Path) -> Path:
+    return Path(str(artifact_path) + ".findings.json")
+
+
+def validate_audit_findings(step: dict, artifact_path: Path) -> tuple[Path, int, int]:
+    """Require each tagged audit finding to be reasoned away or routed to an exact task."""
+    manifest_path = audit_finding_manifest(artifact_path)
+    if not manifest_path.is_file():
+        die(f"audit finding manifest does not exist: {manifest_path}")
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        die(f"audit finding manifest is unreadable: {manifest_path}: {exc}")
+    findings = payload.get("findings") if isinstance(payload, dict) and payload.get("version") == 1 else None
+    if not isinstance(findings, list) or not findings:
+        die("audit finding manifest requires version=1 and at least one finding disposition")
+
+    records = task_records()
+    seen: set[str] = set()
+    actionable = 0
+    for number, finding in enumerate(findings, 1):
+        if not isinstance(finding, dict):
+            die(f"audit finding {number} must be an object")
+        finding_id = finding.get("id")
+        if not isinstance(finding_id, str) or not finding_id.strip() or finding_id in seen:
+            die(f"audit finding {number} requires a unique nonempty id")
+        seen.add(finding_id)
+        if finding.get("actionable") is False:
+            reason = finding.get("reason")
+            if not isinstance(reason, str) or not reason.strip():
+                die(f"audit finding {finding_id} marked non-actionable requires a reason")
+            continue
+        if finding.get("actionable") is not True:
+            die(f"audit finding {finding_id} requires boolean actionable")
+        actionable += 1
+        target = finding.get("task")
+        expected_owner = finding.get("owner")
+        if not isinstance(target, str) or "/" not in target or not target.strip():
+            die(f"audit finding {finding_id} requires an exact chain/step task id")
+        if target == step.get("id"):
+            die(f"audit finding {finding_id} cannot route to its own audit task")
+        if not isinstance(expected_owner, str) or not expected_owner.strip():
+            die(f"audit finding {finding_id} requires an exact owner")
+        matches = []
+        for record in records.values():
+            data = record.get("data", {})
+            for target_step in data.get("steps", []):
+                if target_step.get("id") == target:
+                    matches.append((data, target_step))
+        if not matches:
+            die(f"audit finding {finding_id} task {target} does not exist")
+        if len(matches) != 1:
+            die(f"audit finding {finding_id} task {target} is ambiguous")
+        target_data, target_step = matches[0]
+        actual_owner = target_step.get("owner")
+        if actual_owner != expected_owner:
+            die(f"audit finding {finding_id} owner mismatch for {target}: expected {expected_owner}, got {actual_owner or '-'}")
+        status = target_step.get("status")
+        if status == "open":
+            current = target_data.get("current")
+            if (not isinstance(current, int) or not 0 <= current < len(target_data.get("steps", []))
+                    or target_data["steps"][current].get("id") != target
+                    or target_data.get("dispatch") != "sent"):
+                die(f"audit finding {finding_id} task {target} is open but not durably dispatched")
+        elif status in ("active", "claimed", "blocked"):
+            pass
+        elif status == "done":
+            if not target_step.get("artifact") or not target_step.get("artifact_sha256"):
+                die(f"audit finding {finding_id} completed task {target} lacks artifact evidence")
+        elif status == "rejected":
+            if not target_step.get("rejected_reason"):
+                die(f"audit finding {finding_id} rejected task {target} lacks a reason")
+        else:
+            die(f"audit finding {finding_id} task {target} has unusable status {status or '-'}")
+    return manifest_path, len(findings), actionable
+
+
 def chat_command() -> str:
     """Find the co-installed board writer without relying on a reflex PATH.
 
@@ -484,11 +566,22 @@ def post_task(data: dict, index: int) -> bool:
     owner_tag = f", owner:{step['owner']}" if step.get("owner") else ""
     independent_note = (f" independent-step: {step['independent_reason']}"
                         if independent_marked(step) else "")
+    if has_task_tag(step, "audit-followthrough"):
+        settlement = (
+            f" Run: mesh-task take {data['chain']} {step['slug']}; write <artifact>.findings.json, then "
+            f"`mesh-task done {data['chain']} {step['slug']} <artifact> [result]`. "
+            "Every finding must map to an exact task+owner or carry a non-actionable reason; "
+            "this tagged task cannot reject to bypass the finding manifest."
+        )
+    else:
+        settlement = (
+            f" Run: mesh-task take {data['chain']} {step['slug']};"
+            f" close in the structured ledger with either `mesh-task done {data['chain']} {step['slug']} <artifact> [result]`"
+            f" or `mesh-task reject {data['chain']} {step['slug']} <reason>`."
+        )
     return emit("task", f"{step['id']}{assignment} — {step['description']}{independent_note}"
                 f"{metadata_suffix(data, step)}"
-                f" Run: mesh-task take {data['chain']} {step['slug']};"
-                f" close in the structured ledger with either `mesh-task done {data['chain']} {step['slug']} <artifact> [result]`"
-                f" or `mesh-task reject {data['chain']} {step['slug']} <reason>`."
+                f"{settlement}"
                 " A board [done] line alone does not close the task ledger."
                 f" task:{step['id']}, ask:{data.get('ask') or '-'}{owner_tag}, status:open")
 
@@ -765,6 +858,12 @@ def done(chain: str, ref: str, artifact: str, result: str) -> None:
         die(f"artifact does not exist: {artifact} (a claim is not complete without evidence)")
     reject_ephemeral_artifact_path(artifact_path)
     validate_artifact_scope(data, step, artifact_path)
+    if has_task_tag(step, "audit-followthrough"):
+        manifest_path, finding_count, actionable_count = validate_audit_findings(step, artifact_path)
+        step.update(finding_manifest=str(manifest_path),
+                    finding_manifest_sha256=artifact_digest(manifest_path),
+                    finding_count=finding_count,
+                    actionable_finding_count=actionable_count)
     step.update(status="done", finished=now(), artifact=str(artifact_path),
                 artifact_sha256=artifact_digest(artifact_path), result=result or "verified")
     if independent:
@@ -1493,6 +1592,8 @@ def reject(chain: str, ref: str, reason: str) -> None:
     path, data = load(chain)
     index, step = step_for(data, ref)
     require_owner(step)
+    if has_task_tag(step, "audit-followthrough"):
+        die(f"audit-followthrough task {step['id']} cannot be rejected; complete it with a finding manifest or block it with an exact retry edge")
     if ((index != data["current"] and not independent_marked(step))
             or step["status"] not in ("active", "blocked")):
         die(f"step {step['id']} is not active or blocked; take it before rejecting")
