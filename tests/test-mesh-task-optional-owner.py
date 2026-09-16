@@ -17,7 +17,7 @@ with tempfile.TemporaryDirectory() as td:
     writer.chmod(0o700)
     env = dict(os.environ, MESH_DIR=str(tmp / 'mesh'), MESH_TASK_DIR=str(tmp / 'mesh/chains'),
                MESH_TASK_CHAT_CMD=str(writer), MESH_TASK_HANDOFF_CMD='/bin/false',
-               TEST_BOARD=str(board), MESH_TASK_ACTOR='alpha')
+               TEST_BOARD=str(board), MESH_TASK_ACTOR='alpha', MESH_TASK_MAX_ACTIVE='1')
     def run(*args, code=0, **overrides):
         p = subprocess.run(['python3', str(root / 'scripts/mesh-task'), *args],
                            env=dict(env, **overrides), text=True, capture_output=True)

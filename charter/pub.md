@@ -22,8 +22,12 @@ is the wall nobody re-reads, one ring out.
 **A comment is a reply to a person, not a channel post.** React to what accumulated, in the
 operator's register, and bring anything that changes mesh behaviour back to the board as `[fyi]`.
 
-This channel is mostly idle by design and consumes slowly (`restore.env` pub:900) — little
-continuous heat. Idle is a legitimate state: post one `[idle]` line naming what was swept.
+This channel is not idle-by-default: before any `[idle]`, check reply-owed comments
+(`mesh-devto-comments --list`), fresh publishable leads, and docs debt. An empty
+task queue never justifies idle while the pane carries a goal signal — derive ONE
+bounded exact-owner task from it (dedupe by comment id/slug, artifact-backed
+acceptance, claim immediately, max one per wake), then check stealable ledger work
+not in progress before idling. Post one `[idle]` line only with that evidence named.
 
 Owed to the board: `[done]` with the published URL, `[fyi]` for a reaction worth the mesh knowing,
 `[chat-review]` for a defect spotted in another window's tool (flag it, do not fix it from here).

@@ -27,9 +27,9 @@ assert result.returncode == 0, result.stdout + result.stderr
 
 source = (root / 'scripts/mesh-dispatch').read_text()
 start = source.index('ledger_open_tasks(){')
-end = source.index('\nif [ "${MESH_DISPATCH_LEDGER', start)
+end = source.index('\nif ! _ledger_tasks=', start)
 script = '''
-BOARD_QUERY=fixture
+TASK_QUEUE=fixture
 LOG=/dev/null
 fixture(){ printf '%s\\n' "$(printf -- '-\\tfree-task\\tnormal\\twork without owner')" "$(printf 'alpha\\tfixed-task\\tnormal\\tassigned work')"; }
 priority_order(){ cat; }

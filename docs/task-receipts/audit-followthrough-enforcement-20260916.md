@@ -57,6 +57,8 @@ reuse-or-create decisions, retry edges, and an independently checkable receipt.
 
 The live cron contains `mesh-lease-audit` at line 187, `mesh-edge-gate-audit` at line 241,
 `mesh-health-warning-task` every minute at line 321, and `mesh-chat-range-review` every fifteen
-minutes at line 347. Operator intake is installed as an enabled systemd path/service; its live
-path state and deployed/source parity are checked after landing in the final handoff.
-
+minutes at line 347. Operator intake was installed and enabled but had failed with
+`Too many open files`: the node had exhausted `fs.inotify.max_user_instances=128` across its
+long-lived agent processes. Unrelated processes were left untouched. The node now has the durable
+`/etc/sysctl.d/90-mesh-inotify.conf` setting `fs.inotify.max_user_instances=512`; `sysctl --system`
+applied it and `mesh-operator-intake.path` restarted as `active (waiting)`, `Result=success`.

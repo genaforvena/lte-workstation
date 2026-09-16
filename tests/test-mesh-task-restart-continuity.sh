@@ -25,7 +25,7 @@ exec python3 "$TEST_REPO/scripts/mesh-task" "$@"
 EOF
 chmod +x "$td/bin/mesh-chat" "$td/bin/mesh-handoff" "$td/bin/mesh-task"
 
-base=(MESH_DIR="$td/mesh" MESH_TASK_DIR="$td/mesh/chains" MESH_TASK_CHAT_CMD="$td/bin/mesh-chat" MESH_TASK_HANDOFF_CMD="$td/bin/mesh-handoff" TEST_BOARD="$td/board" TEST_REPO="$repo" PATH="$td/bin:$PATH")
+base=(MESH_DIR="$td/mesh" MESH_TASK_DIR="$td/mesh/chains" MESH_TASK_CHAT_CMD="$td/bin/mesh-chat" MESH_TASK_HANDOFF_CMD="$td/bin/mesh-handoff" MESH_TASK_MAX_ACTIVE=1 TEST_BOARD="$td/board" TEST_REPO="$repo" PATH="$td/bin:$PATH")
 env "${base[@]}" MESH_TASK_ACTOR=alpha mesh-task create demo "$td/plan.tsv" >/dev/null
 env "${base[@]}" MESH_TASK_ACTOR=alpha mesh-task take demo work >/dev/null
 env "${base[@]}" MESH_TASK_ACTOR=alpha mesh-task create second "$td/second.tsv" >/dev/null

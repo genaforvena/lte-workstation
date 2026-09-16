@@ -38,11 +38,22 @@ printf '%s' "$message" | grep -Fq \
   exit 1
 }
 
+# An empty exact-owner queue never justifies idle (operator 2026-09-15), so EVERY
+# wake now carries the goal-derived fallback — but fenced: one task per wake,
+# duplicate-checked, and another owner's row is still never taken directly.
 ordinary_empty="$(PATH="$td:/usr/bin:/bin" HOME="$td/home" "$tool" --wake-message blocked)"
-if printf '%s' "$ordinary_empty" | grep -Fq 'create one canonical exact-owner task'; then
-  echo "FAIL: a routine telemetry wake must not bypass the recurring self-pick spend gate" >&2
+printf '%s' "$ordinary_empty" | grep -Fq 'create one canonical exact-owner task' || {
+  echo "FAIL: routine wake lost the goal-derived task fallback — an empty owner queue alone now justifies idle" >&2
   exit 1
-fi
+}
+printf '%s' "$ordinary_empty" | grep -Fq 'max one created task per wake' || {
+  echo "FAIL: goal-derived task creation on a routine wake has no one-per-wake fence (spam risk)" >&2
+  exit 1
+}
+printf '%s' "$ordinary_empty" | grep -Fq 'Do not take another mind' || {
+  echo "FAIL: routine wake must still prohibit taking another mind's owned row" >&2
+  exit 1
+}
 fallback="$(PATH="$td:/usr/bin:/bin" HOME="$td/home" "$tool" --wake-message blocked --self-pick)"
 printf '%s' "$fallback" | grep -Fq 'Do not reject a blocked task' || {
   echo "FAIL: no-candidate wake did not forbid rejection as an idle shortcut: $fallback" >&2

@@ -119,10 +119,14 @@ def run() -> None:
             raise AssertionError("healthy ownerless queue fixture failed")
         tape = watch.TAPE.read_text(encoding="utf-8")
         for field in ("health=PASS", "source=PASS", "unfinished=5", "blocked=1",
-                      "idle_minds=2", "dispatchable=3", "ownerless=1", "ownerless_visible=2",
+                      "idle_minds=2", "dispatchable=2", "unroutable=1", "ownerless=1", "ownerless_visible=2",
                       "dispatch_repairs=1"):
             if field not in tape:
                 raise AssertionError(f"tape missing {field}: {tape}")
+        # carol staffs no live window, so its exact-owner row must leave the
+        # dispatchable count without being checked or repaired away.
+        if [watch.TASK, "check", "dispatch", "failed/work", "carol"] in calls:
+            raise AssertionError("unroutable-owner work was eligibility-checked as dispatchable")
         if dispatch_repairs != [[watch.TASK, "reschedule-task", "failed/work"]]:
             raise AssertionError(f"failed exact-owner dispatch was not repaired: {dispatch_repairs}")
         followthrough = watch.FOLLOWTHROUGH.read_text(encoding="utf-8")
