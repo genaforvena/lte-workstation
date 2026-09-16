@@ -2,8 +2,9 @@
 
 Date: 2026-09-16.
 
-`docs/task-receipts/` (and the earlier `task-receipts/`, `artifacts/` corpora) are **node-local
-evidence**, not repository material. They now live under the node's evidence root:
+`docs/task-receipts/`, `docs/audits/` and `docs/chat-range-reviews/` (and the earlier `task-receipts/`,
+`artifacts/` corpora) are **node-local evidence**, not repository material. They now live under the
+node's evidence root:
 
 | was (in repo) | now |
 |---|---|
@@ -11,6 +12,8 @@ evidence**, not repository material. They now live under the node's evidence roo
 | `task-receipts/x.md` | `~/.mesh/evidence/receipts/x.md` |
 | `artifacts/x/y.txt` | `~/.mesh/evidence/artifacts/x/y.txt` |
 | `docs/audits/x.md` | `~/.mesh/evidence/audits/x.md` |
+| `docs/chat-range-reviews/x.md` | `~/.mesh/evidence/chat-range-reviews/x.md` |
+| `docs/chat-range-reviews/x.md.findings.json` | `~/.mesh/evidence/chat-range-reviews/x.md.findings.json` |
 
 Resolve any path, including the legacy spellings above, with:
 
@@ -31,7 +34,9 @@ and a commit stream of `mesh-land: update docs/task-receipts/...` one file at a 
 the repo changes when a receipt is written, so there is nothing to land.
 
 `scripts/mesh-land` additionally filters the evidence trees out of the dirty-surface guard, so a
-receipt written back into the repo by habit cannot mint a genome incident either.
+receipt written back into the repo by habit cannot mint a genome incident either. The writers point at
+the evidence root too, so a corpus is not recreated by the next run: `mesh-chat-range-review` names
+`$(mesh-evidence-dir chat-range-reviews)` in the review prompt it hands to witness.
 
 ## Ledger note
 
