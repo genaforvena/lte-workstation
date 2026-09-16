@@ -1,84 +1,85 @@
 #!/usr/bin/env bash
-# mesh-roz-channel — route Rozalia's Telegram messages to the tg-roz mind window.
-# mesh-voice-rx filters non-owner messages to tg-strangers.log. This reads that log,
-# extracts lines from ROZ_CHAT_ID, and feeds them to the tg-roz tmux window with
-# instruction to reply via mesh-tg-roz. Offset-tracked so each message arrives once.
-#
-#   mesh-roz-channel        poll + feed (run from cron: */1)
-#   mesh-roz-channel --test
+# mesh-roz-channel — serialized, retry-safe Rozalia intake.
+# reflex-cadence: off
+# Event launcher: systemd/mesh-roz-channel.path and boot catch-up service.
 set -uo pipefail
 export PATH="$HOME/.local/bin:$PATH"
 [ -n "${HOME:-}" ] || HOME=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6); export HOME
 [ -f "$HOME/.mesh/nodes" ] && . "$HOME/.mesh/nodes" 2>/dev/null
 
-# The ISO stamp at the head of a tg-strangers.log line. The character class MUST carry '-' or the
-# date truncates at its first hyphen: every [IN] line written into roz-in.log between this tool's
-# birth and 2026-08-22 carried the literal stem "2026" instead of 2026-08-19T13:19:47Z, so the age of
-# the last inbound message was unrecoverable from the conversation log — which is why
-# `mesh-tg-roz --reciprocity` has to render since=na. Its own function so --test can DRIVE it:
-# asserting this by grepping the source would be satisfied by this very comment.
-stranger_ts() { printf '%s' "$1" | grep -oE '^[0-9TZ:-]+' | head -1; }
+STRANGERS="${MESH_ROZ_STRANGERS:-$HOME/.mesh/tg-strangers.log}"
+OFFSET_F="${MESH_ROZ_OFFSET:-$HOME/.mesh/.roz-channel.offset}"
+IN_LOG="${MESH_ROZ_IN_LOG:-$HOME/.mesh/roz-in.log}"
+LOCK_F="${MESH_ROZ_LOCK:-$HOME/.mesh/.roz-channel.lock}"
+WIN="${MESH_ROZ_WINDOW:-tg-roz}"
+ROZ="${ROZ_CHAT_ID:-}"
 
-STRANGERS="$HOME/.mesh/tg-strangers.log"
-OFFSET_F="$HOME/.mesh/.roz-channel.offset"
-SESSION="$(hostname)"
-WIN="tg-roz"
+if [ "${1:-}" = --test ]; then
+  exec python3 "$(dirname "$(readlink -f "$0")")/../tests/test-mesh-roz-channel-delivery.py"
+fi
+[ -n "$ROZ" ] || { echo 'mesh-roz-channel: ROZ_CHAT_ID not set' >&2; exit 1; }
+[ -f "$STRANGERS" ] || exit 0
 
-[ "${1:-}" = --test ] && {
-  command -v tmux >/dev/null 2>&1 || { echo "smoke-test: FAIL (no tmux)"; exit 1; }
-  # The inbound TIMESTAMP is the field the whole conversation log dates itself by. Driven on a real
-  # line shape, not grepped: a truncating class returns the bare year and every downstream age is lost.
-  _fx='2026-08-19T13:19:47Z  from=140230022  "\u043f\u0440\u0438\u0432\u0435\u0442"'
-  _got="$(stranger_ts "$_fx")"
-  [ "$_got" = "2026-08-19T13:19:47Z" ] || {
-    echo "smoke-test: FAIL (inbound ts truncated: got '$_got', want '2026-08-19T13:19:47Z' — the [IN] lines this writes cannot be dated)"; exit 1; }
-  [ -f "$STRANGERS" ] || { echo "smoke-test: ok (ts parse exact; no tg-strangers.log yet; will activate when Rozalia writes)"; exit 0; }
-  echo "smoke-test: ok (ts parse exact on a real line shape)"
-  exit 0
+mkdir -p "$(dirname "$OFFSET_F")" "$(dirname "$IN_LOG")"
+exec 9>"$LOCK_F"
+flock -n 9 || exit 0
+# Catch an unavailable receipt destination before dispatch. Delivery remains at-least-once
+# across a crash between mesh-tell and cursor commit; the stable ask key gates side effects.
+exec 8>>"$IN_LOG" || exit 1
+
+cursor=0
+if [ -f "$OFFSET_F" ]; then
+  cursor=$(cat "$OFFSET_F" 2>/dev/null) || { echo 'mesh-roz-channel: unreadable cursor' >&2; exit 1; }
+fi
+case "$cursor" in ''|*[!0-9]*) echo 'mesh-roz-channel: invalid cursor' >&2; exit 1;; esac
+# The producer appends committed newline records; in-place historical edits are not intake.
+linecount=$(wc -l < "$STRANGERS") || exit 1
+[ "$cursor" -le "$linecount" ] || {
+  echo 'mesh-roz-channel: source truncated below cursor; reconciliation required' >&2; exit 1;
+}
+save_cursor(){
+  local tmp
+  tmp=$(mktemp "${OFFSET_F}.XXXXXX") || return 1
+  printf '%s\n' "$1" > "$tmp" && mv "$tmp" "$OFFSET_F"
 }
 
-[ -n "${ROZ_CHAT_ID:-}" ] || { echo "mesh-roz-channel: ROZ_CHAT_ID not set" >&2; exit 1; }
-
-# Check the tg-roz window exists in the session
-tmux has-session -t "$SESSION:$WIN" 2>/dev/null || exit 0   # window not open, skip silently
-
-[ -f "$STRANGERS" ] || exit 0   # no strangers log yet
-
-OFFSET="$(cat "$OFFSET_F" 2>/dev/null || echo 0)"
-LINECOUNT="$(wc -l < "$STRANGERS")"
-[ "$LINECOUNT" -le "$OFFSET" ] && exit 0   # nothing new
-
-# Read new lines from offset forward, filter to Rozalia's chat_id
-msgs=()
+line_no=0
 while IFS= read -r line; do
-  printf '%s' "$line" | grep -q "from=${ROZ_CHAT_ID}" || continue
-  # Parse: TIMESTAMP  from=ID  "message text"
-  ts="$(stranger_ts "$line")"
-  raw="$(printf '%s' "$line" | sed 's/^[^ ]* *from=[0-9]* *//')"
-  # Decode JSON-encoded text (may have \u escapes)
-  text="$(printf '%s' "$raw" | python3 -c "import json,sys; print(json.loads(sys.stdin.read().strip()))" 2>/dev/null || printf '%s' "$raw")"
-  msgs+=("$ts  Rozalia: $text")
-done < <(tail -n +$((OFFSET + 1)) "$STRANGERS")
+  line_no=$((line_no + 1))
+  [ "$line_no" -gt "$cursor" ] || continue
 
-# Update offset
-printf '%s' "$LINECOUNT" > "$OFFSET_F"
+  # Boundary matching is deliberate: from=12 must not match from=123.
+  if ! printf '%s\n' "$line" | grep -qE "(^|[[:space:]])from=${ROZ}([[:space:]]|$)"; then
+    save_cursor "$line_no" || exit 1
+    cursor=$line_no
+    continue
+  fi
 
-[ "${#msgs[@]}" -eq 0 ] && exit 0
+  tmux has-session -t "$(hostname):$WIN" 2>/dev/null || {
+    echo "mesh-roz-channel: window unavailable; source line $line_no remains pending" >&2
+    exit 1
+  }
 
-# Feed messages to the tg-roz window
-for msg in "${msgs[@]}"; do
-  prompt="$(cat <<EOF
-Rozalia (chat_id=${ROZ_CHAT_ID}) messages you:
+  ts=$(printf '%s' "$line" | grep -oE '^[0-9TZ:-]+' | head -1)
+  raw=$(printf '%s' "$line" | sed "s/^[^ ]*[[:space:]]*from=${ROZ}[[:space:]]*//")
+  text=$(printf '%s' "$raw" | python3 -c 'import json,sys; print(json.loads(sys.stdin.read().strip()))' 2>/dev/null) || text="$raw"
+  ask="ask:tg-roz-$(printf '%s' "$line" | sha256sum | awk '{print substr($1,1,24)}')"
+  prompt=$(cat <<EOF
+Rozalia (chat_id=${ROZ}) sent a message at ${ts}:
 
-  ${msg}
+${text}
 
-Reply in the same language she used (Russian or English). Keep it concise and friendly.
-The mesh is a home AI system — explain, assist, or chat as appropriate.
-Send your reply with: mesh-tg-roz "your response here"
+This is an event-driven intake. Reconcile this source against existing completed or in-progress work and actual delivery before acting. If actionable unresolved work remains, create or reuse the appropriately owned linked task and preserve ask key ${ask}; use the operator-followthrough/subagent workflow for independent analysis. Do not replay external side effects or claim Telegram send success from this mesh-tell delivery. Reply through the authorized tg-roz channel only when the mind decides a reply is warranted.
 EOF
-  )"
-  mesh-tell "$WIN" "$prompt" 2>/dev/null || true
-  # Rozalia's channel is private: never copy inbound text to the shared board.
-  # Write to roz-in.log so the tg-roz data pane shows conversation history
-  printf '[IN]  %s\n' "$msg" >> "$HOME/.mesh/roz-in.log"
-done
+)
+  if ! mesh-tell "$WIN" "$prompt"; then
+    echo "mesh-roz-channel: mesh-tell failed; source line $line_no remains pending" >&2
+    exit 1
+  fi
+
+  # A successful pane dispatch is not a Telegram send receipt. This is only the private inbound history.
+  printf '[IN]  %s  Rozalia: %s\n' "$ts" "$text" >&8 || exit 1
+  save_cursor "$line_no" || exit 1
+  cursor=$line_no
+done < "$STRANGERS"
+exit 0
