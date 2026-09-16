@@ -33,3 +33,8 @@ holds the job lane's tools beside its docs and funnel) — deployed to `~/.local
 (mesh-land, mesh-sync-tools, mesh-doctor, mesh-autowire, mesh-vitality): the failure direction is
 SILENCE — a dir no reader globs is not reported unlandable, it just stops being landed. A tool this window writes is not live on the node until it is deployed, and not live on the
 mesh until it is landed.
+
+**A busy mind receives nothing.** Every dispatch path this window touches must consult
+`_owner_target` and HOLD (queue, never send) on a busy/unhealthy/logged-out/human owner —
+`dispatch()`, `allocate()`, nudges, and sent-dispatch alike. A new route around the hold is a
+busy-mind leak, not a shortcut (dispatch-busy-guard-20260916).
