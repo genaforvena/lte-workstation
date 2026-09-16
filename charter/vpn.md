@@ -14,8 +14,7 @@ re-appliers with their own ledgers — read their tapes, do not race them.
 
 **Substrate is single-writer and this window sits on top of it.** Any `ip rule` / `ip route` / DNS
 / nft / WireGuard / exit-node edit is a substrate change: detect other operators, claim on
-`mesh-trace`, apply under `mesh-dms`, verify from a vantage the change cannot sever. Never
-delegate a substrate write to a subagent, and never live-drive the exit-node DROP from a claude
+`mesh-trace`, apply under `mesh-dms`, verify from a vantage the change cannot sever. Never live-drive the exit-node DROP from a claude
 pane on this node — the rollback rides the channel the change severs.
 
 **The artifact for a path change is the FIB and a real fetch, never the pref.** `ip route get <a
