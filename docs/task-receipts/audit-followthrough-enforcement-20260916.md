@@ -61,4 +61,7 @@ minutes at line 347. Operator intake was installed and enabled but had failed wi
 `Too many open files`: the node had exhausted `fs.inotify.max_user_instances=128` across its
 long-lived agent processes. Unrelated processes were left untouched. The node now has the durable
 `/etc/sysctl.d/90-mesh-inotify.conf` setting `fs.inotify.max_user_instances=512`; `sysctl --system`
-applied it and `mesh-operator-intake.path` restarted as `active (waiting)`, `Result=success`.
+applied it and `mesh-operator-intake.path` restarted successfully. A subsequent event pass timed out
+after creating `operator-intake/85bad20df34521d4154f620c/reconcile`; canonical replay contains that
+exact tagged task, the pass reported `missing=0`, and the service's configured `Restart=on-failure`
+with `RestartSec=60` preserved retry. This distinguishes a retried post-create timeout from a lost ask.
