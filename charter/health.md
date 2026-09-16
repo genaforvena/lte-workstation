@@ -10,8 +10,7 @@ Tools of the duty: `mesh-card [--refresh]` · `mesh-health`/`mesh-hw-health`/`me
 
 **Substrate stays in this window's own hands** when it holds the claim — routing, `ip rule`/`ip
 route`, DNS, nft, WireGuard, Tailscale exit-node. Detect other operators, claim on `mesh-trace`,
-coordinate over tmux, apply under `mesh-dms`. Subagents may READ substrate state and must never
-write it.
+coordinate over tmux, apply under `mesh-dms`.
 
 **A green reflex is not a live one.** Passing `--test` and being wired are unrelated facts; a
 wired reflex can still tend a target that no longer exists; and a sense whose sampling window is
