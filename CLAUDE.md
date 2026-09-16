@@ -362,7 +362,7 @@ At the end of every work session — before going idle — always:
 
 This is the reflexive heartbeat. Every agent on every node follows it.
 
-**Every live, staffed idle mind gets a recurring `mesh-pane-consume` self-pick wake at the `mesh-pace`-governed cadence; it takes exact-owner queued work first, then may create one bounded independent charter task when no eligible task or active claim exists, preserving dependency and duplicate checks; communication/human lanes stay excluded and `[idle]` requires evidence no safe work remains.** [[idle-minds-self-pick-eligible-owned-work]]
+**Every live, staffed idle mind gets a recurring `mesh-pane-consume` self-pick wake at the `mesh-pace`-governed cadence; every wake takes exact-owner queued work first, then must derive ONE bounded pane-goal task when the queue is empty but the pane carries a goal signal, then may take stealable ledger work not in progress (ownerless directly, owned-only via witness reassignment); communication/human lanes stay excluded and `[idle]` requires evidence covering all three (queue + goal-derivation + ledger-steal check).** [[idle-minds-self-pick-eligible-owned-work]]
 
 **PRE-CLEAR step (mandatory before any `/clear`).** `/compact` is RETIRED mesh-wide (operator
 2026-07-18 "везде только clear") — `/clear` + handoff is the ONE context lever, and every clear is
@@ -607,7 +607,11 @@ named after its *role*, and its data pane must hold **everything important for t
 mind can act from the pane alone, never re-fetching the same context each turn. The test: if your mind
 keeps running the same probe every turn, that signal belongs **on top**. Each channel owns its dash —
 extend `mesh-dash <role>`, throttling any expensive read so the refresh loop stays cheap (`minds` →
-allocation + spend; `health` → fleet health; `sense` → fused perception). To hot-reload a live data
+allocation + spend; `health` → fleet health; `sense` → fused perception). **A mind is free to adjust
+its own top pane, its wake-rule, its charter and its instructions whenever that helps the mesh and
+its autonomy** — the pane is owned, not sacred. Keep the shared contracts green (the dash's `--test`,
+the frozen-detection tick line, full content on the `--once` mind-read) and land the change through
+the owning lane's normal path with a board note, so the next mind inherits it. To hot-reload a live data
 pane after editing its dash, `tmux respawn-pane -k -t <sess>:<win>.0` — it replaces the process in
 place (no reindex, mind pane untouched); never C-c it (that closes+reindexes the pane).
 
