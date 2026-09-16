@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# orphan-ok: sourced canonical tab-splitter library, never itself scheduled.
 # mesh-split-tabs.sh — CANONICAL tab-field splitter for bash (the DRY source).
 #
 # WHY THIS FILE EXISTS. `IFS=$'\t' read -r a b c` is not a tab splitter and never was. Tab is an
