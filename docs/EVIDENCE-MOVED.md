@@ -58,6 +58,21 @@ mesh-evidence-dir --resolve docs/task-plans/x.tsv    # → ~/.mesh/plans/x.tsv
 
 The root honours `MESH_PLANS_DIR`, then `$MESH_DIR/plans`, then `~/.mesh/plans`.
 
+### The rule
+
+New plans are written to the plans root, never into the tree:
+
+```bash
+mesh-evidence-dir --mkdir plans                      # → ~/.mesh/plans
+mesh-task create <chain> ~/.mesh/plans/<name>.tsv <ask-key>
+```
+
+Legacy tracked plan files stay put for now: `docs/plans/` (69 `.tsv` + 6 `.md`) and `docs/*.plan.tsv`
+(10) are tracked repo material with tracked siblings — and a *tracked* edit is exactly what the
+landing path covers. They are cited by other documents, so migrating them is a deliberate change of
+its own rather than something a stray-file cleanup should decide. Both spellings resolve through
+`mesh-evidence-dir`, which keeps either choice cheap.
+
 Unlike the evidence corpora these were **not** a genome load, and it is worth being exact about why:
 `mesh-land` enumerates *untracked* files only from an explicit allowlist (`scripts/`, `job/`,
 `bootstrap.sh`, `setup.sh`, and the `UNTRACKED_DOC_PATHS` set), which has never listed
