@@ -28,6 +28,10 @@ chmod +x "$td/bin/mesh-task"
 printf '2026-09-08T07:00:00Z  raw@test  ::  [fyi] source line\n' >"$td/mesh/chat.log"
 
 export LEGACY_CALLED="$td/legacy-called"
+# The journal skips a view fresher than MESH_TASK_JOURNAL_MIN_AGE (120s); this
+# test replays back-to-back, so pin 0 — otherwise the final reasonless-REJECTED
+# leg is a skipped no-op that exits 0 and reads as "accepted".
+export MESH_TASK_JOURNAL_MIN_AGE=0
 PATH="$td/bin:$PATH" MESH_DIR="$td/mesh" MESH_CHAT_LOG="$td/mesh/chat.log" \
 MESH_WITNESS_COORDINATION_SUMMARY="$td/mesh/tasks.summary" \
   "$repo/scripts/mesh-task-journal" >/dev/null
@@ -37,7 +41,7 @@ grep -q '^task_source=PASS$' "$td/mesh/tasks.summary"
 ! grep -q 'promise_ledger' "$td/mesh/tasks.summary"
 grep -Eq '^REJECTED[[:space:]]+beta[[:space:]]+chain/rejected[[:space:]]+reason=unsafe request$' "$td/mesh/tasks.summary"
 grep -Eq '^BLOCKED[[:space:]]+gamma[[:space:]]+chain/active[[:space:]]+blocker_type=dependency[[:space:]]+retry=waiting-for-input$' "$td/mesh/tasks.summary"
-grep -Eq '^OPEN_UNOWNED[[:space:]]+epsilon[[:space:]]+chain/overdue[[:space:]]+owner_receipt=overdue' "$td/mesh/tasks.summary"
+grep -Eq '^OPEN_UNOWNED[[:space:]]+-[[:space:]]+chain/overdue[[:space:]]+owner_receipt=overdue' "$td/mesh/tasks.summary"
 grep -q '^task_rows=5 unfinished_tasks=3 rejected_tasks=1 done_tasks=1$' "$td/mesh/tasks.summary"
 
 tail -n +2 "$td/mesh/tasks.summary" >"$td/first-replay"
