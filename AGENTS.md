@@ -100,4 +100,4 @@ passing a tool’s self-test does not prove that a reflex runs. Before handoff, 
 what was actually verified. Every gate renders on a top pane, or it is a blind change —
 a verdict visible only in `chat.log` was never rendered; wire each gate into `mesh-doctor`
 so `.doctor-fails` carries it to the health pane.
-[[every-gate-renders-on-a-top-pane|memory/every-gate-renders-on-a-top-pane.md]]
+[[every-gate-renders-on-a-top-pane|~/.mesh/memory/every-gate-renders-on-a-top-pane.md]]

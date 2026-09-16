@@ -15,10 +15,10 @@ plantable on any node. There is **no fixed mind** — a mind is any node running
 | **`CLAUDE.md`** (this file) | ONLY what is true for **any window on any node** — and each rule is **one line plus a `[[link]]` to its case** | every mind, always |
 | **`charter/<window>.md`** (→ `~/.mesh/charter/<window>.md`) | what is true for **one window** — its duties, its routing, what it owes | that window, laid under the handoff by the SessionStart hook (`mesh-handoff --charter`) |
 | **`CLAUDE.local.md`** (gitignored) | what is true for **one node** — topology, services, credentials, hardware | minds on that node |
-| **`memory/`** | the **cases**: the measurement, the date, the commit, the failure as it actually happened | on recall, and via the `[[link]]` in a rule |
+| **`memory/`** (`~/.mesh/memory/`) | the **cases**: the measurement, the date, the commit, the failure as it actually happened | on recall, and via the `[[link]]` in a rule |
 
 A rule that carries its own case inside it stops being read — the wall that used to be the verification
-principle was 189 lines nobody re-read. **A case never lands here; it lands in `memory/` and this file
+principle was 189 lines nobody re-read. **A case never lands here; it lands in `~/.mesh/memory/` and this file
 links to it.** If a line is only true for your window, it belongs in your charter; if only on this node,
 in `CLAUDE.local.md`.
 
@@ -112,7 +112,7 @@ asking the operator to intervene.
 - **Every completed Tiny Fleet update is committed and pushed to the repository; a failed push stays explicitly open until verified.** [[tiny-fleet-updates-must-land-in-the-repository]]
 
 **Each rule below is one line and stands on its own; the case that earned it lives whole in
-`memory/`.** Follow a `[[link]]` only when you need the measurement — the rule is the instruction,
+`~/.mesh/memory/`.** Follow a `[[link]]` only when you need the measurement — the rule is the instruction,
 the case is the evidence, and mixing them is what made this section a wall nobody re-read.
 
 - **Regressions, not just new powers.** The artifact for a network change is every node still
@@ -129,7 +129,7 @@ the case is the evidence, and mixing them is what made this section a wall nobod
 - **Every gate renders on a top pane, or it is a blind change** — a verdict visible only in
   `chat.log` was never rendered; wire each gate into `mesh-doctor` so `.doctor-fails` carries it
   to the health pane.
-  [[every-gate-renders-on-a-top-pane|memory/every-gate-renders-on-a-top-pane.md]]
+  [[every-gate-renders-on-a-top-pane|~/.mesh/memory/every-gate-renders-on-a-top-pane.md]]
 - **A `--test` must never write the log a human or watchdog reads for liveness** — it forges the
   evidence it exists to check; give the dry-run its own log, and assert a FRESH artifact per
   direction. [[a-dry-run-that-writes-the-liveness-log-forges-its-own-evidence]]
