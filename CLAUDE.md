@@ -1,5 +1,9 @@
 # lte-workstation — Node Operator Context
 
+Every engine reads the editable engine-neutral procedural contract [`MESH.md`](MESH.md) before
+acting. `AGENTS.md` is the bootstrap for Codex/OpenCode-style engines; this file remains the full
+doctrine and case index.
+
 This file is the **generic skeleton** (committed) — doctrine, conventions, and mesh-* tool contracts,
 plantable on any node. There is **no fixed mind** — a mind is any node running an agent
 (`docs/mesh-skeleton.md`); run `hostname` to know which body you're in.
