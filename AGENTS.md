@@ -65,6 +65,12 @@ workflow test.
   how things were before is deleted, not explained: remove the obsolete text, the dead path,
   the compatibility note — do not narrate the migration inside the file. History lives in
   the git log, never in the context every mind pays for on every wake.
+- `mesh:14` — Prefer the deterministic solution. Before spending a mind call — or writing one
+  more instruction — ask: "can this be solved deterministically?" Checks are always scripts:
+  a verdict a script can render (a count, a pattern match, a gate, a recurring probe) must
+  never depend on a mind's judgment. Proactively notice what can be replaced with a script
+  and replace it. Instructions describe only what scripts cannot decide; everything else is
+  code with exit codes.
 
 ### Invariant registry (operator-owned, enforced read dependency)
 
