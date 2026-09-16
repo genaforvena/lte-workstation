@@ -33,6 +33,7 @@ COORDINATOR = os.environ.get("MESH_TASK_COORDINATOR", "witness")
 LEASE_SECONDS = int(os.environ.get("MESH_TASK_LEASE_SECONDS", "1800"))
 MAX_UNBLOCK_ATTEMPTS = 3
 MAX_UNBLOCK_DEPTH = 2
+MAX_DISPATCH_RETRIES = int(os.environ.get("MESH_TASK_DISPATCH_RETRIES", "3"))
 LAST_EMIT_ERROR = ""
 SAFE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,119}$")
 TASK_METADATA_KEYS = ("repository", "scope", "artifact_root", "revision", "next_command",
@@ -168,6 +169,76 @@ def reject_ephemeral_artifact_path(artifact_path: Path) -> None:
         root = candidate.resolve()
         if resolved == root or root in resolved.parents:
             die(f"ephemeral artifact path cannot settle a task: {resolved} (under {root})")
+
+
+IMPL_SLUG_VERBS = frozenset({
+    "implement", "fix", "build", "wire", "land", "add", "split", "patch",
+    "repair", "migrate", "refactor", "implement-safe-delete", "rework", "harden",
+    "determinize",
+})
+IMPL_OWNERS = frozenset({"genome"})
+PROSE_SUFFIXES = frozenset({".md", ".markdown", ".txt", ".rst"})
+
+
+PANE_ROLES = frozenset({
+    "steward", "check", "verify", "codex", "worker", "minds", "dev",
+    "reflexes", "organs", "tg", "models", "sound", "sense", "witness", "chat",
+})
+
+
+def validate_implementation_artifact(step: dict, artifact_path: Path, result: str) -> None:
+    """Implementation steps settle only on executables (or plans listing them),
+    wired to a top pane. Receipts are receipts, not artifacts.
+
+    A step needs implementation when its slug's first token is an implementation
+    verb or its owner is an implementation lane — unless the step declares itself
+    receipt-only via the exact `receipt-only` tag. Three hard checks:
+    1. prose suffix (.md/.txt/...) → refused, always;
+    2. the artifact must be executable, or a .tsv plan naming at least one
+       existing executable path (absolute or repo-relative) expected when
+       implemented — anything else is a paragraph about the work, not the work;
+    3. the result must name the observing top pane as `pane:<role>` with a
+       `mesh-dash` role — an artifact no pane observes is waste.
+    """
+    if has_task_tag(step, "receipt-only"):
+        return
+    slug = str(step.get("slug") or "")
+    first_token = slug.split("-")[0].split("_")[0].lower() if slug else ""
+    needs_impl = first_token in IMPL_SLUG_VERBS or step.get("owner") in IMPL_OWNERS
+    if not needs_impl:
+        return
+    if artifact_path.suffix.lower() in PROSE_SUFFIXES:
+        die(f"implementation step {step.get('id')} cannot settle on prose artifact "
+            f"{artifact_path.name}: receipts are receipts, not artifacts — point at "
+            f"the changed executable, a test, or a plan listing executables, "
+            f"or tag the step receipt-only")
+    if artifact_path.suffix.lower() == ".tsv":
+        try:
+            text = artifact_path.read_text(encoding="utf-8")
+        except OSError:
+            text = ""
+        root = Path.cwd()
+        found = False
+        for token in text.replace("\t", " ").replace("\n", " ").split():
+            candidate = Path(token).expanduser()
+            if not candidate.is_absolute():
+                candidate = root / candidate
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                found = True
+                break
+        if not found:
+            die(f"implementation step {step.get('id')} plan artifact "
+                f"{artifact_path.name} lists no existing executable: a plan must "
+                f"name the executables expected when implemented")
+    elif not os.access(artifact_path, os.X_OK):
+        die(f"implementation step {step.get('id')} artifact {artifact_path.name} "
+            f"is not executable: point at the executable (or a .tsv plan listing "
+            f"executables), or tag the step receipt-only")
+    panes = {m.group(1) for m in re.finditer(r"pane:([a-z-]+)", result or "")}
+    if not (panes & PANE_ROLES):
+        die(f"implementation step {step.get('id')} names no observing top pane: "
+            f"add pane:<role> to the result ({'/'.join(sorted(PANE_ROLES))}) — "
+            f"an artifact no pane observes is waste")
 
 
 def update_context(owner: str, chain: str, step: dict, remove: bool = False) -> None:
@@ -525,7 +596,10 @@ def mutation_resources(argv: list[str]) -> set[str]:
                       "reprioritize", "annotate", "block", "wait-for", "clear-wait", "resume",
                       "recover", "dispatch", "reschedule", "reassign"}
     if command in chain_commands and len(argv) > 1:
-        resources.add(f"chain:{argv[1]}")
+        if command == "dispatch" and argv[1].startswith("--"):
+            resources.add("maintenance:dispatch-retry")
+        else:
+            resources.add(f"chain:{argv[1]}")
     elif command == "reschedule-task" and len(argv) > 1:
         resources.add(f"chain:{argv[1].rsplit('/', 1)[0]}")
     elif command == "reassign-owner" and len(argv) > 2:
@@ -858,6 +932,7 @@ def done(chain: str, ref: str, artifact: str, result: str) -> None:
         die(f"artifact does not exist: {artifact} (a claim is not complete without evidence)")
     reject_ephemeral_artifact_path(artifact_path)
     validate_artifact_scope(data, step, artifact_path)
+    validate_implementation_artifact(step, artifact_path, result)
     if has_task_tag(step, "audit-followthrough"):
         manifest_path, finding_count, actionable_count = validate_audit_findings(step, artifact_path)
         step.update(finding_manifest=str(manifest_path),
@@ -1574,6 +1649,106 @@ def retry_dispatch(chain: str) -> None:
     print(f"dispatched {data['steps'][data['current']]['id']}")
 
 
+def dispatch_retry_candidates() -> list[tuple[Path, dict, str]]:
+    """Collect chains whose delivery failed or whose unclaimed lease expired."""
+    current = time.time()
+    found = []
+    for path, data in chain_states():
+        steps = data.get("steps", [])
+        index = data.get("current")
+        if not isinstance(index, int) or not 0 <= index < len(steps):
+            continue
+        step = steps[index]
+        if data.get("status") not in ("open", "active") or step.get("status") != "open":
+            continue
+        if step.get("waiting_for"):
+            continue
+        if data.get("dispatch") == "failed":
+            found.append((path, data, "failed"))
+            continue
+        if data.get("dispatch") == "sent":
+            queued_until = max(epoch_iso(step.get("reschedule_until", "")),
+                               epoch_iso(step.get("dispatch_until", "")))
+            if 0 < queued_until < current:
+                found.append((path, data, "expired"))
+                continue
+        for other in steps:
+            if independent_marked(other) and other.get("status") == "open" \
+                    and other.get("independent_dispatch") == "failed" and not other.get("waiting_for"):
+                found.append((path, data, f"independent-failed:{other['id']}"))
+                break
+    return found
+
+
+def retry_failed_dispatches(limit: int = 0) -> None:
+    """Re-dispatch failed/expired rows under coordinator identity, bounded per row."""
+    if actor() != COORDINATOR:
+        die(f"coordinator required: coordinator={COORDINATOR} actor={actor()}")
+    try:
+        max_retries = max(0, int(os.environ.get("MESH_TASK_DISPATCH_RETRIES", str(MAX_DISPATCH_RETRIES))))
+    except ValueError:
+        max_retries = MAX_DISPATCH_RETRIES
+    candidates = dispatch_retry_candidates()
+    retried = succeeded = failed = exhausted = 0
+    failures = []
+    for path, data, reason in candidates:
+        if limit and retried >= limit:
+            break
+        attempts = int(data.get("dispatch_attempts", 0) or 0)
+        if attempts >= max_retries:
+            exhausted += 1
+            if not data.get("dispatch_retry_exhausted"):
+                emit("yield", f"{data['chain']}: dispatch retries exhausted at {max_retries}; "
+                     f"reason={reason}; needs a hand")
+                data["dispatch_retry_exhausted"] = now()
+                save(path, data)
+            continue
+        if reason.startswith("independent-failed:"):
+            target_id = reason.split(":", 1)[1]
+            target = next((s for s in data["steps"] if s.get("id") == target_id), None)
+            data["dispatch_attempts"] = attempts + 1
+            data.pop("dispatch_retry_exhausted", None)
+            path, data = load(data["chain"])
+            target = next((s for s in data["steps"] if s.get("id") == target_id), None)
+            if target is None or target.get("independent_dispatch") != "failed":
+                continue
+            retried += 1
+            index = data["steps"].index(target)
+            if post_task(data, index):
+                target["dispatched_at"] = now()
+                target["independent_dispatch"] = "sent"
+                target.pop("independent_dispatch_error", None)
+                save(path, data)
+                succeeded += 1
+            else:
+                target["independent_dispatch"] = "failed"
+                target["independent_dispatch_error"] = f"{now()}: board task post failed"
+                save(path, data)
+                failed += 1
+                failures.append(data["chain"])
+            continue
+        data["dispatch_attempts"] = attempts + 1
+        data.pop("dispatch_retry_exhausted", None)
+        if data.get("dispatch") == "sent":
+            data["dispatch"] = "pending"
+        path, live = load(data["chain"])
+        live["dispatch_attempts"] = data["dispatch_attempts"]
+        live.pop("dispatch_retry_exhausted", None)
+        if live.get("dispatch") == "sent":
+            live["dispatch"] = "pending"
+        retried += 1
+        try:
+            dispatch(path, live)
+            succeeded += 1
+        except SystemExit as exc:
+            failed += 1
+            failures.append(f"{live.get('chain', str(path))} rc={exc.code}")
+    print(f"dispatch-retry candidates={len(candidates)} retried={retried} "
+          f"succeeded={succeeded} failed={failed} exhausted={exhausted} max_retries={max_retries}")
+    if failures:
+        die(f"dispatch-retry failures: {'; '.join(failures)}", 1)
+
+
 def reschedule(path: Path, data: dict) -> None:
     """Re-deliver an unclaimed current step without changing task ownership."""
     if data.get("status") not in ("open", "active"):
@@ -2115,6 +2290,52 @@ def test() -> None:
         run("done", "independent", "head", str(artifact), "prerequisite complete")
         if "independent [complete]" not in run("status", "independent").stdout:
             die("self-test ordered completion did not skip its settled independent step")
+        # dispatch --retry driver: failed + expired rows redeliver under coordinator.
+        retry_plan = root / "retry.tsv"
+        retry_plan.write_text("alpha\ta\tfirst retry task\nalpha\tb\tsecond retry task\n")
+        env["MESH_TASK_ACTOR"] = "alpha"
+        run("create", "retry-failed", str(retry_plan))
+        run("take", "retry-failed", "a")
+        env["MESH_TASK_HANDOFF_FAIL"] = "1"
+        run("done", "retry-failed", "a", str(artifact), "first done", expect=1)
+        env.pop("MESH_TASK_HANDOFF_FAIL")
+        expired_plan = root / "expired.tsv"
+        expired_plan.write_text("alpha\ta\texpired lease task\n")
+        env["MESH_TASK_LEASE_SECONDS"] = "-30"
+        run("create", "retry-expired", str(expired_plan))
+        env.pop("MESH_TASK_LEASE_SECONDS")
+        env["MESH_TASK_ACTOR"] = "beta"
+        refused = run("dispatch", "--retry", expect=2)
+        if "coordinator required" not in refused.stderr:
+            die("self-test dispatch --retry accepted a non-coordinator actor", 1)
+        env["MESH_TASK_ACTOR"] = "witness"
+        env["MESH_TASK_COORDINATOR"] = "witness"
+        retry_out = run("dispatch", "--retry")
+        import re as _re
+        _m = _re.search(r"succeeded=(\d+)", retry_out.stdout)
+        if not _m or int(_m.group(1)) < 2:
+            die(f"self-test dispatch --retry did not redeliver both rows: {retry_out.stdout.strip()}", 1)
+        healed = json.loads((root / "mesh/chains/retry-failed.json").read_text())
+        if healed["dispatch"] != "sent" or int(healed.get("dispatch_attempts", 0)) != 1:
+            die("self-test dispatch --retry did not mark the failed row sent with one attempt", 1)
+        cap_plan = root / "cap.tsv"
+        cap_plan.write_text("alpha\ta\tfirst cap task\nalpha\tb\tsecond cap task\n")
+        env["MESH_TASK_ACTOR"] = "alpha"
+        run("create", "retry-cap", str(cap_plan))
+        run("take", "retry-cap", "a")
+        env["MESH_TASK_HANDOFF_FAIL"] = "1"
+        run("done", "retry-cap", "a", str(artifact), "cap done", expect=1)
+        env.pop("MESH_TASK_HANDOFF_FAIL")
+        env["MESH_TASK_ACTOR"] = "witness"
+        env["MESH_TASK_DISPATCH_RETRIES"] = "0"
+        cap_out = run("dispatch", "--retry")
+        if "retried=0" not in cap_out.stdout or "exhausted=" not in cap_out.stdout:
+            die(f"self-test dispatch --retry ignored the retry bound: {cap_out.stdout.strip()}", 1)
+        import re as _re2
+        if int(_re2.search(r"exhausted=(\d+)", cap_out.stdout).group(1)) < 1:
+            die(f"self-test dispatch --retry exhausted nothing at cap 0: {cap_out.stdout.strip()}", 1)
+        env.pop("MESH_TASK_DISPATCH_RETRIES")
+        env["MESH_TASK_ACTOR"] = "alpha"
     print("mesh-task: smoke-test ok (ordered tasks, independent pickup, exact owner, leases, blockers, artifacts)")
 
 
@@ -2124,7 +2345,7 @@ def main(argv: list[str]) -> None:
         print("       plan.tsv rows: owner<TAB>step<TAB>description (priority 0) or owner<TAB>step<TAB>priority<TAB>description")
         print("       independent <chain> <step> <reason> (owner attests a later step can proceed while the current step is blocked)")
         print("       mesh-task progress <chain> <step> <artifact> <next-action> <next-update> | reprioritize <chain> <step> <priority> | annotate <chain> <step> <tags> <design_artifact> | block <chain> <step> <type> <needs> <retry>")
-        print("       mesh-task reject <chain> <step> <reason> | recover <chain> <step> <reactivate|hold> <artifact> <reason> | wait-for <chain> <step> <prerequisite-task> | clear-wait <chain> <step> <reason> | resume <chain> <step> <event> | dispatch <chain> | reschedule <chain> | reschedule-task <task> | unblock-sweep <owner> | reassign-owner <old> <new> <reason> | reassign <chain> <new-owner> <reason> | status <chain> | reconcile <owner> | --test")
+        print("       mesh-task reject <chain> <step> <reason> | recover <chain> <step> <reactivate|hold> <artifact> <reason> | wait-for <chain> <step> <prerequisite-task> | clear-wait <chain> <step> <reason> | resume <chain> <step> <event> | dispatch <chain> | dispatch --retry [--limit=N] | reschedule <chain> | reschedule-task <task> | unblock-sweep <owner> | reassign-owner <old> <new> <reason> | reassign <chain> <new-owner> <reason> | status <chain> | reconcile <owner> | --test")
         print("       mesh-task replay --json  (read structured task-state records from chat.log)")
         print("       mesh-task queue --dispatch [--owner <mind>]  (canonical task-ledger dispatch order; optional exact-mind scope)")
         print("       mesh-task import | rebuild  (import existing chains; rebuild disposable caches)")
@@ -2179,6 +2400,8 @@ def main(argv: list[str]) -> None:
             elif command == "wait-for" and len(argv) == 4: wait_for(*argv[1:])
             elif command == "clear-wait" and len(argv) >= 4: clear_wait(argv[1], argv[2], " ".join(argv[3:]))
             elif command == "resume" and len(argv) == 4: unblock(*argv[1:])
+            elif command == "dispatch" and argv[1:] in (["--retry"], ["--retry-all"]): retry_failed_dispatches()
+            elif command == "dispatch" and len(argv) == 3 and argv[1] == "--retry": retry_failed_dispatches(int(argv[2].split("=", 1)[1]) if argv[2].startswith("--limit=") else 0)
             elif command == "dispatch" and len(argv) == 2: retry_dispatch(*argv[1:])
             elif command == "reschedule" and len(argv) == 2: reschedule_chain(argv[1])
             elif command == "reschedule-task" and len(argv) == 2: reschedule_task(argv[1])
