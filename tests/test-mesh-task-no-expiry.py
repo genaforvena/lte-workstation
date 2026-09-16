@@ -68,7 +68,7 @@ class TaskNoExpiryTests(unittest.TestCase):
         self.env.pop("MESH_TASK_LEASE_SECONDS")
         audit = self.command("audit").stdout
         self.assertIn("HELD_EXPIRED\thealth\thealth-warning/expired/triage\tretry=next fresh health warning", audit)
-        self.assertIn("OPEN_UNOWNED\talpha\tgenuine-open/inspect", audit)
+        self.assertIn("OPEN_UNOWNED\t-\tgenuine-open/inspect", audit)
 
     def test_reject_requires_a_reason_and_is_the_only_non_done_terminal_path(self):
         rejected = self.command("reject", "no-expiry", "inspect", expect=2)
