@@ -1,0 +1,220 @@
+#!/usr/bin/env python3
+"""Reconcile untracked operator input into bounded, canonical recovery tasks.
+
+No external sends: the owner reconciles prior work and receipts before acting.
+"""
+# reflex-cadence: off
+# Event launcher: systemd/mesh-operator-intake.path (and boot catch-up service).
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tempfile
+from datetime import datetime, timedelta, timezone
+
+from mesh_task_log import replay
+
+MESH = Path(os.environ.get("MESH_DIR", str(Path.home() / ".mesh")))
+VOICE = Path(os.environ.get("MESH_OPERATOR_INTAKE_VOICE", str(MESH / "voice-in.log")))
+CHAT = Path(os.environ.get("MESH_OPERATOR_INTAKE_CHAT", str(MESH / "chat.log")))
+ROOT = MESH / "operator-intake"
+PLANS = ROOT / "plans"
+STATE = ROOT / "status.json"
+FLOOR = ROOT / "bootstrap-floor"
+TASK = os.environ.get("MESH_OPERATOR_INTAKE_TASK", str(Path(__file__).resolve().with_name("mesh-task")))
+STAMP = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ)\s+(TEXT|VOICE|DOCUMENT)\s+(.*)$")
+
+
+def now():
+    return datetime.now(timezone.utc)
+
+
+def iso(value):
+    return value.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_stamp(value):
+    return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+
+
+def key(raw):
+    return "tg-" + hashlib.sha256(raw.rstrip(b"\n")).hexdigest()[:24]
+
+
+def atomic_text(path, text):
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd, name = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(name, path)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+
+
+def publish(result):
+    atomic_text(STATE, json.dumps(result, sort_keys=True) + "\n")
+    with (ROOT / "run.log").open("a", encoding="utf-8") as handle:
+        handle.write(result["run"] + " RUN health=" + result["health"] + " "
+                     + json.dumps(result, sort_keys=True) + "\n")
+
+
+def linked(records):
+    return {str(record["data"].get("ask") or "").removeprefix("ask:")
+            for record in records.values()}
+
+
+def inputs(floor, instant, grace):
+    result = {}
+    with VOICE.open("rb") as handle:
+        for number, raw in enumerate(handle, 1):
+            if not raw.endswith(b"\n"):
+                continue  # writer has not committed this source line yet
+            match = STAMP.match(raw.rstrip(b"\n").decode("utf-8"))
+            if not match:
+                continue
+            stamp, kind, _ = match.groups()
+            date = parse_stamp(stamp)
+            if date < floor or (instant - date).total_seconds() < grace:
+                continue
+            ask = key(raw)
+            result.setdefault(ask, dict(ask=ask, stamp=stamp, kind=kind, line=number))
+    return list(result.values())
+
+
+def plan_for(item):
+    ask = item["ask"]
+    chain = "operator-intake/" + ask.removeprefix("tg-")
+    plan = PLANS / (ask + ".tsv")
+    description = (
+        f"Reconcile operator {item['kind']} source {VOICE}:{item['line']} "
+        f"at {item['stamp']} with SHA256 prefix {ask.removeprefix('tg-')}. "
+        "Read the original source and verify its digest; find existing work and actual delivery receipts. "
+        "This is a coverage gap, not proof the request is unanswered. Do not resend or repeat side effects "
+        "without checking prior evidence. Answered/non-actionable input closes with a private evidence receipt. "
+        "For unresolved work, create or reuse an exact owned task with this ask key and acceptance criteria; "
+        "record its ID before closing reconciliation. Requested delivery needs the actual destination and "
+        "transport receipt. Use mesh-operator-followthrough. Prefer subagents for independent investigation; "
+        "the owning mind alone claims, writes the board, and verifies artifacts. "
+        "Beside the completion receipt, write <receipt>.findings.json with version=1 and a nonempty findings "
+        "array; each finding has a unique id and either actionable=true with exact task and owner, or "
+        "actionable=false with a nonempty reason. Settlement verifies this mapping against the canonical ledger. "
+        "Keep message contents and account data in node-local evidence."
+    )
+    atomic_text(plan, f"#tags=audit-followthrough\n" f"tg\treconcile\t{description}\n")
+    return chain, plan
+
+
+def run(dry=False, event=False):
+    instant = now()
+    result = dict(run=iso(instant), health="UNKNOWN", created=0, attempted=0,
+                  missing=None, oldest_gap=None, errors=[])
+    try:
+        grace = 0 if event else max(0, float(os.environ.get("MESH_OPERATOR_INTAKE_GRACE", "120")))
+        stat = VOICE.stat()
+        result.update(mode="event" if event else "manual", source_size=stat.st_size,
+                      source_mtime_ns=stat.st_mtime_ns, source_inode=stat.st_ino)
+        cap = max(1, min(10, int(os.environ.get("MESH_OPERATOR_INTAKE_BATCH", "3"))))
+        floor = (parse_stamp(FLOOR.read_text().strip()) if FLOOR.exists() else
+                 instant - timedelta(hours=max(0, float(os.environ.get(
+                     "MESH_OPERATOR_INTAKE_BOOTSTRAP_HOURS", "48")))))
+        # Finish all reads before creating anything. An unavailable ledger is not empty.
+        records = replay(CHAT)
+        source = inputs(floor, instant, grace)
+        asks = linked(records)
+        gaps = [item for item in source if item["ask"] not in asks]
+        result.update(observed=len(source), linked=len(source) - len(gaps),
+                      missing=len(gaps), floor=iso(floor),
+                      oldest_gap=min((item["stamp"] for item in gaps), default=None))
+        if not dry and not FLOOR.exists():
+            # Persist once, before any task mutation. Downtime cannot age out unseen input.
+            atomic_text(FLOOR, iso(floor) + "\n")
+        if dry:
+            result.update(health="GAPS" if gaps else "OK", would_create=min(cap, len(gaps)))
+            return 0, result
+        for item in gaps[:cap]:
+            result["attempted"] += 1
+            try:
+                chain, plan = plan_for(item)
+                env = dict(os.environ, MESH_DIR=str(MESH), MESH_CHAT_LOG=str(CHAT),
+                           MESH_WHO="operator-intake@" + os.uname().nodename,
+                           MESH_TASK_ACTOR="operator-intake")
+                created = subprocess.run([TASK, "create", chain, str(plan), item["ask"]],
+                                         env=env, text=True, capture_output=True, timeout=60)
+                if created.returncode:
+                    # A timeout/race may have committed. Trust canonical state, never error prose.
+                    if item["ask"] not in linked(replay(CHAT)):
+                        result["errors"].append(f"{item['ask']}: create rc={created.returncode}")
+                else:
+                    result["created"] += 1
+            except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+                result["errors"].append(f"{item['ask']}: {type(exc).__name__}; replay next pass")
+        # Confirm the postcondition, including a concurrent creator or crash after commit.
+        confirmed = linked(replay(CHAT))
+        remaining = [item for item in source if item["ask"] not in confirmed]
+        result.update(missing=len(remaining), linked=len(source) - len(remaining),
+                      oldest_gap=min((item["stamp"] for item in remaining), default=None))
+        result["health"] = "DEGRADED" if result["errors"] else ("GAPS" if remaining else "OK")
+    except (OSError, ValueError, TypeError) as exc:
+        result.update(health="UNKNOWN", errors=[f"{type(exc).__name__}: {exc}"])
+    if not dry:
+        publish(result)
+    return (1 if result["health"] in ("UNKNOWN", "DEGRADED") or
+            (event and result.get("missing")) else 0), result
+
+
+def status():
+    try:
+        result = json.loads(STATE.read_text())
+        age = max(0, int((now() - parse_stamp(result["run"])).total_seconds()))
+        result["age_seconds"] = age
+        if result.get("mode") == "event":
+            stat = VOICE.stat()
+            if (stat.st_size, stat.st_mtime_ns, stat.st_ino) != (result.get("source_size"), result.get("source_mtime_ns"), result.get("source_inode")):
+                pending_age = max(0, now().timestamp() - stat.st_mtime)
+                result["health"] = "STALE" if pending_age > 900 else "PENDING"
+        elif age > 900:
+            result["health"] = "STALE"
+    except (OSError, ValueError, KeyError, TypeError):
+        result = dict(health="UNKNOWN", reason="no readable operator intake status")
+    print(json.dumps(result, sort_keys=True))
+    return 0 if result.get("health") in ("OK", "GAPS") else 1
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--status", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--test", action="store_true")
+    parser.add_argument("--event", action="store_true")
+    args = parser.parse_args()
+    if args.test:
+        test = Path(__file__).resolve().parents[1] / "tests/test-mesh-operator-intake-lifecycle.py"
+        return subprocess.run([sys.executable, str(test)]).returncode
+    if args.status:
+        return status()
+    if args.dry_run:
+        rc, result = run(True, args.event)
+    else:
+        ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with (ROOT / ".lock").open("a") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                print(iso(now()) + " RUN health=BUSY reason=another-intake-pass")
+                return 0
+            rc, result = run(event=args.event)
+    print(json.dumps(result, sort_keys=True))
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())
