@@ -34,6 +34,7 @@ LEASE_SECONDS = int(os.environ.get("MESH_TASK_LEASE_SECONDS", "1800"))
 MAX_UNBLOCK_ATTEMPTS = 3
 MAX_UNBLOCK_DEPTH = 2
 MAX_DISPATCH_RETRIES = int(os.environ.get("MESH_TASK_DISPATCH_RETRIES", "3"))
+DRAIN_MARKER = os.environ.get("MESH_TASK_DRAIN_MARKER", "operator-drained")
 LAST_EMIT_ERROR = ""
 SAFE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,119}$")
 TASK_METADATA_KEYS = ("repository", "scope", "artifact_root", "revision", "next_command",
@@ -1207,11 +1208,70 @@ def block(chain: str, ref: str, reason_type: str, needs: str, retry: str) -> Non
     if unblock_chain:
         emit("task", f"{step['id']}: unblock task available at {unblock_chain}/resolve; "
              f"resume only after its artifact-backed result")
-    elif data.get("chain", "").startswith("unblock/") and unblock_depth(data) >= MAX_UNBLOCK_DEPTH:
-        emit("yield", f"{step['id']}: recovery-depth-cap={MAX_UNBLOCK_DEPTH}; remains blocked with "
-             f"needs={step.get('needs', 'unspecified')} retry={step.get('retry', 'unspecified')}; "
-             "the exact owner can resume only after that retry condition is evidenced")
     print(f"blocked {step['id']}")
+
+
+def registry_invariants():
+    """Parse MESH.md's ```invariant-registry block. Returns (rev, [row dicts])."""
+    import re as _re
+    root = Path(os.environ.get("MESH_GENOME", str(Path(__file__).resolve().parent.parent)))
+    text = (root / "MESH.md").read_text()
+    m = _re.search(r"```invariant-registry\n(.*?)```", text, flags=_re.S)
+    if not m:
+        die("no ```invariant-registry block in MESH.md")
+    block = m.group(1)
+    rm = _re.search(r"^rev:\s*(\S+)", block, flags=_re.M)
+    rows = []
+    for ln in block.splitlines():
+        if not ln.startswith("id="):
+            continue
+        rows.append(dict(p.split("=", 1) for p in ln.split(" | ") if "=" in p))
+    return (rm.group(1) if rm else "unknown"), rows
+
+
+def preflight(chain: str, ref: str) -> None:
+    """Gate a resource-blocker claim against the invariant registry (read-only).
+    A blocked capability/dependency step whose needs/retry names a registry domain must cite
+    the registry rev AND record the invariant's preflight check in its artifact. Exit 0 = pass
+    (or not-applicable), 2 = RED (claim invalid) or UNKNOWN (conflicting rows route to owner)."""
+    path, data = load(chain)
+    _, step = step_for(data, ref)
+    if step.get("status") != "blocked" or step.get("blocker_type") not in ("capability", "dependency"):
+        print(f"preflight: {step['id']} n/a (not a blocked resource claim)")
+        return
+    rev, rows = registry_invariants()
+    hay = f"{step.get('needs', '')} {step.get('retry', '')}".lower()
+    matched = [r for r in rows if r.get("id", "").split(".")[0].lower() in hay]
+    if not matched:
+        print(f"preflight: {step['id']} n/a (no registry domain named)")
+        return
+    by_scope_domain: dict = {}
+    for r in rows:
+        by_scope_domain.setdefault((r.get("scope"), r.get("id", "").split(".")[0]), []).append(r)
+    for (scope, domain), group in by_scope_domain.items():
+        if len({g.get("preflight") for g in group}) > 1 and len({g.get("precedence") for g in group}) == 1:
+            die(f"preflight UNKNOWN: conflicting registry rows for {scope}/{domain} at equal "
+                f"precedence — route to {group[0].get('owner')} window, both rows preserved")
+    art = step.get("artifact") or step.get("progress_artifact")
+    body = ""
+    if art:
+        for cand in (Path(str(art)),
+                     Path(os.environ.get("MESH_GENOME", str(Path(__file__).resolve().parent.parent))) / str(art)):
+            try:
+                body = cand.read_text()
+                break
+            except OSError:
+                continue
+    problems = []
+    if f"rev: {rev}" not in body and f"rev:{rev}" not in body and rev not in body:
+        problems.append(f"artifact cites no registry rev (want {rev})")
+    for r in matched:
+        check = (r.get("preflight") or "").split("+")[0].strip().split()[0]
+        if check and check not in body:
+            problems.append(f"artifact records no '{check}' preflight for {r.get('id')}")
+    if problems:
+        die(f"preflight RED for {step['id']}: " + "; ".join(problems))
+    print(f"preflight: {step['id']} PASS (rev {rev}, {[r.get('id') for r in matched]})")
 
 
 def unblock(chain: str, ref: str, event: str, internal: bool = False) -> None:
@@ -1448,10 +1508,65 @@ def resume_cleared_parent(data: dict, step: dict) -> None:
     unblock(parent_chain, parent_step, event, internal=True)
 
 
-def recovery_owner(owner: str) -> str | None:
-    """Choose a live mind that can repair a resolver blocked by its owner."""
-    candidates = sorted(n for n in live_owners() - {owner} if _is_mind_window(n))
-    return candidates[0] if candidates else None
+def drained_resolver(candidate: dict) -> bool:
+    """True when a terminal resolver was closed by an authorized drain.
+
+    A drain closes a resolver because the blocker is decided to be irreducible, not
+    because an automatic attempt failed. Without this, the sweep treats the drain as
+    a failed attempt and mints a fresh successor for the same epoch, so the drain
+    only renames the row it closed.
+    """
+    steps = candidate.get("steps", [])
+    index = candidate.get("current", 0)
+    if not isinstance(index, int) or not (0 <= index < len(steps)):
+        return False
+    return DRAIN_MARKER in (steps[index].get("rejected_reason") or "")
+
+
+def root_unblock_prerequisite(data: dict) -> str:
+    """Walk `unblock_parent` ancestry to the deepest non-unblock chain.
+
+    Legacy resolver records can outlive their parent chain, so an unreadable
+    ancestor ends the walk and names the last chain that was still resolvable.
+    """
+    records = task_records()
+    current = data
+    seen = set()
+    root = data.get("unblock_parent") or "-"
+    while current and current.get("chain", "").startswith("unblock/"):
+        if current["chain"] in seen:
+            break
+        seen.add(current["chain"])
+        parent = current.get("unblock_parent")
+        if not parent:
+            break
+        root = parent
+        record = records.get(parent)
+        current = record.get("data") if record else None
+    return root
+
+
+def meta_unblock_yield(data: dict, step: dict) -> None:
+    """Record once that a blocked resolver stops here instead of minting a resolver.
+
+    The 2026-09-16 inventory (~/.mesh/evidence/unblock-mess-20260916/inventory.md)
+    found 275 of 627 unblock steps (95 still open) were resolvers minted for other
+    resolvers: the sweep matched every blocked step, including `unblock/` chains,
+    so a resourceless resolver minted a successor instead of parking. A resolver's
+    blocker is the original task's prerequisite, so another resolver adds a hop and
+    a queue row without adding authority. One deduped [yield] names the root
+    prerequisite; the ancestry cap stays as a backstop for legacy records.
+    """
+    if data.get("unblock_meta_yield"):
+        return
+    message = (f"{step['id']}: blocker is itself an unblock resolver; no resolver is minted "
+               f"for recovery work. Root prerequisite={root_unblock_prerequisite(data)}; its exact "
+               f"owner still owes an artifact-backed result or an evidenced block with the exact "
+               f"retry edge (retry={step.get('retry', 'unspecified')}, "
+               f"ancestry-depth={unblock_depth(data)} cap={MAX_UNBLOCK_DEPTH})")
+    if emit("yield", message):
+        data["unblock_meta_yield"] = now()
+        save(path_for(data["chain"]), data)
 
 
 def report_unblock_attempt_exhaustion(data: dict) -> None:
@@ -1472,18 +1587,14 @@ def report_unblock_attempt_exhaustion(data: dict) -> None:
 
 
 def ensure_unblock_task(data: dict, step: dict) -> str | None:
-    """Materialize one resolver, or a cross-mind resolver for blocked resolvers."""
+    """Materialize exactly one resolver, never a resolver for a resolver."""
     owner = step.get("owner")
     if not owner:
         return None
-    resolver_owner = owner
     if data.get("chain", "").startswith("unblock/"):
-        if unblock_depth(data) >= MAX_UNBLOCK_DEPTH:
-            return None
-        resolver_owner = recovery_owner(owner)
-        if not resolver_owner:
-            emit("yield", f"{step['id']}: blocked resolver has no other live mind for recovery")
-            return None
+        meta_unblock_yield(data, step)
+        return None
+    resolver_owner = owner
     identity = unblock_identity(owner, step, data.get("chain", ""))
     existing = [other for _, candidate in chain_states()
                 if candidate.get("unblock_for") == identity
@@ -1501,7 +1612,8 @@ def ensure_unblock_task(data: dict, step: dict) -> str | None:
     # next sweep issue exactly one fresh attempt after a failed one.
     retryable = [candidate for candidate in existing
                  if candidate.get("status") in ("complete", "rejected")
-                 and not cleared_unblock_event(candidate, candidate.get("steps", [])[candidate.get("current", 0)])]
+                 and not cleared_unblock_event(candidate, candidate.get("steps", [])[candidate.get("current", 0)])
+                 and not drained_resolver(candidate)]
     if existing and not retryable:
         return existing[0]["chain"]
     if retryable:
@@ -2053,8 +2165,11 @@ def test() -> None:
         env = os.environ.copy(); env.update({"MESH_DIR": str(root / "mesh"), "MESH_TASK_DIR": str(root / "mesh" / "chains"),
             "MESH_TASK_CHAT_CMD": str(fake_chat), "MESH_TASK_HANDOFF_CMD": str(fake_h),
             "MESH_TASK_CHAT_LOG": str(board), "MESH_TASK_HANDOFF_LOG": str(handoffs), "MESH_TASK_ACTOR": "alpha"})
-        def run(*args: str, expect: int = 0):
-            got = subprocess.run([sys.executable, __file__, *args], env=env, text=True,
+        def run(*args: str, expect: int = 0, env_extra: dict | None = None):
+            e = dict(env)
+            if env_extra:
+                e.update(env_extra)
+            got = subprocess.run([sys.executable, __file__, *args], env=e, text=True,
                                  capture_output=True)
             if got.returncode != expect:
                 die(f"self-test command {' '.join(args)} rc={got.returncode}: {got.stderr.strip()}", 1)
@@ -2336,6 +2451,41 @@ def test() -> None:
             die(f"self-test dispatch --retry exhausted nothing at cap 0: {cap_out.stdout.strip()}", 1)
         env.pop("MESH_TASK_DISPATCH_RETRIES")
         env["MESH_TASK_ACTOR"] = "alpha"
+        # preflight gate (operator/constant-forgetting-20260916): a blocked resource claim
+        # naming a registry domain is RED until its artifact cites the rev and records the
+        # check; a recorded one passes; conflicting rows render UNKNOWN to the owner.
+        pf_plan = root / "pf.tsv"
+        pf_plan.write_text("alpha\tgpu-step\tresolve gpu contention\n")
+        run("create", "preflight-demo", str(pf_plan))
+        run("take", "preflight-demo", "gpu-step")
+        run("block", "preflight-demo", "gpu-step", "capability", "gpu vram contention", "event:gpu-free")
+        red = run("preflight", "preflight-demo", "gpu-step", expect=2)
+        if "preflight RED" not in red.stderr:
+            die("self-test preflight accepted a check-less resource claim", 1)
+        pf_art = root / "pf-artifact.md"
+        pf_art.write_text("rev: 20260916.1\n\nollama ps: empty; managed-ownership read: mesh-owned.\n")
+        run("resume", "preflight-demo", "gpu-step", "gpu-check-recorded")
+        run("progress", "preflight-demo", "gpu-step", str(pf_art), "await gpu free", "2026-09-17T00:00:00Z")
+        run("block", "preflight-demo", "gpu-step", "capability", "gpu vram contention", "event:gpu-free")
+        if "PASS" not in run("preflight", "preflight-demo", "gpu-step").stdout:
+            die("self-test preflight rejected a recorded check", 1)
+        pf_art.write_text("rev: 20000101.0\n\nollama ps: empty.\n")
+        run("resume", "preflight-demo", "gpu-step", "gpu-check-rerecorded")
+        run("progress", "preflight-demo", "gpu-step", str(pf_art), "await gpu free", "2026-09-17T00:00:00Z")
+        run("block", "preflight-demo", "gpu-step", "capability", "gpu vram contention", "event:gpu-free")
+        stale = run("preflight", "preflight-demo", "gpu-step", expect=2)
+        if "no registry rev" not in stale.stderr:
+            die("self-test preflight accepted a stale rev", 1)
+        conflict_genome = root / "conflict-genome"
+        conflict_genome.mkdir()
+        (conflict_genome / "MESH.md").write_text(
+            "# C\n- `mesh:1` — node-owned x\n\n```invariant-registry\nrev: 1\n"
+            "id=gpu.a | owner=tg | scope=node | precedence=10 | source=s | preflight=ollama ps\n"
+            "id=gpu.b | owner=tg | scope=node | precedence=10 | source=s | preflight=nvidia-smi\n```\n")
+        unknown = run("preflight", "preflight-demo", "gpu-step", expect=2,
+                      env_extra={"MESH_GENOME": str(conflict_genome)})
+        if "UNKNOWN" not in unknown.stderr:
+            die("self-test preflight resolved a conflict instead of routing UNKNOWN", 1)
     print("mesh-task: smoke-test ok (ordered tasks, independent pickup, exact owner, leases, blockers, artifacts)")
 
 
@@ -2345,7 +2495,7 @@ def main(argv: list[str]) -> None:
         print("       plan.tsv rows: owner<TAB>step<TAB>description (priority 0) or owner<TAB>step<TAB>priority<TAB>description")
         print("       independent <chain> <step> <reason> (owner attests a later step can proceed while the current step is blocked)")
         print("       mesh-task progress <chain> <step> <artifact> <next-action> <next-update> | reprioritize <chain> <step> <priority> | annotate <chain> <step> <tags> <design_artifact> | block <chain> <step> <type> <needs> <retry>")
-        print("       mesh-task reject <chain> <step> <reason> | recover <chain> <step> <reactivate|hold> <artifact> <reason> | wait-for <chain> <step> <prerequisite-task> | clear-wait <chain> <step> <reason> | resume <chain> <step> <event> | dispatch <chain> | dispatch --retry [--limit=N] | reschedule <chain> | reschedule-task <task> | unblock-sweep <owner> | reassign-owner <old> <new> <reason> | reassign <chain> <new-owner> <reason> | status <chain> | reconcile <owner> | --test")
+        print("       mesh-task reject <chain> <step> <reason> | recover <chain> <step> <reactivate|hold> <artifact> <reason> | wait-for <chain> <step> <prerequisite-task> | clear-wait <chain> <step> <reason> | resume <chain> <step> <event> | dispatch <chain> | dispatch --retry [--limit=N] | reschedule <chain> | reschedule-task <task> | unblock-sweep <owner> | reassign-owner <old> <new> <reason> | reassign <chain> <new-owner> <reason> | status <chain> | reconcile <owner> | preflight <chain> <step> | --test")
         print("       mesh-task replay --json  (read structured task-state records from chat.log)")
         print("       mesh-task queue --dispatch [--owner <mind>]  (canonical task-ledger dispatch order; optional exact-mind scope)")
         print("       mesh-task import | rebuild  (import existing chains; rebuild disposable caches)")
@@ -2397,6 +2547,7 @@ def main(argv: list[str]) -> None:
             elif command == "reprioritize" and len(argv) == 4: reprioritize(*argv[1:])
             elif command == "annotate" and len(argv) == 5: annotate(*argv[1:])
             elif command == "block" and len(argv) == 6: block(*argv[1:])
+            elif command == "preflight" and len(argv) == 3: preflight(*argv[1:])
             elif command == "wait-for" and len(argv) == 4: wait_for(*argv[1:])
             elif command == "clear-wait" and len(argv) >= 4: clear_wait(argv[1], argv[2], " ".join(argv[3:]))
             elif command == "resume" and len(argv) == 4: unblock(*argv[1:])
