@@ -40,6 +40,9 @@
 #
 # Usage:
 #   mesh-claim <key> [--ttl <sec>]   claim <key> (refuses if someone else holds a LIVE claim; exit 2)
+#   mesh-claim --wait <key> [--ttl <sec>] [--timeout <sec>]  wait until free, then claim
+#   (leases: a successful claim also writes ~/.mesh/claims/<sha1(key)>.json
+#   {key,owner,epoch,ttl}; --done/--yield remove it. Board posts are the lock.)
 #   mesh-claim --done <key>          mark your claim complete
 #   mesh-claim --yield <key>         release your claim without completing
 #   mesh-claim --check <key>         status only, no post — prints verdict, sets exit code:
@@ -113,6 +116,11 @@ SEP=" :: "                                    # mesh-chat field separator (ts<2s
 # is never read as liveness by anything — and MESH_CLAIM_STRIKE_DIR gives --test its own dir so the
 # suite never touches the real strike state.
 STRIKE_DIR="${MESH_CLAIM_STRIKE_DIR:-$HOME/.mesh/claim-idle-strikes}"
+# File-backed claim leases: a local (per-node) durable record of claims THIS node
+# successfully took. The board stays the lock (visibility + cross-node); the lease
+# file is the crash-recovery / fast-local-check companion. Written on successful
+# claim, removed on done/yield. MESH_CLAIM_DIR gives --test its own dir.
+CLAIM_DIR="${MESH_CLAIM_DIR:-$HOME/.mesh/claims}"
 IDLE_STRIKES_REQUIRED="${MESH_CLAIM_IDLE_STRIKES:-2}"   # sweeps of IDLE needed before "abandoned"
 IDLE_MIN_SPAN="${MESH_CLAIM_IDLE_MIN_SPAN:-300}"        # min seconds between counted strikes (sweep cadence is 10m)
 # HELD-INCAPABLE hold bound (chat-review/rate-limited-owner-reads-live {#4cdb7881}). A quota-shed owner
@@ -162,6 +170,20 @@ _idle_strikes() {  # <key> <claim_epoch> <artifact_mtime> <now> -> prints count
   printf '%s|%s|%s|%s\n' "$ce" "$mt" "$cnt" "$last" > "$file" 2>/dev/null
   printf '%s\n' "$cnt"
 }
+
+# --- file-backed leases ------------------------------------------------------------
+_lease_path() { printf '%s/%s.json' "$CLAIM_DIR" "$(printf '%s' "${1:-}" | sha1sum | awk '{print $1}')"; }
+_lease_write() {  # <key> <ttl> -> write lease json; 0 ok
+  local key="${1:-}" ttl="${2:-$DEFAULT_TTL}" now ep f
+  now="$(date +%s)"; ep=$(( now + ttl ))
+  mkdir -p "$CLAIM_DIR" 2>/dev/null || return 1
+  f="$(_lease_path "$key")"
+  printf '{"key":%s,"owner":%s,"epoch":%s,"ttl":%s,"expires":%s}\n' \
+    "$(printf '%s' "$key" | jq -Rs . 2>/dev/null || printf '"%s"' "$key")" \
+    "$(printf '%s' "$WHO" | jq -Rs . 2>/dev/null || printf '"%s"' "$WHO")" \
+    "$now" "$ttl" "$ep" > "$f.tmp" 2>/dev/null && mv "$f.tmp" "$f"
+}
+_lease_remove() { rm -f "$(_lease_path "${1:-}")" 2>/dev/null; return 0; }
 
 # --- pure: an artifact key is a single token, never free text (no spaces), bounded, sane charset ----
 valid_key() {  # <key> -> 0 valid / 1 invalid
@@ -544,6 +566,22 @@ case "${1:-}" in
     WHO="otheruser/mesh-chat@h"; _done_gate gk-caller-key 0; [ $? -eq 2 ] \
       || f="$f donegate-genuinely-other-user-not-refused (a truly different user must still be refused)"
     BOARD="$_gk_orig_board"; WHO="$_gk_orig_who"; rm -f "$_gk_board"
+    # --- file-backed claim leases -------------------------------------------------
+    # sandboxed via MESH_CLAIM_DIR so the suite never touches real lease state.
+    _cl_lease_dir="$(mktemp -d)"; _cl_orig_claimdir="$CLAIM_DIR"; CLAIM_DIR="$_cl_lease_dir"
+    _lk="lease-test-key"; _lease_write "$_lk" 60
+    _lf="$(_lease_path "$_lk")"
+    [ -f "$_lf" ] || f="$f lease-file-missing"
+    grep -qF "\"key\"" "$_lf" 2>/dev/null || f="$f lease-no-key-field"
+    grep -qF "\"owner\"" "$_lf" 2>/dev/null || f="$f lease-no-owner-field"
+    grep -qF "\"epoch\"" "$_lf" 2>/dev/null || f="$f lease-no-epoch-field"
+    grep -qF "\"ttl\"" "$_lf" 2>/dev/null || f="$f lease-no-ttl-field"
+    [ "$(grep -o '"ttl": *[0-9]*' "$_lf" | grep -o '[0-9]*')" = 60 ] || f="$f lease-ttl-value"
+    _lease_remove "$_lk"
+    [ ! -f "$_lf" ] || f="$f lease-not-removed"
+    # removing a never-written lease must be a silent no-op
+    _lease_remove "never-claimed-key" || f="$f lease-remove-rc"
+    CLAIM_DIR="$_cl_orig_claimdir"; rm -rf "$_cl_lease_dir"
     # owner_liveness DEAD-SHELL (chat-review/shed-pane-dead-shell-misclassified 2026-07-07): a shed/
     # killed owner's window must age its claim as STALE, same as plain DEAD (exit 5) — NOT fall
     # through to the default branch's LIVE (DEAD-SHELL never textually contains "IDLE"). Stub
@@ -960,12 +998,41 @@ case "${1:-}" in
     force=0; [ "${3:-}" = "--force" ] && force=1
     _done_gate "$key" "$force" || exit 2
     _strike_reset "$key"   # the key's lifecycle ended; a later re-claim starts its strike count clean
+    _lease_remove "$key"   # drop our local lease file (no-op if never written here)
     _post "[claim-done] $key"; echo "released (done): $key"; exit 0 ;;
 
   --yield)
     key="${2:-}"; valid_key "$key" || { echo "mesh-claim: invalid key: '$key'" >&2; exit 64; }
     _strike_reset "$key"
+    _lease_remove "$key"
     _post "[yield] $key"; echo "yielded: $key"; exit 0 ;;
+
+  --wait)
+    # mesh-claim --wait <key> [--ttl <sec>] [--timeout <sec>]: block until the key is
+    # free (unclaimed or stale) then claim it. Polls _resolve; default timeout 300s.
+    # Board posts stay the lock — exactly one [claim] post on success, nothing on timeout.
+    key="${2:-}"; shift 2 2>/dev/null || true
+    ttl="$DEFAULT_TTL"; timeout=300
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --ttl) ttl="${2:-$DEFAULT_TTL}"; shift 2 ;;
+        --timeout) timeout="${2:-300}"; shift 2 ;;
+        *) echo "mesh-claim --wait: unknown arg '$1'" >&2; exit 64 ;;
+      esac
+    done
+    valid_key "$key" || { echo "mesh-claim: invalid key (artifact id, no spaces): '$key'" >&2; exit 64; }
+    start="$(date +%s)"; interval=2
+    while :; do
+      set -- $(_resolve "$key"); verdict="$1"; owner="${3:-}"
+      case "$verdict" in
+        theirs|expired|held-incapable)
+          now="$(date +%s)"; [ $(( now - start )) -ge "$timeout" ] \
+            && { echo "mesh-claim --wait: '$key' still held by $owner after ${timeout}s" >&2; exit 2; }
+          sleep "$interval" ;;
+        yours) echo "already yours: $key (re-claim is a no-op; not re-posting)"; exit 1 ;;
+        *) _post "[claim] $key ttl=$ttl"; _lease_write "$key" "$ttl"; echo "claimed: $key (ttl=${ttl}s)"; exit 0 ;;
+      esac
+    done ;;
 
   ""|-h|--help)
     sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
@@ -985,6 +1052,6 @@ case "${1:-}" in
       # keeps HELD-INCAPABLE from being STALE wearing a nicer word.
       held-incapable) echo "mesh-claim: '$key' held by $owner — its window is RATE-LIMITED (quota wall / keepalive shed), so it can neither tend nor release this right now. Standing down. It becomes reclaimable on its own once the hold is spent (TTL + ${INCAPABLE_HOLD}s); --force only if you mean to take live work." >&2; exit 2 ;;
       yours)   echo "already yours: $key (re-claim is a no-op; not re-posting)"; exit 1 ;;   # debounce: no spam
-      *)       _post "[claim] $key ttl=$ttl"; echo "claimed: $key (ttl=${ttl}s)"; exit 0 ;;   # unclaimed or stale → take it
+      *)       _post "[claim] $key ttl=$ttl"; _lease_write "$key" "$ttl"; echo "claimed: $key (ttl=${ttl}s)"; exit 0 ;;   # unclaimed or stale → take it
     esac ;;
 esac
