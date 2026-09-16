@@ -57,7 +57,7 @@ class BlockedSelfUnblockTests(unittest.TestCase):
         self.command("create", "autonomous", str(plan), actor="alpha")
         description = self.records()["autonomous"]["data"]["steps"][0]["description"]
         self.assertIn("missing-prerequisite recovery:", description)
-        self.assertIn("reuse an exact active prerequisite task or create and link one", description)
+        self.assertIn("reuse an exact active prerequisite task or create/link one", description)
         self.assertIn("Reject only invalid, duplicate, out-of-scope, or unsafe work", description)
 
     def records(self):
@@ -87,6 +87,22 @@ class BlockedSelfUnblockTests(unittest.TestCase):
         self.assertEqual({r["steps"][0]["owner"] for r in resolvers}, {"alpha"})
         self.assertTrue(all("narrowest safe in-scope" in r["steps"][0]["description"]
                             for r in resolvers))
+
+    def test_unblock_resolver_carries_parent_operational_context(self):
+        plan = Path(self.tmp.name) / "context.tsv"
+        plan.write_text("alpha\tinspect\tDiagnose camera backend; artifact=docs/camera.md\n")
+        self.command("create", "context", str(plan), actor="alpha")
+        self.command("take", "context", "inspect", actor="alpha")
+        self.command("progress", "context", "inspect", str(TASK),
+                     "rerun camera probe", "2026-09-11T01:00:00Z", actor="alpha")
+        self.command("block", "context", "inspect", "capability",
+                     "camera probe timed out", "after USB recovery", actor="alpha")
+        resolver = self.resolvers()[0]["steps"][0]["description"]
+        self.assertIn("parent=context/inspect", resolver)
+        self.assertIn("parent-description=Diagnose camera backend; artifact=docs/camera.md", resolver)
+        self.assertIn(f"parent-progress-artifact={TASK}", resolver)
+        self.assertIn("parent-next-action=rerun camera probe", resolver)
+        self.assertIn("parent-ask=-", resolver)
 
     def test_operator_input_assumes_consent_and_derives_exact_action_packet(self):
         self.make_active("operator-input-policy")
@@ -142,27 +158,26 @@ class BlockedSelfUnblockTests(unittest.TestCase):
         self.command("take", resolver, "resolve", actor="alpha")
         self.assertIn("resolve [active]", self.command("status", resolver).stdout)
 
-    def test_blocked_resolver_gets_cross_mind_recovery_and_exact_resume(self):
+    def test_blocked_resolver_mints_no_nested_resolver_and_owner_resumes_directly(self):
+        """A blocked resolver is terminal; its owner keeps the direct resume path."""
         self.make_active("blocked")
         self.command("block", "blocked", "inspect", "dependency", "input", "event:ready", actor="alpha")
         resolver = self.resolvers()[0]["chain"]
         self.command("take", resolver, "resolve", actor="alpha")
         self.command("block", resolver, "resolve", "dependency", "backend", "event:backend-ready", actor="alpha")
 
-        nested = [r for r in self.resolvers() if r["chain"] != resolver]
-        self.assertEqual(len(nested), 1)
-        self.assertEqual(nested[0]["steps"][0]["owner"], "beta")
-        self.assertEqual(nested[0]["unblock_parent"], resolver)
+        # No cross-mind successor is minted for a resolver: the recursion ends here.
+        self.assertEqual([r for r in self.resolvers() if r["chain"] != resolver], [])
+        self.assertIn("resolve [blocked]", self.command("status", resolver).stdout)
+        self.assertIn("blocked [blocked]", self.command("status", "blocked").stdout)
+        self.assertIn("blocker is itself an unblock resolver", self.events.read_text())
 
-        nested_chain = nested[0]["chain"]
-        self.command("take", nested_chain, "resolve", actor="beta")
-        artifact = TASK
-        self.command("done", nested_chain, "resolve", str(artifact),
-                     "unblock=cleared event=backend-ready", actor="beta")
+        # The exact owner still has the direct path: resume on the evidenced retry event.
+        self.command("resume", resolver, "resolve", "backend-ready", actor="alpha")
         self.assertIn("resolve [active]", self.command("status", resolver).stdout)
         self.assertIn("blocked [blocked]", self.command("status", "blocked").stdout)
 
-    def test_sweep_backfills_recovery_for_legacy_blocked_resolver(self):
+    def test_sweep_mints_no_recovery_for_legacy_blocked_resolver(self):
         resolver = "unblock/alpha/legacy-resolver"
         self.seed_ledger({
             "version": 2, "chain": resolver, "ask": None,
@@ -176,47 +191,35 @@ class BlockedSelfUnblockTests(unittest.TestCase):
                         "blocker_type": "dependency", "needs": "backend",
                         "retry": "event:backend-ready"}]
         })
-        self.command("unblock-sweep", actor="witness")
-        self.assertEqual(len([r for r in self.resolvers() if r.get("unblock_parent") == resolver]), 1)
+        swept = self.command("unblock-sweep", actor="witness")
+        self.assertIn("unblock-sweep owner=all created=0", swept.stdout)
+        self.assertEqual([r for r in self.resolvers() if r.get("unblock_parent") == resolver], [])
+        self.assertIn("blocker is itself an unblock resolver", self.events.read_text())
 
-    def test_sweep_retries_after_resolver_reports_unresolved_blocker(self):
+    def test_blocked_resolver_gets_no_unresolved_retry_successor(self):
         self.make_active("blocked")
         self.command("block", "blocked", "inspect", "dependency", "input", "event:ready", actor="alpha")
         resolver = self.resolvers()[0]["chain"]
         self.command("take", resolver, "resolve", actor="alpha")
         self.command("block", resolver, "resolve", "dependency", "backend", "event:backend-ready", actor="alpha")
-        nested = next(r for r in self.resolvers() if r["chain"] != resolver)
-        self.command("take", nested["chain"], "resolve", actor="beta")
-        artifact = TASK
-        self.command("done", nested["chain"], "resolve", str(artifact),
-                     "unblock=blocked reason=full backend still absent", actor="beta")
 
-        self.command("unblock-sweep", actor="witness")
-        retries = [r for r in self.resolvers() if r.get("unblock_parent") == resolver]
-        self.assertEqual(len(retries), 2)
-        self.assertEqual(sum(r["status"] == "open" for r in retries), 1)
-        self.assertEqual(max(r.get("unblock_attempt", 1) for r in retries), 2)
+        swept = self.command("unblock-sweep", actor="witness")
+        self.assertIn("unblock-sweep owner=all created=0", swept.stdout)
+        self.assertEqual([r for r in self.resolvers() if r.get("unblock_parent") == resolver], [])
+        self.assertEqual(len(self.resolvers()), 1, self.resolvers())
 
-    def test_sweep_backoffs_repeated_unresolved_retry_without_new_evidence(self):
+    def test_repeated_sweep_on_blocked_resolver_is_idempotent_and_yields_once(self):
+        """The backoff still bounds recovery; it no longer nests resolvers."""
         self.make_active("blocked")
         self.command("block", "blocked", "inspect", "dependency", "input", "event:ready", actor="alpha")
         resolver = self.resolvers()[0]["chain"]
         self.command("take", resolver, "resolve", actor="alpha")
         self.command("block", resolver, "resolve", "dependency", "backend", "event:backend-ready", actor="alpha")
-        nested = next(r for r in self.resolvers() if r["chain"] != resolver)
-        self.command("take", nested["chain"], "resolve", actor="beta")
-        artifact = TASK
-        self.command("done", nested["chain"], "resolve", str(artifact),
-                     "unblock=blocked reason=backend still absent", actor="beta")
-        self.command("unblock-sweep", actor="witness")
-        retry = next(r for r in self.resolvers()
-                     if r.get("unblock_parent") == resolver and r["chain"] != nested["chain"])
-        self.command("take", retry["chain"], "resolve", actor="beta")
-        self.command("done", retry["chain"], "resolve", str(artifact),
-                     "unblock=blocked reason=backend still absent", actor="beta")
-        self.command("unblock-sweep", actor="witness")
-        retries = [r for r in self.resolvers() if r.get("unblock_parent") == resolver]
-        self.assertEqual(len(retries), 2)
+        for _ in range(3):
+            swept = self.command("unblock-sweep", actor="witness")
+            self.assertIn("unblock-sweep owner=all created=0", swept.stdout)
+        self.assertEqual(len(self.resolvers()), 1, self.resolvers())
+        self.assertEqual(self.events.read_text().count("blocker is itself an unblock resolver"), 1)
 
     def test_sweep_migrates_legacy_blocked_parent_with_terminal_old_resolver(self):
         parent = {"version": 2, "chain": "legacy", "ask": None,

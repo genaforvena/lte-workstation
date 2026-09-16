@@ -94,23 +94,47 @@ class RecoveryGrowthTests(unittest.TestCase):
             f"2026-09-11T00:00:00Z  fixture  ::  {encode(state, 1)}" for state in states
         ) + "\n")
 
-    def test_recovery_depth_is_bounded_after_one_cross_mind_hop(self):
+    def test_blocked_resolver_mints_no_second_resolver_and_names_the_root(self):
+        """Recovery ends at the source: a resolver is terminal, not a new chain head.
+
+        Before 2026-09-16 the sweep matched every blocked step, including `unblock/`
+        chains, so a resolver that could not clear its blocker minted a cross-mind
+        successor. That is what produced the 89 stuck depth-2 rows and the 95-node
+        meta pile measured in ~/.mesh/evidence/unblock-mess-20260916/inventory.md.
+        """
         self.make_active("parent")
         self.command("block", "parent", "work", "dependency", "input", "event:ready")
         first = self.resolvers()[0]
+        self.assertEqual(first["steps"][0]["owner"], "alpha")
         self.command("take", first["chain"], "resolve", actor="alpha")
         self.command("block", first["chain"], "resolve", "dependency", "backend", "event:backend")
-        second = next(r for r in self.resolvers() if r["chain"] != first["chain"])
-        self.assertEqual(second["steps"][0]["owner"], "beta")
 
-        self.command("take", second["chain"], "resolve", actor="beta")
-        self.command("block", second["chain"], "resolve", "dependency", "runner", "event:runner",
-                     actor="beta")
         self.command("unblock-sweep", actor="witness")
-        resolvers = self.resolvers()
-        self.assertEqual(len(resolvers), 2, resolvers)
-        self.assertIn(f"{second['chain']} [blocked]", self.command("status", second["chain"]).stdout)
-        self.assertIn("recovery-depth-cap=2", (self.root / "chat-events.log").read_text())
+        self.assertEqual(len(self.resolvers()), 1, self.resolvers())
+        events = (self.root / "chat-events.log").read_text()
+        self.assertIn("blocker is itself an unblock resolver; no resolver is minted", events)
+        self.assertIn("Root prerequisite=parent", events)
+        self.assertIn(f"{first['chain']} [blocked]", self.command("status", first["chain"]).stdout)
+        self.assertIn("parent [blocked]", self.command("status", "parent").stdout)
+
+    def test_drained_resolver_is_terminal_and_gets_no_automatic_successor(self):
+        """A drain closes a row for good; it is not a failed attempt to retry.
+
+        Without this, the sweep reads the drain as attempt 1 failing and mints an
+        attempt 2 for the same epoch, so draining the backlog renames it instead of
+        settling it.
+        """
+        self.make_active("parent")
+        self.command("block", "parent", "work", "dependency", "input", "event:ready")
+        first = self.resolvers()[0]
+        self.command("take", first["chain"], "resolve")
+        self.command("reject", first["chain"], "resolve",
+                     "operator-drained 2026-09-16: prerequisite is an irreducible external "
+                     "condition; parent keeps its typed block", actor="alpha")
+        swept = self.command("unblock-sweep", actor="witness")
+        self.assertIn("unblock-sweep owner=all created=0", swept.stdout)
+        self.assertEqual(len(self.resolvers()), 1, self.resolvers())
+        self.assertIn("parent [blocked]", self.command("status", "parent").stdout)
 
     def test_sweep_does_not_duplicate_while_a_resolver_is_open(self):
         self.seed_blocked_parent_with_attempts(["complete", "open", "open"])
