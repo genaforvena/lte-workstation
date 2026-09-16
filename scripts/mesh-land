@@ -236,13 +236,16 @@ post_overlap_alert(){
 # Git landing is single-writer work. A slow candidate suite can approach the cadence; without a
 # process lock the next cron tick enters the same index/worktree and turns slowness into corruption
 # risk. Refuse the overlap before candidate enumeration and leave the exact reason on the board.
-if [ "${1:-}" = --autoland ]; then
+# Every landing mutation is a single-writer operation.  Manual --apply used to skip this guard,
+# so two steward loops could commit/deploy against one index while the cadenced --autoland arm was
+# also running; the result was a dirty worktree, partial landing, and misleading per-batch evidence.
+if [ "${1:-}" = --autoland ] || [ "${1:-}" = --apply ]; then
   mkdir -p "$(dirname "$LAND_RUN_LOCK")"
   exec 8>"$LAND_RUN_LOCK"
   if command -v flock >/dev/null 2>&1 && ! flock -n 8; then
-    _overlap="mesh-land: autoland overlap refused — previous run still active past the next cadence boundary"
+    _overlap="mesh-land: ${1#--} overlap refused — previous landing writer still holds the single-writer lock"
     echo "$_overlap" >&2
-    post_overlap_alert
+    [ "${1:-}" = --autoland ] && post_overlap_alert
     exit 1
   fi
 fi
@@ -1031,6 +1034,29 @@ autoland_excuse(){
   local _rb; _rb="$(rollback_excuse "$1")"
   [ -n "$_rb" ] && { printf '%s' "$_rb"; return; }
   is_substrate "$1" && { printf 'substrate'; return; }
+  # Receipt gate (2026-09-16): a receipt file lands only if it names a state
+  # change, a measurement, or a failure with a retry edge. Proof-of-work-only
+  # ("stale, PASS, nothing changed") belongs in a ledger line / rollup.
+  case "${1#"$REPO"/}" in task-receipts/*|docs/task-receipts/*)
+    _rg="$REPO/scripts/mesh-receipt-gate"
+    [ -x "$_rg" ] || _rg="$(dirname "$(readlink -f "$0")")/mesh-receipt-gate"
+    _rg_out="$("$_rg" "$1" 2>&1)" || { printf 'receipt HOLD: %s' "$_rg_out"; return; } ;;
+  esac
+  # New-tool quality gates (2026-09-16): a NEW (untracked) script candidate must
+  # also pass the substrate, tmux-session, and test-quality lints. Tracked
+  # files are grandfathered — the lints surface as audit findings, never as
+  # land blocks on existing tools. New tools have no such excuse.
+  case "${1#"$REPO"/}" in scripts/*)
+    if ! git -C "$REPO" ls-files --error-unmatch "${1#"$REPO"/}" >/dev/null 2>&1; then
+      _qg_d="$(dirname "$(readlink -f "$0")")"
+      _qg_out="$("$_qg_d/mesh-substrate-lint" "$1" 2>&1)"; _qg_rc=$?
+      [ "$_qg_rc" = 1 ] && { printf 'substrate HOLD: %s' "$_qg_out"; return; }
+      _qg_out="$("$_qg_d/mesh-tmux-lint" "$1" 2>&1)"; _qg_rc=$?
+      [ "$_qg_rc" = 1 ] && { printf 'tmux HOLD: %s' "$_qg_out"; return; }
+      _qg_out="$("$_qg_d/mesh-test-quality-gate" --tool "$1" 2>&1)"; _qg_rc=$?
+      [ "$_qg_rc" = 1 ] && { printf 'test-quality HOLD: %s' "$_qg_out"; return; }
+    fi ;;
+  esac
   is_doc "$1" && return 0                                   # prose/data auto-land on settle+tracked (no --test)
   is_repo_test "$1" && { printf 'test artifact requires steward verification'; return 0; }
   # A companion asset has no --test of its own; the gate is its PARENT tool's, which compiles it.
@@ -1199,6 +1225,45 @@ close_out_cleared(){
     esac
   done < "$state"
   mv -f "$tmp" "$state"
+}
+
+# route_dirty_worktree_task — turn a dirty landing surface into one canonical, exact-owner incident
+# task.  Candidate enumeration alone is insufficient: staged interlopers, in-flight edits, and files
+# outside the current rotating batch can otherwise remain dirty with no task until a human notices.
+# The report and signature are derived from HEAD plus porcelain status, so repeats are idempotent and
+# a changed worktree gets a new task instead of mutating the old task's evidence.
+route_dirty_worktree_task(){
+  local status sig state report chain plan out rc previous task_cmd task_log
+  status="$(git -C "$REPO" status --porcelain=v1 --untracked-files=all 2>/dev/null | LC_ALL=C sort)"
+  [ -n "$status" ] || return 0
+  report="${MESH_LAND_DIRTY_REPORT:-${MESH_DIR:-$HOME/.mesh}/mesh-land-dirty-report.tsv}"
+  state="${MESH_LAND_DIRTY_TASK_STATE:-${MESH_DIR:-$HOME/.mesh}/.mesh-land-dirty-task}"
+  mkdir -p "$(dirname "$report")" "$(dirname "$state")"
+  {
+    printf 'observed_at\thead\tstatus\n'
+    while IFS= read -r line; do
+      [ -n "$line" ] && printf '%s\t%s\t%s\n' "$(date -u +%FT%TZ)" \
+        "$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo unknown)" "$line"
+    done <<< "$status"
+  } > "$report"
+  sig="$(printf '%s\n%s\n' "$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)" "$status" | sha256sum | awk '{print $1}')"
+  previous="$(cat "$state" 2>/dev/null || true)"
+  [ "$sig" = "$previous" ] && return 0
+  chain="land-dirty-${sig:0:16}"
+  task_cmd="${MESH_LAND_TASK_CMD:-mesh-task}"
+  command -v "$task_cmd" >/dev/null 2>&1 || [ -x "$task_cmd" ] || { echo "mesh-land: dirty report ready but mesh-task is absent: $report" >&2; return 1; }
+  plan="$(mktemp "${MESH_DIR:-$HOME/.mesh}/.mesh-land-dirty-plan.XXXXXX")" || return 1
+  printf 'genome\tguard-dirty-worktree\t100\tReconcile the dirty landing surface recorded in %s; identify each staged, unstaged, and untracked path, preserve in-flight work, and land verified semantic units through mesh-land. priority:incident\n' "$report" > "$plan"
+  out="$(MESH_TASK_ACTOR=mesh-land timeout 20 "$task_cmd" create "$chain" "$plan" "ask:land-dirty-${sig:0:16}" 2>&1)"; rc=$?
+  rm -f "$plan"
+  if [ "$rc" -ne 0 ] && ! printf '%s' "$out" | grep -q "already exists"; then
+    echo "mesh-land: failed to create dirty-worktree incident task: $out" >&2
+    return 1
+  fi
+  printf '%s\n' "$sig" > "${state}.tmp.$$" && mv -f "${state}.tmp.$$" "$state"
+  task_log="${MESH_LAND_DIRTY_TASK_LOG:-${MESH_DIR:-$HOME/.mesh}/mesh-land-dirty-task.log}"
+  printf '%s\t%s\t%s\n' "$(date -u +%FT%TZ)" "$chain" "$report" >> "$task_log"
+  echo "mesh-land: dirty-worktree incident=$chain report=$report" >&2
 }
 
 # cite_for_candidate: $1=basename → echoes "cites: chat-review/<slug>" if the recent board carries a
@@ -2760,6 +2825,7 @@ fi
 # rollback, or test work. Large trees previously paid all of those per-path costs before the
 # bulk branch could notice that the diagnostic needed aggregation.
 if [ "${1:-}" = --check ]; then
+  route_dirty_worktree_task || true
   _raw_total="$(printf '%s\n' "$_enum" | awk 'NF{n++} END{print n+0}')"
   _raw_threshold="${MESH_LAND_CHECK_BULK_THRESHOLD:-100}"
   if [ "$_raw_total" -gt "$_raw_threshold" ]; then
