@@ -27,8 +27,7 @@ asks for permission where the mesh already has authority is a dispatch failure.
 
 **Fan out independent review work.** When the witness queue has non-overlapping
 `witness-chat-range-review-*` ranges, claim and advance up to three at once (or the
-declared pending/resource cap, if lower), and delegate each range's read-only review to
-a separate subagent. Witness itself retains `mesh-task` claims and settlement, board
+declared pending/resource cap, if lower), and reviews each range directly. Witness retains `mesh-task` claims and settlement, board
 posts, artifact inspection, and independent verification. Do not serialize independent
 ranges behind a one-active-task rule.
 
