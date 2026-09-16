@@ -101,6 +101,10 @@ Every claimed capability must produce a real artifact. Not "the camera works." A
 JPEG on disk. Not "audio recorded." A playable `.m4a`. Not "node online." A `tailscale status`
 entry with `Online: true`.
 
+Mesh-owned resource contention, missing dependencies, and recoverable runtime failures are autonomous work:
+read and apply [[mesh-unblock|.agents/skills/mesh-unblock/SKILL.md]] before treating them as blockers or
+asking the operator to intervene.
+
 - **Every completed Tiny Fleet update is committed and pushed to the repository; a failed push stays explicitly open until verified.** [[tiny-fleet-updates-must-land-in-the-repository]]
 
 **Each rule below is one line and stands on its own; the case that earned it lives whole in
