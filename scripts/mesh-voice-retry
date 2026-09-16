@@ -1,0 +1,174 @@
+#!/usr/bin/env python3
+"""Re-transcribe consumer for the lossless voice-intake retry ledger.
+
+Reads ~/.mesh/voice-retry.log rows (update_id + audio digest + spool/held paths),
+transcribes the surviving material via `mesh-voice-rx --retranscribe` (offline,
+spool-first, no Telegram poll, no instance-lock fight), and delivers recovered
+text to ~/.mesh/voice-recovered/<digest>.txt with a `recovered=` row in the same
+ledger. A second failure does NOT append a duplicate retry row (--retranscribe
+runs with no_row): this consumer owns the ledger and records its own outcome.
+
+Why a subprocess, not an import: mesh-voice-rx exits 0 at import time when the
+live receiver holds the instance lock, so in-process reuse is structurally
+impossible beside the poller. The --retranscribe entry point is the contract.
+
+Usage:
+  mesh-voice-retry --consume            # all unrecovered rows with surviving audio
+  mesh-voice-retry --backfill <held.oga> [update_id]  # audio retained, no retry row
+  mesh-voice-retry --test               # offline: parse/select/deliver + garbage-audio
+                                        # failure path (ffmpeg fails deterministically,
+                                        # no STT model needed)
+"""
+import hashlib
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+MESH = Path(os.environ.get("MESH_DIR", str(Path.home() / ".mesh")))
+RETRY_LOG = Path(os.environ.get("MESH_VOICE_RETRY_LOG", str(MESH / "voice-retry.log")))
+RECOVERED_DIR = MESH / "voice-recovered"
+VOICE_RX = Path(__file__).resolve().parent / "mesh-voice-rx"
+
+
+def parse_rows(text):
+    """Parse retry-ledger rows into dicts. Malformed lines are skipped, never fatal."""
+    rows = []
+    for line in text.splitlines():
+        if "update=" not in line or "digest=" not in line:
+            continue
+        kv = dict(re.findall(r"(\w+)=(\S+)", line))
+        if "digest" in kv:
+            rows.append(kv)
+    return rows
+
+
+def material_for(row):
+    """First surviving audio copy: spool, then held. None when both are gone."""
+    for key in ("spool", "held"):
+        p = row.get(key)
+        if p and p not in ("gone", "none") and Path(p).exists():
+            return p
+    return None
+
+
+def already_recovered(digest):
+    if not RETRY_LOG.exists():
+        return False
+    return f"digest={digest} recovered=" in RETRY_LOG.read_text()
+
+
+def digest_of(path):
+    h = hashlib.sha256()
+    with open(str(path), "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()[:16]
+
+
+def retranscribe(audio, update_id):
+    """Run the offline entry point. Returns (ok, text)."""
+    try:
+        got = subprocess.run([str(VOICE_RX), "--retranscribe", str(audio), str(update_id)],
+                             text=True, capture_output=True, timeout=900)
+    except subprocess.TimeoutExpired:
+        return (False, "[voice: retranscribe timed out at 900s — retry when load drops]")
+    txt = (got.stdout or "").strip()
+    return (got.returncode == 0 and not txt.startswith("[voice:"), txt or "[voice: empty retranscribe output]")
+
+
+def deliver(digest, text, src):
+    RECOVERED_DIR.mkdir(exist_ok=True)
+    out = RECOVERED_DIR / f"{digest}.txt"
+    out.write_text(text + "\n")
+    with open(str(RETRY_LOG), "a") as f:
+        f.write(f"recovered digest={digest} file={out} src={src} chars={len(text)}\n")
+    return out
+
+
+def consume_row(row):
+    digest = row.get("digest", "unknown")
+    if already_recovered(digest):
+        return ("skip", "already recovered", digest)
+    audio = material_for(row)
+    if audio is None:
+        return ("failure", "spool and held copies both gone — retry when audio resurfaces", digest)
+    ok, txt = retranscribe(audio, row.get("update") or "backfill")
+    if not ok:
+        return ("failure", f"{txt} — retry edge: {audio} retained, re-run --consume", digest)
+    out = deliver(digest if digest != "unknown" else digest_of(audio), txt, audio)
+    return ("recovered", str(out), digest)
+
+
+def main(argv):
+    if "--test" in argv:
+        import tempfile
+        ok = True
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            global RETRY_LOG, RECOVERED_DIR
+            RETRY_LOG = td / "retry.log"
+            RECOVERED_DIR = td / "recovered"
+            (td / "retry.log").write_text(
+                "2026-09-16T00:00:00Z update=1 file_uid=u1 failure=empty wav_secs=5 "
+                f"digest=abc123 spool={td}/s.oga held={td}/h.oga\n"
+                "garbage line without keys\n"
+                "2026-09-16T00:00:01Z update=2 file_uid=u2 failure=x wav_secs=1 "
+                "digest=dead00 spool=gone held=none\n")
+            rows = parse_rows((td / "retry.log").read_text())
+            if len(rows) != 2:
+                print("FAIL (row parse)"); ok = False
+            (td / "h.oga").write_bytes(b"OGGS")
+            if material_for(rows[0]) != str(td / "h.oga"):
+                print("FAIL (spool-missing falls back to held)"); ok = False
+            if material_for(rows[1]) is not None:
+                print("FAIL (gone material must be None)"); ok = False
+            # Garbage audio exercises the typed-failure path honestly: ffmpeg fails
+            # deterministically, no STT model or credential involved.
+            st, detail, dg = consume_row(rows[0])
+            if st != "failure" or "ffmpeg" not in detail:
+                print(f"FAIL (garbage audio must fail typed, got {st}: {detail[:60]})"); ok = False
+            st2, _, _ = consume_row(rows[1])
+            if st2 != "failure":
+                print("FAIL (missing audio must fail typed)"); ok = False
+            # Failure must not duplicate the retry row (no_row contract).
+            if (td / "retry.log").read_text().count("\n") != 2:
+                print("FAIL (failed consume appended a duplicate retry row)"); ok = False
+            # Delivery writes text + recovered row.
+            out = deliver("abc123", "hello operator", str(td / "h.oga"))
+            if not out.exists() or "recovered=" not in (td / "retry.log").read_text():
+                print("FAIL (deliver did not write text + recovered row)"); ok = False
+        print("smoke-test: ok" if ok else "smoke-test: FAILED")
+        return 0 if ok else 1
+    if "--backfill" in argv:
+        i = argv.index("--backfill")
+        held = argv[i + 1]
+        uid = argv[i + 2] if len(argv) > i + 2 else "backfill"
+        if not Path(held).exists():
+            print(f"backfill: {held} gone — typed failure, retry when audio resurfaces")
+            return 2
+        row = {"update": uid, "file_uid": "backfill",
+               "digest": digest_of(held), "spool": "gone", "held": held}
+        st, detail, dg = consume_row(row)
+        print(f"backfill: {st} digest={dg} {detail[:300]}", flush=True)
+        return 0 if st == "recovered" else 1
+    if "--consume" in argv:
+        if not RETRY_LOG.exists():
+            print("consume: no retry ledger — nothing to do")
+            return 0
+        rec = fail = skip = 0
+        for row in parse_rows(RETRY_LOG.read_text()):
+            st, detail, dg = consume_row(row)
+            print(f"consume: {st} digest={dg} {detail[:100]}", flush=True)
+            rec += st == "recovered"
+            fail += st == "failure"
+            skip += st == "skip"
+        print(f"consume: recovered={rec} failure={fail} skip={skip}")
+        return 0 if fail == 0 else 1
+    print(__doc__)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
