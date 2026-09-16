@@ -25,3 +25,21 @@ Recovery action:
   the scheduled reflex line, and rerun `mesh-doctor --test`.
 
 The parent remains open/waiting; no claim is silently active.
+
+## Post-gate completion — 2026-09-16T06:35Z
+
+The named prerequisite reached `HEAD` (`scripts/mesh-nic-physical` is present in
+`git ls-tree HEAD`). The parent was resumed with the event:
+`autoland/senses-nic-physical-wire-20260916/land-senses-nic-physical DONE; scripts/mesh-nic-physical present in HEAD; proceed with mesh-autowire --apply and mesh-doctor --test`.
+
+Verification after resume:
+
+- `mesh-autowire --apply` completed; `~/.mesh/reflexes.cron:352` now contains
+  `*/5 * * * * $HOME/.local/bin/mesh-nic-physical --edge >> $HOME/.mesh/nic-physical.log 2>&1 # autowired 2026-09-16`.
+- `mesh-doctor --test` returned exit `0`; its smoke-test completed `ok`.
+- `scripts/mesh-nic-physical --test` returned exit `0` with a real sysfs read:
+  `iface=enp42s0`.
+- Fresh `scripts/mesh-nic-physical --json` at `2026-09-16T06:35:46Z` produced
+  `UP-CLEAN`, `carrier=1`, `tx_carrier_errors=0`, `carrier_changes=2`.
+
+The sensor/reflex wiring acceptance condition is satisfied.
