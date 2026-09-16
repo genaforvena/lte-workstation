@@ -65,3 +65,9 @@ applied it and `mesh-operator-intake.path` restarted successfully. A subsequent 
 after creating `operator-intake/85bad20df34521d4154f620c/reconcile`; canonical replay contains that
 exact tagged task, the pass reported `missing=0`, and the service's configured `Restart=on-failure`
 with `RestartSec=60` preserved retry. This distinguishes a retried post-create timeout from a lost ask.
+
+During final receipt landing, commit `19a07d80` inherited 68 unrelated paths that other minds had
+already staged in the shared index. No path was reverted or discarded. The exact corrective review
+`shared-index-commit-audit-20260916/audit-commit-19a07d80` is assigned to `genome`, tagged
+`audit-followthrough`, and dispatched; it must disposition every path and route any illegitimate or
+test-temporary artifact to an exact-owner corrective task without rewriting shared history.
