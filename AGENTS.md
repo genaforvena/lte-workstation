@@ -1,5 +1,9 @@
 # lte-workstation — Codex operator contract
 
+Read [`MESH.md`](MESH.md) first. It is the editable, engine-neutral procedural contract shared by
+Codex/OpenCode-style minds; this file is the repository bootstrap and `CLAUDE.md` remains the full
+mesh doctrine.
+
 This repository is a distributed mesh of machines and agent minds. Codex is a first-class mind in
 that mesh. Work from the repository root unless the task explicitly names another node.
 
