@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# orphan-ok: sourced predicate library (never wired to cron by design).
 # mesh-pidfile.sh — THE ONE PREDICATE deciding whether a pid read back from a persisted file is
 # still the process that wrote it. Sourced; never wired to cron.
 #
