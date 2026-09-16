@@ -126,6 +126,10 @@ the case is the evidence, and mixing them is what made this section a wall nobod
   reachability is not producing, and a hollow organ runs cron-green while its artifact goes stale.
   [[a-sensor-test-must-assert-a-real-hardware-read]]
 - **A gate you have not seen FAIL is not a gate** — break the fix, watch it go red, restore it.
+- **Every gate renders on a top pane, or it is a blind change** — a verdict visible only in
+  `chat.log` was never rendered; wire each gate into `mesh-doctor` so `.doctor-fails` carries it
+  to the health pane.
+  [[every-gate-renders-on-a-top-pane|memory/every-gate-renders-on-a-top-pane.md]]
 - **A `--test` must never write the log a human or watchdog reads for liveness** — it forges the
   evidence it exists to check; give the dry-run its own log, and assert a FRESH artifact per
   direction. [[a-dry-run-that-writes-the-liveness-log-forges-its-own-evidence]]
