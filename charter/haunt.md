@@ -48,8 +48,6 @@ Standing decisions, each earned rather than assumed:
   just as well by canaries that are safe in a public repo, safe in CI, and safe
   to hand a stranger. A version that needs real harm is a different project with
   different obligations, and it would not measure better.
-- **A subagent's report is a claim, not an artifact** — check the file, the tape,
-  the test seen red then green.
 
 ## What it owes
 
