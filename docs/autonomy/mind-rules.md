@@ -1,1 +1,1 @@
-Compatibility pointer: the canonical editable procedural contract is [`MESH.md`](../../MESH.md).
+Compatibility pointer: the canonical editable procedural contract is [`AGENTS.md`](../../AGENTS.md) ("Mesh operating contract" section).
