@@ -24,10 +24,11 @@ mesh-study-launch 204eb988a48d284ad14ae29bfc27bd635c6979065eded5f9eb4805aea0b281
 
 ## Verification evidence
 
-At `2026-09-16T06:34:30Z`, the live probes observed an RTX 3060 with `9102 MiB` free of
-`12288 MiB`; `ollama ps` showed its header and no resident model rows. The user services
-`ollama.service`, `mesh-room-gigaam.service`, and `mesh-voice-clone.service` were all active
-before and after verification. No live model or service was stopped by these checks.
+At `2026-09-16T06:59:58Z`, the live probes observed an RTX 3060 with `6099 MiB` free of
+`12288 MiB`; `ollama ps` showed `tiny-fleet-v1:latest` at `100% GPU`, expiring in about one
+second. `ollama.service`, `mesh-room-gigaam.service`, and `mesh-voice-clone.service` were all
+inactive, and `mesh-gpu-lease --status` reported `GPU_LEASE=none`. No live model or service was
+stopped by these checks.
 
 Focused commands and results:
 
@@ -35,7 +36,7 @@ Focused commands and results:
 python3 tests/test-mesh-gpu-lease.py       PASS
 scripts/mesh-gpu-lease --test              PASS
 MESH_DIR=<temporary directory> scripts/mesh-heavy-run --test  PASS
-tests/test-mesh-study-launch.sh            PASS
+bash tests/test-mesh-study-launch.sh       PASS
 ```
 
 The isolated heavy-run test exercised the durable GPU queue, bounded selective lease,
@@ -44,13 +45,24 @@ and invocation of the durable heavy queue. This verifies the deployed wiring and
 non-mutation boundary; no GPU-bound production job was launched because the verification task
 does not authorize one.
 
+The installed scheduler wiring was checked directly: `mesh-heavy-drain --run` runs every two
+minutes, `mesh-study-autowake --run` every five minutes, and `mesh-gpu-lease --sweep` every minute.
+Repository and installed SHA-256 values matched for `mesh-study-launch`, `mesh-heavy-run`, and
+`mesh-gpu-lease`.
+
 ## Delegation
 
-`genome-preemption-audit` was launched for a read-only repository audit. Its final report was
-inspected, but the result is corroborative only; the source paths, hashes, focused tests, and
-live probes above were personally inspected and are the completion evidence.
+`genome-dispatch-audit` was launched for a read-only repository audit. Its final report was
+personally inspected, then corroborated by rerunning the source checks, live probes, scheduler
+inspection, and hashes above. The worker changed no files and claimed no task.
 
 ## Result
 
 The preemption mechanism is wired and deployed through the approved heavy-job admission path,
-with selective restoration and durable retry. Live production state remained unchanged.
+with selective restoration and durable retry. The live dispatch wiring is corroborated, but the
+acceptance condition requiring a resulting real preemption/unblock event remains unproven because
+the managed services are inactive/masked and no authorized contention job can safely be launched.
+Keep this task active. Exact retry edge: when a managed service is active and an authorized GPU
+job creates a real shortfall, rerun the four focused checks plus `ollama ps`,
+`mesh-gpu-lease --status`, and before/after service/model state, then append the resulting
+execution/unblock evidence here.
