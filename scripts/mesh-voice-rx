@@ -53,6 +53,29 @@ VOICE_HOLD_DAYS = float(os.environ.get("MESH_VOICE_HOLD_DAYS", "7"))
 # path its audio landed on (see _log_voice_file). Outlives the bounded hold on purpose — it is the
 # handle by which a note can be re-fetched after its audio is pruned.
 VOICE_FILES_LOG = Path(os.environ.get("MESH_VOICE_FILES_LOG", str(MESH / "voice-in-files.log")))
+# Lossless-intake retry ledger (task operator/voice-intake-recovery-20260916): one row per note
+# whose STT came back empty after local + cloud, keyed by Telegram update_id + sha256 of the
+# audio bytes, pointing at the two surviving copies (spool + hold). A later re-transcribe runs
+# off this row instead of asking the operator to re-send. Append-only; never read by liveness.
+VOICE_RETRY_LOG = Path(os.environ.get("MESH_VOICE_RETRY_LOG", str(MESH / "voice-retry.log")))
+def _log_voice_retry(update_id, file_uid, failure, wav_secs, spool_path, held_path, audio_path):
+    # Best-effort: a retry-row write must never cost the operator his message or raise into poll.
+    try:
+        import hashlib as _hl
+        h = _hl.sha256()
+        with open(str(audio_path), "rb") as _f:
+            for _chunk in iter(lambda: _f.read(65536), b""):
+                h.update(_chunk)
+        digest = h.hexdigest()[:16]
+    except Exception:
+        digest = "unknown"
+    try:
+        with open(str(VOICE_RETRY_LOG), "a") as _f:
+            _f.write(f"{ts()} update={update_id} file_uid={file_uid} failure={failure} "
+                     f"wav_secs={wav_secs} digest={digest} spool={spool_path} held={held_path}\n")
+    except Exception as e:
+        print(f"[voice-rx] retry-row write failed: {str(e)[:80]}", file=sys.stderr)
+    return digest
 SCRUB_CMD = os.environ.get("MESH_LOG_SCRUB_CMD", "mesh-log-scrub")
 
 # Route through mesh-whisper-run (nice+ionice+flock shim, drop-in args) so a voice-note burst can't
@@ -222,6 +245,70 @@ def _whisper_budget(wav, floor=WHISPER_BUDGET_FLOOR, ceiling=WHISPER_BUDGET_CEIL
         return floor
     return int(max(floor, min(ceiling, 60.0 + 3.0 * secs)))
 
+# HANG KILL (2026-09-16): a 21s note sat the whole 240s floor producing ZERO bytes —
+# whisper wedged, not slow, so no floor raise would have helped. whisper.cpp streams progress to
+# stderr; a run silent for this long is killed and retried ONCE, then falls to cloud.
+# Defined up here (above the --test block) so the smoke test can drive it with stub binaries.
+WHISPER_HANG_SECS = int(os.environ.get("MESH_WHISPER_HANG_SECS", "120"))
+
+def _run_whisper(wav, budget, hang_secs=WHISPER_HANG_SECS):
+    """Run local whisper with hang detection. Returns (stdout, rc, hung, timed_out).
+    stderr goes to a temp FILE, never a PIPE (a verbose run would block on a full pipe with
+    nobody reading). Retry is hang-only: a run that makes progress but exceeds budget keeps
+    the budget as its bound — retrying slowness just burns 2x budget for the same answer."""
+    import tempfile as _tf_w
+    hung_seen = False
+    for _attempt in (1, 2):
+        try:
+            with _tf_w.NamedTemporaryFile(prefix="whisper-err-", delete=True) as _ef:
+                try:
+                    _p = subprocess.Popen([str(WHISPER), "-m", str(MODEL), "-f", str(wav),
+                                           "-nt", "-l", "auto"],
+                                          stdout=subprocess.PIPE, stderr=_ef, text=True)
+                except Exception as e:
+                    print(f"[voice-rx] local whisper spawn failed: {str(e)[:80]}", file=sys.stderr)
+                    return "", None, False, False
+                _deadline = time.time() + budget
+                _last_prog = time.time(); _last_size = 0
+                while True:
+                    _rc = _p.poll()
+                    try:
+                        _sz = os.fstat(_ef.fileno()).st_size
+                    except OSError:
+                        _sz = _last_size
+                    if _sz > _last_size:
+                        _last_size = _sz; _last_prog = time.time()
+                    if _rc is not None:
+                        try:
+                            _out = _p.stdout.read() if _p.stdout else ""
+                        except Exception:
+                            _out = ""
+                        return _out, _rc, False, False
+                    _now = time.time()
+                    if _now - _last_prog > hang_secs:
+                        _p.kill()
+                        try:
+                            _p.wait(timeout=10)
+                        except Exception:
+                            pass
+                        hung_seen = True
+                        break  # retry once (attempt 2), else fall out with hung=True
+                    if _now > _deadline:
+                        _p.kill()
+                        try:
+                            _p.wait(timeout=10)
+                        except Exception:
+                            pass
+                        return "", None, False, True
+                    try:
+                        _p.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        pass
+        except Exception as e:
+            print(f"[voice-rx] local whisper error: {str(e)[:80]}", file=sys.stderr)
+            return "", None, False, False
+    return "", None, hung_seen, False
+
 def _instrumental_intro(chent, voiced, dest, heard):
     """The routed line for a note whose TEXT says speech but whose AUDIO says instrument. Pure, so
     the contract that matters is assertable offline: it CARRIES the transcript verbatim (a note the
@@ -347,6 +434,31 @@ if len(sys.argv) > 1 and sys.argv[1] == '--test':
         _t(_whisper_budget(Path(_bd) / "absent.wav") == 240, "an unmeasurable wav must fall to the floor")
         _t(WHISPER_BUDGET_CEILING <= 600, "ceiling raised past what WatchdogSec=900 can carry")
         _t(abs(_wav_seconds(_mkwav(60)) - 60) < 0.1, "wav duration from size is wrong")
+
+    # 7b) A HUNG whisper is killed on silence and retried once (2026-09-16: a 21s note sat the
+    # whole 240s floor producing zero bytes). Stub binaries stand in for whisper: one silent
+    # (must die at hang_secs, not budget), one chatty-then-stuck (progress resets the clock —
+    # must die at budget, never flagged hung). Red if silence burns the full budget.
+    with _tf_b.TemporaryDirectory() as _hd:
+        _w5 = Path(_hd) / "w5.wav"; _w5.write_bytes(b"\0" * (44 + 5 * 32000))
+        _w_old, _m_old = WHISPER, MODEL
+        _silent = Path(_hd) / "silent.sh"
+        _silent.write_text("#!/bin/sh\nsleep 30\n"); _silent.chmod(0o755)
+        _chatty = Path(_hd) / "chatty.sh"
+        _chatty.write_text("#!/bin/sh\nfor i in $(seq 1 15); do echo progress >&2; sleep 2; done\n"); _chatty.chmod(0o755)
+        WHISPER, MODEL = _silent, ""
+        _t0 = time.time()
+        _o, _r, _h, _hto = _run_whisper(_w5, budget=60, hang_secs=3)
+        _dt = time.time() - _t0
+        _t(_h and not _hto and _o == "", "silent run not flagged hung")
+        _t(_dt < 30, f"silent run burned {_dt:.0f}s instead of dying on silence (the 21s-note fault)")
+        WHISPER, MODEL = _chatty, ""
+        _t0 = time.time()
+        _o2, _r2, _h2, _to2 = _run_whisper(_w5, budget=8, hang_secs=5)
+        _dt2 = time.time() - _t0
+        _t(not _h2 and _to2, "chatty-then-stuck run misread as hung instead of timed-out")
+        _t(_dt2 >= 8, "chatty run died before its budget (progress must reset the silence clock)")
+        WHISPER, MODEL = _w_old, _m_old
 
     # 8) DEAFNESS IS CHARGED IN UP-TIME (2026-08-26). Driven against a FABRICATED boot record built
     # from this node's real `last -xF`, replaying the five verdicts that were 100% false and the one
@@ -915,6 +1027,31 @@ if len(sys.argv) > 1 and sys.argv[1] == '--test-voice-hold':
             if pa is None or pb is None or pa == pb or not (pa.exists() and pb.exists()):
                 print("smoke-test: FAIL (same-second notes collide — one recording overwrites another)")
                 ok = False
+        # 4. STT-failure retry row (task operator/voice-intake-recovery-20260916): an empty
+        #    transcript must leave a durable row keyed by update + audio digest pointing at the
+        #    surviving copies — a red fixture (STT fails) still leaves a playable nonzero source
+        #    artifact reference and an exact retry handle.
+        if ok:
+            _rl_old = VOICE_RETRY_LOG; VOICE_RETRY_LOG = td / "voice-retry.log"
+            src2 = td / "note.oga"; src2.write_bytes(b"OGGSnote-bytes")
+            d = _log_voice_retry(879098783, "AgADuniq2", "empty-after-fallback", "21",
+                                 str(td / "spool" / "879098783.oga"), str(src2), str(src2))
+            got = VOICE_RETRY_LOG.read_text() if VOICE_RETRY_LOG.exists() else ""
+            import hashlib as _hl2
+            if (not got or "update=879098783" not in got or "AgADuniq2" not in got
+                    or "failure=empty-after-fallback" not in got or str(src2) not in got
+                    or f"digest={_hl2.sha256(b'OGGSnote-bytes').hexdigest()[:16]}" not in got
+                    or d != _hl2.sha256(b'OGGSnote-bytes').hexdigest()[:16]):
+                print("smoke-test: FAIL (no keyed retry row on STT failure — the note is unrecoverable)")
+                ok = False
+            if ok:
+                d2 = _log_voice_retry(1, "u", "local-timeout", "unknown",
+                                      "gone", "none", td / "missing.oga")
+                got2 = VOICE_RETRY_LOG.read_text()
+                if d2 != "unknown" or got2.count("\n") != 2 or "digest=unknown" not in got2:
+                    print("smoke-test: FAIL (retry row must still land with digest=unknown when audio is gone)")
+                    ok = False
+            VOICE_RETRY_LOG = _rl_old
     print("smoke-test: ok" if ok else "smoke-test: FAILED")
     sys.exit(0 if ok else 1)
 
@@ -1097,7 +1234,9 @@ def groq_stt(wav):
         print(f"[voice-rx] groq_stt failed: {str(e)[:80]}", file=sys.stderr)
         return None
 
-def transcribe(file_id, doc=None, spooled=None):
+def transcribe(file_id, doc=None, spooled=None, retry_ctx=None):
+    # retry_ctx: {"update_id": int|None, "file_uid": str|None} — threaded from handle() so an
+    # STT failure can leave a durable retry row keyed by update + audio digest (lossless intake).
     oga = MESH / "voice-in.oga"; wav = MESH / "voice-in.wav"
     if spooled and Path(spooled).exists():
         # SPOOL-FIRST consumer. The bytes are already on disk; re-downloading them would re-run the
@@ -1117,16 +1256,22 @@ def transcribe(file_id, doc=None, spooled=None):
     local_admit_refused = False; local_timed_out = False
     budget = _whisper_budget(wav); wav_secs = _wav_seconds(wav)
     try:
-        out = subprocess.run([str(WHISPER), "-m", str(MODEL), "-f", str(wav), "-nt", "-l", "auto"],
-                             capture_output=True, text=True, timeout=budget)
-        # rc 75 = the whisper-run admission gate REFUSED (node too memory-pressured to run the ~2GB
-        # job) → stdout is empty but the audio was NEVER transcribed. Do NOT surface that as an
-        # "empty transcript" (a FAKE — the operator DID speak). Fall through to the cloud fallback.
-        local_admit_refused = (out.returncode == 75)
-        txt = clean_transcript(" ".join(out.stdout.split()).strip())
+        _wout, _wrc, _whung, _wto = _run_whisper(wav, budget)
+        if _wto:
+            local_timed_out = True; txt = ""
+        elif _whung:
+            # Both attempts wedged on silence — name it like a timeout (the operator waited
+            # the budget either way) and fall through to cloud.
+            local_timed_out = True; txt = ""
+        else:
+            # rc 75 = the whisper-run admission gate REFUSED (node too memory-pressured to run
+            # the ~2GB job) → stdout is empty but the audio was NEVER transcribed. Do NOT surface
+            # that as an "empty transcript" (a FAKE — the operator DID speak). Fall to cloud.
+            local_admit_refused = (_wrc == 75)
+            txt = clean_transcript(" ".join((_wout or "").split()).strip())
     except subprocess.TimeoutExpired:
-        # CRITICAL: never let a slow transcription RAISE — it would propagate to poll_once and stop
-        # the offset advancing, wedging the WHOLE inbound queue on one note. Fall through to cloud.
+        # Must not happen (_run_whisper bounds itself) — kept so a slow transcription can never
+        # RAISE into poll_once and wedge the WHOLE inbound queue on one note.
         local_timed_out = True; txt = ""
     except Exception as e:
         print(f"[voice-rx] local whisper error: {str(e)[:80]}", file=sys.stderr)
@@ -1236,7 +1381,18 @@ def transcribe(file_id, doc=None, spooled=None):
         except OSError: pass
     if txt:
         return txt
-    # Still empty after local + cloud. Be HONEST about WHY: an admission-refused local run means the
+    # Still empty after local + cloud. Leave the lossless retry row FIRST (held copy exists,
+    # working copies unlinked just above): update_id + audio digest + both surviving paths +
+    # failure class, so a later re-transcribe runs off this row instead of a re-send.
+    _rc = retry_ctx or {}
+    _failure = ("admit-refused" if local_admit_refused
+                else "local-timeout" if local_timed_out else "empty-after-fallback")
+    _spool = spooled if (spooled and Path(str(spooled)).exists()) else "gone"
+    _log_voice_retry(_rc.get("update_id"), _rc.get("file_uid"), _failure,
+                     (f"{wav_secs:.0f}" if wav_secs is not None else "unknown"),
+                     _spool, held if held else "none",
+                     held if held else (spooled or oga))
+    # Be HONEST about WHY: an admission-refused local run means the
     # operator spoke but the node was too loaded to transcribe and the cloud fallback also failed —
     # tell them to resend as text, never fake a content-free "empty transcript" that reads as "he sent
     # nothing" (the 2026-07-07 incident: 4 real notes surfaced as blanks → operator "Mesh, wtf?!").
@@ -1319,7 +1475,9 @@ def peer_handle(update, msg, frm, who):
     same four bytes. Nothing here writes voice-in.log or pokes the tg mind: this lane is hers."""
     if msg.get("voice"):
         v = msg["voice"]
-        txt = transcribe(v["file_id"], v, spooled=spool_audio_path(update))
+        txt = transcribe(v["file_id"], v, spooled=spool_audio_path(update),
+                         retry_ctx={"update_id": update.get("update_id"),
+                                    "file_uid": (v.get("file_unique_id") if isinstance(v, dict) else None)})
         secs = int(v.get("duration") or 0)
         peer_write(frm, f"[voice {secs}s] {txt}")
         return
@@ -1366,7 +1524,9 @@ def handle(update):
         # transcribed to "(upbeat music)…" garbage and the file DELETED (2026-07-06: operator's 3
         # jam tracks lost — 1 garbled, 2 silently dropped). Audio routes to the inbox branch below.
         fid = msg["voice"]["file_id"]
-        txt = transcribe(fid, msg["voice"], spooled=spool_audio_path(update))
+        _rctx = {"update_id": update.get("update_id"),
+                 "file_uid": (msg["voice"].get("file_unique_id") if isinstance(msg.get("voice"), dict) else None)}
+        txt = transcribe(fid, msg["voice"], spooled=spool_audio_path(update), retry_ctx=_rctx)
         write("VOICE", txt)
         typing_start(); kick_feed(); post_to_board(txt)
     elif msg.get("text"):
