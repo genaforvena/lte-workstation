@@ -42,7 +42,7 @@ def run() -> None:
         fixture = base / "audit.txt"
         fixture.write_text(
             f"OVERDUE\tgenome\t{STALE_TASK}\tlease=2026-09-12T21:34:18Z\n"
-            f"OPEN_UNOWNED\tgenome\t{RECOVERY_TASK}\tcurrent={RECOVERY_TASK} dispatch=sent\n",
+            f"OPEN_UNOWNED\t-\t{RECOVERY_TASK}\tcurrent={RECOVERY_TASK} dispatch=sent\n",
             encoding="utf-8",
         )
         (fakebin / "mesh-task").write_text(
