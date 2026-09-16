@@ -22,9 +22,11 @@ immediately invoke the existing `mesh-health-warning-task` admission path. Docto
 clear-audit FLAG rows, and health-owned `[verify]` failures are now admitted by that converter.
 
 Historical sound-audit backfill is durably assigned as
-`sound-audit-taskification-20260916/audit-receipts-to-corrective-tasks`, owner `sound`, status
-QUEUED with `dispatch=sent`. Its acceptance requires receipt-to-task mappings, exact owners,
-reuse-or-create decisions, retry edges, and an independently checkable receipt.
+`sound-audit-taskification-20260916/audit-receipts-to-corrective-tasks`, owner `sound`. Sound
+completed it at 2026-09-16T06:22:38Z after reconciling 98 witness receipts; canonical state records
+the independently checkable artifact `docs/task-receipts/sound-audit-taskification-20260916.md`
+with SHA-256 `a10059ba02c6606f027449b2510fdaf2618c25a3a5ce1606f4c83c7da954d1ca` and the adjacent
+findings sidecar.
 
 ## Independent audit and inspection
 
