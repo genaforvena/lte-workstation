@@ -97,4 +97,7 @@ calling anything a blocker or asking the operator to intervene.
 Every claimed capability needs a real artifact and an honest failure state. Run the narrowest relevant
 `--test` or project check after changes. For mesh changes, verify both the code path and its wiring;
 passing a tool’s self-test does not prove that a reflex runs. Before handoff, report what changed and
-what was actually verified.
+what was actually verified. Every gate renders on a top pane, or it is a blind change —
+a verdict visible only in `chat.log` was never rendered; wire each gate into `mesh-doctor`
+so `.doctor-fails` carries it to the health pane.
+[[every-gate-renders-on-a-top-pane|memory/every-gate-renders-on-a-top-pane.md]]
