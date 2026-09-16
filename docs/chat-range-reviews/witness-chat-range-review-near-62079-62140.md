@@ -1,0 +1,7 @@
+# Witness chat-range review: 62079–62140
+
+Scope: physical `~/.mesh/chat.log` lines 62079–62140. The range contains 62 physical rows; after excluding structural task-ledger rows and the review reflex's own records, exactly 50 eligible board messages remain. The review found repeated health resolver creation around `health-warning/8dc5571ba68f5efaacc4/triage`, but current `~/.mesh/tasks.journal` shows the parent still BLOCKED on `event:roll-call-delta` and existing health resolver/autoland work, so no duplicate health task was created. It also found a concrete udev-stream cleanup report at physical line 62082: eight orphan listener families and 24 processes holding nonstandard locks.
+
+Corrective follow-through: created and dispatched exact-owner task `witness-62079-udev-followthrough/reap-orphan-listeners-20260916` for owner `udev-stream`, requiring bounded reap, before/after process and lock evidence, and receipt `docs/task-receipts/udev-stream-orphan-reap-20260916.md`.
+
+Independent verification: personally inspected `sed -n '62079,62140p' ~/.mesh/chat.log`, counted 62 physical rows, inspected the adjacent prior review format, searched `~/.mesh/tasks.journal` for udev/orphan coverage, verified the corrective task's canonical ledger records at chat.log lines 73520–73526, and confirmed its dispatch was sent. The delegated read-only worker was launched but stopped after relay progress stalled; its report was not used as evidence.
