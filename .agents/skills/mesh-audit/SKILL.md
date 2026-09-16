@@ -42,6 +42,16 @@ that covers the finding and cite it; otherwise create a corrective task naming t
 owner, acceptance condition, retry edge, and durable artifact path. A finding
 recorded only in a receipt is incomplete.
 
+DETERMINIZE. For every check this audit performed by judgement, ask whether a
+deterministic gate could perform it instead — a script, a lint, a `--test` arm, a
+`mesh-doctor` check. Judgement rots; a gate runs every tick. If the answer is yes,
+the audit owes an exact-owner task to build it (script path, red-then-green proof,
+wiring into the doctor/pane path). If the answer is no, write the one sentence
+saying why this check is irreducibly judgement — "needs a human eye" without the
+reason is not the sentence. An audit that leaves a determinable check as judgement
+is itself a finding (against this audit, actionable, owner: whoever can build the
+gate).
+
 Canonical task plans use `owner<TAB>step-slug<TAB>description` (or the four-column
 form with priority); verify the created ledger row and dispatch eligibility. Mark
 every task that performs an audit, review, reconciliation, or other work promising
