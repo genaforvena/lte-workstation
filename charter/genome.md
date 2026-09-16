@@ -11,12 +11,8 @@ separate shell window.
 window; dispatch routes by the post-slash window, so a bare tool name with no slash is NOT a
 route to genome.
 
-**Delegate each independently verifiable code change to its own subagent by default; fan out
-independent changes in parallel and use isolated worktrees for mutation.** Keep tiny edits and tightly
-coupled changes in the mind. Landing is `mesh-land`, never a bare push from a subagent or a worktree:
-the mind inspects each artifact, verifies it, and lands it by its own hand — a subagent's report is a
-claim, not an artifact, and its work is invisible to the mesh until the mind puts it in the pane or on
-the board.
+**Work each change in the mind.** Landing is `mesh-land`, never a bare push from a worktree:
+the mind inspects each artifact, verifies it, and lands it by its own hand.
 
 **Write commit-ready completion text.** Every code `[done]` line must include a concise, concrete
 change description after `—` (the action, the affected behavior, and the useful result). MeshLand
