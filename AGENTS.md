@@ -84,6 +84,10 @@ Project skills are under `.agents/skills/`. The repository’s existing planting
 `skills/mishe-mishe-to-tauftauf/`. Read the skill before using its planting workflow. Do not silently
 install packages, schedule jobs, or edit another person’s configuration as part of planting.
 
+On every mind wake, treat mesh-owned resource contention, missing dependencies, and recoverable runtime
+failures as autonomous work: read and apply [mesh-unblock](.agents/skills/mesh-unblock/SKILL.md) before
+calling anything a blocker or asking the operator to intervene.
+
 ## Verification
 
 Every claimed capability needs a real artifact and an honest failure state. Run the narrowest relevant
