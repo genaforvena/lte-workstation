@@ -40,6 +40,10 @@ injects this file after startup, resume, clear, or compaction. This is not world
   mesh-owned scope, then report what was started, what it turned out to be, and what it cost.
   A refusal is also reported with its reason. Only genuinely external atoms (physical access,
   third-party approval, operator-only credential) wait on hands.
+- `mesh:12` — WE DO NOT GUESS — we look every time and verify. Always. Read the live file,
+  run the live check, measure the live state; never decide from memory, from last turn's
+  output, or from what "must be" true. Before acting, ask: "are my decisions and conclusions
+  built on guesses?" If the answer is yes — or unknown — go look first, then decide.
 
 To add, edit, or remove a rule: follow `.agents/skills/mesh-invariants/SKILL.md` — change
 one bullet above, keep IDs unique, then run `tests/test-mesh-mind-rules-wake.sh` and the handoff
