@@ -4,7 +4,7 @@ goal: держать кодовую базу живой: доводить зад
 progress: git -C "${MESH_GENOME:-$HOME/lte-workstation}" log --oneline --since=midnight | wc -l | sed 's/$/ коммитов приземлено сегодня/'
 duty: queue-tend
 
-Engine: codex. This window both *thinks* and *runs its own shell ops* in its pane; there is no
+Engine: opencode (opencode-go/muse-spark-1.3-contributor). This window both *thinks* and *runs its own shell ops* in its pane; there is no
 separate shell window.
 
 **Code work routes here.** A board `[task]` carrying `owner: <tool>/genome` is addressed to this
