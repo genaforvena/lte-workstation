@@ -54,8 +54,8 @@ def run() -> None:
         dispatch_repairs: list[list[str]] = []
         omit_bob_unowned = False
         audit = (
-            "OPEN_UNOWNED\talice\towned/work\tdispatch=sent\n"
-            "OPEN_UNOWNED\tcarol\tfailed/work\tdispatch=failed\n"
+            "OPEN_UNOWNED\t-\towned/work\tdispatch=sent\n"
+            "OPEN_UNOWNED\t-\tfailed/work\tdispatch=failed\n"
             "OPEN_UNOWNED\t-\tpool/work\tdispatch=sent\n"
             "RUNNING\tgenome\tgenome/landing\tlease=2030-01-01T00:00:00Z\n"
             "BLOCKED\thaunt\tchain/wait\tdependency\tretry=prerequisite\n"
@@ -201,7 +201,7 @@ def run() -> None:
             def queue_row() -> str:
                 return f"health\t{task_id}\t0\tfixture task\n"
 
-            audit_open = f"OPEN_UNOWNED\thealth\t{task_id}\tdispatch=sent\n"
+            audit_open = f"OPEN_UNOWNED\t-\t{task_id}\tdispatch=sent\n"
             audit_active = f"RUNNING\thealth\t{task_id}\tlease=2030-01-01T00:30:01Z\n"
             audit_owner_busy = (audit_open +
                                 f"RUNNING\thealth\t{kind}/existing\tlease=2030-01-01T00:30:01Z\n")
