@@ -26,15 +26,27 @@ The fresh `mesh-dash --once check` at `2026-09-16T04:38:47Z` returned rc 0 and s
 cache. The load condition makes probe-based claims unreliable; it does not justify a
 substrate or process intervention here.
 
+## Recovery verification (2026-09-16T06:16Z)
+
+The previously blocking prerequisite is now terminal: the exact witness review
+`witness-chat-range-review-near-61134-61195/review` is `done`, with the personally inspected
+receipt and adjacent findings sidecar at:
+
+- `docs/chat-range-reviews/witness-chat-range-review-near-61134-61195.md`
+- `docs/chat-range-reviews/witness-chat-range-review-near-61134-61195.md.findings.json`
+
+The sidecar is schema version 1 and maps its one actionable finding to the exact owner-routed
+task `review-adint-readme-stale-20260916/refresh-stageb-readme`; the other three findings are
+explicitly non-actionable. `MESH_TASK_ACTOR=witness mesh-task reconcile witness` returned exit 0
+with `153 canonical pointer(s)`.
+
 ## Disposition
 
-Typed dependency block: preserve this health warning open pending the exact witness-owned
-review reaching a terminal ledger state and its reconciliation check becoming eligible.
+The original dependency is cleared. The warning's stale reconciliation condition is now
+resolved by the witness review reaching `done`; no substrate action is indicated.
 
-Retry event: witness completes or rejects
-`witness-chat-range-review-near-61134-61195/review`, then rerun the exact witness
-reconciliation check and re-triage this warning. No substrate change or duplicate review
-was created.
+No substrate change or duplicate review was created. The remaining actionable finding belongs
+to `adint`, not health.
 
 ## Verification
 
