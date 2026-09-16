@@ -153,6 +153,15 @@ class ChatRangeReviewTests(unittest.TestCase):
         self.assertIn("no-action", description)
         self.assertIn("explicitly non-actionable", description)
 
+    def test_created_reviews_are_tagged_for_settlement_enforcement(self) -> None:
+        self.add_messages(1)
+        self.run_reflex()
+        self.add_messages(50, base=1)
+        self.run_reflex()
+        records = self.read_tasks()
+        created = next(iter(records.values()))
+        self.assertIn("#tags=audit-followthrough", created["data"]["steps"][0]["description"])
+
     def test_idle_tick_emits_a_run_row(self) -> None:
         self.add_messages(2)
         first = io.StringIO()
