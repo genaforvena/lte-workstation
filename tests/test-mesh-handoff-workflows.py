@@ -22,7 +22,7 @@ with tempfile.TemporaryDirectory() as td:
         assert "An idea does not wait for a go" in context
         assert "living procedures, not set in stone" in context
         assert "adapt and improve" in context
-        for skill in ("mesh-window-turn", "mesh-audit", "mesh-unblock", "mesh-operator-followthrough", "mesh-task-recovery"):
+        for skill in ("mesh-window-turn", "mesh-audit", "mesh-unblock", "mesh-operator-followthrough", "mesh-task-recovery", "mesh-invariants"):
             path = ROOT / ".agents/skills" / skill / "SKILL.md"
             assert str(path) in context, (charter.stem, skill)
             assert path.is_file()
