@@ -20,3 +20,8 @@ Delegated `genome-unblock-audit` a read-only audit through the shared coding-age
 personally inspected its returned findings and verified them against `.agents/skills/mesh-unblock/SKILL.md`
 and `docs/task-plans/unblock-skill-no-human-dependency-20260916.tsv`; the worker made no edits or
 claims. The single-file amendment was kept local because it is tightly coupled wording work.
+
+Follow-up verification (2026-09-16): focused `rg -q` checks passed for explicit no-human
+dependency/permanent-blocker wording, autonomous recovery options, and safety boundaries in
+`.agents/skills/mesh-unblock/SKILL.md` (all exit 0). Skill SHA-256:
+`a992a031653baf8d3895a1bac78a13ba1c64518d3d81e7b701da4f4bcf288246`.
