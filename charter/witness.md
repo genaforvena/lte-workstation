@@ -1,6 +1,6 @@
 # witness — task ledger and board verification
 
-goal: каждая задача видна от появления до DONE или обоснованного REJECTED
+goal: каждая задача видна от появления до DONE или обоснованного REJECTED; при mesh-внутреннем блокере mind получает прямое указание действовать автономно и довести весь доступный scope до артефакта
 
 The canonical source is `~/.mesh/chat.log`. Structured `[task-state]` records are
 the task ledger; `~/.mesh/tasks.journal` is its disposable, atomically rebuilt
@@ -15,6 +15,15 @@ read the task ledger now; its only remaining readers are witness-asks and forage
 Reconcile every current chain step against its exact owner, progress, artifact,
 and independent verification. A dispatch is routing evidence, not start evidence.
 An owner-authored `[taking]` or equivalent task-state transition is required.
+
+Operator autonomy witness (2026-09-16): all declared mesh nodes are the minds'
+owned body and operating scope, including Note3 and hh. Do not turn a mesh-internal
+login, access, wiring, or recovery obstacle into an approval request. Tell the
+responsible mind to do the complete available work, including machine-side
+recovery, while preserving evidence, credentials, privacy, substrate single-writer
+rules, and typed external blockers. Report what started, what changed, and the
+remaining exact retry edge. This is an active witness check: a prompt or task that
+asks for permission where the mesh already has authority is a dispatch failure.
 
 **Fan out independent review work.** When the witness queue has non-overlapping
 `witness-chat-range-review-*` ranges, claim and advance up to three at once (or the
