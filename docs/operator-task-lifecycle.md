@@ -56,11 +56,13 @@ task scope, repository evidence, protocol, and runtime constraints; record the r
 alternatives in an artifact. Use `operator-input` only for a genuinely external authority or
 missing input, not to defer a machine-owned decision.
 
-An expired active lease is not an available queue slot: the one-active-task-per-owner guard will
-also suppress that owner's corrective task. The exact owner must settle the current claim first by
+An expired active lease is not an available queue slot: active claims count toward the configured
+owner capacity (`MESH_TASK_MAX_ACTIVE`, default three). Prefer parallel subagents for independent
+work within that capacity; never impose a one-active-task rule by habit. At capacity, the exact
+owner must settle or renew its current claims by
 recording artifact-backed progress with a real update deadline, or by blocking/rejecting it with a
 concrete reason. Witness routes and verifies this recovery but never impersonates the owner. Once
-the claim is settled, take the already-routed corrective task; do not create a duplicate. If there
+capacity becomes available, take the already-routed corrective task; do not create a duplicate. If there
 are no runnable candidates and no missing resolvers, preserve the explicit blockers and report the
 exact event needed to reopen the frontier instead of manufacturing work.
 
