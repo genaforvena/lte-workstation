@@ -1,4 +1,4 @@
-# Receipts and artifacts moved out of this repository
+# Receipts, artifacts and plan files moved out of this repository
 
 Date: 2026-09-16.
 
@@ -38,9 +38,34 @@ receipt written back into the repo by habit cannot mint a genome incident either
 the evidence root too, so a corpus is not recreated by the next run: `mesh-chat-range-review` names
 `$(mesh-evidence-dir chat-range-reviews)` in the review prompt it hands to witness.
 
+## Scratch plans
+
+Plan files are work **inputs** (`mesh-task create <chain> <plan.tsv>`), not records of finished work, so
+they have their own root rather than living under the evidence root:
+
+| was (in repo) | now |
+|---|---|
+| `docs/task-plans/x.tsv` | `~/.mesh/plans/x.tsv` |
+| `task-plans/x.tsv` | `~/.mesh/plans/x.tsv` |
+| `.mesh-tg-<slug>.plan.tsv` (repo root) | `~/.mesh/plans/.mesh-tg-<slug>.plan.tsv` |
+
+```bash
+mesh-evidence-dir plans                              # → the plans root
+mesh-evidence-dir --resolve docs/task-plans/x.tsv    # → ~/.mesh/plans/x.tsv
+```
+
+The root honours `MESH_PLANS_DIR`, then `$MESH_DIR/plans`, then `~/.mesh/plans`.
+
+Unlike the evidence corpora these were **not** a genome load, and it is worth being exact about why:
+`mesh-land` enumerates *untracked* files only from an explicit allowlist (`scripts/`, `job/`,
+`bootstrap.sh`, `setup.sh`, and the `UNTRACKED_DOC_PATHS` set), which has never listed
+`docs/task-plans/`. The *tracked* arm is broader — it covers `charter/ docs/ task-receipts/ memory/
+skills/ tests/` — so a plan file that is tracked and edited in place does become a landing candidate,
+while a brand-new untracked one does not. Moving them out removes the clutter and that edge together.
+
 ## Ledger note
 
-Ledger rows and earlier receipts that cite the old in-repo paths are **not** rewritten. Resolve them
-with `mesh-evidence-dir --resolve <path>`; the content is preserved under the evidence root (the
+Ledger rows and earlier receipts that cite the old in-repo paths (including `docs/task-plans/x.tsv`) are
+**not** rewritten. Resolve them with `mesh-evidence-dir --resolve <path>`; the content is preserved under the evidence root (the
 migration was verified byte-for-byte). A row whose artifact no longer resolves in-repo is a path to
 resolve, not a lost artifact.
