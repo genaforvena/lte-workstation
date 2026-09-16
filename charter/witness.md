@@ -6,7 +6,7 @@ The canonical source is `~/.mesh/chat.log`. Structured `[task-state]` records ar
 the task ledger; `~/.mesh/tasks.journal` is its disposable, atomically rebuilt
 view for the top pane. The pane also shows the newest 20 raw source lines.
 
-Engine: codex (gpt-5.6-luna; operator 2026-09-12 — witness back on Codex Luna). Data pane: unfinished tasks + raw board tail.
+Engine: opencode (opencode-go/muse-spark-1.3-contributor; operator 2026-09-16). Data pane: unfinished tasks + raw board tail.
 
 On every witness turn, read `tasks.journal`, `chat.log`, and `mesh-task audit`.
 Never cite the retired `mesh-promises` replay as task state (2026-09-12: its
