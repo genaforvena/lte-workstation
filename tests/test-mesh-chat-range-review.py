@@ -107,6 +107,10 @@ class ChatRangeReviewTests(unittest.TestCase):
         self.assertEqual(sum("medium" in key for key in records), 0)
         self.assertEqual(sum("deep" in key for key in records), 0)
 
+    def test_default_pending_cap_is_conservative(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(review.max_pending(), 3)
+
     def test_each_tier_has_its_declared_message_range_and_structured_rows_do_not_count(self) -> None:
         self.assertEqual(dict(review.TIERS), {"near": 50, "medium": 250, "deep": 1000})
         lines = [f"2026-09-12T00:00:00Z mind :: message-{i}" for i in range(1000)]
@@ -133,6 +137,21 @@ class ChatRangeReviewTests(unittest.TestCase):
         self.assertIn("MESSAGE_RE", description)
         self.assertIn("is_source_message", description)
         self.assertIn("Malformed rows that do not match MESSAGE_RE are excluded", description)
+
+    def test_review_prompt_requires_ledger_disposition_for_each_actionable_finding(self) -> None:
+        description = review.description_for(
+            "near", 50, {"start_line": 1, "end_line": 50}, review.chain_for(
+                "near", {"start_line": 1, "end_line": 50}
+            )
+        )
+        self.assertIn("finding-to-ledger mapping", description)
+        self.assertIn("task id, owner, status, artifact/verification", description)
+        self.assertIn("one exact responsible-owner task", description)
+        self.assertIn("existing exact chain/step", description)
+        self.assertIn("current terminal or active state", description)
+        self.assertIn("fully covers the finding", description)
+        self.assertIn("no-action", description)
+        self.assertIn("explicitly non-actionable", description)
 
     def test_idle_tick_emits_a_run_row(self) -> None:
         self.add_messages(2)
