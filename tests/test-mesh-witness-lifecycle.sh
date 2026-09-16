@@ -10,7 +10,7 @@ cat >"$td/bin/mesh-task" <<'EOF'
 printf '%s\n' \
  'DONE	genome	tinyfleet-specialists/audit-current-repo	artifact=/tmp/audit.md' \
  'DONE	witness	tinyfleet-specialists/review-eval-method	artifact=/tmp/review.md' \
- 'OPEN_UNOWNED	genome	tinyfleet-specialists/mood-lora-bench	dispatch=sent' \
+  'OPEN_UNOWNED	-	tinyfleet-specialists/mood-lora-bench	dispatch=sent' \
  'REJECTED	adint	self-adint/device-export	reason=operator-declined' \
  'REJECTED	job	job/operator-ask	reason=duplicate-task' \
  'RUNNING	adint	self-adint/device-export	progress=waiting-on-csv'
