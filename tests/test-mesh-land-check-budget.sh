@@ -72,6 +72,36 @@ wait "$holder" 2>/dev/null || true
 grep -Fq 'autoland overlap refused' "$td/overlap.out"
 grep -Fq '[health-fail] mesh-land: autoland overlap refused' "$td/board"
 
+overlap_board_before="$(grep -Fc '[health-fail] mesh-land: autoland overlap refused' "$td/board")"
+(
+    exec 9> "$td/run.lock"
+    flock 9
+    sleep 5
+) &
+overlap_holder=$!
+for _ in $(seq 1 100); do
+    flock -n "$td/run.lock" true 2>/dev/null || break
+    sleep 0.01
+done
+set +e
+for _ in 1 2; do
+    HOME="$td/home" PATH="$td/bin:$PATH" TEST_BOARD="$td/board" MESH_REPO="$td/repo" \
+        MESH_MANIFEST_READER="$td/manifest-reader.sh" MESH_LAND_RUN_LOCK="$td/run.lock" \
+        MESH_LAND_OVERLAP_STATE="$td/overlap.state" MESH_LAND_OVERLAP_TRACE="$td/overlap.trace" \
+        bash "$repo_root/scripts/mesh-land" --autoland > /dev/null 2>&1
+done
+set -e
+kill "$overlap_holder" 2>/dev/null || true
+wait "$overlap_holder" 2>/dev/null || true
+[[ "$(grep -Fc '[health-fail] mesh-land: autoland overlap refused' "$td/board")" -eq "$(( overlap_board_before + 1 ))" ]] || {
+    echo 'FAIL: repeated overlap emitted a duplicate board health-fail' >&2
+    exit 1
+}
+grep -Fq 'overlap alert suppressed' "$td/overlap.trace" || {
+    echo 'FAIL: repeated overlap was not recorded in the trace' >&2
+    exit 1
+}
+
 HOME="$td/home" PATH="$td/bin:$PATH" TEST_BOARD="$td/board" MESH_REPO="$td/repo" \
     MESH_MANIFEST_READER="$td/manifest-reader.sh" MESH_LAND_SETTLE=0 \
     MESH_LAND_AUTOLAND_BATCH=1 MESH_LAND_AUTOLAND_CURSOR="$td/cursor" \
