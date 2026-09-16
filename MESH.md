@@ -33,10 +33,18 @@ injects this file after startup, resume, clear, or compaction. This is not world
 - `mesh:9` — Every autonomous mutation has a bounded scope, before/after evidence, rollback or
   retry edge, and an artifact. Prefer quarantine/restore over irreversible deletion; never infer
   ownership from a stale task, FYI, process name, or successful self-test.
+- `mesh:10` — Spend internal compute before acting: consider at least two to three distinct
+  approaches, compare them against the task's acceptance, and choose the best with a one-line
+  justification. The first idea that comes to mind is not the answer.
+- `mesh:11` — The mesh decides and informs the operator; it does not seek approvals. Act on
+  mesh-owned scope, then report what was started, what it turned out to be, and what it cost.
+  A refusal is also reported with its reason. Only genuinely external atoms (physical access,
+  third-party approval, operator-only credential) wait on hands.
 
-To add, edit, or remove a rule: change one bullet above, keep IDs unique, then run
-`tests/test-mesh-mind-rules-wake.sh` and the handoff workflow test. No ledger FYI is required to
-make a procedural rule durable; use FYI only to announce the change and its evidence.
+To add, edit, or remove a rule: follow `.agents/skills/mesh-invariants/SKILL.md` — change
+one bullet above, keep IDs unique, then run `tests/test-mesh-mind-rules-wake.sh` and the handoff
+workflow test. No ledger FYI is required to make a procedural rule durable; use FYI only to
+announce the change and its evidence.
 
 ## Invariant registry (operator-owned, enforced read dependency)
 
@@ -47,6 +55,7 @@ precedence render UNKNOWN to the owner window. `mesh-rules --check` validates th
 `mesh-handoff --restore` injects scope-relevant rows + `rev`; `mesh-task preflight` gates claims.
 
 ```invariant-registry
-rev: 20260916.1
+rev: 20260916.2
 id=gpu.mesh-owned.v1 | owner=tg | scope=node | precedence=10 | source=operator-verbatim 2026-09-16 (artifacts/tg-constant-forgetting-20260916.md: mesh-home owns the GPU completely; Ollama/model residency and contention are mesh-owned work) | preflight=ollama ps + managed-ownership read recorded in the task artifact before any GPU/VRAM blocker claim
+id=mesh.decides-informs.v1 | owner=tg | scope=mesh | precedence=10 | source=operator-verbatim 2026-09-16 (no approval wait; mesh decides and lets operator know) | preflight=action started + outcome reported; "waiting for approval" never a state on mesh-owned scope
 ```
