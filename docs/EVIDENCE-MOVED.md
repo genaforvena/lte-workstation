@@ -47,6 +47,8 @@ they have their own root rather than living under the evidence root:
 |---|---|
 | `docs/task-plans/x.tsv` | `~/.mesh/plans/x.tsv` |
 | `task-plans/x.tsv` | `~/.mesh/plans/x.tsv` |
+| `docs/plans/x.tsv` | `~/.mesh/plans/x.tsv` |
+| `docs/x.plan.tsv` | `~/.mesh/plans/x.plan.tsv` |
 | `.mesh-tg-<slug>.plan.tsv` (repo root) | `~/.mesh/plans/.mesh-tg-<slug>.plan.tsv` |
 
 ```bash
