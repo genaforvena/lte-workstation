@@ -16,9 +16,13 @@ with tempfile.TemporaryDirectory() as td:
         assert result.returncode == 0, result.stderr
         context = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
         assert f"Charter for the `{charter.stem}` window" in context
+        assert "Mesh operating contract — every engine, every mind" in context
+        assert "`mesh:3`" in context
+        assert "Standing autonomy orders" in context
+        assert "An idea does not wait for a go" in context
         assert "living procedures, not set in stone" in context
         assert "adapt and improve" in context
-        for skill in ("mesh-window-turn", "mesh-operator-followthrough", "mesh-task-recovery"):
+        for skill in ("mesh-window-turn", "mesh-audit", "mesh-unblock", "mesh-operator-followthrough", "mesh-task-recovery"):
             path = ROOT / ".agents/skills" / skill / "SKILL.md"
             assert str(path) in context, (charter.stem, skill)
             assert path.is_file()
