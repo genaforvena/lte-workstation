@@ -9,6 +9,7 @@ exactly one successor and writes the successor's handoff before posting its task
 from __future__ import annotations
 
 import json
+import errno
 import hashlib
 import calendar
 import contextlib
@@ -84,6 +85,23 @@ COORDINATOR = os.environ.get("MESH_TASK_COORDINATOR", "witness")
 LEASE_SECONDS = int(os.environ.get("MESH_TASK_LEASE_SECONDS", "1800"))
 MAX_UNBLOCK_ATTEMPTS = 3
 MAX_UNBLOCK_DEPTH = 2
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+# Bounded lock acquisition: a stuck holder must fail LOUD, never hang a
+# take/done into a timeout(1) kill (rc=124, chat.log 76984-77026). Reads
+# (queue/status/replay/check) never take these locks; only mutations do, and
+# each mutation holds them only across its own mutate+append.
+LOCK_TIMEOUT_SECONDS = _env_float("MESH_TASK_LOCK_TIMEOUT", 30.0)
+LOCK_POLL_BASE_SECONDS = 0.05
+LOCK_POLL_CAP_SECONDS = 0.5
+EMIT_TIMEOUT_SECONDS = _env_float("MESH_TASK_EMIT_TIMEOUT", 30.0)
 MAX_SWEEP_META_YIELDS = 3
 _SWEEP_META_YIELD_COUNT = 0
 _SWEEP_META_YIELD_OVERFLOWED = 0
@@ -569,11 +587,16 @@ def emit(marker: str, body: str) -> bool:
     command = chat_command()
     try:
         result = subprocess.run([command, f"[{marker}] {body}"], check=False,
-                                text=True, capture_output=True)
+                                text=True, capture_output=True,
+                                timeout=EMIT_TIMEOUT_SECONDS)
         if result.returncode == 0:
             return True
         detail = (result.stderr or result.stdout or "no helper output").strip().replace("\n", " ")
         LAST_EMIT_ERROR = f"chat rc={result.returncode}: {detail[:240]}"
+        return False
+    except subprocess.TimeoutExpired:
+        # A hung board writer must not hold chain+owner locks forever.
+        LAST_EMIT_ERROR = f"chat emit timeout after {EMIT_TIMEOUT_SECONDS:g}s"
         return False
     except OSError as exc:
         # Callers decide whether a missing board helper is retryable or transition-blocking.
@@ -596,9 +619,13 @@ def save(path: Path, data: dict) -> None:
             revision = previous["revision"] + 1 if previous else 1
             payload = encode_task_state(data, revision).removeprefix("[task-ledger] ")
             command = str(Path(__file__).resolve().with_name("mesh-chat"))
-            result = subprocess.run([command, "--task-state", payload],
-                                    env=dict(os.environ, MESH_DIR=str(ROOT)),
-                                    text=True, capture_output=True, check=False)
+            try:
+                result = subprocess.run([command, "--task-state", payload],
+                                        env=dict(os.environ, MESH_DIR=str(ROOT)),
+                                        text=True, capture_output=True, check=False,
+                                        timeout=EMIT_TIMEOUT_SECONDS)
+            except subprocess.TimeoutExpired:
+                die(f"task-state append timed out after {EMIT_TIMEOUT_SECONDS:g}s; cache not changed", 1)
             if result.returncode:
                 die(f"task-state append failed; cache not changed: {result.stderr.strip()}", 1)
             records[data["chain"]] = decode_task_state(payload)
@@ -632,6 +659,11 @@ def resource_locks(resources: set[str]):
     receipt-before-state ordering that prevents stale re-dispatches; owner
     locks preserve cross-chain active-capacity checks. Names are hashed so a
     lock filename never interprets a task or owner identifier as a path.
+
+    Acquisition is BOUNDED: LOCK_EX|LOCK_NB with exponential backoff plus
+    pid/time jitter to decorrelate thundering-herd retries. A holder that
+    outlives MESH_TASK_LOCK_TIMEOUT refuses the waiter LOUD (lock-timeout)
+    instead of hanging it into a timeout(1) kill.
     """
     lock_dir = CHAINS / ".locks"
     lock_dir.mkdir(parents=True, exist_ok=True)
@@ -641,12 +673,41 @@ def resource_locks(resources: set[str]):
             digest = hashlib.sha256(resource.encode("utf-8")).hexdigest()
             handle = (lock_dir / f"{digest}.lock").open("a+", encoding="utf-8")
             handles.append(handle)
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            _acquire_bounded(handle, resource)
         yield
     finally:
         for handle in reversed(handles):
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            if handle.closed:
+                continue
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
             handle.close()
+
+
+def _acquire_bounded(handle, resource: str) -> None:
+    """Take one LOCK_EX within LOCK_TIMEOUT_SECONDS or die with lock-timeout."""
+    deadline = time.monotonic() + max(0.1, LOCK_TIMEOUT_SECONDS)
+    delay = LOCK_POLL_BASE_SECONDS
+    while True:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except OSError as exc:
+            if exc.errno not in (errno.EACCES, errno.EAGAIN):
+                raise
+        now = time.monotonic()
+        if now >= deadline:
+            try:
+                handle.close()
+            except OSError:
+                pass
+            die(f"lock-timeout waiting for '{resource}' after {LOCK_TIMEOUT_SECONDS:g}s; "
+                f"another mesh-task holds it — retry with backoff, do not queue behind it silently", 2)
+        jitter = ((time.monotonic_ns() ^ (os.getpid() << 16)) % 1000) / 1000.0 * delay
+        time.sleep(delay + jitter)
+        delay = min(delay * 2.0, LOCK_POLL_CAP_SECONDS)
 
 
 def mutation_resources(argv: list[str]) -> set[str]:
@@ -2602,6 +2663,65 @@ def test() -> None:
                       env_extra={"MESH_GENOME": str(conflict_genome)})
         if "UNKNOWN" not in unknown.stderr:
             die("self-test preflight resolved a conflict instead of routing UNKNOWN", 1)
+        # Lock-contention triage (chat.log 76984-77026 rc=124): a stuck holder
+        # must refuse waiters LOUD within MESH_TASK_LOCK_TIMEOUT, never hang a
+        # take into a timeout(1) kill; and a hung board writer must not hold
+        # chain+owner locks forever (MESH_TASK_EMIT_TIMEOUT).
+        import fcntl as _fcntl
+        import hashlib as _hashlib
+        import threading as _threading
+        lock_plan = root / "lock.tsv"
+        lock_plan.write_text("alpha\tinspect\tlock contention probe\n")
+        run("create", "lockdemo", str(lock_plan))
+        lock_file = root / "mesh/chains/.locks" / (_hashlib.sha256(b"chain:lockdemo").hexdigest() + ".lock")
+        lock_file.parent.mkdir(parents=True, exist_ok=True)
+        _release = _threading.Event()
+        def _hold():
+            with lock_file.open("a+", encoding="utf-8") as _h:
+                _fcntl.flock(_h.fileno(), _fcntl.LOCK_EX)
+                _release.wait(timeout=15)
+                _fcntl.flock(_h.fileno(), _fcntl.LOCK_UN)
+        _t = _threading.Thread(target=_hold, daemon=True)
+        _t.start()
+        _deadline = time.time() + 5
+        while time.time() < _deadline:
+            try:
+                with lock_file.open("a+", encoding="utf-8") as _probe:
+                    _fcntl.flock(_probe.fileno(), _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+                    _fcntl.flock(_probe.fileno(), _fcntl.LOCK_UN)
+                time.sleep(0.05)
+            except OSError:
+                break
+        _start = time.time()
+        refused = run("take", "lockdemo", "inspect", expect=2,
+                      env_extra={"MESH_TASK_LOCK_TIMEOUT": "1"})
+        _waited = time.time() - _start
+        _release.set()
+        _t.join(timeout=20)
+        if "lock-timeout" not in refused.stderr:
+            die(f"self-test lock contention hung or mis-reported: {refused.stderr.strip()}", 1)
+        if _waited > 10:
+            die(f"self-test lock-timeout exceeded its bound: {_waited:.1f}s", 1)
+        run("take", "lockdemo", "inspect")
+        slow_chat = fake / "slow-chat"
+        slow_chat.write_text("#!/bin/sh\nsleep 30\n")
+        slow_chat.chmod(0o755)
+        hung = run("done", "lockdemo", "inspect", str(artifact), "slow board proof",
+                   expect=1, env_extra={"MESH_TASK_CHAT_CMD": str(slow_chat),
+                                        "MESH_TASK_EMIT_TIMEOUT": "1"})
+        if "board event failed" not in hung.stderr:
+            die(f"self-test hung board writer was not refused loud: {hung.stderr.strip()}", 1)
+        run("done", "lockdemo", "inspect", str(artifact), "lock triage proof pane:witness")
+        # Parallel annotate across distinct chains under one owner all succeed.
+        import concurrent.futures as _futures
+        for _i in range(8):
+            _p = root / f"par{_i}.tsv"
+            _p.write_text(f"alpha\tstep{_i}\tparallel leg {_i}\n")
+            run("create", f"pardemo{_i}", str(_p))
+        with _futures.ThreadPoolExecutor(max_workers=8) as _pool:
+            _results = list(_pool.map(lambda _i: run("annotate", f"pardemo{_i}", f"step{_i}", "evidence", str(artifact)), range(8)))
+        if any(_r.returncode != 0 for _r in _results):
+            die("self-test parallel mutation under one owner failed", 1)
     print("mesh-task: smoke-test ok (ordered tasks, independent pickup, exact owner, leases, blockers, artifacts)")
 
 
