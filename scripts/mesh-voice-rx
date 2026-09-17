@@ -58,6 +58,7 @@ VOICE_FILES_LOG = Path(os.environ.get("MESH_VOICE_FILES_LOG", str(MESH / "voice-
 # audio bytes, pointing at the two surviving copies (spool + hold). A later re-transcribe runs
 # off this row instead of asking the operator to re-send. Append-only; never read by liveness.
 VOICE_RETRY_LOG = Path(os.environ.get("MESH_VOICE_RETRY_LOG", str(MESH / "voice-retry.log")))
+def ts(): return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 def _log_voice_retry(update_id, file_uid, failure, wav_secs, spool_path, held_path, audio_path):
     # Best-effort: a retry-row write must never cost the operator his message or raise into poll.
     try:
@@ -76,6 +77,50 @@ def _log_voice_retry(update_id, file_uid, failure, wav_secs, spool_path, held_pa
     except Exception as e:
         print(f"[voice-rx] retry-row write failed: {str(e)[:80]}", file=sys.stderr)
     return digest
+# Operator standing rule (task operator/stt-failure-ledger-20260916): an STT failure mints
+# its own exact-owner ledger repair task — never a silent placeholder in voice-in.log.
+# Called after the retry row is durable, with the digest it returned. Chain-per-digest gives
+# dedupe for free (create refuses an existing chain, which is success-by-prior-mint).
+# Best-effort and NEVER raising into poll: a mint failure is stderr noise, the operator's
+# message path is unaffected. Owner tg: the lane that owes the operator his note back, via
+# mesh-voice-retry --consume.
+REPAIR_OWNER = "tg"
+def _mint_stt_repair_task(digest, failure, wav_secs, update_id, file_uid):
+    # Only the live intake mints. Offline/test entry points never touch the ledger unless
+    # the test explicitly opts in (MESH_VOICE_RX_TEST_MINT=1 with a sandboxed MESH_DIR).
+    if digest in (None, "", "unknown"):
+        return None
+    if len(sys.argv) > 1 and sys.argv[1].startswith("--test"):
+        if os.environ.get("MESH_VOICE_RX_TEST_MINT") != "1":
+            return None
+    task_cmd = os.environ.get("MESH_VOICE_RX_TASK_CMD", str(HOME / ".local/bin/mesh-task"))
+    chain = f"voice-stt-{digest}"
+    desc = (f"Re-transcribe the operator's voice note that STT failed on ({failure}, {wav_secs}s audio): "
+            f"retry row in voice-retry.log digest={digest} update={update_id} file_uid={file_uid}; "
+            f"run mesh-voice-retry --consume and deliver the recovered text; "
+            f"retry=audio retained at the spool/held paths named in the retry row")
+    import tempfile as _tf_m
+    try:
+        with _tf_m.NamedTemporaryFile("w", encoding="utf-8", prefix="voice-stt-", suffix=".tsv", delete=False) as _h:
+            _plan = _h.name
+            _h.write(f"{REPAIR_OWNER}\tretranscribe\t{desc}\n")
+        try:
+            _env = dict(os.environ, MESH_TASK_ACTOR=REPAIR_OWNER)
+            _r = subprocess.run([task_cmd, "create", chain, _plan], env=_env,
+                                text=True, capture_output=True, timeout=60)
+            if _r.returncode:
+                _detail = ((_r.stderr or _r.stdout) or "").strip().replace("\n", " ")
+                if "already exists" in _detail:
+                    return chain
+                print(f"[voice-rx] repair-task mint failed ({_r.returncode}): {_detail[:120]}", file=sys.stderr)
+                return None
+            return chain
+        finally:
+            try: os.unlink(_plan)
+            except OSError: pass
+    except Exception as e:
+        print(f"[voice-rx] repair-task mint error: {str(e)[:80]}", file=sys.stderr)
+        return None
 SCRUB_CMD = os.environ.get("MESH_LOG_SCRUB_CMD", "mesh-log-scrub")
 
 # Route through mesh-whisper-run (nice+ionice+flock shim, drop-in args) so a voice-note burst can't
@@ -531,6 +576,44 @@ if len(sys.argv) > 1 and sys.argv[1] == '--test':
     _t(abs((_deaf + _unc + _off) - (_now - _mt)) < 1, "the up/off/unplaceable split does not sum to the gap")
     _t(_off > 0 and _deaf > 0, "a gap spanning both up-time and power-offs charged one of them as zero")
 
+    # 8h) AN STT FAILURE MINTS ITS OWN REPAIR TASK (operator/stt-failure-ledger-20260916).
+    # Drives the real failure path offline: garbage audio through _log_voice_retry (rebound to
+    # a sandbox ledger so the live voice-retry.log is untouched), then the mint against a
+    # sandboxed MESH_DIR with the board writer stubbed — and asserts the ledger row exists via
+    # the real mesh-task replay. Red if the mint is skipped, raises, or leaves no row; red if
+    # a duplicate mint raises instead of succeeding-by-prior-mint.
+    with _tf_b.TemporaryDirectory() as _md:
+        _sandbox = Path(_md); (_sandbox / "chat.log").write_text("")
+        _garbage = _sandbox / "note.oga"; _garbage.write_bytes(b"not audio at all")
+        _old_retry_log, VOICE_RETRY_LOG = VOICE_RETRY_LOG, _sandbox / "voice-retry.log"
+        _old_env = {k: os.environ.get(k) for k in ("MESH_DIR", "MESH_TASK_CHAT_CMD", "MESH_VOICE_RX_TEST_MINT")}
+        os.environ["MESH_DIR"] = str(_sandbox)
+        os.environ["MESH_TASK_CHAT_CMD"] = "true"
+        os.environ["MESH_VOICE_RX_TEST_MINT"] = "1"
+        try:
+            _dg = _log_voice_retry(4242, "fileuid-x", "empty-after-fallback", "7", "gone", "none", _garbage)
+            _t(_dg not in (None, "", "unknown"), "retry row left no digest to key the repair chain on")
+            _row = (_sandbox / "voice-retry.log").read_text() if (_sandbox / "voice-retry.log").exists() else ""
+            _t(f"digest={_dg}" in _row and "update=4242" in _row,
+               "retry row did not land in the sandbox ledger with digest+update")
+            _chain = _mint_stt_repair_task(_dg, "empty-after-fallback", "7", 4242, "fileuid-x")
+            _t(_chain == f"voice-stt-{_dg}", f"mint did not return the digest-keyed chain (got {_chain})")
+            _rp = subprocess.run(
+                [os.environ.get("MESH_VOICE_RX_TASK_CMD", str(HOME / ".local/bin/mesh-task")),
+                 "replay", "--json"],
+                env=dict(os.environ), text=True, capture_output=True, timeout=60)
+            _t(_rp.returncode == 0, f"sandbox ledger replay failed: {(_rp.stderr or '')[:120]}")
+            _t(f"voice-stt-{_dg}" in (_rp.stdout or ""), "minted repair task has no row in the ledger replay")
+            _dup = _mint_stt_repair_task(_dg, "empty-after-fallback", "7", 4242, "fileuid-x")
+            _t(_dup == f"voice-stt-{_dg}", "duplicate mint did not succeed-by-prior-mint")
+            _t(_mint_stt_repair_task("unknown", "empty-after-fallback", "7", 4242, "fileuid-x") is None,
+               "an unknown digest minted a chain it cannot dedupe")
+        finally:
+            VOICE_RETRY_LOG = _old_retry_log
+            for _k, _v in _old_env.items():
+                if _v is None: os.environ.pop(_k, None)
+                else: os.environ[_k] = _v
+
     _line = _instrumental_intro(0.9882, 0.449, "/tmp/x.oga", "то что он сказал")
     _t("то что он сказал" in _line, "the hedged routing line DROPS the transcript")
     _t("/tmp/x.oga" in _line and "not act on it" in _line.lower(), "routing line loses the audio path or the warning")
@@ -603,7 +686,7 @@ def get(method, **params):
 # 18:55Z looking "out of order / future-of-now", which made operator-message loss-detection
 # impossible (the 2026-06-13 409 lifeline adjudication couldn't tell what arrived "today since X").
 # Matches the board/trace ISO convention; consumers (mesh-dash tails+displays) are format-agnostic.
-def ts(): return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+# Defined beside the retry ledger (above the --test block) so the smoke test can drive it.
 
 def write_rx_state(status):
     # status: "OK" (a poll completed) or "ERR:<class>" (dns|conflict|http|net|other). Write on EVERY
@@ -1389,10 +1472,15 @@ def transcribe(file_id, doc=None, spooled=None, retry_ctx=None):
                 else "local-timeout" if local_timed_out else "empty-after-fallback")
     if not _rc.get("no_row"):
         _spool = spooled if (spooled and Path(str(spooled)).exists()) else "gone"
-        _log_voice_retry(_rc.get("update_id"), _rc.get("file_uid"), _failure,
+        _digest = _log_voice_retry(_rc.get("update_id"), _rc.get("file_uid"), _failure,
                          (f"{wav_secs:.0f}" if wav_secs is not None else "unknown"),
                          _spool, held if held else "none",
                          held if held else (spooled or oga))
+        # Operator standing rule: the failure mints its own repair task (never a silent
+        # placeholder). Same no_row guard: --retranscribe owns its own outcome ledger.
+        _mint_stt_repair_task(_digest, _failure,
+                              (f"{wav_secs:.0f}" if wav_secs is not None else "unknown"),
+                              _rc.get("update_id"), _rc.get("file_uid"))
     # Be HONEST about WHY: an admission-refused local run means the
     # operator spoke but the node was too loaded to transcribe and the cloud fallback also failed —
     # tell them to resend as text, never fake a content-free "empty transcript" that reads as "he sent
