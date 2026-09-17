@@ -2,6 +2,9 @@
 
 No persistent index: revisions make duplicate delivery harmless and conflicting
 or missing records explicit. The writer must append before updating its cache.
+replay_cached() adds an mtime-keyed cross-process cache over replay() so
+check/queue/replay share one parse instead of replaying the whole log per
+invocation; the full replay stays the correctness reference and the fallback.
 """
 from __future__ import annotations
 
@@ -548,6 +551,168 @@ def replay(path: Path) -> dict[str, dict]:
             canonical = candidate
         latest[chain] = canonical
     return latest
+
+
+CACHE_NAME = '.task-replay-cache.json'
+
+
+def _cache_paths(path: Path) -> tuple[Path, Path]:
+    cache = path.parent / CACHE_NAME
+    return cache, cache.with_name(cache.name + '.lock')
+
+
+def _read_cache(cache: Path) -> dict | None:
+    try:
+        data = json.loads(cache.read_text(encoding='utf-8'))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get('chains'), dict):
+        return None
+    return data
+
+
+def _merge_records(cached: dict, chunks: list[bytes], path: Path) -> dict[str, dict]:
+    """Fold freshly appended log bytes into cached per-chain state.
+
+    Mirrors replay()'s validation per chain (contiguous revisions, conflict and
+    transition checks with the same quarantine). Anything the incremental path
+    cannot prove — a gap, a conflict, a shrunk or replaced file — raises
+    ReplayError and the caller falls back to the full replay.
+    """
+    grouped: dict[str, dict[int, dict]] = {}
+    for chunk in chunks:
+        for raw in chunk.split(b'\n'):
+            if not raw:
+                continue
+            match = EVENT_BYTES.match(raw)
+            if not match:
+                continue
+            try:
+                record = decode(match.group(2))
+                chain = record['data']['chain']
+                revision = record['revision']
+            except (ValueError, TypeError, KeyError) as exc:
+                raise ReplayError(f'{path}: incremental decode: {exc}') from exc
+            revisions = grouped.setdefault(chain, {})
+            if revision in revisions and revisions[revision] != record:
+                raise ReplayError(f'conflicting task-state revision {chain}/{revision}')
+            revisions[revision] = record
+    chains = cached['chains']
+    for chain, revisions in grouped.items():
+        entry = chains.get(chain)
+        if entry is None:
+            ordered = sorted(revisions)
+            if ordered != list(range(1, ordered[-1] + 1)):
+                raise ReplayError(f'missing task-state revision for {chain}')
+            canonical: dict | None = None
+        else:
+            expected = int(entry['max_rev']) + 1
+            ordered = sorted(revisions)
+            if ordered and ordered[0] == int(entry['max_rev']):
+                if revisions[ordered[0]] != entry['latest']:
+                    raise ReplayError(f'conflicting task-state revision {chain}/{ordered[0]}')
+                ordered = ordered[1:]
+            if ordered and (ordered[0] != expected or ordered != list(range(expected, ordered[-1] + 1))):
+                raise ReplayError(f'missing task-state revision for {chain}')
+            canonical = entry['latest']
+        for revision in ordered:
+            candidate = revisions[revision]
+            if canonical is None:
+                canonical = candidate
+                continue
+            try:
+                validate_transition(canonical, candidate)
+            except ReplayError as exc:
+                if str(exc) not in ('terminal task-state regression', 'terminal task-state mutation'):
+                    raise
+                continue
+            canonical = candidate
+        chains[chain] = {'max_rev': ordered[-1], 'latest': canonical}
+    return {chain: entry['latest'] for chain, entry in chains.items()}
+
+
+def replay_cached(path: Path, cache_path: Path | None = None) -> dict[str, dict]:
+    """Share one chat.log parse across processes via an mtime-keyed cache.
+
+    The cache key is (dev, ino, size, mtime_ns); a hit returns the stored view
+    without touching the log. A grown file parses only the appended tail. Any
+    surprise — shrunk or replaced file, revision gap, conflict, corrupt cache,
+    or movement under read — falls back to replay(). Equivalent output or a
+    loud ReplayError, never a stale view.
+    """
+    path = Path(path)
+    cache, lock_path = _cache_paths(path) if cache_path is None else (Path(cache_path), Path(str(cache_path) + '.lock'))
+    try:
+        st = path.stat()
+    except OSError as exc:
+        raise ReplayError(f'{path}: {exc}') from exc
+    key = {'dev': st.st_dev, 'ino': st.st_ino, 'size': st.st_size, 'mtime_ns': st.st_mtime_ns}
+    try:
+        with lock_path.open('a+') as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            try:
+                return _replay_cached_locked(path, cache, key, st)
+            except ReplayError:
+                raise
+            except (OSError, ValueError) as exc:
+                raise ReplayError(f'{path}: cache refresh failed: {exc}') from exc
+    except ReplayError:
+        return replay(path)
+
+
+def _store_cache(cache: Path, payload: dict) -> None:
+    tmp = cache.with_name(cache.name + f'.tmp.{os.getpid()}')
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, sort_keys=True), encoding='utf-8')
+    os.replace(tmp, cache)
+
+
+def _replay_cached_locked(path: Path, cache: Path, key: dict, st: 'os.stat_result') -> dict[str, dict]:
+    cached = _read_cache(cache)
+    if cached and cached.get('key') == key:
+        return {chain: entry['latest'] for chain, entry in cached['chains'].items()}
+    if (cached and cached.get('dev') == key['dev'] and cached.get('ino') == key['ino']
+            and isinstance(cached.get('size'), int) and 0 <= cached['size'] <= key['size']
+            and isinstance(cached.get('chains'), dict)):
+        with path.open('rb') as source:
+            source.seek(cached['size'])
+            tail = source.read()
+        moved = path.stat()
+        if moved.st_size == key['size'] and moved.st_mtime_ns == key['mtime_ns']:
+            text = (cached.get('fragment') or '') .encode('utf-8') + tail
+            if text.endswith(b'\n') or not text:
+                chunks, fragment = [text], ''
+            else:
+                cut = text.rfind(b'\n')
+                chunks = [text[:cut + 1]] if cut >= 0 else [b'']
+                fragment = text[cut + 1:].decode('utf-8', 'replace')
+            latest = _merge_records(cached, chunks, path)
+            _store_cache(cache, {'key': key, 'dev': key['dev'], 'ino': key['ino'],
+                                 'size': key['size'], 'fragment': fragment, 'chains': cached['chains']})
+            return latest
+    latest = replay(path)
+    chains = {}
+    # Re-derive per-chain max revisions without a second full decode: the log is
+    # append-only, so one ordered scan rebuilds the continuity the cache needs.
+    revs: dict[str, list[int]] = {}
+    with path.open('rb') as source:
+        for line in source:
+            match = EVENT_BYTES.match(line.rstrip(b'\n'))
+            if not match:
+                continue
+            try:
+                record = decode(match.group(2))
+                revs.setdefault(record['data']['chain'], []).append(record['revision'])
+            except (ValueError, TypeError, KeyError):
+                continue
+    for chain, record in latest.items():
+        ordered = sorted(set(revs.get(chain, [])))
+        chains[chain] = {'max_rev': ordered[-1] if ordered else 0, 'latest': record}
+    with path.open('rb') as source:
+        data = source.read()
+    fragment = '' if data.endswith(b'\n') or not data else data.rpartition(b'\n')[2].decode('utf-8', 'replace')
+    _store_cache(cache, {'key': key, 'dev': key['dev'], 'ino': key['ino'],
+                         'size': key['size'], 'fragment': fragment, 'chains': chains})
+    return {chain: entry['latest'] for chain, entry in chains.items()}
 
 
 def append(root: Path, who: str, payload: str) -> None:
