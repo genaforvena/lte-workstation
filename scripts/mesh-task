@@ -25,6 +25,7 @@ from pathlib import Path
 from mesh_task_log import replay as replay_task_log, encode as encode_task_state, decode as decode_task_state
 from mesh_task_log import eligibility, independent_ready
 from mesh_task_log import ORIGIN_FIELDS
+from mesh_task_log import EVENT_BYTES
 
 
 ROOT = Path(os.environ.get("MESH_DIR", str(Path.home() / ".mesh")))
@@ -164,6 +165,51 @@ def task_records(allow_missing: bool = False) -> dict:
         log = ROOT / "chat.log"
         _records = {} if allow_missing and not log.exists() else replay_task_log(log)
     return _records
+
+
+def latest_chain_record(chain: str):
+    """Fast-path previous-record lookup for ONE chain (fix-double-replay-emit-timeout,
+    2026-09-17): save() used to full-replay 83k-line chat.log (~16-22s) and then the
+    append subprocess replayed it AGAIN (~16-22s), so every mutation ran ~35s+ against
+    a 30s emit timeout. This scans for this chain's ledger lines only (cheap memcmp
+    prefilter; decode just the hits) and returns its latest record, or None when the
+    chain is absent OR the hits don't form a clean 1..N run. The full replay inside
+    append() stays the canonical gate (revision + transition + origin checks under
+    lock) — a wrong answer here can only surface as a clear ReplayError retry, never
+    as silent corruption."""
+    log = ROOT / "chat.log"
+    if not log.exists():
+        return None
+    try:
+        needle = re.compile(rb'/chain=s:' + re.escape(chain).encode() + rb' \|')
+    except (TypeError, ValueError):
+        return None
+    hits = {}
+    try:
+        with log.open('rb') as source:
+            for line in source:
+                if not needle.search(line):
+                    continue
+                match = EVENT_BYTES.match(line.rstrip(b'\n'))
+                if not match:
+                    continue
+                try:
+                    record = decode_task_state(match.group(2))
+                except (ValueError, TypeError, KeyError):
+                    return None
+                try:
+                    revision = record['revision']
+                except (TypeError, KeyError):
+                    return None
+                hits[revision] = record
+    except OSError:
+        return None
+    if not hits:
+        return None
+    ordered = sorted(hits)
+    if ordered != list(range(1, ordered[-1] + 1)):
+        return None
+    return hits[ordered[-1]]
 
 
 def chain_states():
@@ -612,9 +658,16 @@ def require_emit(marker: str, body: str) -> None:
 
 def save(path: Path, data: dict) -> None:
     # Contexts are disposable pointers. Chain states must reach chat.log first.
+    previous = None
+    accepted = None
     if isinstance(data, dict) and "chain" in data and "steps" in data and path.parent == CHAINS:
-        records = task_records()
-        previous = records.get(data["chain"])
+        # Fast path (fix-double-replay-emit-timeout): the previous record comes from a
+        # per-chain scan, not a full replay — append() replays canonically under lock.
+        # Fall back to the full replay only when the fast path declines (gap/oddity).
+        previous = latest_chain_record(data["chain"])
+        if previous is None and (ROOT / "chat.log").exists():
+            records = task_records()
+            previous = records.get(data["chain"])
         if previous is None or previous["data"] != data:
             revision = previous["revision"] + 1 if previous else 1
             payload = encode_task_state(data, revision).removeprefix("[task-ledger] ")
@@ -628,10 +681,19 @@ def save(path: Path, data: dict) -> None:
                 die(f"task-state append timed out after {EMIT_TIMEOUT_SECONDS:g}s; cache not changed", 1)
             if result.returncode:
                 die(f"task-state append failed; cache not changed: {result.stderr.strip()}", 1)
-            records[data["chain"]] = decode_task_state(payload)
+            if _records is not None:
+                _records[data["chain"]] = decode_task_state(payload)
+            accepted = revision
     if path.exists():
         try:
             if json.loads(path.read_text(encoding="utf-8")) == data:
+                if path.parent == CHAINS and isinstance(data, dict) and "chain" in data:
+                    # No new append: the accepted revision is whatever the log holds now.
+                    latest = latest_chain_record(data["chain"])
+                    if latest is not None and latest["data"] == data:
+                        accepted = latest["revision"]
+                    if accepted is not None:
+                        note_fastpos(data["chain"], accepted)
                 return
         except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             pass
@@ -647,6 +709,9 @@ def save(path: Path, data: dict) -> None:
             os.unlink(tmp)
         except FileNotFoundError:
             pass
+    if path.parent == CHAINS and isinstance(data, dict) and "chain" in data and accepted is not None:
+        # Cache file is now byte-current with the accepted append.
+        note_fastpos(data["chain"], accepted)
 
 
 @contextlib.contextmanager
@@ -737,12 +802,77 @@ def mutation_resources(argv: list[str]) -> set[str]:
 
 def load(chain: str) -> tuple[Path, dict]:
     path = path_for(chain)
-    record = task_records().get(chain)
+    record = fast_chain_record(chain)
+    if record is None:
+        record = task_records().get(chain)
     if record is not None:
         data = json.loads(json.dumps(record["data"]))
         canonicalize_owners(data)
         return path, data
     die(f"chain '{chain}' is absent from chat.log (create it, or explicitly import existing chains)")
+
+
+def fast_chain_record(chain: str):
+    """Guarded cache read for mutation entry (fix-double-replay-emit-timeout, 2026-09-17):
+    load() used to full-replay the 83k-line chat.log (~25s) and then the append
+    subprocess replayed it AGAIN (~25s) — every mutation ran ~35s+ against the 30s
+    emit timeout with no lock holder at all. This returns the chain's record from
+    the disposable chain cache when the log is provably untouched since the last
+    successful save (same inode + size + mtime-ns, recorded beside the revision the
+    append gate accepted). ANY mismatch — or a missing/stale sidecar — falls back to
+    the canonical replay. A wrong answer here cannot corrupt: save()/append() still
+    revision- and transition-check under lock, so staleness surfaces as a clear
+    ReplayError retry, never a silent write."""
+    try:
+        sidecar = CHAINS / ".fastpos.json"
+        pos = json.loads(sidecar.read_text(encoding="utf-8"))
+        entry = pos.get("rev", {}).get(chain)
+        logpos = pos.get("log", {})
+        log = ROOT / "chat.log"
+        st = log.stat()
+        if (entry is None or logpos.get("ino") != st.st_ino
+                or logpos.get("size") != st.st_size
+                or logpos.get("mtime_ns") != st.st_mtime_ns):
+            return None
+        data = json.loads(path_for(chain).read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or data.get("chain") != chain:
+            return None
+        return {"revision": entry, "data": data}
+    except (OSError, ValueError, TypeError, KeyError):
+        return None
+
+
+def note_fastpos(chain: str, revision: int) -> None:
+    """Record the accepted revision + log identity after a successful save."""
+    try:
+        log = ROOT / "chat.log"
+        st = log.stat()
+        sidecar = CHAINS / ".fastpos.json"
+        try:
+            pos = json.loads(sidecar.read_text(encoding="utf-8"))
+            if not isinstance(pos, dict):
+                pos = {}
+        except (OSError, ValueError):
+            pos = {}
+        rev = pos.get("rev")
+        if not isinstance(rev, dict):
+            rev = {}
+        rev[chain] = revision
+        pos["rev"] = rev
+        pos["log"] = {"ino": st.st_ino, "size": st.st_size, "mtime_ns": st.st_mtime_ns}
+        tmp_fd, tmp = tempfile.mkstemp(prefix=".fastpos.", dir=str(CHAINS), text=True)
+        try:
+            with os.fdopen(tmp_fd, "w", encoding="utf-8") as handle:
+                json.dump(pos, handle)
+                handle.write("\n")
+            os.replace(tmp, sidecar)
+        finally:
+            try:
+                os.unlink(tmp)
+            except FileNotFoundError:
+                pass
+    except OSError:
+        pass
 
 
 def step_for(data: dict, ref: str) -> tuple[int, dict]:
