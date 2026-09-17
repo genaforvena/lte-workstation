@@ -380,5 +380,80 @@ class ReplayTests(unittest.TestCase):
             self.assertEqual(self.path.read_bytes(), before)
 
 
+class ReplayCacheTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / 'chat.log'
+        self.base = dict(chain='plan', current=0, status='open', steps=[
+            dict(id='plan/first', slug='first', owner='alpha', status='open', description='first')])
+
+    def event(self, data, rev):
+        return '2026-09-08T00:00:00Z  alpha@node  ::  ' + log.encode(data, rev) + '\n'
+
+    def write(self, *events):
+        with self.path.open('ab') as handle:
+            for event in events:
+                handle.write(event.encode('utf-8'))
+
+    def test_cold_populates_and_hit_returns_equal_view(self):
+        self.write(self.event(self.base, 1), 'prose line\n')
+        first = log.replay_cached(self.path)
+        self.assertEqual(first, log.replay(self.path))
+        self.assertTrue((Path(self.tmp.name) / '.task-replay-cache.json').exists())
+        meta = json.loads((Path(self.tmp.name) / '.task-replay-cache.json').read_text())
+        second = log.replay_cached(self.path)
+        self.assertEqual(second, first)
+        self.assertEqual(meta['size'], self.path.stat().st_size)
+
+    def test_appended_tail_merges_to_full_replay(self):
+        self.write(self.event(self.base, 1))
+        log.replay_cached(self.path)
+        started = copy.deepcopy(self.base)
+        started['status'] = started['steps'][0]['status'] = 'active'
+        self.write('prose\n', self.event(started, 2))
+        self.assertEqual(log.replay_cached(self.path), log.replay(self.path))
+        self.assertEqual(log.replay_cached(self.path)['plan']['data'], started)
+
+    def test_truncated_file_falls_back_to_full_reparse(self):
+        self.write(self.event(self.base, 1))
+        log.replay_cached(self.path)
+        other = dict(chain='other', current=0, status='open', steps=[
+            dict(id='other/only', slug='only', owner='beta', status='open', description='only')])
+        self.path.write_bytes(self.event(other, 1).encode('utf-8'))
+        self.assertEqual(log.replay_cached(self.path), log.replay(self.path))
+
+    def test_corrupt_cache_falls_back_to_full_reparse(self):
+        self.write(self.event(self.base, 1))
+        log.replay_cached(self.path)
+        (Path(self.tmp.name) / '.task-replay-cache.json').write_text('{corrupt', encoding='utf-8')
+        self.assertEqual(log.replay_cached(self.path), log.replay(self.path))
+
+    def test_trailing_fragment_reassembles_on_next_append(self):
+        full = self.event(self.base, 1)
+        self.path.write_bytes(full.encode('utf-8') + b'2026-09-08T00:00:0')
+        log.replay_cached(self.path)
+        with self.path.open('ab') as handle:
+            handle.write(b'0Z  alpha@node  ::  ' + log.encode(self.base, 1).removeprefix(log.MARKER).encode('utf-8') + b'\n')
+        # Duplicate delivery of an identical revision is idempotent.
+        self.assertEqual(log.replay_cached(self.path), log.replay(self.path))
+
+    def test_duplicate_tail_revision_preserves_cache_continuity(self):
+        self.write(self.event(self.base, 1))
+        log.replay_cached(self.path)
+        self.write('duplicate delivery\n', self.event(self.base, 1))
+        self.assertEqual(log.replay_cached(self.path), log.replay(self.path))
+        self.assertEqual(log.replay_cached(self.path)['plan']['data'], self.base)
+
+    def test_conflicting_tail_is_loud_never_stale(self):
+        self.write(self.event(self.base, 1))
+        log.replay_cached(self.path)
+        tampered = copy.deepcopy(self.base)
+        tampered['steps'][0]['description'] = 'rewritten'
+        self.write(self.event(tampered, 1))
+        with self.assertRaises(log.ReplayError):
+            log.replay_cached(self.path)
+
+
 if __name__ == '__main__':
     unittest.main()
