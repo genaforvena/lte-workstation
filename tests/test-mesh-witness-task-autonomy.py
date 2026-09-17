@@ -58,6 +58,7 @@ def run() -> None:
             "OPEN_UNOWNED\t-\tfailed/work\tdispatch=failed\n"
             "OPEN_UNOWNED\t-\tpool/work\tdispatch=sent\n"
             "RUNNING\tgenome\tgenome/landing\tlease=2030-01-01T00:00:00Z\n"
+            "RUNNING\thealth\thealth-warning/ace9180f/triage\tlease=2030-01-01T00:00:00Z\n"
             "BLOCKED\thaunt\tchain/wait\tdependency\tretry=prerequisite\n"
         )
         global_queue = ("alice\towned/work\t0\tdescription\n"
@@ -118,7 +119,7 @@ def run() -> None:
         if watch.run_once() != 0:
             raise AssertionError("healthy ownerless queue fixture failed")
         tape = watch.TAPE.read_text(encoding="utf-8")
-        for field in ("health=PASS", "source=PASS", "unfinished=5", "blocked=1",
+        for field in ("health=PASS", "source=PASS", "unfinished=6", "blocked=1",
                       "idle_minds=2", "dispatchable=2", "unroutable=1", "ownerless=1", "ownerless_visible=2",
                       "dispatch_repairs=1"):
             if field not in tape:
@@ -152,6 +153,13 @@ def run() -> None:
             raise AssertionError(f"stalled active claim lacked exact task evidence: {stalled_tape}")
         if len(recovery_wakes) != 1 or recovery_wakes[0][2] != "genome" or "genome/landing" not in recovery_wakes[0][-1]:
             raise AssertionError(f"stalled active claim did not wake its exact owner: {recovery_wakes}")
+        # Triage rows are the detector's own repair queue: an aged
+        # health-warning triage must never read as stalled work nor wake triage
+        # about itself (ace9180f triaged stalled 92f9dc0c).
+        if "active-task-stalled-health-warning/ace9180f/triage-for-" in stalled_tape:
+            raise AssertionError(f"stalled triage row was reported as stalled work: {stalled_tape}")
+        if any("health-warning/ace9180f/triage" in wake[-1] for wake in recovery_wakes):
+            raise AssertionError(f"stalled triage row woke its owner: {recovery_wakes}")
         watch.time.time = original_time
         watch.STATE.write_text("{}\n", encoding="utf-8")
 
