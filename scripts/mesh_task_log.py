@@ -627,7 +627,11 @@ def _merge_records(cached: dict, chunks: list[bytes], path: Path) -> dict[str, d
                     raise
                 continue
             canonical = candidate
-        chains[chain] = {'max_rev': ordered[-1], 'latest': canonical}
+        # A duplicate delivery may be the only record in this tail.  It is
+        # consumed above as the cached max revision, leaving no new revision
+        # to index; preserve the existing continuity marker in that case.
+        max_rev = ordered[-1] if ordered else int(entry['max_rev']) if entry is not None else 0
+        chains[chain] = {'max_rev': max_rev, 'latest': canonical}
     return {chain: entry['latest'] for chain, entry in chains.items()}
 
 
