@@ -22,7 +22,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from mesh_task_log import replay as replay_task_log, encode as encode_task_state, decode as decode_task_state
+from mesh_task_log import replay as replay_task_log, replay_cached as replay_task_log_cached, encode as encode_task_state, decode as decode_task_state
 from mesh_task_log import eligibility, independent_ready
 from mesh_task_log import ORIGIN_FIELDS
 from mesh_task_log import EVENT_BYTES
@@ -163,7 +163,12 @@ def task_records(allow_missing: bool = False) -> dict:
     global _records
     if _records is None:
         log = ROOT / "chat.log"
-        _records = {} if allow_missing and not log.exists() else replay_task_log(log)
+        if allow_missing and not log.exists():
+            _records = {}
+        elif os.environ.get("MESH_TASK_REPLAY_CACHE", "on") == "off":
+            _records = replay_task_log(log)
+        else:
+            _records = replay_task_log_cached(log)
     return _records
 
 
@@ -1855,6 +1860,113 @@ def report_unblock_attempt_exhaustion(data: dict) -> None:
         save(path_for(data["chain"]), data)
 
 
+def _unblock_pair_cover(parent_chain: str, parent_step: str, epoch: str, owner: str,
+                        identity: str) -> dict | None:
+    """Return the canonical resolver for one (parent, step, epoch, owner) pair.
+
+    Pre-guard resolvers lack unblock_parent/unblock_step, so they match by the
+    legacy identity instead. Earliest-created wins: later same-pair chains are
+    historical duplicate mints, never the canonical record.
+    """
+    matches = [c for _, c in chain_states()
+               if (c.get("unblock_parent") == parent_chain
+                   and c.get("unblock_step") == parent_step
+                   and str(c.get("unblock_epoch", "")) == epoch
+                   and (c.get("steps", [{}])[0].get("owner") == owner or not owner))
+               or (not c.get("unblock_parent") and c.get("unblock_for") == identity)]
+    if not matches:
+        return None
+    return min(matches, key=lambda c: c.get("created", ""))
+
+
+def _unblock_retry_date(cover: dict, rstep: dict, step: dict) -> float:
+    """When the next attempt on an existing resolver is due.
+
+    An explicit ISO date in the live parent gate wins while the gate is
+    unchanged (same blocker_type/needs/retry as the snapshot taken at mint) —
+    a rejected resolver for an unchanged external-event gate must not re-mint
+    before its retry date. Otherwise the terminal timestamp plus the attempt
+    backoff applies.
+    """
+    gate_now = [step.get("blocker_type", ""), step.get("needs", ""), step.get("retry", "")]
+    if cover.get("unblock_gate") and list(cover["unblock_gate"]) == gate_now:
+        for text in (step.get("retry", ""), step.get("needs", "")):
+            match = re.search(r"20\d\d-\d\d-\d\dT\d\d:\d\d:\d\dZ", text or "")
+            if match:
+                return epoch_iso(match.group(0))
+    terminal_at = (rstep.get("finished") or rstep.get("rejected") or cover.get("created", ""))
+    return epoch_iso(terminal_at) + unresolved_retry_backoff(int(cover.get("unblock_attempt", 1)))
+
+
+def _append_unblock_retry(path: Path, cover: dict, rstep: dict) -> None:
+    """Append the due fresh attempt as a successor step on the same chain.
+
+    The ledger forbids terminal→open transitions — only a successor step with
+    recovery_action + a real recovery_artifact (+sha256) + recovered_from may
+    follow a rejection. The due receipt is a real file under MESH_DIR (one per
+    attempt, bounded by MAX_UNBLOCK_ATTEMPTS on the chain counter). The previous
+    step is left byte-identical, which the replay gate requires.
+    """
+    attempt = int(cover.get("unblock_attempt", 1)) + 1
+    receipt_dir = ROOT / "unblock-due"
+    receipt_dir.mkdir(parents=True, exist_ok=True)
+    receipt = receipt_dir / (cover["chain"].replace("/", "__") + f"-attempt-{attempt}.md")
+    receipt.write_text(
+        f"# unblock retry due\n\nchain: {cover['chain']}\nparent: {cover.get('unblock_parent')}\n"
+        f"step: {cover.get('unblock_step')}\nepoch: {cover.get('unblock_epoch')}\n"
+        f"attempt: {attempt}\ndecided: {now()}\n")
+    digest = hashlib.sha256(receipt.read_bytes()).hexdigest()
+    owner = rstep.get("owner", "")
+    new_step = {"id": f"{cover['chain']}/resolve-retry-{attempt}", "owner": owner,
+                "slug": f"resolve-retry-{attempt}",
+                "description": f"{rstep.get('description', '')} (retry attempt {attempt} after due date)",
+                "priority": 90, "status": "open", "next_update": now(),
+                "recovery_action": "retry-after-date", "recovery_artifact": str(receipt),
+                "recovery_artifact_sha256": digest, "recovered_from": rstep.get("id", "")}
+    cover["steps"].append(new_step)
+    cover["current"] = len(cover["steps"]) - 1
+    cover["status"] = "open"
+    cover["unblock_attempt"] = attempt
+    cover["dispatch"] = "pending"
+
+
+def _refresh_unblock_resolver(cover_chain: str, step: dict) -> str:
+    """Reuse the existing pair resolver: touch its edge, redrive when due.
+
+    Returns the same chain in every case — the caller never mints while a pair
+    resolver exists. A due retry appends ONE successor attempt on the same chain
+    (the only terminal exit the ledger allows); attempts stay bounded by
+    MAX_UNBLOCK_ATTEMPTS on the chain's own counter.
+    """
+    path, cover = load(cover_chain)
+    steps = cover.get("steps", [])
+    index = cover.get("current", 0)
+    rstep = steps[index] if isinstance(index, int) and 0 <= index < len(steps) else {}
+    status = cover.get("status")
+    live = status in ("open", "active", "claimed")
+    terminal = status in ("complete", "rejected")
+    cleared = cleared_unblock_event(cover, rstep) if terminal else None
+    attempt = int(cover.get("unblock_attempt", 1))
+    if terminal and not cleared and not drained_resolver(cover) and attempt >= MAX_UNBLOCK_ATTEMPTS:
+        report_unblock_attempt_exhaustion(cover)
+    due = (status == "rejected" and not cleared and not drained_resolver(cover)
+           and attempt < MAX_UNBLOCK_ATTEMPTS
+           and _unblock_retry_date(cover, rstep, step) <= time.time())
+    if due:
+        _append_unblock_retry(path, cover, rstep)
+        print(f"unblock-reuse: fresh attempt on {cover_chain}; no new chain minted")
+    else:
+        if not live:
+            print(f"dedupe-guard: refused duplicate resolver for {step.get('id', '')}; "
+                  f"covered by {cover_chain} (status={status})")
+        rstep["next_update"] = now()
+    cover["unblock_reused_at"] = now()
+    save(path, cover)
+    if cover.get("dispatch") == "pending":
+        dispatch(path, cover)
+    return cover_chain
+
+
 def ensure_unblock_task(data: dict, step: dict) -> str | None:
     """Materialize exactly one resolver, never a resolver for a resolver."""
     owner = step.get("owner")
@@ -1863,67 +1975,26 @@ def ensure_unblock_task(data: dict, step: dict) -> str | None:
     if data.get("chain", "").startswith("unblock/"):
         meta_unblock_yield(data, step)
         return None
-    # Epoch-insensitive duplicate guard (2026-09-16: unblock/adint/7ab7a4eddf275995
-    # was minted for unblock/genome/4bc0af69ea5dc40e/resolve while that parent was
-    # already covered). The identity below keys on the blocked timestamp, so a
-    # re-emitted epoch mints again for the same parent. Refuse when a resolver for
-    # the SAME parent+step is still live, or already cleared it — cite it, don't mint.
-    # Failed-terminal resolvers keep the bounded retry path below (an attempt is not
-    # coverage), so this guard only closes the live and the cleared cases.
+    # One chain per (parent, step, epoch, owner) (2026-09-17: reuse-resolver-
+    # per-parent-epoch; honor-rejected-resolver-retry-date). The sweep used to
+    # mint a new chain per poll — the attempt number in the digest made every
+    # retry a NEW chain by construction — and the epoch was recorded but never a
+    # reuse key. Now the pair is the key: an existing resolver is returned, its
+    # retry/next_update edge touched, and it is redriven when due; a new chain
+    # mints only when no resolver exists for the pair.
     _pchain, _pstep = data.get("chain", ""), step.get("id", "")
-    _covering = [c for _, c in chain_states()
-                 if c.get("unblock_parent") == _pchain and c.get("unblock_step") == _pstep]
-    _live = [c for c in _covering if c.get("status") in ("open", "active", "claimed")]
-    if _live:
-        _cover = max(_live, key=lambda c: c.get("created", ""))
-        print(f"dedupe-guard: refused duplicate resolver for {_pstep}; "
-              f"covered by {_cover['chain']} (status={_cover.get('status')})")
-        return _cover["chain"]
-    _cleared = [c for c in _covering
-                if c.get("status") == "complete"
-                and cleared_unblock_event(c, (c.get("steps", []) or [{}])[c.get("current", 0) or 0])]
-    if _cleared:
-        _cover = max(_cleared, key=lambda c: c.get("created", ""))
-        print(f"dedupe-guard: refused duplicate resolver for {_pstep}; "
-              f"already cleared by {_cover['chain']}")
-        return _cover["chain"]
+    _epoch = str(step.get("block_epoch", ""))
+    _identity = unblock_identity(owner, step, data.get("chain", ""))
+    _cover = _unblock_pair_cover(_pchain, _pstep, _epoch, owner, _identity)
+    if _cover:
+        return _refresh_unblock_resolver(_cover["chain"], step)
     resolver_owner = owner
-    identity = unblock_identity(owner, step, data.get("chain", ""))
-    existing = [other for _, candidate in chain_states()
-                if candidate.get("unblock_for") == identity
-                for other in [candidate]]
-    # An unresolved terminal result may remain in history after a newer retry
-    # has already been dispatched. The pending retry is the actionable owner
-    # task; never let an older failure outrank it and mint another successor.
-    pending = [candidate for candidate in existing
-               if candidate.get("status") in ("open", "active", "claimed")]
-    if pending:
-        return max(pending, key=lambda candidate: candidate.get("created", ""))["chain"]
-    # A terminal resolver that explicitly reported an unresolved blocker is
-    # an attempt, not proof that the blocked parent is actionable forever.
-    # Keep active/open resolvers and cleared resolvers idempotent, but let the
-    # next sweep issue exactly one fresh attempt after a failed one.
-    retryable = [candidate for candidate in existing
-                 if candidate.get("status") in ("complete", "rejected")
-                 and not cleared_unblock_event(candidate, candidate.get("steps", [])[candidate.get("current", 0)])
-                 and not drained_resolver(candidate)]
-    if existing and not retryable:
-        return existing[0]["chain"]
-    if retryable:
-        latest = max(retryable, key=lambda candidate: (
-            int(candidate.get("unblock_attempt", 1)), candidate.get("created", "")))
-        latest_step = latest.get("steps", [])[latest.get("current", 0)]
-        terminal_at = (latest_step.get("finished") or latest_step.get("rejected")
-                       or latest.get("created", ""))
-        latest_attempt = int(latest.get("unblock_attempt", 1))
-        if latest_attempt >= MAX_UNBLOCK_ATTEMPTS:
-            report_unblock_attempt_exhaustion(latest)
-            return latest["chain"]
-        if (latest_attempt >= 2
-                and epoch_iso(terminal_at) + unresolved_retry_backoff(latest_attempt) > time.time()):
-            return latest["chain"]
-    attempt = max((int(candidate.get("unblock_attempt", 1)) for candidate in existing), default=0) + 1
-    digest = hashlib.sha256(f"{identity}|attempt={attempt}".encode("utf-8")).hexdigest()[:16]
+    identity = _identity
+    # No resolver exists for the pair: mint the one and only chain for it. The
+    # digest is deterministic on the pair identity (no attempt number), so even
+    # a re-mint after manual deletion returns the same name. The gate snapshot
+    # below lets later sweeps tell an unchanged gate from a new epoch.
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
     chain = f"unblock/{resolver_owner}/{digest}"
     if chain in task_records():
         return chain
@@ -1991,7 +2062,9 @@ def ensure_unblock_task(data: dict, step: dict) -> str | None:
         "unblock_parent": data.get("chain", ""),
         "unblock_step": step.get("id", ""),
         "unblock_epoch": step.get("block_epoch", ""),
-        "unblock_attempt": attempt,
+        "unblock_attempt": 1,
+        "unblock_gate": [step.get("blocker_type", ""), step.get("needs", ""),
+                         step.get("retry", "")],
         "steps": [{"id": f"{chain}/resolve", "owner": resolver_owner, "slug": "resolve",
                     "description": description, "priority": 90, "status": "open"}],
     }
@@ -2646,6 +2719,96 @@ def test() -> None:
             die(f"self-test sweep did not skip unblock/ chains: {resolver_sweep.stdout.strip()}", 1)
         if "itself an unblock resolver" in board.read_text()[len(board_before):]:
             die("self-test sweep posted a meta-yield for a skipped unblock/ chain", 1)
+        # One chain per (parent, epoch): a terminal-but-uncleared resolver is
+        # reused, never re-minted. Second sweep over the same blocked epoch must
+        # return the same chain and mint nothing.
+        reuse_parent_plan = root / "reuse-parent.tsv"
+        reuse_parent_plan.write_text("alpha\treuse-work\tblocked epoch parent\n")
+        run("create", "reuse-parent", str(reuse_parent_plan))
+        run("take", "reuse-parent", "reuse-work")
+        run("block", "reuse-parent", "reuse-work", "external-event", "gate-datum", "retry after gate arrives")
+        run("unblock-sweep", "alpha")
+        reuse_chain = None
+        for candidate_path in (root / "mesh/chains").glob("unblock__*.json"):
+            candidate = json.loads(candidate_path.read_text())
+            if candidate.get("unblock_step") == "reuse-parent/reuse-work":
+                reuse_chain = candidate["chain"]
+        if not reuse_chain:
+            die("self-test pair reuse minted no resolver", 1)
+        run("take", reuse_chain, "resolve")
+        run("done", reuse_chain, "resolve", str(artifact), "gate still closed, attempt logged pane:witness")
+        reuse_sweep = run("unblock-sweep", "alpha")
+        if "unblock-task " in reuse_sweep.stdout:
+            die(f"self-test sweep re-minted a resolver for a covered epoch: {reuse_sweep.stdout.strip()}", 1)
+        reuse_state = None
+        for candidate_path in (root / "mesh/chains").glob("unblock__*.json"):
+            candidate = json.loads(candidate_path.read_text())
+            if candidate.get("unblock_step") == "reuse-parent/reuse-work":
+                if reuse_state is not None:
+                    die("self-test sweep left two chains for one pair", 1)
+                reuse_state = candidate
+        if reuse_state is None or reuse_state["chain"] != reuse_chain:
+            die("self-test sweep did not return the existing pair chain", 1)
+        if int(reuse_state.get("unblock_attempt", 0)) != 1 or not reuse_state.get("unblock_reused_at"):
+            die("self-test sweep did not touch the reuse edge on the waiting chain", 1)
+        # Rejected resolver under an unchanged external-event gate with a future
+        # retry date: same chain, edge updated, nothing minted before the date.
+        future_parent_plan = root / "future-parent.tsv"
+        future_parent_plan.write_text("delta	future-work	future gated parent\n")
+        env["MESH_TASK_ACTOR"] = "delta"
+        run("create", "future-parent", str(future_parent_plan))
+        run("take", "future-parent", "future-work")
+        run("block", "future-parent", "future-work", "external-event", "gate-datum", "retry after 2099-01-01T00:00:00Z event:gate-opens")
+        run("unblock-sweep", "delta")
+        future_chain = None
+        for candidate_path in (root / "mesh/chains").glob("unblock__*.json"):
+            candidate = json.loads(candidate_path.read_text())
+            if candidate.get("unblock_step") == "future-parent/future-work":
+                future_chain = candidate["chain"]
+        if not future_chain:
+            die("self-test future-gate pair minted no resolver", 1)
+        run("take", future_chain, "resolve")
+        run("reject", future_chain, "resolve", "external gate unresolved")
+        future_sweep = run("unblock-sweep", "delta")
+        if "unblock-task " in future_sweep.stdout:
+            die(f"self-test sweep minted before the retry date: {future_sweep.stdout.strip()}", 1)
+        future_state = json.loads((root / "mesh/chains" / (future_chain.replace("/", "__") + ".json")).read_text())
+        if future_state["chain"] != future_chain or int(future_state.get("unblock_attempt", 0)) != 1:
+            die("self-test sweep did not hold the rejected chain before its date", 1)
+        # Past retry date: the due retry appends ONE successor attempt on the SAME
+        # chain (the only terminal exit the ledger allows) — never a second
+        # chain, never a terminal reopen, and never a second append.
+        past_parent_plan = root / "past-parent.tsv"
+        past_parent_plan.write_text("delta	past-work	past gated parent\n")
+        run("create", "past-parent", str(past_parent_plan))
+        run("take", "past-parent", "past-work")
+        run("block", "past-parent", "past-work", "external-event", "gate-datum", "retry after 2020-01-01T00:00:00Z event:gate-opens")
+        run("unblock-sweep", "delta")
+        past_chain = None
+        for candidate_path in (root / "mesh/chains").glob("unblock__*.json"):
+            candidate = json.loads(candidate_path.read_text())
+            if candidate.get("unblock_step") == "past-parent/past-work":
+                past_chain = candidate["chain"]
+        if not past_chain:
+            die("self-test past-gate pair minted no resolver", 1)
+        run("take", past_chain, "resolve")
+        run("reject", past_chain, "resolve", "external gate unresolved")
+        due_sweep = run("unblock-sweep", "delta")
+        if "unblock-task " in due_sweep.stdout:
+            die(f"self-test due retry minted a second chain: {due_sweep.stdout.strip()}", 1)
+        past_state = json.loads((root / "mesh/chains" / (past_chain.replace("/", "__") + ".json")).read_text())
+        if past_state["chain"] != past_chain or int(past_state.get("unblock_attempt", 0)) != 2:
+            die("self-test due retry did not append the fresh attempt on the same chain", 1)
+        if past_state.get("status") != "open" or len(past_state["steps"]) != 2:
+            die("self-test due retry is not a live successor step", 1)
+        if past_state["steps"][0].get("status") != "rejected":
+            die("self-test due retry rewrote terminal history instead of appending", 1)
+        if past_state["steps"][1].get("recovered_from") != past_state["steps"][0].get("id"):
+            die("self-test due retry successor does not link its rejected predecessor", 1)
+        again_sweep = run("unblock-sweep", "delta")
+        again_state = json.loads((root / "mesh/chains" / (past_chain.replace("/", "__") + ".json")).read_text())
+        if "unblock-task " in again_sweep.stdout or len(again_state["steps"]) != 2:
+            die("self-test sweep appended more than one fresh attempt after the date", 1)
         env["MESH_TASK_ACTOR"] = "beta"
         run("progress", "demo", "verify", str(artifact), "await review", "2026-09-08T00:00:00Z")
         run("progress", "demo", "verify", str(artifact), "finish review", "2026-09-08T01:00:00Z")
