@@ -24,6 +24,20 @@ printf '%s\n' "$out" | grep -q '"age_s":0' || { echo "missing fresh age: $out"; 
 edge="$(MESH_CPU_DEMAND_ROOT="$td/cpufreq" MESH_CPU_DEMAND_STATE="$td/state" "$TOOL" --edge)"
 [ -z "$edge" ] || { echo "unchanged --edge was noisy: $edge"; fail=1; }
 
+# The edge-gate audit seeds the first state line to force FIRE.  The predecessor
+# signature must therefore be the first line, while keyed readers may continue
+# to locate the remaining fields by name.
+first_line="$(head -1 "$td/state")"
+printf '%s\n' "$first_line" | grep -q '^signature=' || {
+  echo "edge predecessor signature is not the first state line: $first_line"; fail=1;
+}
+cp "$td/state" "$td/fire-state"
+printf 'ZZ_EDGE_AUDIT_SEED\n' > "$td/fire-state"
+fire="$(MESH_CPU_DEMAND_ROOT="$td/cpufreq" MESH_CPU_DEMAND_STATE="$td/fire-state" "$TOOL" --edge)"
+[ -n "$fire" ] || { echo "first-line predecessor seed did not fire"; fail=1; }
+hold="$(MESH_CPU_DEMAND_ROOT="$td/cpufreq" MESH_CPU_DEMAND_STATE="$td/fire-state" "$TOOL" --edge)"
+[ -z "$hold" ] || { echo "post-fire --edge hold was noisy: $hold"; fail=1; }
+
 mkdir -p "$td/home/.mesh"
 cp "$td/state" "$td/home/.mesh/.cpu-demand-state"
 roll="$(HOME="$td/home" "$ROOT/scripts/mesh-sensorium" --cached 2>/dev/null)"
