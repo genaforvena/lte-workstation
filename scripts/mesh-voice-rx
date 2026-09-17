@@ -121,6 +121,63 @@ def _mint_stt_repair_task(digest, failure, wav_secs, update_id, file_uid):
     except Exception as e:
         print(f"[voice-rx] repair-task mint error: {str(e)[:80]}", file=sys.stderr)
         return None
+GIGAAM_TIMEOUT = int(os.environ.get("MESH_GIGAAM_TIMEOUT", "150"))
+GIGAAM_CHUNK_SECS = int(os.environ.get("MESH_GIGAAM_CHUNK_SECS", "20"))
+def _split_wav(wav, chunk_secs=GIGAAM_CHUNK_SECS):
+    """Split a wav into <=chunk_secs pieces for GigaAM's plain transcribe() (longform needs
+    an HF token for pyannote, unavailable — so chunk by hand like the 2026-09-16 recovery).
+    Returns (paths, tmpdir-or-None); a short file returns itself with no copy."""
+    import wave as _wv
+    try:
+        _w = _wv.open(str(wav), "rb")
+        _n, _fr = _w.getnframes(), _w.getframerate()
+        _params = _w.getparams(); _dur = _n / float(_fr or 16000)
+        if _dur <= chunk_secs:
+            _w.close()
+            return [Path(wav)], None
+        import tempfile as _tf_s
+        _td = _tf_s.mkdtemp(prefix="giga-chunks-")
+        _per = int(chunk_secs * _fr); _paths = []; _i = 0
+        while True:
+            _frames = _w.readframes(_per)
+            if not _frames:
+                break
+            _cp = Path(_td) / f"chunk{_i:02d}.wav"
+            _o = _wv.open(str(_cp), "wb"); _o.setparams(_params); _o.writeframes(_frames); _o.close()
+            _paths.append(_cp); _i += 1
+        _w.close()
+        return _paths or [Path(wav)], _td
+    except Exception:
+        return [Path(wav)], None
+def gigaam_stt(wav):
+    """GPU STT via GigaAM v2_ctc (Sber, non-autoregressive, Russian-specialised) in ~/.venv-ai.
+    FIRST leg since 2026-09-17: whisper.cpp is a CPU-only build and three short notes blew the
+    240s budget on 4 threads under mesh CPU load (load ~80; niced job starved), while the RTX
+    3060 sat idle — threads (16 now) cannot fix contention, a different device can. ~8s per
+    60s audio warm, cold model load tolerated inside the timeout; WER 0.312 vs turbo's 0.250
+    is the price of load-immunity. Returns text, or None on any failure. Never raises.
+    Defined up here (above the --test block) so the smoke test can drive it with stubs."""
+    py = os.environ.get("MESH_GIGAAM_PYTHON", str(HOME / ".venv-ai/bin/python"))
+    model = os.environ.get("MESH_GIGAAM_MODEL", "v2_ctc")
+    _src = ("import sys; import gigaam; m = gigaam.load_model(sys.argv[1]); "
+            "ts = [(r if isinstance(r, str) else getattr(r, 'text', str(r))) "
+            "for r in (m.transcribe(p) for p in sys.argv[2:])]; print(' '.join(ts))")
+    _chunks, _chunkdir = _split_wav(wav)
+    try:
+        _r = subprocess.run([py, "-c", _src, model] + [str(c) for c in _chunks],
+                            text=True, capture_output=True, timeout=GIGAAM_TIMEOUT)
+    except Exception as e:
+        print(f"[voice-rx] gigaam_stt error: {str(e)[:80]}", file=sys.stderr)
+        return None
+    finally:
+        if _chunkdir:
+            import shutil as _sh_g
+            try: _sh_g.rmtree(_chunkdir)
+            except Exception: pass
+    if _r.returncode:
+        print(f"[voice-rx] gigaam_stt rc={_r.returncode}: {(_r.stderr or '')[:120].strip()}", file=sys.stderr)
+        return None
+    return (_r.stdout or "").strip() or None
 SCRUB_CMD = os.environ.get("MESH_LOG_SCRUB_CMD", "mesh-log-scrub")
 
 # Route through mesh-whisper-run (nice+ionice+flock shim, drop-in args) so a voice-note burst can't
@@ -529,6 +586,49 @@ if len(sys.argv) > 1 and sys.argv[1] == '--test':
         _t(f"-t {WHISPER_THREADS}" in _a3, f"whisper spawn not node-sized (argv: {_a3.strip()[:120]})")
         _t(_o3.strip() == "heard words", "stub transcript did not come back through _run_whisper")
         _t(WHISPER_THREADS == max(1, min(16, (os.cpu_count() or 4))), "thread count not capped at core count")
+
+    # 7d) THE GPU LEG NEVER RAISES AND NEVER FAKES (2026-09-17: gigaam-first ordering). A stub
+    # interpreter echoing text yields that text; `false` (rc 1, empty) yields None; a missing
+    # binary yields None without raising. Red if any leg raises or fakes content.
+    with _tf_b.TemporaryDirectory() as _gd:
+        _gw = Path(_gd) / "n.wav"; _gw.write_bytes(b"\0" * (44 + 32000))
+        _echo = Path(_gd) / "echo.sh"
+        _echo.write_text("#!/bin/sh\necho stub transcript\n"); _echo.chmod(0o755)
+        _old_gp = os.environ.get("MESH_GIGAAM_PYTHON")
+        os.environ["MESH_GIGAAM_PYTHON"] = str(_echo)
+        try:
+            _t(gigaam_stt(_gw) == "stub transcript", "stub GPU transcript did not come back")
+            os.environ["MESH_GIGAAM_PYTHON"] = "/bin/false"
+            _t(gigaam_stt(_gw) is None, "a failed GPU run faked a transcript")
+            os.environ["MESH_GIGAAM_PYTHON"] = str(Path(_gd) / "absent-py")
+            _t(gigaam_stt(_gw) is None, "a missing GPU interpreter raised instead of yielding None")
+        finally:
+            if _old_gp is None: os.environ.pop("MESH_GIGAAM_PYTHON", None)
+            else: os.environ["MESH_GIGAAM_PYTHON"] = _old_gp
+        # 7e) LONG AUDIO IS CHUNKED FOR THE GPU LEG (plain transcribe() rejects long wavs and
+        # longform needs an unavailable HF token). A short file passes through with no copy; a
+        # 45s file becomes 3 pieces of <=20s. Red if the limit is exceeded or audio is lost.
+        import wave as _wv_t
+        _short = Path(_gd) / "s.wav"
+        with _wv_t.open(str(_short), "wb") as _o:
+            _o.setnchannels(1); _o.setsampwidth(2); _o.setframerate(16000)
+            _o.writeframes(b"\0" * 16000 * 2 * 10)
+        _p1, _d1 = _split_wav(_short)
+        _t(_p1 == [_short] and _d1 is None, "a short file was copied instead of passing through")
+        _long = Path(_gd) / "l.wav"
+        with _wv_t.open(str(_long), "wb") as _o:
+            _o.setnchannels(1); _o.setsampwidth(2); _o.setframerate(16000)
+            _o.writeframes(b"\0" * 16000 * 2 * 45)
+        _p2, _d2 = _split_wav(_long)
+        _t(len(_p2) == 3, f"a 45s file did not split into 3 chunks (got {len(_p2)})")
+        _ok = True
+        for _c in _p2:
+            with _wv_t.open(str(_c), "rb") as _r:
+                if _r.getnframes() / float(_r.getframerate()) > 20.001:
+                    _ok = False
+        _t(_ok, "a chunk exceeds the 20s GPU-leg limit")
+        import shutil as _sh_t
+        _sh_t.rmtree(_d2, ignore_errors=True)
 
     # 8) DEAFNESS IS CHARGED IN UP-TIME (2026-08-26). Driven against a FABRICATED boot record built
     # from this node's real `last -xF`, replaying the five verdicts that were 100% false and the one
@@ -1363,31 +1463,39 @@ def transcribe(file_id, doc=None, spooled=None, retry_ctx=None):
     if not wav.exists(): return "[voice: ffmpeg failed]"
     local_admit_refused = False; local_timed_out = False
     budget = _whisper_budget(wav); wav_secs = _wav_seconds(wav)
-    try:
-        _wout, _wrc, _whung, _wto = _run_whisper(wav, budget)
-        if _wto:
+    # GPU FIRST (2026-09-17): GigaAM on the idle RTX 3060 is load-immune (~8s/60s warm);
+    # CPU whisper starved past the 240s budget under mesh load and threads cannot fix
+    # contention. A real GPU transcript is authoritative and whisper is not re-run over it.
+    txt = clean_transcript(" ".join((gigaam_stt(wav) or "").split()).strip())
+    if txt:
+        print(f"[voice-rx] gigaam STT ok ({len(txt)} chars)", file=sys.stderr)
+    if not txt:
+        try:
+            _wout, _wrc, _whung, _wto = _run_whisper(wav, budget)
+            if _wto:
+                local_timed_out = True; txt = ""
+            elif _whung:
+                # Both attempts wedged on silence — name it like a timeout (the operator waited
+                # the budget either way) and fall through to cloud.
+                local_timed_out = True; txt = ""
+            else:
+                # rc 75 = the whisper-run admission gate REFUSED (node too memory-pressured to run
+                # the ~2GB job) → stdout is empty but the audio was NEVER transcribed. Do NOT surface
+                # that as an "empty transcript" (a FAKE — the operator DID speak). Fall to cloud.
+                local_admit_refused = (_wrc == 75)
+                txt = clean_transcript(" ".join((_wout or "").split()).strip())
+        except subprocess.TimeoutExpired:
+            # Must not happen (_run_whisper bounds itself) — kept so a slow transcription can never
+            # RAISE into poll_once and wedge the WHOLE inbound queue on one note.
             local_timed_out = True; txt = ""
-        elif _whung:
-            # Both attempts wedged on silence — name it like a timeout (the operator waited
-            # the budget either way) and fall through to cloud.
-            local_timed_out = True; txt = ""
-        else:
-            # rc 75 = the whisper-run admission gate REFUSED (node too memory-pressured to run
-            # the ~2GB job) → stdout is empty but the audio was NEVER transcribed. Do NOT surface
-            # that as an "empty transcript" (a FAKE — the operator DID speak). Fall to cloud.
-            local_admit_refused = (_wrc == 75)
-            txt = clean_transcript(" ".join((_wout or "").split()).strip())
-    except subprocess.TimeoutExpired:
-        # Must not happen (_run_whisper bounds itself) — kept so a slow transcription can never
-        # RAISE into poll_once and wedge the WHOLE inbound queue on one note.
-        local_timed_out = True; txt = ""
-    except Exception as e:
-        print(f"[voice-rx] local whisper error: {str(e)[:80]}", file=sys.stderr)
-        txt = ""
-    # CLOUD FALLBACK: local whisper produced nothing (admission-refused under memory pressure, timed
+        except Exception as e:
+            print(f"[voice-rx] local whisper error: {str(e)[:80]}", file=sys.stderr)
+            txt = ""
+    # CLOUD FALLBACK: local legs produced nothing (GPU unavailable, admission-refused under memory pressure, timed
     # out, or errored). Groq STT needs zero local RAM, so voice survives an OOM-pressured node instead
-    # of the mesh going silently deaf. Only reached when local yields empty — a real local transcript
-    # is authoritative and never overridden. (honest-fusion, 2026-07-07 empty-transcript incident.)
+    # of the mesh going silently deaf. Only reached when GPU and CPU legs yield empty — a real
+    # local transcript is authoritative and never overridden. (honest-fusion, 2026-07-07
+    # empty-transcript incident.)
     if not txt:
         cloud = groq_stt(wav)
         if cloud:
