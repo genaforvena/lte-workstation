@@ -170,6 +170,11 @@ def _escape(value: str) -> str:
 
 
 def _unescape(value: str) -> str:
+    # Fast path (fix-double-replay-emit-timeout, 2026-09-17): '%' is the ONLY escape
+    # introducer, so a value without one decodes to itself. Semantics-preserving by
+    # construction — the loop below copies every non-'%' char verbatim.
+    if '%' not in value:
+        return value
     out = []
     index = 0
     while index < len(value):
@@ -192,6 +197,9 @@ def _pointer_key(value: str) -> str:
 
 
 def _pointer_unkey(value: str) -> str:
+    # Fast path, same contract as _unescape: '~' is the only escape introducer.
+    if '~' not in value:
+        return value
     out = []
     index = 0
     while index < len(value):
@@ -583,10 +591,127 @@ def append(root: Path, who: str, payload: str) -> None:
             os.fsync(output.fileno())
 
 
+def _smoke_test() -> None:
+    """--test: differential contract for the escape fast paths (fix-double-replay-emit-
+    timeout, 2026-09-17). _unescape/_pointer_unkey skip inputs without their introducer;
+    this asserts the skip is invisible: an INDEPENDENT reference implementation (regex,
+    not a copy of the loop) must agree on every input, errors included, plus an
+    encode->decode round trip and a two-chain replay fixture. No board writes, no
+    network, <5s. Exit 0 green, 1 red with the failing arm named."""
+    import random as _rnd
+    failures = []
+    def _check(name, cond):
+        if not cond:
+            failures.append(name)
+    def _ref_unescape(value):
+        # independent: single regex pass instead of the char loop
+        import re as _re2
+        out = []
+        pos = 0
+        for m in _re2.finditer(r'%(?:[0-9A-F]{2}|[\s\S])', value):
+            out.append(value[pos:m.start()])
+            tok = m.group(0)
+            if len(tok) != 3 or not _re2.fullmatch(r'[0-9A-F]{2}', tok[1:]):
+                raise ReplayError('malformed readable percent escape')
+            code = int(tok[1:], 16)
+            if code not in (0x25, 0x7c, 0x0a, 0x0d) and not (code < 0x20 or code == 0x7f):
+                raise ReplayError('readable escape is not a grammar-breaking byte')
+            out.append(chr(code))
+            pos = m.end()
+        out.append(value[pos:])
+        # a trailing lone '%' never matches the regex but must still raise
+        if '%' in value[pos:]:
+            raise ReplayError('malformed readable percent escape')
+        return ''.join(out)
+    def _ref_unkey(value):
+        import re as _re2
+        out = []
+        pos = 0
+        for m in _re2.finditer(r'~[\s\S]', value):
+            out.append(value[pos:m.start()])
+            tok = m.group(0)
+            if tok == '~0':
+                out.append('~')
+            elif tok == '~1':
+                out.append('/')
+            else:
+                raise ReplayError('malformed readable JSON pointer escape')
+            pos = m.end()
+        out.append(value[pos:])
+        if '~' in value[pos:]:
+            raise ReplayError('malformed readable JSON pointer escape')
+        return ''.join(out)
+    corpus = ['', 'a', 'plain words 123', '%', '%%', '100%', '%2', '%2G', '%20', 'a%20b%7C',
+              '%0A%0D%25%7C', '%FF', '%7f', '%1F', 'x%41y', '~', '~~', '~0', '~1', '~2',
+              'a~0b~1c', '~~0', 'trail~', '%~0', '~%20', 'mix %20 ed ~1 done']
+    _rng = _rnd.Random(20260917)
+    alphabet = list('ab %~019AFxyz\n|') + ['%20', '~0', '~1']
+    for _ in range(400):
+        corpus.append(''.join(_rng.choice(alphabet) for _ in range(_rng.randrange(0, 24))))
+    for v in corpus:
+        for fn, ref, label in ((_unescape, _ref_unescape, 'unescape'),
+                               (_pointer_unkey, _ref_unkey, 'unkey')):
+            try:
+                got = fn(v)
+                got_err = None
+            except ReplayError as e:
+                got, got_err = None, str(e)
+            try:
+                want = ref(v)
+                want_err = None
+            except ReplayError as e:
+                want, want_err = None, str(e)
+            if got != want or got_err != want_err:
+                _check(f'{label} diff on {v!r}: got ({got!r},{got_err}) want ({want!r},{want_err})', False)
+    # encode->decode round trip with escape-heavy leaves
+    rec = {'chain': 't', 'current': 0, 'status': 'open',
+           'steps': [{'id': 't/s', 'slug': 's', 'owner': 'genome', 'status': 'open',
+                      'description': '100% ~ready | pipe\nnewline\x01'}]}
+    try:
+        back = decode(encode(rec, 3).removeprefix(MARKER))
+        _check('round trip data', back['data'] == rec)
+        _check('round trip revision', back['revision'] == 3)
+    except ReplayError:
+        _check('round trip raised', False)
+    # two-chain replay fixture incl. a quarantined post-terminal row
+    import tempfile as _tf
+    with _tf.TemporaryDirectory() as _td:
+        lp = Path(_td) / 'chat.log'
+        stem = {'chain': 'c', 'current': 0, 'status': 'open',
+                'steps': [{'id': 'c/s', 'slug': 's', 'owner': 'genome', 'status': 'open',
+                           'description': 'd'}]}
+        line = lambda d, r: (f'2026-09-17T00:00:0{r}Z  t@h  ::  ' + encode_readable(d, r) + '\n')
+        done = json.loads(json.dumps(stem))
+        done['steps'][0]['status'] = 'done'
+        done['status'] = 'complete'
+        bad = json.loads(json.dumps(done))
+        bad['steps'][0]['description'] = 'mutated after terminal'
+        bad['steps'][0]['artifact'] = 'a-different-artifact'
+        other = json.loads(json.dumps(stem))
+        other['chain'] = 'c2'
+        other['steps'][0]['id'] = 'c2/s'
+        lp.write_text(line(stem, 1) + line(other, 1) + line(done, 2) + line(bad, 3),
+                      encoding='utf-8')
+        try:
+            states = replay(lp)
+            _check('fixture chains', sorted(states) == ['c', 'c2'])
+            _check('quarantine holds terminal',
+                   states['c']['data']['steps'][0]['description'] == 'd')
+        except ReplayError:
+            _check('fixture replay raised', False)
+    if failures:
+        print(f'smoke-test: FAIL ({len(failures)} arms): {failures[0]}', file=sys.stderr)
+        sys.exit(1)
+    print('smoke-test: ok (escape differential, round trip, replay fixture)')
+    sys.exit(0)
+
+
 if __name__ == '__main__':
     try:
+        if len(sys.argv) == 2 and sys.argv[1] == '--test':
+            _smoke_test()
         if len(sys.argv) != 5 or sys.argv[1] != 'append':
-            raise ReplayError('usage: mesh_task_log.py append <mesh-dir> <author> <task-state-payload>')
+            raise ReplayError('usage: mesh_task_log.py append <mesh-dir> <author> <task-state-payload> | mesh_task_log.py --test')
         append(Path(sys.argv[2]), sys.argv[3], sys.argv[4])
     except (OSError, ValueError) as exc:
         print(f'mesh-task-log: {exc}', file=sys.stderr)
