@@ -169,6 +169,9 @@ def run() -> None:
             raise AssertionError(f"canonically DONE row was reported as stalled: {stalled_tape}")
         if any("done/stale-lease" in wake[-1] for wake in recovery_wakes):
             raise AssertionError(f"DONE row woke its owner: {recovery_wakes}")
+        # The terminal skip is its own counter, never folded into stalled.
+        if "skipped_stale=1" not in stalled_tape:
+            raise AssertionError(f"terminal skip lacked its own counter: {stalled_tape}")
         watch.time.time = original_time
         watch.STATE.write_text("{}\n", encoding="utf-8")
 
