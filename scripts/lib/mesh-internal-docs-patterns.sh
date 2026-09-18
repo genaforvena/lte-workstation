@@ -13,14 +13,14 @@
 # ("${path#"$REPO"/}"), so absolute and relative callers agree.
 
 # shellcheck disable=SC2034
-INTERNAL_DOCS_PATTERNS="docs/health-warning-* health-warning-* */docs/health-warning-* */health-warning-*"
+INTERNAL_DOCS_PATTERNS="docs/health-warning-* health-warning-* */docs/health-warning-* */health-warning-* *.findings.json */*.findings.json"
 
 # is_internal_evidence <path> — rc 0 iff the path is internal evidence.
 # Accepts repo-absolute or repo-relative paths; strips a leading "$REPO/".
 is_internal_evidence(){
   local _rel="${1#"$REPO"/}"
   case "$_rel" in
-    docs/health-warning-*|health-warning-*|*/docs/health-warning-*|*/health-warning-*) return 0 ;;
+    docs/health-warning-*|health-warning-*|*/docs/health-warning-*|*/health-warning-*|*.findings.json|*/*.findings.json) return 0 ;;
     *) return 1 ;;
   esac
 }
