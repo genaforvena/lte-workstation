@@ -2,7 +2,8 @@
 # mesh-internal-docs-patterns.sh — THE ONE pattern table for internal docs.
 #
 # INTERNAL DOCS NEVER LAND IN GIT (2026-09-17). Node-local triage/health-warning
-# write-ups are operator-private evidence, not repo material.
+# write-ups and health-observation analyses are operator-private evidence,
+# not repo material.
 #
 # Sourced by BOTH scripts/mesh-land (is_internal_evidence deny-list) and
 # scripts/mesh-repo-hygiene (repo scan). One table, two readers — a pattern added
@@ -13,14 +14,14 @@
 # ("${path#"$REPO"/}"), so absolute and relative callers agree.
 
 # shellcheck disable=SC2034
-INTERNAL_DOCS_PATTERNS="docs/health-warning-* health-warning-* */docs/health-warning-* */health-warning-* *.findings.json */*.findings.json"
+INTERNAL_DOCS_PATTERNS="docs/health-warning-* health-warning-* */docs/health-warning-* */health-warning-* docs/health-observation-analysis-* health-observation-analysis-* */docs/health-observation-analysis-* */health-observation-analysis-* *.findings.json */*.findings.json"
 
 # is_internal_evidence <path> — rc 0 iff the path is internal evidence.
 # Accepts repo-absolute or repo-relative paths; strips a leading "$REPO/".
 is_internal_evidence(){
   local _rel="${1#"$REPO"/}"
   case "$_rel" in
-    docs/health-warning-*|health-warning-*|*/docs/health-warning-*|*/health-warning-*|*.findings.json|*/*.findings.json) return 0 ;;
+    docs/health-warning-*|health-warning-*|*/docs/health-warning-*|*/health-warning-*|docs/health-observation-analysis-*|health-observation-analysis-*|*/docs/health-observation-analysis-*|*/health-observation-analysis-*|*.findings.json|*/*.findings.json) return 0 ;;
     *) return 1 ;;
   esac
 }
