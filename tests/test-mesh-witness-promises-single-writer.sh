@@ -31,6 +31,7 @@ wait "$first"
 set +e
 PATH="$tmp/bin:$PATH" MESH_DIR="$tmp/mesh" \
   MESH_WITNESS_COORDINATION_SUMMARY="$tmp/mesh/summary" \
+  MESH_TASK_JOURNAL_MIN_AGE=0 \
   MESH_WITNESS_TASK_TIMEOUT=0.1s "$root/scripts/mesh-task-journal" >/dev/null 2>&1
 timed_rc=$?
 set -e
