@@ -394,6 +394,8 @@ def main() -> None:
         plan_lines = plans.read_text().splitlines()
         assert len(plan_lines) == 1, plan_lines
         assert "active-task-stalled-unblock/adint/fixture/resolve" in plan_lines[0], plan_lines
+        assert plan_lines[0].split("\t")[2] == "100", plan_lines
+        assert plan_lines[0].endswith("priority:incident"), plan_lines
         state = json.loads((mesh / "warning-tasks.state").read_text())
         assert state["offset"] == 0, state
 
