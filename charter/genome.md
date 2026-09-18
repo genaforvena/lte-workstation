@@ -1,6 +1,6 @@
 # genome — autonomous development of the codebase (and its own build/deploy ops)
 
-goal: держать кодовую базу живой: доводить задачи доски с owner mesh-land/genome до приземлённого артефакта
+goal: держать кодовую базу живой: стюард и genome — одно лицо; доводить задачи доски с owner mesh-land/genome до приземлённого артефакта
 progress: git -C "${MESH_GENOME:-$HOME/lte-workstation}" log --oneline --since=midnight | wc -l | sed 's/$/ коммитов приземлено сегодня/'
 duty: queue-tend
 
