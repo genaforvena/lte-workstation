@@ -1,0 +1,149 @@
+#!/usr/bin/env python3
+# reflex-cadence: */1 * * * *
+"""Wake the health mind immediately when a new critical board error arrives.
+
+The health-warning-task reflex owns durable task creation.  This reflex owns only the
+low-latency wake, so a queued task cannot depend on a busy or backlogged warning cursor.
+"""
+
+from __future__ import annotations
+
+import fcntl
+import hashlib
+import json
+import os
+import re
+import subprocess
+import tempfile
+from pathlib import Path
+
+
+MESH = Path(os.environ.get("MESH_DIR", str(Path.home() / ".mesh")))
+CHAT = Path(os.environ.get("MESH_CHAT_LOG", str(MESH / "chat.log")))
+STATE = Path(os.environ.get("MESH_HEALTH_CRITICAL_WAKE_STATE", str(MESH / ".health-critical-wake.state")))
+WINDOW = os.environ.get("MESH_HEALTH_CRITICAL_WAKE_WINDOW", "health")
+MIND_STATE = os.environ.get("MESH_MIND_STATE_CMD", "mesh-mind-state")
+TELL = os.environ.get("MESH_TELL_CMD", "mesh-tell")
+
+LINE_RE = re.compile(rb"^(?P<stamp>\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ)\s+(?P<sender>\S+)\s+::\s+(?P<body>.*)$")
+CRITICAL = re.compile(
+    rb"\[(?:critical|fatal|panic|error|failure|failed|delivery-failed|health-fail|"
+    rb"pane-frozen|mind-wedged|mind-stranded|mind-holding|scheduler-dead|organ-down|alarm|"
+    rb"node-down|lan-down|vpn-down|watchdog-dead)\]",
+    re.I,
+)
+DOCTOR_FAIL = re.compile(rb"^\[doctor\]\s+[1-9]\d*\s+FAIL\b", re.I)
+
+
+def load_state() -> dict:
+    try:
+        state = json.loads(STATE.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        state = {}
+    if not isinstance(state, dict) or not isinstance(state.get("seen"), list):
+        state = {}
+    state.setdefault("offset", 0)
+    state.setdefault("seen", [])
+    if not isinstance(state["offset"], int) or state["offset"] < 0:
+        state["offset"] = 0
+    state["seen"] = [str(item) for item in state["seen"][-256:]]
+    return state
+
+
+def save_state(state: dict) -> None:
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=f".{STATE.name}.", dir=STATE.parent, text=True)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(state, handle, sort_keys=True)
+            handle.write("\n")
+        os.replace(tmp, STATE)
+    finally:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+
+
+def critical_line(raw: bytes) -> tuple[str, str, str] | None:
+    match = LINE_RE.match(raw.rstrip(b"\n"))
+    if not match:
+        return None
+    body = match.group("body")
+    if not (CRITICAL.search(body) or DOCTOR_FAIL.search(body)):
+        return None
+    stamp = match.group("stamp").decode("ascii")
+    sender = match.group("sender").decode("utf-8", "replace")
+    text = body.decode("utf-8", "replace")
+    return stamp, sender, text
+
+
+def wake(prompt: str) -> tuple[bool, str]:
+    try:
+        state = subprocess.run([MIND_STATE, WINDOW], text=True, capture_output=True, check=False, timeout=8)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, f"mind-state unavailable: {exc}"
+    status = (state.stdout.strip().splitlines() or [""])[0].split("\t", 1)[0]
+    if status != "IDLE":
+        return False, f"health is {status or 'UNKNOWN'}; durable urgent task remains the retry path"
+    try:
+        result = subprocess.run([TELL, "--ack", WINDOW, prompt], text=True,
+                                capture_output=True, check=False, timeout=20)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, f"wake failed: {exc}"
+    if result.returncode:
+        detail = (result.stderr or result.stdout).strip().replace("\n", " ")
+        return False, f"wake failed rc={result.returncode}: {detail[:240]}"
+    return True, "wake delivered"
+
+
+def run() -> int:
+    if not CHAT.is_file():
+        print(f"mesh-health-critical-wake: chat.log unavailable: {CHAT}")
+        return 2
+    lock = STATE.with_name(STATE.name + ".lock")
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    with lock.open("a+") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        state = load_state()
+        size = CHAT.stat().st_size
+        if state["offset"] > size:
+            state["offset"] = 0
+        candidates: list[tuple[str, str, str, str]] = []
+        with CHAT.open("rb") as source:
+            source.seek(state["offset"])
+            while True:
+                end = source.tell()
+                raw = source.readline()
+                if not raw:
+                    break
+                event = critical_line(raw)
+                if event:
+                    stamp, sender, body = event
+                    key = hashlib.sha256(raw.rstrip(b"\n")).hexdigest()
+                    if key not in state["seen"]:
+                        candidates.append((key, stamp, sender, body))
+                state["offset"] = source.tell()
+        if not candidates:
+            save_state(state)
+            print("mesh-health-critical-wake: no new critical error")
+            return 0
+        key, stamp, sender, body = candidates[-1]
+        prompt = (f"URGENT automatic health task: investigate the critical chat.log error from {sender} "
+                  f"at {stamp}: {body}. Start now; this is top priority and needs an artifact-backed fix.")
+        ok, detail = wake(prompt)
+        if ok:
+            state["seen"].append(key)
+        save_state(state)
+        print(f"mesh-health-critical-wake: {'delivered' if ok else 'deferred'} {detail}")
+    return 0
+
+
+if __name__ == "__main__":
+    if len(os.sys.argv) > 1 and os.sys.argv[1] == "--test":
+        assert critical_line(b"2026-01-01T00:00:00Z watchdog@node :: [critical] disk failed\n")
+        assert critical_line(b"2026-01-01T00:00:00Z doctor@node :: [doctor] 2 FAIL, 1 WARN\n")
+        assert critical_line(b"2026-01-01T00:00:00Z chat@node :: [fyi] routine\n") is None
+        print("mesh-health-critical-wake --test: PASS")
+    else:
+        raise SystemExit(run())
