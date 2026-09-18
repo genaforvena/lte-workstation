@@ -35,6 +35,52 @@ def inventory() -> tuple[int, int]:
     return ok, len(EXPECTED)
 
 
+def jit_state() -> str:
+    """Report the JIT-compile posture without importing torch.
+
+    off      = MESH_TINY_FLEET_JIT != "1" (default; zero behavior change)
+    ready    = enabled and a cached/in-memory compile path is configured
+    The worker never dies on a compile failure: maybe_jit_compile() falls
+    back to eager and names the fallback in the returned state.
+    """
+    if os.environ.get("MESH_TINY_FLEET_JIT", "").strip() != "1":
+        return "off"
+    return "ready"
+
+
+def maybe_jit_compile(model):
+    """Opt-in torch.compile with a persistent Inductor cache.
+
+    Fault-tolerance point: the first compile after a crash/restart is the
+    slowest step of worker recovery. A disk-backed Inductor cache
+    (TORCHINDUCTOR_CACHE_DIR under the fleet dir) lets a restarted worker
+    reuse compiled artifacts instead of recompiling from scratch, cutting
+    restart downtime. Any failure (no torch, compile error, bad cache dir)
+    falls back to the eager model — compilation must never take the
+    worker down, so this function never raises.
+    Returns (model, state) where state is one of off/compiled/eager-fallback.
+    """
+    if os.environ.get("MESH_TINY_FLEET_JIT", "").strip() != "1":
+        return model, "off"
+    try:
+        import torch
+    except Exception as exc:
+        return model, f"eager-fallback(no-torch: {exc})"
+    try:
+        cache = os.environ.get(
+            "MESH_TINY_FLEET_JIT_CACHE", str(FLEET / ".inductor-cache")
+        )
+        os.makedirs(cache, exist_ok=True)
+        os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", cache)
+        mode = os.environ.get("MESH_TINY_FLEET_JIT_MODE", "reduce-overhead").strip()
+        if mode not in ("default", "reduce-overhead", "max-autotune"):
+            mode = "reduce-overhead"
+        model = torch.compile(model, mode=mode)
+        return model, f"compiled(mode={mode},cache={cache})"
+    except Exception as exc:
+        return model, f"eager-fallback(compile-failed: {exc})"
+
+
 def policy_decision(prompt: str) -> dict:
     if not (FLEET / "scripts" / "operator_policy.py").is_file():
         raise FileNotFoundError("tiny-fleet policy runtime is absent")
@@ -98,6 +144,9 @@ def run(prompt: str) -> int:
         local_files_only=True,
     )
     model = PeftModel.from_pretrained(model, str(adapter), local_files_only=True)
+    model, jit = maybe_jit_compile(model)
+    if os.environ.get("MESH_TINY_FLEET_JIT_LOG", "").strip() == "1":
+        print(f"[jit] {jit}", file=sys.stderr)
     rendered = tok.apply_chat_template(
         [{"role": "user", "content": prompt}], tokenize=False, add_generation_prompt=True
     )
@@ -127,6 +176,7 @@ def main() -> int:
         )
         print(f"adapter inventory: {passed}/{total}")
         print(f"abstain/escalate contract: {sum(checks)}/{len(checks)}")
+        print(f"jit: {jit_state()}")
         return 0 if passed == total and all(checks) else 1
     if not args.prompt.strip():
         return 1
