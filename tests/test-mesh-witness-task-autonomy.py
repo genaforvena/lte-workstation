@@ -59,6 +59,7 @@ def run() -> None:
             "OPEN_UNOWNED\t-\tpool/work\tdispatch=sent\n"
             "RUNNING\tgenome\tgenome/landing\tlease=2030-01-01T00:00:00Z\n"
             "RUNNING\thealth\thealth-warning/ace9180f/triage\tlease=2030-01-01T00:00:00Z\n"
+            "RUNNING\tgenome\tdone/stale-lease\tlease=2030-01-01T00:00:00Z\n"
             "BLOCKED\thaunt\tchain/wait\tdependency\tretry=prerequisite\n"
         )
         global_queue = ("alice\towned/work\t0\tdescription\n"
@@ -86,6 +87,8 @@ def run() -> None:
                      "queued_at": "1970-01-01T00:16:00Z"},
                     {"id": "genome/landing", "owner": "genome", "status": "active",
                      "last_progress": "1970-01-01T00:15:00Z"},
+                    {"id": "done/stale-lease", "owner": "genome", "status": "done",
+                     "artifact": "/tmp/fixture-artifact", "result": "ok"},
                     {"id": "chain/wait", "owner": "haunt", "status": "blocked",
                      "blocked": "1970-01-01T00:14:00Z"},
                 ]}}})
@@ -119,7 +122,7 @@ def run() -> None:
         if watch.run_once() != 0:
             raise AssertionError("healthy ownerless queue fixture failed")
         tape = watch.TAPE.read_text(encoding="utf-8")
-        for field in ("health=PASS", "source=PASS", "unfinished=6", "blocked=1",
+        for field in ("health=PASS", "source=PASS", "unfinished=7", "blocked=1",
                       "idle_minds=2", "dispatchable=2", "unroutable=1", "ownerless=1", "ownerless_visible=2",
                       "dispatch_repairs=1"):
             if field not in tape:
@@ -160,6 +163,12 @@ def run() -> None:
             raise AssertionError(f"stalled triage row was reported as stalled work: {stalled_tape}")
         if any("health-warning/ace9180f/triage" in wake[-1] for wake in recovery_wakes):
             raise AssertionError(f"stalled triage row woke its owner: {recovery_wakes}")
+        # A DONE row holding a live lease is journal lag, not a stall: no
+        # error and no recovery wake for it, while the live claim still pages.
+        if "active-task-stalled-done/stale-lease-for-" in stalled_tape:
+            raise AssertionError(f"canonically DONE row was reported as stalled: {stalled_tape}")
+        if any("done/stale-lease" in wake[-1] for wake in recovery_wakes):
+            raise AssertionError(f"DONE row woke its owner: {recovery_wakes}")
         watch.time.time = original_time
         watch.STATE.write_text("{}\n", encoding="utf-8")
 
