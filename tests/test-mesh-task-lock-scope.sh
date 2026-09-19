@@ -9,14 +9,24 @@ mkdir -p "$td/bin" "$td/mesh/chains"
 printf 'alpha\twork\tproduce a durable artifact\n' >"$td/one.tsv"
 printf 'beta\twork\tproduce a separate durable artifact\n' >"$td/two.tsv"
 
-cat >"$td/bin/mesh-chat" <<'EOF'
+cat >"$td/bin/mesh-chat" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
-if [[ "${1:-}" == '[taking] one/work:'* ]]; then
-  : >"$TEST_TAKING"
-  while [[ ! -e "$TEST_RELEASE" ]]; do sleep 0.02; done
+if [[ "\${1:-}" == --task-state ]]; then
+  # Sandbox-faithful ledger append: the real append entry point against the
+  # fixture MESH_DIR, so take/load replays the chain from the sandbox chat.log
+  # (at land time the hardcoded real mesh-chat did this; the flood fix routes
+  # save() through MESH_TASK_CHAT_CMD, and a fake that swallows --task-state
+  # leaves no log for take to replay -> false red).
+  # NOTE: outer heredoc is unquoted so $repo/$td bind at fixture creation;
+  # fake-runtime vars stay backslash-escaped.
+  exec python3 "$repo/scripts/mesh_task_log.py" append "$td/mesh" "test" "\$2"
 fi
-printf '%s\n' "$1" >>"$TEST_BOARD"
+if [[ "\${1:-}" == '[taking] one/work:'* ]]; then
+  : >"\$TEST_TAKING"
+  while [[ ! -e "\$TEST_RELEASE" ]]; do sleep 0.02; done
+fi
+printf '%s\n' "\$1" >>"\$TEST_BOARD"
 EOF
 chmod +x "$td/bin/mesh-chat"
 
