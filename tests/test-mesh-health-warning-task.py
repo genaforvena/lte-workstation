@@ -33,6 +33,15 @@ def main() -> None:
     assert warning_key("health@mesh-home", "[verify] health: lease audit FAILED")
     assert warning_key("health@mesh-home", "[verify] health: lease audit clean") is None
 
+    stalled_with_sibling = (
+        "[health-fail] witness-task-autonomy: errors="
+        "active-task-stalled-unblock/adint/9408d7f1f2f1225b/resolve-for-1885s;"
+        "active-task-stalled-witness/abc123/resolve-for-900s"
+    )
+    assert warning_key("mesh-home/mesh-witness-task-autono@mesh-home", stalled_with_sibling) == (
+        "error-task:unblock/adint/9408d7f1f2f1225b/resolve"
+    )
+
     # Chronic suppression roll-ups are trace-tier refreshes, not fresh urgent
     # incidents.  Their measured counters and last-text snapshot change on
     # every emission, but subject plus chronic signature identifies one chain.
