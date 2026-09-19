@@ -7,15 +7,24 @@ trap 'rm -rf "$td"' EXIT
 mkdir -p "$td/mesh/chains"
 printf 'alpha\twork\tproduce a verified artifact\n' >"$td/plan.tsv"
 printf 'evidence\n' >"$td/artifact.md"
+cat >"$td/chat" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == --task-state ]]; then
+  exec python3 "$TEST_TASK_LOG" append "$MESH_DIR" fixture "$2"
+fi
+exit 0
+EOF
+chmod +x "$td/chat"
 
 base_env=(
   MESH_DIR="$td/mesh"
   MESH_TASK_DIR="$td/mesh/chains"
   MESH_TASK_HANDOFF_CMD=/bin/true
   MESH_TASK_ACTOR=alpha
+  TEST_TASK_LOG="$repo/scripts/mesh_task_log.py"
 )
 
-env "${base_env[@]}" MESH_TASK_CHAT_CMD=/bin/true \
+env "${base_env[@]}" MESH_TASK_CHAT_CMD="$td/chat" \
   python3 "$repo/scripts/mesh-task" create demo "$td/plan.tsv" ask:demo >/dev/null
 
 if env "${base_env[@]}" MESH_TASK_CHAT_CMD=/bin/false \
@@ -30,7 +39,7 @@ assert data["status"] == "open", data
 assert data["steps"][0]["status"] == "open", data
 PY
 
-env "${base_env[@]}" MESH_TASK_CHAT_CMD=/bin/true \
+env "${base_env[@]}" MESH_TASK_CHAT_CMD="$td/chat" \
   python3 "$repo/scripts/mesh-task" take demo work >/dev/null
 if env "${base_env[@]}" MESH_TASK_CHAT_CMD=/bin/false \
     python3 "$repo/scripts/mesh-task" done demo work "$repo/scripts/mesh-task" verified \
@@ -69,7 +78,7 @@ assert "progress_artifact" not in step, data
 assert "blocker_type" not in step, data
 PY
 
-env "${base_env[@]}" MESH_TASK_CHAT_CMD=/bin/true \
+env "${base_env[@]}" MESH_TASK_CHAT_CMD="$td/chat" \
   python3 "$repo/scripts/mesh-task" block demo work dependency upstream event:upstream >/dev/null
 if env "${base_env[@]}" MESH_TASK_CHAT_CMD=/bin/false \
     python3 "$repo/scripts/mesh-task" resume demo work upstream-arrived \
