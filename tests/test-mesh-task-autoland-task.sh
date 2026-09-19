@@ -7,7 +7,8 @@ trap 'rm -rf "$td"' EXIT
 mkdir -p "$td/mesh/chains"
 printf 'genome\timplement\timplement the parser guard\n' >"$td/plan.tsv"
 printf 'verified parser artifact\n' >"$td/artifact.md"
-printf '%s\n' '#!/usr/bin/env bash' 'printf "%s\\n" "$1" >>"$MESH_TASK_CHAT_LOG"' >"$td/chat"
+printf '%s\n' '#!/usr/bin/env bash' \
+  'if [ "${1:-}" = "--task-state" ]; then printf "%s mesh-task@fixture :: [task-ledger] %s\n" "$(date -u +%FT%TZ)" "$2" >>"$MESH_TASK_CHAT_LOG"; else printf "%s\n" "$1" >>"$MESH_TASK_CHAT_LOG"; fi' >"$td/chat"
 chmod +x "$td/chat"
 
 env \
@@ -70,6 +71,6 @@ grep -q 'Suggested commit subject:.*parser-guard/implement.*parser guard verifie
 grep -q 'Why/context: implement the parser guard' "$td/mesh/chat.log"
 grep -q "Artifact: $repo/scripts/mesh-task" "$td/mesh/chat.log"
 grep -q 'artifact-sha256:' "$td/mesh/chat.log"
-[ "$(grep -c 'autoland/parser-guard/implement' "$td/mesh/chat.log")" = 1 ]
+[ "$(grep -c '\[task\] autoland/parser-guard/implement' "$td/mesh/chat.log")" = 1 ]
 
 echo 'test-mesh-task-autoland-task: PASS'
