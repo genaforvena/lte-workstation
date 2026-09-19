@@ -24,6 +24,7 @@ printf '%s\n' 'promise-check=PASS'
 EOF
 cat > "$T/bin/mesh-ledger" <<'EOF'
 #!/usr/bin/env bash
+[ "${TEST_CHECK_RC:-0}" = 0 ] || exit "$TEST_CHECK_RC"
 printf '%s\n' 'ledger-check=PASS'
 EOF
 cat > "$T/bin/mesh-labor" <<'EOF'
@@ -75,5 +76,10 @@ grep -q '^source=task status=KNOWN ' "$cron_out"
 for source in promises ledger labor; do
   grep -q "^source=$source status=KNOWN verdict=PASS$" "$cron_out"
 done
+
+# Forced deadline termination is UNKNOWN, never a verified accounting failure.
+HOME="$T/home" MESH_DIR="$T/home/.mesh" MESH_EVIDENCE_ROOT="$T/home/.mesh/evidence" PATH="$T/bin:$PATH" MESH_RECON_REPO="$T/repo" TEST_CHECK_RC=137 \
+  "$BIN" --cutoff 2026-09-09T00:01:00Z --output "$T/killed-report"
+grep -q '^source=ledger status=UNKNOWN reason=timeout$' "$T/killed-report"
 
 echo 'test-mesh-hledger-reconcile: PASS'
