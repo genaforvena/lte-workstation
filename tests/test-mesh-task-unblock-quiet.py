@@ -134,6 +134,46 @@ exec bash "$1" --run
                                  text=True, capture_output=True, timeout=5)
             self.assertEqual(got.returncode, 0, got.stderr)
 
+    def test_concurrent_block_attempts_emit_one_canonical_event(self):
+        """A same-chain block race must not duplicate the blocked board event."""
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            chat_wrapper = root / "chat-wrapper"
+            chat_wrapper.write_text(
+                "#!/bin/sh\n"
+                "case \"$1\" in\n"
+                "  \\[blocked\\]*) sleep 0.4 ;;\n"
+                "esac\n"
+                f"exec {REPO / 'scripts' / 'mesh-chat'} \"$@\"\n"
+            )
+            chat_wrapper.chmod(0o755)
+            env = os.environ | {
+                "MESH_DIR": temp,
+                "MESH_TASK_DIR": str(root / "chains"),
+                "MESH_TASK_ACTOR": "alpha",
+                "MESH_TASK_CHAT_CMD": str(chat_wrapper),
+                "MESH_TASK_HANDOFF_CMD": "/bin/true",
+            }
+            plan = root / "plan.tsv"
+            plan.write_text("alpha\twork\tblocked race\n")
+            for command in (("create", "race", str(plan)), ("take", "race", "work")):
+                created = subprocess.run(
+                    [sys.executable, str(REPO / "scripts" / "mesh-task"), *command],
+                    env=env, capture_output=True, text=True, timeout=10)
+                self.assertEqual(created.returncode, 0, created.stderr)
+
+            command = [sys.executable, str(REPO / "scripts" / "mesh-task"),
+                       "block", "race", "work", "external-event", "gate", "retry"]
+            processes = [subprocess.Popen(command, env=env, stdout=subprocess.PIPE,
+                                          stderr=subprocess.PIPE, text=True)
+                         for _ in range(2)]
+            results = [process.communicate(timeout=15) for process in processes]
+            self.assertEqual(sum(process.returncode == 0 for process in processes), 1,
+                             results)
+            blocked = [line for line in (root / "chat.log").read_text().splitlines()
+                       if " ::  [blocked] " in line and "race/work" in line]
+            self.assertEqual(len(blocked), 1, blocked)
+
 
 if __name__ == "__main__":
     unittest.main()
