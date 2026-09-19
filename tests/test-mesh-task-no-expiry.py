@@ -16,11 +16,20 @@ class TaskNoExpiryTests(unittest.TestCase):
         root = Path(self.tmp.name)
         fake = root / "bin"
         fake.mkdir()
-        chat_log = root / "chat-events.log"
+        chat_log = root / "mesh" / "chat.log"
         for name in ("chat", "handoff"):
             tool = fake / name
             if name == "chat":
-                tool.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$*\" >> {chat_log}\nexit 0\n")
+                tool.write_text(
+                    f"#!/bin/sh\n"
+                    f"if [ \"${{1:-}}\" = --task-state ]; then\n"
+                    f"  mkdir -p \"$(dirname '{chat_log}')\"\n"
+                    f"  printf '%s mesh-test@node :: [task-ledger] %s\\n' \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" \"$2\" >> '{chat_log}'\n"
+                    f"else\n"
+                    f"  printf '%s\\n' \"$*\" >> '{chat_log}'\n"
+                    f"fi\n"
+                    f"exit 0\n"
+                )
             else:
                 tool.write_text("#!/bin/sh\nexit 0\n")
             tool.chmod(0o755)
@@ -30,6 +39,7 @@ class TaskNoExpiryTests(unittest.TestCase):
             "MESH_TASK_CHAT_CMD": str(fake / "chat"),
             "MESH_TASK_HANDOFF_CMD": str(fake / "handoff"),
             "MESH_TASK_ACTOR": "alpha",
+            "MESH_CHAT_LOG": str(chat_log),
             "MESH_TASK_CHAT_EVENTS": str(chat_log),
         }
         plan = root / "plan.tsv"
@@ -91,6 +101,25 @@ class TaskNoExpiryTests(unittest.TestCase):
         queue = self.command("queue", "--dispatch").stdout
         self.assertFalse(any(line.split("\t", 2)[1] == "no-expiry/inspect"
                              for line in queue.splitlines()))
+
+    def test_dead_letter_sweep_parks_old_blocker_and_preserves_dispatch(self):
+        self.command("block", "no-expiry", "inspect", "dependency", "missing input", "after input")
+        open_plan = Path(self.tmp.name) / "open.tsv"
+        open_plan.write_text("alpha\tcontinue\tcontinue independent work\n")
+        self.command("create", "dispatchable", str(open_plan))
+        first = self.command("dead-letter-sweep", "--age-seconds=0")
+        self.assertIn("parked=1", first.stdout)
+        second = self.command("dead-letter-sweep", "--age-seconds=0")
+        self.assertIn("parked=0", second.stdout)
+        audit = self.command("audit").stdout
+        self.assertIn("DLQ\talpha\tno-expiry/inspect\t", audit)
+        self.assertNotIn("BLOCKED\talpha\tno-expiry/inspect", audit)
+        queue = self.command("queue", "--dispatch").stdout
+        self.assertTrue(any("dispatchable/continue" in line for line in queue.splitlines()))
+        records = __import__("json").loads(self.command("replay", "--json").stdout)
+        parked = records["no-expiry"]["data"]["steps"][0]
+        self.assertEqual(parked["status"], "rejected")
+        self.assertTrue(parked["dead_lettered"])
 
     def test_block_materializes_one_deduplicated_owner_unblock_task_per_epoch(self):
         self.command("block", "no-expiry", "inspect", "dependency", "missing input", "after input")
