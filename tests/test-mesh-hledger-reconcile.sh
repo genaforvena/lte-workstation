@@ -37,7 +37,7 @@ git -C "$T/repo" commit -qm fixture
 
 out="$T/report"
 set +e
-HOME="$T/home" PATH="$T/bin:$PATH" MESH_RECON_REPO="$T/repo" \
+HOME="$T/home" MESH_DIR="$T/home/.mesh" MESH_EVIDENCE_ROOT="$T/home/.mesh/evidence" PATH="$T/bin:$PATH" MESH_RECON_REPO="$T/repo" \
   "$BIN" --cutoff 2026-09-09T00:01:00Z --output "$out"
 rc=$?
 set -e
@@ -54,9 +54,21 @@ grep -q '^adjustment_policy=PROPOSE_ONLY' "$out"
 # A deployed copy is outside the genome checkout. With only the standard MESH_REPO contract,
 # it must still resolve task receipts and the repository instead of silently reading ~/.local.
 deployed_out="$T/deployed-report"
-MESH_REPO="$T/repo" HOME="$T/home" PATH="$T/bin:$PATH" \
+MESH_REPO="$T/repo" MESH_DIR="$T/home/.mesh" MESH_EVIDENCE_ROOT="$T/home/.mesh/evidence" HOME="$T/home" PATH="$T/bin:$PATH" \
   env -u MESH_RECON_REPO "$BIN" --cutoff 2026-09-09T00:01:00Z --output "$deployed_out"
 grep -q '^source=artifacts status=KNOWN count=1 ' "$deployed_out"
 grep -q '^source=git status=KNOWN ' "$deployed_out"
+
+# Cron invokes an absolute tool path with only the system PATH. Installed sibling
+# tools must still be discovered; otherwise every accounting source reads UNKNOWN.
+mkdir -p "$T/home/.local/bin"
+cp "$T/bin/mesh-task" "$T/bin/mesh-promises" "$T/bin/mesh-ledger" "$T/bin/mesh-labor" "$T/home/.local/bin/"
+cron_out="$T/cron-report"
+HOME="$T/home" MESH_DIR="$T/home/.mesh" MESH_EVIDENCE_ROOT="$T/home/.mesh/evidence" PATH=/usr/bin:/bin MESH_RECON_REPO="$T/repo" \
+  "$BIN" --cutoff 2026-09-09T00:01:00Z --output "$cron_out"
+grep -q '^source=task status=KNOWN ' "$cron_out"
+for source in promises ledger labor; do
+  grep -q "^source=$source status=KNOWN verdict=PASS$" "$cron_out"
+done
 
 echo 'test-mesh-hledger-reconcile: PASS'
