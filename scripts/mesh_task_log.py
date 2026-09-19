@@ -511,7 +511,7 @@ def ledger_projection(records: dict, events: list) -> list:
     return retained
 
 
-def replay(path: Path) -> dict[str, dict]:
+def replay(path: Path, *, _revisions: dict | None = None) -> dict[str, dict]:
     """Return each chain's latest record; gaps/conflicts never become empty success."""
     records: dict[str, dict[int, dict]] = {}
     with path.open('rb') as source:
@@ -550,6 +550,8 @@ def replay(path: Path) -> dict[str, dict]:
                 continue
             canonical = candidate
         latest[chain] = canonical
+        if _revisions is not None:
+            _revisions[chain] = ordered
     return latest
 
 
@@ -636,10 +638,11 @@ def _merge_records(cached: dict, chunks: list[bytes], path: Path) -> dict[str, d
 
 
 def replay_cached(path: Path, cache_path: Path | None = None) -> dict[str, dict]:
-    """Share one chat.log parse across processes via an mtime-keyed cache.
+    """Share one chat.log parse across processes via a content-verified cache.
 
     The cache key is (dev, ino, size, mtime_ns); a hit returns the stored view
-    without touching the log. A grown file parses only the appended tail. Any
+    after verifying the source digest. A grown file verifies the cached prefix
+    before parsing only the appended tail. Any
     surprise — shrunk or replaced file, revision gap, conflict, corrupt cache,
     or movement under read — falls back to replay(). Equivalent output or a
     loud ReplayError, never a stale view.
@@ -659,7 +662,7 @@ def replay_cached(path: Path, cache_path: Path | None = None) -> dict[str, dict]
             # 20260918: 8-10 WRITE waiters, all young). Hit returns under LOCK_SH.
             fcntl.flock(lock.fileno(), fcntl.LOCK_SH)
             cached = _read_cache(cache)
-            if cached and cached.get('key') == key:
+            if cached and cached.get('key') == key and _cache_prefix_valid(path, cached):
                 return {chain: entry['latest'] for chain, entry in cached['chains'].items()}
             # MISS: upgrade to EX (fcntl has no upgrade — release, take EX, re-check).
             # Re-stat under EX: the log may have grown while we waited, and a stale
@@ -688,13 +691,33 @@ def _store_cache(cache: Path, payload: dict) -> None:
     os.replace(tmp, cache)
 
 
+def _prefix_digest(path: Path, size: int) -> str:
+    digest = hashlib.sha256()
+    with path.open('rb') as source:
+        remaining = size
+        while remaining:
+            chunk = source.read(min(1024 * 1024, remaining))
+            if not chunk:
+                raise ReplayError(f'{path}: source shrank while hashing')
+            digest.update(chunk)
+            remaining -= len(chunk)
+    return digest.hexdigest()
+
+
+def _cache_prefix_valid(path: Path, cached: dict) -> bool:
+    size = cached.get('size')
+    expected = cached.get('source_sha256')
+    return (isinstance(size, int) and size >= 0 and isinstance(expected, str)
+            and _prefix_digest(path, size) == expected)
+
+
 def _replay_cached_locked(path: Path, cache: Path, key: dict, st: 'os.stat_result') -> dict[str, dict]:
     cached = _read_cache(cache)
-    if cached and cached.get('key') == key:
+    if cached and cached.get('key') == key and _cache_prefix_valid(path, cached):
         return {chain: entry['latest'] for chain, entry in cached['chains'].items()}
     if (cached and cached.get('dev') == key['dev'] and cached.get('ino') == key['ino']
             and isinstance(cached.get('size'), int) and 0 <= cached['size'] <= key['size']
-            and isinstance(cached.get('chains'), dict)):
+            and isinstance(cached.get('chains'), dict) and _cache_prefix_valid(path, cached)):
         with path.open('rb') as source:
             source.seek(cached['size'])
             tail = source.read()
@@ -704,36 +727,32 @@ def _replay_cached_locked(path: Path, cache: Path, key: dict, st: 'os.stat_resul
             if text.endswith(b'\n') or not text:
                 chunks, fragment = [text], ''
             else:
-                cut = text.rfind(b'\n')
-                chunks = [text[:cut + 1]] if cut >= 0 else [b'']
-                fragment = text[cut + 1:].decode('utf-8', 'replace')
+                # Full replay rejects incomplete structured records. It alone
+                # decides whether a trailing fragment is harmless prose.
+                raise ReplayError(f'{path}: incomplete appended line')
             latest = _merge_records(cached, chunks, path)
             _store_cache(cache, {'key': key, 'dev': key['dev'], 'ino': key['ino'],
-                                 'size': key['size'], 'fragment': fragment, 'chains': cached['chains']})
+                                 'size': key['size'], 'fragment': fragment, 'chains': cached['chains'],
+                                 'source_sha256': _prefix_digest(path, key['size'])})
             return latest
-    latest = replay(path)
-    chains = {}
-    # Re-derive per-chain max revisions without a second full decode: the log is
-    # append-only, so one ordered scan rebuilds the continuity the cache needs.
+    initial_digest = _prefix_digest(path, key['size'])
     revs: dict[str, list[int]] = {}
-    with path.open('rb') as source:
-        for line in source:
-            match = EVENT_BYTES.match(line.rstrip(b'\n'))
-            if not match:
-                continue
-            try:
-                record = decode(match.group(2))
-                revs.setdefault(record['data']['chain'], []).append(record['revision'])
-            except (ValueError, TypeError, KeyError):
-                continue
+    latest = replay(path, _revisions=revs)
+    chains = {}
     for chain, record in latest.items():
         ordered = sorted(set(revs.get(chain, [])))
         chains[chain] = {'max_rev': ordered[-1] if ordered else 0, 'latest': record}
     with path.open('rb') as source:
         data = source.read()
+    moved = path.stat()
+    if (len(data) != key['size'] or moved.st_ino != key['ino']
+            or moved.st_dev != key['dev'] or moved.st_mtime_ns != key['mtime_ns']
+            or hashlib.sha256(data).hexdigest() != initial_digest):
+        raise ReplayError(f'{path}: source changed during cache rebuild')
     fragment = '' if data.endswith(b'\n') or not data else data.rpartition(b'\n')[2].decode('utf-8', 'replace')
     _store_cache(cache, {'key': key, 'dev': key['dev'], 'ino': key['ino'],
-                         'size': key['size'], 'fragment': fragment, 'chains': chains})
+                         'size': key['size'], 'fragment': fragment, 'chains': chains,
+                         'source_sha256': initial_digest})
     return {chain: entry['latest'] for chain, entry in chains.items()}
 
 
