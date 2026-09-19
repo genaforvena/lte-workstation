@@ -653,7 +653,25 @@ def replay_cached(path: Path, cache_path: Path | None = None) -> dict[str, dict]
     key = {'dev': st.st_dev, 'ino': st.st_ino, 'size': st.st_size, 'mtime_ns': st.st_mtime_ns}
     try:
         with lock_path.open('a+') as lock:
+            # READERS SHARE: a cache hit is a pure read and must never serialize behind
+            # (or block) other readers — the old LOCK_EX here turned every concurrent
+            # queue/audit call into a 7MB-rewrite queue (chat-review lock contention
+            # 20260918: 8-10 WRITE waiters, all young). Hit returns under LOCK_SH.
+            fcntl.flock(lock.fileno(), fcntl.LOCK_SH)
+            cached = _read_cache(cache)
+            if cached and cached.get('key') == key:
+                return {chain: entry['latest'] for chain, entry in cached['chains'].items()}
+            # MISS: upgrade to EX (fcntl has no upgrade — release, take EX, re-check).
+            # Re-stat under EX: the log may have grown while we waited, and a stale
+            # key would store a just-written stale cache (extra miss, self-correcting
+            # but wasteful). Recheck after EX so only one refresher wins.
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            try:
+                st = path.stat()
+            except OSError as exc:
+                raise ReplayError(f'{path}: {exc}') from exc
+            key = {'dev': st.st_dev, 'ino': st.st_ino, 'size': st.st_size, 'mtime_ns': st.st_mtime_ns}
             try:
                 return _replay_cached_locked(path, cache, key, st)
             except ReplayError:
