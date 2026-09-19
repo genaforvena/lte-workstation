@@ -6,6 +6,7 @@ from __future__ import annotations
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
+import hashlib
 import re
 import sys
 
@@ -42,19 +43,40 @@ def load_journal(directory: Path):
     intervals = set()
     journal_total = 0
     task_totals = Counter()
+    documented_corrections = 0
     transaction = re.compile(r"(?m)(?=^\d{4}-\d\d-\d\d\s+\*)")
     window_re = re.compile(r"(?:^|\s)window:([^.]*)\.\.([^\s;]+)")
-    task_re = re.compile(r"^\d{4}-\d\d-\d\d\s+\*\s+labour feed task:([^\s;]+)", re.M)
+    task_re = re.compile(r"^\d{4}-\d\d-\d\d\s+\*\s+labour (?:feed|correction) task:([^\s;]+)", re.M)
     posting_re = re.compile(
-        r"^\s+expenses:labour:([^:\s]+):([^\s]+)\s+([0-9,]+)\s+TURN\s*$", re.M
+        r"^\s+expenses:labour:([^:\s]+):([^\s]+)\s+([+-]?[0-9,]+)\s+TURN\s*$", re.M
     )
-    for path in journal_files(directory):
-        content = path.read_text(errors="replace")
+    # Explicit append-only attribution for historical correction transactions that
+    # predate window tags. The hash binds the entire original transaction, excluding
+    # attribution directives and surrounding whitespace; prose is never guessed.
+    annotation_re = re.compile(
+        r"^; labor-correction-window: ([0-9a-f]{64}) ([^\s]+)\s*$", re.M
+    )
+    contents = [(path, path.read_text(errors="replace")) for path in journal_files(directory)]
+    attribution = {}
+    used_attribution = set()
+    for path, content in contents:
+        for digest, window_text in annotation_re.findall(content):
+            if digest in attribution and attribution[digest] != window_text:
+                raise ValueError(f"conflicting correction attribution for {digest}")
+            attribution[digest] = window_text
+    for path, content in contents:
+        content = annotation_re.sub("", content)
         for block in transaction.split(content):
             if not block.strip():
                 continue
             window = window_re.search(block)
             postings = list(posting_re.finditer(block))
+            is_correction = "correction" in block.splitlines()[0].lower()
+            if not window and postings and is_correction:
+                digest = hashlib.sha256(block.strip().encode()).hexdigest()
+                if digest in attribution:
+                    window = window_re.search("window:" + attribution[digest])
+                    used_attribution.add(digest)
             if not window:
                 if postings:
                     raise ValueError(f"unwindowed labour posting in {path}")
@@ -70,9 +92,14 @@ def load_journal(directory: Path):
                 count = int(amount.replace(",", ""))
                 groups[(start, end, provider, owner_window.strip(), task)] += count
                 journal_total += count
+                if is_correction:
+                    documented_corrections += count
                 if task != "-":
                     task_totals[task] += count
-    return intervals, groups, journal_total, task_totals
+    unused = set(attribution) - used_attribution
+    if unused:
+        raise ValueError(f"unmatched correction attribution: {','.join(sorted(unused))}")
+    return intervals, groups, journal_total, task_totals, documented_corrections
 
 
 def main() -> int:
@@ -84,7 +111,7 @@ def main() -> int:
         print(f"reconciliation: UNKNOWN — source missing: {source_path}")
         return 2
     rows = load_source(source_path)
-    intervals, journal_groups, journal_total, journal_tasks = load_journal(directory)
+    intervals, journal_groups, journal_total, journal_tasks, corrections = load_journal(directory)
     watermark_path = directory / ".watermark"
     watermark = instant(watermark_path.read_text().strip()) if watermark_path.exists() else None
     if intervals:
@@ -144,8 +171,8 @@ def main() -> int:
         % (len(rows), journal_total, len(rows) - journal_total, len(intervals))
     )
     print(
-        "partition: pre_inception=%d not_yet_fed=%d documented_corrections=0 duplicate_feed_turns=%d missing_feed_turns=%d interval_overlap_rows=%d unexplained_groups=%d"
-        % (pre_inception, pending, duplicate_feed_turns, missing_feed_turns, duplicate_coverage, unexplained_groups)
+        "partition: pre_inception=%d not_yet_fed=%d documented_corrections=%+d duplicate_feed_turns=%d missing_feed_turns=%d interval_overlap_rows=%d unexplained_groups=%d"
+        % (pre_inception, pending, corrections, duplicate_feed_turns, missing_feed_turns, duplicate_coverage, unexplained_groups)
     )
     print(
         "task_attribution: explicit=%d/%d (%.1f%%) untagged_unknown=%d task_ids=%d journal_explicit=%d"
