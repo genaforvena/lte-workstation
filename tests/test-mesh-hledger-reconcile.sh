@@ -16,6 +16,10 @@ printf '%s\n' '{"tasks":[{"id":"task-one"}]}'
 EOF
 cat > "$T/bin/mesh-promises" <<'EOF'
 #!/usr/bin/env bash
+[ "${MESH_PROMISE_AUTOREACT:-}" = 0 ] || exit 21
+case "${MESH_PROMISES_DIR:-}" in /tmp/mesh-hledger-reconcile.*/promises) ;; *) exit 22;; esac
+mkdir -p "$MESH_PROMISES_DIR"
+printf 'temporary derived journal\n' > "$MESH_PROMISES_DIR/promises.journal"
 printf '%s\n' 'promise-check=PASS'
 EOF
 cat > "$T/bin/mesh-ledger" <<'EOF'
@@ -50,6 +54,7 @@ grep -q '^source=task status=KNOWN' "$out"
 grep -q '^source=artifacts status=KNOWN' "$out"
 grep -q '^difference_class=' "$out"
 grep -q '^adjustment_policy=PROPOSE_ONLY' "$out"
+grep -q '^source=promises status=KNOWN verdict=PASS$' "$out"
 
 # A deployed copy is outside the genome checkout. With only the standard MESH_REPO contract,
 # it must still resolve task receipts and the repository instead of silently reading ~/.local.
