@@ -93,4 +93,19 @@ late="$(date -u -d '3 minutes ago' +%Y-%m-%dT%H:%M:%SZ)"
 append_turn "$late" genome coordination/delayed
 expect_reconciliation_failure
 
+# Freeze the feed clock at a source event's second. That second is still open
+# for appends, so it must remain beyond the committed watermark.
+setup_case open_second
+fixed_now="$(date -u +%s)"
+append_turn "$(date -u -d "@$fixed_now" +%Y-%m-%dT%H:%M:%SZ)" wake coordination/open-second
+mkdir -p "$CASE/home/.local/bin"
+printf '#!/usr/bin/env bash\nif [ "$*" = "-u +%%s" ]; then echo %s; else exec /usr/bin/date "$@"; fi\n' \
+  "$fixed_now" > "$CASE/home/.local/bin/date"
+chmod +x "$CASE/home/.local/bin/date"
+run_labor --feed >/dev/null
+watermark_epoch="$(date -u -d "$(cat "$CASE/labour/.watermark")" +%s)"
+test "$watermark_epoch" -lt "$fixed_now"
+run_labor --check >"$CASE/check.out"
+grep -q 'not_yet_fed=1' "$CASE/check.out"
+
 echo 'test-mesh-labor-reconciliation: PASS (concurrency, balanced missing/duplicate feeds, delayed event)'
