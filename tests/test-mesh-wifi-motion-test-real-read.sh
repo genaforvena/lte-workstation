@@ -63,4 +63,15 @@ printf 'not-a-scan\n' > "$log"
 run_test malformed_out malformed_rc
 [ "$malformed_rc" -eq 2 ] || { echo "FAIL: malformed real tape must exit 2, got rc=$malformed_rc: $malformed_out"; exit 1; }
 
+# The runtime path must honor the same timestamp requirement as --test. A syntactically scan-like
+# line without producer time is not evidence of a current room state and must not become STILL.
+printf 'host n=4 aps=[60|AA:AA:AA:AA:AA:01|A|5240 55|BB:BB:BB:BB:BB:02|B|5240 50|CC:CC:CC:CC:CC:03|C|5240 45|DD:DD:DD:DD:DD:04|D|5240]\n' > "$log"
+set +e
+untime_out=$(HOME="$home" MESH_WIFI_MOTION_LOG="$log" MESH_WIFI_MOTION_REFRESH=0 "$tool" --json 2>&1)
+untime_rc=$?
+set -e
+[ "$untime_rc" -eq 2 ] || { echo "FAIL: runtime must reject an untimeable tape (rc=$untime_rc): $untime_out"; exit 1; }
+grep -q 'timestamp_unparseable' <<<"$untime_out" \
+  || { echo "FAIL: runtime degraded path must name the missing timestamp: $untime_out"; exit 1; }
+
 echo 'mesh-wifi-motion --test live-artifact gate: PASS'
