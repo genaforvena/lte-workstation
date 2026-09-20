@@ -255,6 +255,56 @@ geom_classify() {
 }
 geom_rank() { case "$1" in WIDTH-DOWN) echo 3;; CAP-DROP) echo 2;; BASELINE) echo 1;; *) echo 0;; esac; }
 
+# ---- AXIS 3: PCIe device power state ------------------------------------------------------
+POWER_STATE_FILE="${MESH_PCIE_POWER_STATE:-$HOME/.mesh/.pcie-power-state}"
+
+# power_state_raw -> "<slot> <D-state> <d3cold_allowed>" for complete kernel rows.
+# This is intentionally separate from runtime_status: PCIe D-state is the bus/device power
+# state, while runtime PM is a policy/usage layer and may report unsupported on NVMe.
+power_state_raw() {
+  local d slot state d3
+  for d in "$PCI_ROOT"/*/; do
+    [ -r "$d/power_state" ] || continue
+    [ -r "$d/d3cold_allowed" ] || continue
+    state="$(tr -d '[:space:]' < "$d/power_state" 2>/dev/null)"
+    d3="$(tr -d '[:space:]' < "$d/d3cold_allowed" 2>/dev/null)"
+    case "$state:$d3" in
+      D[0-3]:0|D[0-3]:1|D3hot:0|D3hot:1|D3cold:0|D3cold:1) ;;
+      *) continue ;;
+    esac
+    slot="$(basename "$d")"
+    printf '%s %s %s\n' "$slot" "$state" "$d3"
+  done
+}
+
+# Print and persist the live D-state census.  Missing power_state is honest n/a and does not
+# turn the older AER/geometry axes into a false failure.  Successful runs always touch the
+# artifact so a stable D0 fleet remains live rather than decaying to false STALE.
+power_axis() {
+  local raw="$1" d0=0 d3=0 other=0 n=0 line slot state d3ok
+  [ -n "$raw" ] || { echo 'pcie-power: n/a — no complete PCIe power_state+d3cold_allowed rows'; return 2; }
+  while read -r slot state d3ok; do
+    [ -n "$slot" ] || continue
+    n=$((n + 1))
+    case "$state" in
+      D0) d0=$((d0 + 1)) ;;
+      D3hot|D3cold) d3=$((d3 + 1)) ;;
+      *) other=$((other + 1)) ;;
+    esac
+  done <<< "$raw"
+  [ "$n" -gt 0 ] || { echo 'pcie-power: n/a — no complete PCIe power_state+d3cold_allowed rows'; return 2; }
+  mkdir -p "$(dirname "$POWER_STATE_FILE")" 2>/dev/null || {
+    echo "pcie-power: cannot create state directory for $POWER_STATE_FILE" >&2; return 1;
+  }
+  printf '%s\nd0=%s\nd3=%s\nother=%s\ndevices=%s\n' \
+    "$raw" "$d0" "$d3" "$other" "$n" > "$POWER_STATE_FILE" || return 1
+  mesh-state-touch "$POWER_STATE_FILE" 2>/dev/null || {
+    echo "pcie-power: cannot touch live artifact $POWER_STATE_FILE" >&2; return 1;
+  }
+  printf 'pcie-power: D0=%s D3=%s other=%s devices=%s\n' "$d0" "$d3" "$other" "$n"
+  return 0
+}
+
 # Print the geometry block. rc: 0 fine · 1 fault (WIDTH-DOWN/CAP-DROP) · 2 honest n/a.
 # write_state=1 updates the high-water baseline (the --test drives it with a scratch state file).
 geom_axis() {
@@ -360,6 +410,22 @@ if [ "${1:-}" = --test ]; then
   speed_tenths '' >/dev/null 2>&1        && { echo "test: speed_tenths must reject empty FAIL"; e=1; }
   [ "$(fmt_s 160)" = 16.0 ] && [ "$(fmt_s 25)" = 2.5 ] || { echo "test: fmt_s FAIL"; e=1; }
 
+  # (5b) POWER-STATE axis: PCIe's device power state is a separate live hardware signal from
+  # AER errors and negotiated link geometry.  The fixture must count only complete D-state rows.
+  pf="$tf/pci-power"; mkdir -p "$pf/0000:01:00.0" "$pf/0000:02:00.0" "$pf/0000:03:00.0"
+  printf 'D0\n' > "$pf/0000:01:00.0/power_state"
+  printf '1\n'  > "$pf/0000:01:00.0/d3cold_allowed"
+  printf 'D3hot\n' > "$pf/0000:02:00.0/power_state"
+  printf '1\n'     > "$pf/0000:02:00.0/d3cold_allowed"
+  printf 'not-a-state\n' > "$pf/0000:03:00.0/power_state"
+  old_pci_root="$PCI_ROOT"; PCI_ROOT="$pf"; power_fixture="$(power_state_raw)"; PCI_ROOT="$old_pci_root"
+  [ "$(printf '%s\n' "$power_fixture" | wc -l)" -eq 2 ] \
+    || { echo "test: power-state parser must keep only valid D-state rows: $power_fixture FAIL"; e=1; }
+  printf '%s\n' "$power_fixture" | grep -q '^0000:01:00.0 D0 1$' \
+    || { echo "test: D0 power-state row missing FAIL"; e=1; }
+  printf '%s\n' "$power_fixture" | grep -q '^0000:02:00.0 D3hot 1$' \
+    || { echo "test: D3hot power-state row missing FAIL"; e=1; }
+
   # (6) GEOMETRY not-fire gate — the whole point of the axis. The fixture is the REAL topology of
   #     this node, the five healthy lines measured 2026-08-15 that a naive "current < device max"
   #     rule calls faults. Built as a true sysfs shape (devices/ tree + bus/ symlinks) so
@@ -446,7 +512,15 @@ if [ "${1:-}" = --test ]; then
       || { echo "test: live effective-ceiling resolution dropped device(s) FAIL"; e=1; }
     ngeo="$(printf '%s\n' "$greal" | grep -c .)"
   fi
-  [ "$e" = 0 ] && echo "test: PASS (real read: $ndev AER device(s), $ngeo geometry device(s))" || echo "test: FAIL"
+  preal="$(power_state_raw)"
+  if [ -z "$preal" ]; then
+    echo "test: no complete live PCIe power-state row — honest n/a"
+    [ "$e" = 0 ] && exit 2 || exit 1
+  fi
+  printf '%s\n' "$preal" | awk 'NF!=3 || $2 !~ /^D([0-3]|3hot|3cold)$/ || $3 !~ /^[01]$/ {bad=1} END{exit bad}' \
+    || { echo "test: live power-state read produced a malformed row FAIL"; e=1; }
+  npower="$(printf '%s\n' "$preal" | grep -c .)"
+  [ "$e" = 0 ] && echo "test: PASS (real read: $ndev AER device(s), $ngeo geometry device(s), $npower PCIe power-state device(s))" || echo "test: FAIL"
   exit "$e"
 fi
 
@@ -456,12 +530,17 @@ fi
 # EVERY AER exit path — an axis must never be silenced by an unrelated axis's n/a.
 geom_out=""; geom_rc=0
 geom_out="$(geom_axis 1)"; geom_rc=$?
+power_out=""; power_rc=0
+power_raw="$(power_state_raw)"
+power_out="$(power_axis "$power_raw")"; power_rc=$?
 
 # combine <aer-exit> — 1 (a real fault on either axis) wins over 3 (AER blind) over 2 (both n/a).
 finish() {
   local aer_rc="$1"
   printf '%s\n' "$geom_out"
+  printf '%s\n' "$power_out"
   if [ "$aer_rc" = 1 ] || [ "$geom_rc" = 1 ]; then exit 1; fi
+  if [ "$power_rc" = 1 ]; then exit 1; fi
   if [ "$aer_rc" = 3 ]; then exit 3; fi
   if [ "$aer_rc" = 2 ] && [ "$geom_rc" = 2 ]; then exit 2; fi
   exit 0
