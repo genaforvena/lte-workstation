@@ -16,3 +16,12 @@ run = subprocess.run(['bash', '-c', f'. {root / "scripts/mesh-patterns.sh"}\n' +
 assert run.returncode == 0, run.stderr
 assert run.stdout.startswith('IDLE\t'), run.stdout
 print('PASS: current Codex ready prompt is dispatchable IDLE')
+
+omp_pane = '''
+π >
+'''
+run = subprocess.run(['bash', '-c', f'. {root / "scripts/mesh-patterns.sh"}\n' + classify + '\nclassify'], input=omp_pane,
+                     text=True, capture_output=True)
+assert run.returncode == 0, run.stderr
+assert run.stdout.startswith('IDLE\t'), run.stdout
+print('PASS: current OMP ready prompt is dispatchable IDLE')
