@@ -181,6 +181,8 @@ def run() -> None:
         failure_tape = watch.TAPE.read_text(encoding="utf-8").splitlines()[-1]
         if "unowned-pool/work-invisible-to-idle-bob" not in failure_tape:
             raise AssertionError(f"failure tape lacks exact owner/task: {failure_tape}")
+        if "health=FAIL" not in failure_tape or "source=FAIL journal_pass=True" not in failure_tape:
+            raise AssertionError(f"overall failure did not override source label: {failure_tape}")
         if not alerts or "witness-task-autonomy" not in alerts[-1]:
             raise AssertionError("autonomy failure was not surfaced on the board")
 
