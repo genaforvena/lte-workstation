@@ -35,6 +35,8 @@ run_test fresh_out fresh_rc
 [ "$fresh_rc" -eq 0 ] || { echo "FAIL: fresh real-read artifact should pass (rc=$fresh_rc): $fresh_out"; exit 1; }
 grep -q 'real-read artifact:.*verdict=STILL.*age_s=' <<<"$fresh_out" \
   || { echo "FAIL: passing test must report its fresh classified scan artifact: $fresh_out"; exit 1; }
+grep -q 'temporal=FULL.*snapshots=6/6' <<<"$fresh_out" \
+  || { echo "FAIL: fresh artifact must expose full temporal coverage: $fresh_out"; exit 1; }
 
 # A producer clock slightly ahead is within the sense's configured skew tolerance. Keep the runtime
 # classification valid while surfacing freshness as UNKNOWN; --test must not misreport this as a
