@@ -1,4 +1,4 @@
-import type { Plugin } from "@opencode-ai/plugin"
+import { Plugin } from "@opencode/plugin"
 
 // mesh-handoff — opencode port of the Claude SessionStart hook
 // (`mesh-handoff --restore` in ~/.claude/settings.json, matcher startup|clear).
@@ -59,30 +59,29 @@ function shQuote(s: string): string {
 // construction is a bare TUI exit or window close — no event fires — so those
 // still rest on the pre-clear write + the 5-minute snapshot reflex + refs/wip.
 async function snapshotWin(
-  client: { app: { log: (a: unknown) => Promise<unknown> } },
+  _ctx: unknown,
   why: string
 ): Promise<void> {
   try {
     const win = await thisWindow()
     if (!win) return
     const { rc } = await shRc(`mesh-handoff --snapshot ${shQuote(win)} >/dev/null 2>&1`)
-    await client.app
-      .log({ body: { service: "mesh-handoff", level: rc <= 6 ? "info" : "warn", message: `pre-switch snapshot (${why}) win=${win} rc=${rc}` } })
-      .catch(() => {})
+    console.info(`[mesh-handoff] pre-switch snapshot (${why}) win=${win} rc=${rc}`)
   } catch {
     // fail-safe is SILENCE — never break a session switch on our own malfunction
   }
 }
 
-export const MeshHandoff: Plugin = async ({ client }) => {
-  await client.app.log({ body: { service: "mesh-handoff", level: "info", message: "plugin loaded" } }).catch(() => {})
-  return {
-    "experimental.chat.system.transform": async (input, output) => {
-      const sid = input.sessionID ?? ""
+export default Plugin.define({
+  id: "mesh-handoff",
+  async setup(ctx) {
+    console.info("[mesh-handoff] plugin loaded")
+    await ctx.session.hook("context", async (event) => {
+      const sid = event.sessionID ?? ""
       if (!sid || seen.has(sid)) return
       const win = await thisWindow()
       if (!win) {
-        await client.app.log({ body: { service: "mesh-handoff", level: "warn", message: "skip: no window (MESH_WHO and TMUX_PANE both empty)" } }).catch(() => {})
+        console.warn("[mesh-handoff] skip: no window (MESH_WHO and TMUX_PANE both empty)")
         return
       }
       const safe = win.replace(/[^A-Za-z0-9._-]/g, "_")
@@ -101,23 +100,26 @@ export const MeshHandoff: Plugin = async ({ client }) => {
           `Work-memory handoff restored (mesh-handoff, pre-/clear). This is YOUR thread from before the /clear — resume from it:\n\n${handoff.slice(0, 4000)}`
         )
       if (parts.length) {
-        output.system.push(parts.join("\n\n---\n\n"))
+        event.system.push({ type: "text", text: parts.join("\n\n---\n\n") })
         seen.add(sid)
-        await client.app.log({ body: { service: "mesh-handoff", level: "info", message: `injected charter=${charter ? "yes" : "no"} handoff=${handoff ? "yes" : "no"} win=${win}` } }).catch(() => {})
+        console.info(`[mesh-handoff] injected charter=${charter ? "yes" : "no"} handoff=${handoff ? "yes" : "no"} win=${win}`)
       }
-    },
-    event: async ({ event }) => {
-      const t = (event as { type?: string }).type ?? ""
-      if (t === "tui.command.execute") {
-        // /clear IS session.new (alias of /new) — snapshot the outgoing thread.
-        const cmd = (event as { properties?: { command?: string } }).properties?.command ?? ""
-        if (cmd !== "session.new") return
-        await snapshotWin(client, "session.new")
-        return
+    })
+    const controller = new AbortController()
+    void (async () => {
+      for await (const item of ctx.event.subscribe({ signal: controller.signal })) {
+        const event = item as { type?: string; properties?: { command?: string } }
+        const t = event.type ?? ""
+        if (t === "tui.command.execute") {
+          // /clear IS session.new (alias of /new) — snapshot the outgoing thread.
+          const cmd = event.properties?.command ?? ""
+          if (cmd !== "session.new") continue
+          await snapshotWin(ctx, "session.new")
+          continue
+        }
+        if (t === "session.deleted") await snapshotWin(ctx, "session.deleted")
       }
-      if (t === "session.deleted") {
-        await snapshotWin(client, "session.deleted")
-      }
-    },
-  }
-}
+    })()
+    return () => controller.abort()
+  },
+})
