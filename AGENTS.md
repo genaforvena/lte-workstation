@@ -101,6 +101,33 @@ id=mind.top-pane-live.v1 | owner=all-minds | scope=mesh | precedence=10 | source
 - Prefer `rg` for searches. Use `apply_patch` for deliberate file edits. Preserve unrelated dirty
   worktree changes.
 
+## How omp operates here
+
+omp (Oh My Pi) is a first-class mind in this mesh and carries the same lifecycle wiring as
+Codex. Its host events do the work; the scripts below are the wiring, and they are the contract,
+not a suggestion.
+
+- `session_start` reconciles and records the root: `scripts/mesh-omp-lifecycle --start` runs
+  `mesh-task reconcile`, restores the durable handoff through `mesh-handoff --restore`
+  (`--append-system-prompt` is frozen at spawn, so the live handoff reaches the model only
+  through the extension's context injection), and writes the root session id to
+  `<STATE>/<win>.thread`. A session whose id is not the recorded root owns no pane and never
+  writes a receipt.
+- `session_stop` is the turn boundary, not `agent_end`: it carries `turn_id`, `session_id`,
+  `last_assistant_message`, and `stop_hook_active` natively, and it fires first. The extension
+  forwards it as `scripts/mesh-omp-lifecycle --receipt`, which writes one sha256-keyed receipt
+  per `(session-id, turn-id)`, launches the token recorder, and starts a background `--drain`.
+- The drain settles the turn: board-receipt gate, generic handoff when the turn produced no
+  manual one, exactly one `spend.log` TURN row, then a quiet `mesh-clear <window>` once the
+  mind state is IDLE. A busy or newer-turn window leaves the receipt durable — it never
+  interrupts live work.
+- `mesh-handoff <window> "<done> + <next> + <key paths>"` is the ONE durable context lever.
+  omp's internal `SessionHandoff` is a compaction summary, not durable state. Read tiers with
+  `mesh-handoff --charter <win>` / `--show <win>`.
+- `mesh-clear <window>` closes the loop for an omp pane without injecting a Codex restore
+  prompt: restore rides the extension's own `session_start` on the new session.
+- Verification is the scripts: `scripts/mesh-omp-lifecycle --test` and `scripts/mesh-clear --test`.
+
 ## Context, compaction, and handoffs
 
 Every completed work turn ends in an artifact and a textual handoff, then a context reset.
