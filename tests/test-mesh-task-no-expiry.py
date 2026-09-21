@@ -66,6 +66,33 @@ class TaskNoExpiryTests(unittest.TestCase):
         self.assertIn("explicitly reject or complete", rejected.stderr)
         self.assertIn("no-expiry [active]", self.command("status", "no-expiry").stdout)
 
+    def test_lease_expiry_reap_reopens_and_dispatches_only_stale_active_claims(self):
+        self.env["MESH_TASK_COORDINATOR"] = "alpha"
+        reaped = self.command("lease-expiry-reap")
+        self.assertIn("reaped=1", reaped.stdout)
+        self.assertIn("QUEUED\talpha\tno-expiry/inspect", self.command("audit").stdout)
+        self.assertIn("no-expiry/inspect", self.command("queue", "--dispatch").stdout)
+        state = __import__("json").loads(self.command("replay", "--json").stdout)["no-expiry"]["data"]
+        step = state["steps"][0]
+        self.assertEqual(step["status"], "open")
+        self.assertNotIn("lease_until", step)
+        self.assertEqual(step["lease_reap_attempts"], 1)
+        self.assertIn("lease-expiry reaped", self.env["MESH_TASK_CHAT_EVENTS"] and Path(self.env["MESH_TASK_CHAT_EVENTS"]).read_text())
+
+        fresh_plan = Path(self.tmp.name) / "fresh.tsv"
+        fresh_plan.write_text("alpha\tfresh\tfresh progress claim\n")
+        self.command("create", "fresh", str(fresh_plan))
+        self.command("take", "fresh", "fresh")
+        blocked_plan = Path(self.tmp.name) / "blocked.tsv"
+        blocked_plan.write_text("alpha\tblocked\tblocked claim\n")
+        self.command("create", "blocked", str(blocked_plan))
+        self.command("take", "blocked", "blocked")
+        self.command("block", "blocked", "blocked", "dependency", "input", "event:input")
+        untouched = self.command("lease-expiry-reap")
+        self.assertIn("reaped=0", untouched.stdout)
+        self.assertIn("fresh [active]", self.command("status", "fresh").stdout)
+        self.assertIn("blocked [blocked]", self.command("status", "blocked").stdout)
+
     def test_expired_health_warning_dispatch_is_held_but_genuine_open_is_preserved(self):
         root = Path(self.tmp.name)
         health_plan = root / "health-warning.tsv"
