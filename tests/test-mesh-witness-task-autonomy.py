@@ -378,6 +378,26 @@ def run() -> None:
             raise AssertionError("above-threshold refusals must stay FAIL")
         if len(posted) != 3 or "check-refused-rc2" not in posted[2]:
             raise AssertionError(f"above-threshold refusals lacked their bucketed alert: {posted}")
+        # A persisting stall must not re-alert as its elapsed ticks up: same
+        # id under a larger N shares one signature (raw N stays on tape).
+        posted.clear()
+        watch.STATE.write_text("{}\n", encoding="utf-8")
+        if watch.report(["active-task-stalled-a/w-for-1801s"], "source=FAIL", moment + 360) != "FAIL":
+            raise AssertionError("first stall sighting must stay FAIL")
+        if len(posted) != 1 or "active-task-stalled-a/w" not in posted[0] or "for-1801s" in posted[0]:
+            raise AssertionError(f"stall lacked its id-only alert: {posted}")
+        if watch.report(["active-task-stalled-a/w-for-2105s"], "source=FAIL", moment + 420) != "FAIL":
+            raise AssertionError("ticked stall must stay FAIL on the tape")
+        if len(posted) != 1:
+            raise AssertionError(f"same stall re-alerted on elapsed tick: {posted}")
+        if "for-2105s" not in watch.TAPE.read_text(encoding="utf-8"):
+            raise AssertionError("ticked elapsed missing from tape row")
+        # A second stalled id is a new signature and still alerts.
+        if watch.report(["active-task-stalled-a/w-for-2105s", "active-task-stalled-b/w-for-1800s"],
+                        "source=FAIL", moment + 480) != "FAIL":
+            raise AssertionError("new stall id must stay FAIL")
+        if len(posted) != 2 or "active-task-stalled-b/w" not in posted[1]:
+            raise AssertionError(f"new stall id did not alert: {posted}")
 
     with tempfile.TemporaryDirectory(prefix="mesh-unblock-reflex-wiring-") as raw:
         base = Path(raw)
@@ -394,8 +414,15 @@ def run() -> None:
                                 text=True, capture_output=True, check=False)
         if result.returncode:
             raise AssertionError(f"scheduled reflex failed: {result.stdout}{result.stderr}")
-        if order.read_text(encoding="utf-8").splitlines() != ["sweep", "witness"]:
-            raise AssertionError("the scheduled recovery sweep did not run before witness verification")
+        lines = order.read_text(encoding="utf-8").splitlines()
+        # Sweep-before-witness, not exact count: recovery legs run before witness
+        # verification, whatever legs the sweep sequence currently holds before
+        # or after (route-unowned distributes after observing).
+        if (lines.count("witness") != 1 or lines[0] == "witness"
+                or set(lines) != {"sweep", "witness"}):
+            raise AssertionError(
+                "the scheduled recovery sweep did not run before witness verification: "
+                f"{lines!r}")
         (home_bin / "mesh-task").write_text("#!/bin/sh\nexit 9\n", encoding="utf-8")
         order.write_text("")
         result = subprocess.run([str(WRAPPER), "--run"], env=env,
