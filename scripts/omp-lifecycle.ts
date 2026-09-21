@@ -82,6 +82,10 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 				// runtime change to process.env (restore.env, /clear re-read) would be lost.
 				env: process.env,
 			});
+			// Bun.spawn's stdin is a FileSink, not a WritableStream: write the bytes
+			// directly, then end the stream so the tool's stdin read returns.
+			child.stdin.write(payload);
+			await child.stdin.end();
 			const code = await child.exited;
 			const stderr = await new Response(child.stderr).text();
 			if (code !== 0) {
