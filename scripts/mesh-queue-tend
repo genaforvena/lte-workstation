@@ -59,18 +59,42 @@ distinct_tokens(){ # idea -> up to 6 distinctive lowercase tokens (>3 chars, non
     | awk 'length>3' | tr 'A-Z' 'a-z' | grep -viFf "$STOPF" 2>/dev/null | sort -u | head -6
 }
 tokens_overlap(){ # $1=tokens(newline) $2=lines $3=min -> 0 if SOME line shares >=min tokens (resolved/claimed)
-  local toks="$1" lines="$2" min="$3" ln t hits
+  local toks="$1" lines="$2" min="$3"
   [ -z "$lines" ] && return 1
-  while IFS= read -r ln; do
-    [ -z "$ln" ] && continue
-    hits=0
-    # WHOLE-WORD, via the same word_in() the FLIP path has always used. `grep -Fiq` is a SUBSTRING
-    # test — the exact false-positive class word_in() was written to stop ("say" must not match
-    # "essay") — and here it decided the opposite verdict from the flip path on the same evidence,
-    # which is a lint testing a different predicate than the parser it guards.
-    for t in $toks; do word_in "$t" "$ln" && hits=$((hits+1)); [ "$hits" -ge "$min" ] && return 0; done
-  done <<< "$lines"
-  return 1
+  # Pre-filtered by the REAPER once per board slice (see the caller): the union of EVERY stayed
+  # idea's tokens, so a line this idea could possibly match (>=1 of ITS tokens) is guaranteed to
+  # have survived. Then the exact per-idea test runs over a few thousand lines, not ~15k. The
+  # predicate is UNCHANGED — same whole-word, optional mesh-, distinct-token counting toward min —
+  # so KEEP/DEMOTE verdicts are identical to the full-board scan, just over a shorter input.
+  local _lk; _lk="$(printf '%s' "$lines" | cksum)"
+  lines="${TOK_PREFILTER[$_lk]:-$2}"
+  [ -z "$lines" ] && return 1
+  printf '%s\n' "$lines" | awk -v min="$min" -v toks="$toks" '
+    BEGIN { n = split(toks, T, "\n") }
+    { hits = 0; line = tolower($0)
+      for (i = 1; i <= n; i++) {
+        t = tolower(T[i]); if (t == "") continue
+        if (match(line, "(^|[^a-z0-9-])(mesh-)?" t "([^a-z0-9-]|$)")) {
+          if (++hits >= min) { print; next }
+        } } }' 2>/dev/null | grep -q .
+}
+
+_prefilter_tokens(){ # $1=lines $2=ALL pass tokens (space|newline) -> lines sharing >=1 token (once per slice)
+  local _lk; _lk="$(printf '%s' "$1" | cksum)"
+  [ -n "${TOK_PREFILTER[$_lk]:-}" ] && { printf '%s' "${TOK_PREFILTER[$_lk]}"; return 0; }
+  # awk turns a `\n` escape inside a -v value into a literal newline, so split on ANY whitespace —
+  # a "\n"-only split would collapse to one giant token and match nothing.
+  local out
+  out="$(printf '%s\n' "$1" | awk -v toks="$2" '
+    BEGIN { n = split(toks, T, /[ \t\n]+/); RE = "(^|[^a-z0-9-])(mesh-)?("; seen = 0
+      for (i = 1; i <= n; i++) { if (T[i] == "") continue
+        if (seen) RE = RE "|"
+        RE = RE T[i]; seen = 1 }
+      if (!seen) RE = "zZ_never_zZ"          # no tokens: match nothing, never "()" (that matches everything)
+      RE = RE ")([^a-z0-9-]|$)" }
+    { if (match(tolower($0), RE)) print }' 2>/dev/null)"
+  TOK_PREFILTER[$_lk]="$out"
+  printf '%s' "$out"
 }
 
 # ── SEMANTIC second-chance for the tilde-reaper (queue-tend/semantic-keep) ──────────────────────
@@ -85,22 +109,64 @@ tokens_overlap(){ # $1=tokens(newline) $2=lines $3=min -> 0 if SOME line shares 
 SEM_MIN="${MESH_QUEUE_SEMANTIC_MIN:-0.45}"      # cos ≥ this = semantically resolved/claimed (paraphrase 0.50–0.82; mesh-noise ceiling ~0.17 — measured all-minilm 2026-07-18)
 SEM_SCAN_MAX="${MESH_QUEUE_SEMANTIC_SCAN:-40}"  # cap the board lines a demote-candidate is embedded against (most-recent tail) — bound the per-run embed cost
 EMBED_OK=0   # set to 1 once at reaper start iff mesh-embed reports an embed model (honest exit-2 gate)
+OLLAMA_URL="${OLLAMA_HOST:-http://localhost:11434}"   # ollama endpoint for the batched embed call below
+
 semantic_overlap(){ # $1=idea $2=lines -> 0 if the idea is semantically near SOME line (cos ≥ SEM_MIN)
   [ "$EMBED_OK" = 1 ] || return 1
-  local idea lines ln msg cos scanned=0
+  local idea lines
   idea="$(echo "${1#\[~\] }" | sed -E 's/\(source:.*//;s/ —.*//')"   # mirror distinct_tokens' stripping
   [ -z "$idea" ] && return 1
   lines="$2"; [ -z "$lines" ] && return 1
-  # newest first (a resolution post-dates the idea), capped — bound embed calls per candidate
-  while IFS= read -r ln; do
-    [ -z "$ln" ] && continue
-    [ "$scanned" -ge "$SEM_SCAN_MAX" ] && break
-    scanned=$((scanned+1))
-    msg="${ln#*:: }"   # compare against the board MESSAGE, not the ts/node prefix
-    cos="$(mesh-embed --cos "$idea" "$msg" 2>/dev/null)" || continue   # exit 2 (organ blip) → skip this line, no fake
-    awk -v c="$cos" -v m="$SEM_MIN" 'BEGIN{exit !(c+0>=m+0)}' && return 0
-  done <<< "$(printf '%s\n' "$lines" | grep -v '^[[:space:]]*$' | tail -n "$SEM_SCAN_MAX" | tac)"
-  return 1
+  # The old loop called `mesh-embed --cos` ONCE PER BOARD LINE (up to SEM_SCAN_MAX per idea), and
+  # each call re-embeds BOTH texts, runs its own `ollama list` model pick, and spawns curl + TWO
+  # python3 processes: on a live board under load that is ~1000 process spawns and ~1000 GPU
+  # round-trips for the ~26 stale [~]s, and the pass ran 4× over its own */15 cadence — exactly the
+  # pile-up this fix exists to break. Batch it: ONE embed for the idea, ONE ollama batch call for
+  # all candidate lines at once, ONE python3 for every cosine. Deterministic vectors (verified:
+  # identical across calls), so this is exact, not an approximation.
+  # Strip the ts/node prefix in PYTHON, not sed: the old loop used bash `${ln#*:: }` (cut at the
+ # FIRST ":: "), and `sed 's/^[^:]*:: //'` is NOT equivalent — `[^:]*` cannot cross the colon
+ # inside a timestamp like 10:00Z, so the prefix survived and the embedded text carried ts/node
+ # noise, dragging a real 0.5561 paraphrase to 0.4143 < SEM_MIN and wrongly DEMOTING it.
+  local cands
+  cands="$(printf '%s\n' "$lines" | grep -v '^[[:space:]]*$' | tail -n "$SEM_SCAN_MAX")"
+  [ -z "$cands" ] && return 1
+  local ivec body
+  ivec="$(mesh-embed --model "$_MODEL" "$idea" 2>/dev/null)" || return 1   # exit 2 → caller's lexical path
+  # ollama /api/embed takes an ARRAY of inputs in one round-trip; this python both builds the JSON
+  # (stripping each prefix at the first ":: ", exactly as the old loop did) and scores all cosines,
+  # so the whole per-idea semantic scan is 2 processes total (mesh-embed + this).
+  body="$(python3 -c '
+import json, sys
+def strip(l):
+    i = l.find(":: ")
+    return l[i + 3:] if i >= 0 else l
+model, idea, cands = sys.argv[1], sys.argv[2], sys.argv[3]
+lines = [strip(l) for l in cands.split("\n") if l.strip()]
+print(json.dumps({"model": model, "input": [idea] + lines}))' \
+    "$_MODEL" "$idea" "$cands" 2>/dev/null)" || return 1
+  local resp
+  resp="$(curl -s -m 60 "$OLLAMA_URL/api/embed" -H 'Content-Type: application/json' --data "$body" 2>/dev/null)" || return 1
+  # any failure/empty/degenerate vector → skip the semantic arm (honest; no faked similarity)
+  echo "$resp" | python3 -c '
+import json, sys, math
+try: d = json.load(sys.stdin)
+except Exception: sys.exit(2)
+if "error" in d: sys.exit(2)
+e = d.get("embeddings") or []
+if not e or not e[0]: sys.exit(2)
+v0 = e[0]
+if not any(abs(x) > 0 for x in v0): sys.exit(2)
+n0 = math.sqrt(sum(x*x for x in v0))
+sem_min = float(sys.argv[1])
+hit = None
+for v in e[1:]:
+    if not v: continue
+    n = math.sqrt(sum(y*y for y in v))
+    if n == 0: continue
+    if sum(a*b for a, b in zip(v0, v)) / (n*n0) >= sem_min:
+        hit = 1; break
+sys.exit(0 if hit else 1)' "$SEM_MIN" 2>/dev/null
 }
 
 extract_cat() { echo "$1" | sed -E 's/^\[[^]]*\][[:space:]]*//; s/:.*//'; }
@@ -131,15 +197,33 @@ novelty_match() {
   # <topic-slug>/...: why"` (genome-established 2026-06-28T02:56:19Z), not [done]/[idle] — mirror the
   # gen-pair-deadend widening below.
   [ -z "$NOV_LINES" ] && NOV_LINES="$(grep -E '\[(done|idle)\]' "$CHAT" 2>/dev/null; grep -iE 'gen-pair-deadend|study-deadend' "$TRACES" 2>/dev/null)"
+  # The per-kind filters below each grep the FULL NOV_LINES (15 MB on a live board). Every one of
+  # the ~21 auto-novelty ideas re-ran them, so a single pass re-grepped the same 15 MB ~84 times
+  # (~0.4 s each) — ~30 s of pure redundancy. Cache each filtered subset per kind for the pass.
+  case "$kind" in
+    CONNECTION) [ -n "${NOV_CONN:-}" ] || NOV_CONN="$(printf '%s\n' "$NOV_LINES" | grep -iE 'CONNECTION|gen-pair')" ;;
+    CO-OSCILLATION) [ -n "${NOV_COOSC:-}" ] || NOV_COOSC="$(printf '%s\n' "$NOV_LINES" | grep -iE 'gen-pair|co-oscillation')" ;;
+    STUDY) [ -n "${NOV_STUDY:-}" ] || NOV_STUDY="$(printf '%s\n' "$NOV_LINES" | grep -E 'study-deadend|STUDY\(')" ;;
+    *) [ -n "${NOV_LIT:-}" ] || NOV_LIT="$(printf '%s\n' "$NOV_LINES" | grep -i 'LITERATURE')" ;;
+  esac
   if [ "$kind" = "CONNECTION" ]; then
     # fused tool bare-names (strip mesh-); need >=2; ONE resolution line must mention ALL of them
     tools="$(echo "$idea" | grep -oE 'mesh-[a-z0-9-]+' | sed 's/^mesh-//' | sort -u)"
     if [ "$(echo "$tools" | grep -c .)" -ge 2 ]; then
-      while IFS= read -r ln; do
-        [ -z "$ln" ] && continue
-        all=1; for t in $tools; do word_in "$t" "$ln" || { all=0; break; }; done
-        [ "$all" = 1 ] && { MATCH_SUMMARY="$(echo "$ln" | sed -E 's/.*\[(done|idle)\][[:space:]]*//' | head -c 100)"; return 0; }
-      done <<< "$(echo "$NOV_LINES" | grep -iE 'CONNECTION|gen-pair')"
+      # word_in() forks a grep per tool per line; on a 140-line × 4-tool subset that is ~560
+      # forks (~3 s) for ONE idea. One awk does the same ALL-tools-must-hit test in one process,
+      # with the IDENTICAL whole-word predicate (a substring test would re-open the "say"/"essay"
+      # false-positive class word_in exists to stop).
+      local _hit
+      _hit="$(printf '%s\n' "$NOV_CONN" | awk -v toks="$tools" '
+        BEGIN { n = split(toks, T, "\n") }
+        { ok = 1; line = tolower($0)
+          for (i = 1; i <= n; i++) {
+            t = tolower(T[i]); if (t == "") { continue }
+            if (!match(line, "(^|[^a-z0-9-])(mesh-)?" t "([^a-z0-9-]|$)")) { ok = 0; break }
+          }
+          if (ok) { sub(/.*\[(done|idle)\][[:space:]]*/, ""); print substr($0, 1, 100); exit } }')"
+      if [ -n "$_hit" ]; then MATCH_SUMMARY="$_hit"; return 0; fi
       return 1
     fi
     # CONNECTION (data-seeded): names raw SENSOR/DEVICE identifiers, not mesh- tools (mesh-ideate's
@@ -157,13 +241,17 @@ novelty_match() {
     anchA="$(echo "$sigA" | tr -cs '[:alnum:]_' '\n' | grep -viwE 'the|and|sense' | awk 'length>=4 || (length>=2 && /[A-Za-z]/ && /[0-9]/)')"
     anchB="$(echo "$sigB" | tr -cs '[:alnum:]_' '\n' | grep -viwE 'the|and|sense' | awk 'length>=4 || (length>=2 && /[A-Za-z]/ && /[0-9]/)')"
     { [ -z "$anchA" ] || [ -z "$anchB" ]; } && return 1
-    while IFS= read -r ln; do
-      [ -z "$ln" ] && continue
-      hitA=0; for a in $anchA; do echo "$ln" | grep -Fiq "$a" && { hitA=1; break; }; done
-      [ "$hitA" = 1 ] || continue
-      hitB=0; for a in $anchB; do echo "$ln" | grep -Fiq "$a" && { hitB=1; break; }; done
-      [ "$hitB" = 1 ] && { MATCH_SUMMARY="$(echo "$ln" | sed -E 's/.*gen-pair-deadend[[:space:]]*//; s/.*\[(done|idle)\][[:space:]]*//' | head -c 100)"; return 0; }
-    done <<< "$(echo "$NOV_LINES" | grep -iE 'CONNECTION|gen-pair')"
+    # One awk instead of a `grep -Fiq` fork per anchor per line: demands >=1 anchor from EACH
+    # side in one line (substring, as before — these are distinctive device identifiers).
+    local _hit
+    _hit="$(printf '%s\n' "$NOV_CONN" | awk -v A="$anchA" -v B="$anchB" '
+      BEGIN { na = split(A, X, "\n"); nb = split(B, Y, "\n") }
+      { line = tolower($0)
+        for (i = 1; i <= na; i++) { if (X[i] != "" && index(line, tolower(X[i]))) { break } }
+        if (i > na) { next }
+        for (j = 1; j <= nb; j++) { if (Y[j] != "" && index(line, tolower(Y[j]))) { break } }
+        if (j <= nb) { sub(/.*gen-pair-deadend[[:space:]]*/, ""); sub(/.*\[(done|idle)\][[:space:]]*/, ""); print substr($0, 1, 100); exit } }')"
+    if [ -n "$_hit" ]; then MATCH_SUMMARY="$_hit"; return 0; fi
   elif [ "$kind" = "CO-OSCILLATION" ]; then
     # CO-OSCILLATION (auto, real data): "<signalA> and <signalB> fluctuate …" — the resolution
     # names the two co-oscillating SIGNALS (devices/APs), NOT mesh- tools, so the CONNECTION arm's
@@ -183,13 +271,16 @@ novelty_match() {
     anchA="$(echo "$sigA" | tr -cs '[:alnum:]_' '\n' | grep -viwE 'wifi|and|the|ble|device|count|over|real|data|auto' | awk 'length>=4 || (length>=2 && /[A-Za-z]/ && /[0-9]/)')"
     anchB="$(echo "$sigB" | tr -cs '[:alnum:]_' '\n' | grep -viwE 'wifi|and|the|ble|device|count|over|real|data|auto' | awk 'length>=4 || (length>=2 && /[A-Za-z]/ && /[0-9]/)')"
     { [ -z "$anchA" ] || [ -z "$anchB" ]; } && return 1
-    while IFS= read -r ln; do
-      [ -z "$ln" ] && continue
-      hitA=0; for a in $anchA; do echo "$ln" | grep -Fiq "$a" && { hitA=1; break; }; done
-      [ "$hitA" = 1 ] || continue
-      hitB=0; for a in $anchB; do echo "$ln" | grep -Fiq "$a" && { hitB=1; break; }; done
-      [ "$hitB" = 1 ] && { MATCH_SUMMARY="$(echo "$ln" | sed -E 's/.*gen-pair-deadend[[:space:]]*//; s/.*\[(done|idle)\][[:space:]]*//' | head -c 100)"; return 0; }
-    done <<< "$(echo "$NOV_LINES" | grep -iE 'gen-pair|co-oscillation')"
+    # One awk, same both-sides-required predicate (>=1 distinctive anchor from each side).
+    local _hit
+    _hit="$(printf '%s\n' "$NOV_COOSC" | awk -v A="$anchA" -v B="$anchB" '
+      BEGIN { na = split(A, X, "\n"); nb = split(B, Y, "\n") }
+      { line = tolower($0)
+        for (i = 1; i <= na; i++) { if (X[i] != "" && index(line, tolower(X[i]))) { break } }
+        if (i > na) { next }
+        for (j = 1; j <= nb; j++) { if (Y[j] != "" && index(line, tolower(Y[j]))) { break } }
+        if (j <= nb) { sub(/.*gen-pair-deadend[[:space:]]*/, ""); sub(/.*\[(done|idle)\][[:space:]]*/, ""); print substr($0, 1, 100); exit } }')"
+    if [ -n "$_hit" ]; then MATCH_SUMMARY="$_hit"; return 0; fi
   elif [ "$kind" = "STUDY" ]; then
     # STUDY ideas are worded 'STUDY(<topic-slug>): ...' — no double-quoted topic (the LITERATURE
     # branch's quote-extraction below doesn't apply, so STUDY ideas fell through to the generic
@@ -203,22 +294,30 @@ novelty_match() {
     # merely discussed the concept in prose while resolving a DIFFERENT idea (verified live
     # 2026-07-01: "STUDY(distributed-systems) — ADJUDICATED: ... G-Set CRDT ..." incidentally
     # contains "crdt" and wrongly closed STUDY(crdt), which had never actually been resolved).
-    while IFS= read -r ln; do
-      [ -z "$ln" ] && continue
-      { echo "$ln" | grep -Fq "STUDY($topic)" || echo "$ln" | grep -Eq "study-deadend[[:space:]]+${topic}(/|:|[[:space:]]|\$)"; } \
-        && { MATCH_SUMMARY="$(echo "$ln" | sed -E 's/.*study-deadend[[:space:]]*//; s/.*\[(done|idle)\][[:space:]]*//' | head -c 100)"; return 0; }
-    done <<< "$(echo "$NOV_LINES" | grep -E 'study-deadend|STUDY\(')"
+    # One awk: the exact-marker test (verbatim 'STUDY(<topic>)' OR 'study-deadend <topic>/|:|SP|EOL'
+    # adjacency) is a two-pattern OR per line, and forking two greps per line over the board was
+    # the STUDY arm's whole cost.
+    local _hit
+    _hit="$(printf '%s\n' "$NOV_STUDY" | awk -v topic="$topic" '
+      BEGIN { m1 = "STUDY(" topic ")" }
+      { if (index($0, m1) || match(tolower($0), "study-deadend[[:space:]]+" tolower(topic) "(/|:|[[:space:]]|$)"))
+          { sub(/.*study-deadend[[:space:]]*/, ""); sub(/.*\[(done|idle)\][[:space:]]*/, ""); print substr($0, 1, 100); exit } }')"
+    if [ -n "$_hit" ]; then MATCH_SUMMARY="$_hit"; return 0; fi
   else  # LITERATURE: quoted topic words must appear in a LITERATURE resolution line
     topic="$(echo "$idea" | grep -oE '"[^"]+"' | head -1 | tr -d '"')"
     [ -z "$topic" ] && return 1
     twords="$(echo "$topic" | tr -cs '[:alnum:]' '\n' | awk 'length>3' | grep -viFf "$STOPF" | head -5)"
     [ -z "$twords" ] && return 1
     need="$(echo "$twords" | grep -c .)"; [ "$need" -gt 2 ] && need=2
-    while IFS= read -r ln; do
-      [ -z "$ln" ] && continue
-      hits=0; for t in $twords; do echo "$ln" | grep -Fiq "$t" && hits=$((hits+1)); done
-      [ "$hits" -ge "$need" ] && { MATCH_SUMMARY="$(echo "$ln" | sed -E 's/.*\[(done|idle)\][[:space:]]*//' | head -c 100)"; return 0; }
-    done <<< "$(echo "$NOV_LINES" | grep -i 'LITERATURE')"
+    # One awk: same substring word test as the old per-word `grep -Fiq` forks, hits counted once
+    # per distinct word, first line reaching `need` wins.
+    local _hit
+    _hit="$(printf '%s\n' "$NOV_LIT" | awk -v need="$need" -v words="$twords" '
+      BEGIN { n = split(words, T, "\n") }
+      { line = tolower($0); hits = 0
+        for (i = 1; i <= n; i++) { t = tolower(T[i]); if (t != "" && index(line, t)) hits++ }
+        if (hits >= need) { sub(/.*\[(done|idle)\][[:space:]]*/, ""); print substr($0, 1, 100); exit } }')"
+    if [ -n "$_hit" ]; then MATCH_SUMMARY="$_hit"; return 0; fi
   fi
   return 1
 }
@@ -651,6 +750,7 @@ floor_before="${floor_before:-0}"
 
 echo "=== mesh-queue-tend @ $(ts) ==="
 echo "ideas: ${#ideas[@]} [~]  |  board: $(echo "$dones" | wc -l) [done]"
+declare -A CANDS_CACHE=()   # per-category [done] candidates; the 14.5 MB grep runs once per text
 echo "queue visibility: floor=${floor_before} [ ]  inflight=${#ideas[@]} [~]"
 echo ""
 
@@ -677,13 +777,17 @@ for idea in "${ideas[@]}"; do
     fi
     continue
   fi
-
   cat_lower="$(echo "$cat" | tr '[:upper:]' '[:lower:]')"
+  # Cache the category-filtered candidates: this grep scans the FULL 14.5 MB `dones` string, and
+  # each of the generic ideas re-ran it — under load that alone consumed the pass's wall time.
+  _ck="${cat_lower// /_}"
+  if [ -n "${CANDS_CACHE[$_ck]:-}" ]; then cands="${CANDS_CACHE[$_ck]}"
+  else
+    cands="$(printf '%s\n' "$dones" | grep -Fi "$cat_lower" 2>/dev/null)"
+    CANDS_CACHE[$_ck]="$cands"
+  fi
   words="$(extract_words "$idea")"
   [ -z "$words" ] && { stayed=$((stayed+1)); stayed_list+=("[$cat] ${idea:0:90}"); continue; }
-  
-  # Fast: find done lines containing category
-  cands="$(echo "$dones" | grep -Fi "$cat_lower" 2>/dev/null)"
   [ -z "$cands" ] && { stayed=$((stayed+1)); stayed_list+=("[$cat] ${idea:0:90}"); continue; }
   
   # Match words against candidates. Each idea used to fork `grep -Fi` ONCE PER WORD × PER
@@ -746,7 +850,11 @@ done
 now=$(date +%s)
 # semantic organ probe (ONCE): mesh-embed --which exits 0 with a model name iff the embed organ is
 # live here; any exit 2 (ollama down / no model) → EMBED_OK stays 0 → reaper is lexical-only, honest.
-command -v mesh-embed >/dev/null 2>&1 && mesh-embed --which >/dev/null 2>&1 && EMBED_OK=1
+# Capture the model name too: reusing it for every vector read skips pick_model's `ollama list`
+# round-trip (a curl + awk per call would otherwise dominate the cached loop).
+if command -v mesh-embed >/dev/null 2>&1; then
+  _MODEL="$(mesh-embed --which 2>/dev/null)" && [ -n "$_MODEL" ] && EMBED_OK=1
+fi
 takings="$(grep '\[taking\]' "$CHAT" 2>/dev/null | tail -500)"
 idle_done="$dones
 $(grep '\[idle\]' "$CHAT" 2>/dev/null | tail -500)
@@ -756,6 +864,28 @@ declare -A seen_at=() seen_now=()
 [ -f "$SEEN" ] && while read -r k e; do [ -n "$k" ] && seen_at["$k"]="$e"; done < "$SEEN"
 # stayed_ideas = the full [~] lines NOT marked for flip
 declare -A is_flip=(); for f in "${flip_lines[@]:-}"; do [ -n "$f" ] && is_flip["$f"]=1; done
+declare -A TOK_PREFILTER=()   # per-board-slice prefilter, built once from the union of all stayed tokens
+#
+# tokens_overlap is called TWICE per stayed [~] (idle_done + takings), and each call scanned the
+# FULL ~15k lines / ~15 MB of the board — 4-8 s per call, so the reaper loop alone could exceed the
+# */15 cadence and re-pile the passes this whole fix exists to break. Most board lines share NONE of
+# any idea's tokens: pre-filter each slice ONCE on the union of EVERY stayed idea's tokens, so any
+# line that could match at >=1 token of any idea survives, and each per-idea >=min test then runs
+# over a few thousand lines. The exact whole-word predicate and DISTINCT-token counting are
+# unchanged, so KEEP/DEMOTE verdicts are identical to the full scan — only the input is shorter.
+_ALL_TOKS=""
+for idea in "${ideas[@]}"; do
+  [ -n "${is_flip[$idea]:-}" ] && continue
+  echo "$idea" | grep -qE "$BLOCKED_RE" && continue
+  _t="$(distinct_tokens "$idea")"
+  [ -n "$_t" ] && _ALL_TOKS="${_ALL_TOKS:+$_ALL_TOKS }$_t"
+done
+if [ -n "$_ALL_TOKS" ]; then
+  # Narrow ONLY the lexical scan: semantic_overlap embeds against its own SEM_SCAN_MAX tail of the
+  # same slices and must see lines the token union missed (a paraphrase shares NO token).
+  _LEX_IDLE_DONE="$(_prefilter_tokens "$idle_done" "$_ALL_TOKS")"
+  _LEX_TAKINGS="$(_prefilter_tokens "$takings" "$_ALL_TOKS")"
+fi
 for idea in "${ideas[@]}"; do
   [ -n "${is_flip[$idea]:-}" ] && continue
   key="$(idea_key "$idea")"; first="${seen_at[$key]:-$now}"; seen_now["$key"]="$first"
@@ -770,7 +900,7 @@ for idea in "${ideas[@]}"; do
     continue
   fi
   toks="$(distinct_tokens "$idea")"
-  if [ -n "$toks" ] && { tokens_overlap "$toks" "$idle_done" 2 || tokens_overlap "$toks" "$takings" 2; }; then
+  if [ -n "$toks" ] && { tokens_overlap "$toks" "$_LEX_IDLE_DONE" 2 || tokens_overlap "$toks" "$_LEX_TAKINGS" 2; }; then
     parked=$((parked+1)); echo "  ⏸ [$(extract_cat "$idea")] KEEP: token-matched a [done]/[idle]/[taking] (resolved or claimed — no blind demote)"; continue
   fi
   # SECOND-CHANCE (semantic): lexical missed, but a paraphrased [done]/[idle]/[taking] may still have
