@@ -81,10 +81,11 @@ precedence render UNKNOWN to the owner window. `mesh-rules --check` validates th
 `mesh-handoff --restore` injects scope-relevant rows + `rev`; `mesh-task preflight` gates claims.
 
 ```invariant-registry
-rev: 20260916.3
+rev: 20260921.1
 id=gpu.mesh-owned.v1 | owner=tg | scope=node | precedence=10 | source=operator-verbatim 2026-09-16 (artifacts/tg-constant-forgetting-20260916.md: mesh-home owns the GPU completely; Ollama/model residency and contention are mesh-owned work) | preflight=ollama ps + managed-ownership read recorded in the task artifact before any GPU/VRAM blocker claim
 id=mesh.decides-informs.v1 | owner=tg | scope=mesh | precedence=10 | source=operator-verbatim 2026-09-16 (no approval wait; mesh decides and lets operator know) | preflight=action started + outcome reported; "waiting for approval" never a state on mesh-owned scope
 id=evidence.mesh-evidence-root.v1 | owner=witness | scope=mesh | precedence=10 | source=docs/EVIDENCE-MOVED.md 2026-09-16 (internal mesh comms — reviews, receipts, evidence, handoffs, chains, plans — live under ~/.mesh evidence/plans roots, never in git) | preflight=mesh-evidence-dir --resolve <path> recorded in the task artifact before any in-repo evidence write
+id=mind.top-pane-live.v1 | owner=all-minds | scope=mesh | precedence=10 | source=operator-verbatim 2026-09-21 (every mind keeps its top pane updated and live) | preflight=mesh-pane-check --channels <live-mind-windows> records PASS for each top pane, including the visible pane live liveness lease
 ```
 
 ## How Codex operates here
