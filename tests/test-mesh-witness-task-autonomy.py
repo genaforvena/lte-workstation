@@ -330,6 +330,55 @@ def run() -> None:
     if result != 1 or "health=FAIL" not in tape or "reconcile-audit-rc-1" not in tape:
         raise AssertionError(f"unreadable post-refusal audit was not kept loud: {tape}")
 
+    with tempfile.TemporaryDirectory(prefix="mesh-autonomy-check-bucket-") as raw:
+        base = Path(raw)
+        watch.TAPE = base / "tape.log"
+        watch.STATE = base / "state.json"
+        watch.ALERT_SECONDS = 1800
+        posted: list[str] = []
+
+        def bucket_command(argv: list[str], timeout: int = 60) -> subprocess.CompletedProcess[str]:
+            posted.append(" ".join(argv[1:]))
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        watch.command = bucket_command
+        moment = 3_000_000
+        # A single routine gate refusal is the gate working, not a fault:
+        # tape stays FAIL with the raw error, but nothing reaches the board.
+        if watch.report(["check-some/work-for-health-rc-2"], "source=FAIL", moment) != "FAIL":
+            raise AssertionError("suppressed refusal must still report FAIL on the tape")
+        if posted:
+            raise AssertionError(f"single gate refusal reached the board: {posted}")
+        if "suppressed_check_refusals=1" not in watch.TAPE.read_text(encoding="utf-8"):
+            raise AssertionError("suppressed refusal lacked its tape count")
+        # A second run refusing a DIFFERENT task is the same non-event, not a
+        # novel signature — the old per-id signature posted a fresh FAIL here.
+        if watch.report(["check-other/work-for-health-rc-2"], "source=FAIL", moment + 60) != "FAIL":
+            raise AssertionError("second refusal must still report FAIL on the tape")
+        if posted:
+            raise AssertionError(f"novel-id refusal reached the board: {posted}")
+        # A non-refusal check exit stays loud with a task-id-free signature.
+        if watch.report(["check-x/work-for-health-rc-1"], "source=FAIL", moment + 120) != "FAIL":
+            raise AssertionError("check rc=1 must stay FAIL")
+        if len(posted) != 1 or "check-error-rc1" not in posted[0] or "check-x/work" in posted[0]:
+            raise AssertionError(f"check rc=1 lacked its bucketed alert: {posted}")
+        # Mixed refusal + real error alerts once; the same classes under a
+        # different task id must not re-alert inside ALERT_SECONDS.
+        if watch.report(["check-a/work-for-health-rc-2", "journal-rc-1"], "source=FAIL", moment + 180) != "FAIL":
+            raise AssertionError("mixed refusal+fault must stay FAIL")
+        if len(posted) != 2 or "journal-rc-1" not in posted[1] or "check-refused-rc2" not in posted[1]:
+            raise AssertionError(f"mixed error lacked its bucketed alert: {posted}")
+        if watch.report(["check-b/work-for-health-rc-2", "journal-rc-1"], "source=FAIL", moment + 240) != "FAIL":
+            raise AssertionError("repeat mixed error must stay FAIL on the tape")
+        if len(posted) != 2:
+            raise AssertionError(f"same-class repeat re-alerted: {posted}")
+        # At/above threshold, pure refusals alert too — just under one stable bucket.
+        many = [f"check-t{i}/work-for-health-rc-2" for i in range(5)]
+        if watch.report(many, "source=FAIL", moment + 300) != "FAIL":
+            raise AssertionError("above-threshold refusals must stay FAIL")
+        if len(posted) != 3 or "check-refused-rc2" not in posted[2]:
+            raise AssertionError(f"above-threshold refusals lacked their bucketed alert: {posted}")
+
     with tempfile.TemporaryDirectory(prefix="mesh-unblock-reflex-wiring-") as raw:
         base = Path(raw)
         home_bin = base / ".local" / "bin"
