@@ -1,4 +1,4 @@
-import type { Plugin } from "@opencode-ai/plugin"
+import { Plugin } from "@opencode/plugin"
 
 // mesh-rtk — opencode port of the Claude PreToolUse hook
 // (`rtk hook claude`, matcher Bash, in ~/.claude/settings.json).
@@ -11,12 +11,15 @@ import type { Plugin } from "@opencode-ai/plugin"
 // payload, run `rtk hook claude`, and write updatedInput.command back.
 // Non-bash tools pass through untouched. Fail-open: rtk absent or
 // erroring leaves args as-is (a hook that breaks bash breaks everything).
-export const MeshRtk: Plugin = async ({ client }) => {
-  await client.app.log({ body: { service: "mesh-rtk", level: "info", message: "plugin loaded" } }).catch(() => {})
-  return {
-    "tool.execute.before": async (input, output) => {
-      if (input.tool !== "bash" && input.tool !== "Bash") return
-      const cmd = output?.args?.command
+export default Plugin.define({
+  id: "mesh-rtk",
+  async setup(ctx) {
+    console.info("[mesh-rtk] plugin loaded")
+    await ctx.tool.hook("execute.before", async (event) => {
+      if (event.tool !== "bash" && event.tool !== "Bash") return
+      const input = event.input
+      if (!input || typeof input !== "object") return
+      const cmd = (input as Record<string, unknown>).command
       if (typeof cmd !== "string" || !cmd) return
       try {
         const payload = JSON.stringify({ tool_name: "Bash", tool_input: { command: cmd } })
@@ -28,10 +31,10 @@ export const MeshRtk: Plugin = async ({ client }) => {
         const raw = await new Response(p.stdout).text()
         await p.exited
         const next = JSON.parse(raw)?.hookSpecificOutput?.updatedInput?.command
-        if (typeof next === "string" && next && next !== cmd) output.args.command = next
+        if (typeof next === "string" && next && next !== cmd) (input as Record<string, unknown>).command = next
       } catch {
         // fail-open: leave args untouched
       }
-    },
-  }
-}
+    })
+  },
+})
