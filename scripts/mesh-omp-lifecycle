@@ -1,0 +1,585 @@
+#!/usr/bin/env python3
+"""omp (Oh My Pi) lifecycle: textual birth, durable turn receipt, handoff, quiet reset.
+
+omp is the third engine on this node (beside Codex and opencode). It has no hooks.json;
+the wiring is an omp extension module (omp-lifecycle.ts) that shells out here:
+  session_start          → --start   (charter+handoff restore + task reconcile)
+  agent_end !willContinue → a JSON event on stdin (receipt + handoff + TURN + reset)
+  process exit           → --end     (last-chance drain)
+A cron/reflex calls --drain to retry pending receipts; --ready asks whether any remain.
+
+Identity: omp has no thread-id. The analogue is the pair (session_id, turn_id), which
+SessionStopEvent carries natively. Birth records the root session_id; a receipt from a
+different session is a stale root and is excluded, exactly like Codex's auxiliary threads.
+
+State layout mirrors codex-lifecycle/ so mesh-clear's native-hook gate generalizes:
+  <STATE>/<win>.native    birth mtime marker (manual-handoff-since-birth needs it)
+  <STATE>/<win>.thread    the root session_id
+  <STATE>/<win>/<key>.json  one receipt per (session,turn)
+orphan-ok: omp extension events; --drain retries pending resets.
+"""
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import time
+
+ROOT = Path(os.environ.get("MESH_DIR", str(Path.home() / ".mesh")))
+STATE = ROOT / "omp-lifecycle"
+MESH_BIN = Path.home() / ".local" / "bin"
+
+# omp's cleared composer is not Codex's "Ask Codex to do anything"; the engine renders an
+# input prompt line. Verified against live panes, not assumed.
+EMPTY_COMPOSER_HINT = os.environ.get("MESH_OMP_EMPTY_HINT", "")
+
+
+def child_env():
+    env = dict(os.environ)
+    env["PATH"] = str(MESH_BIN) + os.pathsep + env.get("PATH", "")
+    return env
+
+
+def run(*args, **kwargs):
+    kwargs.setdefault("env", child_env())
+    return subprocess.run(args, text=True, capture_output=True, timeout=40, **kwargs)
+
+
+def window():
+    pane = os.environ.get("TMUX_PANE")
+    if not pane:
+        return ""
+    result = run("tmux", "display-message", "-p", "-t", pane, "#{window_name}")
+    name = result.stdout.strip() if result.returncode == 0 else ""
+    return name if re.fullmatch(r"[A-Za-z0-9_.-]+", name) else ""
+
+
+def save(path, value):
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(value, ensure_ascii=False) + "\n")
+    tmp.replace(path)
+
+
+def birth(win, session):
+    STATE.mkdir(parents=True, exist_ok=True)
+    env = dict(os.environ, MESH_HANDOFF_TEST_WINDOW=win, MESH_WHO=win + "@" + os.uname().nodename)
+    # A session restart can land between an owner taking work and its first progress
+    # receipt.  Rebuild this window's pointer from canonical chains before restoring its
+    # handoff so stale cache rows cannot choose the task.
+    recovered = run("mesh-task", "reconcile", win, env=env)
+    if recovered.returncode:
+        raise RuntimeError(recovered.stderr or "task-context recovery failed")
+    # The restore is the ONLY durable-context lever: omp's --append-system-prompt is frozen
+    # at spawn, so a live handoff reaches the model through mesh-handoff's additionalContext
+    # (the extension injects it on the first context event of the new session).
+    result = run("mesh-handoff", "--restore", env=env)
+    if result.returncode:
+        raise RuntimeError(result.stderr)
+    (STATE / (win + ".native")).write_text(str(time.time()))
+    (STATE / (win + ".thread")).write_text(session)
+    print(result.stdout, end="")
+
+
+def receipt(win, event):
+    # The extension forwards omp's session_stop (the settle boundary) as this record. It
+    # carries turn_id/session_id/messages natively; the pair below is the dedup key.
+    if event.get("type") != "agent-turn-complete":
+        return None
+    session, turn = event.get("session-id"), event.get("turn-id")
+    if not session or not turn:
+        raise ValueError("completion lacks session-id or turn-id; refusing an ambiguous receipt")
+    key = hashlib.sha256((str(session) + ":" + str(turn)).encode()).hexdigest()
+    directory = STATE / win
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / (key + ".json")
+    if path.exists():
+        return path
+    event.update(window=win, received_at=time.time(), status="pending")
+    save(path, event)
+    return path
+
+
+def launch_token_recorder(path):
+    """Hand the observation to the recorder after the callback has returned."""
+    recorder = MESH_BIN / "mesh-token-usage-recorder"
+    if not recorder.exists():
+        return
+    store = ROOT / "token-usage"
+    with (STATE / "recorder.log").open("a") as log:
+        subprocess.Popen([str(recorder), "--store", str(store), "--event-file", str(path)],
+                         stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                         start_new_session=True)
+
+
+def is_root(win, event):
+    identity = STATE / (win + ".thread")
+    return identity.exists() and event.get("session-id") == identity.read_text()
+
+
+def active_task(win):
+    path = ROOT / "task-context" / (win + ".json")
+    try:
+        contexts = json.loads(path.read_text())
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return ""
+    if isinstance(contexts, dict):
+        contexts = [contexts]
+    if not isinstance(contexts, list) or len(contexts) != 1:
+        return ""
+    task = contexts[0].get("task", "")
+    return task if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,119}", task) else ""
+
+
+def pre_handoff_gate(win):
+    """Return a reset-blocking reason when an active task lacks a board receipt."""
+    path = ROOT / "task-context" / (win + ".json")
+    try:
+        contexts = json.loads(path.read_text())
+    except FileNotFoundError:
+        return ""
+    except (json.JSONDecodeError, OSError) as exc:
+        return "task context unreadable: " + str(exc)
+    if isinstance(contexts, dict):
+        contexts = [contexts]
+    if not isinstance(contexts, list):
+        return "task context is not a list"
+    active = []
+    for context in contexts:
+        status = context.get("status")
+        if status == "done":
+            continue
+        # A typed blocker is a durable stopping point, not an in-flight turn.
+        # Keep it in task-context for retry, but do not require a second board
+        # receipt before another turn can start. Malformed blocked rows fail
+        # closed through the ordinary exact-receipt check below.
+        if status == "blocked" and isinstance(context.get("retry"), str) and context["retry"].strip():
+            continue
+        active.append(context)
+    if not active:
+        return ""
+    board = Path(os.environ.get("MESH_CHAT_LOG", str(ROOT / "chat.log")))
+    try:
+        # The board is an append-only cross-engine tape. A malformed byte in
+        # one unrelated line must not prevent a valid task receipt from
+        # clearing the current window; preserve the line with replacement
+        # characters and keep matching the receipt fields normally.
+        board_text = board.read_text(errors="replace")
+    except FileNotFoundError:
+        return "active task has no board receipt"
+    except OSError as exc:
+        return "board unreadable: " + str(exc)
+    for context in active:
+        task = context.get("task", "")
+        owner = context.get("owner", "")
+        next_action = context.get("next_action", "")
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,119}", task):
+            return "active task has no canonical task id"
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", owner) or owner != win:
+            return "active task has no exact owner for this window"
+        task_marker = "task:" + task
+        owner_marker = re.compile(r"(?:owner|mind)[:=]\s*(?:mesh-task/)?" + re.escape(owner) + r"(?:\s|[,;]|$)")
+        sender_marker = re.compile(r"^\S+\s+" + re.escape(owner) + r"@")
+        receipt_found = False
+        for line in board_text.splitlines():
+            if task_marker in line and (owner_marker.search(line) or sender_marker.search(line)):
+                if isinstance(next_action, str) and next_action.strip() and next_action.strip() not in line:
+                    continue
+                if re.search(r"::\s+\[(taking|progress|resume|blocked)\]", line):
+                    receipt_found = True
+                    break
+        if not receipt_found:
+            return "active task has no matching board receipt"
+    return ""
+
+
+def manual_handoff_since_birth(win):
+    """Whether this turn already wrote the substantive manual handoff."""
+    marker = STATE / (win + ".native")
+    handoff = ROOT / "handoff" / (win + ".md")
+    try:
+        source = next(line for line in handoff.read_text().splitlines()
+                      if line.startswith("# source: "))
+        return (source == "# source: manual"
+                and handoff.stat().st_mtime_ns > marker.stat().st_mtime_ns)
+    except (FileNotFoundError, OSError, StopIteration):
+        return False
+
+
+def consume_done_task(win):
+    path = ROOT / "task-context" / (win + ".json")
+    try:
+        contexts = json.loads(path.read_text())
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return
+    if isinstance(contexts, dict):
+        contexts = [contexts]
+    if not isinstance(contexts, list):
+        return
+    remaining = [c for c in contexts if c.get("status") != "done"]
+    if remaining:
+        path.write_text(json.dumps(remaining, ensure_ascii=False) + "\n")
+    elif path.exists():
+        path.unlink()
+
+
+def autoland_after_ready(win):
+    """Start the genome lander once this turn has reached its ready boundary."""
+    if win != os.environ.get("MESH_OMP_AUTOLAND_WINDOW", "genome"):
+        return
+    result = run("mesh-land", "--autoland")
+    log = ROOT / "omp-lifecycle" / "autoland.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    detail = (result.stdout + result.stderr).strip().replace("\n", " ")
+    with log.open("a") as stream:
+        stream.write(f"{stamp} window={win} rc={result.returncode}"
+                     f"{(' ' + detail) if detail else ''}\n")
+
+
+def mind_pane(win):
+    """Resolve the mind pane for a window, or "" when the window is not live."""
+    try:
+        panes = run("tmux", "list-panes", "-t", os.uname().nodename + ":" + win,
+                    "-F", "#{pane_top} #{pane_id}").stdout.splitlines()
+    except subprocess.TimeoutExpired:
+        return ""
+    if not panes or not panes[0].strip():
+        return ""
+    try:
+        return max(panes, key=lambda s: int(s.split()[0])).split()[1]
+    except (ValueError, IndexError):
+        return ""
+
+
+def clear_observed(pane, before, hint):
+    """Whether the pane shows a fresh, empty composer after mesh-clear ran."""
+    for _ in range(30):
+        after = run("tmux", "capture-pane", "-p", "-t", pane).stdout
+        if after != before:
+            if hint and hint in after:
+                return True
+            # No engine-specific hint configured: accept any stable content change
+            # that no longer contains a live assistant marker.
+            if after != before and not re.search(r"^[•◦]", after, re.M):
+                return True
+        time.sleep(0.2)
+    return False
+
+
+def close(path):
+    event = json.loads(path.read_text())
+    if event["status"] in ("cleared", "excluded"):
+        return
+    win = event["window"]
+    # A deferred receipt belongs to the root that produced it.  Once a later
+    # session_start has registered a different root for this window, retrying
+    # the old receipt must not reset the newer conversation.
+    if not is_root(win, event):
+        event.update(status="excluded", excluded_at=time.time(),
+                     error="stale root receipt; newer session owns this window")
+        save(path, event)
+        return
+    # Persist the engine's actual final response, not an LLM-generated reconstruction.
+    artifact = path.with_suffix(".md")
+    if not artifact.exists():
+        artifact.write_text("# Turn result: " + win + "\n\n" +
+                            str(event.get("last-assistant-message") or "No final response recorded.") + "\n")
+    pane = mind_pane(win)
+    if not pane:
+        event["error"] = "mind pane unresolved for window " + win
+        save(path, event)
+        return
+    env = child_env()
+    env.update(MESH_WHO=win + "@" + os.uname().nodename,
+               TMUX_PANE=pane, MESH_OMP_WINDOW=win, MESH_OMP_NATIVE_HOOKS="1")
+    gate_reason = pre_handoff_gate(win)
+    if gate_reason:
+        event["error"] = "pre-handoff gate: " + gate_reason
+        save(path, event)
+        return
+    if not event.get("handoff"):
+        # A manual handoff written during this turn is already the useful board
+        # receipt. Do not append the generic lifecycle receipt or overwrite it.
+        if manual_handoff_since_birth(win):
+            event["handoff"] = True
+            save(path, event)
+        else:
+            prior = path.with_suffix(".prior.md")
+            current = ROOT / "handoff" / (win + ".md")
+            if current.exists() and not prior.exists():
+                prior.write_text(current.read_text())
+            note = ("Completed omp turn; result artifact: " + str(artifact) +
+                    ". Previous work-state: " + str(prior) +
+                    ". Read the result and verify its cited artifacts; claims are not verification. "
+                    "On the next source change or dispatch, read the live top pane and open obligations. "
+                    "Do not redo completed work merely because context was reset.")
+            # Generic lifecycle receipts are durable memory, not board events. Key them by the
+            # current task so a changed obligation still produces one visible receipt.
+            env["MESH_HANDOFF_BOARD_MODE"] = "dedupe"
+            env["MESH_HANDOFF_BOARD_KEY"] = "omp-lifecycle:%s:%s" % (win, active_task(win) or "none")
+            result = run("mesh-handoff", win, note, env=env)
+            if result.returncode:
+                raise RuntimeError(result.stderr)
+            event["handoff"] = True
+            save(path, event)
+    if not event.get("counted"):
+        # The sampler excludes native-hook windows; this receipt is their sole TURN writer.
+        with (ROOT / "spend.log").open("a+") as log:
+            fcntl.flock(log, fcntl.LOCK_EX)
+            log.seek(0)
+            if f"event:{path.stem}" not in log.read():
+                stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                task = active_task(win)
+                suffix = f" task:{task}" if task else ""
+                log.write(f"{stamp} turn {win} omp openai paid unknown event:{path.stem}{suffix}\n")
+                if task:
+                    consume_done_task(win)
+        event["counted"] = True
+        save(path, event)
+    state = run("mesh-mind-state", win).stdout.split("\t", 1)[0].strip()
+    if state != "IDLE":
+        return  # durable pending receipt; never interrupt a newer working turn
+    before = run("tmux", "capture-pane", "-p", "-t", pane).stdout
+    result = run("mesh-clear", win, env=env)
+    if result.returncode:
+        event["error"] = result.stderr or result.stdout
+        save(path, event)
+        return
+    if not clear_observed(pane, before, EMPTY_COMPOSER_HINT):
+        event["error"] = "clear sent but fresh empty composer not observed"
+        save(path, event)
+        return
+    autoland_after_ready(win)
+    event.update(status="cleared", cleared_at=time.time())
+    save(path, event)
+    (ROOT / (".compact-" + win)).write_text(str(int(time.time())))
+
+
+def drain():
+    """Retry every pending receipt under the serialization lock, oldest first."""
+    time.sleep(1)  # allow the completion callback to return to the TUI
+    with (STATE / ".lock").open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        for path in sorted(STATE.glob("*/*.json"),
+                           key=lambda p: json.loads(p.read_text())["received_at"]):
+            try:
+                close(path)
+            except Exception as exc:
+                print(str(path) + ": " + str(exc), file=sys.stderr)
+
+
+def main():
+    STATE.mkdir(parents=True, exist_ok=True)
+    if sys.argv[1:] == ["--test"]:
+        selftest()
+        return
+    if len(sys.argv) == 3 and sys.argv[1] == "--ready":
+        pending = (STATE / (sys.argv[2] + ".restarting")).exists() or any(
+            json.loads(p.read_text()).get("status") not in ("cleared", "excluded")
+            for p in (STATE / sys.argv[2]).glob("*.json"))
+        sys.exit(3 if pending else 0)
+    if sys.argv[1:] == ["--start"]:
+        win = window()
+        event = json.load(sys.stdin)
+        if win and event.get("session-id"):
+            birth(win, event["session-id"])
+        return
+    if sys.argv[1:] == ["--receipt"]:
+        win = window()
+        if not win:
+            return  # non-mesh sessions/subagents do not own panes
+        event = json.load(sys.stdin)
+        if not is_root(win, event):
+            return  # only the root session owns the mind turn
+        with (STATE / ".lock").open("w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            path = receipt(win, event)
+        if path:
+            launch_token_recorder(path)
+            with (STATE / "worker.log").open("a") as log:
+                subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--drain"],
+                                 stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                                 start_new_session=True)
+        return
+    if sys.argv[1:] == ["--end"]:
+        # Process exit is the last retry point for receipts the asynchronous settle
+        # handler did not finish before the session closed.
+        drain()
+        return
+    if sys.argv[1:] == ["--drain"]:
+        drain()
+        return
+    return
+
+
+def selftest():
+    import tempfile
+    global ROOT, STATE, run, EMPTY_COMPOSER_HINT
+    with tempfile.TemporaryDirectory() as td:
+        ROOT = Path(td)
+        STATE = ROOT / "omp-lifecycle"
+        STATE.mkdir()
+        EMPTY_COMPOSER_HINT = "Ask anything"
+        calls = []
+        clear_envs = []
+        screen = ["• Finished work\n› Ask anything"]
+        state = ["WORKING"]
+        panes = ["0 %1\n20 %2"]
+
+        def fake(*args, **kwargs):
+            calls.append(args)
+            if args[0] == "mesh-clear":
+                clear_envs.append(kwargs.get("env", {}))
+            out = ""
+            if args[0] == "mesh-mind-state":
+                out = state[0] + "\tfixture"
+            if args[:2] == ("tmux", "list-panes"):
+                out = panes[0]
+            if args[:2] == ("tmux", "capture-pane"):
+                out = screen[0]
+            if args[0] == "mesh-clear":
+                clear_count = sum(call[0] == "mesh-clear" for call in calls)
+                screen[0] = f"new chat {clear_count}\n› Ask anything"
+            return subprocess.CompletedProcess(args, 0, out, "")
+
+        run = fake
+        # The drain is cron-launched with a minimal PATH; child mesh tools must still resolve.
+        assert child_env()["PATH"].startswith(str(MESH_BIN) + os.pathsep)
+
+        # omp identity: (session_id, turn_id), not Codex's thread-id.
+        event = {"type": "agent-turn-complete", "session-id": "sess", "turn-id": 7,
+                 "last-assistant-message": "artifact: /fixture/result; verified test passed"}
+        assert not is_root("w", event)
+        (STATE / "w.thread").write_text("sess")
+        assert is_root("w", event)
+        assert not is_root("w", dict(event, **{"session-id": "subagent-session"}))
+        assert receipt("w", {"type": "other"}) is None
+
+        # Board-receipt gate (shared with codex-lifecycle; identical doctrine).
+        (ROOT / "task-context").mkdir()
+        (ROOT / "task-context" / "w.json").write_text(
+            '[{"chain":"demo","step":"inspect","task":"demo/inspect", "owner":"w", '
+            '"status":"claimed", "next_action":"run focused verification"}]\n')
+        (ROOT / "chat.log").write_text(
+            "2026-09-07T00:00:00Z  w  :: [progress] demo/inspect: artifact=/tmp/a "
+            "next=run focused verification owner:w task:demo/inspect\n")
+        assert pre_handoff_gate("w") == ""
+        (ROOT / "task-context" / "w.json").write_text(
+            '[{"chain":"demo","step":"inspect","task":"demo/inspect", "owner":"w", '
+            '"status":"claimed", "next_action":"run focused verification"}]\n')
+        (ROOT / "chat.log").write_text("")
+        assert "board receipt" in pre_handoff_gate("w")
+        (ROOT / "chat.log").write_text(
+            "2026-09-07T00:00:00Z  w  :: [progress] demo/inspect next=run focused verification "
+            "owner:w task:demo/inspect\n")
+
+        # A WORKING mind is never interrupted; the receipt stays durable-pending.
+        path = receipt("w", event)
+        assert receipt("w", dict(event)) == path
+        close(path)
+        assert json.loads(path.read_text())["status"] == "pending"
+        assert not any(c[0] == "mesh-clear" for c in calls)
+        assert "artifact: /fixture/result" in path.with_suffix(".md").read_text()
+
+        # IDLE: handoff before clear, exactly one TURN row, autoland after the clear.
+        state[0] = "IDLE"
+        os.environ["MESH_OMP_AUTOLAND_WINDOW"] = "w"
+        old_path = os.environ["PATH"]
+        os.environ["PATH"] = "/usr/bin:/bin"
+        close(path)
+        os.environ["PATH"] = old_path
+        del os.environ["MESH_OMP_AUTOLAND_WINDOW"]
+        assert json.loads(path.read_text())["status"] == "cleared"
+        close(path)
+        assert len((ROOT / "spend.log").read_text().splitlines()) == 1
+        assert "task:demo/inspect" in (ROOT / "spend.log").read_text()
+        assert sum(c[0] == "mesh-clear" for c in calls) == 1
+        assert "omp openai" in (ROOT / "spend.log").read_text()
+        land_i = next(i for i, c in enumerate(calls) if c[:2] == ("mesh-land", "--autoland"))
+        clear_i = next(i for i, c in enumerate(calls) if c[0] == "mesh-clear")
+        assert land_i > clear_i
+        assert clear_envs[0]["PATH"].startswith(str(MESH_BIN) + os.pathsep)
+        assert next(i for i, c in enumerate(calls) if c[0] == "mesh-handoff") < clear_i
+        assert not any(c[0] in ("codex", "ollama", "mesh-tell") for c in calls)
+
+        # A receipt whose session is no longer the window's root must never clear the
+        # newer root that owns it now.
+        stale = receipt("w", dict(event, **{"session-id": "former-root", "turn-id": 99}))
+        clear_calls = sum(c[0] == "mesh-clear" for c in calls)
+        close(stale)
+        assert json.loads(stale.read_text())["status"] == "excluded"
+        assert sum(c[0] == "mesh-clear" for c in calls) == clear_calls
+
+        # A damaged/non-UTF-8 board line must not abort the lifecycle drain
+        # before it can evaluate the valid receipt already present.
+        (ROOT / "chat.log").write_bytes(
+            ("2026-07-01T00:00:00Z  foreign@h  :: [fyi] damaged ").encode()
+            + b"\xd0\n"
+            + ("2026-07-01T00:00:01Z  w@h  :: [progress] demo/inspect next=run focused verification "
+               "task:demo/inspect\n").encode())
+        assert pre_handoff_gate("w") == ""
+
+        # An active task with no current board receipt keeps the reset pending.
+        (ROOT / "chat.log").write_text("")
+        blocked_event = {"type": "agent-turn-complete", "session-id": "sess",
+                         "turn-id": 11, "last-assistant-message": "blocked"}
+        blocked_path = receipt("w", blocked_event)
+        close(blocked_path)
+        assert json.loads(blocked_path.read_text())["status"] == "pending"
+        assert "pre-handoff gate" in json.loads(blocked_path.read_text())["error"]
+        assert sum(c[0] == "mesh-clear" for c in calls) == 1
+
+        # Typed blocked work is a durable stop with its retry condition, not an
+        # in-flight turn that should prevent this completion receipt from draining.
+        (ROOT / "task-context" / "w.json").write_text(
+            '[{"chain":"blocked","step":"inspect","task":"blocked/inspect",'
+            '"owner":"w","status":"blocked","retry":"event:ready"}]\n')
+        (ROOT / "chat.log").write_text("")
+        blocked_only_event = {"type": "agent-turn-complete", "session-id": "sess",
+                              "turn-id": 12, "last-assistant-message": "blocked work retained"}
+        blocked_only_path = receipt("w", blocked_only_event)
+        close(blocked_only_path)
+        assert json.loads(blocked_only_path.read_text())["status"] == "cleared", \
+            json.loads(blocked_only_path.read_text())
+        assert sum(c[0] == "mesh-clear" for c in calls) == 2
+
+        # A substantive manual handoff during the turn is already the board receipt;
+        # the lifecycle fallback must preserve it and post nothing.
+        manual = "manual"
+        (STATE / (manual + ".native")).write_text("started")
+        manual_handoff = ROOT / "handoff" / (manual + ".md")
+        manual_handoff.parent.mkdir(parents=True, exist_ok=True)
+        manual_handoff.write_text("# source: manual\n\nricher state\n")
+        later = time.time_ns() + 1_000_000
+        os.utime(manual_handoff, ns=(later, later))
+        (STATE / (manual + ".thread")).write_text(manual)
+        manual_event = {"type": "agent-turn-complete", "session-id": "manual",
+                        "turn-id": 3, "last-assistant-message": "manual artifact"}
+        manual_path = receipt(manual, manual_event)
+        handoff_calls = sum(c[0] == "mesh-handoff" for c in calls)
+        close(manual_path)
+        assert sum(c[0] == "mesh-handoff" for c in calls) == handoff_calls
+        assert "richer state" in manual_handoff.read_text()
+
+        # An unresolvable mind pane leaves the receipt durable, not lost.
+        panes[0] = ""
+        nopane = receipt("w", dict(event, **{"turn-id": 21}))
+        close(nopane)
+        assert json.loads(nopane.read_text())["status"] == "pending"
+        assert "pane unresolved" in json.loads(nopane.read_text())["error"]
+
+        # --start restores charter+handoff and records the root session, and is a
+        # no-op without a tmux window or a session id (subagents never own a pane).
+        env_before = dict(os.environ)
+        os.environ["TMUX_PANE"] = ""
+        assert window() == ""
+        os.environ = env_before
+        print("lifecycle-test: ok (omp session/turn identity, handoff before clear, busy deferral, "
+              "idempotent turn count, quiet reset, stale-root exclusion)")
+
+
+if __name__ == "__main__":
+    main()
