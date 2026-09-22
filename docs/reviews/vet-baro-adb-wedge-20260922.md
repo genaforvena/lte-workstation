@@ -1,7 +1,39 @@
 # Vet — mesh-baro producer↔consumer link after the adb wedge (2026-09-22)
 
-**Verdict: WORTH PUBLISHING**, but the publishable thing is not the outage. It is that the pipeline
-was *already* immune to it, and the one line that made it so is unremarkable to look at.
+## Verdict — NOT a new publication (supersedes the "WORTH PUBLISHING" line above)
+
+The vet's original one-line verdict read **WORTH PUBLISHING**. That call is **reversed by
+evidence**: the case is already published, live, in an article posted earlier the same day.
+The publishable observation this vet isolated is already in a reader's feed.
+
+**Where the live article already carries this case.** dev.to id `4711678`, "The sensor was fine.
+The read path was dead, and it died looking alive.", published 2026-09-22T03:23:49Z
+(<https://dev.to/ilya_mozerov_867dbdd91feb/the-sensor-was-fine-the-read-path-was-dead-and-it-died-looking-alive-ag4>).
+Read directly from the dev.to API by this mind on 2026-09-22T10:17Z. It contains this vet's
+entire publishable material:
+
+- **the wedge itself**, in its own section "The same sensor, a second dead read path" — the hung
+  shell read, `rc=124` under timeout, `adb devices` still listing the phone as present, and the
+  scoped `adb kill-server` recovery with "no commit and no new tool".
+- **this vet's core tension, in the article's own words**: "A presence check that passes while the
+  read hangs is the wedged case." That is the sentence this vet arrived at independently under
+  "## The tension worth the piece" — *trust the operation, bound its time, never a proxy for the
+  read* — already published.
+- **the immunity claim**: the article's "The corrective is not a better health check" and its four
+  measurable behaviours (failed read writes no state, one announcement per outage, consumer as
+  freshness authority, baseline only written when stable) cover the same producer/consumer
+  contract this vet verified live.
+
+**What remains true.** The measured claims in this vet's Verification section are unaffected —
+they were run personally and they hold. What changed is only the publication decision: no second
+post. Re-publishing would duplicate a live same-day article in the same author's feed, and the
+charter's dedupe principle — a draft that only repeats a live article is not work — forbids that.
+The pane novelty is already consumed.
+
+**Provenance limit kept visible**: the wedge and the recovery remain pane-recorded, not a durable
+artifact, and this dedupe check is an API read of the live article, not a replay of the outage.
+
+---
 
 ## The failure that did not happen
 
