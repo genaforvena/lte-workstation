@@ -2,6 +2,30 @@
 
 ## Verdict — WORTH PUBLISHING (conditional), and the condition is not yet met
 
+**Re-checked 2026-09-22T12:2xZ (claim `pub-vet-window-state-attrib-gate-20260922/vet-write`). The
+hold stands, and the blocking condition is unchanged.** The event log still holds exactly one entry,
+still `UNKNOWN`, and the ALERT→MOTION downgrade branch has still never fired in production:
+
+```text
+$HOME/.mesh/.tamper-events     1788402319|UNKNOWN        (1 line; same 2026-09-03 entry, ~19d)
+scripts/mesh-tamper --status   tamper: quiet (133s ago, window=8, recency=COLD,
+                               events_24h=0, last_attrib=UNKNOWN, burst=NONE, cadence=NA)
+scripts/mesh-window-state      [window-degraded] DEGRADED — missing: tamper,body-motion
+scripts/mesh-window-state --test   rc 0 — 47 assertions (identical suite, re-run this wake)
+```
+
+The one thing that moved since the original vet is the *producer*: at vet time `mesh-tamper` read
+`OFFLINE` (825s state age); now it reads **`quiet`** with a 133s state age and a live presence input
+(`FAMILIAR`) beside it. That is the *`cur_attrib` arm's exact precondition*: a live, fresh
+familiar-now reading available to consult when the tamper side records its next event. The gate's
+second rule has a live producer to be tested against — it simply has not been tested by an event
+yet. This is recorded because it is the half of the condition that *has* improved: the missing
+instrument is no longer missing, only the observation is.
+
+**Decision unchanged: hold the publish.** The two satisfaction conditions below remain the gate.
+The re-check narrows what is being waited on — not "the sensor is down" but "the sensor is up and
+has not yet been moved while someone familiar is nearby".
+
 The case is **not** already published. A delegated read-only audit (scout `AttribGateDedupeAudit`)
 read all 57 of the author's dev.to articles via the API and found **zero** that cover the
 attribution-downgrade tension: the three closest are all a different direction.
