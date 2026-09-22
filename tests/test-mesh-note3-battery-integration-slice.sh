@@ -41,7 +41,7 @@ test_out=$("$shim" --test 2>&1)
 test_rc=$?
 set -e
 case "$test_rc" in
-  0) printf '%s\n' "$test_out" | grep -q 'fixture acceptance + live ADB .* read' || {
+  0) printf '%s\n' "$test_out" | grep -q 'fixture acceptance + jitter edge + live ADB .* read' || {
        echo "Note 3 integration: green test omitted live battery data: $test_out" >&2
        exit 1
      } ;;
