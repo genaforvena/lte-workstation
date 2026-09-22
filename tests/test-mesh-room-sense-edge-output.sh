@@ -51,6 +51,13 @@ cat >"$bin/mesh-note3-gfxinfo" <<'EOF'
 #!/usr/bin/env bash
 exit 2
 EOF
+cat >"$bin/mesh-imac-input" <<'EOF'
+#!/usr/bin/env bash
+# The iMac keyboard is a LIVE cross-node read (ssh to MESH_IMAC_HOST); left unstubbed it would leak
+# a real key event into a unit test and flip the seeded verdict nondeterministically. Dark = rc 2,
+# the same "sense dark, not faked" contract mesh-room-sense expects from the tool itself.
+exit 2
+EOF
 chmod +x "$bin"/*
 
 run_edge() {
