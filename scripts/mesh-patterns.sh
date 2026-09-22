@@ -69,7 +69,7 @@ rl_is_walled(){
   # (operator FP 2026-06-15: discover/sense recovered after their 2:20pm reset but the old "hit your
   # session limit" banner sat in scrollback above the live idle footer → falsely RATE-LIMITED + shed.)
   printf '%s\n' "$txt" | grep -vE '^[[:space:]]*$' | tail -4 \
-    | grep -qE '⏵⏵ auto mode on|\? for shortcuts[^$]*agents|Use /skills to list|Ask (anything|Codex to do anything)|ctrl\+p commands|gpt-[0-9a-zA-Z.-]+[[:space:]]+(mini|low|medium|max|ultra|pro|nano)[[:space:]]*·[[:space:]]*~/|esc to interrupt|…[[:space:]]*\([0-9]|ing\.\.\.[[:space:]]*\([0-9]' && return 1
+    | grep -qE '⏵⏵ auto mode on|\? for shortcuts[^$]*agents|Use /skills to list|Ask (anything|Codex to do anything)|ctrl\+p commands|gpt-[0-9a-zA-Z.-]+[[:space:]]+(mini|low|medium|max|ultra|pro|nano)[[:space:]]*·[[:space:]]*~/|esc to interrupt|…[[:space:]]*\([0-9]|ing\.\.\.[[:space:]]*\([0-9]|╰─$' && return 1
   printf '%s\n' "$txt" | grep -vE '^[[:space:]]*[❯›]' | grep -qiE "$MESH_STRONG_RL_RE" && return 0
   printf '%s\n' "$txt" | grep -vE '^[[:space:]]*[❯›]' \
     | awk -v m="$MESH_RL_BANNER_MAXLEN" 'length($0)<=m' | grep -qiE "$MESH_RL_RE" && return 0
@@ -627,7 +627,8 @@ if [ "${1:-}" = --test ] && [ "${BASH_SOURCE[0]}" = "${0}" ]; then
   ck "$MESH_RL_RE" no "all systems nominal"                  "nominal"
   ck "$MESH_RL_RE" no "+429"                                 "bare-cache-delta-429 (statusline telemetry)"
   ck "$MESH_RL_RE" no "tok 14290 cached"                     "429-inside-larger-number"
-  ck "$MESH_STRONG_RL_RE" no "+429"                          "STRONG: bare-cache-delta-429"
+  ck "$MESH_STRONG_RL_RE" no "+429"                                 "STRONG: bare-cache-delta-429 (statusline telemetry)"
+  ck "$MESH_STRONG_RL_RE" no " - Python PID 1786040 at 429.8% CPU"  "STRONG: cpu-telemetry-429.8 (health pane FP 2026-09-22: CPU% prose is not an engine wall)"
   echo "MESH_AUTH_RE — login/context, distinct from quota:"
   ck "$MESH_AUTH_RE" match "Please login to continue"        "login-required"
   ck "$MESH_AUTH_RE" match "100% context used"               "context-full"
@@ -668,7 +669,7 @@ if [ "${1:-}" = --test ] && [ "${BASH_SOURCE[0]}" = "${0}" ]; then
   ckw clear  "input-box quota draft"  "❯ should we retry after we hit the usage limit?"
   ckw clear  "statusline cache-delta +429" "main · 41% ctx · +429 cache tokens"
   ckw clear  "STALE banner + idle footer" "$(printf '⎿  You'"'"'ve hit your session limit · resets 2:20pm (Europe/Moscow)\n   /upgrade to increase your usage limit.\n✻ Worked for 1s\n❯ \n  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents')"
-  ckw clear  "STALE banner + spinner"     "$(printf '⎿  You'"'"'ve hit your session limit · resets 2:20pm\n✻ Cogitating… (12s · esc to interrupt)')"
+  ckw clear  "STALE banner + omp footer"    "$(printf ' - Current /proc/loadavg: 23.34 26.13 26.58; host remains overloaded.\n - Posted [fyi] at 03:57:14Z: continue observe-only.\n\n π > ◑ GPT-5.6-Luna > 📁 ~/lte-workstation\n╰─')"
   echo "auth_is_dead — banner-shape gate (a mind is never killed or silenced off its own prose):"
   cka(){ local want="$1" label="$2" txt="$3"; if printf '%s\n' "$txt" | auth_is_dead; then got=dead; else got=clear; fi
          if [ "$got" = "$want" ]; then echo "  ok: $label ($got)"; else echo "  FAIL: $label want=$want got=$got"; fail=1; fi; }
