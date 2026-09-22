@@ -21,7 +21,13 @@ class RecoveryGrowthTests(unittest.TestCase):
         fake.mkdir()
         events = root / "chat-events.log"
         chat = fake / "chat"
-        chat.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$*\" >> {events}\n")
+        chat.write_text(
+            "#!/bin/sh\n"
+            'if [ "$1" = "--task-state" ]; then\n'
+            f'  exec python3 "{ROOT / "scripts" / "mesh_task_log.py"}"'
+            ' append "$MESH_DIR" test-harness "$2"\n'
+            "fi\n"
+            f"printf '%s\\n' \"$*\" >> {events}\n")
         chat.chmod(0o755)
         handoff = fake / "handoff"
         handoff.write_text("#!/bin/sh\nexit 0\n")
@@ -86,7 +92,7 @@ class RecoveryGrowthTests(unittest.TestCase):
                 "version": 2, "chain": chain, "ask": None, "created": finished,
                 "status": state_status, "current": 0, "dispatch": "sent",
                 "unblock_for": identity, "unblock_parent": "parent", "unblock_step": "parent/work",
-                "unblock_attempt": attempt, "steps": [step],
+                "unblock_epoch": 1, "unblock_attempt": attempt, "steps": [step],
             })
         mesh = Path(self.env["MESH_DIR"])
         mesh.mkdir(parents=True, exist_ok=True)
