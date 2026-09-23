@@ -165,7 +165,7 @@ class SyntheticAdapterTest(unittest.TestCase):
                 "cleaner scan=2026-09-23T03:45:01Z head=" + "a" * 40 +
                 " candidates=2 held=1 actionable=1 delete=0 oldest=private-secret-name\n"
                 "unknowns=0 count-drift=candidates:+1\n"
-                "TASK: PENDING\n"
+                "TASK: PRESENT\n"
                 "TASK-EPOCH: 42\n"
                 "held-reasons=protected-root:1\n"
                 "actionable-paths=private-secret-name\n"
@@ -176,7 +176,7 @@ class SyntheticAdapterTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("STATE: INTERMEDIATE", result.stdout)
             self.assertIn("candidates=2 held=1 actionable=1 delete=0 unknowns=0", result.stdout)
-            self.assertIn("task=pending", result.stdout)
+            self.assertIn("task=present", result.stdout)
             self.assertIn("task-epoch=42", result.stdout)
             self.assertNotIn("private-secret-name", result.stdout)
             current.write_text("cleaner scan=invalid candidates=2 held=1 actionable=1 delete=0\n",
@@ -201,16 +201,12 @@ class SyntheticAdapterTest(unittest.TestCase):
                 "'unknowns=0 count-drift=candidates:+1' 'held-paths=private-secret-name'\n",
                 encoding="utf-8")
             (repo / "scripts/mesh-dash").chmod(0o755)
-            bin_dir = base / "bin"
-            bin_dir.mkdir()
-            (bin_dir / "mesh-task").write_text("#!/bin/sh\nprintf 'eligible task\\n'\n", encoding="utf-8")
-            (bin_dir / "mesh-task").chmod(0o755)
             chat_log = base / "chat.log"
-            chat_log.write_text("2026-09-23T03:45:01Z [task-ledger] /current=i:0 | /steps/0/owner=s:cleaner\n",
+            chat_log.write_text("2026-09-23T03:45:01Z [task-ledger] /chain=s:test | /current=i:0 | /status=s:open | /steps/0/owner=s:cleaner | /steps/0/status=s:open\n",
                                 encoding="utf-8")
             env = {**os.environ, "MESH_MISHE_HOME": str(home), "MESH_MISHE_CORE": str(CORE),
                    "MESH_MISHE_PYTHON": "python3", "MESH_REPO": str(repo),
-                   "PATH": "/usr/bin:/bin", "MESH_MISHE_TASK_CLI": str(bin_dir / "mesh-task"),
+                   "PATH": "/usr/bin:/bin",
                    "MESH_MISHE_CHAT_LOG": str(chat_log)}
 
             def run(*args):
@@ -226,12 +222,12 @@ class SyntheticAdapterTest(unittest.TestCase):
             self.assertEqual(observed.returncode, 0, observed.stderr)
             feed = (home / "feed").read_text(encoding="utf-8")
             self.assertIn("CLEANER: candidates=1 held=1 actionable=0", feed)
-            self.assertIn("task=pending", feed)
+            self.assertIn("task=present", feed)
             self.assertIn("task-epoch=1", feed)
             self.assertNotIn("private-secret-name", feed)
             self.assertFalse((home / "minds/cleaner").exists())
             with chat_log.open("a", encoding="utf-8") as stream:
-                stream.write("2026-09-23T03:45:02Z [task-ledger] /current=i:0 | /steps/0/owner=s:cleaner\n")
+                stream.write("2026-09-23T03:45:02Z [task-ledger] /chain=s:test | /current=i:0 | /status=s:complete | /steps/0/owner=s:cleaner | /steps/0/status=s:complete\n")
             self.assertEqual(run("once").returncode, 0)
             self.assertIn("task-epoch=2", (home / "feed").read_text(encoding="utf-8"))
             doctor = subprocess.run([str(ROOT / "scripts/mesh-mishe-doctor")], env=env,
