@@ -58,9 +58,15 @@ mode=(root/'omp-mode').read_text() if (root/'omp-mode').exists() else 'settle'
 if mode=='sleep':
     (root/'omp-entered').write_text('yes')
     time.sleep(60)
+elif mode=='effect-sleep':
+    with (root/'external-actions').open('a') as f: f.write('action\\n')
+    (root/'omp-entered').write_text('yes')
+    time.sleep(60)
 elif mode=='no-handoff':
     pass
 else:
+    if mode=='settle-effect':
+        with (root/'external-actions').open('a') as f: f.write('action\\n')
     token=os.environ['MESH_MISHE_INVOCATION']
     (root/'omp-prompt').write_text(sys.argv[-1])
     (Path(os.environ['MESH_MISHE_HOME'])/'handoffs/cleaner.md').write_text('invocation:'+token)
@@ -189,6 +195,32 @@ else:
             recovered = self.call(task=True)
             self.assertEqual(recovered.returncode, 0, recovered.stderr)
             self.assertIn("refs/wip/cleaner " + commit, (self.root / "mesh/omp-prompt").read_text())
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait()
+            with contextlib.suppress(Exception):
+                child.stdout.close()
+                child.stderr.close()
+
+    def test_model_side_effect_before_handoff_remains_ambiguous(self):
+        """A same-ID retry can repeat model actions; dispatch must hold UNKNOWN."""
+        (self.root / "mesh/omp-mode").write_text("effect-sleep")
+        child = subprocess.Popen(self.command(), env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            marker = self.root / "mesh/omp-entered"
+            for _ in range(100):
+                if marker.exists():
+                    break
+                time.sleep(.05)
+            self.assertTrue(marker.exists())
+            child.kill()
+            child.wait(timeout=5)
+            self.assertEqual(self.check().returncode, 2)
+            self.assertEqual((self.root / "mesh/external-actions").read_text().splitlines(), ["action"])
+            (self.root / "mesh/omp-mode").write_text("settle-effect")
+            self.assertEqual(self.call().returncode, 0)
+            self.assertEqual((self.root / "mesh/external-actions").read_text().splitlines(), ["action", "action"])
         finally:
             if child.poll() is None:
                 child.kill()
