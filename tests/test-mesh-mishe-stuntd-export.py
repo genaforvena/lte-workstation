@@ -50,7 +50,8 @@ class StuntdExportTest(unittest.TestCase):
         return subprocess.run([sys.executable, str(ROOT / "scripts/mesh-mishe-stuntd-export"),
                                "--manifest", str(self.manifest), "--home", str(self.home),
                                "--output", str(self.output), "--min-examples", str(minimum)],
-                              env={**os.environ, "MESH_MISHE_CORE": str(CORE)}, text=True,
+                              env={**os.environ, "MESH_MISHE_CORE": str(CORE),
+                                   "MESH_MISHE_EXPORT_ROOT": str(self.root)}, text=True,
                               capture_output=True)
 
     def test_exports_only_pinned_safe_pairs(self):
@@ -87,6 +88,13 @@ class StuntdExportTest(unittest.TestCase):
         result = self.run_export()
         self.assertEqual(result.returncode, 2)
         self.assertIn("invalid guard accepted", result.stderr)
+        self.assertFalse(self.output.exists())
+
+    def test_output_outside_private_root_is_refused(self):
+        self.output = self.root.parent / "stuntd-export-should-not-exist.jsonl"
+        result = self.run_export()
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("local mesh evidence root", result.stderr)
         self.assertFalse(self.output.exists())
 
 
