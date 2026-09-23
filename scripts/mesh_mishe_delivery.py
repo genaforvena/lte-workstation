@@ -120,7 +120,7 @@ def switch(channel: str, target: str, expected: int, feed_seq: int) -> dict:
         if target == "legacy":
             for item in outbox_dir(channel).glob("*.json"):
                 status = read_json(item).get("status")
-                if status in ("claimed", "unknown"):
+                if status != "delivered":
                     raise BoundaryError(f"unreconciled sink identity {item.name}")
         record = {"channel": channel, "generation": expected + 1, "authority": target,
                   "active_feed_seq": feed_seq,
@@ -137,7 +137,7 @@ def sink_status(sink: str, key: str) -> str:
         result = subprocess.run([sink, "--idempotency-status", key], text=True, capture_output=True, timeout=10)
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise BoundaryError(f"sink status query unavailable: {type(exc).__name__}") from exc
-    if result.returncode != 0:
+    if result.returncode not in (0, 3):
         raise BoundaryError("sink status query failed")
     try:
         status = json.loads(result.stdout)["status"]
@@ -145,6 +145,8 @@ def sink_status(sink: str, key: str) -> str:
         raise BoundaryError("sink status query malformed") from exc
     if status not in ("delivered", "refused", "unknown"):
         raise BoundaryError("sink status query invalid")
+    if (result.returncode == 3) != (status == "unknown"):
+        raise BoundaryError("sink status query exit code disagrees with status")
     return status
 
 
@@ -156,7 +158,7 @@ def dispatch_once(channel: str) -> dict:
         sink = os.environ.get("MESH_MISHE_SINK")
         if not sink or not os.path.isfile(sink) or not os.access(sink, os.X_OK):
             raise BoundaryError("idempotent sink capability absent")
-        entries = core_feed().entries()
+        entries = core_feed().entries(start=current["active_feed_seq"] + 1)
         results = []
         for entry in entries:
             if entry.sequence <= current["active_feed_seq"] or entry.source != "mishe-tauftauf":
@@ -229,7 +231,17 @@ def check(channel: str) -> dict:
             if state not in counts or item.get("channel") != channel:
                 raise BoundaryError(f"invalid outbox record {path.name}")
             counts[state] += 1
-        status = "UNKNOWN" if counts["claimed"] or counts["unknown"] else "PASS"
+        missing = 0
+        if current["authority"] == "mishe":
+            for entry in entries[current["active_feed_seq"]:]:
+                if entry.source == "mishe-tauftauf" and REQUEST.fullmatch(entry.body):
+                    match = REQUEST.fullmatch(entry.body)
+                    if match.group(1) != channel:
+                        continue
+                    path = outbox_dir(channel) / f"{current['generation']}-{entry.sequence}.json"
+                    if not path.exists():
+                        missing += 1
+        status = "UNKNOWN" if missing or counts["claimed"] or counts["unknown"] else "PASS"
         return {"status": status, "channel": channel, "authority": current["authority"],
                 "generation": current["generation"], "active_feed_seq": current["active_feed_seq"],
-                "feed_tail": len(entries), "outbox": counts}
+                "feed_tail": len(entries), "missing_outbox": missing, "outbox": counts}

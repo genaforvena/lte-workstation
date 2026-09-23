@@ -45,6 +45,14 @@ class AuthorityTest(unittest.TestCase):
         record.write_text("broken")
         self.assertNotEqual(self.run_cmd("read", "synthetic").returncode, 0)
 
+    def test_rollback_requires_outbox_reconciliation(self):
+        self.feed("shadow")
+        self.assertEqual(self.run_cmd("switch", "synthetic", "--to", "mishe", "--expect-generation", "0", "--feed-seq", "1").returncode, 0)
+        outbox = self.home / "outbox/synthetic/1-2.json"
+        outbox.parent.mkdir(parents=True)
+        outbox.write_text('{"status":"pending"}')
+        self.assertNotEqual(self.run_cmd("switch", "synthetic", "--to", "legacy", "--expect-generation", "1", "--feed-seq", "1").returncode, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -20,7 +20,7 @@ class DispatchTest(unittest.TestCase):
         self.sink = self.home / "sink"
         self.sink.write_text("#!/usr/bin/env python3\nimport json,os,sys\nfrom pathlib import Path\n"
                              "p=Path(os.environ['SINK_LEDGER']); a=sys.argv[1:]; d=json.loads(p.read_text()) if p.exists() else {}\n"
-                             "if a[0]=='--idempotency-status':\n print(json.dumps({'status':d.get(a[1],'unknown')})); sys.exit(0)\n"
+                             "if a[0]=='--idempotency-status':\n s=d.get(a[1],'unknown'); print(json.dumps({'status':s})); sys.exit(3 if s=='unknown' else 0)\n"
                              "if a[0]=='--idempotency-key':\n d[a[1]]='delivered'; p.write_text(json.dumps(d)); sys.exit(0)\n"
                              "sys.exit(2)\n")
         self.sink.chmod(0o755)
@@ -43,8 +43,10 @@ class DispatchTest(unittest.TestCase):
     def test_shadow_request_excluded_and_delivery_idempotent(self):
         self.activate()
         self.feed("wake requested top-pain synthetic for entry 2")
+        self.assertEqual(self.run_cmd("mesh-mishe-dispatch", "--check", "synthetic").returncode, 2)
         first = self.run_cmd("mesh-mishe-dispatch", "--once", "synthetic")
         self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(self.run_cmd("mesh-mishe-dispatch", "--check", "synthetic").returncode, 0)
         ledger = json.loads((self.home / "sink-ledger.json").read_text())
         self.assertEqual(list(ledger), ["synthetic:1:2"])
         self.assertEqual(self.run_cmd("mesh-mishe-dispatch", "--once", "synthetic").returncode, 0)
