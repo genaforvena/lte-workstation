@@ -318,6 +318,15 @@ class SyntheticAdapterTest(unittest.TestCase):
             self.assertIn("judge-view: projected-publish-v1", doctor.stdout)
             self.assertIn("task bridge: PASS", doctor.stdout)
             self.assertIn("cleaner=shadow; authority=legacy", doctor.stdout)
+            delta_env = {**env, "MESH_MISHE_DELTA_VIEW": "1"}
+            delta = subprocess.run([str(ROOT / "scripts/mesh-mishe-run"), "once"], env=delta_env,
+                                   text=True, capture_output=True)
+            self.assertEqual(delta.returncode, 0, delta.stdout + delta.stderr)
+            delta_doctor = subprocess.run([str(ROOT / "scripts/mesh-mishe-doctor")], env=delta_env,
+                                          text=True, capture_output=True)
+            self.assertEqual(delta_doctor.returncode, 0, delta_doctor.stdout + delta_doctor.stderr)
+            self.assertIn("judge-view: projected-pair-v1", delta_doctor.stdout)
+            self.assertIn("parity: PASS", delta_doctor.stdout)
             (home / ".mesh-mishe-view").write_text("cleaner=disabled\n", encoding="utf-8")
             unsafe = subprocess.run([str(ROOT / "scripts/mesh-mishe-doctor")], env=env,
                                     text=True, capture_output=True)
