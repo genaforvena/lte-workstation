@@ -16,6 +16,44 @@ CORE = Path(os.environ["MESH_MISHE_CORE"]) if os.environ.get("MESH_MISHE_CORE") 
 
 
 class SyntheticAdapterTest(unittest.TestCase):
+    def test_scheduled_judge_uses_cache_and_refresh_is_explicit(self):
+        if CORE is None or not (CORE / "src/mishe_tauftauf/__main__.py").is_file():
+            self.skipTest("set MESH_MISHE_CORE to the public core")
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "core"
+            state = Path(tmp) / "state"
+            state.write_text("STATE: RED\n", encoding="utf-8")
+            count = Path(tmp) / "calls"
+            judge = Path(tmp) / "judge"
+            judge.write_text("#!/usr/bin/env python3\nfrom pathlib import Path\n"
+                             f"p = Path({str(count)!r})\n"
+                             "n = int(p.read_text()) + 1 if p.exists() else 1\n"
+                             "p.write_text(str(n))\n"
+                             "print('probability 0.9' if n % 2 else 'probability 0.1')\n",
+                             encoding="utf-8")
+            judge.chmod(0o755)
+            env = {**os.environ, "MESH_MISHE_HOME": str(home), "MESH_MISHE_CORE": str(CORE),
+                   "MESH_MISHE_PYTHON": "python3", "MESH_REPO": str(ROOT),
+                   "MESH_MISHE_SYNTHETIC_FILE": str(state)}
+
+            def run(mode, configured=True):
+                selected = {**env, **({"MESH_MISHE_JUDGE": str(judge)} if configured else {})}
+                return subprocess.run([str(ROOT / "scripts/mesh-mishe-run"), mode],
+                                      env=selected, text=True, capture_output=True)
+
+            self.assertEqual(run("init").returncode, 0)
+            self.assertEqual(run("refresh-controls", configured=False).returncode, 2)
+            first = run("once")
+            self.assertEqual(first.returncode, 0, first.stderr)
+            self.assertFalse(count.exists(), "scheduled pass must not refresh missing controls")
+            refresh = run("refresh-controls")
+            self.assertEqual(refresh.returncode, 0, refresh.stderr)
+            self.assertEqual(int(count.read_text()), 12)
+            self.assertTrue((home / "control-cache.json").is_file())
+            again = run("once")
+            self.assertEqual(again.returncode, 0, again.stderr)
+            self.assertEqual(int(count.read_text()), 12)
+
     def test_default_state_path_works_without_shell_override(self):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp) / "core"
