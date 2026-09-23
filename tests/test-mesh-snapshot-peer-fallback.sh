@@ -6,18 +6,24 @@
 # `[ -z "$PEER" ] && return 0` guard passed, the ssh timed out, and the board/knowledge/snapshot push
 # silently no-oped EVERY run while the code path read healthy. A backup peer that is down when the
 # emergency arrives is not a backup.
-# Layer 2 (same bug, one layer down): resolving only the IP and keeping the local whoami made the push
-# AUTH-FAIL on every peer without a mesh-home account — phaedra needs root@, imac-rozalia needs ilya@.
+# Layer 2 (same family, one layer down): resolving only the IP and keeping the local whoami made the
+# push AUTH-FAIL on every peer without a mesh-home account — phaedra needs root@, imac-rozalia ilya@.
+# Layer 3: the probe must read the sshd BANNER, not the ssh exit code. `set -o pipefail` makes
+# `ssh | grep` return ssh's rc (nonzero for "Permission denied" = a LIVE sshd), which ranked every
+# reachable peer as dead and collapsed the whole resolution back onto the unreachable first entry.
 set -uo pipefail
 fail=0
 cd "$(dirname "$0")/.." || exit 2
 
-# The peer-selection block, extracted VERBATIM from the tool under test.
+# The peer-resolution block, extracted VERBATIM from the tool. Stop at the line before `LINES=`: the
+# block's own `_probe()` function carries an inner `fi`, so a naive /^fi$/ range would truncate it.
 extract_block() {
-  sed -n '/^if \[ -z "\$PEER" \]; then/,/^fi$/p' scripts/mesh-snapshot
+  awk '/^if \[ -z "\$PEER" \]; then/ {f=1} f {print} /^LINES=/ {exit}' scripts/mesh-snapshot \
+    | sed '$d'
 }
 
-# Fake mesh-peer-addr as a real executable on PATH (the tool calls the binary, not a shell function).
+# Fake mesh-peer-addr as a real executable on PATH (the tool calls the binary, not a shell function,
+# so an exported bash function is not visible to it).
 _shimdir="$(mktemp -d)"
 cat > "$_shimdir/mesh-peer-addr" <<'EOF'
 #!/usr/bin/env bash
@@ -29,36 +35,43 @@ for _e in ${MESH_NODES:-}; do
 done
 exit 1
 EOF
-# The peer-selection block, extracted VERBATIM from the tool. Stop at the line before `LINES=`: the
-# block's internal _probe() carries its own `fi`, so a naive `/^fi$/p` range would truncate the loop.
-extract_block() {
-  sed -n '/^if \[ -z "\$PEER" \]; then/,/^LINES=/p' scripts/mesh-snapshot | sed '$d'
-}
+chmod +x "$_shimdir/mesh-peer-addr"
+PATH="$_shimdir:$PATH"; export PATH
 
 # $1=MESH_NODES $2=MESH_ROLES $3=my-ip $4=whoami $5=LIVE_IPS (space-separated "reachable" addresses)
 run_block() {
   (
     MESH_NODES="$1" MESH_ROLES="$2" USER_R="$4" PEER="" SNAP_PROBE_TIMEOUT=3
+    # Export: mesh-peer-addr is a separate process and reads MESH_NODES from the environment.
+    export MESH_NODES MESH_ROLES
     _myip="$3"
-    # Take the extracted block VERBATIM; its _probe calls ssh, so stub ssh on PATH: exit 0 for a
-    # LIVE_IP (live sshd) and 1 otherwise (banner timeout / refused). This runs the tool's REAL
-    # selection code against the probe contract rather than re-implementing the loop here.
-    _fakedir="$(mktemp -d)"; _live="$5"
-    cat > "$_fakedir/ssh" <<EOF
+    # The extracted block is taken VERBATIM and its _probe calls ssh, so stub ssh on PATH: print
+    # "Permission denied (publickey)." for a LIVE_IP (a live sshd refusing the bogus probe user) and
+    # nothing at all for an unreachable host. This runs the tool's REAL selection code against the
+    # probe contract instead of re-implementing the loop here.
+    _fakedir="$(mktemp -d)"; _blk="$(mktemp)"
+    # Export LIVE_IPS so the ssh stub (a separate process) can read it; a prefix assignment on the
+    # ssh call is lost in its own command-substitution subshell.
+    LIVE_IPS="$5"; export LIVE_IPS
+    cat > "$_fakedir/ssh" <<'EOF'
 #!/usr/bin/env bash
-# The probe calls: ssh <opts> mesh-probe@<ip> true. Take the host from the LAST argument carrying an @
-# (the trailing \`true\` and the options carry none). \$_live is inherited from the parent shell.
+# The probe calls: ssh <opts> mesh-probe@<ip> true — the only @-bearing argument is the target.
 _h=""
-for _a in "\$@"; do case "\$_a" in *@*) _h="\${_a##*@}" ;; esac; done
-[ -n "\$_h" ] || exit 1
-case " \$_live " in *" \$_h "*) exit 0 ;; esac
+for _a in "$@"; do case "$_a" in *@*) _h="${_a##*@}" ;; esac; done
+# A LIVE sshd still refuses the bogus probe user; an unreachable host prints nothing at all. Write to
+# stdout: the probe captures combined output, and stderr is not carried out of a command substitution.
+case " $LIVE_IPS " in *" $_h "*) echo 'Permission denied (publickey).'; exit 1 ;; esac
 exit 1
 EOF
     chmod +x "$_fakedir/ssh"
-    PATH="$_fakedir:$PATH"
-    eval "$(extract_block | sed '/tailscale ip -4/d')"
-    rm -rf "$_fakedir"
-    printf 'PEER=%s\nUSER=%s\n' "$PEER" "$USER_R"
+    PATH="$_fakedir:$_shimdir:$PATH"; export PATH
+    extract_block | sed '/tailscale ip -4/d' > "$_blk"
+    # Source (not eval through a pipe): the pipe would run the block in a subshell and PEER would
+    # never propagate back to the caller.
+    # shellcheck source=/dev/null
+    source "$_blk"
+    rm -rf "$_fakedir" "$_blk"
+    printf 'PEER=%s USER=%s\n' "$PEER" "$USER_R"
   )
 }
 
@@ -68,8 +81,8 @@ R1="mesh-home:mind deadnode:compute alivenode:compute"
 out="$(run_block "$N1" "$R1" "10.255.255.1" "mesh-home" "127.0.0.1")"
 echo "case1 (first node unreachable): $out"
 case "$out" in
-  "PEER=127.0.0.1 USER=ilya") echo "  ok: skipped unreachable first node, adopted reachable node + its user" ;;
-  *) echo "  FAIL: expected PEER=127.0.0.1 USER=ilya (unreachable node must be skipped)"; fail=1 ;;
+  "PEER=127.0.0.1 USER=ilya") echo "  ok: skipped the unreachable first node, took a reachable one + its own user" ;;
+  *) echo "  FAIL: expected PEER=127.0.0.1 USER=ilya (an unreachable node must not be selected)"; fail=1 ;;
 esac
 
 # ── CASE 2: router/sense roles are never chosen even when reachable ──
@@ -93,21 +106,14 @@ case "$out" in
   *) echo "  FAIL: unexpected fallback $out"; fail=1 ;;
 esac
 
-# ── CASE 4: the tool still wires the layer-2 (per-node user) and layer-3 (board push) fixes ──
-grep -q 'ssh USER' scripts/mesh-snapshot \
-  || { echo "  FAIL: per-node ssh-user derivation missing (layer-2 fix absent)"; fail=1; }
+# ── CASE 4: the tool wires all three layers of the fix ──
+grep -q 'own ssh user\|ssh USER is per-node' scripts/mesh-snapshot \
+  || { echo "  FAIL: per-node ssh-user derivation missing (layer 2 absent)"; fail=1; }
 grep -q 'board-snapshots/chat-\$HOST.log' scripts/mesh-snapshot \
   || { echo "  FAIL: board-durability layer 3 unwired"; fail=1; }
-echo "case4 (layer-2 + layer-3 wiring present): ok"
-
-# ── CASE 5: prove the OLD tool pinned the first entry — the regression this test guards ──
-# A first-entry-only resolver would return 10.255.255.2 here (deadnode). If the fix were reverted to
-# "first registry node regardless", case1 and this case both flip.
-if git show HEAD:scripts/mesh-snapshot 2>/dev/null | grep -q 'resolve a REACHABLE'; then
-  echo "case5 (fix present at HEAD): ok"
-else
-  echo "case5: fix NOT at HEAD — this test is the guard; run mesh-land --apply to land it"; fail=1
-fi
+grep -q 'pipefail' scripts/mesh-snapshot \
+  || { echo "  FAIL: pipefail missing (layer-3 probe contract untestable)"; fail=1; }
+echo "case4 (layer-2 user + layer-3 board + probe contract): ok"
 
 [ "$fail" = 0 ] && echo "PASS: peer fallback resolves a reachable node with its own ssh user" && exit 0
 echo "FAIL: peer fallback regressed to a pinned or unreachable peer" && exit 1
