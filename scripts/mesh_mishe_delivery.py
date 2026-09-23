@@ -87,8 +87,11 @@ def authority_path(channel: str) -> Path:
 
 
 def read_authority(channel: str) -> dict:
-    synthetic(channel)
+    if not re.fullmatch(r"[a-z][a-z0-9-]*", channel):
+        raise BoundaryError("invalid channel")
     path = authority_path(channel)
+    if path.is_symlink():
+        raise BoundaryError("authority record must not be a symlink")
     if not path.exists():
         return {"channel": channel, "generation": 0, "authority": "legacy", "active_feed_seq": 0,
                 "installed_at": None}
