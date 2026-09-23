@@ -67,6 +67,30 @@ class SyntheticAdapterTest(unittest.TestCase):
             self.assertIn("STATE: GREEN", feed)
             check = adapter("mesh-mishe-doctor")
             self.assertEqual(check.returncode, 0, check.stdout + check.stderr)
+            # Observation timestamps can be old while stable passes remain fresh.
+            feed_path = home / "feed"
+            old_feed = feed_path.read_text(encoding="utf-8")
+            import re
+            old_feed = re.sub(r"^(\d{20}) \d{4}-\d\d-\d\dT[^ ]+ (observation/synthetic ::)$",
+                              r"\1 2020-01-01T00:00:00.000000Z \2", old_feed, flags=re.MULTILINE)
+            feed_path.write_text(old_feed, encoding="utf-8")
+            self.assertEqual(adapter("mesh-mishe-run", "once").returncode, 0)
+            self.assertEqual(adapter("mesh-mishe-doctor").returncode, 0)
+            (home / ".mesh-mishe-pass").write_text("0\n", encoding="ascii")
+            stale_pass = adapter("mesh-mishe-doctor")
+            self.assertNotEqual(stale_pass.returncode, 0)
+            self.assertIn("stale", stale_pass.stdout)
+            self.assertEqual(adapter("mesh-mishe-run", "once").returncode, 0)
+            self.assertEqual(adapter("mesh-mishe-doctor").returncode, 0)
+            appended = subprocess.run(["python3", "-c", "from mishe_tauftauf.feed import Feed; import sys; Feed(sys.argv[1]).append_runtime('observation/synthetic', sys.argv[2])",
+                                      str(home), "UNKNOWN — event projector synthetic invalid-size"],
+                                     env={**env, "PYTHONPATH": str(CORE / "src")},
+                                     text=True, capture_output=True)
+            self.assertEqual(appended.returncode, 0, appended.stderr)
+            self.assertNotEqual(adapter("mesh-mishe-doctor").returncode, 0)
+            state.write_text("STATE: RED\nSECRET: fixture-private-recovery\n", encoding="utf-8")
+            self.assertEqual(adapter("mesh-mishe-run", "once").returncode, 0)
+            self.assertEqual(adapter("mesh-mishe-doctor").returncode, 0)
             env["MESH_MISHE_MAX_AGE"] = "0"
             stale = adapter("mesh-mishe-doctor")
             self.assertNotEqual(stale.returncode, 0)
