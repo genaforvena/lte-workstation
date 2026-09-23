@@ -135,6 +135,12 @@ class FleetProjectionTest(unittest.TestCase):
             self.assertTrue((home / "projectors/tg").exists())
             self.assertFalse((home / "top-pains/tiny-fleet").exists())
             self.assertEqual((home / "projection.key").stat().st_mode & 0o777, 0o600)
+            (home / ".fleet-shadow-hold").write_text("profile pending\n")
+            feed_before = (home / "feed").read_bytes()
+            held = subprocess.run([str(run), "once"], env=env, capture_output=True, text=True)
+            self.assertEqual(held.returncode, 0)
+            self.assertIn("fleet shadow held", held.stdout)
+            self.assertEqual((home / "feed").read_bytes(), feed_before)
             self.assertEqual(subprocess.run([str(run), "--freshness"], env=env, capture_output=True).returncode, 2)
             for channel in ("health", "tg"):
                 (home / f".mesh-mishe-seen-{channel}").write_text(str(time.time_ns()))
