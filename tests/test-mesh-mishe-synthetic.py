@@ -165,6 +165,7 @@ class SyntheticAdapterTest(unittest.TestCase):
                 "cleaner scan=2026-09-23T03:45:01Z head=" + "a" * 40 +
                 " candidates=2 held=1 actionable=1 delete=0 oldest=private-secret-name\n"
                 "unknowns=0 count-drift=candidates:+1\n"
+                "TASK: PENDING\n"
                 "held-reasons=protected-root:1\n"
                 "actionable-paths=private-secret-name\n"
                 "held-paths=private-secret-name\n"
@@ -174,6 +175,7 @@ class SyntheticAdapterTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("STATE: INTERMEDIATE", result.stdout)
             self.assertIn("candidates=2 held=1 actionable=1 delete=0 unknowns=0", result.stdout)
+            self.assertIn("task=pending", result.stdout)
             self.assertNotIn("private-secret-name", result.stdout)
             current.write_text("cleaner scan=invalid candidates=2 held=1 actionable=1 delete=0\n",
                                encoding="utf-8")
@@ -197,8 +199,13 @@ class SyntheticAdapterTest(unittest.TestCase):
                 "'unknowns=0 count-drift=candidates:+1' 'held-paths=private-secret-name'\n",
                 encoding="utf-8")
             (repo / "scripts/mesh-dash").chmod(0o755)
+            bin_dir = base / "bin"
+            bin_dir.mkdir()
+            (bin_dir / "mesh-task").write_text("#!/bin/sh\nprintf 'eligible task\\n'\n", encoding="utf-8")
+            (bin_dir / "mesh-task").chmod(0o755)
             env = {**os.environ, "MESH_MISHE_HOME": str(home), "MESH_MISHE_CORE": str(CORE),
-                   "MESH_MISHE_PYTHON": "python3", "MESH_REPO": str(repo)}
+                   "MESH_MISHE_PYTHON": "python3", "MESH_REPO": str(repo),
+                   "PATH": str(bin_dir) + os.pathsep + os.environ["PATH"]}
 
             def run(*args):
                 return subprocess.run([str(ROOT / "scripts/mesh-mishe-run"), *args], env=env,
@@ -213,6 +220,7 @@ class SyntheticAdapterTest(unittest.TestCase):
             self.assertEqual(observed.returncode, 0, observed.stderr)
             feed = (home / "feed").read_text(encoding="utf-8")
             self.assertIn("CLEANER: candidates=1 held=1 actionable=0", feed)
+            self.assertIn("task=pending", feed)
             self.assertNotIn("private-secret-name", feed)
             self.assertFalse((home / "minds/cleaner").exists())
             doctor = subprocess.run([str(ROOT / "scripts/mesh-mishe-doctor")], env=env,
