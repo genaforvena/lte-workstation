@@ -87,6 +87,17 @@ class CleanerParityTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertIn("PENDING covered=1 missing=0 pending=1", result.stdout)
 
+    def test_recovered_unknown_observation_does_not_poison_parity(self):
+        self.ledger(["open", "active"])
+        self.observation(1, 1, [(1, "open")], sequence=1)
+        with (self.home / "feed").open("a", encoding="utf-8") as stream:
+            stream.write("00000000000000000002 2026-09-23T04:00:03.000000Z observation/cleaner ::\n"
+                         "    | STATE: UNKNOWN\n    .\n")
+        self.observation(5, 2, [(1, "open"), (2, "active")], sequence=3)
+        result = self.check()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("PASS covered=2 missing=0 pending=0", result.stdout)
+
     def test_no_transition_is_unknown(self):
         self.ledger([])
         self.observation(5, 0, [])
