@@ -210,7 +210,7 @@ class SyntheticAdapterTest(unittest.TestCase):
                                 encoding="utf-8")
             env = {**os.environ, "MESH_MISHE_HOME": str(home), "MESH_MISHE_CORE": str(CORE),
                    "MESH_MISHE_PYTHON": "python3", "MESH_REPO": str(repo),
-                   "PATH": str(bin_dir) + os.pathsep + os.environ["PATH"],
+                   "PATH": "/usr/bin:/bin", "MESH_MISHE_TASK_CLI": str(bin_dir / "mesh-task"),
                    "MESH_MISHE_CHAT_LOG": str(chat_log)}
 
             def run(*args):
