@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+"""Synthetic idempotent gateway for cleaner's generated-file quarantine action.
+
+Only explicit --synthetic-root and --state-dir are accepted. The live cleaner
+settle cron does not call this gateway and cannot acquire authority through it.
+"""
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import sys
+import tempfile
+import time
+
+
+class Hold(Exception):
+    pass
+
+
+def digest(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def atomic(path: Path, row: dict):
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd, name = tempfile.mkstemp(prefix=".action-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as stream:
+            json.dump(row, stream, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(name, path)
+        directory = os.open(path.parent, os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        Path(name).unlink(missing_ok=True)
+
+
+def key_for(scan_id: str, row: dict) -> str:
+    fields = [scan_id, row["path"], row["device_inode"], row["mtime_utc"]]
+    return hashlib.sha256(json.dumps(fields, separators=(",", ":")).encode()).hexdigest()
+
+
+def safe_path(root: Path, relative: str) -> Path:
+    if not re.fullmatch(r"\.firecrawl/[A-Za-z0-9_.-]+\.json", relative):
+        raise Hold("path outside generated JSON class")
+    directory = root / ".firecrawl"
+    if directory.is_symlink() or not directory.is_dir():
+        raise Hold("generated directory unavailable or symlinked")
+    path = root / relative
+    if path.is_symlink():
+        raise Hold("source symlink")
+    return path
+
+
+def observed(row: dict, source: Path) -> tuple[os.stat_result, str]:
+    st = source.stat(follow_symlinks=False)
+    if not stat.S_ISREG(st.st_mode):
+        raise Hold("source is not a regular file")
+    if st.st_size > 16 * 1024 * 1024:
+        raise Hold("source exceeds bounded quarantine size")
+    identity = f"{st.st_dev}:{st.st_ino}"
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(st.st_mtime))
+    if row.get("device_inode") != identity or row.get("mtime_utc") != stamp or time.time() - st.st_mtime < 3600:
+        raise Hold("source identity, timestamp, or age changed")
+    return st, digest(source)
+
+
+def status(receipt: Path, source: Path, dest: Path, key: str) -> tuple[str, str]:
+    if not receipt.exists():
+        return "unknown", "no durable action receipt"
+    if receipt.is_symlink() or source.is_symlink() or dest.is_symlink():
+        raise Hold("symlink in action identity")
+    row = json.loads(receipt.read_text())
+    if row.get("key") != key or row.get("source") != str(source) or row.get("destination") != str(dest):
+        raise Hold("action receipt identity conflict")
+    expected = row.get("sha256")
+    if not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{64}", expected):
+        raise Hold("action receipt digest invalid")
+    src, dst = source.exists(), dest.exists()
+    if dst and not src and dest.is_file() and digest(dest) == expected:
+        return "delivered", "quarantine content verified"
+    if src and not dst and source.is_file() and digest(source) == expected:
+        return "pending", "source unchanged; safe retry"
+    return "unknown", "ambiguous or changed source/destination"
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--synthetic-root", required=True, type=Path)
+    parser.add_argument("--state-dir", required=True, type=Path)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--quarantine", metavar="KEY")
+    mode.add_argument("--status", metavar="KEY")
+    parser.add_argument("--manifest", type=Path)
+    parser.add_argument("--path")
+    args = parser.parse_args()
+    root = args.synthetic_root.resolve(strict=True)
+    state = args.state_dir.resolve(strict=True)
+    if root == Path.home().resolve() / "lte-workstation" or state == Path.home().resolve() / ".mesh/cleaner":
+        raise Hold("live cleaner paths are excluded")
+    if root == state or root in state.parents or state in root.parents:
+        raise Hold("synthetic root and action state must be separate")
+    key = args.quarantine or args.status
+    if not re.fullmatch(r"[0-9a-f]{64}", key):
+        raise Hold("invalid action key")
+    receipt = state / "actions" / f"{key}.json"
+    lockpath = state / "actions" / f"{key}.lock"
+    lockpath.parent.mkdir(parents=True, exist_ok=True)
+    with lockpath.open("a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        if args.status:
+            if not receipt.exists():
+                print(json.dumps({"key": key, "status": "unknown", "reason": "no durable action receipt"}))
+                return 3
+            row = json.loads(receipt.read_text())
+            source, dest = Path(row["source"]), Path(row["destination"])
+            if not source.is_relative_to(root) or not dest.is_relative_to(state):
+                raise Hold("action receipt escaped synthetic scope")
+            verdict, reason = status(receipt, source, dest, key)
+            print(json.dumps({"key": key, "status": verdict, "reason": reason}))
+            return 0 if verdict == "delivered" else 3
+        if args.manifest is None or not args.path:
+            raise Hold("manifest and path required for quarantine")
+        manifest = json.loads(args.manifest.read_text())
+        if manifest.get("version") != 1 or not isinstance(manifest.get("scan_id"), str):
+            raise Hold("invalid scan manifest")
+        rows = [r for r in manifest.get("candidates", []) if isinstance(r, dict) and r.get("path") == args.path]
+        if len(rows) != 1:
+            raise Hold("candidate absent or duplicated")
+        row = rows[0]
+        if key_for(manifest["scan_id"], row) != key:
+            raise Hold("action key does not match scan identity")
+        if row.get("reasons") != ["disposable-generated"] or any(row.get(k) for k in ("active_refs", "owner_refs", "task_refs")):
+            raise Hold("candidate is held or not generated")
+        source = safe_path(root, args.path)
+        dest = state / "quarantine" / key / args.path
+        if receipt.exists():
+            verdict, reason = status(receipt, source, dest, key)
+            if verdict == "delivered":
+                print(json.dumps({"key": key, "status": verdict, "reason": reason}))
+                return 0
+            if verdict != "pending":
+                raise Hold(reason)
+        st, sha = observed(row, source)
+        if st.st_dev != state.stat().st_dev:
+            raise Hold("cross-device move cannot be atomic")
+        planned = {"version": 1, "key": key, "scan_id": manifest["scan_id"], "source": str(source),
+                   "destination": str(dest), "sha256": sha, "device_inode": row["device_inode"],
+                   "mtime_utc": row["mtime_utc"], "status": "planned"}
+        if receipt.exists() and json.loads(receipt.read_text()) != planned:
+            raise Hold("source changed since planned receipt")
+        if dest.exists():
+            raise Hold("quarantine destination already exists")
+        atomic(receipt, planned)
+        if os.environ.get("MESH_CLEANER_ACTION_FAULT") == "after-plan":
+            raise Hold("injected crash after plan")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        os.rename(source, dest)
+        if os.environ.get("MESH_CLEANER_ACTION_FAULT") == "after-move":
+            raise Hold("injected crash after move")
+        verdict, reason = status(receipt, source, dest, key)
+        print(json.dumps({"key": key, "status": verdict, "reason": reason}))
+        return 0 if verdict == "delivered" else 3
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (Hold, OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
+        print(f"mesh-cleaner-action: UNKNOWN {exc}", file=sys.stderr)
+        raise SystemExit(3)
