@@ -61,6 +61,14 @@ class CleanerAction(unittest.TestCase):
         self.assertEqual(repeated.returncode, 0, repeated.stderr)
         self.assertEqual(len(list((self.state / "quarantine").rglob("old.json"))), 1)
 
+    def test_sigkill_after_move_never_duplicates_quarantine(self):
+        killed = self.apply(fault="kill-after-move")
+        self.assertEqual(killed.returncode, -9)
+        self.assertFalse(self.source.exists())
+        self.assertEqual(json.loads(self.call("--status", self.key).stdout)["status"], "delivered")
+        self.assertEqual(self.apply().returncode, 0)
+        self.assertEqual(len(list((self.state / "quarantine").rglob("old.json"))), 1)
+
     def test_plan_crash_retries_only_unchanged_source(self):
         self.assertEqual(self.apply(fault="after-plan").returncode, 3)
         status = self.call("--status", self.key)
