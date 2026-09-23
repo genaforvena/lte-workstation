@@ -183,6 +183,10 @@ class SyntheticAdapterTest(unittest.TestCase):
             self.assertIn("task-event-count=1", result.stdout)
             self.assertIn("task-events=42:open", result.stdout)
             self.assertNotIn("private-secret-name", result.stdout)
+            previous.write_text("TASK-EPOCH: 99\nTASK-EVENT-COUNT: 2\n", encoding="utf-8")
+            rewind = subprocess.run([str(ROOT / "scripts/mesh-mishe-project"), "--channel", "cleaner",
+                                     str(previous), str(current)], text=True, capture_output=True)
+            self.assertEqual(rewind.stdout, "STATE: UNKNOWN\n")
             current.write_text("cleaner scan=invalid candidates=2 held=1 actionable=1 delete=0\n",
                                encoding="utf-8")
             malformed = subprocess.run([str(ROOT / "scripts/mesh-mishe-project"), "--channel", "cleaner",
