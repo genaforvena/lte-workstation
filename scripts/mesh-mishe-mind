@@ -1,0 +1,227 @@
+#!/usr/bin/env python3
+"""Run one projected Mesh wake in a disposable omp session.
+
+The invocation record is a retry pointer, not a success receipt.  Only a
+canonical task result, an invocation-tied board row, and an invocation-tied
+core handoff can settle it.
+"""
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tempfile
+import time
+
+NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+TASK = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,119}$")
+LIMIT = 16000
+
+
+def bounded(path: Path, limit: int = LIMIT) -> str:
+    data = path.read_bytes()
+    if len(data) > limit:
+        raise ValueError(f"oversize input: {path.name}")
+    return data.decode("utf-8")
+
+
+def run(args, *, env=None, timeout=60):
+    result = subprocess.run(args, text=True, capture_output=True, env=env, timeout=timeout)
+    if result.returncode:
+        raise RuntimeError(f"{Path(args[0]).name} rc={result.returncode}: {result.stderr[:300]}")
+    if len(result.stdout.encode()) > LIMIT:
+        raise ValueError(f"oversize output: {Path(args[0]).name}")
+    return result.stdout
+
+
+def write(path: Path, record: dict):
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd, name = tempfile.mkstemp(prefix=".mind-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as stream:
+            json.dump(record, stream, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(name, 0o600)
+        os.replace(name, path)
+        directory = os.open(path.parent, os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        Path(name).unlink(missing_ok=True)
+
+
+def find_task_status(task_cmd, task_id, channel, env):
+    chain, step = task_id.rsplit("/", 1)
+    output = run([task_cmd, "status", chain], env=env)
+    rows = [line for line in output.splitlines() if re.search(rf"\b{re.escape(task_id)} \[", line)]
+    if len(rows) != 1 or f"owner={channel}" not in rows[0]:
+        raise RuntimeError("exact-owner task status missing")
+    return rows[0]
+
+
+def core_python():
+    core = Path(os.environ.get("MESH_MISHE_CORE", str(Path.home() / "mishe-tauftauf")))
+    installed = Path.home() / ".mesh/venvs/mishe-tauftauf/bin/python"
+    python = os.environ.get("MESH_MISHE_PYTHON", str(installed if installed.is_file() else Path(sys.executable)))
+    env = dict(os.environ, PYTHONPATH=str(core / "src") + os.pathsep + os.environ.get("PYTHONPATH", ""))
+    return python, env
+
+
+def predictions(home: Path, channel: str) -> str:
+    python, env = core_python()
+    snippet = ("import sys; from pathlib import Path; from mishe_tauftauf.feed import Feed; "
+               "from mishe_tauftauf.predictions import expectations_text; "
+               "h=Path(sys.argv[1]); print(expectations_text(h, Feed(h).entries(), sys.argv[2]), end='')")
+    return run([python, "-c", snippet, str(home), channel], env=env)
+
+
+def verify_core_handoff(home: Path, channel: str, request_id: str):
+    python, env = core_python()
+    snippet = ("import sys; from pathlib import Path; from mishe_tauftauf.feed import Feed; "
+               "h=Path(sys.argv[1]); needle='handoff top-pain '+sys.argv[2]+' invocation '+sys.argv[3]; "
+               "print('YES' if any(e.source=='mishe-tauftauf' and e.body.startswith(needle+'\\n') "
+               "for e in Feed(h).entries()) else 'NO')")
+    if run([python, "-c", snippet, str(home), channel, request_id], env=env).strip() != "YES":
+        raise RuntimeError("invocation-tied core feed handoff receipt absent")
+
+
+def settle(record, *, channel, task_id, request_id, handoff_dir, home, chat_log, task_cmd, env):
+    token = f"invocation:{request_id}"
+    handoff = handoff_dir / f"{channel}.md"
+    if token not in bounded(handoff):
+        raise RuntimeError("invocation-tied handoff absent")
+    verify_core_handoff(home, channel, request_id)
+    board = bounded(chat_log, limit=8_000_000)
+    if not any(token in line and ("[done]" in line or "[fyi]" in line or "[yield]" in line)
+               for line in board.splitlines()):
+        raise RuntimeError("invocation-tied board receipt absent")
+    if task_id:
+        status = find_task_status(task_cmd, task_id, channel, env)
+        if "[done]" in status:
+            artifact = re.search(r"\bartifact=(\S+)", status)
+            if artifact is None or not Path(artifact.group(1)).is_file():
+                raise RuntimeError("completed task artifact absent")
+        elif "[blocked]" in status:
+            if "retry=" not in status:
+                raise RuntimeError("blocked task lacks retry")
+        else:
+            raise RuntimeError("task remains incomplete WIP")
+    record["status"] = "settled"
+    record["settled_at"] = time.time()
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--channel", required=True)
+    parser.add_argument("--request-id", required=True)
+    parser.add_argument("--event-file", required=True, type=Path)
+    parser.add_argument("--task-id")
+    args = parser.parse_args()
+    if not NAME.fullmatch(args.channel) or not NAME.fullmatch(args.request_id):
+        parser.error("invalid channel or request identity")
+    if args.task_id and (not TASK.fullmatch(args.task_id) or "/" not in args.task_id):
+        parser.error("invalid task identity")
+    mesh = Path(os.environ.get("MESH_DIR", str(Path.home() / ".mesh")))
+    home = Path(os.environ.get("MESH_MISHE_HOME", str(mesh / "mishe-tauftauf")))
+    repo = Path(os.environ.get("MESH_REPO", str(Path.home() / "lte-workstation")))
+    state = mesh / "mishe-mind" / args.channel
+    state.mkdir(parents=True, exist_ok=True, mode=0o700)
+    lock = (state / "invocation.lock").open("a+")
+    try:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("mesh-mishe-mind: HELD invocation lease busy", file=sys.stderr)
+        return 2
+    path = state / f"{args.request_id}.json"
+    event = json.loads(bounded(args.event_file))
+    if not isinstance(event, dict) or event.get("channel") != args.channel or event.get("request_id") != args.request_id:
+        raise ValueError("projected event identity mismatch")
+    identity = hashlib.sha256(args.event_file.read_bytes()).hexdigest()
+    previous = json.loads(path.read_text()) if path.exists() else None
+    if previous and (previous.get("event_sha256") != identity or previous.get("task_id") != args.task_id):
+        raise ValueError("request identity reused for different input")
+    if previous and previous.get("status") == "settled":
+        print(f"mesh-mishe-mind: already settled {args.request_id}")
+        return 0
+    authority = json.loads(run([os.environ.get("MESH_MISHE_AUTHORITY_CMD", str(repo / "scripts/mesh-mishe-authority")), "read", args.channel]))
+    if authority.get("authority") != "mishe":
+        raise RuntimeError("channel is not under mishe authority")
+    python, core_env = core_python()
+    env = dict(core_env, MESH_TASK_ACTOR=args.channel, MESH_WINDOW=args.channel,
+               MESH_MISHE_INVOCATION=args.request_id, MISHE_TAUFTAUF_INVOCATION=args.request_id,
+               MISHE_TAUFTAUF_SLUG=args.channel)
+    task_cmd = os.environ.get("MESH_MISHE_TASK_CMD", str(repo / "scripts/mesh-task"))
+    record = previous or {"channel": args.channel, "request_id": args.request_id,
+                          "task_id": args.task_id, "event_sha256": identity,
+                          "generation": authority.get("generation"), "started_at": time.time()}
+    if record.get("generation") != authority.get("generation"):
+        raise RuntimeError("authority generation changed; reconcile invocation")
+    handoff_dir = Path(os.environ.get("MESH_MISHE_HANDOFF_DIR", str(home / "handoffs")))
+    chat_log = Path(os.environ.get("MESH_CHAT_LOG", str(mesh / "chat.log")))
+    if previous:
+        try:
+            settle(record, channel=args.channel, task_id=args.task_id, request_id=args.request_id,
+                   handoff_dir=handoff_dir, home=home, chat_log=chat_log, task_cmd=task_cmd, env=env)
+            write(path, record)
+            print(f"mesh-mishe-mind: recovered {args.request_id}")
+            return 0
+        except (OSError, ValueError, RuntimeError):
+            pass
+    if args.task_id:
+        status = find_task_status(task_cmd, args.task_id, args.channel, env)
+        if "[open]" in status:
+            run([task_cmd, "check", "dispatch", args.task_id, args.channel], env=env)
+            chain, step = args.task_id.rsplit("/", 1)
+            run([task_cmd, "take", chain, step], env=env)
+        elif "[active]" not in status:
+            raise RuntimeError("task is neither open nor active")
+        record["task_claimed"] = True
+    record["status"] = "running"
+    write(path, record)
+    charter = bounded(Path(os.environ.get("MESH_MISHE_CHARTER_DIR", str(mesh / "charter"))) / f"{args.channel}.md")
+    prior = handoff_dir / f"{args.channel}.md"
+    handoff = bounded(prior, 4000) if prior.exists() else "(none)"
+    dash = run([os.environ.get("MESH_MISHE_DASH_CMD", str(repo / "scripts/mesh-dash")), "--once", args.channel], timeout=60)
+    expectation = predictions(home, args.channel)
+    prompt = (f"One-shot Mesh invocation {args.request_id} for exact window {args.channel}.\n"
+              f"Use this current input; do not assume resident pane memory.\n"
+              f"CHARTER\n{charter}\nTOP PANE\n{dash}\nPROJECTED EVENT\n{json.dumps(event, sort_keys=True)}\n"
+              f"EXACT OWNER TASK\n{args.task_id or '(none)'}\nACTIVE PREDICTIONS\n{expectation}\n"
+              f"BOUNDED HANDOFF\n{handoff}\n"
+              f"Perform the warranted work. Write a core handoff file containing invocation:{args.request_id} "
+              f"and submit it with {python} -m mishe_tauftauf --home {home} handoff {args.channel} FILE. "
+              f"Write the Mesh textual handoff with mesh-handoff {args.channel} containing "
+              f"invocation:{args.request_id}, and post [done], [fyi], or [yield] with the same token through mesh-chat. "
+              "For a task, settle it through mesh-task with a real artifact or typed blocker and retry. "
+              "Keep unfinished work recoverable through refs/wip or an equivalent verified pointer.\n")
+    record["input_sha256"] = hashlib.sha256(prompt.encode()).hexdigest()
+    write(path, record)
+    omp = os.environ.get("MESH_MISHE_OMP_CMD", "omp")
+    result = subprocess.run([omp, "--print", "--no-extensions", "--no-session", "--approval-mode=yolo", "--cwd", str(repo),
+                             "--max-time=600", prompt], env=env, text=True, capture_output=True, timeout=660)
+    record["omp_exit"] = result.returncode
+    record["omp_output_sha256"] = hashlib.sha256(result.stdout.encode()).hexdigest()
+    write(path, record)
+    if result.returncode:
+        raise RuntimeError(f"omp rc={result.returncode}: {result.stderr[:300]}")
+    settle(record, channel=args.channel, task_id=args.task_id, request_id=args.request_id,
+           handoff_dir=handoff_dir, home=home, chat_log=chat_log, task_cmd=task_cmd, env=env)
+    write(path, record)
+    print(f"mesh-mishe-mind: settled {args.request_id}")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as exc:
+        print(f"mesh-mishe-mind: UNKNOWN {exc}", file=sys.stderr)
+        raise SystemExit(2)
