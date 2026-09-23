@@ -84,6 +84,27 @@ class AutomaticEventTest(unittest.TestCase):
         self.assertEqual(bad.returncode, 2)
         self.assertFalse((self.home / "feed").exists())
 
+    def test_read_only_check_renders_backlog_and_unknown(self):
+        self.assertIn('scripts/mesh-mishe-auto-events" check',
+                      (ROOT / "scripts/mesh-doctor").read_text())
+        empty = self.call("check")
+        self.assertEqual(empty.returncode, 0)
+        self.assertEqual(json.loads(empty.stdout)["status"], "DISABLED")
+        self.assertFalse((self.home / "automatic-events").exists())
+        key = self.call("begin", "cleaner", "mesh-feed", "a" * 64).stdout.strip()
+        pending = self.call("check")
+        self.assertEqual(pending.returncode, 2)
+        self.assertEqual(json.loads(pending.stdout)["backlog"], 1)
+        self.assertEqual(self.call("drain").returncode, 0)
+        imported_pending = self.call("check")
+        self.assertEqual(imported_pending.returncode, 2)
+        self.assertEqual(json.loads(imported_pending.stdout)["uncertain"], 1)
+        self.assertEqual(self.call("finish", key, "delivered").returncode, 0)
+        self.assertEqual(self.call("drain").returncode, 0)
+        settled = self.call("check")
+        self.assertEqual(settled.returncode, 0)
+        self.assertEqual(json.loads(settled.stdout)["status"], "PASS")
+
 
 if __name__ == "__main__":
     unittest.main()
