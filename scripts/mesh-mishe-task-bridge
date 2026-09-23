@@ -1,0 +1,201 @@
+#!/usr/bin/env python3
+"""Copy exact-owner cleaner task transitions into the observation-only feed."""
+import hashlib
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import sys
+
+
+SOURCE = "observation/cleaner-task"
+STATUSES = {"open", "active", "complete", "rejected", "blocked"}
+STATE_NAME = "cleaner-task-bridge.json"
+
+
+def fail(reason):
+    print(f"mishe cleaner task bridge: UNKNOWN reason={reason}; authority=legacy")
+    return 2
+
+
+def feed_class():
+    core = os.environ.get("MESH_MISHE_CORE")
+    if core:
+        sys.path.insert(0, str(Path(core) / "src"))
+    try:
+        from mishe_tauftauf.feed import Feed
+        return Feed
+    except ModuleNotFoundError:
+        selected = Path(os.environ.get("MESH_MISHE_PYTHON", str(Path.home() / ".mesh/venvs/mishe-tauftauf/bin/python")))
+        if selected.is_file() and selected.resolve() != Path(sys.executable).resolve():
+            os.execv(str(selected), [str(selected), __file__, *sys.argv[1:]])
+        raise
+
+
+def atomic_state(path, state):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(path.name + f".{os.getpid()}.tmp")
+    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="ascii") as stream:
+            json.dump(state, stream, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp, path)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+def event(line, epoch):
+    if "[task-ledger]" not in line:
+        return None
+    current = re.findall(r"(?:^| \| )/current=i:(\d+)(?=\s|$)", line)
+    if len(current) != 1:
+        if "/owner=s:cleaner" in line:
+            raise ValueError("ledger")
+        return None
+    owner = re.findall(rf"(?:^| \| )/steps/{current[0]}/owner=s:([^\s|]+)", line)
+    if len(owner) != 1:
+        if "/owner=s:cleaner" in line:
+            raise ValueError("ledger")
+        return None
+    if owner[0] != "cleaner":
+        return None
+    status = re.findall(r"(?:^| \| )/status=s:([^\s|]+)", line)
+    if len(status) != 1 or status[0] not in STATUSES:
+        raise ValueError("ledger")
+    return f"cleaner task-ledger epoch={epoch} status={status[0]}"
+
+
+def main():
+    mode = sys.argv[1] if len(sys.argv) == 2 else ""
+    if mode not in {"baseline", "once", "check"}:
+        print("usage: mesh-mishe-task-bridge baseline|once|check", file=sys.stderr)
+        return 2
+    home = Path(os.environ.get("MESH_MISHE_HOME", str(Path.home() / ".mesh/mishe-tauftauf")))
+    log = Path(os.environ.get("MESH_MISHE_CHAT_LOG", str(Path.home() / ".mesh/chat.log")))
+    state_path = home / STATE_NAME
+    try:
+        Feed = feed_class()
+        feed = Feed(home)
+        if mode == "baseline":
+            if state_path.exists():
+                return fail("already-baselined")
+            with log.open("rb") as stream:
+                stat = os.fstat(stream.fileno())
+                epoch = 0
+                offset = 0
+                last_hash = ""
+                last_len = 0
+                for line in stream:
+                    if not line.endswith(b"\n"):
+                        return fail("partial-baseline")
+                    line.decode("utf-8")
+                    epoch += 1
+                    offset += len(line)
+                    last_hash = hashlib.sha256(line).hexdigest()
+                    last_len = len(line)
+            state = {"version": 1, "device": stat.st_dev, "inode": stat.st_ino,
+                     "offset": offset, "epoch": epoch, "baseline_epoch": epoch,
+                     "last_hash": last_hash, "last_len": last_len, "event_count": 0}
+            atomic_state(state_path, state)
+            print(f"mishe cleaner task bridge: BASELINED epoch={epoch}; authority=legacy")
+            return 0
+        state = json.loads(state_path.read_text(encoding="ascii"))
+        if set(state) != {"version", "device", "inode", "offset", "epoch", "baseline_epoch", "last_hash", "last_len", "event_count"} or \
+                state["version"] != 1 or any(type(state[key]) is not int or state[key] < 0
+                                              for key in ("device", "inode", "offset", "epoch", "baseline_epoch", "last_len", "event_count")) or \
+                state["baseline_epoch"] > state["epoch"] or \
+                not isinstance(state["last_hash"], str) or \
+                (state["epoch"] == 0 and (state["last_hash"] != "" or state["last_len"] != 0)) or \
+                (state["epoch"] > 0 and (not re.fullmatch(r"[0-9a-f]{64}", state["last_hash"]) or
+                                           state["last_len"] < 1 or state["last_len"] > state["offset"])):
+            return fail("state")
+        with log.open("rb") as stream:
+            stat = os.fstat(stream.fileno())
+            if stat.st_dev != state["device"] or stat.st_ino != state["inode"] or stat.st_size < state["offset"]:
+                return fail("rewind")
+            if state["offset"]:
+                stream.seek(state["offset"] - state["last_len"])
+                last_line = stream.read(state["last_len"])
+                if hashlib.sha256(last_line).hexdigest() != state["last_hash"]:
+                    return fail("rewind")
+            stream.seek(state["offset"])
+            pending = []
+            epoch = state["epoch"]
+            offset = state["offset"]
+            last_hash = state["last_hash"]
+            last_len = state["last_len"]
+            while True:
+                raw = stream.readline()
+                if not raw:
+                    break
+                if not raw.endswith(b"\n"):
+                    break  # Writer has not completed its line; retry on the next tick.
+                epoch += 1
+                offset += len(raw)
+                last_hash = hashlib.sha256(raw).hexdigest()
+                last_len = len(raw)
+                body = event(raw.decode("utf-8"), epoch)
+                if body:
+                    pending.append(body)
+        # Parse the complete feed before writing anything. A corrupt feed is UNKNOWN.
+        receipts = feed.entries()
+        event_receipts = [e for e in receipts if e.source == SOURCE]
+        event_epochs = []
+        for receipt in event_receipts:
+            match = re.fullmatch(r"cleaner task-ledger epoch=(\d+) status=(open|active|complete|rejected|blocked)", receipt.body)
+            if not match or int(match.group(1)) > epoch:
+                return fail("feed-rewind")
+            event_epochs.append(int(match.group(1)))
+        if event_epochs != sorted(set(event_epochs)) or any(e <= state["baseline_epoch"] for e in event_epochs):
+            return fail("feed-events")
+        expected_count = state["event_count"] + len(pending)
+        if len(event_receipts) > expected_count or (mode == "check" and len(event_receipts) != expected_count):
+            return fail("feed-count")
+        controls = {(e.source, e.body) for e in receipts}
+        if mode == "check":
+            if pending:
+                return fail("pending")
+            if not any(int(re.search(r"epoch=(\d+)", e.body).group(1)) > state["baseline_epoch"]
+                       for e in event_receipts):
+                return fail("no-transition")
+            for receipt in event_receipts:
+                disposition = f"entry {receipt.sequence} for top-pain cleaner: wake"
+                request = f"wake requested top-pain cleaner for entry {receipt.sequence}"
+                if ("mishe-tauftauf", disposition) not in controls or ("mishe-tauftauf", request) not in controls:
+                    return fail("route-receipt")
+            print(f"mishe cleaner task bridge: PASS epoch={epoch}; authority=legacy")
+            return 0
+        for body in pending:
+            feed.append_runtime_once(SOURCE, body)
+        if len([e for e in feed.entries() if e.source == SOURCE]) != expected_count:
+            return fail("feed-count")
+        # These markers are deterministic route receipts. The coordinator sees the
+        # disposition and does not ask System One whether this owner event matters.
+        # Observe-only mode never dispatches a mind or changes legacy wake authority.
+        for receipt in (e for e in feed.entries() if e.source == SOURCE):
+            feed.append_runtime_once("mishe-tauftauf", f"entry {receipt.sequence} for top-pain cleaner: wake")
+            feed.append_runtime_once("mishe-tauftauf", f"wake requested top-pain cleaner for entry {receipt.sequence}")
+        new_state = {**state, "offset": offset, "epoch": epoch, "last_hash": last_hash,
+                     "last_len": last_len, "event_count": expected_count}
+        if new_state != state:
+            atomic_state(state_path, new_state)
+        print(f"mishe cleaner task bridge: PASS epoch={epoch} events={len(pending)}; authority=legacy")
+        return 0
+    except (OSError, UnicodeError, ValueError, TypeError, KeyError, ImportError):
+        return fail("input")
+
+
+if __name__ == "__main__":
+    bridge_home = Path(os.environ.get("MESH_MISHE_HOME", str(Path.home() / ".mesh/mishe-tauftauf")))
+    try:
+        bridge_home.mkdir(parents=True, exist_ok=True)
+        lock_fd = os.open(bridge_home / ".cleaner-task-bridge.lock", os.O_RDWR | os.O_CREAT, 0o600)
+        with os.fdopen(lock_fd, "rb") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            sys.exit(main())
+    except OSError:
+        sys.exit(fail("lock"))

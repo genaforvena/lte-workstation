@@ -238,7 +238,7 @@ class SyntheticAdapterTest(unittest.TestCase):
             base = Path(tmp)
             home, repo = base / "core", base / "repo"
             (repo / "scripts").mkdir(parents=True)
-            for name in ("mesh-mishe-render", "mesh-mishe-project", "mesh-mishe-parity"):
+            for name in ("mesh-mishe-render", "mesh-mishe-project", "mesh-mishe-parity", "mesh-mishe-task-bridge"):
                 shutil.copy2(ROOT / "scripts" / name, repo / "scripts" / name)
             (repo / "scripts/mesh-dash").write_text(
                 "#!/bin/sh\n"
@@ -274,10 +274,18 @@ class SyntheticAdapterTest(unittest.TestCase):
             self.assertIn("task-events=1:open", feed)
             self.assertNotIn("private-secret-name", feed)
             self.assertFalse((home / "minds/cleaner").exists())
+            baseline = subprocess.run(["python3", str(ROOT / "scripts/mesh-mishe-task-bridge"), "baseline"],
+                                      env=env, text=True, capture_output=True)
+            self.assertEqual(baseline.returncode, 0, baseline.stdout + baseline.stderr)
             with chat_log.open("a", encoding="utf-8") as stream:
                 stream.write("2026-09-23T03:45:02Z [task-ledger] /chain=s:test | /current=i:0 | /status=s:complete | /steps/0/owner=s:cleaner | /steps/0/status=s:complete\n")
             self.assertEqual(run("once").returncode, 0)
             feed = (home / "feed").read_text(encoding="utf-8")
+            self.assertIn("cleaner task-ledger epoch=2 status=complete", feed)
+            self.assertIn("for top-pain cleaner: wake", feed)
+            self.assertIn("wake requested top-pain cleaner for entry", feed)
+            self.assertLess(feed.index("cleaner task-ledger epoch=2 status=complete"),
+                            feed.index("task-events=1:open,2:complete"))
             self.assertIn("task-epoch=2", feed)
             self.assertIn("task-event-count=2", feed)
             self.assertIn("task-events=1:open,2:complete", feed)
@@ -306,6 +314,7 @@ class SyntheticAdapterTest(unittest.TestCase):
             self.assertEqual(doctor.returncode, 0, doctor.stdout + doctor.stderr)
             self.assertIn("parity: PASS covered=1 missing=0 pending=0", doctor.stdout)
             self.assertIn("judge-view: projected-publish-v1", doctor.stdout)
+            self.assertIn("task bridge: PASS", doctor.stdout)
             self.assertIn("cleaner=shadow; authority=legacy", doctor.stdout)
             (home / ".mesh-mishe-view").write_text("cleaner=disabled\n", encoding="utf-8")
             unsafe = subprocess.run([str(ROOT / "scripts/mesh-mishe-doctor")], env=env,
