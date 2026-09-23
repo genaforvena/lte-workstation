@@ -44,7 +44,9 @@ class BridgeTest(unittest.TestCase):
         with self.log.open("a", encoding="utf-8") as stream:
             for status in ("open", "active", "complete"):
                 stream.write(row(status))
-        self.assertEqual(self.bridge("check").returncode, 2)
+        pending = self.bridge("check")
+        self.assertEqual(pending.returncode, 2)
+        self.assertIn("reason=pending", pending.stdout)
         result = self.bridge("once")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual([e.body for e in self.feed()], [
