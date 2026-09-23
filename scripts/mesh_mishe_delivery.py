@@ -204,7 +204,8 @@ def dispatch_once(channel: str) -> dict:
                 try:
                     result = subprocess.run([sink, "--idempotency-key", key, channel,
                                              "Coordinator wake; read your charter and current state."],
-                                            text=True, capture_output=True, timeout=15)
+                                            text=True, capture_output=True, timeout=15,
+                                            env={**os.environ, "MESH_TELL_AUTOMATIC": "0"})
                 except (OSError, subprocess.TimeoutExpired) as exc:
                     raise BoundaryError(f"sink call ambiguous: {type(exc).__name__}") from exc
                 if os.environ.get("MESH_MISHE_FAULT") == "after-tell":
