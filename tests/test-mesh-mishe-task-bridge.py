@@ -38,6 +38,16 @@ class BridgeTest(unittest.TestCase):
         from mishe_tauftauf.feed import Feed
         return [e for e in Feed(self.home).entries() if e.source == "observation/cleaner-task"]
 
+    def test_default_interpreter_retries_installed_venv(self):
+        venv = Path.home() / ".mesh/venvs/mishe-tauftauf/bin/python"
+        if not venv.is_file():
+            self.skipTest("mesh mishe venv absent")
+        self.env.pop("MESH_MISHE_CORE")
+        self.env.pop("PYTHONPATH", None)
+        self.env["MESH_MISHE_PYTHON"] = str(venv)
+        result = self.bridge("baseline")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_transient_burst_replay_and_privacy(self):
         self.assertEqual(self.bridge("baseline").returncode, 0)
         self.assertIn("no-new-intent", self.bridge("check").stdout)
