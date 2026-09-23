@@ -83,6 +83,11 @@ class AutomaticEventTest(unittest.TestCase):
         bad = self.call("drain")
         self.assertEqual(bad.returncode, 2)
         self.assertFalse((self.home / "feed").exists())
+        target = self.home / "outside.json"
+        target.write_text(json.dumps({"secret": "outside"}))
+        event.unlink()
+        event.symlink_to(target)
+        self.assertEqual(self.call("drain").returncode, 2)
 
     def test_read_only_check_renders_backlog_and_unknown(self):
         self.assertIn('scripts/mesh-mishe-auto-events" check',
