@@ -66,7 +66,8 @@ class AutomaticTellTest(unittest.TestCase):
         lifecycle.write_text(f"#!/bin/sh\ntouch '{entered}'\n"
                              f"while [ ! -f '{release}' ]; do sleep 0.05; done\nexit 0\n")
         lifecycle.chmod(0o755)
-        tell = subprocess.Popen([str(ROOT / "scripts/mesh-tell"), "--automatic", "synthetic", "fixture"],
+        private_prompt = "fixture-private-operator-text"
+        tell = subprocess.Popen([str(ROOT / "scripts/mesh-tell"), "--automatic", "synthetic", private_prompt],
                                 env=self.env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
             for _ in range(100):
@@ -85,6 +86,13 @@ class AutomaticTellTest(unittest.TestCase):
                 _, error = change.communicate(timeout=15)
                 self.assertEqual(change.returncode, 0, error)
                 self.assertTrue(self.calls.exists(), "legacy send was lost before switch")
+                records = list((self.home / "mishe/automatic-events/events").glob("*.json"))
+                self.assertEqual(len(records), 1)
+                self.assertNotIn(private_prompt, records[0].read_text())
+                imported = subprocess.run([str(ROOT / "scripts/mesh-mishe-auto-events"), "import", "synthetic"],
+                                          env=self.env, text=True, capture_output=True)
+                self.assertEqual(imported.returncode, 0, imported.stderr)
+                self.assertNotIn(private_prompt, (self.home / "mishe/feed").read_text())
             finally:
                 if change.poll() is None:
                     change.kill()

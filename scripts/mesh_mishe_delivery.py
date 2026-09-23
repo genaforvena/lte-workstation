@@ -13,6 +13,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
@@ -153,6 +154,33 @@ def sink_status(sink: str, key: str) -> str:
     return status
 
 
+def synthetic_policy(channel: str) -> tuple[str, str]:
+    """Deterministic synthetic admission; live owner evidence has no adapter yet."""
+    path = home() / "dispatch-policy" / f"{channel}.json"
+    value = read_json(path)
+    if (value.get("version") != 1 or value.get("channel") != channel
+            or value.get("domain") != "synthetic"
+            or type(value.get("private")) is not bool or type(value.get("protected")) is not bool
+            or value.get("mind_state") not in ("idle", "busy", "unknown")
+            or type(value.get("refractory_until")) is not int or value["refractory_until"] < 0
+            or type(value.get("pace_allowed")) is not bool
+            or value.get("task_owner") is not None and not isinstance(value["task_owner"], str)):
+        raise BoundaryError("synthetic dispatch policy malformed or unavailable")
+    if value["private"] or value["protected"]:
+        return "refused", "private-or-protected-domain"
+    if value["task_owner"] is not None:
+        return "held", "canonical-task-eligibility-unverified"
+    if value["mind_state"] == "unknown":
+        raise BoundaryError("synthetic mind state UNKNOWN")
+    if value["mind_state"] == "busy":
+        return "held", "mind-busy"
+    if value["refractory_until"] > time.time():
+        return "held", "refractory"
+    if not value["pace_allowed"]:
+        return "held", "pace"
+    return "eligible", "synthetic-admitted"
+
+
 def dispatch_once(channel: str) -> dict:
     with channel_lock(channel):
         current = read_authority(channel)
@@ -162,6 +190,7 @@ def dispatch_once(channel: str) -> dict:
         if not sink or not os.path.isfile(sink) or not os.access(sink, os.X_OK):
             raise BoundaryError("idempotent sink capability absent")
         entries = core_feed().entries(start=current["active_feed_seq"] + 1)
+        by_sequence = {entry.sequence: entry for entry in entries}
         results = []
         for entry in entries:
             if entry.sequence <= current["active_feed_seq"] or entry.source != "mishe-tauftauf":
@@ -176,10 +205,32 @@ def dispatch_once(channel: str) -> dict:
             item = read_json(path) if path.exists() else {"channel": channel, "generation": current["generation"],
                 "request_id": entry.sequence, "key": key, "status": "pending"}
             if (item.get("key") != key or item.get("status") not in
-                    ("pending", "claimed", "unknown", "refused", "delivered")):
+                    ("pending", "held", "claimed", "unknown", "refused", "delivered")):
                 raise BoundaryError("outbox record invalid")
+            stimulus = by_sequence.get(int(match.group(2)))
+            if (stimulus is None or stimulus.sequence >= entry.sequence
+                    or stimulus.source != "observation/synthetic"):
+                if item["status"] not in ("pending", "held"):
+                    raise BoundaryError("ungrounded request has an attempted sink identity")
+                item["status"] = "held"
+                item["reason"] = "ungrounded-stimulus"
+                atomic_json(path, item)
+                results.append({"key": key, "status": "held", "reason": item["reason"]})
+                continue
             if item["status"] == "delivered":
                 results.append({"key": key, "status": "delivered"})
+                continue
+            if item["status"] == "refused":
+                results.append({"key": key, "status": "refused"})
+                continue
+            admission, reason = synthetic_policy(channel)
+            if admission != "eligible":
+                if item["status"] in ("claimed", "unknown"):
+                    raise BoundaryError("policy changed while sink identity is ambiguous")
+                item["status"] = admission
+                item["reason"] = reason
+                atomic_json(path, item)
+                results.append({"key": key, "status": admission, "reason": reason})
                 continue
             atomic_json(path, item)
             status = sink_status(sink, key)
@@ -247,7 +298,7 @@ def check(channel: str) -> dict:
                     path = outbox_dir(channel) / f"{current['generation']}-{entry.sequence}.json"
                     if not path.exists():
                         missing += 1
-        status = "UNKNOWN" if missing or counts["claimed"] or counts["unknown"] else "PASS"
+        status = "UNKNOWN" if missing or counts["claimed"] or counts["unknown"] or counts["held"] else "PASS"
         return {"status": status, "channel": channel, "authority": current["authority"],
                 "generation": current["generation"], "active_feed_seq": current["active_feed_seq"],
                 "feed_tail": tail, "missing_outbox": missing, "outbox": counts}

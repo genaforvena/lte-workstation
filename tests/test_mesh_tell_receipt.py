@@ -74,6 +74,32 @@ class ReceiptTests(unittest.TestCase):
         self.assertEqual(again.returncode, 3)
         self.assertEqual(calls.read_text(encoding="utf-8"), before)
 
+    def test_kill_after_real_send_before_receipt_never_replays(self):
+        bindir = Path(self.tmp.name) / "success-bin"
+        bindir.mkdir()
+        calls = Path(self.tmp.name) / "successful-send-calls"
+        tmux = bindir / "tmux"
+        tmux.write_text(
+            "#!/bin/sh\n"
+            "case \"$1\" in\n"
+            "  list-panes) printf '0 0\\n'; exit 0 ;;\n"
+            f"  send-keys) printf 'send\\n' >> '{calls}'; exit 0 ;;\n"
+            "  capture-pane) exit 0 ;;\n"
+            "esac\nexit 0\n", encoding="utf-8")
+        tmux.chmod(0o755)
+        env = dict(self.env, PATH=str(bindir) + ":" + os.environ["PATH"],
+                   MESH_TELL_ALLOW_SHELL="1", MESH_TELL_WAL=str(Path(self.tmp.name) / "wal"),
+                   MESH_TELL_TEST_FAULT="after-send")
+        args = [str(TELL), "--idempotency-key", "cleaner:2:req-kill", "cleaner", "harmless"]
+        killed = subprocess.run(args, env=env, text=True, capture_output=True)
+        self.assertIn(killed.returncode, (-9, 137), killed.stderr)
+        self.assertTrue(calls.exists(), "tmux send did not occur before injected crash")
+        self.assertEqual(self.call("status", "cleaner:2:req-kill").returncode, 3)
+        prior = calls.read_text(encoding="utf-8")
+        replay = subprocess.run(args, env={**env, "MESH_TELL_TEST_FAULT": ""}, text=True, capture_output=True)
+        self.assertEqual(replay.returncode, 3)
+        self.assertEqual(calls.read_text(encoding="utf-8"), prior)
+
 
 if __name__ == "__main__":
     unittest.main()
