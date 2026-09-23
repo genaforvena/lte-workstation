@@ -1,0 +1,448 @@
+#!/usr/bin/env bash
+# reflex-cadence: 17 3 * * *
+# mesh-evidence-quarantine — the node-local EVIDENCE ROOT's quarantine + retention layer.
+#
+# WHY THIS EXISTS. mesh-evidence-sweep (2026-09-16) proved the pattern this tool is the second half
+# of: the writers were repointed at the evidence root, so a straggler writing the OLD spelling now
+# lands in the right place. But repointing only MOVES the arrival problem — it does nothing about
+# what accumulates after. Measured 2026-09-23 on mesh-home: 289MB in ~/.mesh/evidence, of which
+# 177MB is ONE directory (opencode-v2-migration-20260921) holding a 185MB opencode BINARY saved as
+# "evidence", and 51MB/264 files in artifacts/ with no retention at all. Nothing names a maximum
+# age for any of it, and nothing moves a superseded artifact aside instead of deleting it, so the
+# root either grows without bound or gets deleted by hand — and a hand-delete is exactly the
+# irreversible step that destroyed nothing yet but has no reverse.
+#
+# The transferable concept is QUARANTINE OVER DELETE (from the zero-trust "execution boundary"
+# family: a mutation of a file whose provenance you cannot fully re-derive must be reversible, or it
+# must be refused). mesh-knowledge-publish already uses this shape for a decommissioned clone
+# (~/.mesh/attic/.../WHY-THIS-IS-HERE.md): "kept here rather than deleted only because a tombstone
+# is reversible and a delete is not." That reasoning was applied ONCE, by hand, to a directory
+# nobody had automated reason to revisit. This tool is the same reasoning at the root scale, on a
+# cadence, with a byte-verify and a live-holder check — the same two guards mesh-evidence-sweep
+# uses on the repo side, because a quarantine is a mutation of the evidence root and the evidence
+# root is the thing this tool exists to protect.
+#
+# WHAT IT DOES (three movements, all reversible-except-age):
+#   1. QUARANTINE a named, superseded or oversized artifact set: move it under $QUARANTINE with a
+#      UTC stamp, byte-verify the move, and write a MANIFEST beside it recording origin, size, the
+#      exact command that would restore it, and the reason. Nothing is deleted.
+#   2. EXPIRE quarantined items older than the retention floor: this is the ONE irreversible step,
+#      and it is bounded to the quarantine dir only, so a misjudged quarantine costs a manifest and
+#      some disk, not evidence. A straggler read of the manifest still names the origin.
+#   3. REPORT the root's composition — per-subdir size, the largest single items, and the count of
+#      quarantined items awaiting expiry — because 289MB/177MB-in-one-dir was not visible from any
+#      existing tool, and a retention layer that cannot be audited is a deletion layer with a
+#      better name.
+#
+# SCOPE — deliberately narrow, and the scope is the safety claim:
+#   - only $EVIDENCE_ROOT and $QUARANTINE (both under MESH_DIR unless overridden), never the repo.
+#     `in_root` resolves the target and refuses anything that does not land INSIDE the root, so a
+#     symlink or a '..' cannot redirect a quarantine outside it.
+#   - the quarantine layout is FLAT: slashes in the origin name become '-', so an origin at any
+#     depth lands exactly one level under $QUARANTINE and --expire's single-level walk can never
+#     descend into or beyond the quarantine root. (An earlier draft refused every name containing a
+#     '/' instead, on the theory that a quarantine is a whole-artifact-set decision. That made the
+#     tool's only real use case illegal — evidence lives at evidence/artifacts/<name>. Depth was
+#     never the property that made a quarantine reversible; provenance was.)
+#   - a LIVE-HOLDER check (a process holding the path as CWD or an open FD) blocks quarantine: the
+#     same /proc evidence mesh-tmp-guard uses, for the same reason — mtime cannot separate a live
+#     tool's output dir from a finished one.
+#   - quarantine NEVER overwrites: a name collision is moved aside as .collision-<stamp>, reported,
+#     and the manifest records BOTH names.
+#
+# Exit codes: 0 = assessed (or nothing to do) · 2 = cannot assess the root at all (honest n/a,
+# never a fake clean) · 64 = usage
+#
+#   mesh-evidence-quarantine --report                 composition of the evidence root (default)
+#   mesh-evidence-quarantine --quarantine <name> --reason <text> [--expires-days N]
+#   mesh-evidence-quarantine --expire [--expires-days N]
+#   mesh-evidence-quarantine --list                   quarantined items + their manifests
+#   mesh-evidence-quarantine --restore <stamp-or-name>  move a quarantined item back to the root
+#   mesh-evidence-quarantine --dry-run ...            report only, move nothing
+#   mesh-evidence-quarantine --test                   sandboxed falsifiable smoke test
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+
+# Precedence: an already-set env var WINS over derivation from MESH_DIR. This is not cosmetic. If a
+# caller (or this tool's own --test) exports QUARANTINE=<sandbox>, a child invocation re-deriving it
+# from MESH_DIR would silently point the quarantine at the EVIDENCE ROOT — and --expire iterates its
+# target dir and `rm -rf`s what it finds there, which would delete evidence instead of expiring
+# quarantined copies. The override must survive re-entry.
+MESH="${MESH_DIR:-$HOME/.mesh}"
+EVIDENCE_ROOT="${EVIDENCE_ROOT:-${MESH_EVIDENCE_ROOT:-$MESH/evidence}}"
+QUARANTINE="${QUARANTINE:-${MESH_EVIDENCE_QUARANTINE:-$MESH/evidence-quarantine}}"
+DEFAULT_EXPIRE_DAYS="${MESH_EVIDENCE_EXPIRE_DAYS:-30}"
+
+
+usage(){ sed -n '2,60p' "$0" | sed 's/^# \{0,1\}//'; }
+
+# ── live-holder evidence (a process CWD or open FD on the path) ─────────────────────────────────
+# A quarantine is a mutation of the evidence root; a path a live process is INSIDE or READING must
+# not be moved out from under it. mtime cannot decide this: a tool that finished writing an hour ago
+# and a tool writing now have the same-looking directory. Empty output = nothing protected, never
+# everything — the guard fails OPEN on an unreadable /proc only for the ABSENCE of the check, and
+# that absence is reported in the quarantine line, never silent.
+proc_held(){
+  { readlink /proc/[0-9]*/cwd; readlink /proc/[0-9]*/fd/[0-9]*; } 2>/dev/null | sort -u
+}
+# held_by <path> <held-list> — 0 if a live process holds it. Herestring, never a grep-on-a-pipe:
+# under this script's own `set -o pipefail` a `printf | grep -q` whose grep exits early kills printf
+# with SIGPIPE/141 and pipefail reports that as the verdict, so a path that IS held reads as free
+# (the bug mesh-tmp-guard found and fixed at the same scale — it fired hardest when the node was
+# busiest, which is when a quarantine is most likely to be wrong about liveness).
+held_by(){
+  local p="$1" l="$2" parent f
+  parent="$(dirname "$p" 2>/dev/null)"
+  # A here-string, not a hand-rolled chomp on the list. Command substitution strips
+  # trailing newlines, so the LAST entry of a held list arrives with no newline to
+  # strip and the chomp returns it unchanged — the loop never terminated and every
+  # quarantine hung. read's own EOF on the final line is the terminating condition.
+  while IFS= read -r f; do
+    case "$f" in
+      "$p"|"$p"/*|"$parent"/*) return 0 ;;
+    esac
+  done <<< "$l"
+  return 1
+}
+
+# ── path safety: the quarantine must stay inside the mesh and must not escape via .. ───────────
+# in_root <path> <root> — 0 only if <path> is a real path INSIDE <root>.
+# readlink -f resolves a symlink to its target, so a symlink TO /etc/hosts would read as inside
+# ANY root and a quarantine would follow it outside the evidence tree. The -L check refuses a
+# symlink standing at the named path itself (the root may still hold symlinks pointing inward);
+# readlink -f is then the traversal guard for the resolved location. (-P is not in coreutils here.)
+in_root(){
+  local p="$1" root="$2" rp
+  [ -L "$p" ] && return 1
+  [ -e "$p" ] || return 1
+  rp="$(readlink -f "$p" 2>/dev/null)" || return 1
+  case "$rp/" in "${root%/}/"*) return 0 ;; esac
+  return 1
+}
+
+# ── movement: copy → byte-verify → remove, so the root never loses a byte it has not duplicated ─
+# move_verified <src> <dst> — 0 on a byte-identical landing with the source gone.
+# Communicates a name collision through the GLOBAL $MV_ASIDE, never stdout: a function that both
+# prints and returns a code cannot be captured (`moved="$(move_verified ...)"` strips the rc, and a
+# printf with no output still returns 0, so "printed something" and "succeeded" are the same signal
+# to a caller that can only see one of them). The manifest needs BOTH, so the collision path is a
+# side channel and the verdict is the exit code.
+move_verified(){
+  local src="$1" dst="$2" base
+  MV_ASIDE=""
+  base="$(basename "$src")"
+  mkdir -p "$dst" || return 1
+  if [ -e "$dst/$base" ]; then
+    if cmp -s "$src" "$dst/$base"; then
+      rm -rf "$src"; return 0          # the copy already IS the truth
+    fi
+    local aside="$dst/$base.collision-$(date -u +%Y%M%dT%H%M%SZ)"
+    mv -n "$src" "$aside" || return 1
+    MV_ASIDE="$aside"                  # caller records BOTH names in the manifest
+    return 0
+  fi
+  # cp -a alone leaves a PARTIAL copy of a directory tree behind on a mid-copy failure and still
+  # returns non-zero, so the caller's "leaving it in place" message is a lie. Copy recursively
+  # into a holding name, then byte-compare the whole tree; only then is it the truth.
+  local hold="$dst/$base.quarantine-hold"
+  rm -rf "$hold"
+  if [ -d "$src" ]; then
+    cp -aR "$src" "$hold" || { rm -rf "$hold"; return 1; }
+  else
+    cp -a "$src" "$hold" || { rm -rf "$hold"; return 1; }
+  fi
+  if diff -r -q "$src" "$hold" >/dev/null 2>&1; then
+    mv "$hold" "$dst/$base" || { rm -rf "$hold"; return 1; }
+    rm -rf "$src"; return 0
+  fi
+  echo "mesh-evidence-quarantine: copy of $src is not byte-identical; leaving it in place" >&2
+  rm -rf "$hold"
+  return 1
+}
+
+# ── the manifest: the reason the quarantine is reversible in PRACTICE, not just in principle ────
+# A manifest records enough that a stranger (or a mind after a context reset) can decide whether to
+# restore without re-deriving the original decision: what, how big, why it moved, how to undo it.
+write_manifest(){
+  local qdir="$1" origin="$2" reason="$3" restore_cmd="$4" extra="${5:-}"
+  {
+    echo "# quarantine manifest — $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "origin: $origin"
+    echo "reason: $reason"
+    [ -n "$extra" ] && echo "$extra"
+    echo "restore: $restore_cmd"
+    echo "# byte-verified on quarantine; restore is a move back to the evidence root"
+  } > "$qdir/MANIFEST.md"
+}
+
+do_quarantine(){
+  local name="$1" reason="$2" expire_days="$3" dry="$4" src stamp qdir size held_list
+  src="$EVIDENCE_ROOT/$name"
+  [ -e "$src" ] || { echo "mesh-evidence-quarantine: no such artifact in the evidence root: $name" >&2; return 2; }
+  in_root "$src" "$EVIDENCE_ROOT" || { echo "mesh-evidence-quarantine: refuses a path outside the evidence root: $src" >&2; return 2; }
+  # TRAVERSAL check, not a depth rule. The first draft refused any name containing '/', on the theory
+  # that a quarantine is a whole-artifact-set decision. That made the tool's ONLY real use case
+  # illegal: evidence lives at evidence/artifacts/<name>, and quarantining one means naming a path
+  # with a slash. The guard that actually carries the safety claim is `in_root` — the target must
+  # resolve INSIDE the evidence root — plus the flat-quarantine layout below, which keeps every
+  # quarantined item exactly one level under $QUARANTINE no matter how deep its origin was. Depth
+  # was never the property that made a quarantine reversible; provenance was.
+  case "$name" in ../*|*/../*|*/..) echo "mesh-evidence-quarantine: refuses a traversal path: $name" >&2; return 2 ;; esac
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  # FLAT quarantine layout: slashes in the origin become '-'. A nested origin path CANNOT create a
+  # nested quarantine dir, so --expire's single-level walk cannot descend into or beyond the root.
+  local qname; qname="$(printf '%s' "$name" | tr '/' '-')"-"$stamp"
+  qdir="$QUARANTINE/$qname"
+  size="$(du -sb "$src" 2>/dev/null | cut -f1)"
+  held_list="$(proc_held)"
+  if held_by "$src" "$held_list"; then
+    echo "quarantine REFUSED (live process holds $name): $EVIDENCE_ROOT/$name"
+    return 2
+  fi
+  if [ -n "$dry" ]; then
+    echo "would quarantine: $name -> evidence-quarantine/$qname (${size:-?} bytes) — $reason"
+    return 0
+  fi
+  mkdir -p "$QUARANTINE" || { echo "mesh-evidence-quarantine: cannot create $QUARANTINE" >&2; return 2; }
+  # COLLISION is on the quarantine DIR, not the artifact inside it. Two quarantines of the same
+  # origin get different stamps, so $qdir is always empty and move_verified's inner
+  # [ -e "$dst/$base" ] never fires — the second quarantine would land beside the first and the
+  # manifest would record nothing about either. When a dir for this origin already holds the
+  # artifact, quarantine the new one into a .collision-<stamp> dir and record the PRIOR dir in
+  # $MV_ASIDE so both are preserved and both are named in the manifest.
+  # The glob is ANCHORED to a real stamp: unanchored, collide-*- also matches
+  # collide-<stamp>.collision-<stamp>, so a third quarantine of the same origin would nest a
+  # .collision suffix onto its own collision dir instead of linking to the prior item. The stamp
+  # is UTC-shaped (digits, a T, digits, Z); the anchor must end at that Z, not at a digit.
+  local prior="" collision="" base_q restore
+  base_q="$(printf '%s' "$name" | tr '/' '-')"
+  for prior in "$QUARANTINE"/"$base_q"-*[0-9]T*[0-9]Z; do
+    [ -d "$prior" ] || continue
+    [ -e "$prior/$(basename "$name")" ] || continue
+    qdir="$QUARANTINE/$(basename "$prior").collision-$stamp"
+    collision="$prior"
+    break
+  done
+  # move_verified creates $qdir before the copy. A FAILED copy leaves an EMPTY stamped dir behind
+  # that --list renders as a quarantined item with no manifest, and a later quarantine of the same
+  # origin would treat it as the prior item. An empty dir is not a quarantine; remove it so a
+  # failed run leaves the quarantine exactly as it found it.
+  move_verified "$src" "$qdir" || { rmdir "$qdir" 2>/dev/null; echo "mesh-evidence-quarantine: move of $name did not verify; the root is untouched" >&2; return 2; }
+  restore="mesh-evidence-quarantine --restore $(basename "$qdir")"
+  local extra="bytes_at_quarantine: ${size:-unknown}"
+  [ -n "$collision" ] && extra="$extra"$'\n'"collision-aside: $collision (a differing item already held the name; both preserved)"
+  if [ "${expire_days:-0}" -gt 0 ]; then
+    extra="$extra"$'\n'"expires_after_days: $expire_days (mesh-evidence-quarantine --expire)"
+  fi
+  write_manifest "$qdir" "$EVIDENCE_ROOT/$name" "$reason" "$restore" "$extra"
+  echo "quarantined: $name -> $qdir (${size:-?} bytes) — reversible via $restore"
+}
+
+# ── expire: the one irreversible step, bounded to the quarantine dir ────────────────────────────
+do_expire(){
+  local expire_days="$1" dry="$2" now cutoff d base ts size removed=0 kept=0
+  [ -d "$QUARANTINE" ] || { echo "(no quarantine dir yet: $QUARANTINE)"; return 0; }
+  now=$(date +%s); cutoff=$(( now - expire_days * 86400 ))
+  for d in "$QUARANTINE"/*; do
+    [ -d "$d" ] || continue
+    ts=$(stat -c %Y "$d" 2>/dev/null) || continue
+    [ -n "$ts" ] && [ "$ts" -lt "$cutoff" ] || { kept=$((kept+1)); continue; }
+    base="$(basename "$d")"; size="$(du -sb "$d" 2>/dev/null | cut -f1)"
+    if [ -n "$dry" ]; then
+      echo "would expire: $base (${size:-?} bytes, $(( (now - ts) / 86400 ))d old)"; removed=$((removed+1)); continue
+    fi
+    rm -rf "$d" && { removed=$((removed+1)); echo "expired: $base (${size:-?} bytes)"; }
+  done
+  [ -n "$dry" ] && echo "expire dry-run: removed=$removed kept=$kept" || echo "expire: removed=$removed kept=$kept"
+  return 0
+}
+
+# ── restore: move a quarantined item back to its recorded origin ────────────────────────────────
+do_restore(){
+  local key="$1" dry="$2" d base origin target mf
+  [ -d "$QUARANTINE" ] || { echo "mesh-evidence-quarantine: no quarantine dir: $QUARANTINE" >&2; return 2; }
+  d=""
+  for cand in "$QUARANTINE"/*; do
+    [ -d "$cand" ] || continue
+    case "$(basename "$cand")" in "$key"|*"$key"*) d="$cand"; break ;; esac
+  done
+  [ -n "$d" ] || { echo "mesh-evidence-quarantine: no quarantined item matches: $key" >&2; return 2; }
+  base="$(basename "$d")"
+  mf="$d/MANIFEST.md"
+  # The origin comes from the MANIFEST, never from the quarantine dirname. The first draft stripped a
+  # trailing -<stamp> from the quarantine name with ${base%-*}: for opencode-v2-migration-... that
+  # strips the wrong dash (origin names contain dashes too) and would restore into a WRONG path
+  # inside the evidence root — a correct-looking move to the wrong place. The manifest is the
+  # provenance record this tool exists to write; restore should read it.
+  origin="$(sed -n 's|^origin: ||p' "$mf" 2>/dev/null | head -1)"
+  if [ -z "$origin" ]; then
+    echo "mesh-evidence-quarantine: $base has no MANIFEST naming its origin — refusing to guess a restore target (the item is preserved at $d)" >&2
+    return 2
+  fi
+  target="$origin"
+  if [ -e "$target" ]; then
+    echo "mesh-evidence-quarantine: $target already exists — restoring would overwrite; refusing (quarantine kept at $d)" >&2
+    return 2
+  fi
+  if [ -n "$dry" ]; then echo "would restore: $base -> $target"; return 0; fi
+  mkdir -p "$(dirname "$target")" || { echo "mesh-evidence-quarantine: cannot create $(dirname "$target")" >&2; return 2; }
+  # Move the artifact INSIDE the quarantine dir, not the dir itself. A quarantine lands at
+  # $qdir/<basename-of-origin> with the MANIFEST beside it; passing $d to move_verified would
+  # nest the stamped quarantine dir inside the evidence root instead of putting the artifact
+  # back where it came from — a restore that "succeeded" and left the root in a worse state.
+  local inner="$d/$(basename "$origin")"
+  [ -e "$inner" ] || { echo "mesh-evidence-quarantine: $base holds no $(basename "$origin") — quarantine incomplete or hand-edited; nothing moved (preserved at $d)" >&2; return 2; }
+  move_verified "$inner" "$(dirname "$target")" || { echo "mesh-evidence-quarantine: restore of $base did not verify; quarantine kept" >&2; return 2; }
+  rmdir "$d" 2>/dev/null
+  echo "restored: $base -> $target"
+}
+
+# ── list: every quarantined item with its manifest, so the quarantine is auditable ─────────────
+do_list(){
+  local d base ts age reason
+  [ -d "$QUARANTINE" ] || { echo "(no quarantine dir yet: $QUARANTINE)"; return 0; }
+  for d in "$QUARANTINE"/*; do
+    [ -d "$d" ] || continue
+    base="$(basename "$d")"; ts=$(stat -c %Y "$d" 2>/dev/null)
+    age="?"
+    [ -n "$ts" ] && age=$(( ($(date +%s) - ts) / 86400 ))d
+    reason="$(sed -n 's/^reason: //p' "$d/MANIFEST.md" 2>/dev/null | head -1)"
+    printf '%s\t%s\t%s\t%s\n' "$base" "$(du -sb "$d" 2>/dev/null | cut -f1)" "$age" "${reason:-no-manifest}"
+  done
+  return 0
+}
+
+# ── report: the composition of the root, because a retention layer must be auditable ───────────
+do_report(){
+  [ -d "$EVIDENCE_ROOT" ] || { echo "mesh-evidence-quarantine: no evidence root at $EVIDENCE_ROOT — nothing to assess (honest n/a, not a clean report)" >&2; return 2; }
+  local total biggest biggest_n=0 qcount=0
+  total="$(du -sb "$EVIDENCE_ROOT" 2>/dev/null | cut -f1)"
+  [ -d "$QUARANTINE" ] && qcount=$(find "$QUARANTINE" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l)
+  printf 'evidence root: %s\n' "$EVIDENCE_ROOT"
+  printf 'total: %s bytes (%s)\n' "${total:-0}" "$(du -sh "$EVIDENCE_ROOT" 2>/dev/null | cut -f1)"
+  printf 'quarantined: %s item(s) at %s\n' "$qcount" "$QUARANTINE"
+  printf '\nlargest children:\n'
+  du -sb "$EVIDENCE_ROOT"/* 2>/dev/null | sort -k1 -n -r | head -8 | while read -r sz path; do
+    printf '  %12s  %s\n' "$(numfmt --to=iec "$sz" 2>/dev/null || echo "$sz")" "$(basename "$path")"
+  done
+  printf '\noldest artifacts/ (the retention question, unanswered anywhere else):\n'
+  find "$EVIDENCE_ROOT/artifacts" -maxdepth 1 -type f -printf '%TY-%Tm-%Td %s %f\n' 2>/dev/null | sort | head -5 | while read -r d s f; do
+    printf '  %s  %10s  %s\n' "$d" "$s" "$f"
+  done
+  return 0
+}
+
+# ── the smoke test: every leg RED before it was written, sandboxed by env override ─────────────
+run_test(){
+  local fail=0 td
+  td="$(mktemp -d)" || { echo "smoke-test: FAIL (no mktemp -d)"; return 1; }
+  trap 'rm -rf "$td"' EXIT INT TERM
+  export MESH_DIR="$td/mesh" MESH_EVIDENCE_ROOT="$td/mesh/evidence" QUARANTINE="$td/mesh/evidence-quarantine"
+  mkdir -p "$MESH_EVIDENCE_ROOT/artifacts" "$QUARANTINE"
+
+  # 1. quarantine moves + byte-verifies + writes a manifest naming the restore command
+  printf 'real evidence\n' > "$MESH_EVIDENCE_ROOT/artifacts/probe-a.md"
+  "$0" --quarantine artifacts/probe-a.md --reason "test: superseded probe" --expires-days 5 > "$td/o1" 2>&1 || { echo "smoke-test: FAIL (quarantine rc): $(cat "$td/o1")"; fail=1; }
+  grep -q "quarantined: artifacts/probe-a.md" "$td/o1" || { echo "smoke-test: FAIL (no quarantine confirmation): $(cat "$td/o1")"; fail=1; }
+  [ ! -e "$MESH_EVIDENCE_ROOT/artifacts/probe-a.md" ] || { echo "smoke-test: FAIL (source not removed after a verified move)"; fail=1; }
+  grep -q "real evidence" "$QUARANTINE"/artifacts-probe-a.md-*/probe-a.md 2>/dev/null || { echo "smoke-test: FAIL (the artifact did not land byte-identical in quarantine)"; fail=1; }
+  grep -q "restore: mesh-evidence-quarantine --restore" "$QUARANTINE"/artifacts-probe-a.md-*/MANIFEST.md 2>/dev/null || { echo "smoke-test: FAIL (manifest names no restore command)"; fail=1; }
+  grep -q "superseded probe" "$QUARANTINE"/artifacts-probe-a.md-*/MANIFEST.md 2>/dev/null || { echo "smoke-test: FAIL (manifest lost the reason)"; fail=1; }
+
+  # 2. restore reverses it, and refuses to overwrite a live item
+  "$0" --restore artifacts-probe-a.md > "$td/o2" 2>&1 || { echo "smoke-test: FAIL (restore rc): $(cat "$td/o2")"; fail=1; }
+  grep -q "real evidence" "$MESH_EVIDENCE_ROOT/artifacts/probe-a.md" 2>/dev/null || { echo "smoke-test: FAIL (restore did not return the artifact)"; fail=1; }
+  "$0" --restore artifacts-probe-a.md > "$td/o3" 2>&1 && { echo "smoke-test: FAIL (restore into an occupied name overwrote it): $(cat "$td/o3")"; fail=1; }
+
+  # 3. a name COLLISION in quarantine is moved aside, never overwritten: two quarantines of the
+  #     same ORIGIN with different CONTENT must both survive. Asserted on the quarantine state
+  #     itself (what --list renders to a reader), not on internal variable values.
+  printf 'first\n'  > "$MESH_EVIDENCE_ROOT/collide"
+  "$0" --quarantine collide --reason "first" > "$td/o4a" 2>&1 || { echo "smoke-test: FAIL (first collision quarantine rc): $(cat "$td/o4a")"; fail=1; }
+  printf 'second\n' > "$MESH_EVIDENCE_ROOT/collide"
+  "$0" --quarantine collide --reason "second" > "$td/o4" 2>&1 || { echo "smoke-test: FAIL (collision quarantine rc): $(cat "$td/o4")"; fail=1; }
+  "$0" --list > "$td/o4list" 2>&1 || { echo "smoke-test: FAIL (list after collision rc): $(cat "$td/o4list")"; fail=1; }
+  #     both items survive: two collide rows in --list (leg 1's probe-a is not counted)
+  local n_quarantined; n_quarantined="$(grep -c '^collide-' "$td/o4list")"
+  [ "$n_quarantined" = "2" ] || { echo "smoke-test: FAIL (a collision did not preserve BOTH items; --list shows $n_quarantined): $(cat "$td/o4list")"; fail=1; }
+  #     no quarantine dir is empty and manifestless — that is the failed-run tombstone shape
+  local d
+  for d in "$QUARANTINE"/collide-*; do
+    [ -f "$d/MANIFEST.md" ] || { echo "smoke-test: FAIL (a collision dir has no manifest): $d"; fail=1; }
+  done
+
+  # 4. expiry is bounded to the quarantine dir and honours the age floor
+  mkdir -p "$QUARANTINE/old-item-20260101T000000Z"; printf 'x\n' > "$QUARANTINE/old-item-20260101T000000Z/f"
+  touch -d "40 days ago" "$QUARANTINE/old-item-20260101T000000Z"
+  mkdir -p "$QUARANTINE/fresh-item-20990101T000000Z"; printf 'y\n' > "$QUARANTINE/fresh-item-20990101T000000Z/f"
+  "$0" --expire --expires-days 30 > "$td/o5" 2>&1 || { echo "smoke-test: FAIL (expire rc): $(cat "$td/o5")"; fail=1; }
+  # 6. a traversal path is refused — the guard that carries the safety claim is `in_root`, not a
+  #    depth rule. An origin at ANY depth is legal (evidence lives at evidence/artifacts/<name>);
+  #    what must be refused is a name that resolves OUTSIDE the root, by ".." or by a symlink.
+  "$0" --quarantine "../../escape" --reason "traversal" > "$td/o7" 2>&1 && { echo "smoke-test: FAIL (a traversal path was quarantined): $(cat "$td/o7")"; fail=1; }
+  # 6b. a symlink inside the root pointing OUTSIDE it is refused by in_root's -L check. A refusal
+  #     must leave the symlink standing in the root and create no quarantine dir for it.
+  ln -s /etc/hosts "$MESH_EVIDENCE_ROOT/escape-link"
+  "$0" --quarantine escape-link --reason "symlink out" > "$td/o7b" 2>&1 && { echo "smoke-test: FAIL (a symlink pointing outside the root was quarantined): $(cat "$td/o7b")"; fail=1; }
+  [ -e "$MESH_EVIDENCE_ROOT/escape-link" ] || { echo "smoke-test: FAIL (a refused quarantine did not leave the symlink standing in the root)"; fail=1; }
+  [ ! -d "$QUARANTINE"/escape-link-* ] || { echo "smoke-test: FAIL (a symlink pointing outside the root was quarantined as if it were local evidence)"; fail=1; }
+  # 7. a live process holding a path blocks the quarantine (the /proc evidence, real not mocked)
+  mkdir -p "$MESH_EVIDENCE_ROOT/held-dir"
+  ( cd "$MESH_EVIDENCE_ROOT/held-dir" && sleep 2 ) &
+  local bgpid=$!
+  sleep 0.4
+  "$0" --quarantine held-dir --reason "live" > "$td/o8" 2>&1
+  local qrc=$?
+  kill "$bgpid" 2>/dev/null; wait "$bgpid" 2>/dev/null
+  [ "$qrc" -ne 0 ] || { echo "smoke-test: FAIL (a dir a live process was INSIDE was quarantined): $(cat "$td/o8")"; fail=1; }
+  grep -q "REFUSED" "$td/o8" || { echo "smoke-test: FAIL (a live-holder refusal did not name itself): $(cat "$td/o8")"; fail=1; }
+  [ -d "$MESH_EVIDENCE_ROOT/held-dir" ] || { echo "smoke-test: FAIL (the live-held dir was moved anyway)"; fail=1; }
+
+  # 8. list renders the quarantined items with their manifest reason, and report renders the composition
+  "$0" --list > "$td/o9" 2>&1 || { echo "smoke-test: FAIL (list rc): $(cat "$td/o9")"; fail=1; }
+  grep -qE "(collide|probe-a)" "$td/o9" || { echo "smoke-test: FAIL (--list did not render the quarantined items): $(cat "$td/o9")"; fail=1; }
+  grep -q "test: superseded probe" "$td/o9" || { echo "smoke-test: FAIL (--list lost the manifest reason): $(cat "$td/o9")"; fail=1; }
+  "$0" --report > "$td/o9" 2>&1 || { echo "smoke-test: FAIL (report rc): $(cat "$td/o9")"; fail=1; }
+  grep -q "total:" "$td/o9" || { echo "smoke-test: FAIL (report has no total)"; fail=1; }
+
+  # 9. report on a MISSING root is a loud n/a, never a clean line
+  rm -rf "$QUARANTINE"
+  "$0" --list > "$td/o11" 2>&1 || { echo "smoke-test: FAIL (list on an empty quarantine dir failed): $(cat "$td/o11")"; fail=1; }
+  rm -rf "$MESH_EVIDENCE_ROOT"
+  "$0" --report > "$td/o10" 2>&1 && { echo "smoke-test: FAIL (a missing evidence root reported success)"; fail=1; }
+
+  [ "$fail" -eq 0 ] && { echo "smoke-test: ok (quarantine moves + verifies + manifests · restore reverses and refuses to overwrite · collision moved aside · expiry bounded to the quarantine dir and age-floored · dry-run inert · traversal path refused · symlink-to-outside refused · a LIVE process holding a path blocks the move · list + report render · missing root is a loud n/a)"; return 0; }
+  echo "smoke-test: FAIL"; return 1
+}
+
+main(){
+  local mode="report" name="" reason="" expire_days="$DEFAULT_EXPIRE_DAYS" dry="" arg
+  while [ $# -gt 0 ]; do
+    arg="$1"
+    case "$arg" in
+      --quarantine) mode="quarantine"; name="${2:-}"; shift 2 ;;
+      --restore)    mode="restore"; name="${2:-}"; shift 2 ;;
+      --reason)     reason="${2:-}"; shift 2 ;;
+      --expires-days) expire_days="${2:-}"; shift 2 ;;
+      --expire)     mode="expire"; shift ;;
+      --list)       mode="list"; shift ;;
+      --report)     mode="report"; shift ;;
+      --dry-run)    dry="1"; shift ;;
+      --test)       run_test; exit $? ;;
+      --help|-h)    usage; exit 0 ;;
+      *)            echo "mesh-evidence-quarantine: unknown argument '$arg'" >&2; usage >&2; exit 64 ;;
+    esac
+  done
+  case "$expire_days" in ''|*[!0-9]*) echo "mesh-evidence-quarantine: --expires-days must be a number of days, got '$expire_days'" >&2; exit 64 ;; esac
+  case "$mode" in
+    quarantine) [ -n "$name" ] && [ -n "$reason" ] || { echo "mesh-evidence-quarantine: --quarantine needs <name> and --reason <text>" >&2; exit 64; }
+                 do_quarantine "$name" "$reason" "$expire_days" "$dry" ;;
+    restore)    [ -n "$name" ] || { echo "mesh-evidence-quarantine: --restore needs a stamp or name" >&2; exit 64; }
+                 do_restore "$name" "$dry" ;;
+    expire)     do_expire "$expire_days" "$dry" ;;
+    list)       do_list ;;
+    report)     do_report ;;
+  esac
+}
+
+main "$@"
