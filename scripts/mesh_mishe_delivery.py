@@ -114,9 +114,9 @@ def switch(channel: str, target: str, expected: int, feed_seq: int) -> dict:
             raise BoundaryError("authority already selected")
         if target not in ("legacy", "mishe") or feed_seq < current["active_feed_seq"]:
             raise BoundaryError("invalid target or feed sequence")
-        entries = core_feed().entries()  # fail closed on malformed feed
-        if feed_seq != len(entries):
-            raise BoundaryError(f"feed sequence must equal current tail {len(entries)}")
+        tail = core_feed().tail_sequence()  # verified checkpoint; fail closed on malformed feed
+        if feed_seq != tail:
+            raise BoundaryError(f"feed sequence must equal current tail {tail}")
         if target == "legacy":
             for item in outbox_dir(channel).glob("*.json"):
                 status = read_json(item).get("status")
@@ -221,9 +221,11 @@ def check(channel: str) -> dict:
     """Read-only health verdict for the synthetic fence and outbox."""
     with channel_lock(channel):
         current = read_authority(channel)
-        entries = core_feed().entries()
-        if current["active_feed_seq"] > len(entries):
+        feed = core_feed()
+        tail = feed.tail_sequence()
+        if current["active_feed_seq"] > tail:
             raise BoundaryError("activation cursor beyond feed tail")
+        entries = feed.entries(start=current["active_feed_seq"] + 1)
         counts = {state: 0 for state in ("pending", "held", "refused", "claimed", "unknown", "delivered")}
         for path in outbox_dir(channel).glob("*.json"):
             item = read_json(path)
@@ -233,7 +235,7 @@ def check(channel: str) -> dict:
             counts[state] += 1
         missing = 0
         if current["authority"] == "mishe":
-            for entry in entries[current["active_feed_seq"]:]:
+            for entry in entries:
                 if entry.source == "mishe-tauftauf" and REQUEST.fullmatch(entry.body):
                     match = REQUEST.fullmatch(entry.body)
                     if match.group(1) != channel:
@@ -244,4 +246,4 @@ def check(channel: str) -> dict:
         status = "UNKNOWN" if missing or counts["claimed"] or counts["unknown"] else "PASS"
         return {"status": status, "channel": channel, "authority": current["authority"],
                 "generation": current["generation"], "active_feed_seq": current["active_feed_seq"],
-                "feed_tail": len(entries), "missing_outbox": missing, "outbox": counts}
+                "feed_tail": tail, "missing_outbox": missing, "outbox": counts}
