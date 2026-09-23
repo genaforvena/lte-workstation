@@ -2,6 +2,8 @@
 """Synthetic Mesh adapter contract against the public coordinator."""
 import os
 from pathlib import Path
+import re
+import shutil
 import subprocess
 import tempfile
 import time
@@ -22,15 +24,43 @@ class SyntheticAdapterTest(unittest.TestCase):
             home = base / "core"
             state = base / "synthetic-state"
             env = {**os.environ, "MESH_MISHE_HOME": str(home), "MESH_MISHE_CORE": str(CORE),
+                   "MESH_MISHE_PYTHON": "python3", "MESH_REPO": str(ROOT),
                    "MESH_MISHE_SYNTHETIC_FILE": str(state)}
 
             def adapter(name, *args):
                 return subprocess.run([str(ROOT / "scripts" / name), *args], env=env,
                                       text=True, capture_output=True)
 
+            self.assertEqual(adapter("mesh-mishe-run", "--test").returncode, 2)
             init = adapter("mesh-mishe-run", "init")
             self.assertEqual(init.returncode, 0, init.stderr)
             self.assertTrue((home / "top-pains" / "synthetic").is_file())
+            gate = adapter("mesh-mishe-run", "--test")
+            self.assertEqual(gate.returncode, 0, gate.stdout + gate.stderr)
+            self.assertFalse((home / ".mesh-mishe-pass").exists())
+            missing_python = subprocess.run([str(ROOT / "scripts/mesh-mishe-run"), "--test"],
+                                            env={**env, "MESH_MISHE_PYTHON": str(base / "missing-python")},
+                                            text=True, capture_output=True)
+            self.assertEqual(missing_python.returncode, 2)
+            fake_home = base / "fake-home"
+            bin_dir = fake_home / ".local/bin"
+            bin_dir.mkdir(parents=True)
+            (fake_home / ".mesh").mkdir()
+            (fake_home / ".mesh-card").write_text("  minds: codex\n", encoding="utf-8")
+            (bin_dir / "mesh-mishe-run").symlink_to(ROOT / "scripts/mesh-mishe-run")
+            fake_repo = fake_home / "genome"
+            (fake_repo / "scripts/lib").mkdir(parents=True)
+            (fake_repo / "job").mkdir()
+            for relative in ("scripts/mesh-manifest", "scripts/lib/mesh-manifest-reader.sh",
+                             "scripts/mesh-mishe-run", "scripts/mesh-mishe-render", "scripts/mesh-mishe-project"):
+                shutil.copy2(ROOT / relative, fake_repo / relative)
+            autowire = subprocess.run([str(ROOT / "scripts/mesh-autowire"), "--check"],
+                                      env={**env, "HOME": str(fake_home), "MESH_REPO": str(fake_repo),
+                                           "MESH_AUTOWIRE_CRONTAB_SRC": "/dev/null", "MESH_LIVENESS_SRC": ""},
+                                      text=True, capture_output=True)
+            self.assertEqual(autowire.returncode, 0, autowire.stderr)
+            self.assertIn("WOULD WIRE:", autowire.stdout)
+            self.assertIn("mesh-mishe-run once", autowire.stdout)
             state.write_text("STATE: GREEN\nSECRET: fixture-private-1\n", encoding="utf-8")
             self.assertEqual(adapter("mesh-mishe-run", "once").returncode, 0)
             state.write_text("STATE: RED\nSECRET: fixture-private-2\n", encoding="utf-8")
@@ -70,7 +100,6 @@ class SyntheticAdapterTest(unittest.TestCase):
             # Observation timestamps can be old while stable passes remain fresh.
             feed_path = home / "feed"
             old_feed = feed_path.read_text(encoding="utf-8")
-            import re
             old_feed = re.sub(r"^(\d{20}) \d{4}-\d\d-\d\dT[^ ]+ (observation/synthetic ::)$",
                               r"\1 2020-01-01T00:00:00.000000Z \2", old_feed, flags=re.MULTILINE)
             feed_path.write_text(old_feed, encoding="utf-8")
@@ -101,6 +130,7 @@ class SyntheticAdapterTest(unittest.TestCase):
             broken = adapter("mesh-mishe-doctor")
             self.assertNotEqual(broken.returncode, 0)
             self.assertIn("UNKNOWN", broken.stdout)
+            self.assertEqual(adapter("mesh-mishe-run", "--test").returncode, 2)
 
     def test_projection_fails_closed_for_unrecognized_or_missing_state(self):
         with tempfile.TemporaryDirectory() as tmp:
