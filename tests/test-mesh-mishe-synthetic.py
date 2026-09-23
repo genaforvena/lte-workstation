@@ -267,7 +267,16 @@ class SyntheticAdapterTest(unittest.TestCase):
                                     text=True, capture_output=True)
             self.assertEqual(doctor.returncode, 0, doctor.stdout + doctor.stderr)
             self.assertIn("parity: PASS covered=1 missing=0 pending=0", doctor.stdout)
+            self.assertIn("judge-view: projected-publish-v1", doctor.stdout)
             self.assertIn("cleaner=shadow; authority=legacy", doctor.stdout)
+            (home / ".mesh-mishe-view").write_text("cleaner=disabled\n", encoding="utf-8")
+            unsafe = subprocess.run([str(ROOT / "scripts/mesh-mishe-doctor")], env=env,
+                                    text=True, capture_output=True)
+            self.assertNotEqual(unsafe.returncode, 0)
+            self.assertIn("judge-view: UNKNOWN", unsafe.stdout)
+            self.assertEqual(run("once").returncode, 0)
+            self.assertEqual(subprocess.run([str(ROOT / "scripts/mesh-mishe-doctor")],
+                                            env=env, text=True, capture_output=True).returncode, 0)
             venv_python = Path.home() / ".mesh/venvs/mishe-tauftauf/bin/python"
             if venv_python.is_file():
                 cron_env = {**env, "MESH_MISHE_PYTHON": str(venv_python)}
