@@ -200,7 +200,7 @@ class SyntheticAdapterTest(unittest.TestCase):
             base = Path(tmp)
             home, repo = base / "core", base / "repo"
             (repo / "scripts").mkdir(parents=True)
-            for name in ("mesh-mishe-render", "mesh-mishe-project"):
+            for name in ("mesh-mishe-render", "mesh-mishe-project", "mesh-mishe-parity"):
                 shutil.copy2(ROOT / "scripts" / name, repo / "scripts" / name)
             (repo / "scripts/mesh-dash").write_text(
                 "#!/bin/sh\n"
@@ -252,10 +252,31 @@ class SyntheticAdapterTest(unittest.TestCase):
             self.assertIn("task-event-count=20", feed)
             self.assertIn("task-events=5:open", feed)
             self.assertIn("20:complete", feed)
+            (home / "cleaner-parity-baseline.json").write_text(
+                '{"epoch":0,"time":"2026-09-23T03:45:00Z"}', encoding="utf-8")
+            doctor = subprocess.run([str(ROOT / "scripts/mesh-mishe-doctor")], env=env,
+                                    text=True, capture_output=True)
+            self.assertNotEqual(doctor.returncode, 0, doctor.stdout + doctor.stderr)
+            self.assertIn("parity: FAIL covered=18 missing=2 pending=0", doctor.stdout)
+            (home / "cleaner-parity-baseline.json").write_text(
+                '{"epoch":20,"time":"2026-09-23T03:45:03Z"}', encoding="utf-8")
+            with chat_log.open("a", encoding="utf-8") as stream:
+                stream.write("2026-09-23T03:45:04Z [task-ledger] /chain=s:test | /current=i:0 | /status=s:open | /steps/0/owner=s:cleaner | /steps/0/status=s:open\n")
+            self.assertEqual(run("once").returncode, 0)
             doctor = subprocess.run([str(ROOT / "scripts/mesh-mishe-doctor")], env=env,
                                     text=True, capture_output=True)
             self.assertEqual(doctor.returncode, 0, doctor.stdout + doctor.stderr)
+            self.assertIn("parity: PASS covered=1 missing=0 pending=0", doctor.stdout)
             self.assertIn("cleaner=shadow; authority=legacy", doctor.stdout)
+            venv_python = Path.home() / ".mesh/venvs/mishe-tauftauf/bin/python"
+            if venv_python.is_file():
+                cron_env = {**env, "MESH_MISHE_PYTHON": str(venv_python)}
+                cron_env.pop("MESH_MISHE_CORE", None)
+                cron_env.pop("PYTHONPATH", None)
+                cron = subprocess.run([str(ROOT / "scripts/mesh-mishe-doctor")], env=cron_env,
+                                      text=True, capture_output=True)
+                self.assertEqual(cron.returncode, 0, cron.stdout + cron.stderr)
+                self.assertIn("parity: PASS covered=1 missing=0 pending=0", cron.stdout)
 
 
 if __name__ == "__main__":

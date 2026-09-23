@@ -1,0 +1,163 @@
+#!/usr/bin/env python3
+"""Compare bounded cleaner shadow observations with durable task-ledger transitions."""
+from bisect import bisect_right
+from datetime import datetime, timezone
+import json
+import os
+from pathlib import Path
+import re
+import sys
+
+
+STATUSES = {"open", "active", "complete", "rejected", "blocked"}
+EVENT_RE = re.compile(r"(\d+):(open|active|complete|rejected|blocked)\Z")
+COUNT_RE = re.compile(r"^CLEANER: .*\btask-epoch=(\d+) task-event-count=(\d+) task-events=([^\n]+)$")
+LEDGER_TIME_RE = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ)\b")
+
+
+def unknown(reason: str) -> int:
+    # Reasons are fixed strings and never include paths, task descriptions or feed bytes.
+    print(f"mishe cleaner parity: UNKNOWN reason={reason}; authority=legacy")
+    return 2
+
+
+def timestamp(value: str) -> datetime:
+    return datetime.fromisoformat(value.removesuffix("Z") + "+00:00")
+
+
+def single(pattern: str, text: str) -> str | None:
+    matches = re.findall(pattern, text)
+    return matches[0] if len(matches) == 1 else None
+
+
+def feed_class():
+    core = os.environ.get("MESH_MISHE_CORE")
+    if core:
+        sys.path.insert(0, str(Path(core) / "src"))
+    try:
+        from mishe_tauftauf.feed import Feed
+        return Feed
+    except ModuleNotFoundError:
+        selected = Path(os.environ.get("MESH_MISHE_PYTHON", str(Path.home() / ".mesh/venvs/mishe-tauftauf/bin/python")))
+        if selected.is_file() and selected.resolve() != Path(sys.executable).resolve():
+            os.execv(str(selected), [str(selected), __file__, *sys.argv[1:]])
+        raise
+
+
+def main() -> int:
+    home = Path(os.environ.get("MESH_MISHE_HOME", str(Path.home() / ".mesh/mishe-tauftauf")))
+    log = Path(os.environ.get("MESH_MISHE_CHAT_LOG", str(Path.home() / ".mesh/chat.log")))
+    baseline_path = Path(os.environ.get("MESH_MISHE_PARITY_BASELINE", str(home / "cleaner-parity-baseline.json")))
+    try:
+        baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+        if set(baseline) != {"epoch", "time"} or type(baseline["epoch"]) is not int or baseline["epoch"] < 0:
+            raise ValueError
+        start = timestamp(baseline["time"])
+        if start.tzinfo is None or start > datetime.now(timezone.utc):
+            raise ValueError
+    except (OSError, UnicodeError, ValueError, TypeError, KeyError):
+        return unknown("baseline")
+
+    events = []
+    all_events = []
+    try:
+        with log.open(encoding="utf-8") as stream:
+            for epoch, line in enumerate(stream, 1):
+                if "[task-ledger]" not in line:
+                    continue
+                current = re.search(r"/current=i:(\d+)", line)
+                if current is None or f"/steps/{current.group(1)}/owner=s:cleaner" not in line:
+                    continue
+                status = single(r"(?:^| \| )/status=s:([^\s|]+)", line)
+                stamp = LEDGER_TIME_RE.match(line)
+                if status not in STATUSES or stamp is None:
+                    return unknown("ledger")
+                when = timestamp(stamp.group(1))
+                all_events.append((epoch, status, when))
+                if epoch > baseline["epoch"]:
+                    if when < start:
+                        return unknown("baseline-window")
+                    events.append((epoch, status, when))
+            log_end = epoch if "epoch" in locals() else 0
+    except (OSError, UnicodeError, ValueError):
+        return unknown("ledger")
+    if baseline["epoch"] > log_end:
+        return unknown("baseline-epoch")
+
+    try:
+        Feed = feed_class()
+        observations = [entry for entry in Feed(home).entries()
+                        if entry.source == "observation/cleaner" and timestamp(entry.timestamp) >= start]
+    except (OSError, UnicodeError, ValueError, ImportError):
+        return unknown("feed")
+    if not observations or not events:
+        return unknown("no-transition")
+
+    epochs = [event[0] for event in all_events]
+    observed = {}
+    latest_epoch = baseline["epoch"]
+    latest_time = start
+    considered = 0
+    first_frame_epoch = None
+    for entry in observations:
+        lines = [line for line in entry.body.splitlines() if line.startswith("CLEANER:")]
+        if len(lines) != 1 or "UNKNOWN" in entry.body:
+            return unknown("observation")
+        match = COUNT_RE.fullmatch(lines[0])
+        if match is None:
+            return unknown("observation")
+        observed_epoch, count = int(match.group(1)), int(match.group(2))
+        if observed_epoch < baseline["epoch"]:
+            continue
+        considered += 1
+        if first_frame_epoch is None:
+            first_frame_epoch = observed_epoch
+        recent = [] if match.group(3) == "NONE" else match.group(3).split(",")
+        if len(recent) > 16 or count != bisect_right(epochs, observed_epoch) or \
+                (recent and observed_epoch != int(recent[-1].split(":", 1)[0])) or \
+                observed_epoch < latest_epoch or observed_epoch > log_end:
+            return unknown("observation-count")
+        expected = [(e, s) for e, s, _ in all_events[:count]][-len(recent):] if recent else []
+        parsed = []
+        for item in recent:
+            found = EVENT_RE.fullmatch(item)
+            if found is None:
+                return unknown("observation-event")
+            parsed.append((int(found.group(1)), found.group(2)))
+        if parsed != expected:
+            return unknown("observation-event")
+        observed_at = timestamp(entry.timestamp)
+        for e, s in parsed:
+            observed.setdefault(e, (s, observed_at))
+        latest_epoch = observed_epoch
+        latest_time = observed_at
+    if not considered:
+        return unknown("no-observation")
+    if any(epoch <= first_frame_epoch and epoch not in observed for epoch, _, _ in events):
+        return unknown("prehistory")
+
+    missing = pending = 0
+    latencies = []
+    for epoch, status, when in events:
+        if epoch in observed:
+            if observed[epoch][0] != status:
+                return unknown("observation-event")
+            latency = (observed[epoch][1] - when).total_seconds()
+            if latency < 0:
+                return unknown("observation-time")
+            latencies.append(latency)
+        elif epoch <= latest_epoch:
+            missing += 1
+        else:
+            pending += 1
+    state = "FAIL" if missing else "PENDING" if pending else "PASS"
+    covered = len(latencies)
+    latency = f"{max(latencies):.0f}s" if latencies else "na"
+    print(f"mishe cleaner parity: {state} covered={covered} missing={missing} pending={pending} "
+          f"latency-max={latency} baseline-epoch={baseline['epoch']} "
+          f"window={baseline['time']}..{latest_time.isoformat().replace('+00:00', 'Z')}; authority=legacy")
+    return 1 if missing else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
