@@ -238,7 +238,7 @@ class SyntheticAdapterTest(unittest.TestCase):
             base = Path(tmp)
             home, repo = base / "core", base / "repo"
             (repo / "scripts").mkdir(parents=True)
-            for name in ("mesh-mishe-render", "mesh-mishe-project", "mesh-mishe-parity", "mesh-mishe-task-bridge"):
+            for name in ("mesh-mishe-render", "mesh-mishe-project", "mesh-mishe-parity", "mesh-mishe-task-bridge", "mesh-mishe-shadow-volume"):
                 shutil.copy2(ROOT / "scripts" / name, repo / "scripts" / name)
             (repo / "scripts/mesh-dash").write_text(
                 "#!/bin/sh\n"
@@ -250,10 +250,15 @@ class SyntheticAdapterTest(unittest.TestCase):
             chat_log = base / "chat.log"
             chat_log.write_text("2026-09-23T03:45:01Z [task-ledger] /chain=s:test | /current=i:0 | /status=s:open | /steps/0/owner=s:cleaner | /steps/0/status=s:open\n",
                                 encoding="utf-8")
+            volume_log = base / "pane-consume.log"
+            volume_log.write_text("", encoding="utf-8")
             env = {**os.environ, "MESH_MISHE_HOME": str(home), "MESH_MISHE_CORE": str(CORE),
                    "MESH_MISHE_PYTHON": "python3", "MESH_REPO": str(repo),
                    "PATH": "/usr/bin:/bin",
-                   "MESH_MISHE_CHAT_LOG": str(chat_log)}
+                   "MESH_MISHE_CHAT_LOG": str(chat_log),
+                   "MESH_MISHE_VOLUME_LEGACY_LOG": str(volume_log),
+                   "MESH_MISHE_VOLUME_START": "2026-09-23T03:00:00Z",
+                   "MESH_MISHE_VOLUME_END": "2026-09-23T04:00:00Z"}
 
             def run(*args):
                 return subprocess.run([str(ROOT / "scripts/mesh-mishe-run"), *args], env=env,
@@ -315,6 +320,7 @@ class SyntheticAdapterTest(unittest.TestCase):
                                     text=True, capture_output=True)
             self.assertEqual(doctor.returncode, 0, doctor.stdout + doctor.stderr)
             self.assertIn("parity: PASS covered=1 missing=0 pending=0", doctor.stdout)
+            self.assertIn("mishe cleaner volume: obs=", doctor.stdout)
             self.assertIn("judge-view: projected-publish-v1", doctor.stdout)
             self.assertIn("task bridge: PASS", doctor.stdout)
             self.assertIn("cleaner=shadow; authority=legacy", doctor.stdout)
@@ -327,6 +333,12 @@ class SyntheticAdapterTest(unittest.TestCase):
             self.assertEqual(delta_doctor.returncode, 0, delta_doctor.stdout + delta_doctor.stderr)
             self.assertIn("judge-view: projected-pair-v1", delta_doctor.stdout)
             self.assertIn("parity: PASS", delta_doctor.stdout)
+            volume_log.unlink()
+            volume_unknown = subprocess.run([str(ROOT / "scripts/mesh-mishe-doctor")], env=delta_env,
+                                            text=True, capture_output=True)
+            self.assertNotEqual(volume_unknown.returncode, 0)
+            self.assertIn("mishe cleaner volume: UNKNOWN", volume_unknown.stdout)
+            volume_log.write_text("", encoding="utf-8")
             (home / ".mesh-mishe-view").write_text("cleaner=disabled\n", encoding="utf-8")
             unsafe = subprocess.run([str(ROOT / "scripts/mesh-mishe-doctor")], env=env,
                                     text=True, capture_output=True)
