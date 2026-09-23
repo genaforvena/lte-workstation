@@ -167,6 +167,8 @@ class SyntheticAdapterTest(unittest.TestCase):
                 "unknowns=0 count-drift=candidates:+1\n"
                 "TASK: PRESENT\n"
                 "TASK-EPOCH: 42\n"
+                "TASK-EVENT-COUNT: 1\n"
+                "TASK-EVENTS: 42:open\n"
                 "held-reasons=protected-root:1\n"
                 "actionable-paths=private-secret-name\n"
                 "held-paths=private-secret-name\n"
@@ -178,6 +180,8 @@ class SyntheticAdapterTest(unittest.TestCase):
             self.assertIn("candidates=2 held=1 actionable=1 delete=0 unknowns=0", result.stdout)
             self.assertIn("task=present", result.stdout)
             self.assertIn("task-epoch=42", result.stdout)
+            self.assertIn("task-event-count=1", result.stdout)
+            self.assertIn("task-events=42:open", result.stdout)
             self.assertNotIn("private-secret-name", result.stdout)
             current.write_text("cleaner scan=invalid candidates=2 held=1 actionable=1 delete=0\n",
                                encoding="utf-8")
@@ -224,12 +228,26 @@ class SyntheticAdapterTest(unittest.TestCase):
             self.assertIn("CLEANER: candidates=1 held=1 actionable=0", feed)
             self.assertIn("task=present", feed)
             self.assertIn("task-epoch=1", feed)
+            self.assertIn("task-event-count=1", feed)
+            self.assertIn("task-events=1:open", feed)
             self.assertNotIn("private-secret-name", feed)
             self.assertFalse((home / "minds/cleaner").exists())
             with chat_log.open("a", encoding="utf-8") as stream:
                 stream.write("2026-09-23T03:45:02Z [task-ledger] /chain=s:test | /current=i:0 | /status=s:complete | /steps/0/owner=s:cleaner | /steps/0/status=s:complete\n")
             self.assertEqual(run("once").returncode, 0)
-            self.assertIn("task-epoch=2", (home / "feed").read_text(encoding="utf-8"))
+            feed = (home / "feed").read_text(encoding="utf-8")
+            self.assertIn("task-epoch=2", feed)
+            self.assertIn("task-event-count=2", feed)
+            self.assertIn("task-events=1:open,2:complete", feed)
+            with chat_log.open("a", encoding="utf-8") as stream:
+                for number in range(3, 21):
+                    status = "open" if number % 2 else "complete"
+                    stream.write(f"2026-09-23T03:45:03Z [task-ledger] /chain=s:test | /current=i:0 | /status=s:{status} | /steps/0/owner=s:cleaner | /steps/0/status=s:{status}\n")
+            self.assertEqual(run("once").returncode, 0)
+            feed = (home / "feed").read_text(encoding="utf-8")
+            self.assertIn("task-event-count=20", feed)
+            self.assertIn("task-events=5:open", feed)
+            self.assertIn("20:complete", feed)
             doctor = subprocess.run([str(ROOT / "scripts/mesh-mishe-doctor")], env=env,
                                     text=True, capture_output=True)
             self.assertEqual(doctor.returncode, 0, doctor.stdout + doctor.stderr)
