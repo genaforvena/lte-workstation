@@ -279,7 +279,8 @@ class SyntheticAdapterTest(unittest.TestCase):
             self.assertEqual(baseline.returncode, 0, baseline.stdout + baseline.stderr)
             with chat_log.open("a", encoding="utf-8") as stream:
                 stream.write("2026-09-23T03:45:02Z [task-ledger] /chain=s:test | /current=i:0 | /status=s:complete | /steps/0/owner=s:cleaner | /steps/0/status=s:complete\n")
-            self.assertEqual(run("once").returncode, 0)
+            first_transition = run("once")
+            self.assertEqual(first_transition.returncode, 0, first_transition.stdout + first_transition.stderr)
             feed = (home / "feed").read_text(encoding="utf-8")
             self.assertIn("cleaner task-ledger epoch=2 status=complete", feed)
             self.assertIn("for top-pain cleaner: wake", feed)
@@ -293,7 +294,8 @@ class SyntheticAdapterTest(unittest.TestCase):
                 for number in range(3, 21):
                     status = "open" if number % 2 else "complete"
                     stream.write(f"2026-09-23T03:45:03Z [task-ledger] /chain=s:test | /current=i:0 | /status=s:{status} | /steps/0/owner=s:cleaner | /steps/0/status=s:{status}\n")
-            self.assertEqual(run("once").returncode, 0)
+            burst = run("once")
+            self.assertEqual(burst.returncode, 0, burst.stdout + burst.stderr)
             feed = (home / "feed").read_text(encoding="utf-8")
             self.assertIn("task-event-count=20", feed)
             self.assertIn("task-events=5:open", feed)

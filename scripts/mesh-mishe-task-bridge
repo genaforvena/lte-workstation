@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Copy exact-owner cleaner task transitions into the observation-only feed."""
 import hashlib
+import hmac
 import fcntl
 import json
 import os
@@ -12,6 +13,8 @@ import sys
 SOURCE = "observation/cleaner-task"
 STATUSES = {"open", "active", "complete", "rejected", "blocked"}
 STATE_NAME = "cleaner-task-bridge.json"
+FIELDS_V1 = {"version", "device", "inode", "offset", "epoch", "baseline_epoch", "last_hash", "last_len", "event_count"}
+FIELDS_V2 = FIELDS_V1 | {"salt", "chain_status", "intent_epochs", "legacy_through_epoch", "baseline_offset"}
 
 
 def fail(reason):
@@ -66,7 +69,141 @@ def event(line, epoch):
     status = re.findall(r"(?:^| \| )/status=s:([^\s|]+)", line)
     if len(status) != 1 or status[0] not in STATUSES:
         raise ValueError("ledger")
-    return f"cleaner task-ledger epoch={epoch} status={status[0]}"
+    chain = re.findall(r"(?:\[task-ledger\] | \| )/chain=s:([^\s|]+)", line)
+    if len(chain) != 1:
+        raise ValueError("ledger")
+    return (f"cleaner task-ledger epoch={epoch} status={status[0]}", status[0], chain[0])
+
+
+def digest(salt, chain):
+    return hmac.new(bytes.fromhex(salt), chain.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def valid_state(state):
+    if not isinstance(state, dict):
+        return False
+    if type(state.get("version")) is not int or state["version"] not in (1, 2):
+        return False
+    fields = FIELDS_V1 if state["version"] == 1 else FIELDS_V2
+    if set(state) != fields:
+        return False
+    if any(type(state[key]) is not int or state[key] < 0
+           for key in ("device", "inode", "offset", "epoch", "baseline_epoch", "last_len", "event_count")):
+        return False
+    if state["baseline_epoch"] > state["epoch"] or not isinstance(state["last_hash"], str):
+        return False
+    if state["epoch"] == 0:
+        if state["last_hash"] != "" or state["last_len"] != 0:
+            return False
+    elif not re.fullmatch(r"[0-9a-f]{64}", state["last_hash"]) or not 1 <= state["last_len"] <= state["offset"]:
+        return False
+    if state["version"] == 2:
+        if type(state["baseline_offset"]) is not int or not 0 <= state["baseline_offset"] <= state["offset"]:
+            return False
+        if not isinstance(state["salt"], str) or not re.fullmatch(r"[0-9a-f]{64}", state["salt"]):
+            return False
+        if not isinstance(state["chain_status"], dict) or any(
+                not isinstance(key, str) or not re.fullmatch(r"[0-9a-f]{64}", key) or
+                not isinstance(value, str) or value not in STATUSES
+                for key, value in state["chain_status"].items()):
+            return False
+        if not isinstance(state["intent_epochs"], list) or any(
+                type(value) is not int or not state["baseline_epoch"] < value <= state["epoch"] for value in state["intent_epochs"]):
+            return False
+        if state["intent_epochs"] != sorted(set(state["intent_epochs"])):
+            return False
+        if type(state["legacy_through_epoch"]) is not int or not state["baseline_epoch"] <= state["legacy_through_epoch"] <= state["epoch"]:
+            return False
+    return True
+
+
+def migrate(state, log, receipts):
+    """Reconcile the v1 cursor and every historical feed row before remembering opens."""
+    salt = os.urandom(32).hex()
+    historical = []
+    chain_status = {}
+    with log.open("rb") as stream:
+        epoch = 0
+        offset = 0
+        baseline_offset = 0
+        for raw in stream:
+            if offset >= state["offset"]:
+                break
+            if not raw.endswith(b"\n") or offset + len(raw) > state["offset"]:
+                raise ValueError("migration-log")
+            epoch += 1
+            offset += len(raw)
+            if epoch == state["baseline_epoch"]:
+                baseline_offset = offset
+            if epoch <= state["baseline_epoch"]:
+                continue
+            parsed = event(raw.decode("utf-8"), epoch)
+            if parsed:
+                body, status, chain = parsed
+                historical.append((epoch, body))
+                chain_status[digest(salt, chain)] = status
+    if offset != state["offset"] or epoch != state["epoch"]:
+        raise ValueError("migration-cursor")
+    events = [receipt for receipt in receipts if receipt.source == SOURCE]
+    observed = []
+    for receipt in events:
+        match = re.fullmatch(r"cleaner task-ledger epoch=(\d+) status=(open|active|complete|rejected|blocked)", receipt.body)
+        if match is None:
+            raise ValueError("migration-feed")
+        observed.append((int(match.group(1)), receipt.body))
+    if observed != historical or len(events) != state["event_count"]:
+        raise ValueError("migration-feed")
+    controls = {(e.source, e.body) for e in receipts}
+    for receipt in events:
+        if (("mishe-tauftauf", f"entry {receipt.sequence} for top-pain cleaner: wake") not in controls or
+                ("mishe-tauftauf", f"wake requested top-pain cleaner for entry {receipt.sequence}") not in controls):
+            raise ValueError("migration-receipt")
+    return {**state, "version": 2, "salt": salt, "chain_status": chain_status,
+            "intent_epochs": [], "legacy_through_epoch": state["epoch"],
+            "baseline_offset": baseline_offset}
+
+
+def audit(state, log, receipts):
+    """Check every post-baseline task row, cycle opening and feed projection."""
+    chain_status = {}
+    intents = []
+    expected = []
+    with log.open("rb") as stream:
+        stream.seek(state["baseline_offset"])
+        offset = state["baseline_offset"]
+        epoch = state["baseline_epoch"]
+        while offset < state["offset"]:
+            raw = stream.readline()
+            if not raw.endswith(b"\n") or offset + len(raw) > state["offset"]:
+                return False
+            offset += len(raw)
+            epoch += 1
+            parsed = event(raw.decode("utf-8"), epoch)
+            if parsed:
+                body, status, chain = parsed
+                expected.append((epoch, body))
+                identity = digest(state["salt"], chain)
+                if epoch > state["legacy_through_epoch"] and status == "open" and chain_status.get(identity) != "open":
+                    intents.append(epoch)
+                chain_status[identity] = status
+    actual = []
+    for receipt in receipts:
+        if receipt.source != SOURCE:
+            continue
+        match = re.fullmatch(r"cleaner task-ledger epoch=(\d+) status=(open|active|complete|rejected|blocked)", receipt.body)
+        if match is None:
+            return False
+        actual.append((int(match.group(1)), receipt.body))
+    return (epoch == state["epoch"] and actual == expected and
+            chain_status == state["chain_status"] and intents == state["intent_epochs"])
+
+
+def route_ok(controls, receipt, intended):
+    expected = "wake" if intended else "irrelevant"
+    dispositions = {kind for kind in ("wake", "observe", "irrelevant", "addressed")
+                    if ("mishe-tauftauf", f"entry {receipt.sequence} for top-pain cleaner: {kind}") in controls}
+    request = ("mishe-tauftauf", f"wake requested top-pain cleaner for entry {receipt.sequence}")
+    return dispositions == {expected} and (request in controls) == intended
 
 
 def main():
@@ -97,21 +234,17 @@ def main():
                     offset += len(line)
                     last_hash = hashlib.sha256(line).hexdigest()
                     last_len = len(line)
-            state = {"version": 1, "device": stat.st_dev, "inode": stat.st_ino,
+            state = {"version": 2, "device": stat.st_dev, "inode": stat.st_ino,
                      "offset": offset, "epoch": epoch, "baseline_epoch": epoch,
-                     "last_hash": last_hash, "last_len": last_len, "event_count": 0}
+                     "last_hash": last_hash, "last_len": last_len, "event_count": 0,
+                     "salt": os.urandom(32).hex(), "chain_status": {},
+                     "intent_epochs": [], "legacy_through_epoch": epoch,
+                     "baseline_offset": offset}
             atomic_state(state_path, state)
             print(f"mishe cleaner task bridge: BASELINED epoch={epoch}; authority=legacy")
             return 0
         state = json.loads(state_path.read_text(encoding="ascii"))
-        if set(state) != {"version", "device", "inode", "offset", "epoch", "baseline_epoch", "last_hash", "last_len", "event_count"} or \
-                state["version"] != 1 or any(type(state[key]) is not int or state[key] < 0
-                                              for key in ("device", "inode", "offset", "epoch", "baseline_epoch", "last_len", "event_count")) or \
-                state["baseline_epoch"] > state["epoch"] or \
-                not isinstance(state["last_hash"], str) or \
-                (state["epoch"] == 0 and (state["last_hash"] != "" or state["last_len"] != 0)) or \
-                (state["epoch"] > 0 and (not re.fullmatch(r"[0-9a-f]{64}", state["last_hash"]) or
-                                           state["last_len"] < 1 or state["last_len"] > state["offset"])):
+        if not valid_state(state):
             return fail("state")
         with log.open("rb") as stream:
             stat = os.fstat(stream.fileno())
@@ -138,11 +271,16 @@ def main():
                 offset += len(raw)
                 last_hash = hashlib.sha256(raw).hexdigest()
                 last_len = len(raw)
-                body = event(raw.decode("utf-8"), epoch)
-                if body:
-                    pending.append(body)
+                parsed = event(raw.decode("utf-8"), epoch)
+                if parsed:
+                    pending.append((epoch, *parsed))
         # Parse the complete feed before writing anything. A corrupt feed is UNKNOWN.
         receipts = feed.entries()
+        if state["version"] == 1:
+            if mode == "check":
+                return fail("migration-required")
+            state = migrate(state, log, receipts)
+            atomic_state(state_path, state)
         event_receipts = [e for e in receipts if e.source == SOURCE]
         event_epochs = []
         for receipt in event_receipts:
@@ -155,34 +293,55 @@ def main():
         expected_count = state["event_count"] + len(pending)
         if len(event_receipts) > expected_count:
             return fail("feed-count")
+        indexed_events = {int(re.search(r"epoch=(\d+)", receipt.body).group(1)): receipt.body
+                          for receipt in event_receipts}
+        if any(indexed_events.get(event_epoch, body) != body for event_epoch, body, _, _ in pending):
+            return fail("feed-events")
         controls = {(e.source, e.body) for e in receipts}
         if mode == "check":
             if pending:
                 return fail("pending")
             if len(event_receipts) != expected_count:
                 return fail("feed-count")
-            if not any(int(re.search(r"epoch=(\d+)", e.body).group(1)) > state["baseline_epoch"]
-                       for e in event_receipts):
-                return fail("no-transition")
+            if not audit(state, log, receipts):
+                return fail("ledger-intents")
+            if not state["intent_epochs"]:
+                return fail("no-new-intent")
             for receipt in event_receipts:
-                disposition = f"entry {receipt.sequence} for top-pain cleaner: wake"
-                request = f"wake requested top-pain cleaner for entry {receipt.sequence}"
-                if ("mishe-tauftauf", disposition) not in controls or ("mishe-tauftauf", request) not in controls:
+                receipt_epoch = int(re.search(r"epoch=(\d+)", receipt.body).group(1))
+                intended = receipt_epoch <= state["legacy_through_epoch"] or receipt_epoch in state["intent_epochs"]
+                if not route_ok(controls, receipt, intended):
                     return fail("route-receipt")
             print(f"mishe cleaner task bridge: PASS epoch={epoch}; authority=legacy")
             return 0
-        for body in pending:
+        chain_status = dict(state["chain_status"])
+        intents = set(state["intent_epochs"])
+        for event_epoch, body, status, chain in pending:
             feed.append_runtime_once(SOURCE, body)
+            identity = digest(state["salt"], chain)
+            if status == "open" and chain_status.get(identity) != "open":
+                intents.add(event_epoch)
+            chain_status[identity] = status
         if len([e for e in feed.entries() if e.source == SOURCE]) != expected_count:
             return fail("feed-count")
-        # These markers are deterministic route receipts. The coordinator sees the
-        # disposition and does not ask System One whether this owner event matters.
-        # Observe-only mode never dispatches a mind or changes legacy wake authority.
+        # Exact-owner task rows receive deterministic dispositions, so the
+        # coordinator cannot re-judge a non-opening row into a wake.
         for receipt in (e for e in feed.entries() if e.source == SOURCE):
-            feed.append_runtime_once("mishe-tauftauf", f"entry {receipt.sequence} for top-pain cleaner: wake")
-            feed.append_runtime_once("mishe-tauftauf", f"wake requested top-pain cleaner for entry {receipt.sequence}")
+            receipt_epoch = int(re.search(r"epoch=(\d+)", receipt.body).group(1))
+            if receipt_epoch in intents or receipt_epoch <= state["legacy_through_epoch"]:
+                feed.append_runtime_once("mishe-tauftauf", f"entry {receipt.sequence} for top-pain cleaner: wake")
+                feed.append_runtime_once("mishe-tauftauf", f"wake requested top-pain cleaner for entry {receipt.sequence}")
+            else:
+                feed.append_runtime_once("mishe-tauftauf", f"entry {receipt.sequence} for top-pain cleaner: irrelevant")
+        final_controls = {(e.source, e.body) for e in feed.entries()}
+        for receipt in (e for e in feed.entries() if e.source == SOURCE):
+            receipt_epoch = int(re.search(r"epoch=(\d+)", receipt.body).group(1))
+            intended = receipt_epoch in intents or receipt_epoch <= state["legacy_through_epoch"]
+            if not route_ok(final_controls, receipt, intended):
+                return fail("route-receipt")
         new_state = {**state, "offset": offset, "epoch": epoch, "last_hash": last_hash,
-                     "last_len": last_len, "event_count": expected_count}
+                     "last_len": last_len, "event_count": expected_count,
+                     "chain_status": chain_status, "intent_epochs": sorted(intents)}
         if new_state != state:
             atomic_state(state_path, new_state)
         print(f"mishe cleaner task bridge: PASS epoch={epoch} events={len(pending)}; authority=legacy")

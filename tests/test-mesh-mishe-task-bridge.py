@@ -40,7 +40,7 @@ class BridgeTest(unittest.TestCase):
 
     def test_transient_burst_replay_and_privacy(self):
         self.assertEqual(self.bridge("baseline").returncode, 0)
-        self.assertIn("no-transition", self.bridge("check").stdout)
+        self.assertIn("no-new-intent", self.bridge("check").stdout)
         with self.log.open("a", encoding="utf-8") as stream:
             for status in ("open", "active", "complete"):
                 stream.write(row(status))
@@ -53,9 +53,11 @@ class BridgeTest(unittest.TestCase):
             f"cleaner task-ledger epoch={i} status={status}"
             for i, status in enumerate(("open", "active", "complete"), 2)])
         raw = (self.home / "feed").read_text()
-        for receipt in self.feed():
+        for receipt in self.feed()[:1]:
             self.assertIn(f"entry {receipt.sequence} for top-pain cleaner: wake", raw)
             self.assertIn(f"wake requested top-pain cleaner for entry {receipt.sequence}", raw)
+        for receipt in self.feed()[1:]:
+            self.assertNotIn(f"entry {receipt.sequence} for top-pain cleaner: wake", raw)
         self.assertEqual(self.bridge("check").returncode, 0)
         with self.log.open("a", encoding="utf-8") as stream:
             for i in range(20):
@@ -71,9 +73,7 @@ class BridgeTest(unittest.TestCase):
         saved["last_len"] = len("unrelated baseline\n")
         saved["event_count"] = 0
         state.write_text(json.dumps(saved))
-        self.assertEqual(self.bridge("once").returncode, 0)
-        self.assertEqual(len(self.feed()), 23)
-        self.assertEqual(self.bridge("once").returncode, 0)
+        self.assertEqual(self.bridge("once").returncode, 2)
         self.assertEqual(len(self.feed()), 23)
 
     def test_gate_rejects_missing_event_count(self):
@@ -86,6 +86,15 @@ class BridgeTest(unittest.TestCase):
         saved["event_count"] += 1
         state.write_text(json.dumps(saved))
         self.assertIn("feed-count", self.bridge("check").stdout)
+
+    def test_non_object_state_fails_closed(self):
+        self.assertEqual(self.bridge("baseline").returncode, 0)
+        state = self.home / "cleaner-task-bridge.json"
+        state.write_text("null\n")
+        result = self.bridge("once")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("UNKNOWN reason=state", result.stdout)
+        self.assertEqual(result.stderr, "")
 
     def test_malformed_and_rewind_fail_closed(self):
         self.assertEqual(self.bridge("baseline").returncode, 0)
@@ -129,11 +138,118 @@ class BridgeTest(unittest.TestCase):
             self.assertEqual(sum(e.body == event.body and e.source == event.source for e in all_entries), 1)
             disposition = f"entry {event.sequence} for top-pain cleaner: wake"
             request = f"wake requested top-pain cleaner for entry {event.sequence}"
-            self.assertEqual(sum(e.body == disposition and e.source == "mishe-tauftauf" for e in all_entries), 1)
-            self.assertEqual(sum(e.body == request and e.source == "mishe-tauftauf" for e in all_entries), 1)
+            self.assertEqual(sum(e.body == disposition and e.source == "mishe-tauftauf" for e in all_entries), int(event == first))
+            self.assertEqual(sum(e.body == request and e.source == "mishe-tauftauf" for e in all_entries), int(event == first))
             self.assertEqual(DISPOSITION_RE.findall(disposition), [(str(event.sequence), "cleaner", "wake")])
         self.assertEqual(self.bridge("once").returncode, 0)
         self.assertEqual(len(feed.entries()), len(all_entries))
+
+    def test_one_intent_per_chain_and_two_distinct_openings(self):
+        self.assertEqual(self.bridge("baseline").returncode, 0)
+        with self.log.open("a", encoding="utf-8") as stream:
+            for chain, status in (("private-A", "open"), ("private-A", "open"),
+                                  ("private-A", "active"), ("private-B", "open"),
+                                  ("private-A", "complete"), ("private-B", "blocked"),
+                                  ("private-A", "open")):
+                stream.write(row(status, chain))
+        self.assertEqual(self.bridge("once").returncode, 0)
+        all_events = self.feed()
+        self.assertEqual(len(all_events), 7)
+        raw = (self.home / "feed").read_text()
+        intents = [event.sequence for event in all_events if
+                   f"entry {event.sequence} for top-pain cleaner: wake" in raw]
+        self.assertEqual(intents, [all_events[0].sequence, all_events[3].sequence,
+                                   all_events[6].sequence])
+        self.assertEqual(self.bridge("check").returncode, 0)
+        state = (self.home / "cleaner-task-bridge.json").read_text()
+        self.assertNotIn("private-A", raw + state)
+        self.assertNotIn("private-B", raw + state)
+        from mishe_tauftauf.feed import Feed
+        Feed(self.home).append_runtime_once("mishe-tauftauf",
+                                            f"entry {all_events[1].sequence} for top-pain cleaner: wake")
+        self.assertIn("route-receipt", self.bridge("check").stdout)
+
+    def test_v1_migration_reconstructs_seen_chains_without_new_intents(self):
+        from mishe_tauftauf.feed import Feed
+        self.assertEqual(self.bridge("baseline").returncode, 0)
+        with self.log.open("a", encoding="utf-8") as stream:
+            stream.write(row("open", "old-secret"))
+            stream.write(row("open", "old-secret"))
+        feed = Feed(self.home)
+        for epoch, status in ((2, "open"), (3, "open")):
+            receipt = feed.append_runtime_once("observation/cleaner-task", f"cleaner task-ledger epoch={epoch} status={status}")
+            feed.append_runtime_once("mishe-tauftauf", f"entry {receipt.sequence} for top-pain cleaner: wake")
+            feed.append_runtime_once("mishe-tauftauf", f"wake requested top-pain cleaner for entry {receipt.sequence}")
+        # v1 cursor reflects both events; v1 emitted wake receipts for each.
+        state_path = self.home / "cleaner-task-bridge.json"
+        state = json.loads(state_path.read_text())
+        lines = self.log.read_bytes().splitlines(keepends=True)
+        state.update(epoch=3, offset=sum(map(len, lines)),
+                     last_len=len(lines[-1]), last_hash=__import__("hashlib").sha256(lines[-1]).hexdigest(),
+                     event_count=2)
+        state = {key: value for key, value in state.items()
+                 if key not in {"salt", "chain_status", "intent_epochs", "legacy_through_epoch", "baseline_offset"}}
+        state["version"] = 1
+        state_path.write_text(json.dumps(state))
+        with self.log.open("a", encoding="utf-8") as stream:
+            stream.write(row("open", "old-secret"))
+            stream.write(row("open", "new-secret"))
+        self.assertEqual(self.bridge("once").returncode, 0)
+        all_events = self.feed()
+        self.assertEqual(len(all_events), 4)
+        raw = (self.home / "feed").read_text()
+        self.assertNotIn(f"entry {all_events[2].sequence} for top-pain cleaner: wake", raw)
+        self.assertIn(f"entry {all_events[3].sequence} for top-pain cleaner: wake", raw)
+        self.assertNotIn("old-secret", raw + state_path.read_text())
+        self.assertNotIn("new-secret", raw + state_path.read_text())
+        self.assertEqual(self.bridge("check").returncode, 0)
+
+    def test_v1_migration_rejects_ambiguous_feed(self):
+        from mishe_tauftauf.feed import Feed
+        self.assertEqual(self.bridge("baseline").returncode, 0)
+        with self.log.open("a", encoding="utf-8") as stream:
+            stream.write(row("open", "private-A"))
+        feed = Feed(self.home)
+        feed.append_runtime_once("observation/cleaner-task", "cleaner task-ledger epoch=2 status=active")
+        result = self.bridge("once")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("UNKNOWN", result.stdout)
+        self.assertNotIn("private-A", result.stdout)
+
+    def test_migration_waits_for_new_cycle_and_gate_audits_intents(self):
+        from mishe_tauftauf.feed import Feed
+        self.assertEqual(self.bridge("baseline").returncode, 0)
+        with self.log.open("a", encoding="utf-8") as stream:
+            stream.write(row("open", "private-A"))
+        feed = Feed(self.home)
+        old = feed.append_runtime_once("observation/cleaner-task", "cleaner task-ledger epoch=2 status=open")
+        feed.append_runtime_once("mishe-tauftauf", f"entry {old.sequence} for top-pain cleaner: wake")
+        feed.append_runtime_once("mishe-tauftauf", f"wake requested top-pain cleaner for entry {old.sequence}")
+        state_path = self.home / "cleaner-task-bridge.json"
+        state = json.loads(state_path.read_text())
+        last = row("open", "private-A").encode()
+        state.update(version=1, epoch=2, offset=self.log.stat().st_size,
+                     event_count=1, last_len=len(last),
+                     last_hash=__import__("hashlib").sha256(last).hexdigest())
+        for key in ("salt", "chain_status", "intent_epochs", "legacy_through_epoch", "baseline_offset"):
+            del state[key]
+        state_path.write_text(json.dumps(state))
+        self.assertIn("migration-required", self.bridge("check").stdout)
+        self.assertEqual(self.bridge("once").returncode, 0)
+        self.assertIn("no-new-intent", self.bridge("check").stdout)
+        with self.log.open("a", encoding="utf-8") as stream:
+            stream.write(row("open", "private-A"))
+        self.assertEqual(self.bridge("once").returncode, 0)
+        self.assertIn("no-new-intent", self.bridge("check").stdout)
+        with self.log.open("a", encoding="utf-8") as stream:
+            stream.write(row("blocked", "private-A"))
+            stream.write(row("open", "private-A"))
+        self.assertEqual(self.bridge("once").returncode, 0)
+        self.assertEqual(self.bridge("check").returncode, 0)
+        state = json.loads(state_path.read_text())
+        state["intent_epochs"] = [3]
+        state_path.write_text(json.dumps(state))
+        self.assertIn("ledger-intents", self.bridge("check").stdout)
 
 
 if __name__ == "__main__":
