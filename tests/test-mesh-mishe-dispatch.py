@@ -216,6 +216,44 @@ class DispatchTest(unittest.TestCase):
         self.assertEqual(json.loads(due.stdout)["results"][0]["status"], "delivered")
         self.assertEqual(len(json.loads((self.home / "sink-ledger.json").read_text())), 1)
 
+    def test_live_eligibility_adapter_controls_synthetic_sink(self):
+        self.activate()
+        self.request()
+        path = self.home / "dispatch-policy/synthetic.json"
+        policy = json.loads(path.read_text())
+        policy.update({"evidence_mode": "live", "kind": "telemetry"})
+        path.write_text(json.dumps(policy))
+        adapter = self.home / "adapter"
+        adapter.write_text("#!/usr/bin/env python3\nimport json,os,sys\n"
+                           "status=os.environ.get('ADMIT_STATUS','held')\n"
+                           "print(json.dumps({'channel':sys.argv[1], 'status':status, 'reason':'live-probe'}))\n"
+                           "sys.exit({'eligible':0,'held':1,'refused':1,'unknown':2}[status])\n")
+        adapter.chmod(0o755)
+        self.env["MESH_MISHE_ELIGIBILITY_BIN"] = str(adapter)
+        held = self.run_cmd("mesh-mishe-dispatch", "--once", "synthetic")
+        self.assertEqual(json.loads(held.stdout)["results"][0]["status"], "held")
+        self.assertFalse((self.home / "sink-ledger.json").exists())
+        self.env["ADMIT_STATUS"] = "eligible"
+        delivered = self.run_cmd("mesh-mishe-dispatch", "--once", "synthetic")
+        self.assertEqual(json.loads(delivered.stdout)["results"][0]["status"], "delivered")
+
+    def test_ambiguous_claim_reconciles_receipt_without_new_eligibility_or_send(self):
+        self.activate()
+        self.request()
+        failed = subprocess.run([str(ROOT / "scripts/mesh-mishe-dispatch"), "--once", "synthetic"],
+                                env={**self.env, "MESH_MISHE_FAULT": "after-claim"}, capture_output=True)
+        self.assertNotEqual(failed.returncode, 0)
+        key = "synthetic:1:3"
+        (self.home / "sink-ledger.json").write_text(json.dumps({key: "delivered"}))
+        path = self.home / "dispatch-policy/synthetic.json"
+        policy = json.loads(path.read_text())
+        policy["mind_state"] = "busy"
+        path.write_text(json.dumps(policy))
+        reconciled = self.run_cmd("mesh-mishe-dispatch", "--once", "synthetic")
+        self.assertEqual(reconciled.returncode, 0, reconciled.stderr)
+        self.assertEqual(json.loads(reconciled.stdout)["results"][0]["status"], "delivered")
+        self.assertEqual(json.loads((self.home / "sink-ledger.json").read_text()), {key: "delivered"})
+
 
 if __name__ == "__main__":
     unittest.main()

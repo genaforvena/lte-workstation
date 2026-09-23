@@ -54,6 +54,36 @@ class AutomaticEventTest(unittest.TestCase):
         event.write_text("broken")
         self.assertNotEqual(self.call("import", "synthetic").returncode, 0)
 
+    def test_live_shadow_drain_is_bounded_and_restart_safe(self):
+        digest = "a" * 64
+        first = self.call("begin", "cleaner", "mesh-feed", digest)
+        second = self.call("begin", "health", "mesh-dispatch", digest)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        one = self.call("drain", "--limit", "1")
+        self.assertEqual(one.returncode, 0, one.stderr)
+        self.assertEqual(json.loads(one.stdout)["imported"], 1)
+        self.assertEqual((self.home / "feed").read_text().count("automatic channel="), 1)
+        two = self.call("drain", "--limit", "1")
+        self.assertEqual(two.returncode, 0, two.stderr)
+        self.assertEqual(json.loads(two.stdout)["imported"], 1)
+        self.assertEqual((self.home / "feed").read_text().count("automatic channel="), 2)
+        self.assertEqual(json.loads(self.call("drain").stdout)["imported"], 0)
+        self.assertEqual(self.call("finish", first.stdout.strip(), "delivered").returncode, 0)
+        self.assertEqual(json.loads(self.call("drain").stdout)["imported"], 1)
+        feed = (self.home / "feed").read_text()
+        self.assertIn("status=delivered", feed)
+        self.assertEqual(feed.count("automatic channel="), 3)
+        self.assertEqual(json.loads(self.call("drain").stdout)["imported"], 0)
+
+    def test_drain_rejects_corruption_before_import(self):
+        self.assertEqual(self.call("begin", "cleaner", "mesh-feed", "b" * 64).returncode, 0)
+        event = next((self.home / "automatic-events/events").glob("*.json"))
+        event.write_text("broken")
+        bad = self.call("drain")
+        self.assertEqual(bad.returncode, 2)
+        self.assertFalse((self.home / "feed").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

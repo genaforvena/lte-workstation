@@ -155,7 +155,7 @@ def sink_status(sink: str, key: str) -> str:
 
 
 def synthetic_policy(channel: str) -> tuple[str, str]:
-    """Deterministic synthetic admission; live owner evidence has no adapter yet."""
+    """Deterministic synthetic admission, optionally using Mesh's live evidence adapter."""
     path = home() / "dispatch-policy" / f"{channel}.json"
     value = read_json(path)
     if (value.get("version") != 1 or value.get("channel") != channel
@@ -168,6 +168,30 @@ def synthetic_policy(channel: str) -> tuple[str, str]:
         raise BoundaryError("synthetic dispatch policy malformed or unavailable")
     if value["private"] or value["protected"]:
         return "refused", "private-or-protected-domain"
+    if value.get("evidence_mode") == "live":
+        kind = value.get("kind")
+        task_id = value.get("task_id")
+        if (kind not in ("task", "telemetry", "self-pick")
+                or (kind == "task") != (task_id is not None)
+                or task_id is not None and not isinstance(task_id, str)):
+            raise BoundaryError("invalid live eligibility policy")
+        command = os.environ.get("MESH_MISHE_ELIGIBILITY_BIN", str(Path(__file__).with_name("mesh-mishe-eligibility")))
+        try:
+            probe = subprocess.run([command, channel, kind, *([task_id] if task_id else [])],
+                                   text=True, capture_output=True, timeout=45)
+            evidence = json.loads(probe.stdout)
+        except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
+            raise BoundaryError("live eligibility unavailable") from exc
+        status = evidence.get("status")
+        if (evidence.get("channel") != channel or status not in ("eligible", "held", "refused", "unknown")
+                or probe.returncode != {"eligible": 0, "held": 1, "refused": 1, "unknown": 2}[status]
+                or not isinstance(evidence.get("reason"), str)):
+            raise BoundaryError("live eligibility verdict invalid")
+        if status == "unknown":
+            raise BoundaryError(f"live eligibility UNKNOWN: {evidence['reason']}")
+        return status, evidence["reason"]
+    if value.get("evidence_mode", "fixture") != "fixture":
+        raise BoundaryError("unknown eligibility evidence mode")
     if value["task_owner"] is not None:
         return "held", "canonical-task-eligibility-unverified"
     if value["mind_state"] == "unknown":
@@ -181,7 +205,33 @@ def synthetic_policy(channel: str) -> tuple[str, str]:
     return "eligible", "synthetic-admitted"
 
 
-def dispatch_once(channel: str) -> dict:
+def retry_clock() -> int:
+    fixture = os.environ.get("MESH_MISHE_NOW")
+    if fixture is not None:
+        if not fixture.isdecimal():
+            raise BoundaryError("invalid retry clock fixture")
+        return int(fixture)
+    return int(time.time())
+
+
+def hold_retry(item: dict, reason: str) -> dict:
+    base = os.environ.get("MESH_MISHE_RETRY_BASE", "5")
+    if not base.isdecimal() or int(base) > 300:
+        raise BoundaryError("invalid retry base")
+    attempts = item.get("hold_attempts", 0)
+    if type(attempts) is not int or attempts < 0:
+        raise BoundaryError("invalid hold attempts")
+    attempts += 1
+    item["hold_attempts"] = attempts
+    item["status"] = "held"
+    item["reason"] = reason
+    item["next_retry_at"] = retry_clock() + min(300, int(base) * (2 ** min(attempts - 1, 10)))
+    return item
+
+
+def dispatch_once(channel: str, limit: int = 8) -> dict:
+    if not 1 <= limit <= 64:
+        raise BoundaryError("dispatch limit must be 1..64")
     with channel_lock(channel):
         current = read_authority(channel)
         if current["authority"] != "mishe":
@@ -193,6 +243,8 @@ def dispatch_once(channel: str) -> dict:
         by_sequence = {entry.sequence: entry for entry in entries}
         results = []
         for entry in entries:
+            if len(results) >= limit:
+                break
             if entry.sequence <= current["active_feed_seq"] or entry.source != "mishe-tauftauf":
                 continue
             if entry.body.startswith(f"wake requested top-pain {channel}") and not REQUEST.fullmatch(entry.body):
@@ -207,15 +259,23 @@ def dispatch_once(channel: str) -> dict:
             if (item.get("key") != key or item.get("status") not in
                     ("pending", "held", "claimed", "unknown", "refused", "delivered")):
                 raise BoundaryError("outbox record invalid")
+            if item["status"] == "held":
+                retry_at = item.get("next_retry_at", 0)
+                if type(retry_at) is not int or retry_at < 0:
+                    raise BoundaryError("invalid retry deadline")
+                if retry_at > retry_clock():
+                    results.append({"key": key, "status": "held", "reason": item.get("reason"),
+                                    "retry_after": retry_at})
+                    continue
             stimulus = by_sequence.get(int(match.group(2)))
             if (stimulus is None or stimulus.sequence >= entry.sequence
                     or stimulus.source != "observation/synthetic"):
                 if item["status"] not in ("pending", "held"):
                     raise BoundaryError("ungrounded request has an attempted sink identity")
-                item["status"] = "held"
-                item["reason"] = "ungrounded-stimulus"
+                hold_retry(item, "ungrounded-stimulus")
                 atomic_json(path, item)
-                results.append({"key": key, "status": "held", "reason": item["reason"]})
+                results.append({"key": key, "status": "held", "reason": item["reason"],
+                                "retry_after": item["next_retry_at"]})
                 continue
             if item["status"] == "delivered":
                 results.append({"key": key, "status": "delivered"})
@@ -223,14 +283,24 @@ def dispatch_once(channel: str) -> dict:
             if item["status"] == "refused":
                 results.append({"key": key, "status": "refused"})
                 continue
+            if item["status"] in ("claimed", "unknown"):
+                status = sink_status(sink, key)
+                item["status"] = status if status in ("delivered", "refused") else "unknown"
+                atomic_json(path, item)
+                results.append({"key": key, "status": item["status"]})
+                continue
             admission, reason = synthetic_policy(channel)
             if admission != "eligible":
-                if item["status"] in ("claimed", "unknown"):
-                    raise BoundaryError("policy changed while sink identity is ambiguous")
-                item["status"] = admission
-                item["reason"] = reason
+                if admission == "held":
+                    hold_retry(item, reason)
+                else:
+                    item["status"] = admission
+                    item["reason"] = reason
                 atomic_json(path, item)
-                results.append({"key": key, "status": admission, "reason": reason})
+                result = {"key": key, "status": admission, "reason": reason}
+                if admission == "held":
+                    result["retry_after"] = item["next_retry_at"]
+                results.append(result)
                 continue
             atomic_json(path, item)
             status = sink_status(sink, key)
@@ -238,10 +308,6 @@ def dispatch_once(channel: str) -> dict:
                 item["status"] = "delivered"
             elif status == "refused":
                 item["status"] = "refused"
-            elif item["status"] in ("claimed", "unknown"):
-                item["status"] = "unknown"
-            elif item["status"] == "refused":
-                pass
             else:
                 # Lock covers this check and the side effect: a switch cannot race us.
                 if read_authority(channel) != current:
