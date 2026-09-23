@@ -154,7 +154,7 @@ def run() -> None:
         stalled_tape = watch.TAPE.read_text(encoding="utf-8").splitlines()[-1]
         if "active-task-stalled-genome/landing-for-" not in stalled_tape:
             raise AssertionError(f"stalled active claim lacked exact task evidence: {stalled_tape}")
-        if len(recovery_wakes) != 1 or recovery_wakes[0][2] != "genome" or "genome/landing" not in recovery_wakes[0][-1]:
+        if len(recovery_wakes) != 1 or recovery_wakes[0][3] != "genome" or "genome/landing" not in recovery_wakes[0][-1]:
             raise AssertionError(f"stalled active claim did not wake its exact owner: {recovery_wakes}")
         # Triage rows are the detector's own repair queue: an aged
         # health-warning triage must never read as stalled work nor wake triage
@@ -279,7 +279,7 @@ def run() -> None:
                         taken[0] = True  # The owner claims the row after the queue snapshot.
                 elif argv == [watch.MIND_STATE, "--stats"]:
                     out = "WINDOW\tSTATE\nhealth\tWORKING\nwitness\tWORKING\n"
-                elif argv[:2] == [watch.TELL, "--origin"]:
+                elif argv[:3] == [watch.TELL, "--automatic", "--origin"]:
                     pass
                 elif argv[0] == watch.CHAT:
                     pass
