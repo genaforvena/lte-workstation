@@ -27,7 +27,8 @@ class DispatchTest(unittest.TestCase):
                              "sys.exit(2)\n")
         self.sink.chmod(0o755)
         self.env = {**os.environ, "MESH_MISHE_HOME": str(self.home), "MESH_MISHE_CORE": str(CORE),
-                    "MESH_MISHE_SINK": str(self.sink), "SINK_LEDGER": str(self.home / "sink-ledger.json")}
+                    "MESH_MISHE_SINK": str(self.sink), "SINK_LEDGER": str(self.home / "sink-ledger.json"),
+                    "MESH_MISHE_RETRY_BASE": "0", "MESH_DIR": str(self.home / "mesh")}
 
     def run_cmd(self, name, *args):
         return subprocess.run([str(ROOT / "scripts" / name), *args], env=self.env, text=True, capture_output=True)
@@ -64,6 +65,43 @@ class DispatchTest(unittest.TestCase):
         self.assertEqual(list(ledger), ["synthetic:1:3"])
         self.assertEqual(self.run_cmd("mesh-mishe-dispatch", "--once", "synthetic").returncode, 0)
         self.assertEqual(json.loads((self.home / "sink-ledger.json").read_text()), ledger)
+
+    def test_synthetic_delivered_identity_launches_one_shot_bridge(self):
+        self.activate()
+        self.request()
+        mind = self.home / "mind"
+        mind.write_text("#!/usr/bin/env python3\nimport json,os,sys\nfrom pathlib import Path\n"
+                        "a=sys.argv[1:]; p=Path(a[a.index('--event-file')+1]); "
+                        "event=json.loads(p.read_text()); assert event['channel']=='synthetic'; "
+                        "assert 'STATE: RED' not in p.read_text(); "
+                        "Path(os.environ['MIND_CALLS']).open('a').write(event['request_id']+'\\n'); "
+                        "r=Path(os.environ['MESH_DIR'])/'mishe-mind/synthetic'/ (event['request_id']+'.json'); "
+                        "r.parent.mkdir(parents=True,exist_ok=True); r.write_text(json.dumps({'status':'settled'}))\n")
+        mind.chmod(0o755)
+        self.env.update(MESH_MISHE_MIND_CMD=str(mind), MIND_CALLS=str(self.home / "mind-calls"))
+        result = self.run_cmd("mesh-mishe-dispatch", "--mind-once", "synthetic")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["results"][0]["status"], "mind-settled")
+        self.assertEqual((self.home / "mind-calls").read_text().splitlines(), ["synthetic-g1-r3"])
+        again = self.run_cmd("mesh-mishe-dispatch", "--mind-once", "synthetic")
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertEqual((self.home / "mind-calls").read_text().splitlines(), ["synthetic-g1-r3"] * 2)
+        refused = self.run_cmd("mesh-mishe-dispatch", "--mind-once", "cleaner")
+        self.assertEqual(refused.returncode, 2)
+        self.assertIn("only synthetic", refused.stderr)
+
+    def test_failed_synthetic_mind_is_unknown_with_retry_identity(self):
+        self.activate()
+        self.request()
+        mind = self.home / "mind-fail"
+        mind.write_text("#!/bin/sh\nexit 7\n")
+        mind.chmod(0o755)
+        self.env["MESH_MISHE_MIND_CMD"] = str(mind)
+        failed = self.run_cmd("mesh-mishe-dispatch", "--mind-once", "synthetic")
+        self.assertEqual(failed.returncode, 2)
+        row = json.loads(failed.stdout)["results"][0]
+        self.assertEqual(row["status"], "unknown")
+        self.assertEqual(row["request_id"], "synthetic-g1-r3")
 
     def test_claimed_send_without_sink_confirmation_stays_unknown(self):
         self.activate()
@@ -156,6 +194,27 @@ class DispatchTest(unittest.TestCase):
         path.write_text(json.dumps(policy))
         delivered = self.run_cmd("mesh-mishe-dispatch", "--once", "synthetic")
         self.assertEqual(json.loads(delivered.stdout)["results"][0]["status"], "delivered")
+
+    def test_held_retry_is_bounded_and_never_sends_before_due(self):
+        self.activate()
+        self.request()
+        self.env["MESH_MISHE_RETRY_BASE"] = "2"
+        self.env["MESH_MISHE_NOW"] = "1000"
+        path = self.home / "dispatch-policy/synthetic.json"
+        policy = json.loads(path.read_text())
+        policy["mind_state"] = "busy"
+        path.write_text(json.dumps(policy))
+        first = self.run_cmd("mesh-mishe-dispatch", "--once", "synthetic")
+        self.assertEqual(json.loads(first.stdout)["results"][0]["retry_after"], 1002)
+        policy["mind_state"] = "idle"
+        path.write_text(json.dumps(policy))
+        before_due = self.run_cmd("mesh-mishe-dispatch", "--once", "synthetic")
+        self.assertEqual(json.loads(before_due.stdout)["results"][0]["status"], "held")
+        self.assertFalse((self.home / "sink-ledger.json").exists())
+        self.env["MESH_MISHE_NOW"] = "1002"
+        due = self.run_cmd("mesh-mishe-dispatch", "--once", "synthetic")
+        self.assertEqual(json.loads(due.stdout)["results"][0]["status"], "delivered")
+        self.assertEqual(len(json.loads((self.home / "sink-ledger.json").read_text())), 1)
 
 
 if __name__ == "__main__":

@@ -62,6 +62,7 @@ elif mode=='no-handoff':
     pass
 else:
     token=os.environ['MESH_MISHE_INVOCATION']
+    (root/'omp-prompt').write_text(sys.argv[-1])
     (Path(os.environ['MESH_MISHE_HOME'])/'handoffs/cleaner.md').write_text('invocation:'+token)
     with (root/'chat.log').open('a') as f: f.write('[fyi] invocation:'+token+'\\n')
     if (root/'task-state').exists():
@@ -90,13 +91,29 @@ else:
     def call(self, task=False):
         return subprocess.run(self.command(task), env=self.env, capture_output=True, text=True, timeout=20)
 
+    def check(self):
+        return subprocess.run([sys.executable, str(SCRIPT), "--check", "cleaner"],
+                              env=self.env, capture_output=True, text=True, timeout=5)
+
+    def create_wip_ref(self):
+        def git(*args):
+            return subprocess.run(["git", "-C", str(self.root), *args], check=True,
+                                  capture_output=True, text=True).stdout.strip()
+        git("init", "-q")
+        git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-qm", "base")
+        commit = git("rev-parse", "HEAD")
+        git("update-ref", "refs/wip/cleaner", commit)
+        return commit
+
     def test_noop_receipt_and_repeat(self):
+        self.assertIn("DISABLED", self.check().stdout)
         first = self.call()
         self.assertEqual(first.returncode, 0, first.stderr)
         self.assertEqual(self.call().returncode, 0)
         record = json.loads((self.root / "mesh/mishe-mind/cleaner/req1.json").read_text())
         self.assertEqual(record["status"], "settled")
         self.assertIn("input_sha256", record)
+        self.assertIn("PASS", self.check().stdout)
 
     def test_task_claim_and_verified_artifact(self):
         result = self.call(task=True)
@@ -109,6 +126,8 @@ else:
         self.assertEqual(first.returncode, 2)
         self.assertIn("handoffs/cleaner.md", first.stderr)
         self.assertEqual(json.loads((self.root / "mesh/mishe-mind/cleaner/req1.json").read_text())["status"], "running")
+        self.assertEqual(self.check().returncode, 2)
+        self.assertIn("orphan invocation", self.check().stdout)
         (self.root / "mesh/omp-mode").write_text("settle")
         self.assertEqual(self.call().returncode, 0)
 
@@ -138,6 +157,7 @@ else:
             self.assertTrue(marker.exists())
             child.kill()
             child.wait(timeout=5)
+            self.assertEqual(self.check().returncode, 2)
             (self.root / "mesh/take-sleep").unlink()
             recovered = self.call(task=True)
             self.assertEqual(recovered.returncode, 0, recovered.stderr)
@@ -150,6 +170,7 @@ else:
                 child.stderr.close()
 
     def test_kill_after_claim_and_lease_release(self):
+        commit = self.create_wip_ref()
         (self.root / "mesh/omp-mode").write_text("sleep")
         child = subprocess.Popen(self.command(task=True), env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
@@ -167,6 +188,7 @@ else:
             (self.root / "mesh/omp-mode").write_text("settle")
             recovered = self.call(task=True)
             self.assertEqual(recovered.returncode, 0, recovered.stderr)
+            self.assertIn("refs/wip/cleaner " + commit, (self.root / "mesh/omp-prompt").read_text())
         finally:
             if child.poll() is None:
                 child.kill()
@@ -179,6 +201,14 @@ else:
         self.event.write_text(json.dumps({"channel": "pub", "request_id": "req1"}))
         self.assertEqual(self.call().returncode, 2)
         self.assertFalse((self.root / "mesh/mishe-mind/cleaner/req1.json").exists())
+
+    def test_verified_wip_pointer_reaches_recovery_prompt(self):
+        commit = self.create_wip_ref()
+        result = self.call()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        record = json.loads((self.root / "mesh/mishe-mind/cleaner/req1.json").read_text())
+        self.assertEqual(record["wip_commit"], commit)
+        self.assertIn("refs/wip/cleaner " + commit, (self.root / "mesh/omp-prompt").read_text())
 
 
 if __name__ == "__main__":
