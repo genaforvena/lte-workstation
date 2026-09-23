@@ -156,6 +156,70 @@ class SyntheticAdapterTest(unittest.TestCase):
             self.assertIn("UNKNOWN", result.stdout)
             self.assertNotIn("fixture-private", result.stdout)
 
+    def test_cleaner_projection_is_bounded_and_private(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            previous, current = base / "previous", base / "current"
+            previous.write_text("", encoding="utf-8")
+            current.write_text(
+                "cleaner scan=2026-09-23T03:45:01Z head=" + "a" * 40 +
+                " candidates=2 held=1 actionable=1 delete=0 oldest=private-secret-name\n"
+                "unknowns=0 count-drift=candidates:+1\n"
+                "held-reasons=protected-root:1\n"
+                "actionable-paths=private-secret-name\n"
+                "held-paths=private-secret-name\n"
+                "unknown-paths=none\n", encoding="utf-8")
+            result = subprocess.run([str(ROOT / "scripts/mesh-mishe-project"), "--channel", "cleaner",
+                                     str(previous), str(current)], text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("STATE: INTERMEDIATE", result.stdout)
+            self.assertIn("candidates=2 held=1 actionable=1 delete=0 unknowns=0", result.stdout)
+            self.assertNotIn("private-secret-name", result.stdout)
+            current.write_text("cleaner scan=invalid candidates=2 held=1 actionable=1 delete=0\n",
+                               encoding="utf-8")
+            malformed = subprocess.run([str(ROOT / "scripts/mesh-mishe-project"), "--channel", "cleaner",
+                                        str(previous), str(current)], text=True, capture_output=True)
+            self.assertEqual(malformed.stdout, "STATE: UNKNOWN\n")
+
+    def test_cleaner_enrollment_observes_without_dispatch(self):
+        if CORE is None:
+            self.skipTest("set MESH_MISHE_CORE")
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            home, repo = base / "core", base / "repo"
+            (repo / "scripts").mkdir(parents=True)
+            for name in ("mesh-mishe-render", "mesh-mishe-project"):
+                shutil.copy2(ROOT / "scripts" / name, repo / "scripts" / name)
+            (repo / "scripts/mesh-dash").write_text(
+                "#!/bin/sh\n"
+                "printf '%s\\n' 'cleaner scan=2026-09-23T03:45:01Z head=" + "a" * 40 +
+                " candidates=1 held=1 actionable=0 delete=0 oldest=private-secret-name' "
+                "'unknowns=0 count-drift=candidates:+1' 'held-paths=private-secret-name'\n",
+                encoding="utf-8")
+            (repo / "scripts/mesh-dash").chmod(0o755)
+            env = {**os.environ, "MESH_MISHE_HOME": str(home), "MESH_MISHE_CORE": str(CORE),
+                   "MESH_MISHE_PYTHON": "python3", "MESH_REPO": str(repo)}
+
+            def run(*args):
+                return subprocess.run([str(ROOT / "scripts/mesh-mishe-run"), *args], env=env,
+                                      text=True, capture_output=True)
+
+            self.assertEqual(run("init").returncode, 0)
+            (home / "synthetic.state").write_text("STATE: GREEN\n", encoding="utf-8")
+            enrolled = run("enroll-cleaner")
+            self.assertEqual(enrolled.returncode, 0, enrolled.stderr)
+            self.assertTrue((home / "top-pains/cleaner").is_file())
+            observed = run("once")
+            self.assertEqual(observed.returncode, 0, observed.stderr)
+            feed = (home / "feed").read_text(encoding="utf-8")
+            self.assertIn("CLEANER: candidates=1 held=1 actionable=0", feed)
+            self.assertNotIn("private-secret-name", feed)
+            self.assertFalse((home / "minds/cleaner").exists())
+            doctor = subprocess.run([str(ROOT / "scripts/mesh-mishe-doctor")], env=env,
+                                    text=True, capture_output=True)
+            self.assertEqual(doctor.returncode, 0, doctor.stdout + doctor.stderr)
+            self.assertIn("cleaner=shadow; authority=legacy", doctor.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
