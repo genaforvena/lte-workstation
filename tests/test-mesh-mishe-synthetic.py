@@ -16,6 +16,18 @@ CORE = Path(os.environ["MESH_MISHE_CORE"]) if os.environ.get("MESH_MISHE_CORE") 
 
 
 class SyntheticAdapterTest(unittest.TestCase):
+    def test_default_state_path_works_without_shell_override(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "core"
+            home.mkdir()
+            (home / "synthetic.state").write_text("STATE: GREEN\n", encoding="utf-8")
+            env = {**os.environ, "MESH_MISHE_HOME": str(home)}
+            env.pop("MESH_MISHE_SYNTHETIC_FILE", None)
+            result = subprocess.run([str(ROOT / "scripts/mesh-mishe-render"), "synthetic"],
+                                    env=env, text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "STATE: GREEN\n")
+
     def test_renderer_projection_and_observe_only_feed(self):
         if CORE is None or not (CORE / "src/mishe_tauftauf/__main__.py").is_file():
             self.skipTest("set MESH_MISHE_CORE to the Phase 1 public core worktree")
