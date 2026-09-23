@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Closed-window parity compares IDs, not approximate timestamps or private text."""
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -41,6 +42,23 @@ class ClosedParityTest(unittest.TestCase):
         result = self.check()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("PASS channel=tg sample=2 matched=2 missing=0 late=0 duplicate=0 invalid=0", result.stdout)
+
+    def test_shared_normalizer_identity_closes_window_without_pane_text(self):
+        key = self.base / "projection.key"
+        key.write_bytes(b"z" * 32)
+        key.chmod(0o600)
+        secret = "fixture-private-closed-window"
+        env = {**os.environ, "MESH_MISHE_HOME": str(self.base)}
+        observed = subprocess.run([str(ROOT / "scripts/mesh-pane-consume"), "--pane-identity", "tg"],
+                                  input=f"status=UP\n{secret}\n", env=env, capture_output=True, text=True)
+        self.assertEqual(observed.returncode, 0, observed.stderr)
+        identity = observed.stdout.strip()
+        self.write([{"channel": "tg", "event_id": identity, "kind": "pane", "at": "2026-09-23T04:00:10Z"}],
+                   [{"channel": "tg", "event_id": identity, "kind": "pane", "at": "2026-09-23T04:00:20Z",
+                     "source": "top-pane", "feed_seq": 7}])
+        result = self.check()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn(secret.encode(), self.legacy.read_bytes() + self.projected.read_bytes() + result.stdout.encode())
 
     def test_zero_evidence_is_unknown(self):
         self.write([], [])
