@@ -246,6 +246,15 @@ class FleetProjectionTest(unittest.TestCase):
                              ("tg", "pane", "top-pane"))
             self.assertGreater(rows[0]["feed_seq"], 0)
             self.assertNotIn(secret.encode(), tape.read_bytes() + (home / "feed").read_bytes())
+            refused = subprocess.run([str(run), "once", "--channel", "tg"],
+                                     env={**env, "MESH_MISHE_SKIP_AUTO_DRAIN": "1"},
+                                     capture_output=True, text=True)
+            self.assertEqual(refused.returncode, 2)
+            (home / ".fleet-shadow-hold").write_text("fixture hold\n")
+            allowed = subprocess.run([str(run), "once", "--channel", "tg"],
+                                     env={**env, "MESH_MISHE_SKIP_AUTO_DRAIN": "1"},
+                                     capture_output=True, text=True)
+            self.assertEqual(allowed.returncode, 0, allowed.stderr)
 
 
 if __name__ == "__main__":
