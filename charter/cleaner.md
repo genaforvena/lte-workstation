@@ -13,3 +13,8 @@ remains the sole landing writer.
 Owed artifacts are scan manifests, disposition receipts, documentation review
 packets, and exact-owner task handoffs. Use `[task]` for repairs, `[fyi]` for a
 held risk, and `[done]` only with a verifiable artifact.
+
+Scan manifests use Git's NUL-delimited status records: candidate `path` is the
+literal working-tree name (for staged renames, the destination), not Git's quoted
+display text. A candidate with an unreadable repository is UNKNOWN, never an
+empty successful inventory.
