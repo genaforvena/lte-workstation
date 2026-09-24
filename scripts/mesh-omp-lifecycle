@@ -4,7 +4,7 @@
 omp is the third engine on this node (beside Codex and opencode). It has no hooks.json;
 the wiring is an omp extension module (omp-lifecycle.ts) that shells out here:
   session_start          → --start   (charter+handoff restore + task reconcile)
-  agent_end !willContinue → a JSON event on stdin (receipt + handoff + TURN + reset)
+  session_stop          → --receipt (JSON turn event, handoff + TURN + reset)
   process exit           → --end     (last-chance drain)
 A cron/reflex calls --drain to retry pending receipts; --ready asks whether any remain.
 
@@ -47,6 +47,37 @@ def run(*args, **kwargs):
     return subprocess.run(args, text=True, capture_output=True, timeout=40, **kwargs)
 
 
+def require_persistent():
+    if any(key in os.environ for key in ("MESH_MISHE_INVOCATION", "MISHE_TAUFTAUF_INVOCATION")):
+        raise PermissionError("disposable mishe invocation does not own persistent lifecycle")
+
+
+@contextlib.contextmanager
+def legacy_authority(win):
+    """Keep legacy effects inside a read lease; authority switches are exclusive."""
+    require_persistent()
+    if not re.fullmatch(r"[a-z][a-z0-9-]*", win):
+        raise PermissionError("invalid lifecycle authority channel")
+    directory = Path(os.environ.get(
+        "MESH_MISHE_HOME", str(Path.home() / ".mesh/mishe-tauftauf"))) / "authority"
+    try:
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd = os.open(directory / (win + ".lock"), os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError as exc:
+        raise PermissionError("lifecycle authority lock unavailable for " + win) from exc
+    with os.fdopen(fd, "w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_SH)
+            command = os.environ.get("MESH_MISHE_AUTHORITY_BIN",
+                                     str(Path(__file__).resolve().with_name("mesh-mishe-authority")))
+            result = run(command, "legacy-allowed", win)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise PermissionError("lifecycle authority UNKNOWN for " + win) from exc
+        if result.returncode != 0:
+            raise PermissionError("lifecycle fenced or authority UNKNOWN for " + win)
+        yield
+
+
 def window():
     # An explicit override keeps tests and non-tmux panes honest: without it a missing tmux
     # resolves to "" and birth/receipt are silently skipped, which looks like success.
@@ -68,23 +99,20 @@ def save(path, value):
 
 
 def birth(win, session):
+    require_persistent()
     STATE.mkdir(parents=True, exist_ok=True)
-    env = dict(os.environ, MESH_HANDOFF_TEST_WINDOW=win, MESH_WHO=win + "@" + os.uname().nodename)
-    # A session restart can land between an owner taking work and its first progress
-    # receipt.  Rebuild this window's pointer from canonical chains before restoring its
-    # handoff so stale cache rows cannot choose the task.
-    recovered = run("mesh-task", "reconcile", win, env=env)
-    if recovered.returncode:
-        raise RuntimeError(recovered.stderr or "task-context recovery failed")
-    # The restore is the ONLY durable-context lever: omp's --append-system-prompt is frozen
-    # at spawn, so a live handoff reaches the model through mesh-handoff's additionalContext
-    # (the extension injects it on the first context event of the new session).
-    result = run("mesh-handoff", "--restore", env=env)
-    if result.returncode:
-        raise RuntimeError(result.stderr)
-    (STATE / (win + ".native")).write_text(str(time.time()))
-    (STATE / (win + ".thread")).write_text(session)
-    print(result.stdout, end="")
+    with legacy_authority(win):
+        env = dict(os.environ, MESH_HANDOFF_TEST_WINDOW=win, MESH_WHO=win + "@" + os.uname().nodename)
+        # Rebuild the canonical pointer before restoring context on a legacy root.
+        recovered = run("mesh-task", "reconcile", win, env=env)
+        if recovered.returncode:
+            raise RuntimeError(recovered.stderr or "task-context recovery failed")
+        result = run("mesh-handoff", "--restore", env=env)
+        if result.returncode:
+            raise RuntimeError(result.stderr)
+        (STATE / (win + ".native")).write_text(str(time.time()))
+        (STATE / (win + ".thread")).write_text(session)
+        print(result.stdout, end="")
 
 
 def receipt(win, event):
@@ -284,6 +312,13 @@ def close(path):
     event = json.loads(path.read_text())
     if event["status"] in ("cleared", "excluded"):
         return
+    # Fence before stale-root exclusion: an authority change must retain the
+    # durable pending record, not turn it into a successful or excluded receipt.
+    with legacy_authority(event["window"]):
+        close_legacy(path, event)
+
+
+def close_legacy(path, event):
     win = event["window"]
     # A deferred receipt belongs to the root that produced it.  Once a later
     # session_start has registered a different root for this window, retrying
@@ -378,6 +413,10 @@ def close(path):
 def drain():
     """Retry every pending receipt under the serialization lock, oldest first."""
     time.sleep(1)  # allow the completion callback to return to the TUI
+    require_persistent()
+    if not STATE.exists():
+        return 0
+    failed = False
     with (STATE / ".lock").open("w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         for path in sorted(STATE.glob("*/*.json"),
@@ -386,6 +425,8 @@ def drain():
                 close(path)
             except Exception as exc:
                 print(str(path) + ": " + str(exc), file=sys.stderr)
+                failed = True
+    return 3 if failed else 0
 
 
 def main():
@@ -404,6 +445,7 @@ def main():
             json.loads(p.read_text()).get("status") not in ("cleared", "excluded")
             for p in (STATE / sys.argv[2]).glob("*.json"))
         sys.exit(3 if pending else 0)
+    require_persistent()
     if sys.argv[1:] == ["--start"]:
         main_start()
         return
@@ -415,31 +457,36 @@ def main():
         STATE.mkdir(parents=True, exist_ok=True)
         with (STATE / ".lock").open("w") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
-            # omp's SessionStartEvent carries no session id, so the root may never have
-            # been recorded by --start. Adopt the first completion's session as the root
-            # before deciding ownership, so an unrecorded start still settles.
-            identity = STATE / (win + ".thread")
-            if not identity.exists():
-                identity.write_text(str(event.get("session-id") or ""))
-            if not is_root(win, event):
-                return  # only the root session owns the mind turn
-            path = receipt(win, event)
-        if path:
-            launch_token_recorder(path)
-            with (STATE / "worker.log").open("a") as log:
-                subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--drain"],
-                                 stdin=subprocess.DEVNULL, stdout=log, stderr=log,
-                                 start_new_session=True)
+            with legacy_authority(win):
+                receive_root(win, event)
         return
-    if sys.argv[1:] == ["--end"]:
-        # Process exit is the last retry point for receipts the asynchronous settle
-        # handler did not finish before the session closed.
-        drain()
-        return
-    if sys.argv[1:] == ["--drain"]:
-        drain()
-        return
+    if sys.argv[1:] in (["--end"], ["--drain"]):
+        # Process exit and the periodic retry share the same fenced drain.
+        sys.exit(drain())
     return
+
+
+def receive_root(win, event):
+    """Adopt and record a completion while both lifecycle and authority are locked."""
+    # SessionStartEvent carries no session id. Only an authorized legacy
+    # completion may adopt the root missing from --start.
+    identity = STATE / (win + ".thread")
+    if not identity.exists():
+        # Validate and durably record before adopting a possibly malformed event.
+        path = receipt(win, event)
+        if not path:
+            return
+        identity.write_text(str(event["session-id"]))
+    else:
+        if not is_root(win, event):
+            return
+        path = receipt(win, event)
+    if path:
+        launch_token_recorder(path)
+        with (STATE / "worker.log").open("a") as log:
+            subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--drain"],
+                             stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                             start_new_session=True)
 @contextlib.contextmanager
 def mock_stdin(payload):
     """Feed a payload as sys.stdin, restoring the real stream on exit."""
@@ -452,6 +499,7 @@ def mock_stdin(payload):
 
 def main_start():
     """--start as a callable, so the selftest can exercise birth without a subprocess."""
+    require_persistent()
     win = window()
     try:
         event = json.load(sys.stdin)
@@ -467,8 +515,12 @@ def selftest():
     global ROOT, STATE, run
     with tempfile.TemporaryDirectory() as td:
         ROOT = Path(td)
-        saved_env = {"MESH_WINDOW": os.environ.get("MESH_WINDOW"),
-                     "TMUX_PANE": os.environ.get("TMUX_PANE")}
+        saved_env = {key: os.environ.get(key) for key in (
+            "MESH_WINDOW", "TMUX_PANE", "MESH_MISHE_HOME",
+            "MESH_MISHE_INVOCATION", "MISHE_TAUFTAUF_INVOCATION")}
+        os.environ["MESH_MISHE_HOME"] = str(ROOT / "mishe")
+        os.environ.pop("MESH_MISHE_INVOCATION", None)
+        os.environ.pop("MISHE_TAUFTAUF_INVOCATION", None)
         STATE = ROOT / "omp-lifecycle"
         STATE.mkdir()
         # A missing tmux must not masquerade as success: window() resolves only through an
@@ -668,8 +720,10 @@ def selftest():
             main_start()
         assert not (STATE / "w.thread").exists()
         # The --receipt arm adopts the first session as root when --start could not.
+        from unittest.mock import patch
         sys.argv = ["mesh-omp-lifecycle", "--receipt"]
-        with mock_stdin('{"type": "agent-turn-complete", "session-id": "lazy", "turn-id": 30, "last-assistant-message": "adopted"}'):
+        with patch.object(subprocess, "Popen"), mock_stdin(
+                '{"type": "agent-turn-complete", "session-id": "lazy", "turn-id": 30, "last-assistant-message": "adopted"}'):
             main()
         sys.argv = ["test"]
         assert (STATE / "w.thread").read_text() == "lazy"
@@ -684,4 +738,8 @@ def selftest():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except PermissionError as exc:
+        print("mesh-omp-lifecycle: " + str(exc), file=sys.stderr)
+        sys.exit(3)
