@@ -603,7 +603,50 @@ rssi_burst() {
     }'
 }
 
-# Guard: run the test block ONLY when this file is EXECUTED directly — never when SOURCED.
+# ---- SUBSTRATE / ACTION-CLASS DENYLIST (canonical; extracted from mesh-chaos 2026-09-23) ----
+#
+# LITERATURE (live review, 2026-09-23): the field calls this CAPABILITY-SCOPED / LEAST-AUTHORITY
+# execution, and it is where the mesh's own ad-hoc rule already sits. CapScope — "Authority Is Not a
+# String" (Bouras, Dai, Mechtaev, arXiv:2609.08371, 2026-09-08) shows the primitive: authority is a
+# TYPED capability held OUTSIDE the model's context and checked at the tool boundary, not a string
+# the agent carries. IntentCap (arXiv:2609.14631) adds task-scoped narrowing. AuthBench
+# (arXiv:2605.14859) supplies the negative result that motivates it: models over- AND under-grant
+# privileges, so delegation of the grant decision to the model is itself the failure mode.
+# Reversibility maps to transactional sandboxing — Fault-Tolerant Sandboxing for AI Coding Agents
+# (arXiv:2512.12806, Dec 2025) and Dreadnode's NIST 2025-0035 response: a filesystem mutation is
+# snapshot-able, an EXTERNAL action (push/restart/message) needs a COMPENSATING transaction, and the
+# two classes must be kept apart. mesh-evidence-quarantine is the mesh's compensating-transaction
+# half; this denylist is the refuse-the-action half. OWASP LLM06:2025 "Excessive Agency" is the
+# field's name for the whole failure family.
+#
+# WHY CENTRAL (this is the FER case a third time). Until 2026-09-23 this case statement lived ONLY in
+# mesh-chaos, where it was hardened by review #14 (it was leaky — missed vpn/NetworkManager/dhcp/
+# resolv/netplan; now closed). It is the mesh's ONLY substrate-safety policy, but two other tools
+# (mesh-phone-beacon2, and mesh-evidence-quarantine's own "zero-trust execution-boundary rule")
+# re-state SUBSETS of it in prose because they could not reuse it — exactly the fractured-entangled
+# re-encoding this file was created to stop (see the board_recent_ts_within LITERATURE note above).
+# A policy one tool owns is a policy the mesh does not have.
+#
+# CONTRACT — mesh_substrate_denied <action-string> → rc 0 iff the action is in the STRAND class.
+# STRAND = a mutation that can sever this node's own reachability or identity, so that neither the
+# mesh nor the operator can reach it to undo the change: routing, firewall, every overlay/VPN, DNS,
+# DHCP, ssh, reboot/power. Deliberately a substring DENYLIST, not an allowlist, and deliberately
+# BROAD: `*default*`, `*ssh*`, `*route*` will refuse some safe actions, and that is the correct
+# failure direction — an over-broad deny costs one refused experiment, an under-broad one costs a
+# stranded node with no reverse gear. [[an-exclusion-allowlist-fails-toward-silence-so-invert-the-polarity]]
+# Callers MUST treat rc 0 as REFUSE, never as "ask".
+MESH_SUBSTRATE_DENY_SRC="mesh-patterns.sh"
+export MESH_SUBSTRATE_DENY_SRC
+mesh_substrate_denied(){ # <action-string> -> rc 0 iff the action strands/destroys this node
+  local low; low=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  case "$low" in
+    *route*|*firewall*|*iptables*|*nft*|*ufw*|*wireguard*|*wg-*|*openvpn*|*ipsec*|*vpn*|*tailscale*|*overlay*|\
+    *exit-node*|*dns*|*resolv*|*dhcp*|*netplan*|*networkmanager*|*network-manager*|*nmcli*|*networkd*|*netctl*|\
+    *netmgr*|*iproute*|*ip-link*|*ip-route*|*ip-addr*|*ssh*|*default*|*reboot*|*shutdown*|*poweroff*|*halt*|*dbus*)
+      return 0;;
+  esac
+  return 1
+}
 # (A sourced lib inherits the caller's $1, so without this guard `consumer --test` would trip the
 # lib's own test+exit and hijack the consumer's self-check.)
 if [ "${1:-}" = --test ] && [ "${BASH_SOURCE[0]}" = "${0}" ]; then
@@ -1016,6 +1059,35 @@ IWCEOF
   ck2 "$(_li "$_li_ico" assoc)" no "iwconfig ESSID:off/any -> assoc=no"
   ck2 "$(_li "$_li_ico" ssid)"  na "'off/any' is a state word and must never be published as an ssid"
   ck2 "$(_li "$_li_ico" bssid)" na "'Not-Associated' is not a MAC and must never be published as one"
+  # ---- mesh_substrate_denied (canonical substrate/stranding denylist; mesh-chaos review #14) ----
+  # The two failure directions are asymmetric and BOTH are gated:
+  #   a refusal that fires on a safe string costs one skipped experiment;
+  #   a refusal that MISSES a stranding action costs a node no one can reach to undo it.
+  # Review #14's leaks are each pinned by name, because that is what regressed.
+  sck(){ # $1=string $2=want(deny|allow) $3=label
+    local got; if mesh_substrate_denied "$1"; then got=deny; else got=allow; fi
+    if [ "$got" = "$2" ]; then echo "  ok: $3"; else echo "  FAIL: $3 (got $got, want $2)"; fail=1; fi
+  }
+  echo "mesh_substrate_denied — must REFUSE the stranding class:"
+  sck "ip route add 0.0.0.0/0 via 10.0.0.1"  deny "routing (default-route overwrite)"
+  sck "flush iptables"                 deny "firewall"
+  sck "bring up WireGuard"             deny "wireguard (review #14 leak)"
+  sck "reconnect Tailscale"            deny "tailscale (review #14 leak)"
+  sck "switch to NetworkManager"       deny "networkmanager (review #14 leak)"
+  sck "apply netplan"                  deny "netplan (review #14 leak)"
+  sck "start dnsmasq for dns"          deny "dhcp (review #14 leak)"
+  sck "sed -i resolv.conf"             deny "resolv (review #14 leak)"
+  sck "reboot the node"                deny "reboot"
+  sck "systemctl restart sshd"         deny "ssh"
+  sck "poweroff"                       deny "poweroff"
+  sck "write default route"            deny "default-route"
+  sck "kill dbus"                      deny "dbus"
+  echo "mesh_substrate_denied — must ALLOW a real chaos experiment:"
+  sck "kill mesh-therm-watch && verify it restarts"  allow "kill+verify reflex"
+  sck "truncate ~/.mesh/chaos-test.log"              allow "truncate a log"
+  sck "sleep 30"                                     allow "noop delay"
+  sck "false"                                        allow "a failing command"
+
   rm -rf "$_lid" "$_licd"
   [ "$fail" = 0 ] && { echo "smoke-test: ok"; exit 0; } || { echo "smoke-test: FAIL"; exit 1; }
 fi
