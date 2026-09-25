@@ -27,6 +27,13 @@ level; aggregate rows must retain `n_seen`, `n_expected`, and `coverage` per
 source. Correlation uses overlap of live axes only. Generated task-ledger
 replays and tmux text are not health measurements.
 
+## Hourly admission report
+
+The hourly `mesh-autopoiesis-observer` report includes one event-level row per
+deduplicated source event, retaining its whitespace-normalized raw text. The
+source label identifies the tape, not a semantic event class; these rows are
+inspectable evidence, not typed health measurements.
+
 ## Coverage proof
 
 The TSV contains 8/8 bins and 100% chat coverage. `sensors.log` contributes
