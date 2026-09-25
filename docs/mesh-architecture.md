@@ -190,11 +190,13 @@ projector hashes bounded, regular producer bytes and exact-owner overdue
 audit rows while producing the typed projection. A private 0600 stamp binds
 those hashes, mtimes, pane identity, and projection digest to the tick;
 `mesh-mishe-run` binds it to a committed feed sequence without changing
-public parity or model input. The collector requires matching source bytes
-and mtimes before archiving them under
-`~/.mesh/evidence/migration/fleet-s1-candidates-20260925`. Missing or
-changed S0 evidence fails closed. Pre-stamp observations may be captured
-only with an explicit historical flag; they cannot be relabeled as S0-bound.
+public parity or model input. The collector requires matching source bytes,
+mtimes, and a stable model-visible safe view before archiving under
+`~/.mesh/evidence/migration/fleet-s1-candidates-20260925`. The S0 stamp binds
+the exact original projection; volatile `signal`/`view-change` identifiers may
+rotate on a reread without changing the source or safe view. Missing or changed
+S0 evidence fails closed. Pre-stamp observations require an explicit historical
+flag and exact re-projection; they cannot be relabeled as S0-bound.
 All cases remain `candidate_unreviewed`, without positive/negative labels
 or causal independence proof. Scheduled held runs still skip; held manual
 runs keep `/bin/false` as judge. `mesh-doctor` gates capture status and the
@@ -218,7 +220,9 @@ disposable Mind.
 Scheduled `mesh-tick` delivery also requires legacy authority, a distinct
 bottom pane, and a live Mind-engine process on that pane's tty. A shell
 placeholder yields HOLD without typing; `mesh-tick-gate` leaves that change
-due for the next cadence when a Mind is admitted.
+due for the next cadence when a Mind is admitted. The `check` top pane's
+always-visible lease footer reports `mind=<engine>` or `mind=HOLD` from
+the bottom tty, even when its self-meter scrolls out of view.
 
 ---
 
