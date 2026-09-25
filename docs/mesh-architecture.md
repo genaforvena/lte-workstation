@@ -144,6 +144,14 @@ The resident-Mind roster remains stopped; the production fleet hold and legacy
 authority remain until the separate privacy, repeated-pass and live S1 gates
 are met. Diagnostic Laya scores do not grant authority.
 
+For the other dashboard roles, the projected goal cache has its own 60-second
+source refresh and turns red after five minutes without a successful write;
+repainting identical goal text does not reset that age. This is partial value
+coverage, not an assertion that every role-specific reading has a source
+contract. Unregistered readings remain UNKNOWN, and `cleaner` uses its
+separate mishe-tauftauf pilot pane rather than the dashboard renderer.
+No stopped resident Mind is relaunched to consume these events.
+
 Legacy resident minds use `mesh-tell <window> "<prompt or op>"` and
 `mesh-tell --peek <window>` for window delivery; one-shot witness events do
 not bypass System One with a direct `mesh-tell`.
