@@ -157,9 +157,13 @@ fleet probe, `genome` vitality, `senses` sense map, `minds` mind-state wall,
 `sound` archivist tick, `vpn` server probe, `discover` field-study run tape,
 and `job` employer-liability run tape. Their source ages, not repaint ages or
 unchanged healthy values, determine stalls. `minds` reports SUSPENDED,
-not a failed wall, when the operator has stopped resident Minds. Five
-event-driven role readings remain explicitly UNKNOWN without a periodic
-producer; a quiet pipeline or no new message is not a stalled source.
+not a failed wall, when the operator has stopped resident Minds. `tg-roz`
+compares the committed input-line count with its dispatch cursor: quiet input
+is fresh, an unchanged cursor with unconsumed input for over two minutes is
+stale, and missing/corrupt or concurrently changing files are UNKNOWN. This
+proves intake processing, not that a private reply was sent. Four event-driven
+roles (`adint`, `hire`, `wake`, `haunt`) remain UNKNOWN without an explicit
+source contract; a quiet pipeline or no new run is not a stalled source.
 `mesh-mishe-source-health` reports other-role failures on the health pane
 without sampling that pane during its own render; `mesh-doctor` checks all 17.
 Neither prints private pane text or relaunches stopped resident Minds.
