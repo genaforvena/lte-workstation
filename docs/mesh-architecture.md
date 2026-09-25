@@ -126,7 +126,7 @@ the old 10+ window sprawl):
 | `genome` | claude | autonomous development of the codebase + its own build/deploy |
 | `tg` | claude | operator Telegram comms |
 | `senses` | opencode | keep + develop the senses |
-| `health` | opencode | node/fleet health |
+| `health` | — (one-shot HELD) | node/fleet health data; no resident Mind |
 | `witness` | configured OMP model | mishe-tauftauf stewardship, task-ledger verification, board coordination |
 
 `witness` keeps a live Top Pain showing the structured task journal, a bounded
@@ -212,17 +212,19 @@ false negatives. Reviewer identity and causal source groups are assertions
 requiring separate audit, so the report never grants authority. The numeric
 invariant Laya trial does not consume these enum-only fleet projections.
 
-Legacy resident minds use `mesh-tell <window> "<prompt or op>"` and
-`mesh-tell --peek <window>` for window delivery. A prompt to `witness` is
-always refused: only an admitted System Zero/System One event may invite its
-disposable Mind.
+`mesh-tell <window> "<prompt or op>"` delivers to an admitted resident
+Mind. Automatic legacy delivery also checks the destination node's current
+`MESH_MIND_CHANNELS` roster before sending; manual delivery does not grant
+one-shot authority. A prompt to `witness` is always refused: only an
+admitted System Zero/System One event may invite its disposable Mind.
 
-Scheduled `mesh-tick` delivery also requires legacy authority, a distinct
-bottom pane, and a live Mind-engine process on that pane's tty. A shell
-placeholder yields HOLD without typing; `mesh-tick-gate` leaves that change
-due for the next cadence when a Mind is admitted. The `check` top pane's
-always-visible lease footer reports `mind=<engine>` or `mind=HOLD` from
-the bottom tty, even when its self-meter scrolls out of view.
+Scheduled `mesh-tick` requires node-roster admission, legacy authority, a
+distinct bottom pane, and a live Mind-engine process on that pane's tty. A
+stopped roster or shell placeholder yields HOLD without typing;
+`mesh-tick-gate` leaves the change due for the next cadence. The `check`
+top pane's always-visible footer reports `mind=<engine>` or `mind=HOLD`
+from the bottom tty and `one-shot=HELD` while the fleet hold remains,
+even when its self-meter scrolls out of view.
 
 ---
 
