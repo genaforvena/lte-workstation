@@ -21,9 +21,9 @@ class OneShot(unittest.TestCase):
         (self.root / "mesh/charter").mkdir(parents=True)
         (self.root / "mesh/handoff").mkdir()
         (self.root / "core/handoffs").mkdir(parents=True)
-        (self.root / "mesh/charter/cleaner.md").write_text("Clean safely.\n")
+        (self.root / "mesh/charter/synthetic.md").write_text("Synthetic test channel.\n")
         self.event = self.root / "event.json"
-        self.event.write_text(json.dumps({"channel": "cleaner", "request_id": "req1", "kind": "task"}))
+        self.event.write_text(json.dumps({"channel": "synthetic", "request_id": "req1", "kind": "task"}))
         self.auth = self.helper("authority", "print('{\"authority\":\"mishe\",\"generation\":1}')")
         self.dash = self.helper("dash", "print('TOP PANE fresh')")
         self.pred = self.helper("predictions", """
@@ -40,7 +40,7 @@ from pathlib import Path
 p=Path(os.environ['MESH_DIR'])/'task-state'
 state=p.read_text() if p.exists() else 'open'
 if sys.argv[1]=='status':
-    print(f'  1. demo/do [{state}] owner=cleaner' + (' artifact=' + str(Path(os.environ['MESH_DIR'])/'artifact') if state=='done' else ''))
+    print(f'  1. demo/do [{state}] owner=synthetic' + (' artifact=' + str(Path(os.environ['MESH_DIR'])/'artifact') if state=='done' else ''))
 elif sys.argv[1]=='check':
     if state!='open': sys.exit(2)
 elif sys.argv[1]=='take':
@@ -69,7 +69,7 @@ else:
         with (root/'external-actions').open('a') as f: f.write('action\\n')
     token=os.environ['MESH_MISHE_INVOCATION']
     (root/'omp-prompt').write_text(sys.argv[-1])
-    (Path(os.environ['MESH_MISHE_HOME'])/'handoffs/cleaner.md').write_text('invocation:'+token)
+    (Path(os.environ['MESH_MISHE_HOME'])/'handoffs/synthetic.md').write_text('invocation:'+token)
     with (root/'chat.log').open('a') as f: f.write('[fyi] invocation:'+token+'\\n')
     if (root/'task-state').exists():
         (root/'task-state').write_text('done')
@@ -88,7 +88,7 @@ else:
         return p
 
     def command(self, task=False):
-        args = [sys.executable, str(SCRIPT), "--channel", "cleaner", "--request-id", "req1",
+        args = [sys.executable, str(SCRIPT), "--channel", "synthetic", "--request-id", "req1",
                 "--event-file", str(self.event)]
         if task:
             args += ["--task-id", "demo/do"]
@@ -98,7 +98,7 @@ else:
         return subprocess.run(self.command(task), env=self.env, capture_output=True, text=True, timeout=20)
 
     def check(self):
-        return subprocess.run([sys.executable, str(SCRIPT), "--check", "cleaner"],
+        return subprocess.run([sys.executable, str(SCRIPT), "--check", "synthetic"],
                               env=self.env, capture_output=True, text=True, timeout=5)
 
     def create_wip_ref(self):
@@ -108,7 +108,7 @@ else:
         git("init", "-q")
         git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-qm", "base")
         commit = git("rev-parse", "HEAD")
-        git("update-ref", "refs/wip/cleaner", commit)
+        git("update-ref", "refs/wip/synthetic", commit)
         return commit
 
     def test_noop_receipt_and_repeat(self):
@@ -116,7 +116,7 @@ else:
         first = self.call()
         self.assertEqual(first.returncode, 0, first.stderr)
         self.assertEqual(self.call().returncode, 0)
-        record = json.loads((self.root / "mesh/mishe-mind/cleaner/req1.json").read_text())
+        record = json.loads((self.root / "mesh/mishe-mind/synthetic/req1.json").read_text())
         self.assertEqual(record["status"], "settled")
         self.assertIn("input_sha256", record)
         self.assertIn("PASS", self.check().stdout)
@@ -126,12 +126,36 @@ else:
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((self.root / "mesh/task-state").read_text(), "done")
 
+
+    def test_prompt_excludes_raw_dashboard_handoff_and_predictions(self):
+        self.dash = self.helper("private-dash", "print('PRIVATE-dashboard-source')")
+        self.env["MESH_MISHE_DASH_CMD"] = str(self.dash)
+        self.pred = self.helper("private-predictions", "import sys\nprint('YES' if 'needle=' in sys.argv[2] else 'PRIVATE-predictions-source')")
+        self.env["MESH_MISHE_PYTHON"] = str(self.pred)
+        (self.root / "core/handoffs/synthetic.md").write_text("PRIVATE-prior-handoff\n")
+        result = self.call()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        prompt = (self.root / "mesh/omp-prompt").read_text()
+        for secret in ("PRIVATE-dashboard-source", "PRIVATE-predictions-source",
+                       "PRIVATE-prior-handoff"):
+            self.assertNotIn(secret, prompt)
+
+    def test_real_owner_is_not_invoked_without_projected_s0_s1_sink(self):
+        self.event.write_text(json.dumps({"channel": "cleaner", "request_id": "req1"}))
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), "--channel", "cleaner", "--request-id", "req1",
+             "--event-file", str(self.event)], env=self.env, capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("projected S0/S1", result.stderr)
+        self.assertFalse((self.root / "mesh/omp-prompt").exists())
+        self.assertFalse((self.root / "mesh/mishe-mind/cleaner").exists())
+
     def test_no_handoff_is_incomplete_then_recovered(self):
         (self.root / "mesh/omp-mode").write_text("no-handoff")
         first = self.call()
         self.assertEqual(first.returncode, 2)
-        self.assertIn("handoffs/cleaner.md", first.stderr)
-        self.assertEqual(json.loads((self.root / "mesh/mishe-mind/cleaner/req1.json").read_text())["status"], "running")
+        self.assertIn("handoffs/synthetic.md", first.stderr)
+        self.assertEqual(json.loads((self.root / "mesh/mishe-mind/synthetic/req1.json").read_text())["status"], "running")
         self.assertEqual(self.check().returncode, 2)
         self.assertIn("orphan invocation", self.check().stdout)
         (self.root / "mesh/omp-mode").write_text("settle")
@@ -139,7 +163,7 @@ else:
 
     def test_missing_board_receipt_keeps_unknown(self):
         (self.root / "mesh/omp-mode").write_text("no-handoff")
-        handoff = self.root / "core/handoffs/cleaner.md"
+        handoff = self.root / "core/handoffs/synthetic.md"
         handoff.write_text("invocation:req1")
         result = self.call()
         self.assertEqual(result.returncode, 2)
@@ -194,7 +218,7 @@ else:
             (self.root / "mesh/omp-mode").write_text("settle")
             recovered = self.call(task=True)
             self.assertEqual(recovered.returncode, 0, recovered.stderr)
-            self.assertIn("refs/wip/cleaner " + commit, (self.root / "mesh/omp-prompt").read_text())
+            self.assertIn("refs/wip/synthetic " + commit, (self.root / "mesh/omp-prompt").read_text())
         finally:
             if child.poll() is None:
                 child.kill()
@@ -232,15 +256,91 @@ else:
     def test_event_identity_mismatch(self):
         self.event.write_text(json.dumps({"channel": "pub", "request_id": "req1"}))
         self.assertEqual(self.call().returncode, 2)
-        self.assertFalse((self.root / "mesh/mishe-mind/cleaner/req1.json").exists())
+        self.assertFalse((self.root / "mesh/mishe-mind/synthetic/req1.json").exists())
 
     def test_verified_wip_pointer_reaches_recovery_prompt(self):
         commit = self.create_wip_ref()
         result = self.call()
         self.assertEqual(result.returncode, 0, result.stderr)
-        record = json.loads((self.root / "mesh/mishe-mind/cleaner/req1.json").read_text())
+        record = json.loads((self.root / "mesh/mishe-mind/synthetic/req1.json").read_text())
         self.assertEqual(record["wip_commit"], commit)
-        self.assertIn("refs/wip/cleaner " + commit, (self.root / "mesh/omp-prompt").read_text())
+        self.assertIn("refs/wip/synthetic " + commit, (self.root / "mesh/omp-prompt").read_text())
+
+    def test_witness_uses_explicit_luna_and_requires_disposition_receipt(self):
+        core = Path(os.environ.get("MESH_MISHE_CORE", "/home/mesh-home/mishe-tauftauf"))
+        self.env.update(MESH_MISHE_CORE=str(core), MESH_MISHE_REAL_ALLOWLIST="witness",
+                        MESH_MISHE_WITNESS_MODEL="openai-codex/gpt-6-luna",
+                        MESH_MISHE_SINK=str(SCRIPT.with_name("mesh-mishe-mind-sink")))
+        self.env["MESH_MISHE_DASH_CMD"] = str(self.helper("witness-dash", "print('PRIVATE-witness-chat-tail')"))
+        (self.root / "core/handoffs/witness.md").write_text("PRIVATE-prior-handoff\n")
+        (self.root / "mesh/charter/witness.md").write_text("Check source-backed signals.\n")
+        self.auth = self.helper("authority", "print('{\"authority\":\"mishe\",\"generation\":1,\"active_feed_seq\":0}')")
+        self.env["MESH_MISHE_AUTHORITY_CMD"] = str(self.auth)
+        feed = subprocess.run([sys.executable, "-c",
+                               "from mishe_tauftauf.feed import Feed; import sys; "
+                               "f=Feed(sys.argv[1]); s=f.append_runtime('observation/witness','STATE: RED\\nOBSERVATION: source=top-pane/witness freshness=stale value-coverage=unknown'); "
+                               "f.append_runtime('mishe-tauftauf',f'judged relevance for top-pain witness on entry {s.sequence}: yes probability=0.8 question-version=1 policy-version=1'); "
+                               "f.append_runtime('mishe-tauftauf',f'judged desired-state-met for top-pain witness on entry {s.sequence}: no probability=0.1 question-version=1 policy-version=1'); "
+                               "f.append_runtime('mishe-tauftauf',f'entry {s.sequence} for top-pain witness: wake'); "
+                               "r=f.append_runtime('mishe-tauftauf',f'wake requested top-pain witness for entry {s.sequence}'); "
+                               "print(s.sequence,r.sequence)", str(self.root / "core")],
+                              env={**self.env, "PYTHONPATH": str(core / "src")},
+                              capture_output=True, text=True, check=True)
+        stimulus, request = map(int, feed.stdout.split())
+        request_id = f"witness-g1-r{request}"
+        self.event.write_text(json.dumps({"channel": "witness", "request_id": request_id,
+                                          "source": "observation/witness", "generation": 1,
+                                          "outbox_key": f"witness:1:{request}", "stimulus_seq": stimulus}))
+        outbox = self.root / "core/outbox/witness" / f"1-{request}.json"
+        outbox.parent.mkdir(parents=True)
+        outbox.write_text(json.dumps({"channel": "witness", "generation": 1,
+                                      "request_id": request, "key": f"witness:1:{request}",
+                                      "status": "claimed"}))
+        self.omp = self.helper("omp-witness", """
+import json,os,sys
+from pathlib import Path
+root=Path(os.environ['MESH_DIR']); home=Path(os.environ['MESH_MISHE_HOME'])
+token=os.environ['MESH_MISHE_INVOCATION']
+(root/'omp-args').write_text(json.dumps(sys.argv[1:-1]))
+(root/'omp-prompt').write_text(sys.argv[-1])
+(root/'omp-calls').open('a').write(token+'\\n')
+(home/'handoffs/witness.md').write_text('invocation:'+token)
+(root/'chat.log').open('a').write('[fyi] invocation:'+token+' disposition=non-actionable\\n')
+if not (root/'omit-receipt').exists():
+    evidence=home/'evidence.txt'; evidence.write_text('checked source invocation:'+token)
+    p=home/'mind-dispositions/witness'/(token+'.json'); p.parent.mkdir(parents=True,exist_ok=True)
+    p.write_text(json.dumps({'channel':'witness','request_id':token,'disposition':'non-actionable',
+                             'task_id':None,'evidence':str(evidence)}))
+""")
+        self.env["MESH_MISHE_OMP_CMD"] = str(self.omp)
+        command = [sys.executable, str(SCRIPT), "--channel", "witness", "--request-id", request_id,
+                   "--event-file", str(self.event)]
+        (self.root / "mesh/omit-receipt").write_text("yes")
+        first = subprocess.run(command, env=self.env, capture_output=True, text=True)
+        self.assertEqual(first.returncode, 2)
+        self.assertIn("mind-dispositions", first.stderr)
+        (self.root / "mesh/omit-receipt").unlink()
+        retry = subprocess.run(command, env=self.env, capture_output=True, text=True)
+        self.assertEqual(retry.returncode, 2)
+        self.assertIn("prior witness invocation unresolved", retry.stderr)
+        self.assertEqual((self.root / "mesh/omp-calls").read_text().splitlines(), [request_id])
+        self.assertIn("--model=openai-codex/gpt-6-luna", json.loads((self.root / "mesh/omp-args").read_text()))
+        prompt = (self.root / "mesh/omp-prompt").read_text()
+        self.assertNotIn("PRIVATE-witness-chat-tail", prompt)
+        self.assertNotIn("PRIVATE-prior-handoff", prompt)
+        self.assertIn("STATE: RED", prompt)
+        evidence = self.root / "core/evidence.txt"
+        evidence.write_text("checked source invocation:" + request_id)
+        receipt = self.root / "core/mind-dispositions/witness" / f"{request_id}.json"
+        receipt.parent.mkdir(parents=True)
+        receipt.write_text(json.dumps({"channel": "witness", "request_id": request_id,
+                                       "disposition": "non-actionable", "task_id": None,
+                                       "evidence": str(evidence)}))
+        recovered = subprocess.run(command, env=self.env, capture_output=True, text=True)
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        record = json.loads((self.root / "mesh/mishe-mind/witness" / f"{request_id}.json").read_text())
+        self.assertEqual((record["status"], record["disposition"]), ("settled", "non-actionable"))
+        self.assertEqual((self.root / "mesh/omp-calls").read_text().splitlines(), [request_id])
 
 
 if __name__ == "__main__":
