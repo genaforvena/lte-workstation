@@ -43,6 +43,12 @@ class RosterTests(unittest.TestCase):
         self.process = "bash /bin/mesh-pane-consume cleaner --interval 60\n"
         self.top = f"-- pane live {self.lease} --\n"
         self.bottom = "bash -lc 'omp --model test'"
+        self.proc = root / "proc"
+        for pid, comm, children in ((100, "bash", "101"), (101, "omp", "")):
+            process = self.proc / str(pid)
+            (process / "task" / str(pid)).mkdir(parents=True)
+            (process / "comm").write_text(comm + "\n")
+            (process / "task" / str(pid) / "children").write_text(children)
         self.tasks = "cleaner\ttask\topen\t1\n"
 
     def run_fake(self, *argv):
@@ -51,6 +57,8 @@ class RosterTests(unittest.TestCase):
         if argv[:2] == ("tmux", "list-windows"):
             return self.windows
         if argv[:2] == ("tmux", "display-message"):
+            if argv[-1] == "#{pane_pid}":
+                return "100\n"
             return "exec mesh-dash cleaner" if str(argv[3]).endswith(".0") else self.bottom
         if argv[:2] == ("tmux", "capture-pane"):
             return self.top
@@ -61,7 +69,7 @@ class RosterTests(unittest.TestCase):
         return ""
 
     def snapshot(self):
-        with patch.object(channels, "run", side_effect=self.run_fake):
+        with patch.object(channels, "run", side_effect=self.run_fake), patch.object(channels, "PROC_ROOT", self.proc):
             return channels.inventory(self.args)
 
     def test_effective_last_export_and_inactive_lane(self):
@@ -72,6 +80,18 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(result["channels"][0]["renderer_command"], "exec mesh-dash cleaner")
         self.assertFalse(result["channels"][1]["launch_allowed"])
         self.assertEqual(result["channels"][0]["exact_owner_queued_tasks"], 1)
+
+    def test_operator_stop_keeps_data_without_resident_launch(self):
+        self.env.write_text(self.env.read_text() + 'export MESH_MIND_CHANNELS="__operator_stopped__"\n')
+        result = self.snapshot()
+        self.assertEqual(result["status"], "PASS", result["errors"])
+        self.assertEqual(result["channels"][0]["state"], "suspended-data-only")
+        self.assertFalse(result["channels"][0]["launch_allowed"])
+        self.windows = "cleaner|1\n"
+        single = self.snapshot()
+        self.assertEqual(single["status"], "PASS", single["errors"])
+        self.assertEqual(single["channels"][0]["state"], "suspended-data-only")
+        self.assertEqual(single["channels"][0]["renderer_command"], "exec mesh-dash cleaner")
 
     def test_restore_tmux_process_disagreement(self):
         self.process = ""
@@ -85,13 +105,20 @@ class RosterTests(unittest.TestCase):
 
     def test_missing_charter_engine_and_stale_pane(self):
         (self.charters / "cleaner.md").unlink()
-        self.bottom = "bash -l"
+        (self.proc / "100/task/100/children").write_text("")
         self.top = "-- pane live 2020-01-01T00:00:00Z --\n"
         result = self.snapshot()
         errors = " ".join(result["errors"])
         self.assertIn("missing charter", errors)
         self.assertIn("mind engine absent", errors)
         self.assertIn("stale top-pane", errors)
+        self.assertFalse(result["channels"][0]["launch_allowed"])
+
+    def test_shell_command_does_not_impersonate_resident_mind(self):
+        self.bottom = "bash -lc 'omp --model test; exec bash -l'"
+        (self.proc / "100/task/100/children").write_text("")
+        result = self.snapshot()
+        self.assertIn("mind engine absent from pane", result["errors"][0])
         self.assertFalse(result["channels"][0]["launch_allowed"])
 
     def test_unknown_duplicate_and_direct_caller(self):
@@ -112,6 +139,23 @@ class RosterTests(unittest.TestCase):
         self.tasks = None
         self.assertIn("journal unavailable", " ".join(self.snapshot()["errors"]))
 
+    def test_witness_is_data_only_with_one_shot_sink(self):
+        self.windows = "cleaner|2\nwitness|1\n"
+        self.restore.write_text(self.restore.read_text() + "ensure_witness_data\n")
+        (self.charters / "witness.md").write_text("# witness\n")
+        result = self.snapshot()
+        self.assertEqual(result["status"], "PASS", result["errors"])
+        witness = next(row for row in result["channels"] if row["channel"] == "witness")
+        self.assertEqual(witness["state"], "one-shot-data-only")
+        self.assertEqual(witness["pane_count"], 1)
+        self.assertEqual(witness["allowed_sink"], "mesh-mishe-mind-sink")
+        self.assertFalse(witness["launch_allowed"])
+        self.process += "bash /bin/mesh-pane-consume witness --interval 60\n"
+        self.assertIn("resident consumer", " ".join(self.snapshot()["errors"]))
+        self.process = ""
+        self.windows = "cleaner|2\nwitness|2\n"
+        self.assertIn("exactly one data pane", " ".join(self.snapshot()["errors"]))
+
     def test_live_derived_roster_fixture(self):
         fixture = json.loads((ROOT / "tests/fixtures/mesh-mishe-roster-20260923.json").read_text())
         self.assertEqual(len(fixture["active"]), 17)
@@ -121,7 +165,7 @@ class RosterTests(unittest.TestCase):
 
     def test_tall_pane_lease_capture(self):
         self.top = "\n".join(["data"] * 25 + [f"-- pane live: as of {self.lease} --"] + [""] * 25)
-        with patch.object(channels, "run", side_effect=self.run_fake) as fake:
+        with patch.object(channels, "run", side_effect=self.run_fake) as fake, patch.object(channels, "PROC_ROOT", self.proc):
             self.assertEqual(channels.inventory(self.args)["status"], "PASS")
         captures = [call.args for call in fake.call_args_list if call.args[:2] == ("tmux", "capture-pane")]
         self.assertTrue(all("-100" in call for call in captures))
