@@ -238,7 +238,9 @@ class SyntheticAdapterTest(unittest.TestCase):
             base = Path(tmp)
             home, repo = base / "core", base / "repo"
             (repo / "scripts").mkdir(parents=True)
-            for name in ("mesh-mishe-render", "mesh-mishe-project", "mesh-mishe-parity", "mesh-mishe-task-bridge", "mesh-mishe-shadow-volume"):
+            for name in ("mesh-mishe-render", "mesh-mishe-project", "mesh-mishe-parity",
+                         "mesh-mishe-task-bridge", "mesh-mishe-shadow-volume",
+                         "mesh-mishe-auto-events", "mesh_mishe_delivery.py"):
                 shutil.copy2(ROOT / "scripts" / name, repo / "scripts" / name)
             (repo / "scripts/mesh-dash").write_text(
                 "#!/bin/sh\n"
@@ -324,6 +326,18 @@ class SyntheticAdapterTest(unittest.TestCase):
             self.assertIn("judge-view: projected-publish-v1", doctor.stdout)
             self.assertIn("task bridge: PASS", doctor.stdout)
             self.assertIn("cleaner=shadow; authority=legacy", doctor.stdout)
+            (home / ".mesh-mishe-view").write_text("cleaner=projected-fleet-v1\n")
+            absent_roster = subprocess.run([str(ROOT / "scripts/mesh-mishe-doctor")], env=env,
+                                           text=True, capture_output=True)
+            self.assertNotEqual(absent_roster.returncode, 0)
+            self.assertIn("enrolled roster absent", absent_roster.stdout)
+            (home / "fleet-channels").write_text("cleaner\n")
+            fleet_doctor = subprocess.run([str(ROOT / "scripts/mesh-mishe-doctor")], env=env,
+                                          text=True, capture_output=True)
+            self.assertEqual(fleet_doctor.returncode, 0, fleet_doctor.stdout + fleet_doctor.stderr)
+            self.assertIn("fleet judge-view: projected-fleet-v1", fleet_doctor.stdout)
+            (home / "fleet-channels").unlink()
+            self.assertEqual(run("once").returncode, 0)
             delta_env = {**env, "MESH_MISHE_DELTA_VIEW": "1"}
             delta = subprocess.run([str(ROOT / "scripts/mesh-mishe-run"), "once"], env=delta_env,
                                    text=True, capture_output=True)
