@@ -48,8 +48,7 @@ def witness_conditions(channel: str) -> dict:
     return {"allowlist": channel == "witness" and os.environ.get("MESH_MISHE_REAL_ALLOWLIST") == "witness",
             "sink": bool(sink) and Path(sink).resolve() == approved
             and approved.is_file() and os.access(approved, os.X_OK),
-            "model": os.environ.get("MESH_MISHE_WITNESS_MODEL") in
-            ("gpt-5.6-luna", "openai/gpt-5.6-luna"),
+            "model": os.environ.get("MESH_MISHE_WITNESS_MODEL") == "openai-codex/gpt-6-luna",
             "hold_released": not hold.exists() and not hold.is_symlink()}
 
 
