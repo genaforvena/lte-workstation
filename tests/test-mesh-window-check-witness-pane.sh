@@ -10,7 +10,7 @@ cat >"$td/bin/tmux" <<'EOF'
 #!/usr/bin/env bash
 case "$1" in
   list-windows) printf 'witness\n' ;;
-  list-panes) printf '0\n' ;;
+  list-panes) printf '%b' "${PANE_INDEXES:-0\n}" ;;
   display-message)
     case "$*" in *pane_height*) printf '%s\n' "${WINDOW_HEIGHT:-24}" ;; *) printf '0\n' ;; esac
     ;;
@@ -64,6 +64,8 @@ else
   printf '%s\n' "$out" >&2
   exit 1
 fi
+
+PANE_INDEXES=$'0\n1\n' expect_issue "$td/valid-pane" 'expected one data pane, found 2'
 
 # Compact mode may label the output compact, but it still has to satisfy the 20-row witness
 # contract. The renderer's current 2+2 frame must therefore be refused by the checker.
