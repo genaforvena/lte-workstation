@@ -32,6 +32,11 @@ def main() -> None:
     assert warning_key("clear-audit@mesh-home", "[clear-audit] FLAG orphaned audit")
     assert warning_key("health@mesh-home", "[verify] health: lease audit FAILED")
     assert warning_key("health@mesh-home", "[verify] health: lease audit clean") is None
+    assert warning_key(
+        "mesh-home/mesh-chat-review@mesh-home",
+        "[chat-review] quoted source: [health-fail] witness-task-autonomy",
+    ) is None
+
 
     stalled_with_sibling = (
         "[health-fail] witness-task-autonomy: errors="
