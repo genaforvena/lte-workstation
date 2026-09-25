@@ -161,12 +161,28 @@ not a failed wall, when the operator has stopped resident Minds. `tg-roz`
 compares the committed input-line count with its dispatch cursor: quiet input
 is fresh, an unchanged cursor with unconsumed input for over two minutes is
 stale, and missing/corrupt or concurrently changing files are UNKNOWN. This
-proves intake processing, not that a private reply was sent. Four event-driven
-roles (`adint`, `hire`, `wake`, `haunt`) remain UNKNOWN without an explicit
-source contract; a quiet pipeline or no new run is not a stalled source.
-`mesh-mishe-source-health` reports other-role failures on the health pane
-without sampling that pane during its own render; `mesh-doctor` checks all 17.
-Neither prints private pane text or relaunches stopped resident Minds.
+proves intake processing, not that a private reply was sent. For event-driven
+`adint`, `hire`, `wake`, and `haunt`, an overdue canonical owner task is a
+source-backed stale obligation; a successful audit without such a row is
+UNKNOWN, not proof that a quiet pipeline or research lane is healthy. A failed
+audit is UNKNOWN. `mesh-mishe-source-health` reports other-role failures on
+the health pane without sampling that pane during its own render;
+`mesh-doctor` checks all 17. Neither prints private pane text or relaunches
+stopped resident Minds. The one-shot prompt never injects raw dashboards or
+prior handoffs; non-Witness real owner Minds remain fenced without an approved
+projected S0/S1 sink.
+
+The core can write a `wake requested` entry when System One returns UNKNOWN;
+that entry alone never authorizes a Mind. A real delivery additionally needs
+explicit relevance=yes and desired-state-met=no (or
+continue-observing=no) receipts bound to the source observation. Outside
+Witness, no real sink has that proof boundary yet. For every enrolled fleet
+run, `mesh-mishe-run` requires the disabled local `/bin/false` judge until
+an all-question private-safe judge is verified, even if the hold file is
+removed. While held, scheduled runs skip and manual diagnostics can prove
+S0 projection only, not System One admission or Mind delivery. Direct core
+runs with a live private pane can pass raw context to System One and are not
+a safe production diagnostic.
 
 Legacy resident minds use `mesh-tell <window> "<prompt or op>"` and
 `mesh-tell --peek <window>` for window delivery. A prompt to `witness` is
