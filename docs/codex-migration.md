@@ -56,6 +56,12 @@ The `SessionEnd` hook invokes `mesh-codex-lifecycle --end` as the final retry fo
 receipt that the asynchronous notify callback has not drained yet. `SessionStart` remains in place
 because it binds the root thread and restores the durable handoff before the next turn.
 
+Persistent mind starts, automatic deliveries, and completion receipts take a shared legacy-authority
+lease on the channel. An authority switch takes the exclusive lease; an absent or unreadable record
+fails closed. Disposable mishe-tauftauf invocations do not register a legacy root session or write
+legacy completion receipts, and pending receipts stay durable if authority changes before drain.
+The readiness probe remains independent of the lease so the switch can inspect a live channel.
+
 ## Verification on mesh-home, 2026-09-06
 
 The test rollout remains `senses`, `health`, and `witness`. All three ran native SessionStart probes,
