@@ -151,16 +151,23 @@ successful write; repainting identical goal text does not reset that age.
 300 seconds and turns red after 900 seconds without a completed write.
 `cleaner` uses its separate pilot pane: the matching scan and dry-run settlement
 must both be present and no older than 30 minutes. A missing or mismatched pair
-is UNKNOWN; an overdue pair or a missing checked report is RED. The deterministic
-`mesh-mishe-source-health` check covers all 17 observed channels and reports
-stalled or unknown sources through `mesh-doctor` to the health pane without
-exposing pane text. Goal and publisher caches remain only partial coverage of
-their roles: no role-specific sensor or workflow freshness is inferred from a
-fresh goal. No stopped resident Mind is relaunched to consume these events.
+is UNKNOWN; an overdue pair or a missing checked report is RED. Nine dashboard
+roles also track a periodic semantic producer: `tg` voice/router cycles, `health`
+fleet probe, `genome` vitality, `senses` sense map, `minds` mind-state wall,
+`sound` archivist tick, `vpn` server probe, `discover` field-study run tape,
+and `job` employer-liability run tape. Their source ages, not repaint ages or
+unchanged healthy values, determine stalls. `minds` reports SUSPENDED,
+not a failed wall, when the operator has stopped resident Minds. Five
+event-driven role readings remain explicitly UNKNOWN without a periodic
+producer; a quiet pipeline or no new message is not a stalled source.
+`mesh-mishe-source-health` reports other-role failures on the health pane
+without sampling that pane during its own render; `mesh-doctor` checks all 17.
+Neither prints private pane text or relaunches stopped resident Minds.
 
 Legacy resident minds use `mesh-tell <window> "<prompt or op>"` and
-`mesh-tell --peek <window>` for window delivery; one-shot witness events do
-not bypass System One with a direct `mesh-tell`.
+`mesh-tell --peek <window>` for window delivery. A prompt to `witness` is
+always refused: only an admitted System Zero/System One event may invite its
+disposable Mind.
 
 ---
 
