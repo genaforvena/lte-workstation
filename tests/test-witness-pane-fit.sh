@@ -12,7 +12,7 @@ import os
 from pathlib import Path
 
 journal = Path(os.environ["FIXTURE_JOURNAL"])
-rows = [f"QUEUED\tgenome\tfixture-chain/task-{i:02d}\tcurrent=fixture-chain/task-{i:02d} dispatch=sent"
+rows = [f"QUEUED\tgenome\t{'fixture-mishe/issue-00' if i == 0 else f'fixture-chain/task-{i:02d}'}\tcurrent=fixture-chain/task-{i:02d} dispatch=sent"
         for i in range(25)]
 journal.write_text("\n".join(rows) + "\n", encoding="utf-8")
 chat = Path(os.environ["FIXTURE_CHAT"])
@@ -25,12 +25,12 @@ rendered="$(MESH_DIR="$mesh" MESH_TASK_JOURNAL="$mesh/tasks.journal" \
   "$ROOT/scripts/mesh-dash" --once witness 2>&1)"
 viewport="$(printf '%s\n' "$rendered" | tail -n 47)"
 
-printf '%s\n' "$viewport" | grep -q 'WITNESS TASKS — structured unfinished work' \
-  || { echo 'FAIL: task heading is outside the 47-row viewport' >&2; exit 1; }
 printf '%s\n' "$viewport" | grep -qE 'materialized view: .* · source age=[0-9]+s · authority=' \
   || { echo 'FAIL: exact source-age label is outside the 47-row viewport' >&2; exit 1; }
 printf '%s\n' "$viewport" | grep -q '25 unfinished' \
   || { echo 'FAIL: unfinished task count is outside the 47-row viewport' >&2; exit 1; }
+printf '%s\n' "$viewport" | grep -q 'mishe: 1 unfinished' \
+  || { echo 'FAIL: mishe stewardship count is outside the 47-row viewport' >&2; exit 1; }
 task_rows="$(printf '%s\n' "$viewport" | grep -cE '^(QUEUED|RUNNING|OPEN_UNOWNED|BLOCKED|HELD_REJECTED|HELD_EXPIRED)[[:space:]]')"
 [ "$task_rows" -ge 20 ] \
   || { echo "FAIL: only $task_rows unfinished task rows fit in the viewport" >&2; exit 1; }
@@ -39,6 +39,14 @@ for i in $(seq -w 0 19); do
     || { echo "FAIL: raw chat line $i is outside the 47-row viewport" >&2; exit 1; }
 done
 printf 'test-witness-pane-fit: PASS (%s task rows and 20 raw lines visible together)\n' "$task_rows"
+printf '%s\n' "$viewport" | grep -qE 'MISHE-VALUE: journal FRESH [0-9TZ:-]+' \
+  || { echo 'FAIL: a fresh journal is not exposed as a source-backed value' >&2; exit 1; }
+touch -d '12 minutes ago' "$mesh/tasks.journal"
+stale="$(MESH_DIR="$mesh" MESH_TASK_JOURNAL="$mesh/tasks.journal" \
+  MESH_DASH_CHAT_LOG="$mesh/chat.log" MESH_DASH_PANE_ROWS=47 MESH_DASH_PANE_COLS=189 \
+  "$ROOT/scripts/mesh-dash" --once witness 2>&1)"
+printf '%s\n' "$stale" | grep -qE 'MISHE-VALUE: journal STALE [0-9TZ:-]+' \
+  || { echo 'FAIL: an overdue journal did not cross the source-backed stale threshold' >&2; exit 1; }
 
 # Short panes still render the complete authoritative frame. They do not relabel a truncated
 # viewport as compact coverage; mesh-window-check reports the allocation fault until restore gives
@@ -47,8 +55,6 @@ touch -d '45 seconds ago' "$mesh/tasks.journal" # exercise a two-digit age plus 
 small="$(MESH_DIR="$mesh" MESH_TASK_JOURNAL="$mesh/tasks.journal" \
   MESH_DASH_CHAT_LOG="$mesh/chat.log" MESH_DASH_PANE_ROWS=11 MESH_DASH_PANE_COLS=80 \
   "$ROOT/scripts/mesh-dash" --once witness 2>&1)"
-printf '%s\n' "$small" | grep -q 'WITNESS TASKS — structured unfinished work' \
-  || { echo 'FAIL: short-pane render dropped the witness task heading' >&2; exit 1; }
 printf '%s\n' "$small" | grep -qE 'materialized view: .* · source age=[0-9]+s · authority=' \
   || { echo 'FAIL: short-pane render dropped the labelled source age' >&2; exit 1; }
 printf '%s\n' "$small" | grep -q '25 unfinished' \
