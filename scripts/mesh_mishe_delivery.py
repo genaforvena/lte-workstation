@@ -1,12 +1,13 @@
-"""Synthetic per-channel authority and durable outbox primitives.
+"""Per-channel authority and idempotent wake outbox.
 
-This module cannot promote real channels. Legacy producer fencing and the live
-sink are separate rollout gates.
+Real cutover is restricted to the explicitly enabled witness lane and its
+one-shot sink; synthetic fixtures retain their separate admission policy.
 """
 from __future__ import annotations
 
 import fcntl
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -33,14 +34,35 @@ def core_feed():
     return Feed(home())
 
 
-def synthetic(channel: str) -> None:
-    if channel != "synthetic":
-        raise BoundaryError("only synthetic may switch or dispatch; real channel fence is not installed")
+def witness_enabled(channel: str) -> None:
+    if channel != "witness" or os.environ.get("MESH_MISHE_REAL_ALLOWLIST") != "witness":
+        raise BoundaryError("real witness is not explicitly allowlisted")
+
+
+
+
+def witness_conditions(channel: str) -> dict:
+    sink = os.environ.get("MESH_MISHE_SINK", "")
+    approved = Path(__file__).with_name("mesh-mishe-mind-sink").resolve()
+    hold = home() / ".fleet-shadow-hold"
+    return {"allowlist": channel == "witness" and os.environ.get("MESH_MISHE_REAL_ALLOWLIST") == "witness",
+            "sink": bool(sink) and Path(sink).resolve() == approved
+            and approved.is_file() and os.access(approved, os.X_OK),
+            "model": os.environ.get("MESH_MISHE_WITNESS_MODEL") in
+            ("gpt-5.6-luna", "openai/gpt-5.6-luna"),
+            "hold_released": not hold.exists() and not hold.is_symlink()}
+
+
+def witness_gates(channel: str) -> None:
+    gates = witness_conditions(channel)
+    if not all(gates.values()):
+        raise BoundaryError("witness cutover gate closed: " + ",".join(k for k, v in gates.items() if not v))
 
 
 @contextmanager
 def channel_lock(channel: str):
-    synthetic(channel)
+    if channel != "synthetic":
+        witness_enabled(channel)
     directory = home() / "authority"
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd = os.open(directory / f"{channel}.lock", os.O_CREAT | os.O_RDWR, 0o600)
@@ -108,7 +130,6 @@ def read_authority(channel: str) -> dict:
 def outbox_dir(channel: str) -> Path:
     return home() / "outbox" / channel
 
-
 def switch(channel: str, target: str, expected: int, feed_seq: int) -> dict:
     with channel_lock(channel):
         current = read_authority(channel)
@@ -118,9 +139,13 @@ def switch(channel: str, target: str, expected: int, feed_seq: int) -> dict:
             raise BoundaryError("authority already selected")
         if target not in ("legacy", "mishe") or feed_seq < current["active_feed_seq"]:
             raise BoundaryError("invalid target or feed sequence")
+        if channel == "witness" and target == "mishe":
+            witness_gates(channel)
         tail = core_feed().tail_sequence()  # verified checkpoint; fail closed on malformed feed
         if feed_seq != tail:
             raise BoundaryError(f"feed sequence must equal current tail {tail}")
+        if channel == "witness" and target == "mishe" and not witness_s1_proven(feed_seq):
+            raise BoundaryError("witness S0/S1 calibration wake absent at feed checkpoint")
         if target == "legacy":
             for item in outbox_dir(channel).glob("*.json"):
                 status = read_json(item).get("status")
@@ -133,7 +158,93 @@ def switch(channel: str, target: str, expected: int, feed_seq: int) -> dict:
         return record
 
 
+def preflight(channel: str, expected: int, feed_seq: int) -> dict:
+    """Read-only cutover verdict, without installing authority or emitting a wake."""
+    current = read_authority(channel)
+    tail = core_feed().tail_sequence()
+    gates = {"generation": current["generation"] == expected,
+             "legacy": current["authority"] == "legacy",
+             "feed_tail": tail == feed_seq and tail >= current["active_feed_seq"]}
+    if channel == "witness":
+        gates.update(witness_conditions(channel))
+        gates["s1_proven"] = witness_s1_proven(feed_seq) if gates["feed_tail"] else False
+    elif channel != "synthetic":
+        raise BoundaryError("only synthetic or explicitly allowlisted witness can cut over")
+    return {"channel": channel, "authority": current["authority"],
+            "generation": current["generation"], "feed_tail": tail,
+            "ready": all(gates.values()), "gates": gates}
+
+
 REQUEST = re.compile(r"wake requested top-pain ([a-z][a-z0-9-]*) for entry ([1-9][0-9]*)\Z")
+
+def witness_stimulus(entries: list, request, stimulus_seq: int) -> bool:
+    """Admit only S0-projected stale source or unfinished mishe issues with explicit S1 receipts."""
+    by_sequence = {entry.sequence: entry for entry in entries}
+    stimulus = by_sequence.get(stimulus_seq)
+    if (stimulus is None or stimulus.sequence >= request.sequence
+            or stimulus.source != "observation/witness"):
+        return False
+    lines = stimulus.body.splitlines()
+    if len(lines) != 2 or lines[0] != "STATE: RED":
+        return False
+    observation = lines[1]
+    stale_pane = observation == (
+        "OBSERVATION: source=top-pane/witness freshness=stale value-coverage=unknown"
+    )
+    stale_journal = re.fullmatch(
+        r"OBSERVATION: source=top-pane/witness freshness=fresh journal=stale "
+        r"signal=[0-9a-f]{16}(?: tasks-total=\d{1,6} tasks-unfinished=\d{1,6} "
+        r"tasks-unowned=\d{1,6})?", observation,
+    ) is not None
+    mishe_issues = re.fullmatch(
+        r"OBSERVATION: source=top-pane/witness freshness=fresh journal=fresh "
+        r"signal=[0-9a-f]{16}(?: tasks-total=\d{1,6} tasks-unfinished=\d{1,6} "
+        r"tasks-unowned=\d{1,6})? mishe-issues=[1-9]\d{0,5} issue-digest=[0-9a-f]{16}",
+        observation,
+    ) is not None
+    if not (stale_pane or stale_journal or mishe_issues):
+        return False
+    request_body = f"wake requested top-pain witness for entry {stimulus_seq}"
+    if any(entry.source == "mishe-tauftauf" and entry.body == request_body
+           and stimulus_seq < entry.sequence < request.sequence for entry in entries):
+        return False
+    receipts = {"relevance": [], "desired-state-met": [], "continue-observing": []}
+    disposition = f"entry {stimulus_seq} for top-pain witness: wake"
+    disposition_seq = []
+    for entry in entries:
+        if entry.source != "mishe-tauftauf" or not stimulus_seq < entry.sequence < request.sequence:
+            continue
+        if entry.body == disposition:
+            disposition_seq.append(entry.sequence)
+        matched = re.fullmatch(
+            rf"judged (relevance|desired-state-met|continue-observing) for top-pain witness "
+            rf"on entry {stimulus_seq}: (yes|no|unknown) probability=(\S{{1,32}}) "
+            r"question-version=\S{1,64} policy-version=\S{1,64}", entry.body,
+        )
+        if matched:
+            try:
+                probability = float(matched.group(3))
+            except ValueError:
+                probability = math.nan
+            receipts[matched.group(1)].append(
+                (entry.sequence, matched.group(2), probability)
+            )
+    gates = receipts["desired-state-met"] + receipts["continue-observing"]
+    if (len(disposition_seq) != 1 or len(receipts["relevance"]) != 1 or len(gates) != 1):
+        return False
+    relevance_seq, relevance, relevance_p = receipts["relevance"][0]
+    gate_seq, gate, gate_p = gates[0]
+    return (relevance_seq < gate_seq < disposition_seq[0]
+            and relevance == "yes" and gate == "no"
+            and all(math.isfinite(p) and 0 <= p <= 1 for p in (relevance_p, gate_p)))
+
+
+def witness_s1_proven(feed_seq: int) -> bool:
+    entries = core_feed().entries()
+    return any(entry.sequence <= feed_seq and entry.source == "mishe-tauftauf"
+               and (match := REQUEST.fullmatch(entry.body)) is not None
+               and match.group(1) == "witness"
+               and witness_stimulus(entries, entry, int(match.group(2))) for entry in entries)
 
 
 def sink_status(sink: str, key: str) -> str:
@@ -236,10 +347,12 @@ def dispatch_once(channel: str, limit: int = 8) -> dict:
         current = read_authority(channel)
         if current["authority"] != "mishe":
             raise BoundaryError("mishe is not current authority")
+        if channel == "witness":
+            witness_gates(channel)
         sink = os.environ.get("MESH_MISHE_SINK")
         if not sink or not os.path.isfile(sink) or not os.access(sink, os.X_OK):
             raise BoundaryError("idempotent sink capability absent")
-        entries = core_feed().entries(start=current["active_feed_seq"] + 1)
+        entries = core_feed().entries()
         by_sequence = {entry.sequence: entry for entry in entries}
         results = []
         for entry in entries:
@@ -254,10 +367,13 @@ def dispatch_once(channel: str, limit: int = 8) -> dict:
                 continue
             key = f"{channel}:{current['generation']}:{entry.sequence}"
             path = outbox_dir(channel) / f"{current['generation']}-{entry.sequence}.json"
+            if path.is_symlink():
+                raise BoundaryError("outbox record must not be a symlink")
             item = read_json(path) if path.exists() else {"channel": channel, "generation": current["generation"],
                 "request_id": entry.sequence, "key": key, "status": "pending"}
-            if (item.get("key") != key or item.get("status") not in
-                    ("pending", "held", "claimed", "unknown", "refused", "delivered")):
+            if (item.get("channel") != channel or item.get("generation") != current["generation"]
+                    or item.get("request_id") != entry.sequence or item.get("key") != key
+                    or item.get("status") not in ("pending", "held", "claimed", "unknown", "refused", "delivered")):
                 raise BoundaryError("outbox record invalid")
             if item["status"] == "held":
                 retry_at = item.get("next_retry_at", 0)
@@ -268,8 +384,10 @@ def dispatch_once(channel: str, limit: int = 8) -> dict:
                                     "retry_after": retry_at})
                     continue
             stimulus = by_sequence.get(int(match.group(2)))
-            if (stimulus is None or stimulus.sequence >= entry.sequence
-                    or stimulus.source != "observation/synthetic"):
+            grounded = (witness_stimulus(entries, entry, int(match.group(2))) if channel == "witness"
+                        else stimulus is not None and stimulus.sequence < entry.sequence
+                        and stimulus.source == "observation/synthetic")
+            if not grounded:
                 if item["status"] not in ("pending", "held"):
                     raise BoundaryError("ungrounded request has an attempted sink identity")
                 hold_retry(item, "ungrounded-stimulus")
@@ -289,7 +407,8 @@ def dispatch_once(channel: str, limit: int = 8) -> dict:
                 atomic_json(path, item)
                 results.append({"key": key, "status": item["status"]})
                 continue
-            admission, reason = synthetic_policy(channel)
+            admission, reason = (synthetic_policy(channel) if channel == "synthetic"
+                                 else ("eligible", "witness-source-admitted"))
             if admission != "eligible":
                 if admission == "held":
                     hold_retry(item, reason)
@@ -321,7 +440,8 @@ def dispatch_once(channel: str, limit: int = 8) -> dict:
                 try:
                     result = subprocess.run([sink, "--idempotency-key", key, channel,
                                              "Coordinator wake; read your charter and current state."],
-                                            text=True, capture_output=True, timeout=15,
+                                            text=True, capture_output=True,
+                                            timeout=810 if channel == "witness" else 15,
                                             env={**os.environ, "MESH_TELL_AUTOMATIC": "0"})
                 except (OSError, subprocess.TimeoutExpired) as exc:
                     raise BoundaryError(f"sink call ambiguous: {type(exc).__name__}") from exc
