@@ -1,0 +1,508 @@
+#!/usr/bin/env python3
+"""Read-only legacy observation capture into private, unreviewed source cases."""
+from __future__ import annotations
+
+import argparse
+from datetime import datetime, timezone
+import hashlib
+import importlib.util
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+
+MAX_SOURCE = 4_000_000
+MAX_TOTAL = 16_000_000
+MAX_FEED = 64_000_000
+MAX_PARITY = 16_000_000
+EVENT_CHANNELS = frozenset(("adint", "hire", "wake", "haunt"))
+EVENT_ID = re.compile(r"[0-9a-f]{64}\Z")
+CHANNEL = re.compile(r"[a-z][a-z0-9-]*\Z")
+CASE_NAME = re.compile(r"\d{20}-[0-9a-f]{16}\Z")
+DIGEST = re.compile(r"[0-9a-f]{64}\Z")
+TICK = re.compile(r"[0-9a-f]{32}\Z")
+
+
+class Unavailable(Exception):
+    """A fixed, public reason for refusing private input."""
+
+
+def core_modules():
+    core = Path(os.environ.get("MESH_MISHE_CORE", str(Path.home() / "mishe-tauftauf")))
+    sys.path.insert(0, str(core / "src"))
+    from mishe_tauftauf.external_view import safe_fleet_view
+    from mishe_tauftauf.feed import parse_feed
+    return safe_fleet_view, parse_feed
+
+
+def sources_module():
+    path = Path(__file__).with_name("mesh_mishe_sources.py")
+    spec = importlib.util.spec_from_file_location("mesh_mishe_sources", path)
+    if spec is None or spec.loader is None:
+        raise Unavailable("registry_unavailable")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def bounded_file(path: Path, limit: int, *, with_stat: bool = False):
+    before = path.lstat()
+    if not stat.S_ISREG(before.st_mode) or before.st_size > limit:
+        raise Unavailable("invalid_input_file")
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode) or signature(opened) != signature(before):
+            raise Unavailable("changed_input_file")
+        with os.fdopen(fd, "rb", closefd=False) as stream:
+            content = stream.read(limit + 1)
+        if len(content) > limit or signature(os.fstat(fd)) != signature(opened) or signature(path.lstat()) != signature(opened):
+            raise Unavailable("changed_input_file")
+        return (content, opened) if with_stat else content
+    finally:
+        os.close(fd)
+
+
+def signature(info):
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def parity_rows(home: Path):
+    raw = bounded_file(home / "parity/projected.jsonl", MAX_PARITY)
+    rows = {}
+    for line in raw.splitlines():
+        try:
+            row = json.loads(line)
+            if (type(row) is not dict or set(row) != {"channel", "event_id", "kind", "at", "source", "feed_seq"}
+                or not isinstance(row["channel"], str) or not CHANNEL.fullmatch(row["channel"])
+                or not isinstance(row["event_id"], str) or not EVENT_ID.fullmatch(row["event_id"])
+                or type(row["feed_seq"]) is not int or row["feed_seq"] < 1
+                or row["kind"] != "pane" or row["source"] != "top-pane"
+                or not isinstance(row["at"], str)):
+                raise ValueError
+            key = (row["feed_seq"], row["channel"])
+            if key in rows:
+                raise ValueError
+            rows[key] = row
+        except (ValueError, TypeError, KeyError, UnicodeError) as exc:
+            raise Unavailable("invalid_parity") from exc
+    return rows
+
+
+def validated_stamp(raw: bytes, sequence: int, event_id: str, channel: str, body: str) -> dict:
+    try:
+        stamp = json.loads(raw)
+        if (type(stamp) is not dict
+            or set(stamp) != {"version", "tick", "event_id", "channel", "projected_sha256",
+                                 "sources", "audit_sha256", "feed_seq"}
+            or type(stamp["version"]) is not int or stamp["version"] != 1
+            or type(stamp["feed_seq"]) is not int or stamp["feed_seq"] != sequence
+            or type(stamp["tick"]) is not str or not TICK.fullmatch(stamp["tick"])
+            or stamp["event_id"] != event_id or stamp["channel"] != channel
+            or type(stamp["projected_sha256"]) is not str
+            or stamp["projected_sha256"] != hashlib.sha256(body.encode("utf-8")).hexdigest()
+            or type(stamp["sources"]) is not list or not 0 < len(stamp["sources"]) <= 32
+            or (stamp["audit_sha256"] is not None and
+                (type(stamp["audit_sha256"]) is not str or not DIGEST.fullmatch(stamp["audit_sha256"])))):
+            raise Unavailable("bound_stamp_invalid")
+        origins = set()
+        for source in stamp["sources"]:
+            if (type(source) is not dict or set(source) != {"origin", "sha256", "mtime_ns"}
+                or type(source["origin"]) is not str or not source["origin"]
+                or source["origin"] in origins or type(source["sha256"]) is not str
+                or not DIGEST.fullmatch(source["sha256"])
+                or type(source["mtime_ns"]) is not int or source["mtime_ns"] < 0):
+                raise Unavailable("bound_stamp_invalid")
+            origins.add(source["origin"])
+        if (channel in EVENT_CHANNELS) != (stamp["audit_sha256"] is not None):
+            raise Unavailable("bound_stamp_invalid")
+        return stamp
+    except (ValueError, TypeError, UnicodeError) as exc:
+        raise Unavailable("bound_stamp_invalid") from exc
+
+
+def bound_stamp(home: Path, entry, row, channel: str) -> tuple[dict, bytes]:
+    path = home / "parity/source-bound" / f"{entry.sequence:020d}.json"
+    try:
+        info = path.lstat()
+        if info.st_uid != os.getuid() or info.st_mode & 0o077:
+            raise Unavailable("bound_stamp_invalid")
+        raw = bounded_file(path, 32768)
+        return validated_stamp(raw, entry.sequence, row["event_id"], channel, entry.body), raw
+    except FileNotFoundError as exc:
+        raise Unavailable("bound_stamp_missing") from exc
+    except OSError as exc:
+        raise Unavailable("bound_stamp_invalid") from exc
+
+
+def private_root(path: Path):
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    info = path.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise Unavailable("unsafe_evidence_root")
+
+
+def render_projection(channel: str, repo: Path, env: dict[str, str]) -> str:
+    role = "check" if channel == "health" else channel
+    render = subprocess.run([str(repo / "scripts/mesh-mishe-render"), channel, role], env=env,
+                            capture_output=True, timeout=20)
+    if render.returncode or len(render.stdout) > 65536:
+        raise Unavailable("render_unavailable")
+    # The project CLI stages opaque pane identity only inside the private scratch home.
+    with tempfile.TemporaryDirectory(prefix="pane-", dir=env["MESH_MISHE_HOME"]) as temporary:
+        frame = Path(temporary) / "frame"
+        frame.write_bytes(render.stdout)
+        project = subprocess.run([str(repo / "scripts/mesh-mishe-project"), "--channel", channel,
+                                  str(frame), str(frame)], env=env, capture_output=True, timeout=20)
+    if project.returncode or len(project.stdout) > 2048:
+        raise Unavailable("projection_unavailable")
+    try:
+        return project.stdout.decode("utf-8")
+    except UnicodeError as exc:
+        raise Unavailable("projection_unavailable") from exc
+
+
+def audit_rows(channel: str, repo: Path, env: dict[str, str]) -> bytes:
+    command = env.get("MESH_MISHE_TASK_AUDIT_CMD", str(repo / "scripts/mesh-task"))
+    result = subprocess.run([command, "audit"], env=env, capture_output=True, timeout=10)
+    if result.returncode or len(result.stdout) > 4_000_000:
+        raise Unavailable("audit_unavailable")
+    try:
+        text = result.stdout.decode("utf-8")
+    except UnicodeError as exc:
+        raise Unavailable("audit_unavailable") from exc
+    predicate = re.compile(
+        rf"OVERDUE\t{re.escape(channel)}\t[A-Za-z0-9._/-]{{1,120}}\t"
+        r"lease=\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ(?: independent_reason=[^\n]{1,160})?\Z"
+    )
+    matched = [row for row in text.splitlines() if predicate.fullmatch(row)]
+    if not matched:
+        raise Unavailable("audit_no_overdue")
+    return ("\n".join(matched) + "\n").encode("utf-8")
+
+
+def snapshot(paths: tuple[Path, ...], directory: Path):
+    if not paths or len(paths) > 32 or len(set(paths)) != len(paths):
+        raise Unavailable("source_set_unavailable")
+    records = []
+    total = 0
+    for index, path in enumerate(paths):
+        try:
+            raw, info = bounded_file(path, MAX_SOURCE, with_stat=True)
+        except OSError as exc:
+            raise Unavailable("source_unavailable") from exc
+        if not raw or total + len(raw) > MAX_TOTAL:
+            raise Unavailable("source_unavailable")
+        total += len(raw)
+        target = directory / str(index)
+        with target.open("xb") as stream:
+            stream.write(raw)
+        target.chmod(0o600)
+        records.append({"origin": str(path), "file": f"sources/{index}",
+                        "sha256": hashlib.sha256(raw).hexdigest(), "mtime_ns": info.st_mtime_ns,
+                        "signature": signature(info)})
+    return records
+
+
+def sources_unchanged(paths, records):
+    try:
+        return all(signature(path.lstat()) == tuple(item["signature"])
+                   for path, item in zip(paths, records[:len(paths)], strict=True))
+    except OSError:
+        return False
+
+
+def existing_case(path: Path) -> dict:
+    if path.is_symlink() or not path.is_dir() or path.stat().st_mode & 0o077:
+        raise Unavailable("existing_case_invalid")
+    try:
+        manifest = json.loads(bounded_file(path / "case.json", 32768))
+        if (not isinstance(manifest, dict) or manifest.get("status") != "candidate_unreviewed"
+            or manifest.get("case_id") != path.name or not isinstance(manifest.get("sources"), list)
+            or not manifest["sources"] or type(manifest.get("original_feed_seq")) is not int
+            or manifest["original_feed_seq"] < 1 or not isinstance(manifest.get("channel"), str)
+            or not CHANNEL.fullmatch(manifest["channel"])
+            or not isinstance(manifest.get("event_id"), str) or not EVENT_ID.fullmatch(manifest["event_id"])
+            or not isinstance(manifest.get("projected_view"), str)
+            or not isinstance(manifest.get("safe_view"), str)
+            or any(name in manifest for name in ("label", "authority", "verdict"))
+            or not (type(manifest.get("version")) is int and
+                    ((manifest["version"] == 1 and "provenance_phase" not in manifest)
+                     or (manifest["version"] == 2 and manifest.get("provenance_phase") in
+                         ("s0_projection_hash_matched", "post_observation_reprojection"))))):
+            raise ValueError
+        digests = []
+        for index, item in enumerate(manifest["sources"]):
+            if not isinstance(item, dict) or item.get("file") != f"sources/{index}":
+                raise ValueError
+            raw = bounded_file(path / "sources" / str(index), MAX_SOURCE)
+            digest = hashlib.sha256(raw).hexdigest()
+            if digest != item.get("sha256"):
+                raise ValueError
+            digests.append(digest)
+        source_digest = hashlib.sha256("\n".join(digests).encode()).hexdigest()
+        expected_key = hashlib.sha256(f"{manifest['channel']}\0{manifest['event_id']}".encode()).hexdigest()
+        if (manifest.get("source_digest") != source_digest or manifest.get("capture_key") != expected_key
+            or manifest["case_id"] != f"{manifest['original_feed_seq']:020d}-{manifest['event_id'][:16]}"):
+            raise ValueError
+        bound_path = path / "s0-bound.json"
+        if manifest.get("provenance_phase") == "s0_projection_hash_matched":
+            info = bound_path.lstat()
+            if (info.st_uid != os.getuid() or info.st_mode & 0o077
+                or type(manifest.get("bound_sha256")) is not str
+                or not DIGEST.fullmatch(manifest["bound_sha256"])):
+                raise ValueError
+            bound_raw = bounded_file(bound_path, 32768)
+            if hashlib.sha256(bound_raw).hexdigest() != manifest["bound_sha256"]:
+                raise ValueError
+            stamp = validated_stamp(bound_raw, manifest["original_feed_seq"], manifest["event_id"],
+                                    manifest["channel"], manifest["projected_view"])
+            producer_records = manifest["sources"][:len(stamp["sources"])]
+            if (len(manifest["sources"]) != len(stamp["sources"]) + int(stamp["audit_sha256"] is not None)
+                or [(item.get("origin"), item["sha256"], item.get("mtime_ns")) for item in producer_records]
+                != [(item["origin"], item["sha256"], item["mtime_ns"]) for item in stamp["sources"]]
+                or (stamp["audit_sha256"] is not None
+                    and manifest["sources"][-1]["sha256"] != stamp["audit_sha256"])):
+                raise ValueError
+        elif "bound_sha256" in manifest or bound_path.exists() or bound_path.is_symlink():
+            raise ValueError
+        return manifest
+    except (OSError, ValueError, TypeError, Unavailable) as exc:
+        raise Unavailable("existing_case_invalid") from exc
+
+
+def capture(entry, row, home: Path, mesh_dir: Path, repo: Path, cases: Path,
+            safe_fleet_view, registry, *, allow_historical: bool = False) -> str:
+    channel = entry.source.removeprefix("observation/")
+    safe = safe_fleet_view(entry.body, channel)
+    if safe is None:
+        raise Unavailable("unsafe_projection")
+    if row["at"] != entry.timestamp:
+        raise Unavailable("parity_mismatch")
+    bound = None if allow_historical else bound_stamp(home, entry, row, channel)
+    stamp = bound[0] if bound is not None else None
+    phase = "post_observation_reprojection" if allow_historical else "s0_projection_hash_matched"
+    case_id = f"{entry.sequence:020d}-{row['event_id'][:16]}"
+    target = cases / case_id
+    with tempfile.TemporaryDirectory(prefix=".render-", dir=cases) as scratch:
+        sandbox = Path(scratch)
+        sandbox.chmod(0o700)
+        try:
+            key = bounded_file(home / "projection.key", 32)
+            if len(key) == 32:
+                (sandbox / "projection.key").write_bytes(key)
+                (sandbox / "projection.key").chmod(0o600)
+        except (OSError, Unavailable):
+            pass  # No optional keyed view-change can be invented without the key.
+        env = {**os.environ, "MESH_MISHE_HOME": str(sandbox), "MESH_MISHE_RENDER_SOURCE": "pane",
+               "MESH_REPO": str(repo), "MESH_DIR": str(mesh_dir)}
+        env.pop("MESH_MISHE_TICK_ID", None)
+        staging = Path(tempfile.mkdtemp(prefix=".case-", dir=cases))
+        staging.chmod(0o700)
+        try:
+            source_dir = staging / "sources"
+            source_dir.mkdir(mode=0o700)
+            paths = tuple(registry.provenance_files(channel, mesh_dir, repo))
+            records = snapshot(paths, source_dir)
+            if stamp is not None and (
+                [str(path) for path in paths] != [item["origin"] for item in stamp["sources"]]
+                or any(record["sha256"] != original["sha256"]
+                       or record["mtime_ns"] != original["mtime_ns"]
+                       for record, original in zip(records, stamp["sources"], strict=True))
+            ):
+                raise Unavailable("bound_source_mismatch")
+            if channel in EVENT_CHANNELS:
+                if "semantic=obligations:stale" not in safe.splitlines()[1].split():
+                    raise Unavailable("audit_semantic_not_stale")
+                audit = audit_rows(channel, repo, env)
+                if stamp is not None and hashlib.sha256(audit).hexdigest() != stamp["audit_sha256"]:
+                    raise Unavailable("bound_audit_mismatch")
+                audit_index = len(records)
+                (source_dir / str(audit_index)).write_bytes(audit)
+                (source_dir / str(audit_index)).chmod(0o600)
+                records.append({"file": f"sources/{audit_index}", "sha256": hashlib.sha256(audit).hexdigest(),
+                                "source": "exact_owner_overdue_audit", "mtime_ns": None})
+            source_digest = hashlib.sha256("\n".join(item["sha256"] for item in records).encode()).hexdigest()
+            capture_key = hashlib.sha256(f"{channel}\0{row['event_id']}".encode()).hexdigest()
+            before = render_projection(channel, repo, env)
+            # The S0 stamp binds the exact original projection. A live pane's
+            # signal/view-change identifiers can rotate without changing the
+            # producer bytes or the model-visible semantic view. Historical
+            # cases lack that stamp and still require exact re-projection.
+            if before != entry.body and (stamp is None or safe_fleet_view(before, channel) != safe):
+                raise Unavailable("projection_mismatch")
+            after = render_projection(channel, repo, env)
+            if before != after and (stamp is None or safe_fleet_view(after, channel) != safe):
+                raise Unavailable("projection_changed")
+            if channel in EVENT_CHANNELS and audit_rows(channel, repo, env) != audit:
+                raise Unavailable("audit_changed")
+            if not sources_unchanged(paths, records):
+                raise Unavailable("source_changed")
+            if target.exists() or target.is_symlink():
+                manifest = existing_case(target)
+                if (manifest.get("event_id") != row["event_id"] or manifest.get("projected_view") != entry.body
+                    or manifest.get("original_feed_seq") != entry.sequence):
+                    raise Unavailable("existing_case_invalid")
+                previous_phase = manifest.get("provenance_phase", "post_observation_reprojection")
+                if previous_phase != phase:
+                    raise Unavailable("historical_case_exists" if previous_phase == "post_observation_reprojection"
+                                      else "s0_case_exists")
+                return "duplicate"
+            for item in records:
+                item.pop("signature", None)
+            manifest = {"version": 2, "provenance_phase": phase, "status": "candidate_unreviewed",
+                        "case_id": case_id, "channel": channel, "event_id": row["event_id"],
+                        "capture_key": capture_key, "source_digest": source_digest,
+                        "captured_at": datetime.now(timezone.utc).isoformat(),
+                        "original_feed_seq": entry.sequence, "projected_view": entry.body,
+                        "safe_view": safe, "sources": records}
+            if bound is not None:
+                manifest["bound_sha256"] = hashlib.sha256(bound[1]).hexdigest()
+                artifact = staging / "s0-bound.json"
+                with artifact.open("xb") as stream:
+                    stream.write(bound[1])
+                artifact.chmod(0o600)
+            metadata = staging / "case.json"
+            with metadata.open("x", encoding="utf-8") as stream:
+                json.dump(manifest, stream, sort_keys=True)
+                stream.write("\n")
+            metadata.chmod(0o600)
+            for prior in cases.iterdir():
+                if CASE_NAME.fullmatch(prior.name):
+                    previous = existing_case(prior)
+                    if (previous["capture_key"] == capture_key and
+                        previous.get("provenance_phase", "post_observation_reprojection") == phase):
+                        return "duplicate"
+            # A populated case cannot be replaced by rename; replay checks it above.
+            if target.exists() or target.is_symlink():
+                raise Unavailable("case_race")
+            os.rename(staging, target)
+        finally:
+            if staging.exists():
+                shutil.rmtree(staging)
+    return "captured"
+
+
+def record_status(root: Path, state: str, skipped: int, last_reason: str) -> None:
+    payload = {"state": state, "skipped": skipped, "last_skip_reason": last_reason,
+               "at": datetime.now(timezone.utc).isoformat()}
+    fd, name = tempfile.mkstemp(prefix=".capture-status-", dir=root)
+    try:
+        with os.fdopen(fd, "w", encoding="ascii") as stream:
+            os.fchmod(stream.fileno(), 0o600)
+            json.dump(payload, stream)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(name, root / "last-capture.json")
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+
+
+def status(root: Path) -> int:
+    try:
+        if not root.is_dir() or root.is_symlink() or root.stat().st_mode & 0o077:
+            raise Unavailable("private_evidence_unavailable")
+        cases = root / "cases"
+        if not cases.is_dir() or cases.is_symlink() or cases.stat().st_mode & 0o077:
+            raise Unavailable("private_evidence_unavailable")
+        candidates = [existing_case(path) for path in cases.iterdir() if CASE_NAME.fullmatch(path.name)]
+        run = json.loads(bounded_file(root / "last-capture.json", 4096))
+        if (not isinstance(run, dict) or run.get("state") not in ("candidate", "idle", "UNKNOWN")
+            or type(run.get("skipped")) is not int or run["skipped"] < 0
+            or not re.fullmatch(r"[a-z_]+", run.get("last_skip_reason", ""))):
+            raise Unavailable("capture_status_invalid")
+        distinct = len({(case["capture_key"], case.get("provenance_phase", "post_observation_reprojection"))
+                        for case in candidates})
+        bound = sum(case.get("provenance_phase") == "s0_projection_hash_matched" for case in candidates)
+        historical = len(candidates) - bound
+        last_seq = max((case["original_feed_seq"] for case in candidates), default=0)
+        print(f"mishe corpus: captured_candidates={len(candidates)} distinct_capture_keys={distinct} "
+              f"reviewed_labels=0 s0_bound_candidates={bound} historical_candidates={historical} "
+              f"last_capture_seq={last_seq} last_capture_status={run['state']} "
+              f"last_skipped={run['skipped']} last_skip_reason={run['last_skip_reason']}")
+        return 2 if run["state"] == "UNKNOWN" else 0
+    except (OSError, ValueError, TypeError, KeyError, Unavailable) as exc:
+        reason = str(exc) if isinstance(exc, Unavailable) else "private_evidence_unavailable"
+        print(f"mishe corpus: UNKNOWN reason={reason} captured_candidates=UNKNOWN "
+              "distinct_capture_keys=UNKNOWN reviewed_labels=0 "
+              "s0_bound_candidates=UNKNOWN historical_candidates=UNKNOWN")
+        return 2
+
+
+def main() -> int:
+    os.umask(0o077)
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="command", required=True)
+    capture_parser = sub.add_parser("capture")
+    capture_parser.add_argument("--after", type=int, required=True, metavar="SEQ")
+    capture_parser.add_argument("--home", type=Path, required=True)
+    capture_parser.add_argument("--evidence-root", type=Path, required=True)
+    capture_parser.add_argument("--allow-historical-corroboration", action="store_true",
+                                help="capture separately marked post-observation evidence without a bound S0 stamp")
+    status_parser = sub.add_parser("status")
+    status_parser.add_argument("--home", type=Path, required=True)
+    status_parser.add_argument("--evidence-root", type=Path, required=True)
+    args = parser.parse_args()
+    if args.command == "status":
+        return status(args.evidence_root)
+    if args.after < 0:
+        parser.error("--after must be nonnegative")
+    try:
+        private_root(args.evidence_root)
+        cases = args.evidence_root / "cases"
+        private_root(cases)
+        safe_fleet_view, parse_feed = core_modules()
+        registry = sources_module()
+        repo = Path(os.environ.get("MESH_REPO", str(Path(__file__).resolve().parents[1])))
+        mesh_dir = Path(os.environ.get("MESH_DIR", str(args.home.parent)))
+        feed = parse_feed(bounded_file(args.home / "feed", MAX_FEED))
+        observations = [entry for entry in feed if entry.sequence > args.after and entry.source.startswith("observation/")]
+        if not observations:
+            record_status(args.evidence_root, "idle", 0, "none")
+            print("mishe corpus: captured=0 duplicate=0 skipped=0")
+            return 0
+        parity = parity_rows(args.home)
+        last_reason = "none"
+        counts = {"captured": 0, "duplicate": 0, "skipped": 0}
+        for entry in observations:
+            channel = entry.source.removeprefix("observation/")
+            try:
+                if not CHANNEL.fullmatch(channel) or channel not in registry.SEMANTIC_SOURCES and channel not in ("cleaner", "pub", "witness"):
+                    raise Unavailable("channel_unavailable")
+                row = parity.get((entry.sequence, channel))
+                if row is None:
+                    raise Unavailable("parity_missing")
+                result = capture(entry, row, args.home, mesh_dir, repo, cases, safe_fleet_view, registry,
+                                 allow_historical=args.allow_historical_corroboration)
+                counts[result] += 1
+                print(f"mishe corpus: seq={entry.sequence} {result}")
+            except (Unavailable, OSError, subprocess.TimeoutExpired, ValueError) as exc:
+                reason = str(exc) if isinstance(exc, Unavailable) else "capture_unavailable"
+                counts["skipped"] += 1
+                last_reason = reason
+                print(f"mishe corpus: seq={entry.sequence} skipped reason={reason}")
+        result = 0 if counts["captured"] or counts["duplicate"] else 2
+        record_status(args.evidence_root, "candidate" if result == 0 else "UNKNOWN",
+                      counts["skipped"], last_reason)
+        print("mishe corpus: " + " ".join(f"{key}={value}" for key, value in counts.items()))
+        return result
+    except (OSError, ValueError, ImportError, Unavailable) as exc:
+        reason = str(exc) if isinstance(exc, Unavailable) else "input_unavailable"
+        print(f"mishe corpus: UNKNOWN reason={reason}")
+        if args.evidence_root.is_dir() and not args.evidence_root.is_symlink():
+            try:
+                record_status(args.evidence_root, "UNKNOWN", 0, reason)
+            except OSError:
+                pass
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
