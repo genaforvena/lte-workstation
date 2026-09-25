@@ -103,6 +103,22 @@ class AutomaticTellTest(unittest.TestCase):
                 tell.kill()
                 tell.communicate()
 
+    def test_automatic_send_allows_nested_lifecycle_reader(self):
+        rollback = subprocess.run([str(ROOT / "scripts/mesh-mishe-authority"), "switch", "synthetic",
+                                   "--to", "legacy", "--expect-generation", "1", "--feed-seq", "1"],
+                                  env=self.env, capture_output=True)
+        self.assertEqual(rollback.returncode, 0, rollback.stderr)
+        lifecycle = self.bin / "mesh-codex-lifecycle"
+        lifecycle.write_text(
+            "#!/bin/sh\n"
+            'exec flock -s -w 2 "$MESH_MISHE_HOME/authority/synthetic.lock" true\n'
+        )
+        lifecycle.chmod(0o755)
+        result = self.tell("--automatic", "synthetic", "nested-reader")
+        self.assertNotIn("cannot verify turn readiness", result.stderr)
+        self.assertTrue(self.calls.exists(), result.stderr)
+
+
 
 if __name__ == "__main__":
     unittest.main()
