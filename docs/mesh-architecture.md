@@ -184,6 +184,21 @@ S0 projection only, not System One admission or Mind delivery. Direct core
 runs with a live private pane can pass raw context to System One and are not
 a safe production diagnostic.
 
+Fleet S1 candidate capture is private and observation-only. With
+`~/.mesh/mishe-tauftauf/.fleet-corpus-capture` present, each held manual
+`mesh-mishe-run once` joins new feed observations to pane parity and calls
+`mesh-mishe-s1-corpus` before stamping a successful pass. The collector checks
+the bounded fleet view, reprojects the live pane before and after taking
+bounded source snapshots under `~/.mesh/evidence/migration/fleet-s1-candidates-20260925`,
+and deduplicates stable pane capture keys. It records capture-time source bytes,
+not original S0-time producer snapshots; changed sources or missing parity fail
+closed. Cases are `candidate_unreviewed`, with no positive/negative labels or
+independence claim. `mesh-doctor` renders capture status on the health pane;
+neither candidates nor a clean capture confer Mind authority. The numeric
+invariant Laya trial does not consume fleet enum projections: a separate
+fleet-specific S1 trial and independently reviewed, source-group-separated
+100+ positive and 100+ negative cases remain required.
+
 Legacy resident minds use `mesh-tell <window> "<prompt or op>"` and
 `mesh-tell --peek <window>` for window delivery. A prompt to `witness` is
 always refused: only an admitted System Zero/System One event may invite its
