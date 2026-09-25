@@ -127,16 +127,21 @@ the old 10+ window sprawl):
 | `tg` | claude | operator Telegram comms |
 | `senses` | opencode | keep + develop the senses |
 | `health` | opencode | node/fleet health |
-| `witness` | codex (gpt-5.6-luna) | self-measurement **AND** board/room coordination (chat merged in 2026-07-24) |
+| `witness` | configured OMP model | mishe-tauftauf stewardship, task-ledger verification, board coordination |
 
-`witness` carries **two duty classes**: on the TAPE (top) it is read-only and never
-writes a measurement; on the BOARD (bottom) it *acts* — files `[task]` from chat-review,
-drives stuck strands, is `mesh-mind-control`'s agentic fallback. A merge that leaves only
-the passive charter creates a dead lane.
+`witness` keeps a live Top Pain showing the structured task journal, a bounded
+mishe-tauftauf obligation summary, and the raw `chat.log` tail. A stale or new
+source-backed value becomes an ordinary observation: System Zero selects the
+candidate, System One decides whether to publish and wake, and an exclusive
+one-shot OMP Mind reads the current pane, verifies the issue, fixes safe owned
+work or routes an exact-owner task, writes receipts and handoff, then exits.
+The resident-Mind roster remains stopped; a live data pane alone is not an
+acting witness. An UNKNOWN admission or missing receipt remains visible work,
+not a pass.
 
-**Drive any mind without blocking** by sending to its window:
-`mesh-tell <window> "<prompt or op>"`, then `mesh-tell --peek <window>` to read what
-landed. This is the standard autonomous pattern; no operator needed for routine ops.
+Legacy resident minds use `mesh-tell <window> "<prompt or op>"` and
+`mesh-tell --peek <window>` for window delivery; one-shot witness events do
+not bypass System One with a direct `mesh-tell`.
 
 ---
 
