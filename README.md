@@ -53,8 +53,7 @@ An autonomous mesh's real enemy is not downtime — it is a **confident false re
 returns a plausible constant when it has failed is worse than one that crashes, because nothing ever
 comes to look at it. Most of what follows exists because that happened, and was measured.
 
-**Rules are one line; the case that earned them lives elsewhere.** [`CLAUDE.md`](CLAUDE.md) carries
-81 instructions, each a single line linking to the incident behind it — *a mode bit is not the write*,
+**Rules are compact; the case that earned each one lives elsewhere.** [`CLAUDE.md`](CLAUDE.md) carries mesh-wide instructions linked to their evidence — *a mode bit is not the write*,
 *a declared pref is not the FIB*, *a tape of only positives is a numerator*, *an alert wired to the
 fault and not to its actuator's outcome*. The evidence sits in a separate memory tier, so the
 instruction file stays readable. A rule that carries its own case inside it stops being re-read; that
@@ -77,8 +76,8 @@ Senses publish their own coverage — the window they sampled over the cadence t
 reading that stands for 5 seconds out of 300 says so.
 
 The long form is [`docs/mesh-architecture.md`](docs/mesh-architecture.md) and
-[`docs/epistemics.md`](docs/epistemics.md); [`docs/`](docs/) carries 86 documents, most of them
-write-ups of one specific investigation — and most of those are post-mortems on a measurement that lied.
+[`docs/epistemics.md`](docs/epistemics.md); [`docs/`](docs/) carries investigation write-ups and
+post-mortems on measurements that lied.
 
 ## What it actually does
 
@@ -158,7 +157,7 @@ mesh-tools --search <term>
 mesh-tools <category>      # e.g. "Perceive (sensorium)", "Liveness / self-tend"
 ```
 
-`scripts/` currently holds ~690 `mesh-*` tools; the annotated catalog is
+`scripts/` holds the mesh tools and their supporting files; the annotated catalog is
 [`docs/mesh-tooling.md`](docs/mesh-tooling.md). The docs worth reading first:
 
 | file | what it is |
