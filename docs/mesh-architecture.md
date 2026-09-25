@@ -91,9 +91,14 @@ SSH, then `mesh-tell` works).
 
 ## 3. Channels & panes
 
-A mind node's session is a uniform set of **2-pane windows** (channels). Each window is
-named after its **role**:
+A mind node's channel windows normally use a **2-pane** shape (channels). Each
+window is named after its **role**. The shared restore manifest creates data
+surfaces; node-local admission and live pane state determine whether a resident
+Mind is actually present. `witness` is the deliberate one-pane, data-only
+exception; its disposable Mind is launched only by an admitted one-shot event.
+The configured manifest or model setting is not proof of runtime residency.
 
+The pane layout is:
 ```
 ┌─────────────────────────────┐
 │  TOP  = DATA  (mesh-dash <role>, live-refreshing text)   │
@@ -117,34 +122,55 @@ discovers the live two-pane data/mind windows, and `mesh-pane-consume` wakes the
 when the normalized top-pane meaning changes (subject to prediction, refractory, and idle gates);
 the source remains ephemeral and the mind reads the full top pane after the wake.
 
-The current channel set (planted by `mesh-restore`, 2026-06-17 re-org — collapsed from
-the old 10+ window sprawl):
+`mesh-restore` defines the shared channel-role manifest. Node-local `restore.env` selects
+engines and resident Minds, and can retire roles; the manifest describes the shared map,
+not a guarantee that every role has a local Mind on every node.
 
-| channel | engine | duty |
-|---|---|---|
-| `minds` | claude | orchestration / allocation |
-| `genome` | claude | autonomous development of the codebase + its own build/deploy |
-| `tg` | claude | operator Telegram comms |
-| `senses` | opencode | keep + develop the senses |
-| `health` | — (one-shot HELD) | node/fleet health data; no resident Mind |
-| `witness` | configured OMP model | mishe-tauftauf stewardship, task-ledger verification, board coordination |
+| channel | duty |
+|---|---|
+| `minds` | orchestration / allocation |
+| `genome` | autonomous development of the codebase + its own build/deploy |
+| `tg` | operator Telegram comms |
+| `senses` | keep + develop the senses |
+| `health` | node/fleet health data |
+| `cleaner` | report-only repository inventory and safe disposition |
+| `room` | ambient room transcript and third-party observation |
+| `pub` | human-facing docs and publishing |
+| `discover` | capability research and discovery |
+| `sound` | sound-studio work and stewardship |
+| `models` | model selection from measured consumer use |
+| `vpn` | VPN-service observation and diagnosis |
+| `bruno` | cat/activity classification |
+| `diary` | diary reflex and pipeline stewardship |
+| `witness` | live task-journal observation and gated one-shot route |
+| `job` | operator job-search pipeline |
+| `adint` | operator's own advertising-profile research |
+| `hire` | agent's separately isolated employment lane |
+| `haunt` | absorbing-states research and reporting |
+| `wake` | `finnegans-fake` model research |
 
-`witness` keeps a live Top Pain showing the structured task journal, a bounded
-mishe-tauftauf obligation summary, and the raw `chat.log` tail. The live pane
-is observation, not a resident Mind. When witness has exclusive mishe authority
-and the fleet hold is released, a source-backed stale value can enter the feed
-through System Zero. A one-shot wake requires an exact red witness projection
-and explicit System One relevance=yes and desired-state-met=no (or
-continue-observing=no) receipts; UNKNOWN is not admission. The keyed sink sends
-only the projected observation, not the raw pane or prior handoff, to the
+`tg-roz` is conditionally planted on nodes with Rozalia routing configured; it
+is not a universal role. `room`, `models`, `bruno`, and `diary` remain documented
+shared roles even when a node retires them locally.
+
+`witness` keeps a live Top Pane showing the structured task journal, a bounded
+mishe-tauftauf obligation summary, and the raw `chat.log` tail. Its pane is
+observation, not a resident Mind. A one-shot delivery requires an exact red
+witness projection and explicit System One relevance=yes and desired-state-met=no
+(or continue-observing=no) receipts; UNKNOWN is not admission. The keyed sink
+sends only the projected observation, not the raw pane or prior handoff, to a
 disposable OMP Mind. It verifies/settles an exact-owner task or records an
 evidenced non-actionable disposition, writes invocation-tied board and core/Mesh
 handoffs, and exits. Unsettled or ambiguous invocations are not relaunched.
-The resident-Mind roster remains stopped; the production fleet hold and legacy
-authority remain until the separate privacy, repeated-pass and live S1 gates
-are met. Diagnostic Laya scores do not grant authority.
 
-For the 14 other `mesh-dash` roles, the projected charter-goal cache has
+Resident role Minds and the one-shot witness route are distinct: a process on a
+role pane does not grant that role exclusive mishe authority. The one-shot
+route remains held while legacy authority or the fleet-shadow hold is in force;
+privacy, repeated-pass and live S1 gates must pass before promotion.
+Diagnostic Laya scores do not grant authority.
+
+
+For the other `mesh-dash` roles, the projected charter-goal cache has
 its own 60-second source refresh and turns red after five minutes without a
 successful write; repainting identical goal text does not reset that age.
 `pub` delegates to `mesh-pub-dash`: its external-status cache refreshes every
