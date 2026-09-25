@@ -8,5 +8,6 @@ dash_out="$($root/scripts/cleaner/mesh-cleaner-dash --test)"
 grep -q 'actionable=' <<<"$dash_out"
 settle_out="$($root/scripts/cleaner/mesh-cleaner-settle --test)"
 grep -q 'quarantine=' <<<"$settle_out"
+python3 "$root/tests/test-mesh-cleaner-settle-recovery.py"
 test -f "$root/charter/cleaner.md"
 echo 'test-mesh-cleaner: PASS'
