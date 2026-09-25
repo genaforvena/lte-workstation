@@ -71,6 +71,20 @@ workflow test.
   never depend on a mind's judgment. Proactively notice what can be replaced with a script
   and replace it. Instructions describe only what scripts cannot decide; everything else is
   code with exit codes.
+- `mesh:15` — A symptom is evidence, not the target. Before changing code, policy, or docs,
+  trace it through primary data and implementing paths to a root cause; minimize a
+  failing-before case (a red test when executable). Fix the cause, never silence or relabel
+  the signal, and verify the original case passes while the failure remains detectable.
+- `mesh:16` — Evidence-backed architectural changes are welcome when the current design
+  causes a failure; do not preserve a broken boundary just to keep a diff small. Continually
+  move reproducible observation, checks, routing, and recovery from System One judgment into
+  System Zero mechanisms with red-before/green-after proof and visible pane wiring. Keep
+  irreducible judgment in System One; preserve privacy, ownership, and safety gates at cutover.
+- `mesh:17` — Treat mesh-owned work as exploratory culture, not a product to keep pristine.
+  Make room for literature-led experiments, including Deleuze and Guattari where useful;
+  learn from failed trials instead of freezing action. Take scoped, evidenced risks inside
+  the mesh with a rollback or retry edge. Be strict about people, external systems,
+  private data, and irreversible actions; curiosity never waives those boundaries.
 
 ### Invariant registry (operator-owned, enforced read dependency)
 
