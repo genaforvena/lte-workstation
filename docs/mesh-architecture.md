@@ -130,14 +130,19 @@ the old 10+ window sprawl):
 | `witness` | configured OMP model | mishe-tauftauf stewardship, task-ledger verification, board coordination |
 
 `witness` keeps a live Top Pain showing the structured task journal, a bounded
-mishe-tauftauf obligation summary, and the raw `chat.log` tail. A stale or new
-source-backed value becomes an ordinary observation: System Zero selects the
-candidate, System One decides whether to publish and wake, and an exclusive
-one-shot OMP Mind reads the current pane, verifies the issue, fixes safe owned
-work or routes an exact-owner task, writes receipts and handoff, then exits.
-The resident-Mind roster remains stopped; a live data pane alone is not an
-acting witness. An UNKNOWN admission or missing receipt remains visible work,
-not a pass.
+mishe-tauftauf obligation summary, and the raw `chat.log` tail. The live pane
+is observation, not a resident Mind. When witness has exclusive mishe authority
+and the fleet hold is released, a source-backed stale value can enter the feed
+through System Zero. A one-shot wake requires an exact red witness projection
+and explicit System One relevance=yes and desired-state-met=no (or
+continue-observing=no) receipts; UNKNOWN is not admission. The keyed sink sends
+only the projected observation, not the raw pane or prior handoff, to the
+disposable OMP Mind. It verifies/settles an exact-owner task or records an
+evidenced non-actionable disposition, writes invocation-tied board and core/Mesh
+handoffs, and exits. Unsettled or ambiguous invocations are not relaunched.
+The resident-Mind roster remains stopped; the production fleet hold and legacy
+authority remain until the separate privacy, repeated-pass and live S1 gates
+are met. Diagnostic Laya scores do not grant authority.
 
 Legacy resident minds use `mesh-tell <window> "<prompt or op>"` and
 `mesh-tell --peek <window>` for window delivery; one-shot witness events do
