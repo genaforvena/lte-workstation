@@ -185,24 +185,40 @@ runs with a live private pane can pass raw context to System One and are not
 a safe production diagnostic.
 
 Fleet S1 candidate capture is private and observation-only. With
-`~/.mesh/mishe-tauftauf/.fleet-corpus-capture` present, each held manual
-`mesh-mishe-run once` joins new feed observations to pane parity and calls
-`mesh-mishe-s1-corpus` before stamping a successful pass. The collector checks
-the bounded fleet view, reprojects the live pane before and after taking
-bounded source snapshots under `~/.mesh/evidence/migration/fleet-s1-candidates-20260925`,
-and deduplicates stable pane capture keys. It records capture-time source bytes,
-not original S0-time producer snapshots; changed sources or missing parity fail
-closed. Cases are `candidate_unreviewed`, with no positive/negative labels or
-independence claim. `mesh-doctor` renders capture status on the health pane;
-neither candidates nor a clean capture confer Mind authority. The numeric
-invariant Laya trial does not consume fleet enum projections: a separate
-fleet-specific S1 trial and independently reviewed, source-group-separated
-100+ positive and 100+ negative cases remain required.
+`~/.mesh/mishe-tauftauf/.fleet-corpus-capture` present, the original S0
+projector hashes bounded, regular producer bytes and exact-owner overdue
+audit rows while producing the typed projection. A private 0600 stamp binds
+those hashes, mtimes, pane identity, and projection digest to the tick;
+`mesh-mishe-run` binds it to a committed feed sequence without changing
+public parity or model input. The collector requires matching source bytes
+and mtimes before archiving them under
+`~/.mesh/evidence/migration/fleet-s1-candidates-20260925`. Missing or
+changed S0 evidence fails closed. Pre-stamp observations may be captured
+only with an explicit historical flag; they cannot be relabeled as S0-bound.
+All cases remain `candidate_unreviewed`, without positive/negative labels
+or causal independence proof. Scheduled held runs still skip; held manual
+runs keep `/bin/false` as judge. `mesh-doctor` gates capture status and the
+live `check` role distinguishes S0-bound from historical candidates and
+reviewed labels on `pane:health`, even when the aggregate doctor times out.
+Neither grants Mind authority.
+
+`mesh-mishe-fleet-s1-trial` consumes only S0-bound, privately archived,
+independently reviewed fleet cases. Without a review it reports 0/100 and
+0/100; with 100+ per class it can score the pinned offline CPU Laya model,
+counting UNKNOWN as incorrect and reporting coverage, false positives and
+false negatives. Reviewer identity and causal source groups are assertions
+requiring separate audit, so the report never grants authority. The numeric
+invariant Laya trial does not consume these enum-only fleet projections.
 
 Legacy resident minds use `mesh-tell <window> "<prompt or op>"` and
 `mesh-tell --peek <window>` for window delivery. A prompt to `witness` is
 always refused: only an admitted System Zero/System One event may invite its
 disposable Mind.
+
+Scheduled `mesh-tick` delivery also requires legacy authority, a distinct
+bottom pane, and a live Mind-engine process on that pane's tty. A shell
+placeholder yields HOLD without typing; `mesh-tick-gate` leaves that change
+due for the next cadence when a Mind is admitted.
 
 ---
 
