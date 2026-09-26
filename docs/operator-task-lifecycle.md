@@ -16,6 +16,9 @@ mesh-task audit
 
 The accepted block types are `operator-input`, `external-event`, `dependency`, `capability`, and
 `safety`. A block remains open and queryable and cannot be dispatched until an exact-owner resume.
+
+Implementation-step completions require an executable artifact (or a TSV plan naming an existing executable) and the actual observing top-pane role in the result as `pane:<role>`; genome completions use `pane:genome`.
+
 Progress renews the lease and persists artifact, next action, and update deadline in both the chain
 and owner context. `audit` distinguishes a live owner's `EXPIRED` lease from an absent owner's
 `ABANDONED` lease. Closure requires a file, stores its SHA-256, repeats the task and ask keys on the
