@@ -103,6 +103,10 @@ def main() -> None:
         out = run("done", "c-genome", "review-thing", str(prose), "reviewed",
                   expected=2, actor="genome")
         assert "cannot settle on prose" in (out.stdout + out.stderr)
+        # GREEN: the genome lane's live mesh-dash role is accepted.
+        chain("c-genome-pane", "genome", "wire-thing", actor="genome")
+        run("done", "c-genome-pane", "wire-thing", str(tool),
+            "wired on pane:genome", actor="genome")
     finally:
         import shutil
         shutil.rmtree(workspace, ignore_errors=True)
