@@ -67,3 +67,23 @@ printf '%s\n' "$small" | grep -qE '^chat\.log: showing 20/20 raw lines \(unfilte
 printf '%s\n' "$small" | grep -q 'raw-line-19' \
   || { echo 'FAIL: short-pane render dropped newest raw source line' >&2; exit 1; }
 printf 'test-witness-pane-fit: PASS (short panes keep the full frame and expose their allocation fault)\n'
+
+# A live pane census must preserve both the healthy denominator and the hidden-row
+# failure; counting only HOLD lines would misleadingly report zero visible panes.
+mkdir -p "$fixture/bin"
+cat > "$fixture/bin/tmux" <<'EOF'
+#!/bin/sh
+case "$*" in
+  *has-session*) exit 0 ;;
+  *list-windows*) printf 'senses 2\nminds 2\n' ;;
+  *capture-pane*minds.0*) printf '%s\n' '-- minds' 'gate: dispatch FRESH' '-- ⚠ OVERFLOW: 40 rows @100c into 20 — 22 hidden ABOVE (trim role / grow pane) --' '-- pane live 2026-09-25T00:00:00Z · 30s · ticks every frame --' ;;
+  *capture-pane*senses.0*) printf '%s\n' '-- senses' 'ROOM FRESH' '-- pane live 2026-09-25T00:00:00Z · 30s · ticks every frame --' ;;
+  *) exit 1 ;;
+esac
+EOF
+chmod +x "$fixture/bin/tmux"
+coverage="$(PATH="$fixture/bin:$PATH" MESH_DIR="$mesh" MESH_TASK_JOURNAL="$mesh/tasks.journal" \
+  MESH_DASH_CHAT_LOG="$mesh/chat.log" MESH_DASH_PANE_ROWS=47 MESH_DASH_PANE_COLS=189 \
+  "$ROOT/scripts/mesh-dash" --once witness 2>&1)"
+printf '%s\n' "$coverage" | grep -q 'pane=1/2 visible · HOLD:minds' \
+  || { echo 'FAIL: witness pane coverage lost its healthy denominator or hidden-row fault' >&2; exit 1; }
