@@ -31,9 +31,10 @@ def _module_at(name: str, path: Path):
     return module
 
 
-def _hash_file(path: Path) -> tuple[str, int, tuple]:
+def _hash_file(path: Path, allow_empty: bool) -> tuple[str, int, tuple]:
     before = path.lstat()
-    if not stat.S_ISREG(before.st_mode) or not 0 < before.st_size <= MAX_SOURCE:
+    if (not stat.S_ISREG(before.st_mode) or before.st_size > MAX_SOURCE
+        or (before.st_size == 0 and not allow_empty)):
         raise ValueError("source unavailable")
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     try:
@@ -106,7 +107,7 @@ def source_stamp(channel: str, event_id: str, tick: str, home: Path,
         signatures = []
         total = 0
         for path in paths:
-            digest, mtime, signature = _hash_file(path)
+            digest, mtime, signature = _hash_file(path, registry.allows_empty_marker(channel, path))
             total += signature[3]
             if total > MAX_TOTAL:
                 return None
