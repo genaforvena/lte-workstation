@@ -24,6 +24,11 @@ SEMANTIC_SOURCES = {
 }
 
 
+def allows_empty_marker(channel: str, path: Path) -> bool:
+    """The archivist's successful-tick source is deliberately mtime-only."""
+    return channel == "sound" and path.name == ".records-tick"
+
+
 def provenance_files(channel: str, mesh_dir: Path, repo: Path) -> tuple[Path, ...]:
     """Return candidate source paths without opening or resolving any of them.
 
