@@ -24,6 +24,7 @@ EOF
 cat > "$MESH/sensors.log" <<'EOF'
 2026-09-08T10:03:00Z node sense first
 2026-09-08T11:32:00Z node sense second
+2026-09-08T11:59:00Z sensor|<script>alert(1)</script>
 EOF
 
 export MESH_TASK_CHAT_CMD="$TMP/observer-chat"
@@ -36,9 +37,16 @@ export TEST_BOARD="$TMP/board"
 
 "$ROOT/scripts/mesh-autopoiesis-observer" --run > "$TMP/first.out"
 grep -q 'admitted source=observation-window:20260908T100000Z-120000Z' "$TMP/first.out"
-grep -q 'unique_events=6' "$TMP/first.out"
+grep -q 'unique_events=7' "$TMP/first.out"
 test -f "$MESH/autopoiesis-observation/analysis/20260908T100000Z-120000Z.md"
 grep -q 'deduplicated_events=1' "$MESH/autopoiesis-observation/analysis/20260908T100000Z-120000Z.md"
+REPORT="$MESH/autopoiesis-observation/analysis/20260908T100000Z-120000Z.md"
+test "$(awk '/^## Event evidence$/{section=1;next} section && /^\|/{n++} END{print n+0}' "$REPORT")" -eq 9
+test "$(grep -Fxc '| chat.log | <code>2026-09-08T10:01:00Z health@node :: [health] first</code> |' "$REPORT")" -eq 1
+grep -Fqx '| chat.log | <code>2026-09-08T11:30:00Z health@node :: [health] second</code> |' "$REPORT"
+grep -Fqx '| witness.log | <code>2026-09-08T10:02:00Z witness first</code> |' "$REPORT"
+grep -Fqx '| sensors.log | <code>2026-09-08T10:03:00Z node sense first</code> |' "$REPORT"
+grep -Fqx '| sensors.log | <code>2026-09-08T11:59:00Z sensor&#124;&lt;script&gt;alert(1)&lt;/script&gt;</code> |' "$REPORT"
 grep -q 'observation-window:20260908T100000Z-120000Z' "$MESH_TASK_DIR/20260908T100000Z-120000Z.json"
 
 if "$ROOT/scripts/mesh-autopoiesis-observer" --run > "$TMP/second.out" 2>&1; then
