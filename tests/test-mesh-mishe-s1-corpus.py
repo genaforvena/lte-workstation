@@ -12,6 +12,7 @@ import tempfile
 import time
 import unittest
 from unittest.mock import patch
+from scripts import mesh_mishe_provenance as provenance
 
 ROOT = Path(__file__).resolve().parents[1]
 CORE = Path(os.environ.get("MESH_MISHE_CORE", "/home/mesh-home/mishe-tauftauf"))
@@ -157,6 +158,60 @@ class CorpusTest(unittest.TestCase):
         self.assertEqual(list((self.evidence / "cases").iterdir()), cases)
         self.assertFalse((self.home / ".mesh-mishe-seen-health").exists())
         self.assertFalse((self.home / "parity/staged").exists())
+
+    def test_empty_sound_tick_is_bound_without_admitting_empty_other_sources(self):
+        tick = self.mesh / ".records-tick"
+        tick.touch()  # mesh-records' real liveness marker has zero bytes; mtime is its evidence.
+        body = self.configure("sound")
+        self.assertIn("semantic=archivist:fresh", body)
+        self.event(body, "sound")
+        sentinel = self.home / ".fleet-corpus-capture"
+        sentinel.touch(mode=0o600)
+        stamp = provenance.source_stamp("sound", "a" * 64, "b" * 32, self.home, ROOT, body)
+        self.assertIsNotNone(stamp, "the opted-in S0 producer must bind the real empty tick")
+        self.assertEqual(stamp["sources"][1]["sha256"], hashlib.sha256(b"").hexdigest())
+        self.bind(body, "sound")
+        result = self.run_capture()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("captured=1", result.stdout)
+        case = self.cases()[0]
+        self.assertEqual((case / "sources/1").read_bytes(), b"")
+        self.assertEqual(json.loads((case / "case.json").read_text())["provenance_phase"],
+                         "s0_projection_hash_matched")
+
+    def test_empty_sound_tick_update_after_s0_stamp_preserves_original_provenance(self):
+        tick = self.mesh / ".records-tick"
+        tick.touch()
+        body = self.configure("sound")
+        self.event(body, "sound")
+        sentinel = self.home / ".fleet-corpus-capture"
+        sentinel.touch(mode=0o600)
+        stamp = provenance.source_stamp("sound", "a" * 64, "b" * 32, self.home, ROOT, body)
+        self.assertIsNotNone(stamp)
+        self.assertEqual(stamp["sources"][1]["sha256"], hashlib.sha256(b"").hexdigest())
+        bound = self.home / "parity/source-bound"
+        bound.mkdir(parents=True, exist_ok=True)
+        target = bound / "00000000000000000001.json"
+        target.write_text(json.dumps({**stamp, "feed_seq": 1}))
+        target.chmod(0o600)
+
+        original_mtime_ns = stamp["sources"][1]["mtime_ns"]
+        os.utime(tick, ns=(original_mtime_ns + 1_000_000_000,
+                           original_mtime_ns + 1_000_000_000))
+        result = self.run_capture()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        case = self.cases()[0]
+        manifest = json.loads((case / "case.json").read_text())
+        self.assertEqual(json.loads((case / "s0-bound.json").read_text()),
+                         {**stamp, "feed_seq": 1})
+        self.assertEqual(manifest["sources"][1]["mtime_ns"], original_mtime_ns)
+        self.assertEqual((case / "sources/1").read_bytes(), b"")
+
+        other = self.mesh / ".fleet-health.cache"
+        other.touch()
+        with tempfile.TemporaryDirectory() as snapshot_dir:
+            with self.assertRaisesRegex(corpus.Unavailable, "source_unavailable"):
+                corpus.snapshot((other,), Path(snapshot_dir), "health", corpus.sources_module())
 
     def test_bound_source_survives_rotating_pane_identity_not_historical(self):
         self.configure()
@@ -317,7 +372,7 @@ class CorpusTest(unittest.TestCase):
         self.assertIn("skipped reason=invalid_input_file", unsafe.stdout)
         with tempfile.TemporaryDirectory() as snapshot_dir:
             with self.assertRaisesRegex(corpus.Unavailable, "invalid_input_file"):
-                corpus.snapshot((source,), Path(snapshot_dir))
+                corpus.snapshot((source,), Path(snapshot_dir), "health", corpus.sources_module())
         self.assertFalse(list((self.evidence / "cases").iterdir()))
 
     def test_real_source_mutation_between_snapshot_and_rerender(self):
