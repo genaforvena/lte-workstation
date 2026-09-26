@@ -191,14 +191,17 @@ proves intake processing, not that a private reply was sent. For event-driven
 `adint`, `hire`, `wake`, and `haunt`, an overdue canonical owner task is a
 source-backed stale obligation; a successful audit without such a row is
 UNKNOWN, not proof that a quiet pipeline or research lane is healthy. A failed
-audit is UNKNOWN. The live viewport gate requires a role-owned signal row in
-addition to the `pane live` lease; it does not infer health from a repaint or
+audit is UNKNOWN. The live viewport gate requires role-owned critical signal data
+in addition to the `pane live` lease; it does not infer health from a repaint or
 unrelated prose. Explicit stale state holds, and UNKNOWN is visible only when
 attached to the critical signal. The gate uses the current viewport and preserves
-the producer's own freshness semantics rather than applying one global age limit.
-Discover's `APPLY` section must contain a visible attempt row; `[task-ledger]`
-records alone do not satisfy it. `mesh-mishe-source-health` reports other-role
-failures on the health pane without sampling that pane during its own render;
+the producer's freshness semantics instead of applying one global age limit.
+The `genome` signal is its `-- stranded` section: a parsed `mesh-land` candidate
+census carries producer state; a visible probe timeout or failure is UNKNOWN,
+and the section header alone does not pass. Discover's `APPLY` section must
+contain a visible attempt row; `[task-ledger]` records alone do not satisfy it.
+`mesh-mishe-source-health` reports other-role failures on the health pane
+without sampling that pane during its own render;
 `mesh-doctor` checks all 17. Neither prints private pane text or relaunches
 stopped resident Minds. The one-shot prompt never injects raw dashboards or
 prior handoffs; non-Witness real owner Minds remain fenced without an approved
