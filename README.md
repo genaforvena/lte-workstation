@@ -63,9 +63,7 @@ is not a guess, it is what happened to the wall this file used to be.
 is online" — a `tailscale status` entry. Not "the fix landed" — the test seen red, then green. A
 subagent's report is a claim, never an artifact.
 
-**A promise is double-entry bookkeeping.** The work board is a plain text log, and `mesh-promises`
-replays it into an hledger ledger where an unkept promise is a **standing, aged, queryable
-liability**. A task claimed and never discharged does not fade — it accrues.
+**Tasks are durable work, not promises.** `mesh-task` routes and tracks owned work through explicit steps and artifacts. `mesh-promises` is a compatibility accounting view, not the task ledger.
 
 **A detector without an actuator leaves a human as the loop**, so recurring faults get re-appliers
 with their own application ledgers — and once an actuator exists, the alert moves *behind its
@@ -76,8 +74,8 @@ Senses publish their own coverage — the window they sampled over the cadence t
 reading that stands for 5 seconds out of 300 says so.
 
 The long form is [`docs/mesh-architecture.md`](docs/mesh-architecture.md) and
-[`docs/epistemics.md`](docs/epistemics.md); [`docs/`](docs/) carries investigation write-ups and
-post-mortems on measurements that lied.
+[`docs/epistemics.md`](docs/epistemics.md). The curated guides below cover living contracts; [`docs/`](docs/)
+also retains dated investigations and post-mortems, which are evidence rather than a reading list to keep in sync.
 
 ## What it actually does
 
