@@ -121,6 +121,8 @@ liveness-as-lease, advancing while the renderer runs and freezing when it dies. 
 discovers the live two-pane data/mind windows, and `mesh-pane-consume` wakes the bottom mind only
 when the normalized top-pane meaning changes (subject to prediction, refractory, and idle gates);
 the source remains ephemeral and the mind reads the full top pane after the wake.
+`mesh-pane-check` captures the actual viewport and validates each role's producer marker as a
+top-level field; a repeated label inside an aggregate summary does not satisfy that signal.
 
 `mesh-restore` defines the shared channel-role manifest. Node-local `restore.env` selects
 engines and resident Minds, and can retire roles; the manifest describes the shared map,
