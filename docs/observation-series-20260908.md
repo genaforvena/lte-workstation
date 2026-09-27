@@ -29,10 +29,15 @@ replays and tmux text are not health measurements.
 
 ## Hourly admission report
 
-The hourly `mesh-autopoiesis-observer` report includes one event-level row per
-deduplicated source event, retaining its whitespace-normalized raw text. The
-source label identifies the tape, not a semantic event class; these rows are
-inspectable evidence, not typed health measurements.
+The hourly `mesh-autopoiesis-observer` reads `chat.log`, `witness.log`,
+`sensors.log`, and `hw-fault.log`. It emits one event-level row per
+deduplicated source event, retaining whitespace-normalized raw text. Kernel
+fault timestamps with comma fractional seconds and UTC offsets are normalized
+to UTC before the half-open `[start,end)` filter. A missing or unreadable
+source marks the evidence incomplete and defers admission. The fault tape is
+event-only, so a readable interval with no in-window fault rows is a valid
+zero-event source. Source labels identify tapes, not semantic event classes;
+rows are inspectable evidence, not typed health measurements.
 
 ## Coverage proof
 
