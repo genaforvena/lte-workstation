@@ -6,11 +6,13 @@ one-shot sink; synthetic fixtures retain their separate admission policy.
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import math
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -21,6 +23,30 @@ from datetime import datetime, timezone
 
 class BoundaryError(ValueError):
     pass
+
+
+WITNESS_OMP_SHA256 = "d2fdaa29affe96e596eb9c78d42f548f1f291df28608631bcc00750a84b94bc3"
+
+
+def witness_omp_provenance() -> bool:
+    installed = Path.home() / ".local/bin/omp"
+    override = os.environ.get("MESH_MISHE_OMP_CMD")
+    command = override if override is not None else shutil.which("omp")
+    if not command or not installed.is_file() or not os.access(installed, os.X_OK):
+        return False
+    if Path(command).resolve() != installed.resolve():
+        return False
+    digest = hashlib.sha256()
+    try:
+        with installed.open("rb") as stream:
+            if stream.read(4) != b"\x7fELF":
+                return False
+            stream.seek(0)
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+    except OSError:
+        return False
+    return digest.hexdigest() == WITNESS_OMP_SHA256
 
 
 def home() -> Path:
@@ -52,6 +78,7 @@ def witness_conditions(channel: str) -> dict:
             and approved.is_file() and os.access(approved, os.X_OK),
             "mind": (mind is None or bool(mind) and Path(mind).resolve() == approved_mind)
             and approved_mind.is_file() and os.access(approved_mind, os.X_OK),
+            "omp": witness_omp_provenance(),
             "model": os.environ.get("MESH_MISHE_WITNESS_MODEL") == "openai-codex/gpt-6-luna",
             "hold_released": not hold.exists() and not hold.is_symlink()}
 
