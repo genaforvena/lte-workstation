@@ -9,6 +9,7 @@ import sys
 import tempfile
 import time
 import unittest
+from tests.mesh_omp_fixture import wire_omp_fixture
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts/mesh-mishe-mind"
 
@@ -316,6 +317,7 @@ if not (root/'omit-receipt').exists():
                              'task_id':None,'evidence':str(evidence)}))
 """)
         self.env["MESH_MISHE_OMP_CMD"] = str(self.omp)
+        wire_omp_fixture(self.root, self.env, self.omp)
         command = [sys.executable, str(SCRIPT), "--channel", "witness", "--request-id", request_id,
                    "--event-file", str(self.event)]
         (self.root / "mesh/omit-receipt").write_text("yes")
