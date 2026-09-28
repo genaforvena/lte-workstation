@@ -30,4 +30,32 @@ done
 env "${env_base[@]}" "$ROOT/scripts/mesh-study-autowake"
 [ -e "$td/launched" ] || { echo 'mesh-study-autowake: did not launch when ready' >&2; exit 1; }
 
+# A slow study must not be relaunched by the next five-minute tick. The first
+# launcher holds its process open until the fixture releases it.
+cat > "$launcher" <<'EOF'
+#!/usr/bin/env bash
+printf 'launched\n' >> "$MESH_STUDY_AUTOWAKE_MARKER"
+touch "$MESH_STUDY_AUTOWAKE_READY"
+while [ ! -e "$MESH_STUDY_AUTOWAKE_RELEASE" ]; do sleep 0.05; done
+EOF
+chmod +x "$launcher"
+rm -f "$td/launched"
+env "${env_base[@]}" MESH_STUDY_AUTOWAKE_READY="$td/ready" \
+  MESH_STUDY_AUTOWAKE_RELEASE="$td/release" "$ROOT/scripts/mesh-study-autowake" &
+first=$!
+for i in {1..40}; do [ -e "$td/ready" ] && break; sleep 0.05; done
+[ -e "$td/ready" ] || { echo 'mesh-study-autowake: first launch did not start' >&2; exit 1; }
+timeout 2 env "${env_base[@]}" MESH_STUDY_AUTOWAKE_READY="$td/ready2" \
+  MESH_STUDY_AUTOWAKE_RELEASE="$td/release" "$ROOT/scripts/mesh-study-autowake"
+second_rc=$?
+launched="$(wc -l < "$td/launched")"
+touch "$td/release"
+wait "$first"
+[ "$second_rc" -eq 0 ] && [ "$launched" -eq 1 ] \
+  || { echo "mesh-study-autowake: duplicate active study launch (rc=$second_rc count=$launched)" >&2; exit 1; }
+env "${env_base[@]}" MESH_STUDY_AUTOWAKE_READY="$td/ready3" \
+  MESH_STUDY_AUTOWAKE_RELEASE="$td/release" "$ROOT/scripts/mesh-study-autowake"
+[ "$(wc -l < "$td/launched")" -eq 2 ] \
+  || { echo 'mesh-study-autowake: completed launch did not release lock' >&2; exit 1; }
+
 echo 'test-mesh-study-autowake: PASS'
