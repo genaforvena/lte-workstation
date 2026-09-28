@@ -253,6 +253,46 @@ nice_prefix() {
 CAPCACHE="${MESH_HEAVY_CAPCACHE:-$MESH/.heavy-run-capcheck}"
 CAPPROBE_COMM=mesh-capcheck   # <=15 bytes — the kernel's comm field truncates there
 CAPHOG_COMM=mesh-caphog       # <=15 bytes — the --test over-budget hog, signed the same way
+CAPCHECK_EVIDENCE_DIR="${MESH_HEAVY_CAPCHECK_EVIDENCE_DIR:-$MESH/heavy-run-capcheck}"
+CAPCHECK_CGROUP_ROOT="${MESH_HEAVY_CAPCHECK_CGROUP_ROOT:-/sys/fs/cgroup}"
+
+# The probe's python is the OOM victim; this parent remains in its scope long enough
+# to snapshot the exact limit and counters before --collect removes the transient cgroup.
+capture_capcheck_scope() {
+  local _unit="$1" _trace="$2" _rc="$3" _rel="" _hid _controllers _cg _key _line
+  [ -n "$_trace" ] || return 0
+  while IFS=: read -r _hid _controllers _rel; do
+    [ "$_hid" = 0 ] && break
+    _rel=""
+  done < /proc/self/cgroup
+  {
+    printf 'probe_exit_rc=%s\nscope_unit=%s.scope\n' "$_rc" "$_unit"
+    if [ -n "$_rel" ]; then
+      _cg="${CAPCHECK_CGROUP_ROOT%/}${_rel}"
+      printf 'cgroup_path=%s\n' "$_rel"
+      for _key in memory.max memory.swap.max memory.current memory.events; do
+        if [ -r "$_cg/$_key" ]; then
+          while IFS= read -r _line; do printf 'cgroup.%s=%s\n' "$_key" "$_line"; done < "$_cg/$_key"
+        else
+          printf 'cgroup.%s=UNAVAILABLE\n' "$_key"
+        fi
+      done
+    else
+      printf 'cgroup_path=UNAVAILABLE\n'
+    fi
+  } >> "$_trace" 2>/dev/null || echo "mesh-heavy-run: capcheck scope telemetry append failed: $_trace" >&2
+}
+
+# Deterministic capcheck child mode lets --test verify telemetry without creating a real OOM.
+
+if [ "${1:-}" = --capcheck-child ]; then
+  [ "$#" -ge 5 ] || { echo "mesh-heavy-run: invalid internal capcheck child invocation" >&2; exit "$EX_USAGE"; }
+  _probe_python="$2"; _probe_unit="$3"; _probe_trace="$4"; shift 4
+  "$_probe_python" "$@"; _probe_rc=$?
+  [ "$_probe_rc" = 137 ] && capture_capcheck_scope "$_probe_unit" "$_probe_trace" "$_probe_rc"
+  exit "$_probe_rc"
+fi
+
 
 # what the cached verdict is ABOUT. Not a clock: a TTL would serve a refuted verdict for its window
 # and re-probe for nothing when nothing moved.
@@ -271,36 +311,49 @@ mem_cap_available() {
     [ "$(cat "$CAPCACHE" 2>/dev/null)" = "binds $_fp" ] && return 0
   fi
   if command -v python3 >/dev/null 2>&1; then
-    local _o _rc _pd _bin
+    local _o _rc _pd _bin _unit _trace="" _stamp
     _bin="$(command -v python3)"
-    # sign the kill: a symlink whose NAME becomes the victim's comm in the kernel's own line
+    # Sign the kernel victim with a short symlink name.
     _pd="$(mktemp -d 2>/dev/null)" &&
       ln -s "$_bin" "$_pd/$CAPPROBE_COMM" 2>/dev/null &&
       _bin="$_pd/$CAPPROBE_COMM"
-    _o="$(systemd-run --user --scope -q --collect --unit="$CAPPROBE_COMM-$$" \
+    _unit="$CAPPROBE_COMM-$$"
+    if mkdir -p "$CAPCHECK_EVIDENCE_DIR" 2>/dev/null; then
+      _stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+      _trace="$(mktemp "$CAPCHECK_EVIDENCE_DIR/${_stamp}-capcheck-$$.XXXXXX" 2>/dev/null)" || _trace=""
+      if [ -n "$_trace" ]; then
+        printf 'started_at=%s\nboot_id=%s\nfingerprint=%s\nscope_unit=%s.scope\nconfigured_memory.max=32M\nconfigured_memory.swap.max=0M\n' \
+          "$(date -u +%FT%TZ)" "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo UNKNOWN)" \
+          "$_fp" "$_unit" > "$_trace"
+      fi
+    fi
+    [ -n "$_trace" ] || echo "mesh-heavy-run: capcheck evidence directory unavailable: $CAPCHECK_EVIDENCE_DIR" >&2
+    _o="$(systemd-run --user --scope -q --collect --unit="$_unit" \
           -p MemoryMax=32M -p MemorySwapMax=0M -- \
-          "$_bin" -c 'a=bytearray(128*1024*1024); print("ALIVE",len(a))' 2>/dev/null)"; _rc=$?
+          "$0" --capcheck-child "$_bin" "$_unit" "$_trace" \
+          -c 'a=bytearray(128*1024*1024); print("ALIVE",len(a))' 2>/dev/null)"; _rc=$?
     [ -n "${_pd:-}" ] && rm -rf "$_pd"
-    # Three outcomes, and empty stdout is AMBIGUOUS between two of them: (a) the alloc printed ALIVE →
-    # survived → ceiling did NOT bind; (b) the alloc was OOM-killed → scope exits 128+SIGKILL(9)=137 →
-    # ceiling BINDS; (c) systemd-run failed to LAUNCH (no user bus / broken) → empty stdout too, but a
-    # non-signal rc (<128) → NOT a working ceiling. So require a real signal-kill rc, never bare-empty.
-    case "$_o" in *ALIVE*) return 1 ;; esac      # survived → not capping (mints no kernel line)
-    if [ "${_rc:-0}" -ge 128 ]; then             # killed by a signal (cgroup-OOM = 137) → ceiling binds
+    if [ "$_rc" = 137 ]; then
+      [ -n "$_trace" ] && printf 'systemd_run_exit_rc=%s\n' "$_rc" >> "$_trace"
+    else
+      [ -n "$_trace" ] && rm -f "$_trace"
+    fi
+    # Empty stdout is ambiguous: require the expected OOM signal, not a failed launch.
+    case "$_o" in *ALIVE*) return 1 ;; esac
+    if [ "${_rc:-0}" = 137 ]; then
       mkdir -p "$(dirname "$CAPCACHE")" 2>/dev/null
       printf 'binds %s\n' "$_fp" > "$CAPCACHE.tmp$$" 2>/dev/null &&
         mv -f "$CAPCACHE.tmp$$" "$CAPCACHE" 2>/dev/null
       return 0
     fi
-    return 1                                      # launch failure / non-kill exit → no binding ceiling
+    return 1
   fi
   local _cg="/sys/fs/cgroup/user.slice/user-$(id -u 2>/dev/null).slice/cgroup.controllers"
   grep -qw memory "$_cg" 2>/dev/null && \
     systemd-run --user --scope -q --collect -p MemoryMax=32M -- true >/dev/null 2>&1
 }
-
-# --capcheck: exit 0 iff a real cgroup memory ceiling actually binds here. --test uses it to choose the
-# cgroup vs ulimit-fallback assertions; a caller may use it to decide whether to trust the cap.
+# --capcheck: exit 0 iff a real cgroup memory ceiling binds. A signalled probe stores
+# its configured scope and live memory.max/swap.max/current/events under CAPCHECK_EVIDENCE_DIR.
 [ "${1:-}" = --capcheck ] && { mem_cap_available; exit $?; }
 
 if [ "${1:-}" = --drain ]; then
@@ -330,6 +383,54 @@ if [ "${1:-}" = --test ]; then
   _hot='printf NODE-PRESSURE:\040swap\040low\n' # node_clear → HOT
   _accel='printf NODE-ACCELERATING:\040ramp\n'  # node_clear → HOT (dragon-king precursor)
   _base="MESH_HEAVY_LOCK=$_lk MESH_HEAVY_QUEUE_LOCK=$_qlk MESH_HEAVY_ADMIT_WAIT=1 MESH_HEAVY_ADMIT_STEP=1"
+  # 0a) Capcheck scope telemetry is captured before the transient scope is collected.
+  _probe_bin="$_td/capcheck-bin"; _probe_root="$_td/cgroup"; _probe_evidence="$_td/capcheck-evidence"
+  _probe_cache="$_td/capcheck-cache"
+  _probe_rel="$(awk -F: '$1 == 0 {print $3; exit}' /proc/self/cgroup)"
+  [ -n "$_probe_rel" ] || { echo "smoke-test: FAIL (capcheck telemetry requires unified cgroup path)"; exit 1; }
+  mkdir -p "$_probe_bin" "$_probe_root$_probe_rel"
+  cat > "$_probe_bin/python3" <<'EOF'
+#!/bin/sh
+case "${MESH_HEAVY_TEST_PROBE_MODE:-killed}" in
+  killed) exit 137 ;;
+  survived) printf 'ALIVE\n' ;;
+  *) exit 2 ;;
+esac
+EOF
+  cat > "$_probe_bin/systemd-run" <<'EOF'
+#!/bin/sh
+while [ "$#" -gt 0 ] && [ "$1" != -- ]; do shift; done
+[ "${1:-}" = -- ] || exit 64
+shift
+exec "$@"
+EOF
+  chmod +x "$_probe_bin/python3" "$_probe_bin/systemd-run"
+  printf '33554432\n' > "$_probe_root$_probe_rel/memory.max"
+  printf '0\n' > "$_probe_root$_probe_rel/memory.swap.max"
+  printf '12345\n' > "$_probe_root$_probe_rel/memory.current"
+  printf 'low 0\nhigh 0\nmax 1\noom 1\noom_kill 1\noom_group_kill 0\n' > "$_probe_root$_probe_rel/memory.events"
+  env PATH="$_probe_bin:/usr/bin:/bin" MESH_HEAVY_CAPCHECK_CGROUP_ROOT="$_probe_root" \
+    MESH_HEAVY_CAPCHECK_EVIDENCE_DIR="$_probe_evidence" MESH_HEAVY_CAPCACHE="$_probe_cache" \
+    MESH_HEAVY_CAPCACHE_OFF=1 "$0" --capcheck >/dev/null 2>&1
+  _probe_rc=$?
+  _probe_file="$(find "$_probe_evidence" -maxdepth 1 -type f -print -quit 2>/dev/null)"
+  { [ "$_probe_rc" = 0 ] && [ -n "$_probe_file" ] \
+      && grep -q '^configured_memory.max=32M$' "$_probe_file" \
+      && grep -q '^scope_unit=mesh-capcheck-.*\.scope$' "$_probe_file" \
+      && grep -q '^cgroup.memory.max=33554432$' "$_probe_file" \
+      && grep -q '^cgroup.memory.events=oom_kill 1$' "$_probe_file" \
+      && grep -q '^systemd_run_exit_rc=137$' "$_probe_file"; } \
+    || { echo "smoke-test: FAIL (capcheck OOM receipt omitted scope limit/events: rc=$_probe_rc file='$_probe_file')"; exit 1; }
+  rm -f "$_probe_cache"
+  _probe_pass="$_td/capcheck-survived"
+  env PATH="$_probe_bin:/usr/bin:/bin" MESH_HEAVY_TEST_PROBE_MODE=survived \
+    MESH_HEAVY_CAPCHECK_CGROUP_ROOT="$_probe_root" MESH_HEAVY_CAPCHECK_EVIDENCE_DIR="$_probe_pass" \
+    MESH_HEAVY_CAPCACHE="$_probe_cache" MESH_HEAVY_CAPCACHE_OFF=1 "$0" --capcheck >/dev/null 2>&1
+  _probe_rc=$?
+  { [ "$_probe_rc" = 1 ] && [ ! -e "$_probe_cache" ] \
+      && [ -z "$(find "$_probe_pass" -maxdepth 1 -type f -print -quit 2>/dev/null)" ]; } \
+    || { echo "smoke-test: FAIL (survived capcheck must not cache or retain OOM evidence: rc=$_probe_rc)"; exit 1; }
+
 
   # 1) ARG VALIDATION: a missing '--' separator or a non-integer budget is EX_USAGE (64), never a silent run.
   env $_base MESH_HEAVY_FORCE=1 "$0" 2000 echo hi >/dev/null 2>&1; [ "$?" = "$EX_USAGE" ] \
