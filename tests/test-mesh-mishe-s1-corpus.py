@@ -179,6 +179,69 @@ class CorpusTest(unittest.TestCase):
         self.assertEqual(json.loads((case / "case.json").read_text())["provenance_phase"],
                          "s0_projection_hash_matched")
 
+    def test_cleaner_scan_symlink_binds_its_regular_target_inside_cleaner_root(self):
+        cleaner = self.mesh / "cleaner"
+        cleaner.mkdir()
+        scan = cleaner / "scan-20260928141501.json"
+        scan.write_text('{"scan_id":"fixture"}\n')
+        (cleaner / "latest.json").symlink_to(scan.name)
+        (cleaner / "settle-latest.json").write_text('{"scan_id":"fixture"}\n')
+        (self.home / ".fleet-corpus-capture").touch(mode=0o600)
+        body = ("STATE: GREEN\nOBSERVATION: source=top-pane/cleaner freshness=fresh "
+                "cleaner=fresh value-coverage=partial review=pass\n")
+        stamp = provenance.source_stamp("cleaner", "a" * 64, "b" * 32,
+                                        self.home, ROOT, body)
+        self.assertIsNotNone(stamp)
+        self.assertEqual(stamp["sources"][0]["origin"], str(scan))
+        (cleaner / "latest.json").unlink()
+        (cleaner / "latest.json").symlink_to("../../outside.json")
+        (self.base / "outside.json").write_text('{"scan_id":"outside"}\n')
+        self.assertIsNone(provenance.source_stamp("cleaner", "a" * 64, "b" * 32,
+                                                   self.home, ROOT, body))
+
+    def test_genome_uses_bounded_producer_state_when_history_exceeds_source_cap(self):
+        state = self.mesh / ".vitality-state"
+        state.write_text("fails=0\nverdict=OK\ntools=945\nbeta=0.731\n"
+                         "autonomy=0.97\nts=" + self.stamp + "\n")
+        (self.mesh / "vitality.log").write_bytes(b"old history\n" * 500_000)
+        body = self.configure("genome")
+        self.assertIn("semantic=vitality:fresh", body)
+        self.event(body, channel="genome")
+        (self.home / ".fleet-corpus-capture").touch(mode=0o600)
+        stamp = provenance.source_stamp("genome", "a" * 64, "b" * 32,
+                                        self.home, ROOT, body)
+        self.assertIsNotNone(stamp)
+        self.assertEqual(stamp["sources"][1]["origin"], str(state))
+        self.bind(body, channel="genome")
+        captured = self.run_capture()
+        self.assertEqual(captured.returncode, 0, captured.stdout + captured.stderr)
+        case = self.cases()[0]
+        self.assertEqual((case / "sources/1").read_bytes(), state.read_bytes())
+        self.assertEqual(json.loads((case / "case.json").read_text())["provenance_phase"],
+                         "s0_projection_hash_matched")
+        state.write_text("PRIVATE-CHANGED-AFTER-STAMP\n")
+        changed = self.run_capture()
+        self.assertEqual(changed.returncode, 2, changed.stdout)
+        self.assertIn("skipped reason=source_unavailable", changed.stdout)
+
+    def test_genome_missing_or_malformed_state_cannot_gain_a_source_stamp(self):
+        state = self.mesh / ".vitality-state"
+        (self.mesh / "vitality.log").write_text("old history\n")
+        (self.home / ".fleet-corpus-capture").touch(mode=0o600)
+        body = self.configure("genome")
+        for content in (None, "PRIVATE-FAKE-SUCCESS\n", "fails=0\nverdict=OK\n",
+                        "X" * 5000):
+            with self.subTest(content=content):
+                if content is None:
+                    state.unlink(missing_ok=True)
+                else:
+                    state.write_text(content)
+                current = self.configure("genome")
+                self.assertIn("semantic=vitality:unknown", current)
+                self.assertNotIn("PRIVATE-FAKE-SUCCESS", current)
+                self.assertIsNone(provenance.source_stamp("genome", "a" * 64,
+                                                          "b" * 32, self.home, ROOT, body))
+
     def test_empty_sound_tick_update_after_s0_stamp_preserves_original_provenance(self):
         tick = self.mesh / ".records-tick"
         tick.touch()
@@ -428,6 +491,29 @@ class CorpusTest(unittest.TestCase):
             corpus.audit_rows("wake", ROOT, self.env)
         self.assertEqual(self.run_capture().returncode, 2)
         self.assertEqual(list((self.evidence / "cases").iterdir()), [])
+
+    def test_quiet_wake_is_ineligible_but_red_wake_without_stamp_still_fails(self):
+        wrong_owner = "OVERDUE\thire\tother/task\tlease=2026-09-24T00:00:00Z"
+        quiet = self.configure("wake", audit=wrong_owner)
+        self.assertIn("semantic=obligations:unknown", quiet)
+        self.event(quiet, channel="wake")
+        excluded = self.run_capture()
+        self.assertEqual(excluded.returncode, 2, excluded.stdout)
+        self.assertIn("seq=1 ineligible reason=no_verified_obligation", excluded.stdout)
+        self.assertIn("ineligible=1", excluded.stdout)
+        self.assertIn("last_ineligible=1", self.run_status().stdout)
+        self.assertEqual(list((self.evidence / "cases").iterdir()), [])
+
+        overdue = "OVERDUE\twake\tpath/task\tlease=2026-09-24T00:00:00Z"
+        self.env["MOCK_AUDIT"] = overdue
+        os.environ.update(self.env)
+        red = self.configure("wake", audit=overdue)
+        self.assertIn("semantic=obligations:stale", red)
+        self.event(red, channel="wake")
+        refused = self.run_capture()
+        self.assertEqual(refused.returncode, 2, refused.stdout)
+        self.assertIn("seq=1 skipped reason=bound_stamp_missing", refused.stdout)
+        self.assertNotIn("ineligible reason=", refused.stdout)
 
     def test_distinct_sequences_same_capture_key_not_independent_cases(self):
         body = self.configure()
