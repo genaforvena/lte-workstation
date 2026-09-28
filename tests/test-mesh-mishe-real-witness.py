@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from tests.mesh_omp_fixture import wire_omp_fixture
 
 ROOT = Path(__file__).resolve().parents[1]
 CORE = Path(os.environ.get("MESH_MISHE_CORE", "/home/mesh-home/mishe-tauftauf"))
@@ -53,8 +54,9 @@ receipt.write_text(json.dumps({'channel': 'witness', 'request_id': token,
                     "MESH_MISHE_CORE": str(CORE), "MESH_MISHE_REAL_ALLOWLIST": "witness",
                     "MESH_MISHE_WITNESS_MODEL": "openai-codex/gpt-6-luna",
                     "MESH_MISHE_SINK": str(ROOT / "scripts/mesh-mishe-mind-sink"),
-                    "MESH_MISHE_OMP_CMD": str(self.omp), "MESH_MISHE_PYTHON": sys.executable,
+                    "MESH_MISHE_PYTHON": sys.executable,
                     "MESH_REPO": str(ROOT), "CALLS": str(self.calls)}
+        wire_omp_fixture(self.root, self.env, self.omp)
         seed = self.feed("observation/witness", "STATE: RED\nOBSERVATION: source=top-pane/witness freshness=stale value-coverage=unknown")
         self.pass_s1(seed)
         self.feed("mishe-tauftauf", f"entry {seed} for top-pain witness: wake")
@@ -150,6 +152,42 @@ receipt.write_text(json.dumps({'channel': 'witness', 'request_id': token,
                           "--expect-generation", "0", "--feed-seq", str(self.admission_tail))
         self.assertEqual(probe.returncode, 2)
         self.assertFalse(json.loads(probe.stdout)["gates"]["mind"])
+
+    def test_preflight_rejects_spoofed_omp_override(self):
+        self.env["MESH_MISHE_OMP_CMD"] = str(self.omp)
+        probe = self.call("mesh-mishe-authority", "preflight", "witness",
+                          "--expect-generation", "0", "--feed-seq", str(self.admission_tail))
+        self.assertEqual(probe.returncode, 2, probe.stdout + probe.stderr)
+        self.assertFalse(json.loads(probe.stdout)["gates"]["omp"])
+        del self.env["MESH_MISHE_OMP_CMD"]
+        self.activate()
+        self.request()
+        self.env["MESH_MISHE_OMP_CMD"] = str(self.omp)
+        self.assertNotEqual(self.call("mesh-mishe-dispatch", "--once", "witness").returncode, 0)
+        self.assertFalse(self.calls.exists(), "post-activation OMP spoof reached the Mind")
+
+    def test_preflight_rejects_empty_omp_override_and_path_spoof(self):
+        self.env["MESH_MISHE_OMP_CMD"] = ""
+        empty = self.call("mesh-mishe-authority", "preflight", "witness",
+                          "--expect-generation", "0", "--feed-seq", str(self.admission_tail))
+        self.assertEqual(empty.returncode, 2)
+        self.assertFalse(json.loads(empty.stdout)["gates"]["omp"])
+        del self.env["MESH_MISHE_OMP_CMD"]
+        bindir = self.root / "bin"
+        bindir.mkdir()
+        (bindir / "omp").symlink_to(self.omp)
+        self.env["PATH"] = str(bindir) + os.pathsep + self.env["PATH"]
+        shadowed = self.call("mesh-mishe-authority", "preflight", "witness",
+                             "--expect-generation", "0", "--feed-seq", str(self.admission_tail))
+        self.assertEqual(shadowed.returncode, 2)
+        self.assertFalse(json.loads(shadowed.stdout)["gates"]["omp"])
+
+    def test_preflight_accepts_exact_installed_omp_override(self):
+        self.env["MESH_MISHE_OMP_CMD"] = str(Path.home() / ".local/bin/omp")
+        ready = self.call("mesh-mishe-authority", "preflight", "witness",
+                          "--expect-generation", "0", "--feed-seq", str(self.admission_tail))
+        self.assertEqual(ready.returncode, 0, ready.stdout + ready.stderr)
+        self.assertTrue(json.loads(ready.stdout)["gates"]["omp"])
 
     def test_double_dispatch_does_not_duplicate_mind_invocation(self):
         self.activate()
