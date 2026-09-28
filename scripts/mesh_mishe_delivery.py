@@ -44,10 +44,14 @@ def witness_enabled(channel: str) -> None:
 def witness_conditions(channel: str) -> dict:
     sink = os.environ.get("MESH_MISHE_SINK", "")
     approved = Path(__file__).with_name("mesh-mishe-mind-sink").resolve()
+    mind = os.environ.get("MESH_MISHE_MIND_CMD")
+    approved_mind = Path(__file__).with_name("mesh-mishe-mind").resolve()
     hold = home() / ".fleet-shadow-hold"
     return {"allowlist": channel == "witness" and os.environ.get("MESH_MISHE_REAL_ALLOWLIST") == "witness",
             "sink": bool(sink) and Path(sink).resolve() == approved
             and approved.is_file() and os.access(approved, os.X_OK),
+            "mind": (mind is None or bool(mind) and Path(mind).resolve() == approved_mind)
+            and approved_mind.is_file() and os.access(approved_mind, os.X_OK),
             "model": os.environ.get("MESH_MISHE_WITNESS_MODEL") == "openai-codex/gpt-6-luna",
             "hold_released": not hold.exists() and not hold.is_symlink()}
 
