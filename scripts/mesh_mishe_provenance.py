@@ -31,7 +31,7 @@ def _module_at(name: str, path: Path):
     return module
 
 
-def _hash_file(path: Path, allow_empty: bool) -> tuple[str, int, tuple]:
+def _hash_file(path: Path, allow_empty: bool) -> tuple[str, int, tuple, bytes]:
     before = path.lstat()
     if (not stat.S_ISREG(before.st_mode) or before.st_size > MAX_SOURCE
         or (before.st_size == 0 and not allow_empty)):
@@ -43,17 +43,19 @@ def _hash_file(path: Path, allow_empty: bool) -> tuple[str, int, tuple]:
             raise ValueError("source changed")
         digest = hashlib.sha256()
         count = 0
+        chunks = []
         with os.fdopen(fd, "rb", closefd=False) as stream:
             while chunk := stream.read(min(65536, MAX_SOURCE + 1 - count)):
                 count += len(chunk)
                 if count > MAX_SOURCE:
                     raise ValueError("source too large")
                 digest.update(chunk)
+                chunks.append(chunk)
         if count != opened.st_size or _signature(os.fstat(fd)) != _signature(opened):
             raise ValueError("source changed")
         if _signature(path.lstat()) != _signature(opened):
             raise ValueError("source changed")
-        return digest.hexdigest(), opened.st_mtime_ns, _signature(opened)
+        return digest.hexdigest(), opened.st_mtime_ns, _signature(opened), b"".join(chunks)
     finally:
         os.close(fd)
 
@@ -107,7 +109,9 @@ def source_stamp(channel: str, event_id: str, tick: str, home: Path,
         signatures = []
         total = 0
         for path in paths:
-            digest, mtime, signature = _hash_file(path, registry.allows_empty_marker(channel, path))
+            digest, mtime, signature, raw = _hash_file(path, registry.allows_empty_marker(channel, path))
+            if channel == "genome" and path.name == ".vitality-state" and registry.parse_vitality_state(raw) is None:
+                return None
             total += signature[3]
             if total > MAX_TOTAL:
                 return None
