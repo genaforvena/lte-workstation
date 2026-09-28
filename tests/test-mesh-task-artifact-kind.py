@@ -78,6 +78,10 @@ def main() -> None:
         chain("c-impl-ok", "builder", "wire-thing")
         run("done", "c-impl-ok", "wire-thing", str(tool), "wired, observed pane:check")
 
+        # GREEN: the wake data pane is a real observer and must be accepted by the gate.
+        chain("c-impl-wake-pane", "builder", "repair-thing")
+        run("done", "c-impl-wake-pane", "repair-thing", str(tool), "repaired pane:wake")
+
         # RED: plan listing no executable is refused.
         chain("c-plan-empty", "builder", "split-thing")
         out = run("done", "c-plan-empty", "split-thing", str(plan_empty),
@@ -107,6 +111,10 @@ def main() -> None:
         chain("c-genome-pane", "genome", "wire-thing", actor="genome")
         run("done", "c-genome-pane", "wire-thing", str(tool),
             "wired on pane:genome", actor="genome")
+        # GREEN: the job window is an actual mesh-dash role and observes its own result.
+        chain("c-job-pane", "builder", "wire-thing")
+        run("done", "c-job-pane", "wire-thing", str(tool),
+            "fixed on pane:job")
     finally:
         import shutil
         shutil.rmtree(workspace, ignore_errors=True)
