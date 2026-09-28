@@ -50,6 +50,14 @@ class DuplicateCheckTest(unittest.TestCase):
         result = self.check()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_long_unrelated_command_is_not_unknown(self):
+        self.worker(101, "/fleet/runs/study")
+        entry = self.proc / "102"
+        entry.mkdir()
+        (entry / "cmdline").write_bytes(b"python3\0-c\0" + b"x" * 9000 + b"\0")
+        result = self.check()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_oversized_process_command_is_unknown(self):
         entry = self.proc / "101"
         entry.mkdir()
