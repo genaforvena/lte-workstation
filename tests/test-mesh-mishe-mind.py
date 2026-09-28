@@ -296,6 +296,9 @@ else:
         outbox.write_text(json.dumps({"channel": "witness", "generation": 1,
                                       "request_id": request, "key": f"witness:1:{request}",
                                       "status": "claimed"}))
+        sink_event = self.root / "core/mind-events/witness" / f"{request_id}.json"
+        sink_event.parent.mkdir(parents=True)
+        sink_event.write_bytes(self.event.read_bytes())
         self.omp = self.helper("omp-witness", """
 import json,os,sys
 from pathlib import Path
@@ -319,6 +322,10 @@ if not (root/'omit-receipt').exists():
         first = subprocess.run(command, env=self.env, capture_output=True, text=True)
         self.assertEqual(first.returncode, 2)
         self.assertIn("mind-dispositions", first.stderr)
+        sink_status = subprocess.run([str(SCRIPT.with_name("mesh-mishe-mind-sink")),
+                                      "--idempotency-status", f"witness:1:{request}"],
+                                     env=self.env, capture_output=True, text=True)
+        self.assertEqual(json.loads(sink_status.stdout)["status"], "unknown")
         (self.root / "mesh/omit-receipt").unlink()
         retry = subprocess.run(command, env=self.env, capture_output=True, text=True)
         self.assertEqual(retry.returncode, 2)
@@ -338,6 +345,10 @@ if not (root/'omit-receipt').exists():
                                        "evidence": str(evidence)}))
         recovered = subprocess.run(command, env=self.env, capture_output=True, text=True)
         self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        sink_status = subprocess.run([str(SCRIPT.with_name("mesh-mishe-mind-sink")),
+                                      "--idempotency-status", f"witness:1:{request}"],
+                                     env=self.env, capture_output=True, text=True)
+        self.assertEqual(json.loads(sink_status.stdout)["status"], "delivered")
         record = json.loads((self.root / "mesh/mishe-mind/witness" / f"{request_id}.json").read_text())
         self.assertEqual((record["status"], record["disposition"]), ("settled", "non-actionable"))
         self.assertEqual((self.root / "mesh/omp-calls").read_text().splitlines(), [request_id])
