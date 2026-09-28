@@ -467,12 +467,25 @@ def check(channel: str) -> dict:
             raise BoundaryError("activation cursor beyond feed tail")
         entries = feed.entries(start=current["active_feed_seq"] + 1)
         counts = {state: 0 for state in ("pending", "held", "refused", "claimed", "unknown", "delivered")}
+        sink_mismatch = 0
         for path in outbox_dir(channel).glob("*.json"):
             item = read_json(path)
             state = item.get("status")
             if state not in counts or item.get("channel") != channel:
                 raise BoundaryError(f"invalid outbox record {path.name}")
             counts[state] += 1
+            if current["authority"] == "mishe" and state == "delivered":
+                key = item.get("key")
+                if (type(item.get("generation")) is not int or type(item.get("request_id")) is not int
+                        or key != f"{channel}:{item['generation']}:{item['request_id']}"):
+                    raise BoundaryError(f"invalid delivered identity {path.name}")
+                sink = os.environ.get("MESH_MISHE_SINK")
+                try:
+                    confirmed = sink_status(sink, key) if sink else "unknown"
+                except BoundaryError:
+                    confirmed = "unknown"
+                if confirmed != "delivered":
+                    sink_mismatch += 1
         missing = 0
         if current["authority"] == "mishe":
             for entry in entries:
@@ -483,7 +496,8 @@ def check(channel: str) -> dict:
                     path = outbox_dir(channel) / f"{current['generation']}-{entry.sequence}.json"
                     if not path.exists():
                         missing += 1
-        status = "UNKNOWN" if missing or counts["claimed"] or counts["unknown"] or counts["held"] else "PASS"
+        status = "UNKNOWN" if missing or sink_mismatch or counts["claimed"] or counts["unknown"] or counts["held"] else "PASS"
         return {"status": status, "channel": channel, "authority": current["authority"],
                 "generation": current["generation"], "active_feed_seq": current["active_feed_seq"],
-                "feed_tail": tail, "missing_outbox": missing, "outbox": counts}
+                "feed_tail": tail, "missing_outbox": missing, "sink_mismatch": sink_mismatch,
+                "outbox": counts}
