@@ -123,6 +123,8 @@ when the normalized top-pane meaning changes (subject to prediction, refractory,
 the source remains ephemeral and the mind reads the full top pane after the wake.
 `mesh-pane-check` captures the actual viewport and validates each role's producer marker as a
 top-level field; a repeated label inside an aggregate summary does not satisfy that signal.
+The `check` role uses a compact projection at 80+ columns and at most 11 rows, preserving its FLEET, DOCTOR, CPU/GPU, organ and liveness signals; `tests/test-mesh-dash-health-pane-fit.sh` pins that budget. Other geometries retain the overflow lease rather than claiming a fit.
+
 
 `mesh-restore` defines the shared channel-role manifest. Node-local `restore.env` selects
 engines and resident Minds, and can retire roles; the manifest describes the shared map,
