@@ -21,6 +21,36 @@ loader.exec_module(projection)
 
 
 class FleetProjectionTest(unittest.TestCase):
+    def test_genome_dash_reads_bounded_state_without_leaking_history_or_malformed_bytes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            mesh = home / ".mesh"
+            mesh.mkdir()
+            state = mesh / ".vitality-state"
+            state.write_text("fails=0\nverdict=OK\ntools=9\nbeta=0.5\n"
+                             "autonomy=0.8\nts=2026-09-28T14:17:52Z\n")
+            (mesh / "vitality.log").write_text("PRIVATE-VITALITY-HISTORY\n")
+            env = {**os.environ, "HOME": tmp, "MESH_DIR": str(mesh), "MESH_DASH_FAST": "1"}
+            def render(role="genome"):
+                run_env = {**env}
+                if role == "minds":
+                    run_env.pop("MESH_DASH_FAST", None)
+                result = subprocess.run([str(ROOT / "scripts/mesh-dash"), "--once", role],
+                                        env=run_env, capture_output=True, text=True, timeout=20)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                return result.stdout
+            good = render()
+            self.assertIn("vitality: OK fails=0 tools=9", good)
+            self.assertNotIn("PRIVATE-VITALITY-HISTORY", good)
+            state.write_text("PRIVATE-FAKE-SUCCESS\n")
+            bad = render()
+            self.assertIn("vitality: UNKNOWN", bad)
+            self.assertNotIn("PRIVATE-FAKE-SUCCESS", bad)
+            state.write_text("fails=0\nverdict=PRIVATE-FAKE-SUCCESS\ntools=9\n"
+                             "beta=0.5\nautonomy=0.8\nts=2026-09-28T14:17:52Z\n")
+            minds = render("minds")
+            self.assertNotIn("PRIVATE-FAKE-SUCCESS", minds)
+
     def test_private_fixture_bytes_never_enter_projection(self):
         for channel in projection.CHANNEL_ROLES:
             with self.subTest(channel=channel):
@@ -120,7 +150,8 @@ class FleetProjectionTest(unittest.TestCase):
             tmux = Path(tmp) / "tmux"
             tmux.write_text("#!/bin/sh\n"
                             "if [ \"$1\" = display-message ]; then printf '%s\\n' \"$MOCK_META\"; "
-                            "else printf '%s\\n' \"$MOCK_PANE\"; fi\n")
+                            "elif [ \"$1 $2 $3\" = 'capture-pane -p -t' ]; then printf '%s\\n' \"$MOCK_PANE\"; "
+                            "else exit 64; fi\n")
             tmux.chmod(0o755)
             stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             secret = "fixture-private-operator-message"
@@ -296,11 +327,22 @@ class FleetProjectionTest(unittest.TestCase):
             self.assertIn("STATE: UNKNOWN\n", event)
             self.assertIn("cleaner=unknown", event)
 
+    def test_cleaner_checked_report_is_a_resolved_report_only_state(self):
+        frame = ("MISHE-STATE: UNKNOWN\nMISHE-SOURCE: top-pane\nMISHE-FRESHNESS: FRESH\n"
+                 "MISHE-VALUE: cleaner FRESH\nMISHE-CLEANER: PASS\n"
+                 "PRIVATE-cleaner-candidate\n")
+        projected = projection.fleet_projection("cleaner", frame)
+        self.assertEqual(projected, "STATE: GREEN\nOBSERVATION: source=top-pane/cleaner "
+                         "freshness=fresh cleaner=fresh value-coverage=partial review=pass\n")
+        self.assertNotIn("PRIVATE-cleaner-candidate", projected)
+        self.assertIn("STATE: UNKNOWN", projection.fleet_projection("cleaner", frame.replace(
+            "MISHE-CLEANER: PASS\n", "")))
+
     def test_periodic_semantic_source_stall_and_recovery_for_each_owner(self):
         sources = {
             "tg": ((".voice-rx-state", ".textin-cycle"), 120),
             "health": ((".fleet-health.cache",), 600),
-            "genome": (("vitality.log",), 10800),
+            "genome": ((".vitality-state",), 10800),
             "senses": (("sense-map.txt",), 1800),
             "minds": ((".mind-state-watch.cache",), 300),
             "sound": ((".records-tick",), 300),
@@ -332,7 +374,9 @@ class FleetProjectionTest(unittest.TestCase):
                     goal.write_text("static healthy goal")
                     for filename in filenames:
                         source = Path(tmp) / filename
-                        source.write_text("" if filename == ".records-tick" else "static healthy source")
+                        source.write_text("" if filename == ".records-tick" else
+                                          ("fails=0\nverdict=OK\ntools=1\nbeta=0.5\nautonomy=0.5\nts=" + stamp + "\n")
+                                          if channel == "genome" else "static healthy source")
                         os.utime(source, (epoch - limit - 10, epoch - limit - 10))
                     def check():
                         frame = subprocess.run([str(ROOT / "scripts/mesh-mishe-render"), channel, role],
