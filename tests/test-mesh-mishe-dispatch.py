@@ -79,6 +79,21 @@ class DispatchTest(unittest.TestCase):
         self.assertEqual(json.loads(again.stdout)["results"][0]["status"], "refused")
         self.assertEqual((self.home / "sink-calls").read_text().splitlines(), ["synthetic:1:3"])
 
+    def test_check_revalidates_delivered_sink_receipt(self):
+        self.activate()
+        self.request()
+        delivered = self.run_cmd("mesh-mishe-dispatch", "--once", "synthetic")
+        self.assertEqual(json.loads(delivered.stdout)["results"][0]["status"], "delivered")
+        (self.home / "sink-ledger.json").unlink()
+        check = self.run_cmd("mesh-mishe-dispatch", "--check", "synthetic")
+        self.assertEqual(check.returncode, 2, check.stdout + check.stderr)
+        self.assertEqual(json.loads(check.stdout)["status"], "UNKNOWN")
+        self.assertEqual(json.loads(check.stdout)["sink_mismatch"], 1)
+        self.env["MESH_MISHE_SINK"] = str(self.home / "missing-sink")
+        unavailable = self.run_cmd("mesh-mishe-dispatch", "--check", "synthetic")
+        self.assertEqual(unavailable.returncode, 2)
+        self.assertEqual(json.loads(unavailable.stdout)["sink_mismatch"], 1)
+
     def test_claimed_send_without_sink_confirmation_stays_unknown(self):
         self.activate()
         self.request()
