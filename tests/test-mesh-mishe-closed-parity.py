@@ -60,6 +60,14 @@ class ClosedParityTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertNotIn(secret.encode(), self.legacy.read_bytes() + self.projected.read_bytes() + result.stdout.encode())
 
+    def test_matching_shadow_observation_may_precede_legacy_reader(self):
+        self.write([self.event("a", "2026-09-23T04:00:20Z")],
+                   [self.event("a", "2026-09-23T04:00:19Z", source="top-pane", feed_seq=1)])
+        result = self.check()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("matched=1 missing=0 late=0 duplicate=0 invalid=0", result.stdout)
+        self.assertIn("lead-max=1.000s", result.stdout)
+
     def test_zero_evidence_is_unknown(self):
         self.write([], [])
         result = self.check()
