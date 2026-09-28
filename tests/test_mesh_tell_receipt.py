@@ -99,6 +99,15 @@ class ReceiptTests(unittest.TestCase):
         replay = subprocess.run(args, env={**env, "MESH_TELL_TEST_FAULT": ""}, text=True, capture_output=True)
         self.assertEqual(replay.returncode, 3)
         self.assertEqual(calls.read_text(encoding="utf-8"), prior)
+        # The same query result also follows a crash immediately after begin,
+        # when no tmux injection happened. Neither history can be retried safely
+        # from the current sink status alone.
+        before = self.call("begin", "cleaner:2:req-before", "cleaner", "a" * 64)
+        self.assertEqual(before.returncode, 0)
+        after_send_status = json.loads(self.call("status", "cleaner:2:req-kill").stdout)
+        before_send_status = json.loads(self.call("status", "cleaner:2:req-before").stdout)
+        self.assertEqual(after_send_status, before_send_status)
+        self.assertEqual(after_send_status, {"status": "unknown"})
 
 
 if __name__ == "__main__":
