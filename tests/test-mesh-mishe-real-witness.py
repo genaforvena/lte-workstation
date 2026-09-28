@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -19,21 +20,41 @@ class WitnessBoundary(unittest.TestCase):
         self.home = self.root / "core"
         self.home.mkdir()
         self.calls = self.root / "calls"
-        self.mind = self.root / "mind"
-        self.mind.write_text("#!/usr/bin/env python3\nimport hashlib,json,os,sys\nfrom pathlib import Path\n"
-                             "a=sys.argv; event=Path(a[a.index('--event-file')+1]); e=json.loads(event.read_text()); "
-                             "p=Path(os.environ['MESH_DIR'])/'mishe-mind'/e['channel']/(e['request_id']+'.json'); "
-                             "p.parent.mkdir(parents=True,exist_ok=True); "
-                             "Path(os.environ['CALLS']).open('a').write(e['request_id']+'\\n'); "
-                             "p.write_text(json.dumps({'channel':e['channel'],'request_id':e['request_id'], "
-                             "'generation':e['generation'],'event_sha256':hashlib.sha256(event.read_bytes()).hexdigest(), "
-                             "'status':os.environ.get('MIND_RESULT','settled'),'disposition':'non-actionable','task_id':None}))\n")
-        self.mind.chmod(0o755)
+        (self.root / "mesh/charter").mkdir(parents=True)
+        (self.root / "mesh/charter/witness.md").write_text("Witness fixture charter.\n")
+        (self.root / "mesh/chat.log").write_text("")
+        self.omp = self.root / "omp-fixture"
+        self.omp.write_text("""#!/usr/bin/env python3
+import json, os, sys
+from pathlib import Path
+from mishe_tauftauf.feed import Feed
+root = Path(os.environ['MESH_DIR'])
+home = Path(os.environ['MESH_MISHE_HOME'])
+token = os.environ['MESH_MISHE_INVOCATION']
+Path(os.environ['CALLS']).open('a').write(token + '\\n')
+(root / 'omp-args').write_text(json.dumps(sys.argv[1:-1]))
+(root / 'omp-prompt').write_text(sys.argv[-1])
+if os.environ.get('MIND_RESULT') == 'running':
+    sys.exit(0)
+(home / 'handoffs').mkdir(parents=True, exist_ok=True)
+(home / 'handoffs/witness.md').write_text('invocation:' + token)
+Feed(home).append_runtime('mishe-tauftauf', 'handoff top-pain witness invocation ' + token + '\\nfixture')
+(root / 'chat.log').open('a').write('[fyi] invocation:' + token + ' disposition=non-actionable\\n')
+evidence = home / 'evidence.txt'
+evidence.write_text('checked source invocation:' + token)
+receipt = home / 'mind-dispositions/witness' / (token + '.json')
+receipt.parent.mkdir(parents=True, exist_ok=True)
+receipt.write_text(json.dumps({'channel': 'witness', 'request_id': token,
+                               'disposition': 'non-actionable', 'task_id': None,
+                               'evidence': str(evidence)}))
+""")
+        self.omp.chmod(0o755)
         self.env = {**os.environ, "MESH_DIR": str(self.root / "mesh"), "MESH_MISHE_HOME": str(self.home),
                     "MESH_MISHE_CORE": str(CORE), "MESH_MISHE_REAL_ALLOWLIST": "witness",
                     "MESH_MISHE_WITNESS_MODEL": "openai-codex/gpt-6-luna",
                     "MESH_MISHE_SINK": str(ROOT / "scripts/mesh-mishe-mind-sink"),
-                    "MESH_MISHE_MIND_CMD": str(self.mind), "CALLS": str(self.calls)}
+                    "MESH_MISHE_OMP_CMD": str(self.omp), "MESH_MISHE_PYTHON": sys.executable,
+                    "MESH_REPO": str(ROOT), "CALLS": str(self.calls)}
         seed = self.feed("observation/witness", "STATE: RED\nOBSERVATION: source=top-pane/witness freshness=stale value-coverage=unknown")
         self.pass_s1(seed)
         self.feed("mishe-tauftauf", f"entry {seed} for top-pain witness: wake")
@@ -102,6 +123,34 @@ class WitnessBoundary(unittest.TestCase):
         self.assertNotEqual(self.call("mesh-mishe-authority", "switch", "witness", "--to", "mishe",
                                       "--expect-generation", "0", "--feed-seq", str(tail)).returncode, 0)
 
+    def test_preflight_rejects_spoofed_witness_mind_command(self):
+        spoof = self.root / "spoofed-mind"
+        spoof.write_text("#!/bin/sh\nexit 0\n")
+        spoof.chmod(0o755)
+        self.env["MESH_MISHE_MIND_CMD"] = str(spoof)
+        probe = self.call("mesh-mishe-authority", "preflight", "witness",
+                          "--expect-generation", "0", "--feed-seq", str(self.admission_tail))
+        self.assertEqual(probe.returncode, 2, probe.stdout + probe.stderr)
+        self.assertFalse(json.loads(probe.stdout)["gates"]["mind"])
+        switched = self.call("mesh-mishe-authority", "switch", "witness", "--to", "mishe",
+                             "--expect-generation", "0", "--feed-seq", str(self.admission_tail))
+        self.assertNotEqual(switched.returncode, 0)
+        self.assertEqual(json.loads(self.call("mesh-mishe-authority", "read", "witness").stdout)["authority"],
+                         "legacy")
+        del self.env["MESH_MISHE_MIND_CMD"]
+        self.activate()
+        self.request()
+        self.env["MESH_MISHE_MIND_CMD"] = str(spoof)
+        self.assertNotEqual(self.call("mesh-mishe-dispatch", "--once", "witness").returncode, 0)
+        self.assertFalse(self.calls.exists(), "post-activation spoof launched a Mind")
+
+    def test_preflight_rejects_empty_witness_mind_override(self):
+        self.env["MESH_MISHE_MIND_CMD"] = ""
+        probe = self.call("mesh-mishe-authority", "preflight", "witness",
+                          "--expect-generation", "0", "--feed-seq", str(self.admission_tail))
+        self.assertEqual(probe.returncode, 2)
+        self.assertFalse(json.loads(probe.stdout)["gates"]["mind"])
+
     def test_double_dispatch_does_not_duplicate_mind_invocation(self):
         self.activate()
         seq = self.request()
@@ -109,6 +158,14 @@ class WitnessBoundary(unittest.TestCase):
         first = self.call("mesh-mishe-dispatch", "--once", "witness")
         self.assertEqual(first.returncode, 0, first.stderr)
         self.assertEqual(json.loads(first.stdout)["results"], [{"key": key, "status": "delivered"}])
+        record = json.loads((self.root / "mesh/mishe-mind/witness" / f"witness-g1-r{seq}.json").read_text())
+        self.assertEqual((record["status"], record["disposition"], record["omp_exit"]),
+                         ("settled", "non-actionable", 0))
+        self.assertEqual(json.loads((self.home / "mind-dispositions/witness" /
+                                     f"witness-g1-r{seq}.json").read_text())["request_id"],
+                         f"witness-g1-r{seq}")
+        self.assertIn("--model=openai-codex/gpt-6-luna",
+                      json.loads((self.root / "mesh/omp-args").read_text()))
         again = self.call("mesh-mishe-dispatch", "--once", "witness")
         self.assertEqual(again.returncode, 0, again.stderr)
         self.assertEqual(self.calls.read_text().splitlines(), [f"witness-g1-r{seq}"])
