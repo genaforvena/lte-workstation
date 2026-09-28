@@ -332,10 +332,15 @@ class SyntheticAdapterTest(unittest.TestCase):
             self.assertNotEqual(absent_roster.returncode, 0)
             self.assertIn("enrolled roster absent", absent_roster.stdout)
             (home / "fleet-channels").write_text("cleaner\n")
+            parity = home / "parity"
+            parity.mkdir()
+            (parity / "legacy.jsonl").write_text("")
+            (parity / "projected.jsonl").write_text("")
             fleet_doctor = subprocess.run([str(ROOT / "scripts/mesh-mishe-doctor")], env=env,
                                           text=True, capture_output=True)
-            self.assertEqual(fleet_doctor.returncode, 0, fleet_doctor.stdout + fleet_doctor.stderr)
+            self.assertNotEqual(fleet_doctor.returncode, 0, fleet_doctor.stdout + fleet_doctor.stderr)
             self.assertIn("fleet judge-view: projected-fleet-v1", fleet_doctor.stdout)
+            self.assertIn("mishe parity: UNKNOWN sample=0", fleet_doctor.stdout)
             (home / "fleet-channels").unlink()
             self.assertEqual(run("once").returncode, 0)
             delta_env = {**env, "MESH_MISHE_DELTA_VIEW": "1"}
