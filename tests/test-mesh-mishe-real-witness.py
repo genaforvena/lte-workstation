@@ -116,6 +116,54 @@ class WitnessBoundary(unittest.TestCase):
         self.assertEqual(repeat_sink.returncode, 0, repeat_sink.stderr)
         self.assertEqual(self.calls.read_text().splitlines(), [f"witness-g1-r{seq}"])
 
+    def test_sink_crash_after_event_before_mind_stays_unknown_without_launch(self):
+        self.activate()
+        seq = self.request()
+        key = f"witness:1:{seq}"
+        crashed = self.call("mesh-mishe-dispatch", "--once", "witness",
+                            env={**self.env, "MESH_MISHE_SINK_TEST_FAULT": "after-event"})
+        self.assertNotEqual(crashed.returncode, 0)
+        self.assertTrue((self.home / "mind-events/witness" / f"witness-g1-r{seq}.json").exists())
+        self.assertFalse(self.calls.exists(), "Mind was launched before the event-only fault")
+        replay = self.call("mesh-mishe-dispatch", "--once", "witness")
+        self.assertEqual(json.loads(replay.stdout)["results"], [{"key": key, "status": "unknown"}])
+        self.assertFalse(self.calls.exists(), "ambiguous claimed request was reinvoked")
+
+    def test_sink_crash_after_settled_mind_recovers_receipt_without_relaunch(self):
+        self.activate()
+        seq = self.request()
+        key = f"witness:1:{seq}"
+        outbox = self.home / "outbox/witness" / f"1-{seq}.json"
+        outbox.parent.mkdir(parents=True)
+        outbox.write_text(json.dumps({"channel": "witness", "generation": 1,
+                                      "request_id": seq, "key": key, "status": "claimed"}))
+        crashed = self.call("mesh-mishe-mind-sink", "--idempotency-key", key, "witness", "ignored",
+                            env={**self.env, "MESH_MISHE_SINK_TEST_FAULT": "after-mind"})
+        self.assertEqual(crashed.returncode, 86)
+        status = self.call("mesh-mishe-mind-sink", "--idempotency-status", key)
+        self.assertEqual(json.loads(status.stdout)["status"], "delivered")
+        recovered = self.call("mesh-mishe-dispatch", "--once", "witness")
+        self.assertEqual(json.loads(recovered.stdout)["results"], [{"key": key, "status": "delivered"}])
+        self.assertEqual(self.calls.read_text().splitlines(), [f"witness-g1-r{seq}"])
+
+    def test_sink_crash_after_unsettled_mind_never_relaunches(self):
+        self.activate()
+        seq = self.request()
+        key = f"witness:1:{seq}"
+        outbox = self.home / "outbox/witness" / f"1-{seq}.json"
+        outbox.parent.mkdir(parents=True)
+        outbox.write_text(json.dumps({"channel": "witness", "generation": 1,
+                                      "request_id": seq, "key": key, "status": "claimed"}))
+        crashed = self.call("mesh-mishe-mind-sink", "--idempotency-key", key, "witness", "ignored",
+                            env={**self.env, "MIND_RESULT": "running",
+                                 "MESH_MISHE_SINK_TEST_FAULT": "after-mind"})
+        self.assertEqual(crashed.returncode, 86)
+        self.assertEqual(json.loads(self.call("mesh-mishe-mind-sink", "--idempotency-status", key).stdout)["status"],
+                         "unknown")
+        replay = self.call("mesh-mishe-dispatch", "--once", "witness")
+        self.assertEqual(json.loads(replay.stdout)["results"], [{"key": key, "status": "unknown"}])
+        self.assertEqual(self.calls.read_text().splitlines(), [f"witness-g1-r{seq}"])
+
     def test_repeated_s1_for_same_observation_does_not_launch_second_mind(self):
         self.activate()
         first_seq = self.request()
