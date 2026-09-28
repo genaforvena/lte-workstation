@@ -517,6 +517,51 @@ class FleetProjectionTest(unittest.TestCase):
             self.assertEqual(unknown.returncode, 1)
             self.assertIn("unknown=tg", unknown.stdout)
 
+    def test_source_health_quiet_event_lane_is_ineligible_only_after_canonical_audit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmux = Path(tmp) / "tmux"
+            tmux.write_text("#!/bin/sh\nif [ \"$1\" = display-message ]; then "
+                            "printf '%s\\n' \"$MOCK_META\"; else printf '%s\\n' \"$MOCK_PANE\"; fi\n")
+            tmux.chmod(0o755)
+            audit = Path(tmp) / "task-audit"
+            audit.write_text("#!/bin/sh\nprintf '%s\\n' \"$AUDIT_ROW\"\nexit \"${AUDIT_RC:-0}\"\n")
+            audit.chmod(0o755)
+            stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            base = {**os.environ, "PATH": tmp + ":" + os.environ["PATH"],
+                    "MESH_MISHE_HOME": tmp, "MESH_MISHE_GOAL_DIR": tmp,
+                    "MESH_MISHE_RENDER_SOURCE": "pane", "MESH_MISHE_SESSION": "fixture",
+                    "MESH_MISHE_TASK_AUDIT_CMD": str(audit),
+                    "MOCK_PANE": ("PRIVATE-owner-fixture\n-- pane live " + stamp +
+                                  " · 30s · ticks every frame --")}
+            for channel in ("adint", "hire", "wake", "haunt"):
+                with self.subTest(channel=channel):
+                    goal = Path(tmp) / f".goal-{channel}.cache"
+                    goal.write_text("unchanged goal")
+                    env = {**base, "MOCK_META": f'{channel}|0|0|"exec /safe/mesh-dash {channel}"'}
+                    command = [str(ROOT / "scripts/mesh-mishe-source-health"), "--channel", channel]
+
+                    def verdict(row, rc="0"):
+                        return subprocess.run(command, env={**env, "AUDIT_ROW": row, "AUDIT_RC": rc},
+                                              text=True, capture_output=True)
+
+                    quiet = verdict("DONE\tother\tfixture-task\tartifact=fixture")
+                    self.assertEqual(quiet.returncode, 0, quiet.stdout + quiet.stderr)
+                    self.assertIn(f"ineligible={channel}", quiet.stdout)
+                    self.assertIn("0 observed channels", quiet.stdout)
+                    other_owner = verdict(f"OVERDUE\t{channel}-other\tfixture-task\tlease=2026-09-24T00:00:00Z")
+                    self.assertEqual(other_owner.returncode, 0, other_owner.stdout + other_owner.stderr)
+                    self.assertIn(f"ineligible={channel}", other_owner.stdout)
+                    overdue = verdict(f"OVERDUE\t{channel}\tfixture-task\tlease=2026-09-24T00:00:00Z")
+                    self.assertEqual(overdue.returncode, 1)
+                    self.assertIn(f"stale={channel}", overdue.stdout)
+                    failed = verdict("", rc="2")
+                    self.assertEqual(failed.returncode, 1)
+                    self.assertIn(f"unknown={channel}", failed.stdout)
+                    malformed = verdict("audit failed silently")
+                    self.assertEqual(malformed.returncode, 1)
+                    self.assertIn(f"unknown={channel}", malformed.stdout)
+                    goal.unlink()
+
     def test_publisher_async_cache_refresh_does_not_look_unknown(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmux = Path(tmp) / "tmux"
