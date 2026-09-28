@@ -29,6 +29,8 @@ for adapter in study-pooled study-toy_passage_ppl study-executable_code study-ra
 done
 env "${env_base[@]}" "$ROOT/scripts/mesh-study-autowake"
 [ -e "$td/launched" ] || { echo 'mesh-study-autowake: did not launch when ready' >&2; exit 1; }
+[ ! -e "$study/runs/fleet-study-v1/.autowake.lock" ] \
+  || { echo 'mesh-study-autowake: lock polluted the strict matrix run root' >&2; exit 1; }
 
 # A slow study must not be relaunched by the next five-minute tick. The first
 # launcher holds its process open until the fixture releases it.
@@ -57,5 +59,21 @@ env "${env_base[@]}" MESH_STUDY_AUTOWAKE_READY="$td/ready3" \
   MESH_STUDY_AUTOWAKE_RELEASE="$td/release" "$ROOT/scripts/mesh-study-autowake"
 [ "$(wc -l < "$td/launched")" -eq 2 ] \
   || { echo 'mesh-study-autowake: completed launch did not release lock' >&2; exit 1; }
+
+completion="$td/completion"
+cat > "$completion" <<'EOF'
+#!/usr/bin/env bash
+echo fixture-completion
+exit "$MESH_STUDY_COMPLETE_RC"
+EOF
+chmod +x "$completion"
+rm -f "$td/launched"
+for pair in '0 complete' '2 held'; do
+  read -r rc status <<< "$pair"
+  env "${env_base[@]}" MESH_STUDY_COMPLETE_CMD="$completion" MESH_STUDY_COMPLETE_RC="$rc" \
+    "$ROOT/scripts/mesh-study-autowake"
+  [ ! -e "$td/launched" ] && grep -q "\"status\":\"$status\"" "$state" \
+    || { echo "mesh-study-autowake: completion rc=$rc launched or wrong status" >&2; exit 1; }
+done
 
 echo 'test-mesh-study-autowake: PASS'
