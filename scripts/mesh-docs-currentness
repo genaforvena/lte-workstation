@@ -1,0 +1,557 @@
+#!/usr/bin/env python3
+"""Deterministic local docs-currentness events and settlement proof."""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+
+SCRIPT = Path(__file__).resolve()
+DEFAULT_REPO = SCRIPT.parent.parent
+SAFE_CONTRACT = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
+HEX_SHA = re.compile(r"^[0-9a-f]{40}$")
+
+
+@dataclass(frozen=True)
+class Contract:
+    source: str
+    document: str
+    contract: str
+    claim: str
+    check: str
+
+
+def repo_root() -> Path:
+    return Path(os.environ.get("MESH_DOCS_REPO", str(DEFAULT_REPO))).expanduser().resolve()
+
+
+def map_path(repo: Path) -> Path:
+    return Path(os.environ.get("MESH_DOCS_CURRENTNESS_MAP", str(repo / "scripts/mesh-docs-currentness.map"))).expanduser()
+
+
+def mesh_root() -> Path:
+    return Path(os.environ.get("MESH_DIR", str(Path.home() / ".mesh"))).expanduser()
+
+
+def task_dir() -> Path:
+    return Path(os.environ.get("MESH_TASK_DIR", str(mesh_root() / "task-chains"))).expanduser()
+
+
+def task_command() -> list[str]:
+    configured = os.environ.get("MESH_DOCS_TASK_COMMAND", "")
+    return shlex.split(configured) if configured else [sys.executable, str(SCRIPT.parent / "mesh-task")]
+
+
+def run(argv: list[str], cwd: Path, *, check: bool = False, env: dict | None = None) -> subprocess.CompletedProcess:
+    proc = subprocess.run(argv, cwd=cwd, text=True, capture_output=True, check=False, env=env)
+    if check and proc.returncode:
+        raise RuntimeError(f"command failed rc={proc.returncode}: {' '.join(argv)}\n{proc.stdout}{proc.stderr}")
+    return proc
+
+
+def git(repo: Path, *args: str, check: bool = True) -> str:
+    proc = run(["git", "-C", str(repo), *args], repo, check=check)
+    return proc.stdout.strip()
+
+
+def load_map(repo: Path, filename: Path) -> list[Contract]:
+    rows: list[Contract] = []
+    seen: set[tuple[str, str, str]] = set()
+    for number, raw in enumerate(filename.read_text(encoding="utf-8").splitlines(), 1):
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        fields = raw.split("\t")
+        if len(fields) != 5 or any(not value.strip() for value in fields):
+            raise ValueError(f"{filename}:{number}: expected five nonempty tab-separated fields")
+        source, document, contract, claim, check = (value.strip() for value in fields)
+        for path in (source, document):
+            if Path(path).is_absolute() or ".." in Path(path).parts:
+                raise ValueError(f"{filename}:{number}: path must be repository-relative: {path}")
+        if not SAFE_CONTRACT.fullmatch(contract):
+            raise ValueError(f"{filename}:{number}: invalid contract id {contract!r}")
+        if (source, document, contract) in seen:
+            raise ValueError(f"{filename}:{number}: duplicate source/document/contract mapping")
+        seen.add((source, document, contract))
+        if not (repo / source).is_file() or not (repo / document).is_file():
+            raise ValueError(f"{filename}:{number}: mapped source or document is missing")
+        if document.startswith(("docs/reviews/", "docs/drafts/", "docs/evidence/", "tests/")):
+            raise ValueError(f"{filename}:{number}: historical/test path is not a living-document target")
+        tracked = run(["git", "-C", str(repo), "ls-files", "--error-unmatch", "--", document], repo)
+        if tracked.returncode:
+            raise ValueError(f"{filename}:{number}: living document is not tracked: {document}")
+        check_argv = shlex.split(check)
+        if not check_argv or any(token in (";", "|", "&&", ">", "<") for token in check_argv):
+            raise ValueError(f"{filename}:{number}: check must be an argv, not a shell expression")
+        executable = repo / check_argv[0]
+        if check_argv[0].startswith("scripts/") and not executable.is_file():
+            raise ValueError(f"{filename}:{number}: check executable is missing: {check_argv[0]}")
+        rows.append(Contract(source, document, contract, claim, check))
+    if not rows:
+        raise ValueError(f"{filename}: no source-to-living-document mappings")
+    return rows
+
+
+def check_map(repo: Path, filename: Path) -> list[Contract]:
+    rows = load_map(repo, filename)
+    print(f"docs-currentness map: PASS ({len(rows)} living contract(s))")
+    return rows
+
+
+def resolve_commit(repo: Path, revision: str) -> tuple[str, list[str]]:
+    commit = git(repo, "rev-parse", "--verify", f"{revision}^{{commit}}")
+    if not HEX_SHA.fullmatch(commit):
+        raise ValueError(f"not a full commit id: {revision}")
+    ancestor = run(["git", "-C", str(repo), "merge-base", "--is-ancestor", commit, "HEAD"], repo)
+    if ancestor.returncode:
+        raise ValueError(f"source revision {commit[:12]} is not an ancestor of HEAD")
+    paths = git(repo, "diff-tree", "--root", "--no-commit-id", "--no-renames", "--name-only", "-r", commit).splitlines()
+    return commit, paths
+
+
+def event_dir() -> Path:
+    return mesh_root() / "docs-currentness"
+
+
+def write_event(event: dict) -> None:
+    directory = event_dir()
+    directory.mkdir(parents=True, exist_ok=True)
+    target = directory / f"{event['revision']}.json"
+    temporary = target.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(event, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+    os.replace(temporary, target)
+
+
+def origin_fields(revision: str, contract: Contract) -> dict[str, str]:
+    identity = f"{revision}:{contract.source}:{contract.document}:{contract.contract}"
+    return {
+        "kind": "docs-currentness",
+        "source": identity,
+        "hypothesis": "The mapped living-document claim may lag a landed source contract; a changed file alone is not proof of staleness.",
+        "question": f"Compare {contract.source}@{revision[:12]} with {contract.document} for {contract.contract}; edit only if the current prose is inaccurate.",
+        "acceptance": f"Review current source and run `{contract.check}`; record before/after hashes, link check, disposition, and any unresolved code defect in a durable receipt.",
+        "feedback": "If source behavior contradicts the intended contract, leave docs UNKNOWN and route a separate exact-owner genome task; do not invent prose.",
+    }
+
+
+def safe_slug(value: str) -> str:
+    return re.sub(r"[^a-z0-9-]+", "-", value.lower()).strip("-")
+
+
+def create_candidate(repo: Path, revision: str, contract: Contract) -> tuple[str, str]:
+    doc_slug = safe_slug(Path(contract.document).stem)
+    chain = f"docs-currentness-{revision[:12]}-{doc_slug}-{contract.contract}"
+    evidence = mesh_root() / "evidence" / "docs-currentness" / chain
+    plan_lines = [
+        f"# repository={repo}",
+        f"# scope={contract.document}",
+        f"# artifact_root={evidence}",
+        f"# revision={revision}",
+        f"# next_command={contract.check}",
+    ]
+    plan_lines.extend(f"# origin.{key}={value}" for key, value in origin_fields(revision, contract).items())
+    description = (
+        f"Review landed source contract {contract.contract} at {revision[:12]} ({contract.source}) against "
+        f"living document {contract.document}: {contract.claim} Run `{contract.check}` and `scripts/mesh-md-link check --dir docs`; "
+        "edit only if current prose is inaccurate, then provide a proof receipt with before/after hashes and any code defect."
+    )
+    plan_lines.append(f"docs\treview-{contract.contract}\t{description}")
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", prefix="docs-currentness-", suffix=".plan.tsv", delete=False) as stream:
+        plan = Path(stream.name)
+        stream.write("\n".join(plan_lines) + "\n")
+    try:
+        proc = run(task_command() + ["create", chain, str(plan)], repo)
+    finally:
+        plan.unlink(missing_ok=True)
+    if proc.returncode:
+        duplicate = re.search(r"origin\.source '([^']+)' already exists in chain '([^']+)'", proc.stderr)
+        expected = origin_fields(revision, contract)["source"]
+        if duplicate and duplicate.group(1) == expected:
+            return duplicate.group(2), "replay"
+        raise RuntimeError(f"mesh-task create failed rc={proc.returncode}: {proc.stdout}{proc.stderr}")
+    return chain, "created"
+
+
+def pending_candidate(repo: Path, contract: Contract) -> tuple[str, str] | None:
+    pending = []
+    directory = event_dir()
+    if not directory.is_dir():
+        return None
+    seen: set[str] = set()
+    for file in directory.glob("*.json"):
+        event = json.loads(file.read_text(encoding="utf-8"))
+        for candidate in event.get("candidates", []):
+            if candidate.get("document") != contract.document or candidate.get("contract") != contract.contract:
+                continue
+            chain = candidate.get("chain", "")
+            if not chain or chain in seen:
+                continue
+            seen.add(chain)
+            proc = run(task_command() + ["status", chain], repo)
+            if proc.returncode:
+                raise RuntimeError(f"cannot establish prior docs candidate state for {chain}: {proc.stderr}")
+            header = proc.stdout.splitlines()[0] if proc.stdout else ""
+            match = re.search(r"\[([^]]+)\]", header)
+            state = match.group(1) if match else "UNKNOWN"
+            if state not in ("complete", "rejected", "ignored"):
+                pending.append((chain, candidate.get("task_revision", event.get("revision", ""))))
+    if len(pending) > 1:
+        raise RuntimeError(f"UNKNOWN multiple active docs candidates for {contract.document}/{contract.contract}: {pending}")
+    return pending[0] if pending else None
+
+
+def process_event(repo: Path, revision: str, filename: Path, *, force: bool = False) -> int:
+    if not force and not enabled():
+        print("docs-currentness: disabled (mesh-home local flag absent)")
+        return 0
+    mappings = check_map(repo, filename)
+    commit, changed = resolve_commit(repo, revision)
+    by_source = {row.source: row for row in mappings}
+    candidates = [by_source[path] for path in changed if path in by_source]
+    unmapped = [path for path in changed if path.startswith("scripts/") and path not in by_source]
+    # Only map-listed source contracts create work. Tests, fixtures, evidence, and changed docs are not source events.
+    event = {"revision": commit, "sequence": time.time_ns(),
+             "checked_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+             "changed_paths": changed, "unmapped_contract_paths": unmapped, "candidates": []}
+    if not candidates:
+        if unmapped:
+            event["state"] = "UNKNOWN"
+        write_event(event)
+        state = "UNKNOWN" if unmapped else "GREEN"
+        print(f"docs-currentness: source={commit[:12]} candidates=0 state={state} "
+              f"{'unmapped=' + ','.join(unmapped) if unmapped else '(no mapped contract changed)'}")
+        return 0
+    for contract in candidates:
+        pending = pending_candidate(repo, contract)
+        if pending:
+            chain, task_revision = pending
+            disposition = "replay" if task_revision == commit else "supersedes-pending"
+        else:
+            chain, disposition = create_candidate(repo, commit, contract)
+            task_revision = commit
+        event["candidates"].append({"chain": chain, "source": contract.source,
+                                    "document": contract.document, "contract": contract.contract,
+                                    "disposition": disposition, "task_revision": task_revision})
+        print(f"docs-currentness: {disposition} {chain} owner=docs source={commit[:12]} doc={contract.document}")
+    write_event(event)
+    return 0
+
+
+def pilot_enabled(hostname: str, flag: Path) -> bool:
+    if hostname.split(".", 1)[0] != "mesh-home":
+        return False
+    try:
+        return flag.read_text(encoding="utf-8").strip() == "1"
+    except OSError:
+        return False
+
+
+def enabled() -> bool:
+    flag = Path(os.environ.get("MESH_DOCS_PILOT_FLAG", str(Path.home() / ".mesh/docs-currentness.enabled"))).expanduser()
+    return pilot_enabled(socket.gethostname(), flag)
+
+
+
+
+def parse_receipt(path: Path) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            break
+        key, sep, value = line.partition("=")
+        if not sep or not key.strip() or key.strip() in fields:
+            raise ValueError(f"invalid or duplicate receipt field: {line}")
+        fields[key.strip()] = value.strip()
+    return fields
+
+
+def verify_settlement(chain: str, artifact: Path, result: str) -> None:
+    chain_file = task_dir() / (chain.replace("/", "__") + ".json")
+    data = json.loads(chain_file.read_text(encoding="utf-8"))
+    origin = data.get("origin") or {}
+    context = data.get("task_context") or {}
+    identity = origin.get("source", "").split(":", 3)
+    if origin.get("kind") != "docs-currentness" or len(identity) != 4:
+        raise ValueError("task origin is not a complete docs-currentness envelope")
+    task_revision, source_path, document_path, contract_id = identity
+    repo = repo_root()
+    mappings = load_map(repo, map_path(repo))
+    matches = [row for row in mappings if row.source == source_path and row.document == document_path and row.contract == contract_id]
+    if len(matches) != 1:
+        raise ValueError("task origin does not resolve to exactly one current map row")
+    contract = matches[0]
+    if context.get("revision") != task_revision or context.get("scope") != contract.document or context.get("next_command") != contract.check:
+        raise ValueError("task context differs from its source-to-document map")
+    latest_events = []
+    directory = event_dir()
+    if directory.is_dir():
+        for file in directory.glob("*.json"):
+            event = json.loads(file.read_text(encoding="utf-8"))
+            if any(c.get("document") == contract.document and c.get("contract") == contract.contract for c in event.get("candidates", [])):
+                latest_events.append(event)
+    latest_event = max(latest_events, key=lambda item: item.get("sequence", 0)) if latest_events else {}
+    revision = latest_event.get("revision", task_revision)
+    commit, changed = resolve_commit(repo, revision)
+    if contract.source not in changed:
+        raise ValueError("latest source revision did not change its mapped source")
+    receipt = parse_receipt(artifact)
+    before = receipt.get("before_sha256", "")
+    after = receipt.get("after_sha256", "")
+    if receipt.get("source_revision") != commit or receipt.get("document") != contract.document or receipt.get("contract") != contract.contract:
+        raise ValueError("receipt source/document/contract does not match the latest task event")
+    if receipt.get("check_command") != contract.check or receipt.get("check_exit") != "0" or receipt.get("link_check") != "PASS" or receipt.get("state") != "GREEN":
+        raise ValueError("receipt lacks successful source and link checks or GREEN disposition")
+    if not re.fullmatch(r"[0-9a-f]{64}", before) or not re.fullmatch(r"[0-9a-f]{64}", after):
+        raise ValueError("receipt requires before/after SHA-256 values")
+    if receipt.get("disposition") not in ("updated", "already-current"):
+        raise ValueError("receipt disposition must be updated or already-current")
+    checked_at = receipt.get("checked_at", "")
+    if not re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", checked_at):
+        raise ValueError("receipt requires a UTC checked_at timestamp")
+    document = repo / contract.document
+    if not document.is_file() or hashlib.sha256(document.read_bytes()).hexdigest() != after:
+        raise ValueError("current document bytes do not match receipt after_sha256")
+    baseline_proc = run(["git", "-C", str(repo), "show", f"HEAD:{contract.document}"], repo)
+    if baseline_proc.returncode:
+        raise ValueError("document is absent from current HEAD")
+    baseline_hash = hashlib.sha256(baseline_proc.stdout.encode("utf-8")).hexdigest()
+    if before != baseline_hash:
+        raise ValueError("receipt before_sha256 does not match the current committed document")
+    document_diff = run(["git", "-C", str(repo), "diff", "--quiet", "HEAD", "--", contract.document], repo)
+    if receipt["disposition"] == "updated" and (before == after or document_diff.returncode == 0):
+        raise ValueError("updated disposition requires an uncommitted document change")
+    if receipt["disposition"] == "already-current" and (before != after or document_diff.returncode != 0):
+        raise ValueError("already-current disposition requires unchanged committed bytes")
+    expected_root = Path(context.get("artifact_root", str(mesh_root() / "evidence" / "docs-currentness"))).resolve()
+    if artifact.resolve().parent != expected_root:
+        raise ValueError(f"receipt must be directly inside task artifact root {expected_root}")
+    if ("docs-currentness=GREEN" not in result or f"source={commit[:12]}" not in result
+            or f"before={before}" not in result or f"after={after}" not in result
+            or "check=PASS" not in result or "links=PASS" not in result or "pane:docs" not in result):
+        raise ValueError("task result must name GREEN, exact source/before/after hashes, both checks, and pane:docs")
+    proof = shlex.split(contract.check)
+    executable = repo / proof[0] if proof[0].startswith("scripts/") else Path(shutil.which(proof[0]) or "")
+    if not executable or not executable.is_file():
+        raise ValueError(f"mapped proof executable is missing: {proof[0]}")
+    run([str(executable), *proof[1:]], repo, check=True)
+    link_checker = repo / "scripts/mesh-md-link"
+    link_dir = "docs" if contract.document.startswith("docs/") else "."
+    run([str(link_checker), "check", "--dir", link_dir], repo, check=True)
+    print(f"docs-currentness settlement: PASS {chain} {contract.document} source={commit[:12]}")
+
+
+def status(repo: Path) -> int:
+    directory = event_dir()
+    events = []
+    if directory.is_dir():
+        for file in directory.glob("*.json"):
+            try:
+                events.append(json.loads(file.read_text(encoding="utf-8")))
+            except (OSError, ValueError):
+                print(f"docs-currentness: UNKNOWN unreadable event {file.name}")
+                return 1
+    if not events:
+        print("docs-currentness: source=NONE candidates=0 owner=none last-checked=never state=UNKNOWN doc=none contract=none")
+        return 0
+    latest = max(events, key=lambda item: item.get("sequence", 0))
+    candidates = [(event, candidate) for event in events for candidate in event.get("candidates", [])]
+    open_candidates = []
+    settled_owner = "none"
+    last_checked = latest["checked_at"]
+    seen_chains: set[str] = set()
+    for event, candidate in candidates:
+        if candidate["chain"] in seen_chains:
+            continue
+        seen_chains.add(candidate["chain"])
+        proc = run(task_command() + ["status", candidate["chain"]], repo)
+        if proc.returncode:
+            print(f"docs-currentness: source={latest['revision'][:12]} candidates=UNKNOWN owner=UNKNOWN last-checked={last_checked} state=UNKNOWN doc={candidate['document']} contract={candidate['contract']}")
+            return 1
+        header = proc.stdout.splitlines()[0] if proc.stdout else ""
+        match = re.search(r"\[([^]]+)\]", header)
+        chain_state = match.group(1) if match else "UNKNOWN"
+        owner = "UNKNOWN"
+        for line in proc.stdout.splitlines()[1:]:
+            if "owner=docs" in line:
+                state_match = re.search(r"\[([^]]+)\]", line)
+                owner = f"docs:{state_match.group(1) if state_match else 'UNKNOWN'}"
+                break
+        if chain_state not in ("complete", "rejected", "ignored"):
+            open_candidates.append((event, candidate, owner))
+        elif chain_state == "complete":
+            settled_owner = owner
+            artifact_match = re.search(r"artifact=(\S+)", proc.stdout)
+            if artifact_match:
+                try:
+                    receipt = parse_receipt(Path(artifact_match.group(1)))
+                    last_checked = max(last_checked, receipt.get("checked_at", last_checked))
+                except (OSError, ValueError):
+                    pass
+    candidate_event, candidate = max(candidates, key=lambda pair: pair[0].get("sequence", 0)) if candidates else (latest, {})
+    if open_candidates:
+        event, candidate, owner = max(open_candidates, key=lambda pair: pair[0].get("checked_at", ""))
+        state, count = "REVIEW-NEEDED", len({item[1]["chain"] for item in open_candidates})
+    elif latest.get("state") == "UNKNOWN" or latest.get("unmapped_contract_paths"):
+        owner, state, count = "none", "UNKNOWN", 0
+    else:
+        owner, state, count = settled_owner, "GREEN", 0
+    print(f"docs-currentness: source={latest['revision'][:12]} candidates={count} owner={owner} "
+          f"last-checked={last_checked} state={state} doc={candidate.get('document','none')} "
+          f"contract={candidate.get('contract','none')}")
+    return 0
+
+
+def test() -> int:
+    evidence = Path(os.environ.get("MESH_EVIDENCE_ROOT", str(Path.home() / ".mesh/evidence"))).expanduser()
+    evidence.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="docs-currentness-test-", dir=evidence) as temp:
+        root = Path(temp)
+        repo = root / "repo"
+        mesh = root / "mesh"
+        (repo / "scripts").mkdir(parents=True)
+        (repo / "docs").mkdir()
+        (repo / "tests").mkdir()
+        source = DEFAULT_REPO / "scripts/mesh-queue-tend"
+        shutil.copy2(source, repo / "scripts/mesh-queue-tend")
+        doc = repo / "docs/mesh-tooling.md"
+        doc.write_text("<!-- {#deadbeef-1111-4111-8111-111111111111} -->\n# Queue contract\n\nSee [queue](#deadbeef-1111-4111-8111-111111111111).\n\n`mesh-queue-tend` conservatively reconciles queue work.\n", encoding="utf-8")
+        map_file = repo / "scripts/mesh-docs-currentness.map"
+        map_file.write_text("scripts/mesh-queue-tend\tdocs/mesh-tooling.md\tqueue-tend-exact-subject\tOnly an exact quoted subject closes the matching repeated-category item; weak matches stay open.\tscripts/mesh-queue-tend --test\n", encoding="utf-8")
+        (repo / "scripts/mesh-md-link").write_bytes((DEFAULT_REPO / "scripts/mesh-md-link").read_bytes())
+        (repo / "scripts/mesh-md-link").chmod(0o755)
+        subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.name", "docs-currentness-test"], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.email", "docs-currentness-test@invalid"], check=True)
+        subprocess.run(["git", "-C", str(repo), "add", "scripts/mesh-queue-tend", "scripts/mesh-md-link", "docs/mesh-tooling.md", "scripts/mesh-docs-currentness.map"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-qm", "fixture baseline"], check=True)
+        source_path = repo / "scripts/mesh-queue-tend"
+        source_path.write_text(source_path.read_text(encoding="utf-8") + "\n# source-contract fixture change\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "scripts/mesh-queue-tend"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-qm", "source contract change"], check=True)
+        revision = git(repo, "rev-parse", "HEAD")
+        fake_chat = root / "mesh-chat"
+        ledger = root / "mesh" / "chat.log"
+        board = root / "board.log"
+        task_module = DEFAULT_REPO / "scripts/mesh_task_log.py"
+        fake_chat.write_text("#!/bin/sh\nif [ \"$1\" = \"--task-state\" ]; then exec python3 \"" + str(task_module) + "\" append \"$MESH_DIR\" docs-currentness-test \"$2\"; fi\nprintf '%s\\n' \"$1\" >> \"$MESH_TASK_CHAT_LOG\"\n", encoding="utf-8")
+        fake_chat.chmod(0o755)
+        handoff = root / "mesh-handoff"
+        handoff.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8"); handoff.chmod(0o755)
+        evidence_root = mesh / "evidence" / "docs-currentness"
+        env = dict(os.environ)
+        env.update({"MESH_DOCS_REPO": str(repo), "MESH_DOCS_CURRENTNESS_MAP": str(map_file),
+                    "MESH_DOCS_PILOT_FLAG": str(root / "enabled"), "MESH_DIR": str(mesh),
+                    "MESH_TASK_DIR": str(mesh / "task-chains"), "MESH_CHAT_LOG": str(ledger),
+                    "MESH_TASK_CHAT_LOG": str(board), "MESH_TASK_CHAT_CMD": str(fake_chat),
+                    "MESH_TASK_HANDOFF_CMD": str(handoff), "MESH_TASK_LIVE_OWNERS": "docs genome",
+                    "MESH_TASK_MINDSTATE_CMD": "", "MESH_TASK_ACTOR": "genome",
+                    "MESH_EVIDENCE_ROOT": str(mesh / "evidence"), "MESH_PLANS_DIR": str(mesh / "plans"),
+                    "PATH": str(SCRIPT.parent) + os.pathsep + os.environ.get("PATH", "")})
+        flag = Path(env["MESH_DOCS_PILOT_FLAG"])
+        missing_flag = root / "missing-enabled-file"
+        flag.write_text("1", encoding="utf-8")
+        if not pilot_enabled("mesh-home", flag) or pilot_enabled("remote-node", flag) or pilot_enabled("mesh-home", missing_flag):
+            raise RuntimeError("local-host/default-off feature gate failed")
+        disabled = dict(env); disabled["MESH_DOCS_PILOT_FLAG"] = str(missing_flag)
+        off = subprocess.run([sys.executable, str(SCRIPT), "--event", revision], cwd=repo, env=disabled, text=True, capture_output=True)
+        if off.returncode or "disabled" not in off.stdout:
+            raise RuntimeError("default-off pilot gate failed")
+        os.environ.update(env)
+        process_event(repo, revision, map_file, force=True)
+        first_event = json.loads((mesh / "docs-currentness" / f"{revision}.json").read_text(encoding="utf-8"))
+        if len(first_event["candidates"]) != 1 or first_event["candidates"][0]["disposition"] != "created":
+            raise RuntimeError(f"relevant event did not create exactly one candidate: {first_event}")
+        chain = first_event["candidates"][0]["chain"]
+        process_event(repo, revision, map_file, force=True)
+        replay_event = json.loads((mesh / "docs-currentness" / f"{revision}.json").read_text(encoding="utf-8"))
+        if replay_event["candidates"][0]["disposition"] != "replay" or replay_event["candidates"][0]["chain"] != chain:
+            raise RuntimeError("source replay did not reuse the same candidate")
+        source_path = repo / "scripts/mesh-queue-tend"
+        source_path.write_text(source_path.read_text(encoding="utf-8") + "\n# superseding source-contract fixture change\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "scripts/mesh-queue-tend"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-qm", "superseding source contract change"], check=True)
+        latest_revision = git(repo, "rev-parse", "HEAD")
+        process_event(repo, latest_revision, map_file, force=True)
+        superseding = json.loads((mesh / "docs-currentness" / f"{latest_revision}.json").read_text(encoding="utf-8"))
+        if superseding["candidates"][0]["disposition"] != "supersedes-pending" or superseding["candidates"][0]["chain"] != chain:
+            raise RuntimeError("superseding event minted a duplicate instead of extending the pending review")
+        (repo / "tests/irrelevant.py").write_text("fixture-only\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "tests/irrelevant.py"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-qm", "irrelevant test change"], check=True)
+        irrelevant = git(repo, "rev-parse", "HEAD")
+        process_event(repo, irrelevant, map_file, force=True)
+        irrelevant_event = json.loads((mesh / "docs-currentness" / f"{irrelevant}.json").read_text(encoding="utf-8"))
+        if irrelevant_event["candidates"] or len(list((mesh / "task-chains").glob("docs-currentness-*.json"))) != 1:
+            raise RuntimeError("irrelevant test change created a candidate or replay duplicated one")
+        state = json.loads((mesh / "task-chains" / f"{chain}.json").read_text(encoding="utf-8"))
+        if state["steps"][0].get("owner") != "docs" or state.get("origin", {}).get("kind") != "docs-currentness":
+            raise RuntimeError("candidate did not retain exact docs ownership and origin")
+        status_before = subprocess.run([sys.executable, str(SCRIPT), "--status"], cwd=repo, env=env, text=True, capture_output=True)
+        if status_before.returncode or "state=REVIEW-NEEDED" not in status_before.stdout or "owner=docs:open" not in status_before.stdout:
+            raise RuntimeError(f"open owner candidate was not visible: {status_before.stdout}{status_before.stderr}")
+        done = task_command()
+        env["MESH_TASK_ACTOR"] = "docs"
+        subprocess.run(done + ["take", chain, "review-queue-tend-exact-subject"], cwd=repo, env=env, check=True, text=True, capture_output=True)
+        state = json.loads((mesh / "task-chains" / f"{chain}.json").read_text(encoding="utf-8"))
+        evidence_root = Path(state["task_context"]["artifact_root"])
+        before = hashlib.sha256(doc.read_bytes()).hexdigest()
+        doc.write_text("<!-- {#deadbeef-1111-4111-8111-111111111111} -->\n# Queue contract\n\nSee [queue](#deadbeef-1111-4111-8111-111111111111).\n\n`mesh-queue-tend` closes only the exact quoted subject, so a repeated-category completion leaves its siblings open.\n", encoding="utf-8")
+        after = hashlib.sha256(doc.read_bytes()).hexdigest()
+        evidence_root.mkdir(parents=True, exist_ok=True)
+        receipt = evidence_root / "settlement.md"
+        result = f"docs-currentness=GREEN source={latest_revision[:12]} before={before} after={after} check=PASS links=PASS pane:docs"
+        checked_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        common = f"source_revision={latest_revision}\ndocument=docs/mesh-tooling.md\ncontract=queue-tend-exact-subject\ndisposition=updated\nbefore_sha256={before}\nafter_sha256={after}\ncheck_command=scripts/mesh-queue-tend --test\nlink_check=PASS\nstate=GREEN\nchecked_at={checked_at}\n"
+        receipt.write_text(common + "check_exit=1\n", encoding="utf-8")
+        env["MESH_DOCS_RESULT"] = result
+        bad = subprocess.run(done + ["done", chain, "review-queue-tend-exact-subject", str(receipt), result], cwd=repo, env=env, text=True, capture_output=True)
+        if bad.returncode == 0 or "successful source and link checks" not in bad.stderr:
+            raise RuntimeError("settlement accepted a failed source check")
+        receipt.write_text(common + "check_exit=0\n", encoding="utf-8")
+        settled = subprocess.run(done + ["done", chain, "review-queue-tend-exact-subject", str(receipt), result], cwd=repo, env=env, text=True, capture_output=True)
+        if settled.returncode:
+            raise RuntimeError(f"proof-backed doc settlement failed: {settled.stdout}{settled.stderr}")
+        if "PASS" not in settled.stdout + settled.stderr:
+            raise RuntimeError("settlement did not report verifier PASS")
+        status_out = subprocess.run([sys.executable, str(SCRIPT), "--status"], cwd=repo, env=env, text=True, capture_output=True)
+        if status_out.returncode or "state=GREEN" not in status_out.stdout or "contract=queue-tend-exact-subject" not in status_out.stdout:
+            raise RuntimeError(f"settled docs status did not become GREEN: {status_out.stdout}{status_out.stderr}")
+        print("docs-currentness --test: PASS (local-only gate, relevant event, exact docs owner, replay, supersession, irrelevant test change, proof-gated settlement)")
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    repo = repo_root()
+    filename = map_path(repo)
+    if argv == ["--test"]:
+        return test()
+    if argv == ["--check-map"]:
+        check_map(repo, filename)
+        return 0
+    if argv == ["--status"]:
+        return status(repo)
+    if len(argv) == 3 and argv[0] == "--verify-settlement":
+        verify_settlement(argv[1], Path(argv[2]).expanduser().resolve(), os.environ.get("MESH_DOCS_RESULT", ""))
+        return 0
+    if len(argv) == 2 and argv[0] == "--event":
+        return process_event(repo, argv[1], filename)
+    print("usage: mesh-docs-currentness --check-map | --event <commit> | --status | --test", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main(sys.argv[1:]))
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
+        print(f"mesh-docs-currentness: UNKNOWN {exc}", file=sys.stderr)
+        raise SystemExit(1)
